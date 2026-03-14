@@ -1,0 +1,407 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LingClaw</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.0/marked.min.js"></script>
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0f0f1a; --surface: #1a1a2e; --surface2: #16213e;
+  --msg-user: #0f3460; --msg-ai: #12121f; --accent: #e94560; --accent2: #0ea5e9;
+  --text: #e8e8e8; --dim: #888; --border: #2a2a3e;
+  --tool-bg: #0d1117; --tool-border: #30363d;
+  --sidebar-w: 260px;
+}
+body { font-family: -apple-system, 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); height: 100vh; display: flex; overflow: hidden; }
+
+/* ── Sidebar ── */
+.sidebar { width: var(--sidebar-w); background: var(--surface); border-right: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; transition: margin-left .2s; }
+.sidebar.collapsed { margin-left: calc(-1 * var(--sidebar-w)); }
+.sidebar-header { padding: 16px; border-bottom: 1px solid var(--border); display: flex; align-items: center; justify-content: space-between; }
+.sidebar-header h2 { font-size: 15px; color: var(--accent); }
+.sidebar-header button { background: none; border: 1px solid var(--border); color: var(--dim); width: 28px; height: 28px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+.sidebar-header button:hover { border-color: var(--accent); color: var(--text); }
+#session-list { flex: 1; overflow-y: auto; padding: 8px; }
+.session-item { padding: 10px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; color: var(--dim); margin-bottom: 2px; display: flex; justify-content: space-between; align-items: center; }
+.session-item:hover { background: var(--surface2); color: var(--text); }
+.session-item.active { background: var(--surface2); color: var(--text); border-left: 2px solid var(--accent); }
+.session-item .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.session-item .meta { font-size: 11px; color: var(--dim); margin-left: 8px; flex-shrink: 0; }
+
+/* ── Main area ── */
+.main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+header { padding: 10px 16px; background: var(--surface); border-bottom: 1px solid var(--border); display: flex; align-items: center; gap: 12px; }
+header .toggle-sidebar { background: none; border: none; color: var(--dim); font-size: 18px; cursor: pointer; padding: 2px 6px; }
+header .toggle-sidebar:hover { color: var(--text); }
+header .session-name { font-size: 14px; font-weight: 600; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+header .session-id { font-size: 11px; color: var(--dim); font-family: monospace; }
+header .actions { display: flex; gap: 6px; }
+header .actions button { background: none; border: 1px solid var(--border); color: var(--dim); padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+header .actions button:hover { border-color: var(--accent); color: var(--text); }
+.conn-status { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.conn-status.connected { background: #22c55e; }
+.conn-status.disconnected { background: var(--accent); }
+
+/* ── Chat ── */
+#chat { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 10px; }
+.msg { max-width: 85%; padding: 10px 14px; border-radius: 10px; line-height: 1.65; font-size: 14px; word-break: break-word; }
+.msg.user { align-self: flex-end; background: var(--msg-user); border-bottom-right-radius: 2px; }
+.msg.assistant { align-self: flex-start; background: var(--msg-ai); border: 1px solid var(--border); border-bottom-left-radius: 2px; }
+.msg.assistant p { margin: 0 0 8px; }
+.msg.assistant p:last-child { margin-bottom: 0; }
+.msg.assistant pre { margin: 8px 0; position: relative; }
+.msg.assistant code { font-size: 13px; }
+.msg.assistant pre code { display: block; padding: 12px; border-radius: 6px; overflow-x: auto; }
+.msg.assistant :not(pre) > code { background: var(--tool-bg); padding: 1px 5px; border-radius: 3px; font-size: 13px; }
+.msg.system { align-self: center; color: var(--dim); font-size: 12px; font-style: italic; background: none; max-width: 100%; }
+.msg.error { align-self: center; color: var(--accent); font-size: 13px; background: none; }
+.typing::after { content: '▌'; animation: blink .6s infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+
+/* ── Tool panels ── */
+.tool-panel { align-self: flex-start; max-width: 85%; border: 1px solid var(--tool-border); border-radius: 8px; margin: 2px 0; overflow: hidden; font-size: 13px; }
+.tool-header { padding: 6px 12px; background: var(--tool-bg); cursor: pointer; display: flex; align-items: center; gap: 8px; color: var(--dim); }
+.tool-header:hover { background: #161b22; }
+.tool-header .tool-icon { color: var(--accent2); }
+.tool-header .tool-name { font-weight: 600; color: var(--text); }
+.tool-header .chevron { margin-left: auto; transition: transform .2s; }
+.tool-header .chevron.open { transform: rotate(90deg); }
+.tool-body { display: none; padding: 8px 12px; background: var(--tool-bg); border-top: 1px solid var(--tool-border); font-family: monospace; font-size: 12px; white-space: pre-wrap; max-height: 300px; overflow-y: auto; color: var(--dim); }
+.tool-body.show { display: block; }
+
+/* ── Copy button ── */
+.copy-btn { position: absolute; top: 6px; right: 6px; background: var(--surface2); border: 1px solid var(--border); color: var(--dim); padding: 2px 8px; border-radius: 4px; cursor: pointer; font-size: 11px; opacity: 0; transition: opacity .2s; }
+pre:hover .copy-btn { opacity: 1; }
+.copy-btn:hover { color: var(--text); border-color: var(--accent); }
+
+/* ── Input area ── */
+#input-area { padding: 12px 16px; background: var(--surface); border-top: 1px solid var(--border); display: flex; gap: 8px; }
+#input { flex: 1; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 10px 14px; font-size: 14px; resize: none; min-height: 44px; max-height: 120px; font-family: inherit; }
+#input:focus { outline: none; border-color: var(--accent); }
+#send { background: var(--accent); border: none; color: #fff; padding: 0 20px; border-radius: 8px; cursor: pointer; font-size: 14px; font-weight: 500; }
+#send:disabled { opacity: .4; cursor: not-allowed; }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #444; }
+
+/* ── Mobile ── */
+@media (max-width: 768px) {
+  .sidebar { position: absolute; z-index: 10; height: 100vh; }
+  .sidebar.collapsed { margin-left: calc(-1 * var(--sidebar-w)); }
+}
+</style>
+</head>
+<body>
+
+<!-- Sidebar -->
+<aside class="sidebar" id="sidebar">
+  <div class="sidebar-header">
+    <h2>🦀 Sessions</h2>
+    <button onclick="sendCmd('/new')" title="New session">+</button>
+  </div>
+  <div id="session-list"></div>
+</aside>
+
+<!-- Main -->
+<div class="main">
+  <header>
+    <button class="toggle-sidebar" onclick="toggleSidebar()">☰</button>
+    <div class="conn-status disconnected" id="conn-status"></div>
+    <span class="session-name" id="session-name">LingClaw</span>
+    <span class="session-id" id="session-id"></span>
+    <div class="actions">
+      <button onclick="sendCmd('/status')">Status</button>
+      <button onclick="sendCmd('/save')">Save</button>
+      <button onclick="sendCmd('/clear')">Clear</button>
+      <button onclick="sendCmd('/help')">Help</button>
+    </div>
+  </header>
+  <div id="chat"></div>
+  <div id="input-area">
+    <textarea id="input" placeholder="Message LingClaw... (/ for commands)" rows="1"></textarea>
+    <button id="send">Send</button>
+  </div>
+</div>
+
+<script>
+// ── State ──
+const chat = document.getElementById('chat');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+const connStatus = document.getElementById('conn-status');
+const sessionNameEl = document.getElementById('session-name');
+const sessionIdEl = document.getElementById('session-id');
+const sessionList = document.getElementById('session-list');
+
+let ws = null;
+let currentMsg = null;
+let busy = false;
+let currentSessionId = '';
+let sessions = [];
+
+// ── Markdown setup ──
+marked.setOptions({
+  highlight: (code, lang) => {
+    if (lang && hljs.getLanguage(lang)) {
+      return hljs.highlight(code, { language: lang }).value;
+    }
+    return hljs.highlightAuto(code).value;
+  },
+  breaks: true,
+});
+
+// ── WebSocket ──
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
+
+  ws.onopen = () => {
+    connStatus.className = 'conn-status connected';
+    addSystem('Connected.');
+  };
+
+  ws.onclose = () => {
+    connStatus.className = 'conn-status disconnected';
+    addSystem('Disconnected. Reconnecting...');
+    setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => ws.close();
+
+  ws.onmessage = (e) => {
+    const data = JSON.parse(e.data);
+    handleMessage(data);
+  };
+}
+
+function handleMessage(data) {
+  switch (data.type) {
+    case 'session':
+      currentSessionId = data.id;
+      sessionNameEl.textContent = data.name || 'New Chat';
+      sessionIdEl.textContent = data.id.slice(0, 12);
+      break;
+
+    case 'session_switched':
+      currentSessionId = data.id;
+      // Clear chat display on switch
+      chat.innerHTML = '';
+      addSystem(`Switched to session ${data.id.slice(0, 12)}`);
+      break;
+
+    case 'sessions_list':
+      sessions = data.sessions || [];
+      renderSessionList();
+      break;
+
+    case 'start':
+      currentMsg = addAssistant('');
+      currentMsg.classList.add('typing');
+      break;
+
+    case 'delta':
+      if (currentMsg) {
+        currentMsg._rawText = (currentMsg._rawText || '') + data.content;
+        currentMsg.textContent = currentMsg._rawText;
+      }
+      scrollDown();
+      break;
+
+    case 'done':
+      if (currentMsg) {
+        currentMsg.classList.remove('typing');
+        renderMarkdown(currentMsg);
+        currentMsg = null;
+      }
+      busy = false;
+      sendBtn.disabled = false;
+      break;
+
+    case 'tool_call':
+      addToolCall(data.name, data.arguments, data.id);
+      break;
+
+    case 'tool_result':
+      addToolResult(data.name, data.result, data.id);
+      break;
+
+    case 'system':
+      addSystem(data.content);
+      busy = false;
+      sendBtn.disabled = false;
+      break;
+
+    case 'error':
+      addError(data.content);
+      busy = false;
+      sendBtn.disabled = false;
+      break;
+  }
+}
+
+// ── Message rendering ──
+function addMsg(cls, text) {
+  const el = document.createElement('div');
+  el.className = `msg ${cls}`;
+  el.textContent = text;
+  chat.appendChild(el);
+  scrollDown();
+  return el;
+}
+
+function addAssistant(text) { return addMsg('assistant', text); }
+function addSystem(t) { addMsg('system', t); }
+function addError(t) { addMsg('error', `⚠ ${t}`); }
+
+function addToolCall(name, args, id) {
+  const panel = document.createElement('div');
+  panel.className = 'tool-panel';
+  panel.dataset.toolId = id;
+
+  let argsDisplay = args;
+  try { argsDisplay = JSON.stringify(JSON.parse(args), null, 2); } catch(e) {}
+
+  panel.innerHTML = `
+    <div class="tool-header" onclick="this.querySelector('.chevron').classList.toggle('open');this.nextElementSibling.classList.toggle('show')">
+      <span class="tool-icon">⚡</span>
+      <span class="tool-name">${escHtml(name)}</span>
+      <span style="color:var(--dim);font-size:12px">${truncateStr(args, 80)}</span>
+      <span class="chevron">▸</span>
+    </div>
+    <div class="tool-body">${escHtml(argsDisplay)}</div>
+  `;
+  chat.appendChild(panel);
+  scrollDown();
+}
+
+function addToolResult(name, result, id) {
+  // Find matching tool panel and append result
+  const panels = chat.querySelectorAll('.tool-panel');
+  for (const p of panels) {
+    if (p.dataset.toolId === id) {
+      const body = p.querySelector('.tool-body');
+      body.textContent += '\n─── result ───\n' + result;
+      return;
+    }
+  }
+  // Fallback: standalone result
+  const el = document.createElement('div');
+  el.className = 'tool-panel';
+  el.innerHTML = `
+    <div class="tool-header" onclick="this.nextElementSibling.classList.toggle('show')">
+      <span class="tool-icon">📋</span>
+      <span class="tool-name">${escHtml(name)} result</span>
+      <span class="chevron">▸</span>
+    </div>
+    <div class="tool-body show">${escHtml(result)}</div>
+  `;
+  chat.appendChild(el);
+  scrollDown();
+}
+
+function renderMarkdown(el) {
+  const raw = el._rawText || el.textContent;
+  el.innerHTML = marked.parse(raw);
+
+  // Add copy buttons to code blocks
+  el.querySelectorAll('pre').forEach(pre => {
+    pre.style.position = 'relative';
+    const btn = document.createElement('button');
+    btn.className = 'copy-btn';
+    btn.textContent = 'Copy';
+    btn.onclick = () => {
+      const code = pre.querySelector('code');
+      navigator.clipboard.writeText(code?.textContent || pre.textContent);
+      btn.textContent = 'Copied!';
+      setTimeout(() => btn.textContent = 'Copy', 1500);
+    };
+    pre.appendChild(btn);
+  });
+
+  // Highlight code blocks
+  el.querySelectorAll('pre code').forEach(block => {
+    hljs.highlightElement(block);
+  });
+}
+
+// ── Session sidebar ──
+function renderSessionList() {
+  sessionList.innerHTML = '';
+  sessions.sort((a, b) => (b.messages || 0) - (a.messages || 0));
+  for (const s of sessions) {
+    const item = document.createElement('div');
+    item.className = `session-item${s.active ? ' active' : ''}`;
+    item.innerHTML = `
+      <span class="name">${escHtml(s.name)}</span>
+      <span class="meta">${s.messages || 0}msg</span>
+    `;
+    item.onclick = () => {
+      if (s.id !== currentSessionId) {
+        sendCmd(`/switch ${s.id}`);
+      }
+    };
+    sessionList.appendChild(item);
+  }
+
+  // Update header
+  const active = sessions.find(s => s.active);
+  if (active) {
+    sessionNameEl.textContent = active.name;
+    sessionIdEl.textContent = active.id.slice(0, 12);
+  }
+}
+
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('collapsed');
+}
+
+// ── Helpers ──
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function truncateStr(s, max) {
+  return s.length > max ? s.slice(0, max) + '…' : s;
+}
+function scrollDown() { chat.scrollTop = chat.scrollHeight; }
+
+// ── Input ──
+function send() {
+  const text = input.value.trim();
+  if (!text || busy || !ws || ws.readyState !== 1) return;
+
+  if (!text.startsWith('/')) {
+    addMsg('user', text);
+    busy = true;
+    sendBtn.disabled = true;
+  }
+
+  ws.send(text);
+  input.value = '';
+  input.style.height = 'auto';
+}
+
+function sendCmd(cmd) {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(cmd);
+}
+
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+});
+sendBtn.addEventListener('click', send);
+
+connect();
+</script>
+</body>
+</html>
