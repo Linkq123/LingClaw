@@ -164,6 +164,19 @@ fn tool_parameters_http_fetch() -> serde_json::Value {
     })
 }
 
+fn tool_parameters_delete_file() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "File path to delete"
+            }
+        },
+        "required": ["path"]
+    })
+}
+
 fn tool_prompt_line_think(_: &Config) -> String {
     "**think** — Plan your approach step-by-step before complex tasks. Write reasoning here."
         .to_string()
@@ -201,6 +214,10 @@ fn tool_prompt_line_http_fetch(_: &Config) -> String {
     "**http_fetch** — Fetch content from a URL via HTTP GET.".to_string()
 }
 
+fn tool_prompt_line_delete_file(_: &Config) -> String {
+    "**delete_file** — Delete a file from the workspace.".to_string()
+}
+
 fn tool_handler_think<'a>(args: &'a serde_json::Value, _: &'a Config, _: &'a Client, _: &'a Path) -> ToolFuture<'a> {
     Box::pin(async move { exec::tool_think(args) })
 }
@@ -231,6 +248,10 @@ fn tool_handler_search_files<'a>(args: &'a serde_json::Value, config: &'a Config
 
 fn tool_handler_http_fetch<'a>(args: &'a serde_json::Value, config: &'a Config, http: &'a Client, _: &'a Path) -> ToolFuture<'a> {
     Box::pin(async move { net::tool_http_fetch(args, http, config).await })
+}
+
+fn tool_handler_delete_file<'a>(args: &'a serde_json::Value, _: &'a Config, _: &'a Client, workspace: &'a Path) -> ToolFuture<'a> {
+    Box::pin(async move { fs::tool_delete_file(args, workspace).await })
 }
 
 pub(crate) fn tool_specs() -> &'static [ToolSpec] {
@@ -290,6 +311,13 @@ pub(crate) fn tool_specs() -> &'static [ToolSpec] {
             prompt_line: tool_prompt_line_http_fetch,
             parameters: tool_parameters_http_fetch,
             handler: tool_handler_http_fetch,
+        },
+        ToolSpec {
+            name: "delete_file",
+            description: "Delete a file from the workspace. The path must be inside the session workspace.",
+            prompt_line: tool_prompt_line_delete_file,
+            parameters: tool_parameters_delete_file,
+            handler: tool_handler_delete_file,
         },
     ]
 }

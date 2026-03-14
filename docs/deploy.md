@@ -41,6 +41,8 @@ lingclaw restart    # 重启服务
 lingclaw health     # 健康检查
 lingclaw status     # 详细状态（地址、版本、providers、models）
 lingclaw update     # 检查版本，有更新时 rebuild 并重启
+lingclaw install    # 从本地源码安装（当前目录）
+lingclaw install -d E:\path\to\src  # 从指定目录安装
 lingclaw help       # 查看帮助信息
 lingclaw --version  # 显示版本号
 ```
@@ -95,6 +97,8 @@ lingclaw restart    # 重启服务
 lingclaw health     # 健康检查
 lingclaw status     # 详细状态（含版本号）
 lingclaw update     # 检查版本，有更新时 rebuild 并重启
+lingclaw install    # 从本地源码安装（当前目录）
+lingclaw install -d /path/to/src  # 从指定目录安装
 lingclaw help       # 查看帮助信息
 lingclaw --version  # 显示版本号
 ```
@@ -181,6 +185,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/lingclaw /usr/local/bin/
 COPY static/ /app/static/
+COPY docs/reference/templates/ /app/docs/reference/templates/
 
 WORKDIR /app
 EXPOSE 3000
@@ -205,15 +210,15 @@ docker build -t lingclaw:latest .
 docker run -d \
   --name lingclaw \
   -p 3000:3000 \
+  -v lingclaw-data:/root/.lingclaw \
   -v /path/to/.lingclaw.json:/root/.lingclaw/.lingclaw.json:ro \
-  -v lingclaw-sessions:/app/.lingclaw \
   lingclaw:latest
 ```
 
 | 挂载卷 | 用途 |
 |--------|------|
-| `.lingclaw.json` | 配置文件（必须，容器不支持 Setup Wizard） |
-| `lingclaw-sessions` | 持久化 `.lingclaw/sessions/` 会话数据 |
+| `lingclaw-data` | 持久化会话数据和 workspace（`~/.lingclaw/sessions/`、`~/.lingclaw/{sessionId}/workspace/`） |
+| `.lingclaw.json` | 配置文件（必须，容器不支持 Setup Wizard；bind mount 覆盖卷内同路径） |
 
 ### 3.4 Docker Compose
 
@@ -224,12 +229,12 @@ services:
     ports:
       - "3000:3000"
     volumes:
+      - lingclaw-data:/root/.lingclaw
       - ./lingclaw.json:/root/.lingclaw/.lingclaw.json:ro
-      - lingclaw-sessions:/app/.lingclaw
     restart: unless-stopped
 
 volumes:
-  lingclaw-sessions:
+  lingclaw-data:
 ```
 
 > 将 `lingclaw.json.example` 复制为 `lingclaw.json` 并编辑后挂载即可。
@@ -283,13 +288,14 @@ volumes:
 ## 文件结构
 
 ```
-lingclaw           # 二进制
+lingclaw                        # 二进制
 static/
-  index.html       # WebChat 前端
+  index.html                    # WebChat 前端
+docs/reference/templates/       # 7 个 Prompt 模板（BOOTSTRAP/AGENT/IDENTITY/SOUL/USER/TOOLS/MEMORY.md）
 ~/.lingclaw/
-  .lingclaw.json   # 配置文件（Setup Wizard 自动创建）
-.lingclaw/
-  sessions/        # 磁盘持久化的会话 JSON
+  .lingclaw.json                # 配置文件（Setup Wizard 自动创建）
+  sessions/                     # 磁盘持久化的会话 JSON
+  {sessionId}/workspace/        # 每会话隔离工作区（含 7 个 prompt 文件 + memory/ 日志）
 ```
 
 ## 验证部署

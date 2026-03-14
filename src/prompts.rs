@@ -65,14 +65,14 @@ pub(crate) fn init_session_prompt_files(workspace: &Path) {
 
 /// Load session context for the system prompt.
 ///
-/// Reads (in order): SOUL.md, USER.md, MEMORY.md, then today's and yesterday's
+/// Reads (in order): AGENT.md, SOUL.md, USER.md, MEMORY.md, then today's and yesterday's
 /// daily memory files from `memory/YYYY-MM-DD.md`.
 /// Files that don't exist or are empty are silently skipped.
 pub(crate) fn load_session_prompt_files(workspace: &Path) -> String {
     let mut parts = Vec::new();
 
-    // Core identity files (order matters: soul → user → long-term memory)
-    for name in &["SOUL.md", "USER.md", "MEMORY.md"] {
+    // Agent behavior rules first, then identity files (order: agent → soul → user → long-term memory)
+    for name in &["AGENT.md", "SOUL.md", "USER.md", "MEMORY.md"] {
         if let Some(content) = read_nonempty(workspace.join(name)) {
             parts.push(content);
         }
@@ -109,7 +109,7 @@ fn read_nonempty(path: impl AsRef<Path>) -> Option<String> {
 }
 
 /// Return today's date as "YYYY-MM-DD" using system time (no chrono crate needed).
-fn chrono_today() -> String {
+pub(crate) fn chrono_today() -> String {
     // seconds since epoch → days → civil date
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

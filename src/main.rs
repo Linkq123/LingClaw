@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     collections::HashMap,
-    io::{self, BufRead, Write},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -21,18 +20,19 @@ use std::{
 use tokio::sync::Mutex;
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
+mod cli;
 mod prompts;
 mod providers;
 mod tools;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  Config
 // ══════════════════════════════════════════════════════════════════════════════
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Provider {
+pub(crate) enum Provider {
     OpenAI,
     Anthropic,
 }
@@ -62,7 +62,7 @@ impl Provider {
         }
     }
 
-    fn label(self) -> &'static str {
+    pub(crate) fn label(self) -> &'static str {
         match self {
             Self::OpenAI => "openai",
             Self::Anthropic => "anthropic",
@@ -70,22 +70,22 @@ impl Provider {
     }
 }
 
-struct Config {
-    api_key: String,
-    api_base: String,
-    model: String,
-    provider: Provider,
-    providers: HashMap<String, JsonProviderConfig>,
-    port: u16,
-    max_context_tokens: usize,
-    exec_timeout: Duration,
-    max_tool_rounds: usize,
-    max_output_bytes: usize,
-    max_file_bytes: usize,
+pub(crate) struct Config {
+    pub(crate) api_key: String,
+    pub(crate) api_base: String,
+    pub(crate) model: String,
+    pub(crate) provider: Provider,
+    pub(crate) providers: HashMap<String, JsonProviderConfig>,
+    pub(crate) port: u16,
+    pub(crate) max_context_tokens: usize,
+    pub(crate) exec_timeout: Duration,
+    pub(crate) max_tool_rounds: usize,
+    pub(crate) max_output_bytes: usize,
+    pub(crate) max_file_bytes: usize,
 }
 
 impl Config {
-    fn load() -> Self {
+    pub(crate) fn load() -> Self {
         let json_cfg = load_config_file();
         let settings = json_cfg.settings.unwrap_or_default();
         let providers: HashMap<String, JsonProviderConfig> = json_cfg
@@ -236,15 +236,15 @@ struct JsonModelsConfig {
 }
 
 #[derive(Deserialize, Clone)]
-struct JsonProviderConfig {
+pub(crate) struct JsonProviderConfig {
     #[serde(rename = "baseUrl")]
-    base_url: String,
+    pub(crate) base_url: String,
     #[serde(rename = "apiKey")]
-    api_key: String,
+    pub(crate) api_key: String,
     #[serde(default = "default_api_protocol")]
-    api: String,
+    pub(crate) api: String,
     #[serde(default)]
-    models: Vec<JsonModelEntry>,
+    pub(crate) models: Vec<JsonModelEntry>,
 }
 
 fn default_api_protocol() -> String {
@@ -252,22 +252,22 @@ fn default_api_protocol() -> String {
 }
 
 #[derive(Deserialize, Serialize, Clone, Default)]
-struct JsonModelEntry {
-    id: String,
+pub(crate) struct JsonModelEntry {
+    pub(crate) id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
+    pub(crate) name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reasoning: Option<bool>,
+    pub(crate) reasoning: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    input: Option<Vec<String>>,
+    pub(crate) input: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    cost: Option<serde_json::Value>,
+    pub(crate) cost: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "contextWindow")]
-    context_window: Option<u64>,
+    pub(crate) context_window: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "maxTokens")]
-    max_tokens: Option<u64>,
+    pub(crate) max_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    compat: Option<serde_json::Value>,
+    pub(crate) compat: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Default)]
@@ -285,7 +285,7 @@ struct JsonDefaultModel {
     primary: Option<String>,
 }
 
-fn config_dir_path() -> Option<PathBuf> {
+pub(crate) fn config_dir_path() -> Option<PathBuf> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .ok()?;
@@ -295,7 +295,7 @@ fn config_dir_path() -> Option<PathBuf> {
     Some(Path::new(&home).join(".lingclaw"))
 }
 
-fn config_file_path() -> Option<PathBuf> {
+pub(crate) fn config_file_path() -> Option<PathBuf> {
     Some(config_dir_path()?.join(".lingclaw.json"))
 }
 
@@ -313,671 +313,6 @@ fn load_config_file() -> JsonConfig {
     }
 }
 
-// ── First-Run Setup Wizard ───────────────────────────────────────────────────
-
-fn prompt_line(msg: &str) -> String {
-    print!("{msg}");
-    io::stdout().flush().ok();
-    let mut buf = String::new();
-    io::stdin().lock().read_line(&mut buf).unwrap_or(0);
-    buf.trim().to_string()
-}
-
-fn prompt_choice(options: &[&str]) -> usize {
-    loop {
-        for (i, opt) in options.iter().enumerate() {
-            println!("  {}. {opt}", i + 1);
-        }
-        let input = prompt_line("> ");
-        if let Ok(n) = input.parse::<usize>() {
-            if n >= 1 && n <= options.len() {
-                return n - 1;
-            }
-        }
-        println!("Invalid choice. Please enter a number between 1 and {}.", options.len());
-    }
-}
-
-/// Add the current binary's directory to the system PATH.
-fn install_global_path() {
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("   ❌ Cannot determine executable path: {e}");
-            return;
-        }
-    };
-    let dir = match exe.parent() {
-        Some(d) => d.to_string_lossy().to_string(),
-        None => {
-            eprintln!("   ❌ Cannot determine executable directory");
-            return;
-        }
-    };
-
-    #[cfg(target_os = "windows")]
-    {
-        // Read current user PATH, append if not already present
-        let output = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command",
-                   "[Environment]::GetEnvironmentVariable('Path','User')"])
-            .output();
-        match output {
-            Ok(out) => {
-                let current = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if current.to_lowercase().contains(&dir.to_lowercase()) {
-                    println!("   ✅ Already in PATH");
-                    return;
-                }
-                let new_path = if current.is_empty() {
-                    dir.clone()
-                } else {
-                    format!("{current};{dir}")
-                };
-                let cmd = format!(
-                    "[Environment]::SetEnvironmentVariable('Path','{}','User')",
-                    new_path.replace('\'', "''")
-                );
-                let res = std::process::Command::new("powershell")
-                    .args(["-NoProfile", "-Command", &cmd])
-                    .status();
-                match res {
-                    Ok(s) if s.success() => {
-                        println!("   ✅ Added to User PATH: {dir}");
-                        // Also update the current process so child commands work immediately
-                        if let Ok(machine) = std::env::var("Path") {
-                            std::env::set_var("Path", format!("{new_path};{machine}"));
-                        }
-                    }
-                    _ => eprintln!("   ❌ Failed to update PATH"),
-                }
-            }
-            Err(e) => eprintln!("   ❌ Failed to read PATH: {e}"),
-        }
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        // Append to ~/.bashrc and ~/.zshrc if not already present
-        let home = std::env::var("HOME").unwrap_or_default();
-        if home.is_empty() {
-            eprintln!("   ❌ Cannot determine HOME directory");
-            return;
-        }
-        let export_line = format!("export PATH=\"{dir}:$PATH\"");
-        let mut added = false;
-        for rc in &[".bashrc", ".zshrc"] {
-            let rc_path = Path::new(&home).join(rc);
-            if !rc_path.exists() {
-                continue;
-            }
-            let content = std::fs::read_to_string(&rc_path).unwrap_or_default();
-            if content.contains(&dir) {
-                continue;
-            }
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&rc_path) {
-                use std::io::Write;
-                let _ = writeln!(f, "\n# LingClaw\n{export_line}");
-                added = true;
-            }
-        }
-        if added {
-            println!("   ✅ Added to PATH in shell config. Run `source ~/.bashrc` or restart terminal.");
-        } else {
-            println!("   ✅ Already in PATH (or no .bashrc/.zshrc found)");
-        }
-    }
-}
-
-// ── CLI Subcommands ──────────────────────────────────────────────────────────
-
-fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool {
-    match cmd {
-        "start" => {
-            let exe = std::env::current_exe().expect("cannot find executable");
-            let mut extra_args: Vec<String> = vec!["--serve".to_string()];
-            if let Some(p) = port_override {
-                extra_args.push("--port".to_string());
-                extra_args.push(p.to_string());
-                println!("Starting LingClaw daemon on port {p}...");
-            } else {
-                println!("Starting LingClaw daemon...");
-            }
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::process::CommandExt;
-                let _ = std::process::Command::new(&exe)
-                    .args(&extra_args)
-                    .creation_flags(0x00000008) // DETACHED_PROCESS
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .map(|c| println!("Started (PID {})", c.id()))
-                    .map_err(|e| eprintln!("Failed to start: {e}"));
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let mut nohup_args: Vec<std::ffi::OsString> = vec![exe.into()];
-                for a in &extra_args {
-                    nohup_args.push(a.into());
-                }
-                let _ = std::process::Command::new("nohup")
-                    .args(&nohup_args)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .map(|c| println!("Started (PID {})", c.id()))
-                    .map_err(|e| eprintln!("Failed to start: {e}"));
-            }
-            true
-        }
-        "stop" => {
-            let config = Config::load();
-            let port = port_override.unwrap_or(config.port);
-            println!("Stopping LingClaw on port {port}...");
-            #[cfg(target_os = "windows")]
-            {
-                let _ = std::process::Command::new("powershell")
-                    .args(["-NoProfile", "-Command", &format!(
-                        "Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | \
-                         ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force }}"
-                    )])
-                    .status();
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let _ = std::process::Command::new("sh")
-                    .args(["-c", &format!(
-                        "lsof -ti:{port} | xargs -r kill"
-                    )])
-                    .status();
-            }
-            std::thread::sleep(Duration::from_millis(500));
-            match std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
-                Ok(_) => eprintln!("Warning: port {port} still in use"),
-                Err(_) => println!("Stopped."),
-            }
-            true
-        }
-        "restart" => {
-            handle_cli_command("stop", port_override);
-            std::thread::sleep(Duration::from_secs(1));
-            handle_cli_command("start", port_override);
-            true
-        }
-        "health" => {
-            let config = Config::load();
-            let port = port_override.unwrap_or(config.port);
-            let addr = format!("127.0.0.1:{port}");
-            match std::net::TcpStream::connect_timeout(
-                &addr.parse().expect("invalid addr"),
-                Duration::from_secs(3),
-            ) {
-                Ok(mut stream) => {
-                    use std::io::{Read, Write};
-                    let req = format!(
-                        "GET /api/health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-                    );
-                    let _ = stream.write_all(req.as_bytes());
-                    let mut buf = String::new();
-                    let _ = stream.read_to_string(&mut buf);
-                    // Extract JSON body after \r\n\r\n
-                    if let Some(pos) = buf.find("\r\n\r\n") {
-                        let body = buf[pos + 4..].trim();
-                        println!("✅ {body}");
-                    } else {
-                        println!("✅ Running (port {port})");
-                    }
-                }
-                Err(_) => eprintln!("❌ Not running (port {port} unreachable)"),
-            }
-            true
-        }
-        "update" => {
-            let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            if !workspace.join("Cargo.toml").exists() {
-                eprintln!("ERROR: Cargo.toml not found. Run `lingclaw update` from the source directory.");
-                return true;
-            }
-            println!("Current version: v{VERSION}");
-            println!("Pulling latest source...");
-            let pull = std::process::Command::new("git")
-                .args(["pull"])
-                .status();
-            match pull {
-                Ok(s) if s.success() => println!("   ✅ git pull complete"),
-                _ => {
-                    eprintln!("   ❌ git pull failed");
-                    return true;
-                }
-            }
-            // Read version from updated Cargo.toml
-            let new_version = std::fs::read_to_string(workspace.join("Cargo.toml"))
-                .ok()
-                .and_then(|content| {
-                    content.lines().find_map(|line| {
-                        let line = line.trim();
-                        if line.starts_with("version") {
-                            line.split('"').nth(1).map(|v| v.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-            if new_version == VERSION {
-                println!("Already up to date (v{VERSION}).");
-                return true;
-            }
-            println!("New version available: v{VERSION} → v{new_version}");
-            println!("Building...");
-            let build = std::process::Command::new("cargo")
-                .args(["build", "--release"])
-                .status();
-            match build {
-                Ok(s) if s.success() => {
-                    println!("   ✅ Build complete (v{new_version})");
-                    println!("Restarting...");
-                    handle_cli_command("restart", port_override);
-                }
-                _ => eprintln!("   ❌ Build failed"),
-            }
-            true
-        }
-        "status" => {
-            let config = Config::load();
-            let port = port_override.unwrap_or(config.port);
-            let addr = format!("127.0.0.1:{port}");
-
-            // Check if running
-            let running = std::net::TcpStream::connect_timeout(
-                &addr.parse().expect("invalid addr"),
-                Duration::from_secs(2),
-            )
-            .is_ok();
-
-            println!("╔══════════════════════════════════════════════════════════╗");
-            println!("║             🦀 LingClaw v{VERSION}                        ║");
-            println!("╚══════════════════════════════════════════════════════════╝");
-            println!();
-            println!("  Version:       v{VERSION}");
-            println!("  Service:       {}", if running { "✅ Running" } else { "❌ Stopped" });
-            println!("  Address:       http://{addr}");
-            println!("  Default model: {}", config.model);
-            println!("  Provider:      {}", config.provider.label());
-            println!("  API base:      {}", config.api_base);
-            println!("  Exec timeout:  {}s", config.exec_timeout.as_secs());
-            println!("  Max rounds:    {}", config.max_tool_rounds);
-            println!("  Context limit: {} tokens", config.max_context_tokens);
-            println!();
-
-            if config.providers.is_empty() {
-                println!("  Providers: (none configured)");
-            } else {
-                println!("  Providers:");
-                println!();
-                println!("  {:<16} {:<10} {:<30} {:>8}", "NAME", "API", "BASE URL", "MODELS");
-                println!("  {}", "─".repeat(68));
-                for (name, pc) in &config.providers {
-                    println!("  {:<16} {:<10} {:<30} {:>8}",
-                        name, pc.api,
-                        if pc.base_url.len() > 30 { format!("{}…", &pc.base_url[..29]) } else { pc.base_url.clone() },
-                        pc.models.len(),
-                    );
-                }
-            }
-            println!();
-
-            // Collect all models across providers into a flat table
-            struct ModelRow { name: String, id: String, provider: String, ctx: String, max_out: String, flags: String }
-            let rows: Vec<ModelRow> = config.providers.iter().flat_map(|(pname, pc)| {
-                pc.models.iter().map(move |m| ModelRow {
-                    name: m.name.as_deref().unwrap_or(&m.id).to_string(),
-                    id: m.id.clone(),
-                    provider: pname.clone(),
-                    ctx: m.context_window.map(|w| format!("{w}")).unwrap_or_else(|| "-".into()),
-                    max_out: m.max_tokens.map(|t| format!("{t}")).unwrap_or_else(|| "-".into()),
-                    flags: if m.reasoning.unwrap_or(false) { "reasoning".into() } else { String::new() },
-                })
-            }).collect();
-
-            if rows.is_empty() {
-                println!("  Models: (none configured)");
-            } else {
-                println!("  Models ({}):", rows.len());
-                println!();
-                println!("  {:<24} {:<30} {:<12} {:>8} {:>8}  FLAGS",
-                    "NAME", "ID", "PROVIDER", "CTX", "MAX OUT");
-                println!("  {}", "─".repeat(90));
-                for r in &rows {
-                    let dflt = if r.id == config.model { " *" } else { "" };
-                    println!("  {:<24} {:<30} {:<12} {:>8} {:>8}  {}{}",
-                        r.name, r.id, r.provider, r.ctx, r.max_out, r.flags, dflt);
-                }
-                println!();
-                println!("  (* = default model)");
-            }
-            println!();
-
-            // Check for newer version via git
-            let _ = std::process::Command::new("git")
-                .args(["fetch", "--quiet"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            if let Ok(output) = std::process::Command::new("git")
-                .args(["show", "origin/main:Cargo.toml"])
-                .output()
-            {
-                if output.status.success() {
-                    let remote_cargo = String::from_utf8_lossy(&output.stdout);
-                    let remote_ver = remote_cargo.lines().find_map(|line| {
-                        let line = line.trim();
-                        if line.starts_with("version") {
-                            line.split('"').nth(1)
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(rv) = remote_ver {
-                        if rv != VERSION {
-                            println!("  💡 New version available: v{VERSION} → v{rv}");
-                            println!("     Run `lingclaw update` to upgrade.");
-                            println!();
-                        }
-                    }
-                }
-            }
-
-            true
-        }
-        "help" | "--help" | "-h" => {
-            println!("🦀 LingClaw v{VERSION} — Personal AI Assistant");
-            println!();
-            println!("Usage: lingclaw <command> [options]");
-            println!();
-            println!("Commands:");
-            println!("  start              Start the daemon");
-            println!("  stop               Stop the daemon");
-            println!("  restart            Restart the daemon");
-            println!("  health             Health check (exit 0 = ok)");
-            println!("  status             Show detailed service status");
-            println!("  update             Check for updates, rebuild if newer");
-            println!("  help               Show this help message");
-            println!();
-            println!("Options:");
-            println!("  --port <PORT>      Override listening port");
-            println!("  --install-daemon   Re-run Setup Wizard (backup existing config)");
-            println!("  --version, -V      Show version");
-            println!();
-            println!("Without a command, runs the Setup Wizard on first launch,");
-            println!("then starts the daemon in the background.");
-            true
-        }
-        "--version" | "-V" => {
-            println!("lingclaw v{VERSION}");
-            true
-        }
-        _ => false,
-    }
-}
-
-fn run_setup_wizard(force: bool) -> bool {
-    let config_path = match config_file_path() {
-        Some(p) => p,
-        None => {
-            eprintln!("Cannot determine home directory. Skipping setup wizard.");
-            return false;
-        }
-    };
-
-    if config_path.exists() {
-        if !force {
-            return true;
-        }
-        // Backup existing config before overwriting (never clobber previous backups)
-        let mut bak_path = config_path.with_extension("json.bak");
-        if bak_path.exists() {
-            let mut n = 1u32;
-            loop {
-                let candidate = config_path.with_extension(format!("json.bak.{n}"));
-                if !candidate.exists() {
-                    bak_path = candidate;
-                    break;
-                }
-                n += 1;
-            }
-        }
-        if let Err(e) = std::fs::copy(&config_path, &bak_path) {
-            eprintln!("WARNING: Failed to backup config to {}: {e}", bak_path.display());
-        } else {
-            eprintln!("Backed up existing config to {}", bak_path.display());
-        }
-    }
-
-    println!();
-    println!("╔══════════════════════════════════════════════════════════════╗");
-    println!("║                 🦀 LingClaw Setup Wizard                  ║");
-    println!("╚══════════════════════════════════════════════════════════════╝");
-    println!();
-
-    // ── Step 1: Welcome ──────────────────────────────────────────────────
-    println!("1. Hello, welcome to LingClaw. This might pose some security");
-    println!("   issues, but it also offers you endless possibilities for");
-    println!("   creation. Continue?");
-    println!();
-    let choice = prompt_choice(&["YES", "NO"]);
-    if choice == 1 {
-        println!("Bye!");
-        return false;
-    }
-    println!();
-
-    // ── Step 2: Model/Auth Provider ──────────────────────────────────────
-    println!("2. Model/auth provider");
-    println!();
-    let provider_choice = prompt_choice(&["OpenAI", "Anthropic", "Skip for now"]);
-
-    let mut providers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    let mut default_model: Option<String> = None;
-
-    match provider_choice {
-        0 => {
-            // OpenAI
-            println!();
-            let base_url = prompt_line("  Base URL [https://api.openai.com/v1]: ");
-            let base_url = if base_url.is_empty() {
-                "https://api.openai.com/v1".to_string()
-            } else {
-                base_url
-            };
-            let api_key = prompt_line("  API Key: ");
-            providers.insert(
-                "openai".to_string(),
-                json!({
-                    "baseUrl": base_url,
-                    "apiKey": api_key,
-                    "api": "openai-completions",
-                    "models": []
-                }),
-            );
-            default_model = Some("openai/gpt-4o-mini".to_string());
-        }
-        1 => {
-            // Anthropic
-            println!();
-            let base_url = prompt_line("  Base URL [https://api.anthropic.com]: ");
-            let base_url = if base_url.is_empty() {
-                "https://api.anthropic.com".to_string()
-            } else {
-                base_url
-            };
-            let api_key = prompt_line("  API Key: ");
-            providers.insert(
-                "anthropic".to_string(),
-                json!({
-                    "baseUrl": base_url,
-                    "apiKey": api_key,
-                    "api": "anthropic",
-                    "models": []
-                }),
-            );
-            default_model = Some("anthropic/claude-sonnet-4-20250514".to_string());
-        }
-        _ => {
-            // Skip
-        }
-    }
-
-    // ── Step 2b: Configure Models for Provider ───────────────────────────
-    if !providers.is_empty() {
-        println!();
-        println!("   Configure models for your provider.");
-        println!("   Enter model details (leave Name empty to finish):");
-        let prov_name = providers.keys().next().unwrap().clone();
-        let mut models_list: Vec<serde_json::Value> = Vec::new();
-        loop {
-            println!();
-            let name = prompt_line("  Model Name (empty to finish): ");
-            if name.is_empty() {
-                break;
-            }
-            let id = prompt_line(&format!("  Model ID [{name}]: "));
-            let id = if id.is_empty() { name.clone() } else { id };
-
-            let reasoning_str = prompt_line("  Reasoning? (y/N): ").to_lowercase();
-            let reasoning = reasoning_str == "y" || reasoning_str == "yes";
-
-            let input_str = prompt_line("  Input types [text]: ");
-            let input: Vec<String> = if input_str.is_empty() {
-                vec!["text".to_string()]
-            } else {
-                input_str.split(',').map(|s| s.trim().to_string()).collect()
-            };
-
-            let ctx_str = prompt_line("  Context window tokens [128000]: ");
-            let context_window: u64 = ctx_str.parse().unwrap_or(128000);
-
-            let max_str = prompt_line("  Max output tokens [32768]: ");
-            let max_tokens: u64 = max_str.parse().unwrap_or(32768);
-
-            let thinking_fmt = prompt_line("  Thinking format (empty=none, e.g. qwen/openai): ");
-
-            let mut model = json!({
-                "id": id,
-                "name": name,
-                "reasoning": reasoning,
-                "input": input,
-                "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                "contextWindow": context_window,
-                "maxTokens": max_tokens,
-            });
-            if !thinking_fmt.is_empty() {
-                model["compat"] = json!({ "thinkingFormat": thinking_fmt });
-            }
-
-            // Set first model as default if not already set
-            if default_model.is_none() || models_list.is_empty() {
-                default_model = Some(format!("{prov_name}/{id}"));
-            }
-            println!("   ✅ Added {name}");
-            models_list.push(model);
-        }
-
-        // Inject models into the provider entry
-        if let Some(prov) = providers.get_mut(&prov_name) {
-            prov["models"] = json!(models_list);
-        }
-    }
-    println!();
-
-    // ── Step 3: Select Channel ───────────────────────────────────────────
-    println!("3. Select channel (QuickStart)");
-    println!();
-    let _channel = prompt_choice(&["WebChat", "Skip for now"]);
-    println!();
-
-    // ── Step 4: Global PATH ────────────────────────────────────────────
-    println!("4. Do you want to add LingClaw to the global PATH?");
-    println!("   This enables CLI commands: lingclaw start/stop/restart/health/update");
-    println!();
-    let add_path = prompt_choice(&["YES", "NO"]);
-    if add_path == 0 {
-        install_global_path();
-    }
-    println!();
-
-    // ── Step 5: Install ──────────────────────────────────────────────────
-    println!("5. Start installation");
-    prompt_line("   Press Enter to continue...");
-    println!();
-
-    // Build agents.defaults.models map from provider models
-    let mut agent_models = serde_json::Map::new();
-    for (prov_name, prov) in &providers {
-        if let Some(models) = prov.get("models").and_then(|m| m.as_array()) {
-            for m in models {
-                if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
-                    agent_models.insert(format!("{prov_name}/{id}"), json!({}));
-                }
-            }
-        }
-    }
-
-    // Build config JSON
-    let mut config = json!({
-        "settings": {
-            "port": 3000,
-            "execTimeout": 30,
-            "maxToolRounds": 20,
-            "maxContextTokens": 32000,
-        },
-        "models": {
-            "providers": providers,
-        },
-        "agents": {
-            "defaults": {
-                "model": {
-                    "primary": default_model.unwrap_or_else(|| "gpt-4o-mini".to_string()),
-                },
-                "models": agent_models,
-            }
-        }
-    });
-
-    // Add channel info if WebChat selected
-    if _channel == 0 {
-        config["channel"] = json!("webchat");
-    }
-
-    // Ensure ~/.lingclaw directory exists
-    if let Some(dir) = config_dir_path() {
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("ERROR: Failed to create config directory {}: {e}", dir.display());
-            return false;
-        }
-    }
-
-    // Write config file
-    match serde_json::to_string_pretty(&config) {
-        Ok(json_str) => {
-            if let Err(e) = std::fs::write(&config_path, json_str) {
-                eprintln!("ERROR: Failed to write config: {e}");
-                return false;
-            }
-        }
-        Err(e) => {
-            eprintln!("ERROR: Failed to serialize config: {e}");
-            return false;
-        }
-    }
-
-    println!("   ✅ Configuration saved to {}", config_path.display());
-    println!();
-    true
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  Data Models
@@ -1281,37 +616,81 @@ async fn save_session_to_disk(session: &Session) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-async fn load_session_from_disk(id: &str) -> Result<Session, String> {
+fn load_session_from_disk(id: &str) -> Option<Session> {
     if id.contains('/') || id.contains('\\') || id.contains("..") {
-        return Err("Invalid session ID".into());
+        return None;
     }
     let path = sessions_dir().join(format!("{id}.json"));
-    let data = tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|e| e.to_string())?;
-    let mut session: Session = serde_json::from_str(&data).map_err(|e| e.to_string())?;
+    let data = std::fs::read_to_string(&path).ok()?;
+    let mut session: Session = serde_json::from_str(&data).ok()?;
     session.workspace = session_workspace_path(&session.id);
     std::fs::create_dir_all(&session.workspace).ok();
     prompts::init_session_prompt_files(&session.workspace);
-    Ok(session)
+    Some(session)
 }
 
-async fn list_saved_sessions() -> Vec<(String, String)> {
+/// List all saved session summaries from disk, sorted by created_at desc.
+fn list_saved_session_summaries() -> Vec<serde_json::Value> {
     let dir = sessions_dir();
-    let mut result = Vec::new();
-    if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(id) = name.strip_suffix(".json") {
-                if let Ok(content) = tokio::fs::read_to_string(entry.path()).await {
-                    if let Ok(session) = serde_json::from_str::<Session>(&content) {
-                        result.push((id.to_string(), session.name));
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                if let Ok(data) = std::fs::read_to_string(&path) {
+                    if let Ok(s) = serde_json::from_str::<Session>(&data) {
+                        let msg_count = s.messages.iter().filter(|m| m.role != "system").count();
+                        out.push(json!({
+                            "id": s.id,
+                            "name": s.name,
+                            "messages": msg_count,
+                            "created_at": s.created_at,
+                            "updated_at": s.updated_at,
+                        }));
                     }
                 }
             }
         }
     }
-    result
+    out.sort_by(|a, b| {
+        let b_ts = b["created_at"].as_u64().unwrap_or(0);
+        let a_ts = a["created_at"].as_u64().unwrap_or(0);
+        b_ts.cmp(&a_ts)
+    });
+    out
+}
+
+fn build_history_payload(session: &Session) -> serde_json::Value {
+    let mut msgs = Vec::new();
+    for msg in &session.messages {
+        match msg.role.as_str() {
+            "system" => {}
+            "user" => {
+                if let Some(c) = &msg.content {
+                    msgs.push(json!({"role":"user","content":c}));
+                }
+            }
+            "assistant" => {
+                if let Some(c) = &msg.content {
+                    if !c.is_empty() {
+                        msgs.push(json!({"role":"assistant","content":c}));
+                    }
+                }
+                if let Some(tcs) = &msg.tool_calls {
+                    for tc in tcs {
+                        msgs.push(json!({"role":"tool_call","name":tc.function.name,"arguments":tc.function.arguments,"id":tc.id}));
+                    }
+                }
+            }
+            "tool" => {
+                if let Some(c) = &msg.content {
+                    msgs.push(json!({"role":"tool_result","result":c,"id":msg.tool_call_id.as_deref().unwrap_or("")}));
+                }
+            }
+            _ => {}
+        }
+    }
+    json!({"type":"history","messages":msgs})
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1335,59 +714,157 @@ async fn handle_command(
 
     match cmd {
         "/new" => {
-            let mut sessions = state.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(current_session_id) {
-                let model = session.effective_model(&state.config.model).to_string();
-                let system_msg = build_system_prompt(&state.config, &session.workspace, &model);
-                session.messages = vec![system_msg];
-                session.tool_calls_count = 0;
-                session.updated_at = now_epoch();
-                Some(CommandResult {
-                    response: "Context cleared.".into(),
-                    new_session_id: None,
-                    sessions_changed: false,
-                })
-            } else {
-                Some(CommandResult {
-                    response: "Session not found".into(),
-                    new_session_id: None,
-                    sessions_changed: false,
-                })
-            }
-        }
+            // Compress conversation → save to memory → clear context
+            let (conversation_text, workspace, model_str) = {
+                let sessions = state.sessions.lock().await;
+                let session = match sessions.get(current_session_id) {
+                    Some(s) => s,
+                    None => return Some(CommandResult {
+                        response: "Session not found".into(),
+                        new_session_id: None,
+                        sessions_changed: false,
+                    }),
+                };
+                // Build plain-text conversation (skip system prompt)
+                let mut lines = Vec::new();
+                for msg in &session.messages {
+                    match msg.role.as_str() {
+                        "user" => {
+                            if let Some(c) = &msg.content {
+                                lines.push(format!("User: {c}"));
+                            }
+                        }
+                        "assistant" => {
+                            if let Some(c) = &msg.content {
+                                if !c.is_empty() {
+                                    lines.push(format!("Assistant: {c}"));
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                (lines.join("\n"), session.workspace.clone(), session.effective_model(&state.config.model).to_string())
+            };
 
-        "/sessions" => {
-            let sessions = state.sessions.lock().await;
-            if sessions.is_empty() {
+            if conversation_text.is_empty() {
+                // Nothing to compress — just clear
+                let mut sessions = state.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(current_session_id) {
+                    let model = session.effective_model(&state.config.model).to_string();
+                    let sys = build_system_prompt(&state.config, &session.workspace, &model);
+                    session.messages = vec![sys];
+                    session.tool_calls_count = 0;
+                    session.updated_at = now_epoch();
+                }
                 return Some(CommandResult {
-                    response: "No active sessions.".into(),
+                    response: "Context cleared.".into(),
                     new_session_id: None,
                     sessions_changed: false,
                 });
             }
-            let mut list: Vec<String> = sessions
-                .iter()
-                .map(|(id, s)| {
-                    let marker = if id == current_session_id {
-                        " ← active"
-                    } else {
-                        ""
-                    };
-                    format!(
-                        "  {} | {} | msgs:{} tools:{}{}",
-                        &id[..id.len().min(12)],
-                        s.name,
-                        s.messages.len(),
-                        s.tool_calls_count,
-                        marker,
-                    )
-                })
-                .collect();
-            list.sort();
+
+            // Ask LLM to compress
+            let compress_prompt = vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: Some("You are a conversation summarizer. Compress the following conversation into a concise markdown summary. Keep key decisions, code changes, problems solved, and important context. Use bullet points. Write in the same language as the conversation. Do NOT wrap in code blocks.".into()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: Some(conversation_text),
+                    tool_calls: None,
+                    tool_call_id: None,
+                },
+            ];
+            let resolved = state.config.resolve_model(&model_str);
+            let summary = match providers::call_llm_simple(&state.http, &resolved, &compress_prompt).await {
+                Ok(s) => s,
+                Err(e) => {
+                    return Some(CommandResult {
+                        response: format!("Failed to compress conversation: {e}"),
+                        new_session_id: None,
+                        sessions_changed: false,
+                    });
+                }
+            };
+
+            // Append to memory/YYYY-MM-DD.md
+            let today = prompts::chrono_today();
+            let memory_dir = workspace.join("memory");
+            std::fs::create_dir_all(&memory_dir).ok();
+            let memory_path = memory_dir.join(format!("{today}.md"));
+
+            let entry = {
+                let secs = now_epoch();
+                let hh = (secs % 86400) / 3600;
+                let mm = (secs % 3600) / 60;
+                format!("\n\n---\n\n## {hh:02}:{mm:02}\n\n{summary}", summary = summary.trim())
+            };
+
+            // Use a block for the file I/O so it doesn't conflict with async
+            let write_result = if memory_path.exists() {
+                // Append
+                use std::io::Write;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&memory_path)
+                    .and_then(|mut f| f.write_all(entry.as_bytes()))
+            } else {
+                // Create with header
+                let content = format!("# {today}\n{entry}");
+                std::fs::write(&memory_path, content)
+            };
+
+            if let Err(e) = write_result {
+                return Some(CommandResult {
+                    response: format!("Failed to write memory: {e}"),
+                    new_session_id: None,
+                    sessions_changed: false,
+                });
+            }
+
+            // Clear context
+            let mut sessions = state.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(current_session_id) {
+                let model = session.effective_model(&state.config.model).to_string();
+                let sys = build_system_prompt(&state.config, &session.workspace, &model);
+                session.messages = vec![sys];
+                session.tool_calls_count = 0;
+                session.updated_at = now_epoch();
+            }
+
             Some(CommandResult {
-                response: format!("Sessions:\n{}", list.join("\n")),
+                response: format!("Conversation compressed and saved to memory/{today}.md. Context cleared."),
                 new_session_id: None,
                 sessions_changed: false,
+            })
+        }
+
+        "/session_new" => {
+            // Remove current session from memory (release lock before disk I/O)
+            let old = {
+                let mut sessions = state.sessions.lock().await;
+                sessions.remove(current_session_id)
+            };
+            if let Some(ref old) = old {
+                if old.messages.len() > 1 {
+                    let _ = save_session_to_disk(old).await;
+                }
+            }
+            // Create brand-new session
+            let mut s = Session::new();
+            let model = s.effective_model(&state.config.model).to_string();
+            let sys = build_system_prompt(&state.config, &s.workspace, &model);
+            s.messages.push(sys);
+            let new_id = s.id.clone();
+            state.sessions.lock().await.insert(new_id.clone(), s);
+            Some(CommandResult {
+                response: "A new journey begins.".into(),
+                new_session_id: Some(new_id),
+                sessions_changed: true,
             })
         }
 
@@ -1399,33 +876,73 @@ async fn handle_command(
                     sessions_changed: false,
                 });
             }
-            let sessions = state.sessions.lock().await;
-            // Allow prefix matching for convenience
-            let matched: Vec<&String> = sessions
-                .keys()
-                .filter(|k| k.starts_with(arg))
-                .collect();
-            match matched.len() {
-                0 => Some(CommandResult {
-                    response: format!("No session matching '{arg}'"),
+            let target = arg.to_string();
+            if target == current_session_id {
+                return Some(CommandResult {
+                    response: "Already on this session.".into(),
                     new_session_id: None,
                     sessions_changed: false,
-                }),
-                1 => {
-                    let id = matched[0].clone();
-                    let name = sessions.get(&id).map(|s| s.name.as_str()).unwrap_or("?");
-                    Some(CommandResult {
-                        response: format!("Switched to: {name} ({id})"),
-                        new_session_id: Some(id),
-                        sessions_changed: true,
-                    })
-                }
-                _ => Some(CommandResult {
-                    response: format!("Ambiguous: {} sessions match '{arg}'", matched.len()),
-                    new_session_id: None,
-                    sessions_changed: false,
-                }),
+                });
             }
+            // Prevent switching to a session already owned by another connection.
+            // In-memory sessions are exclusively owned; only disk sessions are available.
+            {
+                let sessions = state.sessions.lock().await;
+                if sessions.contains_key(&target) {
+                    return Some(CommandResult {
+                        response: format!("Session '{}' is in use by another connection.", &target[..12.min(target.len())]),
+                        new_session_id: None,
+                        sessions_changed: false,
+                    });
+                }
+            }
+            // Try loading from disk
+            let disk_session = load_session_from_disk(&target);
+            if disk_session.is_none() {
+                return Some(CommandResult {
+                    response: format!("Session '{}' not found.", &target[..12.min(target.len())]),
+                    new_session_id: None,
+                    sessions_changed: false,
+                });
+            }
+            // Save current session outside the lock (avoid blocking other connections)
+            let old = {
+                let mut sessions = state.sessions.lock().await;
+                sessions.remove(current_session_id)
+            };
+            if let Some(ref old) = old {
+                if old.messages.len() > 1 {
+                    let _ = save_session_to_disk(old).await;
+                }
+            }
+            // Atomically claim target — double-check after disk I/O
+            let mut sessions = state.sessions.lock().await;
+            if sessions.contains_key(&target) {
+                // Another connection claimed it — re-insert our old session
+                if let Some(old) = old {
+                    sessions.insert(old.id.clone(), old);
+                }
+                return Some(CommandResult {
+                    response: format!("Session '{}' is in use by another connection.", &target[..12.min(target.len())]),
+                    new_session_id: None,
+                    sessions_changed: false,
+                });
+            }
+            let mut s = disk_session.unwrap();
+            let model = s.effective_model(&state.config.model).to_string();
+            let sys = build_system_prompt(&state.config, &s.workspace, &model);
+            if let Some(first) = s.messages.first_mut() {
+                if first.role == "system" {
+                    *first = sys;
+                }
+            }
+            let id = s.id.clone();
+            sessions.insert(id.clone(), s);
+            Some(CommandResult {
+                response: format!("Loaded session {}", &id[..12.min(id.len())]),
+                new_session_id: Some(id),
+                sessions_changed: true,
+            })
         }
 
         "/rename" => {
@@ -1450,130 +967,6 @@ async fn handle_command(
                     new_session_id: None,
                     sessions_changed: false,
                 })
-            }
-        }
-
-        "/save" => {
-            let sessions = state.sessions.lock().await;
-            if let Some(session) = sessions.get(current_session_id) {
-                match save_session_to_disk(session).await {
-                    Ok(()) => Some(CommandResult {
-                        response: format!(
-                            "Session saved: {} ({})",
-                            session.name, current_session_id
-                        ),
-                        new_session_id: None,
-                        sessions_changed: false,
-                    }),
-                    Err(e) => Some(CommandResult {
-                        response: format!("Save error: {e}"),
-                        new_session_id: None,
-                        sessions_changed: false,
-                    }),
-                }
-            } else {
-                Some(CommandResult {
-                    response: "Current session not found".into(),
-                    new_session_id: None,
-                    sessions_changed: false,
-                })
-            }
-        }
-
-        "/load" => {
-            if arg.is_empty() {
-                let saved = list_saved_sessions().await;
-                if saved.is_empty() {
-                    return Some(CommandResult {
-                        response: "No saved sessions on disk.".into(),
-                        new_session_id: None,
-                        sessions_changed: false,
-                    });
-                }
-                let list: Vec<String> = saved
-                    .iter()
-                    .map(|(id, name)| format!("  {id} → {name}"))
-                    .collect();
-                return Some(CommandResult {
-                    response: format!(
-                        "Saved sessions:\n{}\n\nUse /load <id> to restore.",
-                        list.join("\n")
-                    ),
-                    new_session_id: None,
-                    sessions_changed: false,
-                });
-            }
-            match load_session_from_disk(arg).await {
-                Ok(session) => {
-                    let id = session.id.clone();
-                    let name = session.name.clone();
-                    let mut sessions = state.sessions.lock().await;
-                    sessions.insert(id.clone(), session);
-                    Some(CommandResult {
-                        response: format!("Loaded: {name} ({id})"),
-                        new_session_id: Some(id),
-                        sessions_changed: true,
-                    })
-                }
-                Err(e) => Some(CommandResult {
-                    response: format!("Load error: {e}"),
-                    new_session_id: None,
-                    sessions_changed: false,
-                }),
-            }
-        }
-
-        "/delete" => {
-            if arg.is_empty() {
-                return Some(CommandResult {
-                    response: "Usage: /delete <session_id>".into(),
-                    new_session_id: None,
-                    sessions_changed: false,
-                });
-            }
-            if arg == current_session_id || current_session_id.starts_with(arg) {
-                return Some(CommandResult {
-                    response: "Cannot delete the active session. /switch first.".into(),
-                    new_session_id: None,
-                    sessions_changed: false,
-                });
-            }
-            let mut sessions = state.sessions.lock().await;
-            let to_remove: Vec<String> = sessions
-                .keys()
-                .filter(|k| k.starts_with(arg))
-                .cloned()
-                .collect();
-            match to_remove.len() {
-                0 => Some(CommandResult {
-                    response: format!("No session matching '{arg}'"),
-                    new_session_id: None,
-                    sessions_changed: false,
-                }),
-                1 => {
-                    let id = to_remove[0].clone();
-                    sessions.remove(&id);
-                    // Clean up persisted session file
-                    let session_file = sessions_dir().join(format!("{id}.json"));
-                    if session_file.exists() {
-                        let _ = std::fs::remove_file(&session_file);
-                    }
-                    // Clean up session workspace directory
-                    let ws_dir = session_workspace_path(&id);
-                    if ws_dir.exists() {
-                        let _ = std::fs::remove_dir_all(&ws_dir);
-                    }
-                    Some(CommandResult {
-                        response: format!("Deleted session {id} (memory + disk)"),
-                        new_session_id: None,
-                        sessions_changed: true,
-                    })
-                }
-                _ => Some(CommandResult {
-                    response: format!("Ambiguous: {} sessions match", to_remove.len()),
-                    new_session_id: None,
-                    sessions_changed: false,
-                }),
             }
         }
 
@@ -1727,17 +1120,12 @@ async fn handle_command(
         "/help" => Some(CommandResult {
             response: "\
 Commands:
-  /new             Clear context
+  /new             Compress conversation to memory & clear context
   /status          Show session status
   /model [name]    Show or switch model
   /think [level]   Set thinking mode (off|minimal|low|medium|high|xhigh)
   /skills          List available skills
-  /sessions        List all sessions
-  /switch <id>     Switch to session (prefix match)
   /rename <name>   Rename current session
-  /save            Save current session to disk
-  /load [id]       List or load saved sessions
-  /delete <id>     Delete a session
   /clear           Clear messages (keep system prompt)
   /help            Show this help"
                 .into(),
@@ -1763,23 +1151,59 @@ async fn ws_handler(
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (mut tx, mut rx) = socket.split();
 
-    // Create a session for this connection
-    let mut session = Session::new();
-    let model = session.effective_model(&state.config.model).to_string();
-    let system_msg = build_system_prompt(&state.config, &session.workspace, &model);
-    session.messages.push(system_msg);
-    let mut current_session_id = session.id.clone();
+    // Resume most recent saved session from disk, or create new.
+    // Each connection owns its session exclusively — never reuse another
+    // connection's in-memory entry (avoids shared-state / disconnect bugs).
+    let mut current_session_id;
 
-    ws_send(
-        &mut tx,
-        &json!({"type":"session","id":&current_session_id,"name":"New Chat"}),
-    )
-    .await;
+    // Try saved sessions in recency order; claim the first one not owned by another connection.
+    let saved_ids: Vec<String> = list_saved_session_summaries()
+        .iter()
+        .filter_map(|s| s["id"].as_str().map(|id| id.to_string()))
+        .collect();
 
-    {
-        let mut sessions = state.sessions.lock().await;
-        sessions.insert(current_session_id.clone(), session);
+    let mut claimed: Option<String> = None;
+    for cid in &saved_ids {
+        if let Some(mut session) = load_session_from_disk(cid) {
+            let mut sessions = state.sessions.lock().await;
+            if sessions.contains_key(&session.id) {
+                // Owned by another connection — skip to next candidate
+                continue;
+            }
+            let model = session.effective_model(&state.config.model).to_string();
+            let sys = build_system_prompt(&state.config, &session.workspace, &model);
+            if let Some(first) = session.messages.first_mut() {
+                if first.role == "system" {
+                    *first = sys;
+                }
+            }
+            let id = session.id.clone();
+            sessions.insert(id.clone(), session);
+            claimed = Some(id);
+            break;
+        }
     }
+
+    if let Some(id) = claimed {
+        current_session_id = id.clone();
+        let (name, history) = {
+            let sessions = state.sessions.lock().await;
+            let s = sessions.get(&id).expect("just inserted");
+            (s.name.clone(), build_history_payload(s))
+        };
+        ws_send(&mut tx, &json!({"type":"session","id":&id,"name":&name})).await;
+        ws_send(&mut tx, &history).await;
+    } else {
+        let mut session = Session::new();
+        let model = session.effective_model(&state.config.model).to_string();
+        let sys = build_system_prompt(&state.config, &session.workspace, &model);
+        session.messages.push(sys);
+        current_session_id = session.id.clone();
+        ws_send(&mut tx, &json!({"type":"session","id":&current_session_id,"name":"New Chat"})).await;
+        state.sessions.lock().await.insert(current_session_id.clone(), session);
+    }
+
+    send_sessions_list(&mut tx, &state, &current_session_id).await;
 
     while let Some(Ok(msg)) = rx.next().await {
         let text = match msg {
@@ -1804,7 +1228,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
                 if let Some(new_id) = result.new_session_id {
                     current_session_id = new_id.clone();
-                    ws_send(&mut tx, &json!({"type":"session_switched","id":new_id})).await;
+                    let name = {
+                        let sessions = state.sessions.lock().await;
+                        sessions.get(&current_session_id).map(|s| s.name.clone())
+                            .unwrap_or_else(|| "New Chat".into())
+                    };
+                    ws_send(&mut tx, &json!({"type":"session_switched","id":&new_id,"name":&name})).await;
+                    // Send chat history for the switched-to session
+                    let history = {
+                        let sessions = state.sessions.lock().await;
+                        sessions.get(&current_session_id).map(build_history_payload)
+                    };
+                    if let Some(payload) = history {
+                        ws_send(&mut tx, &payload).await;
+                    }
                 }
                 if result.sessions_changed {
                     send_sessions_list(&mut tx, &state, &current_session_id).await;
@@ -1958,33 +1395,50 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    // ── Cleanup: auto-save and remove ephemeral session on disconnect ────
-    {
+    // ── Cleanup: remove from memory first (release lock), then save to disk ────
+    let disconnected_session = {
         let mut sessions = state.sessions.lock().await;
-        if let Some(session) = sessions.get(&current_session_id) {
-            // Auto-save non-trivial sessions (more than just the system prompt)
-            if session.messages.len() > 1 {
-                let _ = save_session_to_disk(session).await;
-            }
+        sessions.remove(&current_session_id)
+    };
+    if let Some(ref session) = disconnected_session {
+        if session.messages.len() > 1 {
+            let _ = save_session_to_disk(session).await;
         }
-        sessions.remove(&current_session_id);
     }
 }
 
 async fn send_sessions_list(tx: &mut WsTx, state: &AppState, active_id: &str) {
-    let sessions = state.sessions.lock().await;
-    let list: Vec<serde_json::Value> = sessions
-        .iter()
-        .map(|(id, s)| {
-            json!({
-                "id": id,
-                "name": s.name,
-                "messages": s.messages.len(),
-                "active": id == active_id,
-            })
-        })
-        .collect();
-    ws_send(tx, &json!({"type":"sessions_list","sessions":list})).await;
+    // Merge in-memory sessions with on-disk summaries
+    let in_mem: HashMap<String, serde_json::Value> = {
+        let sessions = state.sessions.lock().await;
+        sessions.iter().map(|(id, s)| {
+            let msg_count = s.messages.iter().filter(|m| m.role != "system").count();
+            (id.clone(), json!({
+                "id": id, "name": s.name, "messages": msg_count,
+                "created_at": s.created_at, "active": id == active_id,
+            }))
+        }).collect()
+    };
+    let mut all = list_saved_session_summaries();
+    for item in &mut all {
+        let id = item["id"].as_str().unwrap_or_default().to_string();
+        if let Some(mem) = in_mem.get(&id) {
+            *item = mem.clone();
+        } else {
+            item["active"] = json!(id == active_id);
+        }
+    }
+    for (id, val) in &in_mem {
+        if !all.iter().any(|s| s["id"].as_str() == Some(id)) {
+            all.push(val.clone());
+        }
+    }
+    all.sort_by(|a, b| {
+        let b_ts = b["created_at"].as_u64().unwrap_or(0);
+        let a_ts = a["created_at"].as_u64().unwrap_or(0);
+        b_ts.cmp(&a_ts)
+    });
+    ws_send(tx, &json!({"type":"sessions_list","sessions":all})).await;
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2041,7 +1495,7 @@ async fn main() {
     // CLI subcommands: lingclaw start|stop|restart|health|status|update
     if args.len() > 1
         && !args[1].starts_with('-')
-        && handle_cli_command(&args[1], port_override)
+        && cli::handle_cli_command(&args[1], port_override)
     {
         return;
     }
@@ -2050,13 +1504,13 @@ async fn main() {
     let serve_mode = args.iter().any(|a| a == "--serve");
 
     // First-run setup wizard (before loading config)
-    if !run_setup_wizard(force_wizard) {
+    if !cli::run_setup_wizard(force_wizard) {
         return;
     }
 
     // Default behavior (no --serve): start as daemon
     if !serve_mode {
-        handle_cli_command("start", port_override);
+        cli::handle_cli_command("start", port_override);
         return;
     }
 

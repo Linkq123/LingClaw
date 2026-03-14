@@ -104,7 +104,7 @@ pre:hover .copy-btn { opacity: 1; }
 <aside class="sidebar" id="sidebar">
   <div class="sidebar-header">
     <h2>🦀 Sessions</h2>
-    <button onclick="sendCmd('/new')" title="New session">+</button>
+    <button onclick="newSession()" title="New session">+</button>
   </div>
   <div id="session-list"></div>
 </aside>
@@ -118,7 +118,6 @@ pre:hover .copy-btn { opacity: 1; }
     <span class="session-id" id="session-id"></span>
     <div class="actions">
       <button onclick="sendCmd('/status')">Status</button>
-      <button onclick="sendCmd('/save')">Save</button>
       <button onclick="sendCmd('/clear')">Clear</button>
       <button onclick="sendCmd('/help')">Help</button>
     </div>
@@ -191,9 +190,26 @@ function handleMessage(data) {
 
     case 'session_switched':
       currentSessionId = data.id;
-      // Clear chat display on switch
+      sessionNameEl.textContent = data.name || 'New Chat';
+      sessionIdEl.textContent = data.id.slice(0, 12);
       chat.innerHTML = '';
-      addSystem(`Switched to session ${data.id.slice(0, 12)}`);
+      break;
+
+    case 'history':
+      chat.innerHTML = '';
+      for (const m of (data.messages || [])) {
+        switch (m.role) {
+          case 'user': addMsg('user', m.content); break;
+          case 'assistant': {
+            const el = addAssistant(m.content);
+            el._rawText = m.content;
+            renderMarkdown(el);
+            break;
+          }
+          case 'tool_call': addToolCall(m.name, m.arguments, m.id); break;
+          case 'tool_result': addToolResult('', m.result, m.id); break;
+        }
+      }
       break;
 
     case 'sessions_list':
@@ -334,10 +350,10 @@ function renderMarkdown(el) {
 // ── Session sidebar ──
 function renderSessionList() {
   sessionList.innerHTML = '';
-  sessions.sort((a, b) => (b.messages || 0) - (a.messages || 0));
+  sessions.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
   for (const s of sessions) {
     const item = document.createElement('div');
-    item.className = `session-item${s.active ? ' active' : ''}`;
+    item.className = `session-item${s.id === currentSessionId ? ' active' : ''}`;
     item.innerHTML = `
       <span class="name">${escHtml(s.name)}</span>
       <span class="meta">${s.messages || 0}msg</span>
@@ -349,12 +365,16 @@ function renderSessionList() {
     };
     sessionList.appendChild(item);
   }
-
-  // Update header
-  const active = sessions.find(s => s.active);
+  const active = sessions.find(s => s.id === currentSessionId);
   if (active) {
     sessionNameEl.textContent = active.name;
     sessionIdEl.textContent = active.id.slice(0, 12);
+  }
+}
+
+function newSession() {
+  if (confirm('A new journey unfolds. Will you walk on?')) {
+    sendCmd('/session_new');
   }
 }
 

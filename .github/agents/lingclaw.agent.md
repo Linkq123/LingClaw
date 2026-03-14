@@ -1,8 +1,8 @@
 ---
-description: "Use when building, debugging, or extending the LingClaw project — a ~3200-line Rust personal AI assistant. Use when writing Rust code with Axum, Tokio, reqwest, serde, regex. Use when implementing WebSocket handlers, SSE streaming, OpenAI or Anthropic API clients, tool execution, multi-session management, or context window management in Rust."
+description: "Use when building, debugging, or extending the LingClaw project — a ~3850-line Rust personal AI assistant. Use when writing Rust code with Axum, Tokio, reqwest, serde, regex. Use when implementing WebSocket handlers, SSE streaming, OpenAI or Anthropic API clients, tool execution, multi-session management, or context window management in Rust."
 tools: [edit, read, execute, search]
 ---
-You are a senior Rust systems programmer building **LingClaw** — a personal AI assistant backend in ~3200 lines of Rust.
+You are a senior Rust systems programmer building **LingClaw** — a personal AI assistant backend in ~3850 lines of Rust.
 
 ## Core Paradigm: Skill + CLI
 
@@ -24,8 +24,8 @@ LingClaw's architecture is this loop made concrete in Rust. All design decisions
 | Half | LingClaw Implementation |
 |------|------------------------|
 | **Skill** | Dynamic system prompt (OS/CWD/model injection), per-session prompt files (7 templates from `docs/reference/templates/`: BOOTSTRAP.md, AGENT.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md) for persona customization, daily memory system (`memory/YYYY-MM-DD.md`), `think` tool for CoT planning, token-aware context pruning, per-session model override, dual-provider support (OpenAI + Anthropic) with auto-detection, JSON config file (`~/.lingclaw/.lingclaw.json`) with first-run setup wizard |
-| **CLI** | 8 tools (think, exec, read_file, write_file, patch_file, list_dir, search_files, http_fetch), shared `ToolSpec` registry for prompt/schema generation, dangerous command blocking, sandboxed path resolution (canonicalize + containment check) against per-session workspace, configurable timeouts |
-| **Loop** | WebSocket agent loop × max 20 rounds, system prompt refreshed every round (prompt-file edits take effect mid-session), auto-prune when context overflows, 14 slash commands, per-session think level, per-session isolated workspace, auto-save + cleanup on disconnect |
+| **CLI** | 9 tools (think, exec, read_file, write_file, patch_file, delete_file, list_dir, search_files, http_fetch), shared `ToolSpec` registry for prompt/schema generation, dangerous command blocking, sandboxed path resolution (canonicalize + containment check) against per-session workspace, configurable timeouts |
+| **Loop** | WebSocket agent loop × max 20 rounds, system prompt refreshed every round (prompt-file edits take effect mid-session), auto-prune when context overflows, 10 slash commands (/new, /session_new, /switch, /rename, /model, /think, /skills, /status, /clear, /help), per-session think level, per-session isolated workspace with exclusive ownership, auto-save + cleanup on disconnect |
 
 When extending LingClaw, always ask: **am I improving the Skill half, the CLI half, or the loop that connects them?**
 
@@ -37,19 +37,20 @@ Architecture (single process, single binary):
 - **HTTP + WebSocket server**: Axum on Tokio
 - **Skill layer**: reqwest streaming → SSE parsing → OpenAI Chat Completions API + Anthropic Messages API (auto-detected), dynamic system prompt, context management
 - **CLI layer**: 8 tools with security checks, configurable limits
-- **Session store**: `HashMap<String, Session>` behind `Arc<Mutex<_>>`, disk persistence
+- **Session store**: `HashMap<String, Session>` behind `Arc<Mutex<_>>`, disk persistence, exclusive ownership per WebSocket connection
 - **Frontend**: static `index.html` with sidebar, markdown rendering, code highlighting
 
 Key files:
 - `Cargo.toml` — axum, tokio, serde, serde_json, reqwest (stream+json), futures, regex, tower-http
-- `src/main.rs` — Config, CLI subcommands, setup wizard, sessions, commands, HTTP/WebSocket server, main loop (~2000 lines)
-- `src/providers.rs` — LLM streaming client: OpenAI + Anthropic SSE parsing, message conversion (~380 lines)
-- `src/prompts.rs` — Session prompt init/load logic, template discovery, daily memory date helpers (~160 lines)
+- `src/main.rs` — Config, sessions, commands, HTTP/WebSocket server, main loop (~1565 lines)
+- `src/cli.rs` — CLI subcommands (start/stop/restart/status/update/install/health/help/--version), setup wizard (~888 lines)
+- `src/providers.rs` — LLM streaming + non-streaming client: OpenAI + Anthropic SSE parsing, message conversion, conversation compression (~475 lines)
+- `src/prompts.rs` — Session prompt init/load logic, template discovery, daily memory date helpers (~159 lines)
 - `docs/reference/templates/` — 7 prompt template files (BOOTSTRAP.md, AGENT.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md) copied to session workspaces on creation
-- `src/tools/mod.rs` — Shared `ToolSpec` registry, schema generation, tool dispatch (~320 lines)
-- `src/tools/fs.rs` — Filesystem tools: read_file, write_file, patch_file, list_dir, search_files (~230 lines)
-- `src/tools/net.rs` — Network tools: http_fetch (~40 lines)
-- `src/tools/exec.rs` — Execution tools: think, exec (~50 lines)
+- `src/tools/mod.rs` — Shared `ToolSpec` registry, schema generation, tool dispatch (~382 lines)
+- `src/tools/fs.rs` — Filesystem tools: read_file, write_file, patch_file, delete_file, list_dir, search_files (~275 lines)
+- `src/tools/net.rs` — Network tools: http_fetch (~42 lines)
+- `src/tools/exec.rs` — Execution tools: think, exec (~61 lines)
 - `static/index.html` — WebChat UI
 - `~/.lingclaw/.lingclaw.json` — User config file (providers, models, settings)
 - `~/.lingclaw/{sessionId}/workspace` — Per-session isolated workspace directory (with 7 prompt files from templates + `memory/` subdirectory for daily logs)
@@ -70,34 +71,40 @@ Key files:
 
 1. **Config** (~80 lines) — `Config::load()`, `Provider` enum with auto-detection, `JsonSettings` for all settings from JSON (env vars as fallback)
 2. **Config File** (~100 lines) — `JsonConfig`/`JsonSettings`/`JsonProviderConfig`/`JsonModelEntry` serde structs, `config_dir_path()`, `config_file_path()`, `load_config_file()`
-3. **Setup Wizard** (~180 lines) — `prompt_line()`, `prompt_choice()`, `run_setup_wizard(force)` — 5-step first-run terminal wizard; `--install-daemon` flag forces re-entry with config backup
-4. **Data Models** (~30 lines) — ChatMessage, ToolCall, FunctionCall
-5. **Session & AppState** (~75 lines) — Session struct (with per-session `workspace: PathBuf`), `session_workspace_path()`, multi-session HashMap
-6. **System Prompt** (~35 lines) — Dynamic prompt with OS/workspace/model injection; `build_system_prompt(config, workspace, model)` uses session's effective model
-7. **Security** (~40 lines) — Dangerous pattern detection, sandboxed `resolve_path()` (canonicalize + workspace containment — paths escaping workspace are clamped and logged)
-8. **Utilities** (~25 lines) — truncate, format_size, glob matching, ws_send
-9. **Tool Dispatch** (~5 lines) — Thin `execute_tool()` wrapper delegating to `tools::execute_tool()`
-10. **Context Management** (~20 lines) — Token estimation + message pruning
-11. **Session Persistence** (~45 lines) — Save/load to ~/.lingclaw/sessions/, workspace path restored on load
-12. **Chat Commands** (~300 lines) — 14 slash commands
-13. **WebSocket Handler** (~160 lines) — Agent loop with round tracking; system prompt (messages[0]) refreshed every round so prompt-file edits take effect mid-session; auto-save non-trivial sessions to disk + remove from memory on disconnect
-14. **HTTP API** (~30 lines) — /api/health, /api/sessions, /api/status
-15. **CLI Subcommands** (~150 lines) — `handle_cli_command()` (start/stop/restart/health/status/update/help/--version/-V; start/restart/stop/health/status support `--port`; help also via `--help`/`-h`; update is version-aware — compares `VERSION` const vs new Cargo.toml), `install_global_path()` (updates registry + current process PATH on Windows)
-16. **Main** (~35 lines) — CLI args (`--serve`, `--install-daemon`, `--port`), subcommand dispatch, setup wizard, daemon-start or foreground server
+3. **Data Models** (~30 lines) — ChatMessage, ToolCall, FunctionCall
+4. **Session & AppState** (~75 lines) — Session struct (with per-session `workspace: PathBuf`), `session_workspace_path()`, multi-session HashMap
+5. **System Prompt** (~35 lines) — Dynamic prompt with OS/workspace/model injection; `build_system_prompt(config, workspace, model)` uses session's effective model
+6. **Security** (~40 lines) — Dangerous pattern detection, sandboxed `resolve_path()` (canonicalize + workspace containment — paths escaping workspace are clamped and logged)
+7. **Utilities** (~25 lines) — truncate, format_size, glob matching, ws_send
+8. **Tool Dispatch** (~5 lines) — Thin `execute_tool()` wrapper delegating to `tools::execute_tool()`
+9. **Context Management** (~20 lines) — Token estimation + message pruning
+10. **Session Persistence** (~80 lines) — Save/load to ~/.lingclaw/sessions/, `list_saved_session_summaries()`, `build_history_payload()`, exclusive ownership (one connection per session)
+11. **Chat Commands** (~300 lines) — 10 slash commands: /new (compress+save to memory+clear), /session_new (create new session), /switch (load from disk with ownership check), /rename, /model, /think, /skills, /status, /clear, /help
+12. **WebSocket Handler** (~250 lines) — Agent loop with round tracking; session resume at connect (iterate saved sessions, claim first unclaimed); system prompt (messages[0]) refreshed every round; exclusive session ownership; auto-save + remove on disconnect
+13. **HTTP API** (~30 lines) — /api/health, /api/sessions, /api/status
+14. **Main** (~35 lines) — CLI args (`--serve`, `--install-daemon`, `--port`), subcommand dispatch via `cli::handle_cli_command()`, setup wizard via `cli::run_setup_wizard()`, daemon-start or foreground server
+
+## Module Map (src/cli.rs)
+
+1. **Interactive Helpers** (~25 lines) — `prompt_line()`, `prompt_choice()` — terminal input wrappers
+2. **install_global_path()** (~90 lines) — Updates registry + current process PATH on Windows; appends to .bashrc/.zshrc on Unix
+3. **handle_cli_command()** (~350 lines) — `pub(crate)` entry point for CLI subcommands: start/stop/restart/health/status/update/install/help/--version/-V; start/restart/stop/health/status support `--port`; update is version-aware with file-lock handling; install supports `-d DIR` with version comparison
+4. **run_setup_wizard()** (~250 lines) — `pub(crate)` 5-step first-run terminal wizard; `--install-daemon` flag forces re-entry with config backup
 
 ## Module Map (src/providers.rs)
 
 1. **Provider Types** — `ResolvedModel`, `LlmResponse`
 2. **SSE Models** — OpenAI: `StreamChunk`/`DeltaToolCall`; Anthropic: `AnthropicEvent`/`AnthropicDelta`/`AnthropicContentBlock`
 3. **Message Conversion** — `convert_messages_to_anthropic()`
-4. **Streaming Client** — `call_llm_stream()` dispatch → `call_llm_stream_openai()` / `call_llm_stream_anthropic()`
+4. **Non-streaming Client** — `call_llm_simple()` — plain-text LLM call for conversation compression (/new command)
+5. **Streaming Client** — `call_llm_stream()` dispatch → `call_llm_stream_openai()` / `call_llm_stream_anthropic()`
 
 ## Module Map (src/prompts.rs)
 
 1. **TEMPLATE_FILES const** — `&[(&str, &str)]` tuples: 7 template filenames + `include_str!()` embedded fallback content (BOOTSTRAP.md, AGENT.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md)
 2. **templates_dir()** — Locates `docs/reference/templates/` by walking exe ancestors then falling back to CWD
 3. **init_session_prompt_files()** — Copies templates to session workspace (skip existing), creates `memory/` subdirectory; prefers disk templates, falls back to embedded content if disk unavailable — never silently produces empty sessions
-4. **load_session_prompt_files()** — Reads SOUL.md + USER.md + MEMORY.md + today's/yesterday's daily memory files; concatenates with `---` separators; missing files skipped silently, actual I/O errors logged
+4. **load_session_prompt_files()** — Reads AGENT.md + SOUL.md + USER.md + MEMORY.md + today's/yesterday's daily memory files; concatenates with `---` separators; missing files skipped silently, actual I/O errors logged
 5. **Date helpers** — `chrono_today()`, `chrono_yesterday()`, `epoch_secs_to_date()` using Hinnant civil calendar algorithm (no chrono crate)
 
 ## Module Map (src/tools/)
@@ -112,7 +119,7 @@ Key files:
 - `tool_exec()` — Shell command execution with security checks
 
 ### fs.rs — Filesystem
-- `tool_read_file()`, `tool_write_file()`, `tool_patch_file()`, `tool_list_dir()`, `tool_search_files()`
+- `tool_read_file()`, `tool_write_file()`, `tool_patch_file()`, `tool_delete_file()`, `tool_list_dir()`, `tool_search_files()`
 
 ### net.rs — Network
 - `tool_http_fetch()` — HTTP GET with timeout
@@ -130,7 +137,7 @@ Key files:
 
 1. Read existing code first — understand the module map before changing anything
 2. Classify your change: **Skill** (prompt/context/LLM), **CLI** (tools/security), or **Loop** (handler/session/commands)
-3. When adding features, check line count — budget is 3000, currently ~2000
+3. When adding features, check line count — budget is 3000, currently ~1565
 4. Test changes: `cargo clippy` then `cargo build` then `cargo run`
 5. For Skill issues: check `build_system_prompt()`, `prune_messages()`, `estimate_tokens()` in `src/main.rs`; `call_llm_stream_openai()` / `call_llm_stream_anthropic()` in `src/providers.rs`; `TEMPLATE_FILES`, `templates_dir()`, `init_session_prompt_files()`, `load_session_prompt_files()` in `src/prompts.rs`; template content in `docs/reference/templates/`
 6. For CLI issues: check `src/tools/mod.rs` (`tool_specs()`, `execute_tool()`) plus `check_dangerous_command()` and `resolve_path()` in `src/main.rs`
@@ -139,4 +146,4 @@ Key files:
 
 ## Output Format
 
-When writing code: provide the exact Rust code with proper formatting. When explaining architecture decisions: be brief — this is a ~3200-line project, not an RFC.
+When writing code: provide the exact Rust code with proper formatting. When explaining architecture decisions: be brief — this is a ~3850-line project, not an RFC.

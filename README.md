@@ -1,10 +1,10 @@
 # 🦀 LingClaw
 
-A personal AI assistant in ~3400 lines of Rust. Three pillars: **Skill quality + Rich CLI tools + Intelligent agent loop**.
+A personal AI assistant in ~3100 lines of Rust. Three pillars: **Skill quality + Rich CLI tools + Intelligent agent loop**.
 
 ## Features
 
-**8 Tools** — think, exec, read_file, write_file, patch_file, list_dir, search_files, http_fetch
+**9 Tools** — think, exec, read_file, write_file, patch_file, delete_file, list_dir, search_files, http_fetch
 
 **Smart Agent Loop** — Multi-round tool calling (up to 20 rounds), context window management with auto-pruning, per-session model override
 
@@ -20,7 +20,7 @@ A personal AI assistant in ~3400 lines of Rust. Three pillars: **Skill quality +
 
 **Single Binary** — One Rust binary, one `index.html`, zero database. Daemon mode by default.
 
-**Compact Modules** — `main.rs` (app loop + CLI) + `providers.rs` (LLM streaming) + `prompts.rs` (session prompt templates) + `tools/` (registry + fs/net/exec implementations)
+**Compact Modules** — `main.rs` (app loop) + `cli.rs` (CLI subcommands + setup wizard) + `providers.rs` (LLM streaming) + `prompts.rs` (session prompt templates) + `tools/` (registry + fs/net/exec implementations)
 
 ## Quick Start
 
@@ -37,6 +37,8 @@ lingclaw stop        # Stop daemon
 lingclaw restart     # Restart daemon
 lingclaw status      # Service status + version check
 lingclaw update      # Version-aware update from source
+lingclaw install     # Install from local source (current dir)
+lingclaw install -d /path/to/src  # Install from specified dir
 lingclaw health      # Health check (exit 0 = ok)
 lingclaw help        # Show usage
 lingclaw --version   # Show version
@@ -107,12 +109,7 @@ Model references use `provider/model` format (e.g. `my-provider/gpt-4o-mini`). S
 | `/model [name]` | Show or switch model |
 | `/think [level]` | Set thinking mode (off\|minimal\|low\|medium\|high\|xhigh) |
 | `/skills` | List available skills |
-| `/sessions` | List all active sessions |
-| `/switch <id>` | Switch session (prefix match) |
 | `/rename <name>` | Rename current session |
-| `/save` | Save session to disk |
-| `/load [id]` | List or load saved sessions |
-| `/delete <id>` | Delete a session |
 | `/clear` | Clear messages |
 | `/help` | Show all commands |
 
@@ -125,6 +122,7 @@ Model references use `provider/model` format (e.g. `my-provider/gpt-4o-mini`). S
 | `read_file` | Read files with optional line range |
 | `write_file` | Create or overwrite files |
 | `patch_file` | Find and replace in files |
+| `delete_file` | Delete a file from the workspace |
 | `list_dir` | Directory listing with metadata |
 | `search_files` | Regex search across files |
 | `http_fetch` | HTTP GET with size limits |

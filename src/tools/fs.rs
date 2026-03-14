@@ -254,3 +254,22 @@ pub(crate) async fn tool_search_files(args: &serde_json::Value, config: &Config,
         )
     }
 }
+
+// ── delete_file ──────────────────────────────────────────────────────────────
+
+pub(crate) async fn tool_delete_file(args: &serde_json::Value, workspace: &Path) -> String {
+    let path_str = match args["path"].as_str() {
+        Some(p) => p,
+        None => return "Error: 'path' parameter is required".into(),
+    };
+    let path = resolve_path(path_str, workspace);
+
+    match tokio::fs::metadata(&path).await {
+        Ok(meta) if meta.is_file() => match tokio::fs::remove_file(&path).await {
+            Ok(()) => format!("Deleted {}", path.display()),
+            Err(e) => format!("delete_file error: {e}"),
+        },
+        Ok(_) => format!("delete_file error: {} is a directory, not a file", path.display()),
+        Err(e) => format!("delete_file error: {e}"),
+    }
+}

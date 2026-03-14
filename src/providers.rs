@@ -154,6 +154,65 @@ fn convert_messages_to_anthropic(messages: &[ChatMessage]) -> (String, Vec<serde
 //  LLM Streaming Client
 // ══════════════════════════════════════════════════════════════════════════════
 
+/// Non-streaming LLM call — returns plain text. Used for conversation compression.
+pub(crate) async fn call_llm_simple(
+    http: &Client,
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+) -> Result<String, String> {
+    match resolved.provider {
+        Provider::OpenAI => {
+            let url = format!("{}/chat/completions", resolved.api_base);
+            let body = json!({
+                "model": resolved.model_id,
+                "messages": messages,
+            });
+            let resp = http.post(&url)
+                .bearer_auth(&resolved.api_key)
+                .json(&body)
+                .send().await
+                .map_err(|e| format!("HTTP error: {e}"))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(format!("API {status}: {text}"));
+            }
+            let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            Ok(data["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string())
+        }
+        Provider::Anthropic => {
+            let url = format!("{}/messages", resolved.api_base);
+            let (system, msgs) = convert_messages_to_anthropic(messages);
+            let mut body = json!({
+                "model": resolved.model_id,
+                "messages": msgs,
+                "max_tokens": 4096,
+            });
+            if !system.is_empty() {
+                body["system"] = json!(system);
+            }
+            let resp = http.post(&url)
+                .header("x-api-key", &resolved.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&body)
+                .send().await
+                .map_err(|e| format!("HTTP error: {e}"))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(format!("API {status}: {text}"));
+            }
+            let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            let content = data["content"].as_array()
+                .and_then(|arr| arr.iter().find(|b| b["type"] == "text"))
+                .and_then(|b| b["text"].as_str())
+                .unwrap_or("")
+                .to_string();
+            Ok(content)
+        }
+    }
+}
+
 pub(crate) async fn call_llm_stream(
     http: &Client,
     resolved: &ResolvedModel,
