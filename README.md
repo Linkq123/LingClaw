@@ -1,6 +1,6 @@
 # 🦀 LingClaw
 
-A personal AI assistant in ~2400 lines of Rust. Three pillars: **Skill quality + Rich CLI tools + Intelligent agent loop**.
+A personal AI assistant in ~3400 lines of Rust. Three pillars: **Skill quality + Rich CLI tools + Intelligent agent loop**.
 
 ## Features
 
@@ -8,7 +8,7 @@ A personal AI assistant in ~2400 lines of Rust. Three pillars: **Skill quality +
 
 **Smart Agent Loop** — Multi-round tool calling (up to 20 rounds), context window management with auto-pruning, per-session model override
 
-**Multi-Session** — Create, switch, rename, save/load sessions to disk. Each WebSocket connection gets its own session.
+**Multi-Session** — Create, switch, rename, save/load sessions to disk. Each session has an isolated workspace with customizable prompt files and memory.
 
 **Dual Provider** — Native support for OpenAI and Anthropic APIs with auto-detection
 
@@ -16,28 +16,42 @@ A personal AI assistant in ~2400 lines of Rust. Three pillars: **Skill quality +
 
 **Config File** — JSON config at `~/.lingclaw/.lingclaw.json` with multi-provider support + first-run setup wizard
 
-**Security** — Dangerous command detection, configurable exec timeout, output truncation
+**Security** — Dangerous command detection, sandboxed file access, configurable exec timeout, output truncation
 
-**Single Binary** — One Rust binary, one `index.html`, zero database
+**Single Binary** — One Rust binary, one `index.html`, zero database. Daemon mode by default.
 
-**Compact Modules** — `main.rs` (app loop) + `providers.rs` (LLM streaming) + `tools/` (registry + fs/net/exec implementations)
+**Compact Modules** — `main.rs` (app loop + CLI) + `providers.rs` (LLM streaming) + `prompts.rs` (session prompt templates) + `tools/` (registry + fs/net/exec implementations)
 
 ## Quick Start
 
 ```bash
 cargo build --release
+cargo install --path .
 
 # First run — setup wizard guides you through provider/model config
-cargo run
+lingclaw
 
-# Or configure via environment variables:
-# OpenAI
-OPENAI_API_KEY=sk-xxx cargo run
-
-# Anthropic (auto-detected from model name)
-ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 cargo run
+# CLI management
+lingclaw start       # Start daemon (default)
+lingclaw stop        # Stop daemon
+lingclaw restart     # Restart daemon
+lingclaw status      # Service status + version check
+lingclaw update      # Version-aware update from source
+lingclaw health      # Health check (exit 0 = ok)
+lingclaw help        # Show usage
+lingclaw --version   # Show version
 
 # Open http://127.0.0.1:3000
+```
+
+Environment variable fallback (no config file needed):
+
+```bash
+# OpenAI
+OPENAI_API_KEY=sk-xxx lingclaw
+
+# Anthropic (auto-detected from model name)
+ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 ```
 
 ## Config File
@@ -124,10 +138,26 @@ Browser ←WebSocket→ axum ←HTTP/SSE→ OpenAI / Anthropic API
          │    Agent Loop (≤20)     │
          │  Context Manager        │
          │  Session Store          │
-         └────────────┬────────────┘
-                      ↕
-              Tool Executor ×8
+         └──┬─────────┬───────────┘
+            ↕         ↕
+     Tool Exec ×8  Prompt Templates ×7
 ```
+
+### Session Workspace
+
+Each session gets an isolated workspace at `~/.lingclaw/{sessionId}/workspace/` with 7 prompt files copied from `docs/reference/templates/`:
+
+| File | Purpose |
+|---|---|
+| `BOOTSTRAP.md` | System bootstrap instructions |
+| `AGENT.md` | Agent behavior and capabilities |
+| `IDENTITY.md` | Agent identity and persona |
+| `SOUL.md` | Core reasoning directives |
+| `USER.md` | User-specific preferences |
+| `TOOLS.md` | Tool usage guidelines |
+| `MEMORY.md` | Session memory and context |
+
+Edit these files to customize agent behavior per session. A `memory/` subdirectory holds daily logs.
 
 ## API
 

@@ -1,8 +1,8 @@
 [package]
 name = "lingclaw"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
-description = "A ~2400-line Rust personal AI assistant"
+description = "A ~3400-line Rust personal AI assistant"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
