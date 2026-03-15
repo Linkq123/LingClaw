@@ -1,7 +1,7 @@
 use axum::{
     extract::{
         ws::{Message as WsMsg, WebSocket, WebSocketUpgrade},
-        State,
+        Query, State,
     },
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -1184,46 +1184,59 @@ Commands:
 //  WebSocket Handler
 // ══════════════════════════════════════════════════════════════════════════════
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state))
+#[derive(Deserialize)]
+struct WsQuery {
+    session: Option<String>,
 }
 
-async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Query(query): Query<WsQuery>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let requested = query.session.filter(|s| !s.is_empty());
+    ws.on_upgrade(|socket| handle_socket(socket, state, requested))
+}
+
+async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Option<String>) {
     let (mut tx, mut rx) = socket.split();
 
-    // Resume most recent saved session from disk, or create new.
-    // Each connection owns its session exclusively — never reuse another
-    // connection's in-memory entry (avoids shared-state / disconnect bugs).
+    // Resume a session: prefer the explicitly requested one (browser refresh),
+    // then fall back to the most recent unclaimed saved session, then create new.
     let mut current_session_id;
 
-    // Try saved sessions in recency order; claim the first one not owned by another connection.
-    let saved_ids: Vec<String> = list_saved_session_summaries()
-        .iter()
-        .filter_map(|s| s["id"].as_str().map(|id| id.to_string()))
-        .collect();
+    let mut claimed = if let Some(ref req_id) = requested_id {
+        // Client requested a specific session — wait briefly for the old connection to release it
+        claim_requested_session(req_id, &state).await
+    } else {
+        None
+    };
 
-    let mut claimed: Option<String> = None;
-    for cid in &saved_ids {
-        if let Some(mut session) = load_session_from_disk(cid) {
-            let mut sessions = state.sessions.lock().await;
-            if sessions.contains_key(&session.id) {
-                // Owned by another connection — skip to next candidate
-                continue;
-            }
-            let model = session.effective_model(&state.config.model).to_string();
-            let sys = build_system_prompt(&state.config, &session.workspace, &model);
-            if let Some(first) = session.messages.first_mut() {
-                if first.role == "system" {
-                    *first = sys;
+    // If no explicit request or requested session unavailable, try saved sessions in recency order
+    if claimed.is_none() {
+        let saved_ids: Vec<String> = list_saved_session_summaries()
+            .iter()
+            .filter_map(|s| s["id"].as_str().map(|id| id.to_string()))
+            .collect();
+
+        for cid in &saved_ids {
+            if let Some(mut session) = load_session_from_disk(cid) {
+                let mut sessions = state.sessions.lock().await;
+                if sessions.contains_key(&session.id) {
+                    continue;
                 }
+                let model = session.effective_model(&state.config.model).to_string();
+                let sys = build_system_prompt(&state.config, &session.workspace, &model);
+                if let Some(first) = session.messages.first_mut() {
+                    if first.role == "system" {
+                        *first = sys;
+                    }
+                }
+                let id = session.id.clone();
+                sessions.insert(id.clone(), session);
+                claimed = Some(id);
+                break;
             }
-            let id = session.id.clone();
-            sessions.insert(id.clone(), session);
-            claimed = Some(id);
-            break;
         }
     }
 
@@ -1231,7 +1244,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         current_session_id = id.clone();
         let (name, history) = {
             let sessions = state.sessions.lock().await;
-            let s = sessions.get(&id).expect("just inserted");
+            let s = sessions.get(&id).expect("just claimed");
             (s.name.clone(), build_history_payload(s))
         };
         ws_send(&mut tx, &json!({"type":"session","id":&id,"name":&name})).await;
@@ -1521,8 +1534,44 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     if let Some(ref session) = disconnected_session {
         if session.messages.len() > 1 {
             let _ = save_session_to_disk(session).await;
+        } else {
+            // Empty session — clean up its workspace directory
+            let _ = std::fs::remove_dir_all(&session.workspace);
         }
     }
+}
+
+/// Wait for a specific session to become available (old connection releasing it),
+/// then load from disk and claim it. Returns None if unavailable after timeout.
+async fn claim_requested_session(id: &str, state: &AppState) -> Option<String> {
+    // Validate ID format
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        return None;
+    }
+    // Wait up to 3 seconds for the old connection to release the session
+    for _ in 0..6 {
+        let in_use = state.sessions.lock().await.contains_key(id);
+        if !in_use {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    // Try to load and claim
+    let mut session = load_session_from_disk(id)?;
+    let mut sessions = state.sessions.lock().await;
+    if sessions.contains_key(id) {
+        return None; // Still occupied after timeout
+    }
+    let model = session.effective_model(&state.config.model).to_string();
+    let sys = build_system_prompt(&state.config, &session.workspace, &model);
+    if let Some(first) = session.messages.first_mut() {
+        if first.role == "system" {
+            *first = sys;
+        }
+    }
+    let sid = session.id.clone();
+    sessions.insert(sid.clone(), session);
+    Some(sid)
 }
 
 async fn send_sessions_list(tx: &mut WsTx, state: &AppState, active_id: &str) {

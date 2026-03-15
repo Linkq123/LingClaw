@@ -159,7 +159,9 @@ marked.setOptions({
 // ── WebSocket ──
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const stored = sessionStorage.getItem('lingclaw_session');
+  const qs = stored ? `?session=${encodeURIComponent(stored)}` : '';
+  ws = new WebSocket(`${proto}://${location.host}/ws${qs}`);
 
   ws.onopen = () => {
     connStatus.className = 'conn-status connected';
@@ -186,12 +188,14 @@ function handleMessage(data) {
       currentSessionId = data.id;
       sessionNameEl.textContent = data.name || 'New Chat';
       sessionIdEl.textContent = data.id.slice(0, 12);
+      sessionStorage.setItem('lingclaw_session', data.id);
       break;
 
     case 'session_switched':
       currentSessionId = data.id;
       sessionNameEl.textContent = data.name || 'New Chat';
       sessionIdEl.textContent = data.id.slice(0, 12);
+      sessionStorage.setItem('lingclaw_session', data.id);
       chat.innerHTML = '';
       break;
 
