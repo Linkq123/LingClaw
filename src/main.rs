@@ -3,8 +3,9 @@ use axum::{
         ws::{Message as WsMsg, WebSocket, WebSocketUpgrade},
         State,
     },
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use futures::{stream::SplitSink, SinkExt, StreamExt};
@@ -18,6 +19,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
 mod cli;
@@ -417,6 +419,8 @@ struct AppState {
     config: Config,
     http: Client,
     sessions: Mutex<HashMap<String, Session>>,
+    shutdown: CancellationToken,
+    shutdown_token: String,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -616,6 +620,32 @@ async fn save_session_to_disk(session: &Session) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Remove trailing incomplete tool-call transactions from session messages.
+/// If the last assistant message has tool_calls but not all matching tool results
+/// follow it, pop the assistant message and any partial tool results.
+/// This prevents persisting an invalid message sequence on shutdown interruption.
+fn trim_incomplete_tool_calls(messages: &mut Vec<ChatMessage>) {
+    // Find last assistant message with tool_calls
+    let ast_idx = messages.iter().rposition(|m| {
+        m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
+    });
+    let Some(idx) = ast_idx else { return };
+    let expected = messages[idx]
+        .tool_calls
+        .as_ref()
+        .map(|tc| tc.len())
+        .unwrap_or(0);
+    // Count tool messages that follow the assistant message
+    let actual = messages[idx + 1..]
+        .iter()
+        .filter(|m| m.role == "tool")
+        .count();
+    if actual < expected {
+        // Incomplete: remove assistant + any partial tool results
+        messages.truncate(idx);
+    }
+}
+
 fn load_session_from_disk(id: &str) -> Option<Session> {
     if id.contains('/') || id.contains('\\') || id.contains("..") {
         return None;
@@ -707,6 +737,7 @@ async fn handle_command(
     input: &str,
     current_session_id: &str,
     state: &AppState,
+    cancel: &CancellationToken,
 ) -> Option<CommandResult> {
     let parts: Vec<&str> = input.splitn(2, ' ').collect();
     let cmd = parts[0];
@@ -780,14 +811,26 @@ async fn handle_command(
                 },
             ];
             let resolved = state.config.resolve_model(&model_str);
-            let summary = match providers::call_llm_simple(&state.http, &resolved, &compress_prompt).await {
-                Ok(s) => s,
-                Err(e) => {
+            let summary = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
                     return Some(CommandResult {
-                        response: format!("Failed to compress conversation: {e}"),
+                        response: "Shutdown: compression skipped, context unchanged.".into(),
                         new_session_id: None,
                         sessions_changed: false,
                     });
+                }
+                result = providers::call_llm_simple(&state.http, &resolved, &compress_prompt) => {
+                    match result {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Some(CommandResult {
+                                response: format!("Failed to compress conversation: {e}"),
+                                new_session_id: None,
+                                sessions_changed: false,
+                            });
+                        }
+                    }
                 }
             };
 
@@ -1205,7 +1248,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     send_sessions_list(&mut tx, &state, &current_session_id).await;
 
-    while let Some(Ok(msg)) = rx.next().await {
+    let cancel = state.shutdown.clone();
+    loop {
+        let msg = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            result = rx.next() => match result {
+                Some(Ok(m)) => m,
+                _ => break,
+            },
+        };
         let text = match msg {
             WsMsg::Text(t) => t.to_string(),
             WsMsg::Close(_) => break,
@@ -1219,7 +1271,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
         // ── Slash commands ──────────────────────────────────────────────
         if trimmed.starts_with('/') {
-            if let Some(result) = handle_command(trimmed, &current_session_id, &state).await {
+            let cmd_result = handle_command(trimmed, &current_session_id, &state, &cancel).await;
+            if cancel.is_cancelled() {
+                break;
+            }
+            if let Some(result) = cmd_result {
                 ws_send(
                     &mut tx,
                     &json!({"type":"system","content":result.response}),
@@ -1271,7 +1327,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
 
         let mut completed = false;
-        for round in 0..state.config.max_tool_rounds {
+        let mut shutting_down = false;
+        'agent: for round in 0..state.config.max_tool_rounds {
+            // Check shutdown before starting a new round
+            if cancel.is_cancelled() {
+                shutting_down = true;
+                break;
+            }
+
             // Snapshot messages (prune if needed)
             let (msgs_snapshot, model, workspace) = {
                 let mut sessions = state.sessions.lock().await;
@@ -1298,14 +1361,22 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             ws_send(&mut tx, &json!({"type":"start","round":round + 1})).await;
 
             let resolved = state.config.resolve_model(&model);
-            match providers::call_llm_stream(
-                &state.http,
-                &resolved,
-                &msgs_snapshot,
-                &mut tx,
-            )
-            .await
-            {
+
+            // Wrap LLM call in select so shutdown can interrupt a long stream
+            let llm_result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    shutting_down = true;
+                    break;
+                }
+                r = providers::call_llm_stream(
+                    &state.http,
+                    &resolved,
+                    &msgs_snapshot,
+                    &mut tx,
+                ) => r,
+            };
+            match llm_result {
                 Ok(resp) => {
                     let has_tools = resp.message.tool_calls.is_some();
 
@@ -1320,6 +1391,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
                     if let Some(tool_calls) = &resp.message.tool_calls {
                         for tc in tool_calls {
+                            // Check shutdown before each tool call
+                            if cancel.is_cancelled() {
+                                shutting_down = true;
+                                break 'agent;
+                            }
+
                             ws_send(
                                 &mut tx,
                                 &json!({
@@ -1331,14 +1408,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             )
                             .await;
 
-                            let result = execute_tool(
-                                &tc.function.name,
-                                &tc.function.arguments,
-                                &state.config,
-                                &state.http,
-                                &workspace,
-                            )
-                            .await;
+                            let result = tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    shutting_down = true;
+                                    break 'agent;
+                                }
+                                r = execute_tool(
+                                    &tc.function.name,
+                                    &tc.function.arguments,
+                                    &state.config,
+                                    &state.http,
+                                    &workspace,
+                                ) => r,
+                            };
 
                             ws_send(
                                 &mut tx,
@@ -1380,7 +1463,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             }
         }
 
-        if !completed {
+        if shutting_down {
+            ws_send(
+                &mut tx,
+                &json!({"type":"system","content":"Server shutting down."}),
+            )
+            .await;
+        } else if !completed {
             ws_send(
                 &mut tx,
                 &json!({
@@ -1393,9 +1482,38 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             )
             .await;
         }
+
+        // Auto-save session to disk after each completed exchange
+        // If shutting down, trim incomplete tool-call transactions first
+        if shutting_down {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(&current_session_id) {
+                trim_incomplete_tool_calls(&mut session.messages);
+            }
+        }
+        let snapshot = {
+            let sessions = state.sessions.lock().await;
+            sessions.get(&current_session_id).cloned()
+        };
+        if let Some(ref s) = snapshot {
+            if s.messages.len() > 1 {
+                let _ = save_session_to_disk(s).await;
+            }
+        }
+
+        // If shutting down, break out of the main message loop
+        if shutting_down {
+            break;
+        }
     }
 
     // ── Cleanup: remove from memory first (release lock), then save to disk ────
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&current_session_id) {
+            trim_incomplete_tool_calls(&mut session.messages);
+        }
+    }
     let disconnected_session = {
         let mut sessions = state.sessions.lock().await;
         sessions.remove(&current_session_id)
@@ -1444,6 +1562,26 @@ async fn send_sessions_list(tx: &mut WsTx, state: &AppState, active_id: &str) {
 // ══════════════════════════════════════════════════════════════════════════════
 //  HTTP API
 // ══════════════════════════════════════════════════════════════════════════════
+
+async fn api_shutdown(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    // Verify shutdown token — only the local CLI should be able to trigger this
+    let provided = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if provided != state.shutdown_token {
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "unauthorized" })));
+    }
+
+    // Signal shutdown — each WebSocket handler saves its own session on exit,
+    // and main() does a final flush of any remaining sessions.
+    state.shutdown.cancel();
+    (StatusCode::OK, Json(json!({ "status": "shutting_down" })))
+}
 
 async fn api_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let sessions = state.sessions.lock().await;
@@ -1540,19 +1678,38 @@ async fn main() {
     eprintln!("  Max rounds:    {}", config.max_tool_rounds);
     eprintln!("  Context limit: {} tokens", config.max_context_tokens);
 
+    let shutdown = CancellationToken::new();
+
+    // Generate a one-time shutdown token and write it to disk for CLI use
+    let shutdown_token: String = {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let mut h1 = RandomState::new().build_hasher();
+        let mut h2 = RandomState::new().build_hasher();
+        h1.write_u8(1);
+        h2.write_u8(2);
+        format!("{:016x}{:016x}", h1.finish(), h2.finish())
+    };
+    if let Some(dir) = config_dir_path() {
+        let _ = std::fs::write(dir.join(format!("shutdown-{port}.token")), &shutdown_token);
+    }
+
     let state = Arc::new(AppState {
         config,
         http: Client::new(),
         sessions: Mutex::new(HashMap::new()),
+        shutdown: shutdown.clone(),
+        shutdown_token,
     });
 
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/health", get(api_health))
         .route("/api/sessions", get(api_sessions))
+        .route("/api/shutdown", post(api_shutdown))
         .fallback_service(ServeDir::new("static").append_index_html_on_directories(true))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr = format!("127.0.0.1:{port}");
     println!("🦀 LingClaw v2 listening on http://{addr}");
@@ -1561,5 +1718,34 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("failed to bind");
-    axum::serve(listener, app).await.expect("server failed");
+
+    let shutdown_signal = {
+        let s = shutdown.clone();
+        async move {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => { s.cancel(); },
+                _ = s.cancelled() => {},
+            }
+        }
+    };
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await
+        .ok();
+
+    // Flush all in-memory sessions to disk before exiting
+    let sessions: Vec<Session> = {
+        let guard = state.sessions.lock().await;
+        guard.values().cloned().collect()
+    };
+    for s in &sessions {
+        if s.messages.len() > 1 {
+            let _ = save_session_to_disk(s).await;
+        }
+    }
+    // Clean up shutdown token file
+    if let Some(dir) = config_dir_path() {
+        let _ = std::fs::remove_file(dir.join(format!("shutdown-{port}.token")));
+    }
+    eprintln!("Server shut down, {} session(s) saved.", sessions.len());
 }

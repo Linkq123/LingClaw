@@ -192,12 +192,65 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             let config = Config::load();
             let port = port_override.unwrap_or(config.port);
             println!("Stopping LingClaw on port {port}...");
+
+            // Try graceful shutdown first via API
+            let graceful = std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}").parse().unwrap(),
+                Duration::from_secs(2),
+            )
+            .is_ok();
+
+            if graceful {
+                // Read shutdown token from disk
+                let token = config_dir_path()
+                    .map(|d| d.join(format!("shutdown-{port}.token")))
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .unwrap_or_default();
+
+                // Send POST /api/shutdown with auth token
+                let shutdown_ok = std::process::Command::new(if cfg!(windows) { "powershell" } else { "sh" })
+                    .args(if cfg!(windows) {
+                        vec![
+                            "-NoProfile".to_string(),
+                            "-Command".to_string(),
+                            format!(
+                                "try {{ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:{port}/api/shutdown -Headers @{{Authorization='Bearer {token}'}} -TimeoutSec 5 | Out-Null; $true }} catch {{ $false }}"
+                            ),
+                        ]
+                    } else {
+                        vec![
+                            "-c".to_string(),
+                            format!("curl -sf -X POST http://127.0.0.1:{port}/api/shutdown -H 'Authorization: Bearer {token}' -o /dev/null 2>/dev/null"),
+                        ]
+                    })
+                    .status()
+                    .map(|s| s.success())
+                    .unwrap_or(false);
+
+                if shutdown_ok {
+                    // Wait for graceful shutdown to complete
+                    for _ in 0..10 {
+                        std::thread::sleep(Duration::from_millis(500));
+                        if std::net::TcpStream::connect_timeout(
+                            &format!("127.0.0.1:{port}").parse().unwrap(),
+                            Duration::from_millis(200),
+                        ).is_err() {
+                            println!("Stopped (graceful).");
+                            return true;
+                        }
+                    }
+                    eprintln!("Graceful shutdown timed out, force-killing...");
+                }
+            }
+
+            // Fallback: force-kill
             #[cfg(target_os = "windows")]
             {
                 let _ = std::process::Command::new("powershell")
                     .args(["-NoProfile", "-Command", &format!(
                         "Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | \
-                         ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force }}"
+                         Select-Object -ExpandProperty OwningProcess -Unique | \
+                         ForEach-Object {{ Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }}"
                     )])
                     .status();
             }
@@ -205,7 +258,7 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             {
                 let _ = std::process::Command::new("sh")
                     .args(["-c", &format!(
-                        "lsof -ti:{port} | xargs -r kill"
+                        "lsof -ti:{port} | xargs -r kill -9"
                     )])
                     .status();
             }
