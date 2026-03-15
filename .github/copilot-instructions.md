@@ -1,6 +1,6 @@
 # LingClaw Workspace Instructions
 
-This is **LingClaw** — a ~3850-line Rust personal AI assistant built on the **Skill + CLI** paradigm. Supports **OpenAI** and **Anthropic** APIs with auto-detection. Config via `~/.lingclaw/.lingclaw.json` (JSON config file) with first-run setup wizard.
+This is **LingClaw** — a ~3800-line Rust personal AI assistant built on the **Skill + CLI** paradigm. Supports **OpenAI** and **Anthropic** APIs with auto-detection. Config via `~/.lingclaw/.lingclaw.json` (JSON config file) with first-run setup wizard.
 
 **Skill** = LLM reasoning, system prompt, context management. **CLI** = Tool execution, safety, reliability. The entire project is one loop connecting them.
 
@@ -9,7 +9,7 @@ This is **LingClaw** — a ~3850-line Rust personal AI assistant built on the **
 - `src/main.rs` must stay ≤ 3000 lines. Check with `wc -l src/main.rs` before committing.
 - Backend entrypoint and main loop live in `src/main.rs`. CLI subcommands and setup wizard live in `src/cli.rs`. Provider streaming logic lives in `src/providers.rs`. Session prompt init/load logic lives in `src/prompts.rs`; prompt templates live on disk in `docs/reference/templates/`. Shared tool registry lives in `src/tools/mod.rs` with implementations split into `src/tools/exec.rs`, `src/tools/fs.rs`, `src/tools/net.rs`.
 - Each session has an isolated workspace at `~/.lingclaw/{sessionId}/workspace/` with 7 prompt files (BOOTSTRAP.md, AGENT.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md) copied from `docs/reference/templates/` on creation, plus a `memory/` subdirectory for daily logs. Users customize agent behavior by editing these files.
-- Dependencies: axum, tokio, serde, serde_json, reqwest, futures, regex, tower-http. Do not add more without justification.
+- Dependencies: axum, tokio, serde, serde_json, reqwest, futures, regex, tower-http, tokio-util. Do not add more without justification.
 - Rust edition 2021. Target stable Rust.
 - Use `cargo clippy` and `cargo fmt` before finalizing code.
 - Frontend (`static/index.html`) does not count toward the line budget.

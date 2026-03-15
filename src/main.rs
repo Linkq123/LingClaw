@@ -13,7 +13,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -419,6 +419,9 @@ struct AppState {
     config: Config,
     http: Client,
     sessions: Mutex<HashMap<String, Session>>,
+    /// Session IDs with a live WebSocket connection. Used to distinguish
+    /// "actively connected" from "orphaned in memory (save-on-disconnect failed)".
+    active_connections: Mutex<HashSet<String>>,
     shutdown: CancellationToken,
     shutdown_token: String,
 }
@@ -659,7 +662,70 @@ fn load_session_from_disk(id: &str) -> Option<Session> {
     Some(session)
 }
 
-/// List all saved session summaries from disk, sorted by created_at desc.
+fn refresh_session_system_prompt(state: &AppState, session: &mut Session) {
+    let model = session.effective_model(&state.config.model).to_string();
+    let sys = build_system_prompt(&state.config, &session.workspace, &model);
+    if let Some(first) = session.messages.first_mut() {
+        if first.role == "system" {
+            *first = sys;
+        }
+    }
+}
+
+enum ClaimSessionResult {
+    Claimed(String),
+    InUse,
+    NotFound,
+}
+
+async fn try_claim_session(id: &str, state: &AppState) -> ClaimSessionResult {
+    if id.contains('/') || id.contains('\\') || id.contains("..") {
+        return ClaimSessionResult::NotFound;
+    }
+
+    // Phase 1: quick check — is there an active connection?
+    if state.active_connections.lock().await.contains(id) {
+        return ClaimSessionResult::InUse;
+    }
+
+    // Phase 2: try claiming from in-memory orphan (no disk I/O)
+    {
+        let mut active = state.active_connections.lock().await;
+        if active.contains(id) {
+            return ClaimSessionResult::InUse;
+        }
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(id) {
+            refresh_session_system_prompt(state, session);
+            active.insert(id.to_string());
+            return ClaimSessionResult::Claimed(id.to_string());
+        }
+    }
+
+    // Phase 3: load from disk WITHOUT holding any lock
+    let Some(mut session) = load_session_from_disk(id) else {
+        return ClaimSessionResult::NotFound;
+    };
+    refresh_session_system_prompt(state, &mut session);
+
+    // Phase 4: re-acquire locks and atomically claim
+    let mut active = state.active_connections.lock().await;
+    if active.contains(id) {
+        return ClaimSessionResult::InUse;
+    }
+    let mut sessions = state.sessions.lock().await;
+    if sessions.contains_key(id) {
+        // Someone else loaded it while we were reading disk
+        return ClaimSessionResult::InUse;
+    }
+
+    let sid = session.id.clone();
+    sessions.insert(sid.clone(), session);
+    active.insert(sid.clone());
+    ClaimSessionResult::Claimed(sid)
+}
+
+/// List all saved session summaries from disk, sorted by updated_at desc.
 fn list_saved_session_summaries() -> Vec<serde_json::Value> {
     let dir = sessions_dir();
     let mut out = Vec::new();
@@ -683,8 +749,8 @@ fn list_saved_session_summaries() -> Vec<serde_json::Value> {
         }
     }
     out.sort_by(|a, b| {
-        let b_ts = b["created_at"].as_u64().unwrap_or(0);
-        let a_ts = a["created_at"].as_u64().unwrap_or(0);
+        let b_ts = b["updated_at"].as_u64().unwrap_or(0);
+        let a_ts = a["updated_at"].as_u64().unwrap_or(0);
         b_ts.cmp(&a_ts)
     });
     out
@@ -887,14 +953,23 @@ async fn handle_command(
         }
 
         "/session_new" => {
-            // Remove current session from memory (release lock before disk I/O)
-            let old = {
-                let mut sessions = state.sessions.lock().await;
-                sessions.remove(current_session_id)
+            // Save current session to disk BEFORE removing from memory
+            let snapshot = {
+                let sessions = state.sessions.lock().await;
+                sessions.get(current_session_id).cloned()
             };
-            if let Some(ref old) = old {
-                if old.messages.len() > 1 {
-                    let _ = save_session_to_disk(old).await;
+            if let Some(ref s) = snapshot {
+                if s.messages.len() > 1 {
+                    match save_session_to_disk(s).await {
+                        Ok(()) => {
+                            state.sessions.lock().await.remove(current_session_id);
+                        }
+                        Err(e) => {
+                            eprintln!("Warning: failed to save session {} before /session_new: {e}; keeping in memory", s.id);
+                        }
+                    }
+                } else {
+                    state.sessions.lock().await.remove(current_session_id);
                 }
             }
             // Create brand-new session
@@ -927,65 +1002,48 @@ async fn handle_command(
                     sessions_changed: false,
                 });
             }
-            // Prevent switching to a session already owned by another connection.
-            // In-memory sessions are exclusively owned; only disk sessions are available.
-            {
+            // Save current session to disk BEFORE removing (avoid data loss on save failure)
+            let snapshot = {
                 let sessions = state.sessions.lock().await;
-                if sessions.contains_key(&target) {
-                    return Some(CommandResult {
+                sessions.get(current_session_id).cloned()
+            };
+            if let Some(ref s) = snapshot {
+                if s.messages.len() > 1 {
+                    if let Err(e) = save_session_to_disk(s).await {
+                        eprintln!("Warning: failed to save session {} before /switch: {e}; keeping in memory", s.id);
+                        return Some(CommandResult {
+                            response: "Failed to save current session; switch cancelled to avoid data loss.".into(),
+                            new_session_id: None,
+                            sessions_changed: false,
+                        });
+                    }
+                }
+            }
+            match try_claim_session(&target, state).await {
+                ClaimSessionResult::Claimed(id) => {
+                    // Claim succeeded — safe to remove old session from memory
+                    state.sessions.lock().await.remove(current_session_id);
+                    Some(CommandResult {
+                        response: format!("Loaded session {}", &id[..12.min(id.len())]),
+                        new_session_id: Some(id),
+                        sessions_changed: true,
+                    })
+                }
+                ClaimSessionResult::InUse => {
+                    Some(CommandResult {
                         response: format!("Session '{}' is in use by another connection.", &target[..12.min(target.len())]),
                         new_session_id: None,
                         sessions_changed: false,
-                    });
+                    })
+                }
+                ClaimSessionResult::NotFound => {
+                    Some(CommandResult {
+                        response: format!("Session '{}' not found.", &target[..12.min(target.len())]),
+                        new_session_id: None,
+                        sessions_changed: false,
+                    })
                 }
             }
-            // Try loading from disk
-            let disk_session = load_session_from_disk(&target);
-            if disk_session.is_none() {
-                return Some(CommandResult {
-                    response: format!("Session '{}' not found.", &target[..12.min(target.len())]),
-                    new_session_id: None,
-                    sessions_changed: false,
-                });
-            }
-            // Save current session outside the lock (avoid blocking other connections)
-            let old = {
-                let mut sessions = state.sessions.lock().await;
-                sessions.remove(current_session_id)
-            };
-            if let Some(ref old) = old {
-                if old.messages.len() > 1 {
-                    let _ = save_session_to_disk(old).await;
-                }
-            }
-            // Atomically claim target — double-check after disk I/O
-            let mut sessions = state.sessions.lock().await;
-            if sessions.contains_key(&target) {
-                // Another connection claimed it — re-insert our old session
-                if let Some(old) = old {
-                    sessions.insert(old.id.clone(), old);
-                }
-                return Some(CommandResult {
-                    response: format!("Session '{}' is in use by another connection.", &target[..12.min(target.len())]),
-                    new_session_id: None,
-                    sessions_changed: false,
-                });
-            }
-            let mut s = disk_session.unwrap();
-            let model = s.effective_model(&state.config.model).to_string();
-            let sys = build_system_prompt(&state.config, &s.workspace, &model);
-            if let Some(first) = s.messages.first_mut() {
-                if first.role == "system" {
-                    *first = sys;
-                }
-            }
-            let id = s.id.clone();
-            sessions.insert(id.clone(), s);
-            Some(CommandResult {
-                response: format!("Loaded session {}", &id[..12.min(id.len())]),
-                new_session_id: Some(id),
-                sessions_changed: true,
-            })
         }
 
         "/rename" => {
@@ -1212,30 +1270,23 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         None
     };
 
-    // If no explicit request or requested session unavailable, try saved sessions in recency order
-    if claimed.is_none() {
+    // Only fall back to "most recent saved session" when NO specific session was requested.
+    // If the client asked for a specific session and it failed, create new (don't hijack another).
+    if claimed.is_none() && requested_id.is_none() {
         let saved_ids: Vec<String> = list_saved_session_summaries()
             .iter()
             .filter_map(|s| s["id"].as_str().map(|id| id.to_string()))
             .collect();
 
         for cid in &saved_ids {
-            if let Some(mut session) = load_session_from_disk(cid) {
-                let mut sessions = state.sessions.lock().await;
-                if sessions.contains_key(&session.id) {
+            match try_claim_session(cid, &state).await {
+                ClaimSessionResult::Claimed(id) => {
+                    claimed = Some(id);
+                    break;
+                }
+                ClaimSessionResult::InUse | ClaimSessionResult::NotFound => {
                     continue;
                 }
-                let model = session.effective_model(&state.config.model).to_string();
-                let sys = build_system_prompt(&state.config, &session.workspace, &model);
-                if let Some(first) = session.messages.first_mut() {
-                    if first.role == "system" {
-                        *first = sys;
-                    }
-                }
-                let id = session.id.clone();
-                sessions.insert(id.clone(), session);
-                claimed = Some(id);
-                break;
             }
         }
     }
@@ -1251,12 +1302,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         ws_send(&mut tx, &history).await;
     } else {
         let mut session = Session::new();
-        let model = session.effective_model(&state.config.model).to_string();
-        let sys = build_system_prompt(&state.config, &session.workspace, &model);
+        let sys = build_system_prompt(
+            &state.config,
+            &session.workspace,
+            session.effective_model(&state.config.model),
+        );
         session.messages.push(sys);
         current_session_id = session.id.clone();
+        {
+            let mut active = state.active_connections.lock().await;
+            let mut sessions = state.sessions.lock().await;
+            sessions.insert(current_session_id.clone(), session);
+            active.insert(current_session_id.clone());
+        }
         ws_send(&mut tx, &json!({"type":"session","id":&current_session_id,"name":"New Chat"})).await;
-        state.sessions.lock().await.insert(current_session_id.clone(), session);
     }
 
     send_sessions_list(&mut tx, &state, &current_session_id).await;
@@ -1296,6 +1355,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                 .await;
 
                 if let Some(new_id) = result.new_session_id {
+                    {
+                        let mut ac = state.active_connections.lock().await;
+                        ac.remove(&current_session_id);
+                        ac.insert(new_id.clone());
+                    }
                     current_session_id = new_id.clone();
                     let name = {
                         let sessions = state.sessions.lock().await;
@@ -1520,25 +1584,38 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         }
     }
 
-    // ── Cleanup: remove from memory first (release lock), then save to disk ────
+    // ── Cleanup ────
     {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(&current_session_id) {
             trim_incomplete_tool_calls(&mut session.messages);
         }
     }
-    let disconnected_session = {
-        let mut sessions = state.sessions.lock().await;
-        sessions.remove(&current_session_id)
+    let snapshot = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(&current_session_id).cloned()
     };
-    if let Some(ref session) = disconnected_session {
-        if session.messages.len() > 1 {
-            let _ = save_session_to_disk(session).await;
-        } else {
-            // Empty session — clean up its workspace directory
-            let _ = std::fs::remove_dir_all(&session.workspace);
+    if let Some(ref s) = snapshot {
+        match save_session_to_disk(s).await {
+            Ok(()) => {
+                // Save succeeded — safe to remove from HashMap
+                let mut sessions = state.sessions.lock().await;
+                sessions.remove(&current_session_id);
+            }
+            Err(e) => {
+                // Save failed — keep session in HashMap so data is not lost.
+                // It's marked orphaned (not in active_connections) so claim_requested_session
+                // and the saved_ids loop can still reclaim it from memory.
+                eprintln!("Warning: failed to save session {} on disconnect: {e}; keeping in memory", s.id);
+            }
         }
+    } else {
+        // No snapshot (session already gone from HashMap), just clean up
+        let mut sessions = state.sessions.lock().await;
+        sessions.remove(&current_session_id);
     }
+    // Release active-connection marker only after cleanup is fully settled.
+    state.active_connections.lock().await.remove(&current_session_id);
 }
 
 /// Wait for a specific session to become available (old connection releasing it),
@@ -1548,30 +1625,18 @@ async fn claim_requested_session(id: &str, state: &AppState) -> Option<String> {
     if id.contains('/') || id.contains('\\') || id.contains("..") {
         return None;
     }
-    // Wait up to 3 seconds for the old connection to release the session
+    // Wait up to 3 seconds for the active connection to release the session
     for _ in 0..6 {
-        let in_use = state.sessions.lock().await.contains_key(id);
-        if !in_use {
+        let active = state.active_connections.lock().await.contains(id);
+        if !active {
             break;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    // Try to load and claim
-    let mut session = load_session_from_disk(id)?;
-    let mut sessions = state.sessions.lock().await;
-    if sessions.contains_key(id) {
-        return None; // Still occupied after timeout
+    match try_claim_session(id, state).await {
+        ClaimSessionResult::Claimed(id) => Some(id),
+        ClaimSessionResult::InUse | ClaimSessionResult::NotFound => None,
     }
-    let model = session.effective_model(&state.config.model).to_string();
-    let sys = build_system_prompt(&state.config, &session.workspace, &model);
-    if let Some(first) = session.messages.first_mut() {
-        if first.role == "system" {
-            *first = sys;
-        }
-    }
-    let sid = session.id.clone();
-    sessions.insert(sid.clone(), session);
-    Some(sid)
 }
 
 async fn send_sessions_list(tx: &mut WsTx, state: &AppState, active_id: &str) {
@@ -1582,7 +1647,8 @@ async fn send_sessions_list(tx: &mut WsTx, state: &AppState, active_id: &str) {
             let msg_count = s.messages.iter().filter(|m| m.role != "system").count();
             (id.clone(), json!({
                 "id": id, "name": s.name, "messages": msg_count,
-                "created_at": s.created_at, "active": id == active_id,
+                "created_at": s.created_at, "updated_at": s.updated_at,
+                "active": id == active_id,
             }))
         }).collect()
     };
@@ -1601,10 +1667,13 @@ async fn send_sessions_list(tx: &mut WsTx, state: &AppState, active_id: &str) {
         }
     }
     all.sort_by(|a, b| {
-        let b_ts = b["created_at"].as_u64().unwrap_or(0);
-        let a_ts = a["created_at"].as_u64().unwrap_or(0);
+        let b_ts = b["updated_at"].as_u64().unwrap_or(0);
+        let a_ts = a["updated_at"].as_u64().unwrap_or(0);
         b_ts.cmp(&a_ts)
     });
+    // Filter out empty sessions (0 user messages) from the sidebar — they're just
+    // reconnect placeholders on disk, not useful for the user to see.
+    all.retain(|s| s["active"].as_bool() == Some(true) || s["messages"].as_u64().unwrap_or(0) > 0);
     ws_send(tx, &json!({"type":"sessions_list","sessions":all})).await;
 }
 
@@ -1747,6 +1816,7 @@ async fn main() {
         config,
         http: Client::new(),
         sessions: Mutex::new(HashMap::new()),
+        active_connections: Mutex::new(HashSet::new()),
         shutdown: shutdown.clone(),
         shutdown_token,
     });
