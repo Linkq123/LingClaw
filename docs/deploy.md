@@ -278,7 +278,6 @@ volumes:
 | `apiKey` | — | 通用 API Key（若未使用 providers 多配置） | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` |
 | `apiBase` | 按 provider 默认 | API 端点地址 | `OPENAI_API_BASE` |
 | `execTimeout` | `30` | Shell 命令超时（秒） | `LINGCLAW_EXEC_TIMEOUT` |
-| `maxToolRounds` | `20` | 每条消息最大工具调用轮数 | `LINGCLAW_MAX_TOOL_ROUNDS` |
 | `maxContextTokens` | `32000` | 上下文窗口 Token 预算 | `LINGCLAW_MAX_CONTEXT_TOKENS` |
 | `maxOutputBytes` | `51200` | 工具输出截断阈值 | — |
 | `maxFileBytes` | `204800` | 文件读取大小上限 | — |

@@ -25,7 +25,7 @@ LingClaw's architecture is this loop made concrete in Rust. All design decisions
 |------|------------------------|
 | **Skill** | Dynamic system prompt (OS/CWD/model injection), per-session prompt files (7 templates from `docs/reference/templates/`: BOOTSTRAP.md, AGENT.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md) for persona customization, daily memory system (`memory/YYYY-MM-DD.md`), `think` tool for CoT planning, token-aware context pruning, per-session model override, dual-provider support (OpenAI + Anthropic) with auto-detection, JSON config file (`~/.lingclaw/.lingclaw.json`) with first-run setup wizard |
 | **CLI** | 9 tools (think, exec, read_file, write_file, patch_file, delete_file, list_dir, search_files, http_fetch), shared `ToolSpec` registry for prompt/schema generation, dangerous command blocking, sandboxed path resolution (canonicalize + containment check) against per-session workspace, configurable timeouts |
-| **Loop** | WebSocket agent loop × max 20 rounds, system prompt refreshed every round (prompt-file edits take effect mid-session), auto-prune when context overflows, 10 slash commands (/new, /session_new, /switch, /rename, /model, /think, /skills, /status, /clear, /help), per-session think level, per-session isolated workspace with exclusive ownership, auto-save after each exchange, graceful shutdown (CancellationToken + `/api/shutdown` with per-port token auth), session-aware reconnect (`?session=` query param) |
+| **Loop** | WebSocket agent loop with unlimited tool rounds (internal 200-round hard cap as runaway protection), system prompt refreshed every round (prompt-file edits take effect mid-session), incremental session save after each tool round, auto-prune when context overflows, 10 slash commands (/new, /session_new, /switch, /rename, /model, /think, /skills, /status, /clear, /help), per-session think level, per-session isolated workspace with exclusive ownership, auto-save after each exchange, graceful shutdown (CancellationToken + `/api/shutdown` with per-port token auth), session-aware reconnect (`?session=` query param) |
 
 When extending LingClaw, always ask: **am I improving the Skill half, the CLI half, or the loop that connects them?**
 
@@ -43,8 +43,8 @@ Architecture (single process, single binary):
 
 Key files:
 - `Cargo.toml` — axum, tokio, serde, serde_json, reqwest (stream+json), futures, regex, tower-http, tokio-util
-- `src/main.rs` — Config, sessions, commands, HTTP/WebSocket server, main loop (~1710 lines)
-- `src/cli.rs` — CLI subcommands (start/stop/restart/status/update/install/health/help/--version), setup wizard (~882 lines)
+- `src/main.rs` — Config, sessions, commands, HTTP/WebSocket server, main loop (~1716 lines)
+- `src/cli.rs` — CLI subcommands (start/stop/restart/status/update/install/health/help/--version), setup wizard (~880 lines)
 - `src/providers.rs` — LLM streaming + non-streaming client: OpenAI + Anthropic SSE parsing, message conversion, conversation compression (~436 lines)
 - `src/prompts.rs` — Session prompt init/load logic, template discovery, daily memory date helpers (~144 lines)
 - `docs/reference/templates/` — 7 prompt template files (BOOTSTRAP.md, AGENT.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md) copied to session workspaces on creation
@@ -81,7 +81,7 @@ Key files:
 9. **Context Management** (~20 lines) — Token estimation + message pruning
 10. **Session Persistence & Ownership** (~120 lines) — Save/load to ~/.lingclaw/sessions/, `list_saved_session_summaries()`, `build_history_payload()`, `trim_incomplete_tool_calls()` for safe shutdown; `ClaimSessionResult` enum + `try_claim_session()` (4-phase atomic: quick active check → orphan claim from memory → unlocked disk load → re-lock atomic insert), `claim_requested_session()` (wait-and-claim with 3s timeout for browser refresh), `refresh_session_system_prompt()`, `send_sessions_list()` (merge in-memory + disk, sort by `updated_at`); save-before-remove pattern in all session transitions
 11. **Chat Commands** (~300 lines) — 10 slash commands: /new (compress+save to memory+clear, cancel-aware), /session_new (save-before-remove, create new session), /switch (save-before-remove, delegates to `try_claim_session()`, early-return on save failure), /rename, /model, /think, /skills, /status, /clear, /help
-12. **WebSocket Handler** (~300 lines) — Agent loop with round tracking and `CancellationToken`; session-aware reconnect at connect (`?session=` query param with `claim_requested_session()` wait-and-claim, 3s timeout); system prompt (messages[0]) refreshed every round; cancel-aware LLM streaming and tool execution; auto-save after each exchange; `trim_incomplete_tool_calls` on shutdown/disconnect
+12. **WebSocket Handler** (~300 lines) — Agent loop with unlimited tool rounds (`AGENT_HARD_CAP_ROUNDS = 200` as runaway protection) and `CancellationToken`; incremental session save after each tool round (clone snapshot, release lock, then disk I/O); session-aware reconnect at connect (`?session=` query param with `claim_requested_session()` wait-and-claim, 3s timeout); system prompt (messages[0]) refreshed every round; cancel-aware LLM streaming and tool execution; auto-save after each exchange; `trim_incomplete_tool_calls` on shutdown/disconnect
 13. **HTTP API** (~50 lines) — /api/health, /api/sessions, /api/shutdown (POST, Bearer token auth)
 14. **Main** (~70 lines) — CLI args (`--serve`, `--install-daemon`, `--port`), subcommand dispatch via `cli::handle_cli_command()`, setup wizard via `cli::run_setup_wizard()`, `CancellationToken` + `with_graceful_shutdown`, per-port shutdown token generation + file write, post-shutdown session flush + token cleanup
 
@@ -138,7 +138,7 @@ Key files:
 
 1. Read existing code first — understand the module map before changing anything
 2. Classify your change: **Skill** (prompt/context/LLM), **CLI** (tools/security), or **Loop** (handler/session/commands)
-3. When adding features, check line count — budget is 3000, currently ~1710
+3. When adding features, check line count — budget is 3000, currently ~1716
 4. Test changes: `cargo clippy` then `cargo build` then `cargo run`
 5. For Skill issues: check `build_system_prompt()`, `prune_messages()`, `estimate_tokens()` in `src/main.rs`; `call_llm_stream_openai()` / `call_llm_stream_anthropic()` in `src/providers.rs`; `TEMPLATE_FILES`, `templates_dir()`, `init_session_prompt_files()`, `load_session_prompt_files()` in `src/prompts.rs`; template content in `docs/reference/templates/`
 6. For CLI issues: check `src/tools/mod.rs` (`tool_specs()`, `execute_tool()`) plus `check_dangerous_command()` and `resolve_path()` in `src/main.rs`

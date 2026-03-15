@@ -5,7 +5,6 @@
     "apiKey": "sk-your-api-key-here",
     "apiBase": "https://api.openai.com/v1",
     "execTimeout": 30,
-    "maxToolRounds": 20,
     "maxContextTokens": 32000,
     "maxOutputBytes": 51200,
     "maxFileBytes": 204800

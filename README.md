@@ -97,7 +97,6 @@ Model references use `provider/model` format (e.g. `my-provider/gpt-4o-mini`). S
 | `LINGCLAW_MODEL` | `gpt-4o-mini` | Model name (claude-* triggers Anthropic) |
 | `LINGCLAW_PORT` | `3000` | HTTP listen port |
 | `LINGCLAW_EXEC_TIMEOUT` | `30` | Shell command timeout (seconds) |
-| `LINGCLAW_MAX_TOOL_ROUNDS` | `20` | Max tool call rounds per message |
 | `LINGCLAW_MAX_CONTEXT_TOKENS` | `32000` | Context window token budget |
 
 ## Commands

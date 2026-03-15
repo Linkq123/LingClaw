@@ -81,7 +81,6 @@ pub(crate) struct Config {
     pub(crate) port: u16,
     pub(crate) max_context_tokens: usize,
     pub(crate) exec_timeout: Duration,
-    pub(crate) max_tool_rounds: usize,
     pub(crate) max_output_bytes: usize,
     pub(crate) max_file_bytes: usize,
 }
@@ -154,9 +153,6 @@ impl Config {
                     .or_else(|| std::env::var("LINGCLAW_EXEC_TIMEOUT").ok()?.parse().ok())
                     .unwrap_or(30),
             ),
-            max_tool_rounds: settings.max_tool_rounds
-                .or_else(|| std::env::var("LINGCLAW_MAX_TOOL_ROUNDS").ok()?.parse().ok())
-                .unwrap_or(20),
             max_output_bytes: settings.max_output_bytes.unwrap_or(50 * 1024),
             max_file_bytes: settings.max_file_bytes.unwrap_or(200 * 1024),
         }
@@ -222,8 +218,6 @@ struct JsonSettings {
     api_base: Option<String>,
     #[serde(rename = "execTimeout")]
     exec_timeout: Option<u64>,
-    #[serde(rename = "maxToolRounds")]
-    max_tool_rounds: Option<usize>,
     #[serde(rename = "maxContextTokens")]
     max_context_tokens: Option<usize>,
     #[serde(rename = "maxOutputBytes")]
@@ -1403,9 +1397,25 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             }
         }
 
-        let mut completed = false;
         let mut shutting_down = false;
-        'agent: for round in 0..state.config.max_tool_rounds {
+        let mut round: usize = 0;
+        const AGENT_HARD_CAP_ROUNDS: usize = 200;
+        'agent: loop {
+            // Hard cap: detect runaway tool loops (normal tasks won't hit 200)
+            if round >= AGENT_HARD_CAP_ROUNDS {
+                ws_send(
+                    &mut tx,
+                    &json!({
+                        "type": "system",
+                        "content": format!(
+                            "Detected abnormal tool loop ({} consecutive rounds). Stopping.",
+                            AGENT_HARD_CAP_ROUNDS
+                        )
+                    }),
+                )
+                .await;
+                break;
+            }
             // Check shutdown before starting a new round
             if cancel.is_cancelled() {
                 shutting_down = true;
@@ -1526,36 +1536,33 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         // Loop continues → LLM processes tool results
                     }
 
-                    if !has_tools {
+                    if has_tools {
+                        // Incremental save after each tool round so progress
+                        // is not lost during long tool chains (clone+release lock before disk I/O)
+                        let snapshot = {
+                            let sessions = state.sessions.lock().await;
+                            sessions.get(&current_session_id).cloned()
+                        };
+                        if let Some(ref s) = snapshot {
+                            let _ = save_session_to_disk(s).await;
+                        }
+                    } else {
                         ws_send(&mut tx, &json!({"type":"done"})).await;
-                        completed = true;
                         break;
                     }
                 }
                 Err(e) => {
                     ws_send(&mut tx, &json!({"type":"error","content":e})).await;
-                    completed = true;
                     break;
                 }
             }
+            round += 1;
         }
 
         if shutting_down {
             ws_send(
                 &mut tx,
                 &json!({"type":"system","content":"Server shutting down."}),
-            )
-            .await;
-        } else if !completed {
-            ws_send(
-                &mut tx,
-                &json!({
-                    "type":"system",
-                    "content": format!(
-                        "Reached maximum tool rounds ({}). Stopping.",
-                        state.config.max_tool_rounds
-                    )
-                }),
             )
             .await;
         }
@@ -1793,7 +1800,6 @@ async fn main() {
         eprintln!("  Config providers: {} ({} models)", names.join(", "), total);
     }
     eprintln!("  Exec timeout:  {}s", config.exec_timeout.as_secs());
-    eprintln!("  Max rounds:    {}", config.max_tool_rounds);
     eprintln!("  Context limit: {} tokens", config.max_context_tokens);
 
     let shutdown = CancellationToken::new();
