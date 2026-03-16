@@ -49,6 +49,24 @@ impl std::fmt::Display for AgentPhase {
     }
 }
 
+/// Why the agent loop terminated normally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FinishReason {
+    /// Model produced content with no pending tool calls — normal completion.
+    Complete,
+    /// Model produced no content and no tool calls — unusual empty response.
+    Empty,
+}
+
+impl FinishReason {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::Empty => "empty",
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 //  Round-level state tracker
 // ──────────────────────────────────────────────────────────────────────────────
@@ -64,8 +82,9 @@ pub(crate) struct AgentLoopCtx {
     /// Total tool calls executed in this turn.
     pub(crate) tool_calls: usize,
     /// Whether the ReAct visibility is enabled (controls WS events).
-    #[allow(dead_code)] // Phase 3: controls WS phase events
     pub(crate) show_react: bool,
+    /// Why the loop finished (set by `transition_to_finish`).
+    pub(crate) finish_reason: Option<FinishReason>,
 }
 
 impl AgentLoopCtx {
@@ -75,6 +94,7 @@ impl AgentLoopCtx {
             cycles: 0,
             tool_calls: 0,
             show_react,
+            finish_reason: None,
         }
     }
 
@@ -109,8 +129,9 @@ impl AgentLoopCtx {
     }
 
     /// Transition: Analyze → Finish (model responded without tool_calls).
-    pub(crate) fn transition_to_finish(&mut self) {
+    pub(crate) fn transition_to_finish(&mut self, reason: FinishReason) {
         debug_assert_eq!(self.phase, AgentPhase::Analyze, "Finish requires Analyze");
+        self.finish_reason = Some(reason);
         self.phase = AgentPhase::Finish;
     }
 }
@@ -208,17 +229,42 @@ pub(crate) fn maybe_annotate_observation(tool_name: &str, result: &str) -> Strin
 //  Finish heuristic
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Basic finish check: the model produced a response with content and no
-/// tool_calls. Phase 3 will extend with task-type-aware verification.
-#[allow(dead_code)] // Phase 3: task-type-aware finish heuristic
+/// Basic finish check: the model produced content with no tool_calls.
+#[cfg(test)]
 pub(crate) fn is_finish(has_content: bool, has_tool_calls: bool) -> bool {
     has_content && !has_tool_calls
 }
 
 /// Empty-response finish: no content and no tool_calls.
-#[allow(dead_code)] // Phase 3: task-type-aware finish
+#[cfg(test)]
 pub(crate) fn is_empty_finish(has_content: bool, has_tool_calls: bool) -> bool {
     !has_content && !has_tool_calls
+}
+
+/// Evaluate model response and decide whether to finish or continue.
+/// Returns `Some(reason)` if the loop should finish, `None` if tool
+/// calls are pending and the loop should continue to Act.
+pub(crate) fn evaluate_finish(has_content: bool, has_tool_calls: bool) -> Option<FinishReason> {
+    if has_tool_calls {
+        return None;
+    }
+    if has_content {
+        Some(FinishReason::Complete)
+    } else {
+        Some(FinishReason::Empty)
+    }
+}
+
+/// Compute effective think level when session mode is "auto".
+/// Adapts reasoning budget based on cycle depth and observation context.
+/// Called only for auto-mode sessions with reasoning-capable models.
+pub(crate) fn auto_think_level(cycles: usize, has_observation: bool) -> &'static str {
+    match (cycles, has_observation) {
+        (0, _) => "medium",
+        (_, true) if cycles <= 5 => "high",
+        (1..=5, false) => "medium",
+        _ => "low",
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -249,18 +295,20 @@ mod tests {
         assert_eq!(ctx.cycles, 1);
 
         // Analyze → Finish
-        ctx.transition_to_finish();
+        ctx.transition_to_finish(FinishReason::Complete);
         assert_eq!(ctx.phase(), AgentPhase::Finish);
+        assert_eq!(ctx.finish_reason, Some(FinishReason::Complete));
     }
 
     #[test]
     fn direct_finish_without_tools() {
         let mut ctx = AgentLoopCtx::new(false);
         assert_eq!(ctx.phase(), AgentPhase::Analyze);
-        ctx.transition_to_finish();
+        ctx.transition_to_finish(FinishReason::Empty);
         assert_eq!(ctx.phase(), AgentPhase::Finish);
         assert_eq!(ctx.cycles, 0);
         assert_eq!(ctx.tool_calls, 0);
+        assert_eq!(ctx.finish_reason, Some(FinishReason::Empty));
     }
 
     #[test]
@@ -274,7 +322,7 @@ mod tests {
         }
         assert_eq!(ctx.cycles, 5);
         assert_eq!(ctx.tool_calls, 5);
-        ctx.transition_to_finish();
+        ctx.transition_to_finish(FinishReason::Complete);
         assert_eq!(ctx.phase(), AgentPhase::Finish);
     }
 
@@ -292,7 +340,7 @@ mod tests {
     fn invalid_finish_from_act() {
         let mut ctx = AgentLoopCtx::new(false);
         ctx.transition_to_act();
-        ctx.transition_to_finish(); // wrong: should be in Analyze
+        ctx.transition_to_finish(FinishReason::Complete); // wrong: should be in Analyze
     }
 
     #[test]
@@ -314,9 +362,37 @@ mod tests {
     fn finish_heuristic() {
         assert!(is_finish(true, false));
         assert!(!is_finish(true, true));
-        assert!(!is_finish(false, false)); // empty = not a "real" finish
+        assert!(!is_finish(false, false));
         assert!(is_empty_finish(false, false));
         assert!(!is_empty_finish(true, false));
+    }
+
+    #[test]
+    fn evaluate_finish_returns_correct_reasons() {
+        // Tool calls → continue (None)
+        assert_eq!(evaluate_finish(true, true), None);
+        assert_eq!(evaluate_finish(false, true), None);
+        // Content, no tools → Complete
+        assert_eq!(evaluate_finish(true, false), Some(FinishReason::Complete));
+        // No content, no tools → Empty
+        assert_eq!(evaluate_finish(false, false), Some(FinishReason::Empty));
+    }
+
+    #[test]
+    fn auto_think_level_adapts_by_cycle() {
+        // First round: medium
+        assert_eq!(auto_think_level(0, false), "medium");
+        assert_eq!(auto_think_level(0, true), "medium");
+        // Mid rounds with observation: high
+        assert_eq!(auto_think_level(1, true), "high");
+        assert_eq!(auto_think_level(5, true), "high");
+        // Mid rounds without observation: medium
+        assert_eq!(auto_think_level(1, false), "medium");
+        assert_eq!(auto_think_level(5, false), "medium");
+        // Late rounds: low regardless
+        assert_eq!(auto_think_level(6, false), "low");
+        assert_eq!(auto_think_level(6, true), "low");
+        assert_eq!(auto_think_level(100, true), "low");
     }
 
     #[test]

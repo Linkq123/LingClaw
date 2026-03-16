@@ -32,6 +32,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         tool_calls_count: 0,
         model_override: model_override.map(|value| value.to_string()),
         think_level: default_think_level(),
+        show_react: false,
         workspace: PathBuf::new(),
         avatar: None,
     }
@@ -136,6 +137,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         tool_calls_count: 1,
         model_override: None,
         think_level: default_think_level(),
+        show_react: false,
         workspace: PathBuf::new(),
         avatar: None,
     };
@@ -955,6 +957,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         tool_calls_count: 0,
         model_override: None,
         think_level: default_think_level(),
+        show_react: false,
         workspace: workspace.clone(),
         avatar: None,
     };
@@ -1213,6 +1216,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         tool_calls_count: 1,
         model_override: None,
         think_level: default_think_level(),
+        show_react: false,
         workspace: PathBuf::new(),
         avatar: None,
     };
@@ -1299,4 +1303,66 @@ fn hard_cap_events_include_terminal_done_message() {
     assert_eq!(done_event["phase"], "hard_cap");
     assert_eq!(done_event["cycles"], 3);
     assert_eq!(done_event["tool_calls"], 7);
+}
+
+#[test]
+fn finish_reason_label_appears_in_done_event_shape() {
+    // Verify FinishReason labels are valid strings for the done event
+    assert_eq!(agent::FinishReason::Complete.label(), "complete");
+    assert_eq!(agent::FinishReason::Empty.label(), "empty");
+}
+
+#[test]
+fn auto_think_adapts_in_agent_loop_context() {
+    // Simulate the pattern used in the Analyze arm:
+    // auto mode + reasoning model → phase-adapted level
+    let think_level = "auto";
+    let model_supports_reasoning = true;
+
+    // Cycle 0, no observation
+    let effective = if think_level == "auto" && model_supports_reasoning {
+        agent::auto_think_level(0, false).to_owned()
+    } else {
+        think_level.to_owned()
+    };
+    assert_eq!(effective, "medium");
+
+    // Cycle 2, has observation
+    let effective = if think_level == "auto" && model_supports_reasoning {
+        agent::auto_think_level(2, true).to_owned()
+    } else {
+        think_level.to_owned()
+    };
+    assert_eq!(effective, "high");
+
+    // Cycle 10, late round
+    let effective = if think_level == "auto" && model_supports_reasoning {
+        agent::auto_think_level(10, false).to_owned()
+    } else {
+        think_level.to_owned()
+    };
+    assert_eq!(effective, "low");
+
+    // Explicit level → no adaptation
+    let think_level = "high";
+    let effective = if think_level == "auto" && model_supports_reasoning {
+        agent::auto_think_level(5, true).to_owned()
+    } else {
+        think_level.to_owned()
+    };
+    assert_eq!(effective, "high");
+}
+
+#[test]
+fn show_react_field_defaults_to_false_in_deserialized_session() {
+    let json_str = r#"{
+        "id": "test",
+        "name": "Test",
+        "messages": [],
+        "created_at": 0,
+        "updated_at": 0,
+        "tool_calls_count": 0
+    }"#;
+    let session: Session = serde_json::from_str(json_str).unwrap();
+    assert!(!session.show_react);
 }

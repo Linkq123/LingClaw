@@ -623,6 +623,8 @@ struct Session {
     model_override: Option<String>,
     #[serde(default = "default_think_level")]
     think_level: String,
+    #[serde(default)]
+    show_react: bool,
     #[serde(skip)]
     workspace: PathBuf,
     /// Avatar from IDENTITY.md (transient, not persisted)
@@ -661,6 +663,7 @@ impl Session {
             tool_calls_count: 0,
             model_override: None,
             think_level: default_think_level(),
+            show_react: false,
             workspace,
             avatar,
         }
@@ -1432,11 +1435,13 @@ fn build_session_status(session: &Session, config: &Config) -> String {
          resolved_model_id: {}\n\
          max_tokens: {model_max_tokens}\n\
          context_est: {estimated_tokens}/{ctx_limit}\n\
-         think: {}",
+         think: {}\n\
+         react: {}",
         resolved.provider.label(),
         resolved.api_base,
         resolved.model_id,
         session.think_level,
+        if session.show_react { "on" } else { "off" },
     )
 }
 
@@ -2118,6 +2123,55 @@ async fn handle_command(
             }
         }
 
+        "/react" => {
+            if arg.is_empty() {
+                let sessions = state.sessions.lock().await;
+                let on = sessions
+                    .get(current_session_id)
+                    .map(|s| s.show_react)
+                    .unwrap_or(false);
+                return Some(CommandResult {
+                    response: format!(
+                        "react: {}\nUsage: /react <on|off>",
+                        if on { "on" } else { "off" }
+                    ),
+                    response_type: "system",
+                    new_session_id: None,
+                    sessions_changed: false,
+                });
+            }
+            let val = arg.to_lowercase();
+            let on = match val.as_str() {
+                "on" | "true" | "1" => true,
+                "off" | "false" | "0" => false,
+                _ => {
+                    return Some(CommandResult {
+                        response: format!("Invalid value: {arg}\nUsage: /react <on|off>"),
+                        response_type: "system",
+                        new_session_id: None,
+                        sessions_changed: false,
+                    });
+                }
+            };
+            let mut sessions = state.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(current_session_id) {
+                session.show_react = on;
+                Some(CommandResult {
+                    response: format!("React visibility: {}", if on { "on" } else { "off" }),
+                    response_type: "system",
+                    new_session_id: None,
+                    sessions_changed: true,
+                })
+            } else {
+                Some(CommandResult {
+                    response: "Session not found".into(),
+                    response_type: "system",
+                    new_session_id: None,
+                    sessions_changed: false,
+                })
+            }
+        }
+
         "/help" => {
             let mut help = "\
 Commands:
@@ -2125,6 +2179,7 @@ Commands:
   /status          Show session status
   /model [name]    Show or switch model
   /think [level]   Set thinking mode (auto|off|minimal|low|medium|high|xhigh)
+  /react [on|off]  Toggle ReAct phase visibility
   /skills          List available skills
   /rename <name>   Rename current session
   /clear           Clear messages (keep system prompt)
@@ -2453,9 +2508,17 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             }
         }
 
+        let show_react = {
+            let sessions = state.sessions.lock().await;
+            sessions
+                .get(&current_session_id)
+                .map(|s| s.show_react)
+                .unwrap_or(false)
+        };
+
         let mut shutting_down = false;
         let mut round: usize = 0;
-        let mut react_ctx = agent::AgentLoopCtx::new(false);
+        let mut react_ctx = agent::AgentLoopCtx::new(show_react);
         const AGENT_HARD_CAP_ROUNDS: usize = 200;
 
         // Inter-phase state: Analyze → Act → Observe
@@ -2486,6 +2549,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         ws_send(&tx, &done_event).await;
                         break;
                     }
+
+                    let had_observation_hint = last_observation_hint.is_some();
 
                     let (msgs_snapshot, model, workspace, think_level, prev_avatar) = {
                         let mut sessions = state.sessions.lock().await;
@@ -2556,6 +2621,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
                     let resolved = state.config.resolve_model(&model);
 
+                    // Phase 3: adapt think level based on cycle depth
+                    let effective_think = if think_level == "auto" {
+                        if resolved.reasoning || resolved.thinking_format.is_some() {
+                            agent::auto_think_level(react_ctx.cycles, had_observation_hint)
+                                .to_owned()
+                        } else {
+                            "off".to_owned()
+                        }
+                    } else {
+                        think_level.clone()
+                    };
+
                     let extra_tools: Vec<serde_json::Value> = if cycle_is_main {
                         match resolved.provider {
                             Provider::Anthropic => admin_tool_definitions_anthropic(),
@@ -2579,13 +2656,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             &resolved,
                             &msgs_snapshot,
                             &tx,
-                            &think_level,
+                            &effective_think,
                             &extra_tools,
                         ) => r,
                     };
                     match llm_result {
                         Ok(resp) => {
-                            let _has_content = resp.message.has_nonempty_content();
+                            let has_content = resp.message.has_nonempty_content();
                             let has_tools = resp.message.has_tool_calls();
                             let should_persist = !resp.message.is_empty_assistant_message();
 
@@ -2597,11 +2674,25 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                                 }
                             }
 
-                            if has_tools {
+                            if let Some(reason) = agent::evaluate_finish(has_content, has_tools) {
+                                react_ctx.transition_to_finish(reason);
+                                if react_ctx.show_react {
+                                    ws_send(
+                                        &tx,
+                                        &json!({"type":"react_phase","phase":"finish","cycle":react_ctx.cycles}),
+                                    )
+                                    .await;
+                                }
+                            } else {
                                 pending_tool_calls = resp.message.tool_calls.unwrap_or_default();
                                 react_ctx.transition_to_act();
-                            } else {
-                                react_ctx.transition_to_finish();
+                                if react_ctx.show_react {
+                                    ws_send(
+                                        &tx,
+                                        &json!({"type":"react_phase","phase":"act","cycle":react_ctx.cycles}),
+                                    )
+                                    .await;
+                                }
                             }
                             round += 1;
                         }
@@ -2698,6 +2789,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     let tc_count = pending_tool_calls.len();
                     pending_tool_calls.clear();
                     react_ctx.transition_to_observe(tc_count);
+                    if react_ctx.show_react {
+                        ws_send(
+                            &tx,
+                            &json!({"type":"react_phase","phase":"observe","cycle":react_ctx.cycles}),
+                        )
+                        .await;
+                    }
                 } // end Act
 
                 // ── Observe: summarize large results, save to disk ───────────
@@ -2732,6 +2830,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     }
 
                     react_ctx.transition_to_analyze();
+                    if react_ctx.show_react {
+                        ws_send(
+                            &tx,
+                            &json!({"type":"react_phase","phase":"analyze","cycle":react_ctx.cycles}),
+                        )
+                        .await;
+                    }
                 } // end Observe
 
                 // ── Finish: send done, save, break ───────────────────────────
@@ -2745,11 +2850,17 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         let _ = save_session_to_disk(s).await;
                     }
 
+                    let finish_label = react_ctx
+                        .finish_reason
+                        .map(|r| r.label())
+                        .unwrap_or("complete");
+
                     ws_send(
                         &tx,
                         &json!({
                             "type":"done",
                             "phase":"finish",
+                            "reason": finish_label,
                             "cycles": react_ctx.cycles,
                             "tool_calls": react_ctx.tool_calls,
                         }),

@@ -12,16 +12,16 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 
 - **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
 - **2 主会话管理工具**：`list_sessions`、`delete_session`
-- **12 斜杠命令**：`/new`、`/session_new`、`/switch`、`/rename`、`/model`、`/think`、`/skills`、`/status`、`/clear`、`/help`、`/sessions`、`/delete`
+- **13 斜杠命令**：`/new`、`/session_new`、`/switch`、`/rename`、`/model`、`/think`、`/react`、`/skills`、`/status`、`/clear`、`/help`、`/sessions`、`/delete`
 - **双 Provider 模型路由**：OpenAI + Anthropic，支持 `provider/model` 和纯 model ID
 - **Per-session 模型覆盖**：运行时通过 `/model` 切换
 - **持久化多会话**：每个会话有独立工作区和磁盘存档
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
 - **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
-- **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环，每个阶段一个 match arm
+- **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环，`evaluate_finish()` 结构化完成判定，`auto_think_level()` 按循环深度动态调整推理预算
 - **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留
-- **推理可见性控制**：规划中；当前仅保留内部 phase 元数据，尚未提供 `/react` 命令或配置开关
+- **推理可见性控制**：`/react on|off` 开关控制 ReAct 阶段转换 WS 事件（`react_phase`），`done` 事件包含 `reason`（`complete` | `empty`）
 - **安全控制**：危险命令检测、沙盒路径解析、SSRF 阻断、重定向阻断、输出/文件大小上限
 
 ## Quick Start
@@ -150,6 +150,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `/rename <name>` | 重命名当前会话 |
 | `/model [name]` | 查看可用模型或切换当前会话模型 |
 | `/think [level]` | 设置思维模式：`auto`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh` |
+| `/react [on\|off]` | 切换 ReAct 阶段可见性（启用后每次阶段转换发送 `react_phase` WS 事件） |
 | `/skills` | 列出可用工具帮助 |
 | `/status` | 显示模型、provider、上下文估算、思维级别 |
 | `/clear` | 清空消息但保留系统提示 |
@@ -257,8 +258,8 @@ Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的
 
 - **不回退到文本协议**：保留 OpenAI/Anthropic 原生结构化 tool calling，不使用文本版 `Action: tool_name\nAction Input: {...}` 解析
 - **不污染对话历史**：完整思维链仅在 `think` 工具内部或 provider reasoning stream 中存在，不写入主消息序列
-- **推理可见性规划中**：当前发送 phase 元数据 + observation WS 事件，UI 开关与配置项尚未实现
-- **provider 层感知状态**：不同阶段可动态调整 reasoning 预算和输出期望
+- **推理可见性已实现**：`/react on` 启用 `react_phase` WS 事件，`done` 事件包含结构化 `reason` 字段
+- **provider 层感知状态**：`auto` 模式下 `auto_think_level()` 根据循环深度动态调整推理预算（首轮 medium / 有 observation 时 high / 深轮 low）
 
 ### Agent Loop 详解
 
@@ -273,10 +274,12 @@ handle_socket()
   │    │
   │    ├─ AgentPhase::Analyze
   │    │    ├─ 构建 system prompt + 注入 observation hint
+  │    │    ├─ auto_think_level() 计算有效推理级别
   │    │    ├─ prune messages
   │    │    ├─ call_llm_stream() → 流式输出到前端
+  │    │    ├─ evaluate_finish() → Finish(reason) | Continue
   │    │    ├─ 有 tool_calls → transition_to_act()
-  │    │    └─ 无 tool_calls → transition_to_finish()
+  │    │    └─ 无 tool_calls → transition_to_finish(reason)
   │    │
   │    ├─ AgentPhase::Act
   │    │    ├─ 安全检查
@@ -305,9 +308,9 @@ handle_socket()
 
 ```text
 src/
-├── main.rs          (~3100 行) — Config, Session, Agent Loop (phase-driven), 命令处理, HTTP 路由
-├── main_tests.rs    (~1290 行) — 主流程测试 + observation 摘要集成测试
-├── agent.rs         (~370 行)  — AgentPhase 状态机, 非破坏性 Observation 摘要, Finish 判定
+├── main.rs          (~3150 行) — Config, Session, Agent Loop (phase-driven), 命令处理, HTTP 路由
+├── main_tests.rs    (~1370 行) — 主流程测试 + observation 摘要 + finish heuristic + auto think 集成测试
+├── agent.rs         (~430 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
 ├── cli.rs           (~1100 行) — CLI 子命令, 设置向导, 安装/更新
 ├── providers.rs     (~740 行)  — OpenAI/Anthropic 流式调用, 模型解析
 ├── prompts.rs       (~420 行)  — 提示文件初始化/加载, 头像解析
