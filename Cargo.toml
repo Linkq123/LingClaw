@@ -1,6 +1,6 @@
 [package]
 name = "lingclaw"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "A ~3400-line Rust personal AI assistant"
 
@@ -14,3 +14,4 @@ futures = "0.3"
 regex = "1"
 tower-http = { version = "0.6", features = ["fs", "cors"] }
 tokio-util = "0.7"
+base64 = "0.22"

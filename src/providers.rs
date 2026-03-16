@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::{SystemTime, UNIX_EPOCH}};
 
 use futures::StreamExt;
 use reqwest::Client;
@@ -16,6 +16,11 @@ pub(crate) struct ResolvedModel {
     pub(crate) api_base: String,
     pub(crate) api_key: String,
     pub(crate) model_id: String,
+    pub(crate) reasoning: bool,
+    /// From model config `compat.thinkingFormat`: "qwen", "openai", "anthropic", etc.
+    pub(crate) thinking_format: Option<String>,
+    /// From model config `maxTokens`.
+    pub(crate) max_tokens: Option<u64>,
 }
 
 pub(crate) struct LlmResponse {
@@ -48,6 +53,7 @@ struct StreamChoice {
 #[derive(Deserialize, Debug)]
 struct StreamDelta {
     content: Option<String>,
+    reasoning_content: Option<String>,
     tool_calls: Option<Vec<DeltaToolCall>>,
 }
 
@@ -72,6 +78,7 @@ struct AnthropicDelta {
     #[serde(rename = "type")]
     delta_type: Option<String>,
     text: Option<String>,
+    thinking: Option<String>,
     partial_json: Option<String>,
 }
 
@@ -86,6 +93,43 @@ struct AnthropicContentBlock {
 // ══════════════════════════════════════════════════════════════════════════════
 //  Message Conversion
 // ══════════════════════════════════════════════════════════════════════════════
+
+/// Convert internal messages to clean OpenAI API format (strips timestamps and
+/// extra fields so the provider receives only role/content/tool_calls/tool_call_id).
+fn convert_messages_to_openai(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+
+    for msg in messages {
+        match msg.role.as_str() {
+            "system" | "user" => {
+                out.push(json!({
+                    "role": msg.role,
+                    "content": msg.content.as_deref().unwrap_or(""),
+                }));
+            }
+            "assistant" => {
+                let mut item = json!({
+                    "role": "assistant",
+                    "content": msg.content,
+                });
+                if let Some(tool_calls) = &msg.tool_calls {
+                    item["tool_calls"] = json!(tool_calls);
+                }
+                out.push(item);
+            }
+            "tool" => {
+                out.push(json!({
+                    "role": "tool",
+                    "tool_call_id": msg.tool_call_id.as_deref().unwrap_or(""),
+                    "content": msg.content.as_deref().unwrap_or(""),
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
 
 /// Convert internal messages to Anthropic API format.
 /// Returns (system_prompt, messages_array).
@@ -163,9 +207,10 @@ pub(crate) async fn call_llm_simple(
     match resolved.provider {
         Provider::OpenAI => {
             let url = format!("{}/chat/completions", resolved.api_base);
+            let api_messages = convert_messages_to_openai(messages);
             let body = json!({
                 "model": resolved.model_id,
-                "messages": messages,
+                "messages": api_messages,
             });
             let resp = http.post(&url)
                 .bearer_auth(&resolved.api_key)
@@ -181,7 +226,7 @@ pub(crate) async fn call_llm_simple(
             Ok(data["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string())
         }
         Provider::Anthropic => {
-            let url = format!("{}/messages", resolved.api_base);
+            let url = format!("{}/v1/messages", resolved.api_base);
             let (system, msgs) = convert_messages_to_anthropic(messages);
             let mut body = json!({
                 "model": resolved.model_id,
@@ -213,37 +258,86 @@ pub(crate) async fn call_llm_simple(
     }
 }
 
+/// Map think_level to OpenAI reasoning_effort string.
+fn think_level_to_reasoning_effort(level: &str) -> &str {
+    match level {
+        "minimal" | "low" => "low",
+        "medium" => "medium",
+        "high" | "xhigh" => "high",
+        _ => "medium",
+    }
+}
+
+/// Map think_level to Anthropic thinking budget_tokens.
+fn think_level_to_budget(level: &str) -> u64 {
+    match level {
+        "minimal" => 1024,
+        "low" => 4096,
+        "medium" => 10240,
+        "high" => 16384,
+        "xhigh" => 32768,
+        _ => 10240,
+    }
+}
+
 pub(crate) async fn call_llm_stream(
     http: &Client,
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
-    tx: &mut WsTx,
+    tx: &WsTx,
+    think_level: &str,
 ) -> Result<LlmResponse, String> {
+    // Resolve "auto": enable thinking at medium level if model supports it, else off
+    let effective_level = if think_level == "auto" {
+        if resolved.reasoning || resolved.thinking_format.is_some() {
+            "medium"
+        } else {
+            "off"
+        }
+    } else {
+        think_level
+    };
     match resolved.provider {
-        Provider::OpenAI => call_llm_stream_openai(http, &resolved.api_base, &resolved.api_key, &resolved.model_id, messages, tx).await,
-        Provider::Anthropic => call_llm_stream_anthropic(http, &resolved.api_base, &resolved.api_key, &resolved.model_id, messages, tx).await,
+        Provider::OpenAI => call_llm_stream_openai(http, resolved, messages, tx, effective_level).await,
+        Provider::Anthropic => call_llm_stream_anthropic(http, resolved, messages, tx, effective_level).await,
     }
 }
 
 async fn call_llm_stream_openai(
     http: &Client,
-    api_base: &str,
-    api_key: &str,
-    model: &str,
+    resolved: &ResolvedModel,
     messages: &[ChatMessage],
-    tx: &mut WsTx,
+    tx: &WsTx,
+    think_level: &str,
 ) -> Result<LlmResponse, String> {
-    let url = format!("{api_base}/chat/completions");
-    let body = json!({
-        "model": model,
-        "messages": messages,
+    let thinking_on = think_level != "off";
+    let url = format!("{}/chat/completions", resolved.api_base);
+    let api_messages = convert_messages_to_openai(messages);
+    let mut body = json!({
+        "model": resolved.model_id,
+        "messages": api_messages,
         "tools": tools::tool_definitions(),
         "stream": true,
     });
+    if thinking_on {
+        let fmt = resolved.thinking_format.as_deref().unwrap_or("openai");
+        match fmt {
+            "qwen" => {
+                body["enable_thinking"] = json!(true);
+            }
+            _ => {
+                // OpenAI-compatible reasoning_effort
+                body["reasoning_effort"] = json!(think_level_to_reasoning_effort(think_level));
+            }
+        }
+    }
+    if let Some(mt) = resolved.max_tokens {
+        body["max_tokens"] = json!(mt);
+    }
 
     let resp = http
         .post(&url)
-        .bearer_auth(api_key)
+        .bearer_auth(&resolved.api_key)
         .json(&body)
         .send()
         .await
@@ -259,8 +353,11 @@ async fn call_llm_stream_openai(
     let mut content_buf = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut partial_buf = String::new();
+    let mut in_thinking = false;
+    let mut client_gone = false;
 
     while let Some(chunk) = stream.next().await {
+        if client_gone { break; }
         let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
         partial_buf.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -281,10 +378,25 @@ async fn call_llm_stream_openai(
                 if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
                     if let Some(choices) = chunk.choices {
                         for choice in choices {
+                            // Thinking/reasoning delta (OpenAI/Qwen)
+                            if let Some(think_text) = &choice.delta.reasoning_content {
+                                if !think_text.is_empty() {
+                                    if !in_thinking {
+                                        in_thinking = true;
+                                        if !ws_send(tx, &json!({"type":"thinking_start"})).await { client_gone = true; break; }
+                                    }
+                                    if !ws_send(tx, &json!({"type":"thinking_delta","content":think_text})).await { client_gone = true; break; }
+                                }
+                            }
+                            if client_gone { break; }
                             // Content delta
                             if let Some(text) = &choice.delta.content {
+                                if in_thinking {
+                                    in_thinking = false;
+                                    let _ = ws_send(tx, &json!({"type":"thinking_done"})).await;
+                                }
                                 content_buf.push_str(text);
-                                ws_send(tx, &json!({"type":"delta","content":text})).await;
+                                if !ws_send(tx, &json!({"type":"delta","content":text})).await { client_gone = true; break; }
                             }
                             // Tool call deltas
                             if let Some(tc_deltas) = &choice.delta.tool_calls {
@@ -324,33 +436,56 @@ async fn call_llm_stream_openai(
         partial_buf = leftover.to_string();
     }
 
+    if client_gone {
+        return Err("Client disconnected".into());
+    }
+
+    // Ensure thinking_done is sent if the stream ended while still in thinking
+    // (e.g. reasoning → tool_calls with no content delta)
+    if in_thinking {
+        ws_send(tx, &json!({"type":"thinking_done"})).await;
+    }
+
     build_llm_response(content_buf, tool_calls)
 }
 
 async fn call_llm_stream_anthropic(
     http: &Client,
-    api_base: &str,
-    api_key: &str,
-    model: &str,
+    resolved: &ResolvedModel,
     messages: &[ChatMessage],
-    tx: &mut WsTx,
+    tx: &WsTx,
+    think_level: &str,
 ) -> Result<LlmResponse, String> {
+    let thinking_on = think_level != "off";
     let (system_prompt, anthropic_msgs) = convert_messages_to_anthropic(messages);
-    let url = format!("{api_base}/v1/messages");
+    let url = format!("{}/v1/messages", resolved.api_base);
+    let base_max = resolved.max_tokens.unwrap_or(8192);
+    let effective_max = if thinking_on {
+        let budget = think_level_to_budget(think_level);
+        base_max + budget
+    } else {
+        base_max
+    };
     let mut body = json!({
-        "model": model,
+        "model": resolved.model_id,
         "messages": anthropic_msgs,
         "tools": tools::tool_definitions_anthropic(),
-        "max_tokens": 8192,
+        "max_tokens": effective_max,
         "stream": true,
     });
+    if thinking_on {
+        body["thinking"] = json!({
+            "type": "enabled",
+            "budget_tokens": think_level_to_budget(think_level),
+        });
+    }
     if !system_prompt.is_empty() {
         body["system"] = json!(system_prompt);
     }
 
     let resp = http
         .post(&url)
-        .header("x-api-key", api_key)
+        .header("x-api-key", &resolved.api_key)
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
         .json(&body)
@@ -370,8 +505,12 @@ async fn call_llm_stream_anthropic(
     let mut partial_buf = String::new();
     // Track current content block index → tool_calls index mapping
     let mut block_tool_idx: HashMap<usize, usize> = HashMap::new();
+    let mut thinking_block_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut in_thinking = false;
+    let mut client_gone = false;
 
     while let Some(chunk) = stream.next().await {
+        if client_gone { break; }
         let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
         partial_buf.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -395,18 +534,36 @@ async fn call_llm_stream_anthropic(
                     "content_block_start" => {
                         if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
                             if let Some(block) = &evt.content_block {
-                                if block.block_type == "tool_use" {
-                                    let idx = tool_calls.len();
-                                    tool_calls.push(ToolCall {
-                                        id: block.id.clone().unwrap_or_default(),
-                                        call_type: "function".into(),
-                                        function: FunctionCall {
-                                            name: block.name.clone().unwrap_or_default(),
-                                            arguments: String::new(),
-                                        },
-                                    });
-                                    if let Some(block_idx) = evt.index {
-                                        block_tool_idx.insert(block_idx, idx);
+                                match block.block_type.as_str() {
+                                    "thinking" => {
+                                        if let Some(block_idx) = evt.index {
+                                            thinking_block_indices.insert(block_idx);
+                                        }
+                                        if !in_thinking {
+                                            in_thinking = true;
+                                            if !ws_send(tx, &json!({"type":"thinking_start"})).await { client_gone = true; }
+                                        }
+                                    }
+                                    "tool_use" => {
+                                        let idx = tool_calls.len();
+                                        tool_calls.push(ToolCall {
+                                            id: block.id.clone().unwrap_or_default(),
+                                            call_type: "function".into(),
+                                            function: FunctionCall {
+                                                name: block.name.clone().unwrap_or_default(),
+                                                arguments: String::new(),
+                                            },
+                                        });
+                                        if let Some(block_idx) = evt.index {
+                                            block_tool_idx.insert(block_idx, idx);
+                                        }
+                                    }
+                                    _ => {
+                                        // text or other block: end thinking if active
+                                        if in_thinking {
+                                            in_thinking = false;
+                                            ws_send(tx, &json!({"type":"thinking_done"})).await;
+                                        }
                                     }
                                 }
                             }
@@ -416,10 +573,19 @@ async fn call_llm_stream_anthropic(
                         if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
                             if let Some(delta) = &evt.delta {
                                 match delta.delta_type.as_deref() {
+                                    Some("thinking_delta") => {
+                                        if let Some(text) = &delta.thinking {
+                                            if !ws_send(tx, &json!({"type":"thinking_delta","content":text})).await { client_gone = true; }
+                                        }
+                                    }
                                     Some("text_delta") => {
+                                        if in_thinking {
+                                            in_thinking = false;
+                                            let _ = ws_send(tx, &json!({"type":"thinking_done"})).await;
+                                        }
                                         if let Some(text) = &delta.text {
                                             content_buf.push_str(text);
-                                            ws_send(tx, &json!({"type":"delta","content":text})).await;
+                                            if !ws_send(tx, &json!({"type":"delta","content":text})).await { client_gone = true; }
                                         }
                                     }
                                     Some("input_json_delta") => {
@@ -438,6 +604,17 @@ async fn call_llm_stream_anthropic(
                             }
                         }
                     }
+                    "content_block_stop" => {
+                        // If a thinking block just stopped, send thinking_done
+                        if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
+                            if let Some(block_idx) = evt.index {
+                                if thinking_block_indices.remove(&block_idx) && in_thinking {
+                                    in_thinking = false;
+                                    let _ = ws_send(tx, &json!({"type":"thinking_done"})).await;
+                                }
+                            }
+                        }
+                    }
                     "message_stop" => {
                         // End of message
                     }
@@ -447,6 +624,14 @@ async fn call_llm_stream_anthropic(
             }
         }
         partial_buf = leftover.to_string();
+    }
+
+    if client_gone {
+        return Err("Client disconnected".into());
+    }
+
+    if in_thinking {
+        ws_send(tx, &json!({"type":"thinking_done"})).await;
     }
 
     build_llm_response(content_buf, tool_calls)
@@ -470,6 +655,12 @@ fn build_llm_response(content_buf: String, tool_calls: Vec<ToolCall>) -> Result<
             content,
             tool_calls: tc,
             tool_call_id: None,
+            timestamp: Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            ),
         },
     })
 }

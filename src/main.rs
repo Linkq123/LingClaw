@@ -8,7 +8,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures::{stream::SplitSink, SinkExt, StreamExt};
+use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -18,7 +18,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
@@ -164,6 +164,14 @@ impl Config {
         // Try "provider/model" format
         if let Some((prov_name, model_id)) = model_ref.split_once('/') {
             if let Some(pc) = self.providers.get(prov_name) {
+                let entry = pc.models.iter().find(|m| m.id == model_id);
+                let reasoning = entry.and_then(|e| e.reasoning).unwrap_or(false);
+                let thinking_format = entry
+                    .and_then(|e| e.compat.as_ref())
+                    .and_then(|c| c.get("thinkingFormat"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let max_tokens = entry.and_then(|e| e.max_tokens);
                 return providers::ResolvedModel {
                     provider: match pc.api.as_str() {
                         "anthropic" => Provider::Anthropic,
@@ -172,6 +180,9 @@ impl Config {
                     api_base: pc.base_url.clone(),
                     api_key: pc.api_key.clone(),
                     model_id: model_id.to_string(),
+                    reasoning,
+                    thinking_format,
+                    max_tokens,
                 };
             }
         }
@@ -181,6 +192,9 @@ impl Config {
             api_base: self.api_base.clone(),
             api_key: self.api_key.clone(),
             model_id: model_ref.to_string(),
+            reasoning: false,
+            thinking_format: None,
+            max_tokens: None,
         }
     }
 
@@ -196,6 +210,33 @@ impl Config {
             models.push(self.model.clone());
         }
         models
+    }
+
+    /// Look up the JsonModelEntry for a given model reference ("provider/model" or plain id).
+    fn find_model_entry(&self, model_ref: &str) -> Option<&JsonModelEntry> {
+        if let Some((prov_name, model_id)) = model_ref.split_once('/') {
+            if let Some(pc) = self.providers.get(prov_name) {
+                return pc.models.iter().find(|m| m.id == model_id);
+            }
+        }
+        // Fallback: search all providers by plain id
+        for pc in self.providers.values() {
+            if let Some(entry) = pc.models.iter().find(|m| m.id == model_ref) {
+                return Some(entry);
+            }
+        }
+        None
+    }
+
+    /// Return the effective context token limit for the given model.
+    /// Priority: model's contextWindow → settings.maxContextTokens → 32000.
+    fn context_limit_for_model(&self, model_ref: &str) -> usize {
+        if let Some(entry) = self.find_model_entry(model_ref) {
+            if let Some(cw) = entry.context_window {
+                return cw as usize;
+            }
+        }
+        self.max_context_tokens
     }
 }
 
@@ -323,6 +364,8 @@ struct ChatMessage {
     tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timestamp: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -371,10 +414,13 @@ struct Session {
     think_level: String,
     #[serde(skip)]
     workspace: PathBuf,
+    /// Avatar from IDENTITY.md (transient, not persisted)
+    #[serde(skip)]
+    avatar: Option<String>,
 }
 
 fn default_think_level() -> String {
-    "off".to_string()
+    "auto".to_string()
 }
 
 /// Per-session workspace: ~/.lingclaw/{sessionId}/workspace
@@ -391,6 +437,7 @@ impl Session {
         let workspace = session_workspace_path(&id);
         std::fs::create_dir_all(&workspace).ok();
         prompts::init_session_prompt_files(&workspace);
+        let avatar = prompts::parse_identity_avatar(&workspace);
         Self {
             id,
             name: "New Chat".into(),
@@ -399,8 +446,9 @@ impl Session {
             updated_at: now_epoch(),
             tool_calls_count: 0,
             model_override: None,
-            think_level: "off".into(),
+            think_level: default_think_level(),
             workspace,
+            avatar,
         }
     }
 
@@ -458,6 +506,7 @@ fn build_system_prompt(config: &Config, workspace: &Path, model: &str) -> ChatMe
         content: Some(prompt),
         tool_calls: None,
         tool_call_id: None,
+        timestamp: None,
     }
 }
 
@@ -523,10 +572,16 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
+        // Find the last valid UTF-8 char boundary at or before `max`
+        // to avoid panicking on multi-byte characters.
+        let end = (0..=max)
+            .rev()
+            .find(|&i| s.is_char_boundary(i))
+            .unwrap_or(0);
         format!(
             "{}...\n[truncated at {} bytes, total {} bytes]",
-            &s[..max],
-            max,
+            &s[..end],
+            end,
             s.len()
         )
     }
@@ -552,10 +607,35 @@ fn matches_glob(name: &str, pattern: &str) -> bool {
     }
 }
 
-type WsTx = SplitSink<WebSocket, WsMsg>;
+pub(crate) type WsTx = mpsc::Sender<String>;
 
-async fn ws_send(tx: &mut WsTx, data: &serde_json::Value) {
-    let _ = tx.send(WsMsg::Text(data.to_string().into())).await;
+pub(crate) async fn ws_send(tx: &WsTx, data: &serde_json::Value) -> bool {
+    tx.send(data.to_string()).await.is_ok()
+}
+
+fn ws_try_send(tx: &WsTx, data: &serde_json::Value) -> bool {
+    tx.try_send(data.to_string()).is_ok()
+}
+
+async fn detect_session_avatar_update(session_id: &str, state: &AppState) -> Option<Option<String>> {
+    let (workspace, current_avatar) = {
+        let sessions = state.sessions.lock().await;
+        let session = sessions.get(session_id)?;
+        (session.workspace.clone(), session.avatar.clone())
+    };
+    let fresh = prompts::parse_identity_avatar(&workspace);
+    if fresh != current_avatar {
+        Some(fresh)
+    } else {
+        None
+    }
+}
+
+async fn commit_session_avatar(session_id: &str, avatar: Option<String>, state: &AppState) {
+    let mut sessions = state.sessions.lock().await;
+    if let Some(session) = sessions.get_mut(session_id) {
+        session.avatar = avatar;
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -589,11 +669,57 @@ fn estimate_tokens(messages: &[ChatMessage]) -> usize {
         .sum()
 }
 
+/// Measure the size of the conversational "turn" starting at `start`.
+///
+/// A turn is one of:
+///   - user + optional assistant reply (+ optional tool results)
+///   - assistant without tool_calls (1 message)
+///   - orphaned assistant(tool_calls) + tool results (recovery case)
+///
+/// Returns how many messages belong to this turn.
+fn turn_len(messages: &[ChatMessage], start: usize) -> usize {
+    let msg = &messages[start];
+    if msg.role == "user" {
+        // Remove the user message together with its following assistant reply,
+        // if present, so we prune complete conversational turns.
+        if start + 1 < messages.len() {
+            let next = &messages[start + 1];
+            if next.role == "assistant" {
+                if let Some(tcs) = &next.tool_calls {
+                    if !tcs.is_empty() {
+                        let tool_results = messages[start + 2..]
+                            .iter()
+                            .take_while(|m| m.role == "tool")
+                            .count();
+                        return 2 + tool_results; // user + assistant + tool results
+                    }
+                }
+                return 2; // user + assistant text reply
+            }
+        }
+        return 1; // standalone user
+    }
+    if msg.role == "assistant" {
+        if let Some(tcs) = &msg.tool_calls {
+            if !tcs.is_empty() {
+                let tool_results = messages[start + 1..]
+                    .iter()
+                    .take_while(|m| m.role == "tool")
+                    .count();
+                return 1 + tool_results; // assistant + tool results
+            }
+        }
+    }
+    1 // standalone assistant or tool message
+}
+
 fn prune_messages(messages: &mut Vec<ChatMessage>, max_tokens: usize) {
     // Keep: system message (index 0) + as many recent messages as fit.
-    // Remove oldest non-system messages when over budget.
+    // Remove oldest non-system messages in complete turns so we never
+    // leave orphaned tool_calls or tool results.
     while estimate_tokens(messages) > max_tokens && messages.len() > 2 {
-        messages.remove(1);
+        let count = turn_len(messages, 1);
+        messages.drain(1..1 + count);
     }
 }
 
@@ -652,7 +778,8 @@ fn load_session_from_disk(id: &str) -> Option<Session> {
     let mut session: Session = serde_json::from_str(&data).ok()?;
     session.workspace = session_workspace_path(&session.id);
     std::fs::create_dir_all(&session.workspace).ok();
-    prompts::init_session_prompt_files(&session.workspace);
+    prompts::ensure_session_workspace(&session.workspace);
+    session.avatar = prompts::parse_identity_avatar(&session.workspace);
     Some(session)
 }
 
@@ -757,13 +884,13 @@ fn build_history_payload(session: &Session) -> serde_json::Value {
             "system" => {}
             "user" => {
                 if let Some(c) = &msg.content {
-                    msgs.push(json!({"role":"user","content":c}));
+                    msgs.push(json!({"role":"user","content":c,"timestamp":msg.timestamp}));
                 }
             }
             "assistant" => {
                 if let Some(c) = &msg.content {
                     if !c.is_empty() {
-                        msgs.push(json!({"role":"assistant","content":c}));
+                        msgs.push(json!({"role":"assistant","content":c,"timestamp":msg.timestamp}));
                     }
                 }
                 if let Some(tcs) = &msg.tool_calls {
@@ -862,12 +989,15 @@ async fn handle_command(
                     content: Some("You are a conversation summarizer. Compress the following conversation into a concise markdown summary. Keep key decisions, code changes, problems solved, and important context. Use bullet points. Write in the same language as the conversation. Do NOT wrap in code blocks.".into()),
                     tool_calls: None,
                     tool_call_id: None,
+                    timestamp: None,
                 },
                 ChatMessage {
                     role: "user".into(),
-                    content: Some(conversation_text),
+                    // Cap conversation text to avoid blowing the compression model's context.
+                    content: Some(truncate(&conversation_text, 60_000)),
                     tool_calls: None,
                     tool_call_id: None,
+                    timestamp: Some(now_epoch()),
                 },
             ];
             let resolved = state.config.resolve_model(&model_str);
@@ -1113,14 +1243,14 @@ async fn handle_command(
             match sessions.get(current_session_id) {
                 Some(s) => {
                     let model_ref = s.effective_model(&state.config.model);
+                    let ctx_limit = state.config.context_limit_for_model(model_ref);
                     let tokens = estimate_tokens(&s.messages);
                     Some(CommandResult {
                         response: format!(
                             "agent: LingClaw\n\
                              model: {model_ref}\n\
-                             context: {tokens}/{max_ctx}\n\
+                             context: {tokens}/{ctx_limit}\n\
                              think: {think}",
-                            max_ctx = state.config.max_context_tokens,
                             think = s.think_level,
                         ),
                         new_session_id: None,
@@ -1174,15 +1304,15 @@ async fn handle_command(
         }
 
         "/think" => {
-            const VALID_LEVELS: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh"];
+            const VALID_LEVELS: &[&str] = &["auto", "off", "minimal", "low", "medium", "high", "xhigh"];
             if arg.is_empty() {
                 let sessions = state.sessions.lock().await;
                 let level = sessions
                     .get(current_session_id)
                     .map(|s| s.think_level.as_str())
-                    .unwrap_or("off");
+                    .unwrap_or("auto");
                 return Some(CommandResult {
-                    response: format!("think: {level}\nUsage: /think <off|minimal|low|medium|high|xhigh>"),
+                    response: format!("think: {level}\nUsage: /think <auto|off|minimal|low|medium|high|xhigh>"),
                     new_session_id: None,
                     sessions_changed: false,
                 });
@@ -1190,7 +1320,7 @@ async fn handle_command(
             let level = arg.to_lowercase();
             if !VALID_LEVELS.contains(&level.as_str()) {
                 return Some(CommandResult {
-                    response: format!("Invalid think level: {arg}\nValid: off, minimal, low, medium, high, xhigh"),
+                    response: format!("Invalid think level: {arg}\nValid: auto, off, minimal, low, medium, high, xhigh"),
                     new_session_id: None,
                     sessions_changed: false,
                 });
@@ -1218,7 +1348,7 @@ Commands:
   /new             Compress conversation to memory & clear context
   /status          Show session status
   /model [name]    Show or switch model
-  /think [level]   Set thinking mode (off|minimal|low|medium|high|xhigh)
+  /think [level]   Set thinking mode (auto|off|minimal|low|medium|high|xhigh)
   /skills          List available skills
   /rename <name>   Rename current session
   /clear           Clear messages (keep system prompt)
@@ -1251,7 +1381,40 @@ async fn ws_handler(
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Option<String>) {
-    let (mut tx, mut rx) = socket.split();
+    let (mut socket_tx, mut rx) = socket.split();
+    let (tx, mut outbound_rx) = mpsc::channel::<String>(256);
+    let connection_cancel = CancellationToken::new();
+    let writer_cancel = connection_cancel.clone();
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = outbound_rx.recv().await {
+            if socket_tx.send(WsMsg::Text(msg.into())).await.is_err() {
+                writer_cancel.cancel();
+                break;
+            }
+        }
+    });
+    // Reader task: forward incoming text to a channel and signal disconnect
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<String>(32);
+    let reader_cancel = connection_cancel.clone();
+    let reader = tokio::spawn(async move {
+        while let Some(result) = rx.next().await {
+            match result {
+                Ok(WsMsg::Text(t)) => {
+                    // Use try_send to never block — if the inbound channel is full
+                    // (e.g. agent is busy), drop the message but keep reading so we
+                    // always detect Close / Error frames promptly.
+                    match inbound_tx.try_send(t.to_string()) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                    }
+                }
+                Ok(WsMsg::Close(_)) | Err(_) => break,
+                _ => continue,
+            }
+        }
+        reader_cancel.cancel();
+    });
 
     // Resume a session: prefer the explicitly requested one (browser refresh),
     // then fall back to the most recent unclaimed saved session, then create new.
@@ -1287,13 +1450,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
     if let Some(id) = claimed {
         current_session_id = id.clone();
-        let (name, history) = {
+        let (name, avatar, history) = {
             let sessions = state.sessions.lock().await;
-            let s = sessions.get(&id).expect("just claimed");
-            (s.name.clone(), build_history_payload(s))
+            // Safe: try_claim_session just inserted this id while holding the lock.
+            // Use if-let to satisfy no-unwrap rule, though the None branch is unreachable.
+            if let Some(s) = sessions.get(&id) {
+                (s.name.clone(), s.avatar.clone(), build_history_payload(s))
+            } else {
+                ("New Chat".into(), None, json!({"type":"history","messages":[]}))
+            }
         };
-        ws_send(&mut tx, &json!({"type":"session","id":&id,"name":&name})).await;
-        ws_send(&mut tx, &history).await;
+        ws_send(&tx, &json!({"type":"session","id":&id,"name":&name,"avatar":avatar})).await;
+        ws_send(&tx, &history).await;
     } else {
         let mut session = Session::new();
         let sys = build_system_prompt(
@@ -1303,31 +1471,55 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         );
         session.messages.push(sys);
         current_session_id = session.id.clone();
+        let avatar = session.avatar.clone();
         {
             let mut active = state.active_connections.lock().await;
             let mut sessions = state.sessions.lock().await;
             sessions.insert(current_session_id.clone(), session);
             active.insert(current_session_id.clone());
         }
-        ws_send(&mut tx, &json!({"type":"session","id":&current_session_id,"name":"New Chat"})).await;
+        ws_send(&tx, &json!({"type":"session","id":&current_session_id,"name":"New Chat","avatar":avatar})).await;
     }
 
-    send_sessions_list(&mut tx, &state, &current_session_id).await;
+    send_sessions_list(&tx, &state, &current_session_id).await;
 
     let cancel = state.shutdown.clone();
+    let current_session_ref = Arc::new(Mutex::new(current_session_id.clone()));
+    let poll_cancel = connection_cancel.clone();
+    let poll_state = state.clone();
+    let poll_tx = tx.clone();
+    let poll_session_ref = current_session_ref.clone();
+    let avatar_poller = tokio::spawn(async move {
+        let mut avatar_poll = tokio::time::interval(Duration::from_secs(1));
+        avatar_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                biased;
+                _ = poll_cancel.cancelled() => break,
+                _ = avatar_poll.tick() => {
+                    let session_id = {
+                        let guard = poll_session_ref.lock().await;
+                        guard.clone()
+                    };
+                    if let Some(avatar) = detect_session_avatar_update(&session_id, &poll_state).await {
+                        if ws_try_send(&poll_tx, &json!({"type":"avatar_update","avatar":avatar,"session_id":&session_id})) {
+                            commit_session_avatar(&session_id, avatar, &poll_state).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
+
     loop {
-        let msg = tokio::select! {
+        let text = tokio::select! {
             biased;
             _ = cancel.cancelled() => break,
-            result = rx.next() => match result {
-                Some(Ok(m)) => m,
-                _ => break,
+            _ = connection_cancel.cancelled() => break,
+            result = inbound_rx.recv() => match result {
+                Some(text) => text,
+                None => break,
             },
-        };
-        let text = match msg {
-            WsMsg::Text(t) => t.to_string(),
-            WsMsg::Close(_) => break,
-            _ => continue,
         };
 
         let trimmed = text.trim();
@@ -1335,7 +1527,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             continue;
         }
 
-        // ── Slash commands ──────────────────────────────────────────────
         if trimmed.starts_with('/') {
             let cmd_result = handle_command(trimmed, &current_session_id, &state, &cancel).await;
             if cancel.is_cancelled() {
@@ -1343,7 +1534,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             }
             if let Some(result) = cmd_result {
                 ws_send(
-                    &mut tx,
+                    &tx,
                     &json!({"type":"system","content":result.response}),
                 )
                 .await;
@@ -1355,27 +1546,35 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         ac.insert(new_id.clone());
                     }
                     current_session_id = new_id.clone();
-                    let name = {
+                    {
+                        let mut active_id = current_session_ref.lock().await;
+                        *active_id = current_session_id.clone();
+                    }
+                    let (name, avatar) = {
                         let sessions = state.sessions.lock().await;
-                        sessions.get(&current_session_id).map(|s| s.name.clone())
-                            .unwrap_or_else(|| "New Chat".into())
+                        sessions.get(&current_session_id).map(|s| (s.name.clone(), s.avatar.clone()))
+                            .unwrap_or_else(|| ("New Chat".into(), None))
                     };
-                    ws_send(&mut tx, &json!({"type":"session_switched","id":&new_id,"name":&name})).await;
-                    // Send chat history for the switched-to session
+                    ws_send(&tx, &json!({"type":"session_switched","id":&new_id,"name":&name,"avatar":avatar})).await;
                     let history = {
                         let sessions = state.sessions.lock().await;
                         sessions.get(&current_session_id).map(build_history_payload)
                     };
                     if let Some(payload) = history {
-                        ws_send(&mut tx, &payload).await;
+                        ws_send(&tx, &payload).await;
                     }
                 }
                 if result.sessions_changed {
-                    send_sessions_list(&mut tx, &state, &current_session_id).await;
+                    send_sessions_list(&tx, &state, &current_session_id).await;
+                }
+                if let Some(avatar) = detect_session_avatar_update(&current_session_id, &state).await {
+                    if ws_send(&tx, &json!({"type":"avatar_update","avatar":avatar,"session_id":&current_session_id})).await {
+                        commit_session_avatar(&current_session_id, avatar, &state).await;
+                    }
                 }
             } else {
                 ws_send(
-                    &mut tx,
+                    &tx,
                     &json!({"type":"system","content":"Unknown command. Type /help."}),
                 )
                 .await;
@@ -1383,7 +1582,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             continue;
         }
 
-        // ── Normal message → Agent loop ─────────────────────────────────
         {
             let mut sessions = state.sessions.lock().await;
             if let Some(session) = sessions.get_mut(&current_session_id) {
@@ -1392,6 +1590,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     content: Some(text),
                     tool_calls: None,
                     tool_call_id: None,
+                    timestamp: Some(now_epoch()),
                 });
                 session.updated_at = now_epoch();
             }
@@ -1401,10 +1600,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         let mut round: usize = 0;
         const AGENT_HARD_CAP_ROUNDS: usize = 200;
         'agent: loop {
-            // Hard cap: detect runaway tool loops (normal tasks won't hit 200)
             if round >= AGENT_HARD_CAP_ROUNDS {
                 ws_send(
-                    &mut tx,
+                    &tx,
                     &json!({
                         "type": "system",
                         "content": format!(
@@ -1416,20 +1614,17 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                 .await;
                 break;
             }
-            // Check shutdown before starting a new round
             if cancel.is_cancelled() {
                 shutting_down = true;
                 break;
             }
 
-            // Snapshot messages (prune if needed)
-            let (msgs_snapshot, model, workspace) = {
+            let (msgs_snapshot, model, workspace, think_level, prev_avatar) = {
                 let mut sessions = state.sessions.lock().await;
                 let session = match sessions.get_mut(&current_session_id) {
                     Some(s) => s,
                     None => break,
                 };
-                // Refresh system prompt so prompt-file edits take effect mid-session
                 let model_str = session.effective_model(&state.config.model).to_string();
                 let fresh_system = build_system_prompt(&state.config, &session.workspace, &model_str);
                 if let Some(first) = session.messages.first_mut() {
@@ -1437,37 +1632,53 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         *first = fresh_system;
                     }
                 }
-                prune_messages(&mut session.messages, state.config.max_context_tokens);
+                prune_messages(&mut session.messages, state.config.context_limit_for_model(&model_str));
+                let prev_avatar = session.avatar.clone();
                 (
                     session.messages.clone(),
                     model_str,
                     session.workspace.clone(),
+                    session.think_level.clone(),
+                    prev_avatar,
                 )
             };
 
-            ws_send(&mut tx, &json!({"type":"start","round":round + 1})).await;
+            // Parse avatar outside lock (does sync I/O)
+            let avatar = prompts::parse_identity_avatar(&workspace);
+            if avatar != prev_avatar {
+                let mut sessions = state.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&current_session_id) {
+                    session.avatar = avatar.clone();
+                }
+            }
+
+            if !ws_send(&tx, &json!({"type":"start","round":round + 1,"avatar":avatar})).await {
+                break;
+            }
 
             let resolved = state.config.resolve_model(&model);
 
-            // Wrap LLM call in select so shutdown can interrupt a long stream
             let llm_result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     shutting_down = true;
                     break;
                 }
+                _ = connection_cancel.cancelled() => {
+                    break;
+                }
                 r = providers::call_llm_stream(
                     &state.http,
                     &resolved,
                     &msgs_snapshot,
-                    &mut tx,
+                    &tx,
+                    &think_level,
                 ) => r,
             };
             match llm_result {
                 Ok(resp) => {
                     let has_tools = resp.message.tool_calls.is_some();
 
-                    // Push assistant message to session
                     {
                         let mut sessions = state.sessions.lock().await;
                         if let Some(session) = sessions.get_mut(&current_session_id) {
@@ -1478,14 +1689,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
                     if let Some(tool_calls) = &resp.message.tool_calls {
                         for tc in tool_calls {
-                            // Check shutdown before each tool call
                             if cancel.is_cancelled() {
                                 shutting_down = true;
                                 break 'agent;
                             }
 
-                            ws_send(
-                                &mut tx,
+                            if !ws_send(
+                                &tx,
                                 &json!({
                                     "type":"tool_call",
                                     "id": tc.id,
@@ -1493,12 +1703,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                                     "arguments": tc.function.arguments,
                                 }),
                             )
-                            .await;
+                            .await { break 'agent; }
 
                             let result = tokio::select! {
                                 biased;
                                 _ = cancel.cancelled() => {
                                     shutting_down = true;
+                                    break 'agent;
+                                }
+                                _ = connection_cancel.cancelled() => {
                                     break 'agent;
                                 }
                                 r = execute_tool(
@@ -1510,8 +1723,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                                 ) => r,
                             };
 
-                            ws_send(
-                                &mut tx,
+                            if !ws_send(
+                                &tx,
                                 &json!({
                                     "type":"tool_result",
                                     "id": tc.id,
@@ -1519,9 +1732,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                                     "result": result,
                                 }),
                             )
-                            .await;
+                            .await { break 'agent; }
 
-                            // Push tool result to session
                             let mut sessions = state.sessions.lock().await;
                             if let Some(session) = sessions.get_mut(&current_session_id) {
                                 session.messages.push(ChatMessage {
@@ -1529,30 +1741,29 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                                     content: Some(result),
                                     tool_calls: None,
                                     tool_call_id: Some(tc.id.clone()),
+                                    timestamp: Some(now_epoch()),
                                 });
                                 session.tool_calls_count += 1;
                             }
                         }
-                        // Loop continues → LLM processes tool results
                     }
 
-                    if has_tools {
-                        // Incremental save after each tool round so progress
-                        // is not lost during long tool chains (clone+release lock before disk I/O)
-                        let snapshot = {
-                            let sessions = state.sessions.lock().await;
-                            sessions.get(&current_session_id).cloned()
-                        };
-                        if let Some(ref s) = snapshot {
-                            let _ = save_session_to_disk(s).await;
-                        }
-                    } else {
-                        ws_send(&mut tx, &json!({"type":"done"})).await;
+                    // Incremental save so progress is not lost on crash.
+                    let snapshot = {
+                        let sessions = state.sessions.lock().await;
+                        sessions.get(&current_session_id).cloned()
+                    };
+                    if let Some(ref s) = snapshot {
+                        let _ = save_session_to_disk(s).await;
+                    }
+
+                    if !has_tools {
+                        ws_send(&tx, &json!({"type":"done"})).await;
                         break;
                     }
                 }
                 Err(e) => {
-                    ws_send(&mut tx, &json!({"type":"error","content":e})).await;
+                    ws_send(&tx, &json!({"type":"error","content":e})).await;
                     break;
                 }
             }
@@ -1561,37 +1772,20 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
         if shutting_down {
             ws_send(
-                &mut tx,
+                &tx,
                 &json!({"type":"system","content":"Server shutting down."}),
             )
             .await;
         }
 
-        // Auto-save session to disk after each completed exchange
-        // If shutting down, trim incomplete tool-call transactions first
-        if shutting_down {
-            let mut sessions = state.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(&current_session_id) {
-                trim_incomplete_tool_calls(&mut session.messages);
-            }
-        }
-        let snapshot = {
-            let sessions = state.sessions.lock().await;
-            sessions.get(&current_session_id).cloned()
-        };
-        if let Some(ref s) = snapshot {
-            if s.messages.len() > 1 {
-                let _ = save_session_to_disk(s).await;
-            }
-        }
-
-        // If shutting down, break out of the main message loop
         if shutting_down {
             break;
         }
     }
 
-    // ── Cleanup ────
+    connection_cancel.cancel();
+
+    // Trim incomplete tool-call transactions and save once on disconnect.
     {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(&current_session_id) {
@@ -1605,24 +1799,22 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
     if let Some(ref s) = snapshot {
         match save_session_to_disk(s).await {
             Ok(()) => {
-                // Save succeeded — safe to remove from HashMap
                 let mut sessions = state.sessions.lock().await;
                 sessions.remove(&current_session_id);
             }
             Err(e) => {
-                // Save failed — keep session in HashMap so data is not lost.
-                // It's marked orphaned (not in active_connections) so claim_requested_session
-                // and the saved_ids loop can still reclaim it from memory.
                 eprintln!("Warning: failed to save session {} on disconnect: {e}; keeping in memory", s.id);
             }
         }
     } else {
-        // No snapshot (session already gone from HashMap), just clean up
         let mut sessions = state.sessions.lock().await;
         sessions.remove(&current_session_id);
     }
-    // Release active-connection marker only after cleanup is fully settled.
     state.active_connections.lock().await.remove(&current_session_id);
+    drop(tx);
+    let _ = avatar_poller.await;
+    let _ = reader.await;
+    let _ = writer.await;
 }
 
 /// Wait for a specific session to become available (old connection releasing it),
@@ -1646,7 +1838,7 @@ async fn claim_requested_session(id: &str, state: &AppState) -> Option<String> {
     }
 }
 
-async fn send_sessions_list(tx: &mut WsTx, state: &AppState, active_id: &str) {
+async fn send_sessions_list(tx: &WsTx, state: &AppState, active_id: &str) {
     // Merge in-memory sessions with on-disk summaries
     let in_mem: HashMap<String, serde_json::Value> = {
         let sessions = state.sessions.lock().await;
@@ -1800,7 +1992,7 @@ async fn main() {
         eprintln!("  Config providers: {} ({} models)", names.join(", "), total);
     }
     eprintln!("  Exec timeout:  {}s", config.exec_timeout.as_secs());
-    eprintln!("  Context limit: {} tokens", config.max_context_tokens);
+    eprintln!("  Context limit: {} tokens", config.context_limit_for_model(&config.model));
 
     let shutdown = CancellationToken::new();
 

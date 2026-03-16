@@ -13,6 +13,27 @@ const TEMPLATE_FILES: &[(&str, &str)] = &[
     ("MEMORY.md",    include_str!("../docs/reference/templates/MEMORY.md")),
 ];
 
+fn write_missing_templates(workspace: &Path, include_bootstrap: bool) {
+    let tpl_dir = templates_dir(); // None is fine — we have embedded fallback
+
+    for &(name, embedded) in TEMPLATE_FILES {
+        if !include_bootstrap && name == "BOOTSTRAP.md" {
+            continue;
+        }
+        let dest = workspace.join(name);
+        if dest.exists() {
+            continue; // never overwrite user edits
+        }
+        let content = tpl_dir
+            .as_ref()
+            .and_then(|dir| std::fs::read_to_string(dir.join(name)).ok())
+            .unwrap_or_else(|| embedded.to_string());
+        if let Err(e) = std::fs::write(&dest, &content) {
+            eprintln!("WARNING: failed to write {}: {e}", dest.display());
+        }
+    }
+}
+
 /// Locate the templates directory on disk (prefer disk over embedded).
 fn templates_dir() -> Option<PathBuf> {
     // 1. Relative to executable (production: binary sits at project root or in target/)
@@ -45,40 +66,54 @@ pub(crate) fn init_session_prompt_files(workspace: &Path) {
         eprintln!("WARNING: failed to create memory dir {}: {e}", memory_dir.display());
     }
 
-    let tpl_dir = templates_dir(); // None is fine — we have embedded fallback
+    write_missing_templates(workspace, true);
+}
 
-    for &(name, embedded) in TEMPLATE_FILES {
-        let dest = workspace.join(name);
-        if dest.exists() {
-            continue; // never overwrite user edits
-        }
-        // Try disk first, fall back to embedded content
-        let content = tpl_dir
-            .as_ref()
-            .and_then(|dir| std::fs::read_to_string(dir.join(name)).ok())
-            .unwrap_or_else(|| embedded.to_string());
-        if let Err(e) = std::fs::write(&dest, &content) {
-            eprintln!("WARNING: failed to write {}: {e}", dest.display());
-        }
+/// Ensure essential workspace directories exist for an existing session loaded
+/// from disk. Recreates missing core templates, but intentionally does NOT
+/// re-create BOOTSTRAP.md so bootstrap completion persists across reconnects.
+pub(crate) fn ensure_session_workspace(workspace: &Path) {
+    let memory_dir = workspace.join("memory");
+    if let Err(e) = std::fs::create_dir_all(&memory_dir) {
+        eprintln!("WARNING: failed to create memory dir {}: {e}", memory_dir.display());
     }
+
+    write_missing_templates(workspace, false);
 }
 
 /// Load session context for the system prompt.
 ///
-/// Reads (in order): AGENT.md, SOUL.md, USER.md, MEMORY.md, then today's and yesterday's
-/// daily memory files from `memory/YYYY-MM-DD.md`.
+/// **Bootstrap mode** (BOOTSTRAP.md exists): loads BOOTSTRAP.md + AGENT.md only —
+/// this is the first-run "who am I?" flow.
+///
+/// **Normal mode** (BOOTSTRAP.md deleted): loads AGENT.md + IDENTITY.md +
+/// USER.md + SOUL.md, then MEMORY.md and today's/yesterday's daily memory.
+///
 /// Files that don't exist or are empty are silently skipped.
 pub(crate) fn load_session_prompt_files(workspace: &Path) -> String {
-    let mut parts = Vec::new();
+    let bootstrap = read_nonempty(workspace.join("BOOTSTRAP.md"));
 
-    // Agent behavior rules first, then identity files (order: agent → soul → user → long-term memory)
-    for name in &["AGENT.md", "SOUL.md", "USER.md", "MEMORY.md"] {
+    if let Some(bs_content) = bootstrap {
+        // Bootstrap mode: first-run identity setup
+        let mut parts = vec![bs_content];
+        if let Some(agent) = read_nonempty(workspace.join("AGENT.md")) {
+            parts.push(agent);
+        }
+        return parts.join("\n\n---\n\n");
+    }
+
+    // Normal mode: full persona
+    let mut parts = Vec::new();
+    for name in &["AGENT.md", "IDENTITY.md", "USER.md", "SOUL.md"] {
         if let Some(content) = read_nonempty(workspace.join(name)) {
             parts.push(content);
         }
     }
 
-    // Daily memory: today + yesterday
+    if let Some(content) = read_nonempty(workspace.join("MEMORY.md")) {
+        parts.push(content);
+    }
+
     let today = chrono_today();
     let yesterday = chrono_yesterday();
     for date_str in &[today, yesterday] {
@@ -89,6 +124,70 @@ pub(crate) fn load_session_prompt_files(workspace: &Path) -> String {
     }
 
     parts.join("\n\n---\n\n")
+}
+
+/// Parse the IDENTITY.md file in the workspace and extract the avatar value.
+/// Looks for a line matching `- 头像：<value>` or `- 头像: <value>`.
+/// Returns None if the file doesn't exist, is empty, or no avatar is set.
+pub(crate) fn parse_identity_avatar(workspace: &Path) -> Option<String> {
+    let content = read_nonempty(workspace.join("IDENTITY.md"))?;
+    for line in content.lines() {
+        let line = line.trim().trim_start_matches('-').trim();
+        // Must be exactly "头像：<value>" or "头像: <value>" (colon required immediately)
+        let rest = if let Some(r) = line.strip_prefix("头像：") {
+            r
+        } else if let Some(r) = line.strip_prefix("头像:") {
+            r
+        } else {
+            continue;
+        };
+        let rest = rest.trim();
+        if !rest.is_empty() && !rest.starts_with('（') && !rest.starts_with('(') {
+            // http(s) URLs and data URIs pass through directly
+            if rest.starts_with("http") || rest.starts_with("data:") {
+                return Some(rest.to_string());
+            }
+            // If it ends with a known image extension, resolve as file path; drop on failure
+            if has_image_ext(rest) {
+                return resolve_avatar_to_data_uri(workspace, rest);
+            }
+            // Otherwise treat as text/emoji avatar
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+fn has_image_ext(s: &str) -> bool {
+    let s = s.to_ascii_lowercase();
+    ["png", "jpg", "jpeg", "gif", "svg", "webp", "ico"]
+        .iter()
+        .any(|ext| s.ends_with(&format!(".{ext}")))
+}
+
+/// Try to read a workspace-relative image file and return a data URI.
+fn resolve_avatar_to_data_uri(workspace: &Path, rel_path: &str) -> Option<String> {
+    let full = workspace.join(rel_path).canonicalize().ok()?;
+    let ws_canon = workspace.canonicalize().ok()?;
+    if !full.starts_with(&ws_canon) {
+        return None; // path escapes workspace — reject
+    }
+    let data = std::fs::read(&full).ok()?;
+    let ext = full
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    let mime = match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        _ => return None,
+    };
+    use base64::Engine;
+    Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(&data)))
 }
 
 /// Read a file and return its trimmed content if non-empty.

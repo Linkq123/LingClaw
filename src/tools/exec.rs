@@ -36,6 +36,7 @@ pub(crate) async fn tool_exec(args: &serde_json::Value, config: &Config, workspa
             .arg(flag)
             .arg(command)
             .current_dir(&work_dir)
+            .kill_on_drop(true)
             .output(),
     )
     .await;
