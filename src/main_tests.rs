@@ -1284,3 +1284,19 @@ fn system_prompt_with_observation_hint_preserves_original_content() {
     assert!(content.contains("## Recent Observation Notes"));
     assert!(content.contains("**exec**"));
 }
+
+#[test]
+fn hard_cap_events_include_terminal_done_message() {
+    let (system_event, done_event) = build_agent_hard_cap_events(200, 3, 7);
+
+    assert_eq!(system_event["type"], "system");
+    assert_eq!(
+        system_event["content"],
+        "Detected abnormal tool loop (200 consecutive rounds). Stopping."
+    );
+
+    assert_eq!(done_event["type"], "done");
+    assert_eq!(done_event["phase"], "hard_cap");
+    assert_eq!(done_event["cycles"], 3);
+    assert_eq!(done_event["tool_calls"], 7);
+}

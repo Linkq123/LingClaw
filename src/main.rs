@@ -995,6 +995,28 @@ fn ws_try_send(tx: &WsTx, data: &serde_json::Value) -> bool {
     tx.try_send(data.to_string()).is_ok()
 }
 
+fn build_agent_hard_cap_events(
+    round_limit: usize,
+    cycles: usize,
+    tool_calls: usize,
+) -> (serde_json::Value, serde_json::Value) {
+    (
+        json!({
+            "type": "system",
+            "content": format!(
+                "Detected abnormal tool loop ({} consecutive rounds). Stopping.",
+                round_limit
+            ),
+        }),
+        json!({
+            "type": "done",
+            "phase": "hard_cap",
+            "cycles": cycles,
+            "tool_calls": tool_calls,
+        }),
+    )
+}
+
 async fn detect_session_avatar_update(
     session_id: &str,
     state: &AppState,
@@ -2453,17 +2475,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                 // ── Analyze: snapshot session, call LLM, decide next phase ───
                 agent::AgentPhase::Analyze => {
                     if round >= AGENT_HARD_CAP_ROUNDS {
-                        ws_send(
-                    &tx,
-                    &json!({
-                        "type": "system",
-                        "content": format!(
-                            "Detected abnormal tool loop ({} consecutive rounds). Stopping.",
-                            AGENT_HARD_CAP_ROUNDS
-                        )
-                    }),
-                )
-                .await;
+                        let (system_event, done_event) = build_agent_hard_cap_events(
+                            AGENT_HARD_CAP_ROUNDS,
+                            react_ctx.cycles,
+                            react_ctx.tool_calls,
+                        );
+                        if !ws_send(&tx, &system_event).await {
+                            break;
+                        }
+                        ws_send(&tx, &done_event).await;
                         break;
                     }
 

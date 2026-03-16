@@ -6,9 +6,9 @@
 //  instead of text-based Action parsing.
 //
 //      Analyze ──► Act ──► Observe ──► Analyze  (loop)
-//                    │                   │
-//                    │                   └──► Finish  (exit)
-//                    └──► Finish  (no tools)
+//         │                               │
+//         └──────────► Finish ◄───────────┘
+//                   (no tools)      (no further tools)
 //
 //  Phase 2: the agent loop in main.rs uses `match react_ctx.phase()` to
 //  drive each iteration — one phase per arm. Inter-phase data flows via
