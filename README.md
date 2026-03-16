@@ -6,7 +6,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **CLI** — 工具执行层：安全的命令/文件/网络工具、沙盒路径、SSRF 防护、安装与更新
 - **Loop** — 连接层：WebSocket 会话、多会话状态、流式输出、斜杠命令、持久化
 
-整个后端约 7300 行 Rust（`src/main.rs` 以 3000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
+整个后端约 7300 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
 
 ## Features
 
@@ -19,7 +19,8 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
 - **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
-- **ReAct 风格状态机**：已引入 `Analyze → Act → Observe → Finish` 阶段标记，为后续显式状态转移重构打基础
+- **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环，每个阶段一个 match arm
+- **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留
 - **推理可见性控制**：规划中；当前仅保留内部 phase 元数据，尚未提供 `/react` 命令或配置开关
 - **安全控制**：危险命令检测、沙盒路径解析、SSRF 阻断、重定向阻断、输出/文件大小上限
 
@@ -249,14 +250,14 @@ Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的
 |---|---|---|
 | **Analyze** | 分析用户意图 | 模型分析请求，决定是直接回答还是使用工具。可借助 `think` 工具作为推理便签。 |
 | **Act** | 执行工具 | 模型发出结构化 tool_calls，runtime 调用 `execute_tool()` 执行。所有路径经过安全检查。 |
-| **Observe** | 消化工具结果 | 工具结果以原始内容写入对话历史。Observation 摘要层仍在规划中。 |
+| **Observe** | 消化工具结果 | 工具结果以原始内容写入对话历史。大结果 (>4KB) 生成非破坏性摘要：WS `observation` 事件 + 系统提示注入。 |
 | **Finish** | 完成回答 | 显式判定任务已完成：请求已回答、修改已执行、验证已通过、无剩余 blocker。退出循环。 |
 
 **关键设计决策：**
 
 - **不回退到文本协议**：保留 OpenAI/Anthropic 原生结构化 tool calling，不使用文本版 `Action: tool_name\nAction Input: {...}` 解析
 - **不污染对话历史**：完整思维链仅在 `think` 工具内部或 provider reasoning stream 中存在，不写入主消息序列
-- **推理可见性规划中**：当前只发送内部 phase 元数据，UI 开关与配置项尚未实现
+- **推理可见性规划中**：当前发送 phase 元数据 + observation WS 事件，UI 开关与配置项尚未实现
 - **provider 层感知状态**：不同阶段可动态调整 reasoning 预算和输出期望
 
 ### Agent Loop 详解
@@ -268,24 +269,32 @@ handle_socket()
   │    ├─ 以 "/" 开头? → handle_command()
   │    └─ 否 → 进入 Agent Loop
   │
-  ├─ 'agent: loop (round < 200)
+  ├─ 'agent: loop (round < 200, match react_ctx.phase())
   │    │
-  │    ├─ [Analyze] 构建 system prompt + prune messages
-  │    │    └─ call_llm_stream() → 流式输出到前端
+  │    ├─ AgentPhase::Analyze
+  │    │    ├─ 构建 system prompt + 注入 observation hint
+  │    │    ├─ prune messages
+  │    │    ├─ call_llm_stream() → 流式输出到前端
+  │    │    ├─ 有 tool_calls → transition_to_act()
+  │    │    └─ 无 tool_calls → transition_to_finish()
   │    │
-  │    ├─ 模型响应:
-  │    │    ├─ 有 tool_calls → [Act]
-  │    │    │    ├─ 安全检查
-  │    │    │    ├─ execute_tool() × N
-  │    │    │    ├─ [Observe] 注入 tool result 到 messages
-  │    │    │    ├─ 增量保存 session
-  │    │    │    └─ continue → 下一轮 Analyze
-  │    │    │
-  │    │    └─ 无 tool_calls → [Finish]
-  │    │         ├─ 完成判定
-  │    │         ├─ 追加 assistant 消息
-  │    │         ├─ 保存 session
-  │    │         └─ break
+  │    ├─ AgentPhase::Act
+  │    │    ├─ 安全检查
+  │    │    ├─ execute_tool() × N
+  │    │    ├─ 收集 ToolResultEntry
+  │    │    ├─ 持久化 tool result 到 session
+  │    │    └─ transition_to_observe()
+  │    │
+  │    ├─ AgentPhase::Observe
+  │    │    ├─ summarize_observations() → WS observation 事件
+  │    │    ├─ build_observation_context_hint() → 下轮 hint
+  │    │    ├─ 增量保存 session
+  │    │    └─ transition_to_analyze()
+  │    │
+  │    └─ AgentPhase::Finish
+  │         ├─ 增量保存 session
+  │         ├─ WS done 事件
+  │         └─ break
   │    │
   │    └─ cancel / timeout → 安全退出
   │
@@ -296,9 +305,9 @@ handle_socket()
 
 ```text
 src/
-├── main.rs          (~3000 行) — Config, Session, Agent Loop, 命令处理, HTTP 路由
-├── main_tests.rs    (~1120 行) — 主流程测试
-├── agent.rs         (新增)     — AgentPhase 状态机, Phase 跟踪, Finish 判定
+├── main.rs          (~3100 行) — Config, Session, Agent Loop (phase-driven), 命令处理, HTTP 路由
+├── main_tests.rs    (~1290 行) — 主流程测试 + observation 摘要集成测试
+├── agent.rs         (~370 行)  — AgentPhase 状态机, 非破坏性 Observation 摘要, Finish 判定
 ├── cli.rs           (~1100 行) — CLI 子命令, 设置向导, 安装/更新
 ├── providers.rs     (~740 行)  — OpenAI/Anthropic 流式调用, 模型解析
 ├── prompts.rs       (~420 行)  — 提示文件初始化/加载, 头像解析

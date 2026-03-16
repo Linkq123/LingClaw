@@ -1167,3 +1167,120 @@ fn find_static_dir_from_does_not_walk_past_expected_exe_ancestors() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+// ── Phase 2: observation summary + history payload integration tests ─────
+
+#[test]
+fn observation_summary_does_not_appear_in_persisted_tool_result() {
+    // Verify that even with large tool results, the session stores raw content
+    // and no observation annotation leaks into the history payload.
+    let big_result = format!("{{\"data\":\"{}\"}}", "y".repeat(6000));
+    let session = Session {
+        id: "obs-test".into(),
+        name: "ObsTest".into(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("system".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some(String::new()),
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_obs".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "exec".into(),
+                        arguments: r#"{"command":"ls"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(100),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(big_result.clone()),
+                tool_calls: None,
+                tool_call_id: Some("call_obs".into()),
+                timestamp: Some(101),
+            },
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 1,
+        model_override: None,
+        think_level: default_think_level(),
+        workspace: PathBuf::new(),
+        avatar: None,
+    };
+
+    let payload = build_history_payload(&session);
+    let msgs = payload["messages"].as_array().unwrap();
+    let tool_entry = msgs.iter().find(|m| m["role"] == "tool_result").unwrap();
+    let result_str = tool_entry["result"].as_str().unwrap();
+
+    // Must be exact raw content — no "[Observation:" prefix
+    assert_eq!(result_str, big_result.as_str());
+    assert!(!result_str.starts_with("[Observation:"));
+}
+
+#[test]
+fn observation_summaries_are_independent_of_session_messages() {
+    // summarize_observations produces summaries from ToolResultEntry, not from session
+    let entries = vec![
+        agent::ToolResultEntry {
+            id: "c1".into(),
+            name: "exec".into(),
+            result: "short".into(),
+        },
+        agent::ToolResultEntry {
+            id: "c2".into(),
+            name: "read_file".into(),
+            result: "z\n".repeat(3000),
+        },
+    ];
+
+    let summaries = agent::summarize_observations(&entries);
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].tool_call_id, "c2");
+
+    let hint = agent::build_observation_context_hint(&summaries);
+    assert!(hint.is_some());
+    let hint_text = hint.unwrap();
+    assert!(hint_text.contains("read_file"));
+    assert!(hint_text.contains("3000 lines"));
+}
+
+#[test]
+fn system_prompt_with_observation_hint_preserves_original_content() {
+    // Simulate the pattern used in Analyze phase: appending hint to system prompt
+    let mut msg = ChatMessage {
+        role: "system".into(),
+        content: Some("You are an assistant.".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+
+    let summaries = vec![agent::ObservationSummary {
+        tool_call_id: "c1".into(),
+        tool_name: "exec".into(),
+        byte_size: 8000,
+        line_count: 200,
+        hint: "exec returned 200 lines / 8000 bytes — focus on key findings".into(),
+    }];
+    if let Some(hint) = agent::build_observation_context_hint(&summaries) {
+        if let Some(ref mut content) = msg.content {
+            content.push_str("\n\n");
+            content.push_str(&hint);
+        }
+    }
+
+    let content = msg.content.as_deref().unwrap();
+    assert!(content.starts_with("You are an assistant."));
+    assert!(content.contains("## Recent Observation Notes"));
+    assert!(content.contains("**exec**"));
+}

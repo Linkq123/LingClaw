@@ -2435,9 +2435,25 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         let mut round: usize = 0;
         let mut react_ctx = agent::AgentLoopCtx::new(false);
         const AGENT_HARD_CAP_ROUNDS: usize = 200;
+
+        // Inter-phase state: Analyze → Act → Observe
+        let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
+        let mut collected_results: Vec<agent::ToolResultEntry> = Vec::new();
+        let mut cycle_workspace = std::path::PathBuf::new();
+        let mut cycle_is_main = false;
+        let mut last_observation_hint: Option<String> = None;
+
         'agent: loop {
-            if round >= AGENT_HARD_CAP_ROUNDS {
-                ws_send(
+            if cancel.is_cancelled() {
+                shutting_down = true;
+                break;
+            }
+
+            match react_ctx.phase() {
+                // ── Analyze: snapshot session, call LLM, decide next phase ───
+                agent::AgentPhase::Analyze => {
+                    if round >= AGENT_HARD_CAP_ROUNDS {
+                        ws_send(
                     &tx,
                     &json!({
                         "type": "system",
@@ -2448,175 +2464,203 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     }),
                 )
                 .await;
-                break;
-            }
-            if cancel.is_cancelled() {
-                shutting_down = true;
-                break;
-            }
-
-            let (msgs_snapshot, model, workspace, think_level, prev_avatar) = {
-                let mut sessions = state.sessions.lock().await;
-                let session = match sessions.get_mut(&current_session_id) {
-                    Some(s) => s,
-                    None => break,
-                };
-                let model_str = session.effective_model(&state.config.model).to_string();
-                let is_main = session.is_main();
-                let fresh_system =
-                    build_system_prompt(&state.config, &session.workspace, &model_str, is_main);
-                if let Some(first) = session.messages.first_mut() {
-                    if first.role == "system" {
-                        *first = fresh_system;
+                        break;
                     }
-                }
-                prune_messages(
-                    &mut session.messages,
-                    state.config.context_limit_for_model(&model_str),
-                );
-                let prev_avatar = session.avatar.clone();
-                (
-                    session.messages.clone(),
-                    model_str,
-                    session.workspace.clone(),
-                    session.think_level.clone(),
-                    prev_avatar,
-                )
-            };
 
-            // Parse avatar outside lock (does sync I/O)
-            let avatar = prompts::parse_identity_avatar(&workspace);
-            if avatar != prev_avatar {
-                let mut sessions = state.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(&current_session_id) {
-                    session.avatar = avatar.clone();
-                }
-            }
+                    let (msgs_snapshot, model, workspace, think_level, prev_avatar) = {
+                        let mut sessions = state.sessions.lock().await;
+                        let session = match sessions.get_mut(&current_session_id) {
+                            Some(s) => s,
+                            None => break,
+                        };
+                        let model_str = session.effective_model(&state.config.model).to_string();
+                        let is_main_session = session.is_main();
+                        let mut fresh_system = build_system_prompt(
+                            &state.config,
+                            &session.workspace,
+                            &model_str,
+                            is_main_session,
+                        );
+                        // Inject observation context hint from previous cycle
+                        if let Some(hint) = last_observation_hint.take() {
+                            if let Some(ref mut content) = fresh_system.content {
+                                content.push_str("\n\n");
+                                content.push_str(&hint);
+                            }
+                        }
+                        if let Some(first) = session.messages.first_mut() {
+                            if first.role == "system" {
+                                *first = fresh_system;
+                            }
+                        }
+                        prune_messages(
+                            &mut session.messages,
+                            state.config.context_limit_for_model(&model_str),
+                        );
+                        let prev_avatar = session.avatar.clone();
+                        (
+                            session.messages.clone(),
+                            model_str,
+                            session.workspace.clone(),
+                            session.think_level.clone(),
+                            prev_avatar,
+                        )
+                    };
 
-            if !ws_send(
-                &tx,
-                &json!({
-                    "type":"start",
-                    "round":round + 1,
-                    "avatar":avatar,
-                    "phase":react_ctx.phase().label(),
-                }),
-            )
-            .await
-            {
-                break;
-            }
+                    // Stash per-cycle state for Act phase
+                    cycle_workspace = workspace.clone();
+                    cycle_is_main = current_session_id == MAIN_SESSION_ID;
 
-            let resolved = state.config.resolve_model(&model);
-
-            let is_main = current_session_id == MAIN_SESSION_ID;
-            let extra_tools: Vec<serde_json::Value> = if is_main {
-                match resolved.provider {
-                    Provider::Anthropic => admin_tool_definitions_anthropic(),
-                    Provider::OpenAI => admin_tool_definitions_openai(),
-                }
-            } else {
-                vec![]
-            };
-
-            let llm_result = tokio::select! {
-                biased;
-                _ = cancel.cancelled() => {
-                    shutting_down = true;
-                    break;
-                }
-                _ = connection_cancel.cancelled() => {
-                    break;
-                }
-                r = providers::call_llm_stream(
-                    &state.http,
-                    &resolved,
-                    &msgs_snapshot,
-                    &tx,
-                    &think_level,
-                    &extra_tools,
-                ) => r,
-            };
-            match llm_result {
-                Ok(resp) => {
-                    let has_tools = resp.message.tool_calls.is_some();
-                    let _has_content = resp.message.has_nonempty_content();
-                    let should_persist_message = !resp.message.is_empty_assistant_message();
-
-                    if should_persist_message {
+                    // Parse avatar outside lock (does sync I/O)
+                    let avatar = prompts::parse_identity_avatar(&workspace);
+                    if avatar != prev_avatar {
                         let mut sessions = state.sessions.lock().await;
                         if let Some(session) = sessions.get_mut(&current_session_id) {
-                            session.messages.push(resp.message.clone());
-                            session.updated_at = now_epoch();
+                            session.avatar = avatar.clone();
                         }
                     }
 
-                    if has_tools {
-                        react_ctx.transition_to_act();
+                    if !ws_send(
+                        &tx,
+                        &json!({
+                            "type":"start",
+                            "round": round + 1,
+                            "avatar": avatar,
+                            "phase": react_ctx.phase().label(),
+                        }),
+                    )
+                    .await
+                    {
+                        break;
                     }
 
-                    if let Some(tool_calls) = &resp.message.tool_calls {
-                        for tc in tool_calls {
-                            if cancel.is_cancelled() {
-                                shutting_down = true;
-                                break 'agent;
+                    let resolved = state.config.resolve_model(&model);
+
+                    let extra_tools: Vec<serde_json::Value> = if cycle_is_main {
+                        match resolved.provider {
+                            Provider::Anthropic => admin_tool_definitions_anthropic(),
+                            Provider::OpenAI => admin_tool_definitions_openai(),
+                        }
+                    } else {
+                        vec![]
+                    };
+
+                    let llm_result = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => {
+                            shutting_down = true;
+                            break;
+                        }
+                        _ = connection_cancel.cancelled() => {
+                            break;
+                        }
+                        r = providers::call_llm_stream(
+                            &state.http,
+                            &resolved,
+                            &msgs_snapshot,
+                            &tx,
+                            &think_level,
+                            &extra_tools,
+                        ) => r,
+                    };
+                    match llm_result {
+                        Ok(resp) => {
+                            let _has_content = resp.message.has_nonempty_content();
+                            let has_tools = resp.message.has_tool_calls();
+                            let should_persist = !resp.message.is_empty_assistant_message();
+
+                            if should_persist {
+                                let mut sessions = state.sessions.lock().await;
+                                if let Some(session) = sessions.get_mut(&current_session_id) {
+                                    session.messages.push(resp.message.clone());
+                                    session.updated_at = now_epoch();
+                                }
                             }
 
-                            if !ws_send(
-                                &tx,
-                                &json!({
-                                    "type":"tool_call",
-                                    "id": tc.id,
-                                    "name": tc.function.name,
-                                    "arguments": tc.function.arguments,
-                                }),
-                            )
-                            .await
-                            {
-                                break 'agent;
+                            if has_tools {
+                                pending_tool_calls = resp.message.tool_calls.unwrap_or_default();
+                                react_ctx.transition_to_act();
+                            } else {
+                                react_ctx.transition_to_finish();
                             }
+                            round += 1;
+                        }
+                        Err(e) => {
+                            ws_send(&tx, &json!({"type":"error","content":e})).await;
+                            break;
+                        }
+                    }
+                } // end Analyze
 
-                            let result = if is_main && is_admin_tool(&tc.function.name) {
-                                execute_admin_tool(
+                // ── Act: execute pending tool calls ──────────────────────────
+                agent::AgentPhase::Act => {
+                    collected_results.clear();
+
+                    for tc in &pending_tool_calls {
+                        if cancel.is_cancelled() {
+                            shutting_down = true;
+                            break 'agent;
+                        }
+
+                        if !ws_send(
+                            &tx,
+                            &json!({
+                                "type":"tool_call",
+                                "id": tc.id,
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            }),
+                        )
+                        .await
+                        {
+                            break 'agent;
+                        }
+
+                        let result = if cycle_is_main && is_admin_tool(&tc.function.name) {
+                            execute_admin_tool(&tc.function.name, &tc.function.arguments, &state)
+                                .await
+                        } else {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    shutting_down = true;
+                                    break 'agent;
+                                }
+                                _ = connection_cancel.cancelled() => {
+                                    break 'agent;
+                                }
+                                r = execute_tool(
                                     &tc.function.name,
                                     &tc.function.arguments,
-                                    &state,
-                                )
-                                .await
-                            } else {
-                                tokio::select! {
-                                    biased;
-                                    _ = cancel.cancelled() => {
-                                        shutting_down = true;
-                                        break 'agent;
-                                    }
-                                    _ = connection_cancel.cancelled() => {
-                                        break 'agent;
-                                    }
-                                    r = execute_tool(
-                                        &tc.function.name,
-                                        &tc.function.arguments,
-                                        &state.config,
-                                        &state.http,
-                                        &workspace,
-                                    ) => r,
-                                }
-                            };
-
-                            if !ws_send(
-                                &tx,
-                                &json!({
-                                    "type":"tool_result",
-                                    "id": tc.id,
-                                    "name": tc.function.name,
-                                    "result": result,
-                                }),
-                            )
-                            .await
-                            {
-                                break 'agent;
+                                    &state.config,
+                                    &state.http,
+                                    &cycle_workspace,
+                                ) => r,
                             }
+                        };
 
+                        if !ws_send(
+                            &tx,
+                            &json!({
+                                "type":"tool_result",
+                                "id": tc.id,
+                                "name": tc.function.name,
+                                "result": result,
+                            }),
+                        )
+                        .await
+                        {
+                            break 'agent;
+                        }
+
+                        // Collect for Observe phase before persisting
+                        collected_results.push(agent::ToolResultEntry {
+                            id: tc.id.clone(),
+                            name: tc.function.name.clone(),
+                            result: result.clone(),
+                        });
+
+                        {
                             let mut sessions = state.sessions.lock().await;
                             if let Some(session) = sessions.get_mut(&current_session_id) {
                                 session.messages.push(ChatMessage {
@@ -2629,9 +2673,34 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                                 session.tool_calls_count += 1;
                             }
                         }
-
-                        react_ctx.transition_to_observe(tool_calls.len());
                     }
+
+                    let tc_count = pending_tool_calls.len();
+                    pending_tool_calls.clear();
+                    react_ctx.transition_to_observe(tc_count);
+                } // end Act
+
+                // ── Observe: summarize large results, save to disk ───────────
+                agent::AgentPhase::Observe => {
+                    // Non-destructive observation summaries
+                    let summaries = agent::summarize_observations(&collected_results);
+                    for s in &summaries {
+                        ws_send(
+                            &tx,
+                            &json!({
+                                "type": "observation",
+                                "tool_call_id": s.tool_call_id,
+                                "tool_name": s.tool_name,
+                                "byte_size": s.byte_size,
+                                "line_count": s.line_count,
+                                "hint": s.hint,
+                            }),
+                        )
+                        .await;
+                    }
+                    // Store hint for next Analyze round's system prompt
+                    last_observation_hint = agent::build_observation_context_hint(&summaries);
+                    collected_results.clear();
 
                     // Incremental save so progress is not lost on crash.
                     let snapshot = {
@@ -2642,20 +2711,34 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         let _ = save_session_to_disk(s).await;
                     }
 
-                    if !has_tools {
-                        react_ctx.transition_to_finish();
-                        ws_send(&tx, &json!({"type":"done","phase":"finish","cycles":react_ctx.cycles,"tool_calls":react_ctx.tool_calls})).await;
-                        break;
+                    react_ctx.transition_to_analyze();
+                } // end Observe
+
+                // ── Finish: send done, save, break ───────────────────────────
+                agent::AgentPhase::Finish => {
+                    // Incremental save (also covers no-tool responses)
+                    let snapshot = {
+                        let sessions = state.sessions.lock().await;
+                        sessions.get(&current_session_id).cloned()
+                    };
+                    if let Some(ref s) = snapshot {
+                        let _ = save_session_to_disk(s).await;
                     }
-                    react_ctx.transition_to_analyze(); // Observe → Analyze
-                }
-                Err(e) => {
-                    ws_send(&tx, &json!({"type":"error","content":e})).await;
+
+                    ws_send(
+                        &tx,
+                        &json!({
+                            "type":"done",
+                            "phase":"finish",
+                            "cycles": react_ctx.cycles,
+                            "tool_calls": react_ctx.tool_calls,
+                        }),
+                    )
+                    .await;
                     break;
-                }
-            }
-            round += 1;
-        }
+                } // end Finish
+            } // end match
+        } // end 'agent loop
 
         if shutting_down {
             ws_send(
