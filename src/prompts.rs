@@ -195,7 +195,7 @@ pub(crate) fn parse_identity_avatar(workspace: &Path) -> Option<String> {
             return None;
         }
 
-        if is_none_avatar_value(rest) {
+        if is_none_avatar_value(rest) || has_inline_none_guidance(rest) {
             return None;
         }
 
@@ -225,6 +225,21 @@ fn is_none_avatar_value(value: &str) -> bool {
         normalized.as_str(),
         "none" | "null" | "unset" | "not set" | "未设置" | "暂未设置"
     )
+}
+
+fn has_inline_none_guidance(value: &str) -> bool {
+    let trimmed = value.trim();
+    let lowered = trimmed.to_ascii_lowercase();
+    ["none", "null", "unset", "not set", "未设置", "暂未设置"]
+        .iter()
+        .any(|unset_value| {
+            let Some(rest) = lowered.strip_prefix(unset_value) else {
+                return false;
+            };
+
+            let suffix = rest.trim_start();
+            !suffix.is_empty() && (suffix.starts_with('（') || suffix.starts_with('('))
+        })
 }
 
 fn has_image_ext(s: &str) -> bool {
@@ -353,6 +368,54 @@ mod tests {
 
         assert!(loaded.contains("<!-- memory/2026-03-16.md -->\ntoday memory"));
         assert!(loaded.contains("<!-- memory/2026-03-15.md -->\nyesterday memory"));
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn parse_identity_avatar_treats_inline_none_guidance_as_unset() {
+        let workspace = std::env::temp_dir().join("lingclaw-avatar-inline-none-test");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::write(
+            workspace.join("IDENTITY.md"),
+            "- 头像：none （未设置时填写 none；也可填写工作区相对路径、http(s) URL、data URI）\n",
+        )
+        .expect("identity file should be written");
+
+        let avatar = parse_identity_avatar(&workspace);
+
+        assert_eq!(avatar, None);
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn parse_identity_avatar_keeps_text_that_only_starts_with_none() {
+        let workspace = std::env::temp_dir().join("lingclaw-avatar-none-prefix-text-test");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::write(workspace.join("IDENTITY.md"), "- 头像：none-core\n")
+            .expect("identity file should be written");
+
+        let avatar = parse_identity_avatar(&workspace);
+
+        assert_eq!(avatar.as_deref(), Some("none-core"));
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn parse_identity_avatar_treats_case_mixed_inline_none_guidance_as_unset() {
+        let workspace = std::env::temp_dir().join("lingclaw-avatar-none-mixed-case-test");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::write(workspace.join("IDENTITY.md"), "- 头像：None (leave unset)\n")
+            .expect("identity file should be written");
+
+        let avatar = parse_identity_avatar(&workspace);
+
+        assert_eq!(avatar, None);
 
         let _ = fs::remove_dir_all(&workspace);
     }
