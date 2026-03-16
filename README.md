@@ -19,8 +19,8 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
 - **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
-- **ReAct 风格状态机**：`Analyze → Act → Observe → Finish` 显式阶段控制，取代隐式 has_tools 循环
-- **推理可见性控制**：默认隐藏中间推理，可通过配置或 `/react` 命令开启精简展示
+- **ReAct 风格状态机**：已引入 `Analyze → Act → Observe → Finish` 阶段标记，为后续显式状态转移重构打基础
+- **推理可见性控制**：规划中；当前仅保留内部 phase 元数据，尚未提供 `/react` 命令或配置开关
 - **安全控制**：危险命令检测、沙盒路径解析、SSRF 阻断、重定向阻断、输出/文件大小上限
 
 ## Quick Start
@@ -149,7 +149,6 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `/rename <name>` | 重命名当前会话 |
 | `/model [name]` | 查看可用模型或切换当前会话模型 |
 | `/think [level]` | 设置思维模式：`auto`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh` |
-| `/react [on\|off]` | 切换 ReAct 推理可见性（默认关闭） |
 | `/skills` | 列出可用工具帮助 |
 | `/status` | 显示模型、provider、上下文估算、思维级别 |
 | `/clear` | 清空消息但保留系统提示 |
@@ -250,14 +249,14 @@ Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的
 |---|---|---|
 | **Analyze** | 分析用户意图 | 模型分析请求，决定是直接回答还是使用工具。可借助 `think` 工具作为推理便签。 |
 | **Act** | 执行工具 | 模型发出结构化 tool_calls，runtime 调用 `execute_tool()` 执行。所有路径经过安全检查。 |
-| **Observe** | 消化工具结果 | 工具结果注入对话历史，长结果经 Observation 摘要层压缩。模型评估结果并决定下一步。 |
+| **Observe** | 消化工具结果 | 工具结果以原始内容写入对话历史。Observation 摘要层仍在规划中。 |
 | **Finish** | 完成回答 | 显式判定任务已完成：请求已回答、修改已执行、验证已通过、无剩余 blocker。退出循环。 |
 
 **关键设计决策：**
 
 - **不回退到文本协议**：保留 OpenAI/Anthropic 原生结构化 tool calling，不使用文本版 `Action: tool_name\nAction Input: {...}` 解析
 - **不污染对话历史**：完整思维链仅在 `think` 工具内部或 provider reasoning stream 中存在，不写入主消息序列
-- **推理可见性可控**：默认隐藏阶段信息和推理摘要，可通过 `/react on` 或配置 `showReact: true` 开启
+- **推理可见性规划中**：当前只发送内部 phase 元数据，UI 开关与配置项尚未实现
 - **provider 层感知状态**：不同阶段可动态调整 reasoning 预算和输出期望
 
 ### Agent Loop 详解
@@ -299,7 +298,7 @@ handle_socket()
 src/
 ├── main.rs          (~3000 行) — Config, Session, Agent Loop, 命令处理, HTTP 路由
 ├── main_tests.rs    (~1120 行) — 主流程测试
-├── agent.rs         (新增)     — AgentPhase 状态机, Observation 摘要, Finish 判定
+├── agent.rs         (新增)     — AgentPhase 状态机, Phase 跟踪, Finish 判定
 ├── cli.rs           (~1100 行) — CLI 子命令, 设置向导, 安装/更新
 ├── providers.rs     (~740 行)  — OpenAI/Anthropic 流式调用, 模型解析
 ├── prompts.rs       (~420 行)  — 提示文件初始化/加载, 头像解析

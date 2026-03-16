@@ -2617,14 +2617,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                                 break 'agent;
                             }
 
-                            let annotated =
-                                agent::maybe_annotate_observation(&tc.function.name, &result);
-
                             let mut sessions = state.sessions.lock().await;
                             if let Some(session) = sessions.get_mut(&current_session_id) {
                                 session.messages.push(ChatMessage {
                                     role: "tool".into(),
-                                    content: Some(annotated),
+                                    content: Some(result),
                                     tool_calls: None,
                                     tool_call_id: Some(tc.id.clone()),
                                     timestamp: Some(now_epoch()),

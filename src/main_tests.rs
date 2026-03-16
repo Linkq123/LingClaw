@@ -110,6 +110,52 @@ fn legacy_settings_provider_fields_deserialize() {
 }
 
 #[test]
+fn build_history_payload_preserves_raw_tool_result_content() {
+    let long_raw_result = format!("{{\"ok\":true,\"payload\":\"{}\"}}", "x".repeat(5000));
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("system".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(long_raw_result.clone()),
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+                timestamp: Some(123),
+            },
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 1,
+        model_override: None,
+        think_level: default_think_level(),
+        workspace: PathBuf::new(),
+        avatar: None,
+    };
+
+    let payload = build_history_payload(&session);
+    let messages = payload["messages"]
+        .as_array()
+        .expect("history payload should contain a messages array");
+    let tool_result = messages
+        .iter()
+        .find(|message| message["role"] == "tool_result")
+        .expect("history payload should contain a tool_result entry");
+
+    assert_eq!(
+        tool_result["result"].as_str(),
+        Some(long_raw_result.as_str())
+    );
+}
+
+#[test]
 fn provider_detect_accepts_provider_prefixed_model_refs() {
     assert_eq!(
         Provider::detect(

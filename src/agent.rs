@@ -120,12 +120,14 @@ impl AgentLoopCtx {
 /// Byte threshold above which tool output gets a prefix summary hint.
 /// Original content is always preserved—this only prepends a length note
 /// to help the model focus on the output structure.
+#[allow(dead_code)] // Reserved for a future non-destructive observation-summary path.
 const OBSERVATION_SUMMARY_THRESHOLD: usize = 4096;
 
 /// Annotate a long tool result with a brief header so the model knows the
 /// output is large and should focus on key findings.
 ///
 /// Returns the original string untouched if it is short enough.
+#[allow(dead_code)] // Reserved for a future non-destructive observation-summary path.
 pub(crate) fn maybe_annotate_observation(tool_name: &str, result: &str) -> String {
     if result.len() <= OBSERVATION_SUMMARY_THRESHOLD {
         return result.to_owned();
