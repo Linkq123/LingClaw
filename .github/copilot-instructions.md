@@ -7,7 +7,7 @@ This is **LingClaw** — a ~7300-line Rust personal AI assistant built on the **
 ## Rules
 
 - `src/main.rs` must stay ≤ 3000 lines. Check with `wc -l src/main.rs` before committing.
-- Backend entrypoint and main loop live in `src/main.rs`. CLI subcommands and setup wizard live in `src/cli.rs`. Provider streaming logic lives in `src/providers.rs`. Session prompt init/load logic lives in `src/prompts.rs`; prompt templates live on disk in `docs/reference/templates/`. Shared tool registry lives in `src/tools/mod.rs` with implementations split into `src/tools/exec.rs`, `src/tools/fs.rs`, `src/tools/net.rs`.
+- Backend entrypoint and main loop live in `src/main.rs`. ReAct state machine (`AgentPhase`, `AgentLoopCtx`, observation annotation, finish heuristic) lives in `src/agent.rs`. CLI subcommands and setup wizard live in `src/cli.rs`. Provider streaming logic lives in `src/providers.rs`. Session prompt init/load logic lives in `src/prompts.rs`; prompt templates live on disk in `docs/reference/templates/`. Shared tool registry lives in `src/tools/mod.rs` with implementations split into `src/tools/exec.rs`, `src/tools/fs.rs`, `src/tools/net.rs`.
 - Each session has an isolated workspace at `~/.lingclaw/{sessionId}/workspace/` with 7 prompt files (BOOTSTRAP.md, AGENT.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md) copied from `docs/reference/templates/` on creation, plus a `memory/` subdirectory for daily logs. Bootstrap mode loads `BOOTSTRAP.md + AGENT.md`; after BOOTSTRAP.md is deleted, normal mode loads `AGENT.md + IDENTITY.md + USER.md + SOUL.md`, then `MEMORY.md` and today/yesterday daily memory. Existing sessions should not recreate BOOTSTRAP.md on reconnect.
 - `/new` only compresses conversation, appends to `memory/YYYY-MM-DD.md`, and clears context. It must not initialize a new session or recreate `BOOTSTRAP.md`.
 - Dependencies: axum, tokio, serde, serde_json, reqwest, futures, regex, tower-http, tokio-util. Do not add more without justification.
@@ -24,7 +24,7 @@ This is **LingClaw** — a ~7300-line Rust personal AI assistant built on the **
 
 - **New tool** → Add a `ToolSpec` entry in `src/tools/mod.rs` + parameter builder + handler wrapper. Put the implementation in `src/tools/fs.rs`, `src/tools/net.rs`, or `src/tools/exec.rs` by category. This is CLI-side work.
 - **New provider** → Add SSE parsing + streaming in `src/providers.rs`, add variant to `Provider` enum in `src/main.rs`. This is Skill-side work.
-- **Better reasoning** → Improve `build_system_prompt()` or `prune_messages()` in `src/main.rs`, or edit prompt templates in `docs/reference/templates/`. This is Skill-side work.
+- **Better reasoning** → Improve `build_system_prompt()` or `prune_messages()` in `src/main.rs`, or edit prompt templates in `docs/reference/templates/`. For agent decision layer changes (phase transitions, finish heuristic, observation summary), edit `src/agent.rs`. This is Skill-side work.
 - **New command** → Add match arm in `handle_command()`. This is Loop-side work.
 - **New CLI subcommand** → Add match arm in `handle_cli_command()` in `src/cli.rs`. CLI subcommands run before async runtime (synchronous). Use `--serve` for foreground mode.
 - **Config change** → Update `JsonConfig` / `JsonSettings` structs + `Config::load()` + `run_setup_wizard()` in `src/cli.rs` if interactive.

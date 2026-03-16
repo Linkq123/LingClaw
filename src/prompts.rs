@@ -410,8 +410,11 @@ mod tests {
         let workspace = std::env::temp_dir().join("lingclaw-avatar-none-mixed-case-test");
         let _ = fs::remove_dir_all(&workspace);
         fs::create_dir_all(&workspace).expect("workspace should be created");
-        fs::write(workspace.join("IDENTITY.md"), "- 头像：None (leave unset)\n")
-            .expect("identity file should be written");
+        fs::write(
+            workspace.join("IDENTITY.md"),
+            "- 头像：None (leave unset)\n",
+        )
+        .expect("identity file should be written");
 
         let avatar = parse_identity_avatar(&workspace);
 

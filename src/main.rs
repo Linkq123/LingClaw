@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, Mutex};
 use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 
+mod agent;
 mod cli;
 mod prompts;
 mod providers;
@@ -30,9 +31,7 @@ mod tools;
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const MAIN_SESSION_ID: &str = "main";
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  Config
-// ══════════════════════════════════════════════════════════════════════════════
+// ── Config ──────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Provider {
@@ -549,9 +548,7 @@ fn load_config_file() -> JsonConfig {
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  Data Models
-// ══════════════════════════════════════════════════════════════════════════════
+// ── Data Models ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct ChatMessage {
@@ -598,9 +595,7 @@ struct FunctionCall {
     arguments: String,
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  Session & AppState
-// ══════════════════════════════════════════════════════════════════════════════
+// ── Session & AppState ───────────────────────────────────────────────────────────────────────
 
 fn now_epoch() -> u64 {
     SystemTime::now()
@@ -691,9 +686,7 @@ struct AppState {
     shutdown_token: String,
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  System Prompt
-// ══════════════════════════════════════════════════════════════════════════════
+// ── System Prompt ────────────────────────────────────────────────────────────
 
 fn build_system_prompt(
     config: &Config,
@@ -760,9 +753,7 @@ Only read those files if the user explicitly asks to inspect them, if you need t
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  Security
-// ══════════════════════════════════════════════════════════════════════════════
+// ── Security ─────────────────────────────────────────────────────────────────────────────
 
 const DANGEROUS_PATTERNS: &[&str] = &[
     "rm -rf /",
@@ -953,9 +944,7 @@ fn resolve_static_dir() -> PathBuf {
     find_static_dir_from(exe.as_deref(), cwd.as_deref())
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  Utilities
-// ══════════════════════════════════════════════════════════════════════════════
+// ── Utilities ────────────────────────────────────────────────────────────────
 
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
@@ -1030,9 +1019,7 @@ async fn commit_session_avatar(session_id: &str, avatar: Option<String>, state: 
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  Tool Dispatch
-// ══════════════════════════════════════════════════════════════════════════════
+// ── Tool Dispatch ────────────────────────────────────────────────────────────
 
 async fn execute_tool(
     name: &str,
@@ -1044,9 +1031,7 @@ async fn execute_tool(
     tools::execute_tool(name, args_str, config, http, workspace).await
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  Context Management
-// ══════════════════════════════════════════════════════════════════════════════
+// ── Context Management ──────────────────────────────────────────────────────
 
 fn estimate_tokens(messages: &[ChatMessage]) -> usize {
     messages.iter().map(message_token_len).sum()
@@ -1126,9 +1111,7 @@ fn prune_messages(messages: &mut Vec<ChatMessage>, max_tokens: usize) {
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  Session Persistence
-// ══════════════════════════════════════════════════════════════════════════════
+// ── Session Persistence ──────────────────────────────────────────────────────
 
 fn sessions_dir() -> PathBuf {
     let dir = config_dir_path()
@@ -1357,9 +1340,7 @@ fn build_history_payload(session: &Session) -> serde_json::Value {
     json!({"type":"history","messages":msgs})
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  Admin Helpers (Main Session)
-// ══════════════════════════════════════════════════════════════════════════════
+// ── Admin Helpers (Main Session) ─────────────────────────────────────────────
 
 fn resolve_session_target(target: &str, known_ids: &HashSet<String>) -> Result<String, String> {
     if known_ids.contains(target) {
@@ -1605,9 +1586,7 @@ fn is_admin_tool(name: &str) -> bool {
     matches!(name, "list_sessions" | "delete_session")
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  Chat Commands
-// ══════════════════════════════════════════════════════════════════════════════
+// ── Chat Commands ────────────────────────────────────────────────────────────
 
 struct CommandResult {
     response: String,
@@ -2193,9 +2172,7 @@ Commands:
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  WebSocket Handler
-// ══════════════════════════════════════════════════════════════════════════════
+// ── WebSocket Handler ────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct WsQuery {
@@ -2456,6 +2433,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
         let mut shutting_down = false;
         let mut round: usize = 0;
+        let mut react_ctx = agent::AgentLoopCtx::new(false);
         const AGENT_HARD_CAP_ROUNDS: usize = 200;
         'agent: loop {
             if round >= AGENT_HARD_CAP_ROUNDS {
@@ -2517,7 +2495,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
             if !ws_send(
                 &tx,
-                &json!({"type":"start","round":round + 1,"avatar":avatar}),
+                &json!({
+                    "type":"start",
+                    "round":round + 1,
+                    "avatar":avatar,
+                    "phase":react_ctx.phase().label(),
+                }),
             )
             .await
             {
@@ -2557,6 +2540,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             match llm_result {
                 Ok(resp) => {
                     let has_tools = resp.message.tool_calls.is_some();
+                    let _has_content = resp.message.has_nonempty_content();
                     let should_persist_message = !resp.message.is_empty_assistant_message();
 
                     if should_persist_message {
@@ -2565,6 +2549,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             session.messages.push(resp.message.clone());
                             session.updated_at = now_epoch();
                         }
+                    }
+
+                    if has_tools {
+                        react_ctx.transition_to_act();
                     }
 
                     if let Some(tool_calls) = &resp.message.tool_calls {
@@ -2629,11 +2617,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                                 break 'agent;
                             }
 
+                            let annotated =
+                                agent::maybe_annotate_observation(&tc.function.name, &result);
+
                             let mut sessions = state.sessions.lock().await;
                             if let Some(session) = sessions.get_mut(&current_session_id) {
                                 session.messages.push(ChatMessage {
                                     role: "tool".into(),
-                                    content: Some(result),
+                                    content: Some(annotated),
                                     tool_calls: None,
                                     tool_call_id: Some(tc.id.clone()),
                                     timestamp: Some(now_epoch()),
@@ -2641,6 +2632,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                                 session.tool_calls_count += 1;
                             }
                         }
+
+                        react_ctx.transition_to_observe(tool_calls.len());
                     }
 
                     // Incremental save so progress is not lost on crash.
@@ -2653,9 +2646,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     }
 
                     if !has_tools {
-                        ws_send(&tx, &json!({"type":"done"})).await;
+                        react_ctx.transition_to_finish();
+                        ws_send(&tx, &json!({"type":"done","phase":"finish","cycles":react_ctx.cycles,"tool_calls":react_ctx.tool_calls})).await;
                         break;
                     }
+                    react_ctx.transition_to_analyze(); // Observe → Analyze
                 }
                 Err(e) => {
                     ws_send(&tx, &json!({"type":"error","content":e})).await;
@@ -2788,9 +2783,7 @@ async fn send_sessions_list(tx: &WsTx, state: &AppState, active_id: &str) {
     ws_send(tx, &json!({"type":"sessions_list","sessions":all})).await;
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  HTTP API
-// ══════════════════════════════════════════════════════════════════════════════
+// ── HTTP API ──────────────────────────────────────────────────────────────────
 
 async fn api_shutdown(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Verify shutdown token — only the local CLI should be able to trigger this
@@ -2840,9 +2833,7 @@ async fn api_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({"sessions": list}))
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-//  Main
-// ══════════════════════════════════════════════════════════════════════════════
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
