@@ -1,0 +1,675 @@
+// ── State ──
+const chat = document.getElementById('chat');
+const input = document.getElementById('input');
+const sendBtn = document.getElementById('send');
+const sendIcon = document.getElementById('send-icon');
+const connDot = document.getElementById('conn-dot');
+const connLabel = document.getElementById('conn-label');
+const sessionNameEl = document.getElementById('session-name');
+const sessionIdEl = document.getElementById('session-id');
+const sessionList = document.getElementById('session-list');
+
+let ws = null;
+let currentMsg = null;
+let busy = false;
+let currentSessionId = '';
+let sessions = [];
+let reasoningPanel = null;
+let sessionAvatar = null;
+let reconnectDelay = 1000;
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 50;
+let pendingAssistantText = '';
+let pendingReasoningText = '';
+let assistantFlushHandle = 0;
+let reasoningFlushHandle = 0;
+
+function flushAssistantText() {
+  assistantFlushHandle = 0;
+  if (!currentMsg || !pendingAssistantText) {
+    return;
+  }
+
+  currentMsg._rawText = (currentMsg._rawText || '') + pendingAssistantText;
+  currentMsg.textContent = currentMsg._rawText;
+  pendingAssistantText = '';
+  revealCurrentAssistant();
+  scrollDown();
+}
+
+function scheduleAssistantFlush() {
+  if (assistantFlushHandle) {
+    return;
+  }
+
+  assistantFlushHandle = requestAnimationFrame(flushAssistantText);
+}
+
+function cancelAssistantFlush() {
+  if (assistantFlushHandle) {
+    cancelAnimationFrame(assistantFlushHandle);
+    assistantFlushHandle = 0;
+  }
+  pendingAssistantText = '';
+}
+
+function flushReasoningText() {
+  reasoningFlushHandle = 0;
+  if (!reasoningPanel || !pendingReasoningText) {
+    return;
+  }
+
+  const body = reasoningPanel.querySelector('.reasoning-body');
+  if (!body) {
+    pendingReasoningText = '';
+    return;
+  }
+
+  body.textContent += pendingReasoningText;
+  pendingReasoningText = '';
+  scrollDown();
+}
+
+function scheduleReasoningFlush() {
+  if (reasoningFlushHandle) {
+    return;
+  }
+
+  reasoningFlushHandle = requestAnimationFrame(flushReasoningText);
+}
+
+function cancelReasoningFlush() {
+  if (reasoningFlushHandle) {
+    cancelAnimationFrame(reasoningFlushHandle);
+    reasoningFlushHandle = 0;
+  }
+  pendingReasoningText = '';
+}
+
+function currentMsgRow() {
+  return currentMsg ? currentMsg.closest('.msg-row') : null;
+}
+
+function beginAssistantStream() {
+  cancelAssistantFlush();
+  const message = addAssistant('');
+  const row = message.closest('.msg-row');
+  if (row) {
+    row.hidden = true;
+  }
+  message.classList.add('typing');
+  message._rawText = '';
+  currentMsg = message;
+}
+
+function revealCurrentAssistant() {
+  const row = currentMsgRow();
+  if (row) {
+    row.hidden = false;
+  }
+}
+
+function finishAssistantStream({ discardIfEmpty = false } = {}) {
+  flushAssistantText();
+  if (!currentMsg) {
+    return;
+  }
+
+  const row = currentMsgRow();
+  const raw = (currentMsg._rawText || '').trim();
+  currentMsg.classList.remove('typing');
+
+  if (!raw && discardIfEmpty) {
+    row?.remove();
+    currentMsg = null;
+    return;
+  }
+
+  if (!raw) {
+    row?.removeAttribute('hidden');
+    currentMsg = null;
+    return;
+  }
+
+  revealCurrentAssistant();
+  renderMarkdown(currentMsg);
+  currentMsg = null;
+}
+
+function finishReasoningStream() {
+  flushReasoningText();
+  cancelReasoningFlush();
+}
+
+// ── Markdown setup ──
+marked.setOptions({
+  highlight: (code, lang) => {
+    if (lang && hljs.getLanguage(lang)) {
+      return hljs.highlight(code, { language: lang }).value;
+    }
+    return hljs.highlightAuto(code).value;
+  },
+  breaks: true,
+});
+
+// ── WebSocket ──
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const stored = sessionStorage.getItem('lingclaw_session');
+  const qs = stored ? `?session=${encodeURIComponent(stored)}` : '';
+  ws = new WebSocket(`${proto}://${location.host}/ws${qs}`);
+
+  ws.onopen = () => {
+    reconnectDelay = 1000;
+    reconnectAttempts = 0;
+    connDot.className = 'conn-dot connected';
+    connLabel.textContent = 'Online';
+    addSystem('Connected.');
+  };
+
+  ws.onclose = () => {
+    connDot.className = 'conn-dot disconnected';
+    connLabel.textContent = 'Offline';
+    finishAssistantStream({ discardIfEmpty: true });
+    finishReasoningStream();
+    reasoningPanel = null;
+    setBusy(false);
+    if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
+      addSystem('Disconnected. Reconnecting...');
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+      reconnectAttempts++;
+    } else {
+      addSystem('Connection lost. Please refresh the page.', 'error');
+    }
+  };
+
+  ws.onerror = () => ws.close();
+
+  ws.onmessage = (e) => {
+    let data;
+    try { data = JSON.parse(e.data); } catch { console.warn('Invalid JSON from server:', e.data); return; }
+    handleMessage(data);
+  };
+}
+
+function handleMessage(data) {
+  switch (data.type) {
+    case 'session':
+      currentSessionId = data.id;
+      sessionNameEl.textContent = data.name || 'New Chat';
+      sessionIdEl.textContent = data.id.slice(0, 12);
+      sessionStorage.setItem('lingclaw_session', data.id);
+      applySessionAvatar(data.avatar || null);
+      break;
+
+    case 'session_switched':
+      currentSessionId = data.id;
+      sessionNameEl.textContent = data.name || 'New Chat';
+      sessionIdEl.textContent = data.id.slice(0, 12);
+      sessionStorage.setItem('lingclaw_session', data.id);
+      applySessionAvatar(data.avatar || null);
+      finishAssistantStream({ discardIfEmpty: true });
+      finishReasoningStream();
+      chat.innerHTML = '';
+      reasoningPanel = null;
+      setBusy(false);
+      break;
+
+    case 'history': {
+      chat.innerHTML = '';
+      const msgs = data.messages || [];
+      if (msgs.length === 0) {
+        showWelcome();
+      } else {
+        chat.classList.add('no-animate');
+        for (const m of msgs) {
+          switch (m.role) {
+            case 'user': addMsg('user', m.content, m.timestamp); break;
+            case 'assistant': {
+              const el = addMsg('assistant', m.content, m.timestamp);
+              el._rawText = m.content;
+              renderMarkdown(el);
+              break;
+            }
+            case 'tool_call': addToolCall(m.name, m.arguments, m.id); break;
+            case 'tool_result': addToolResult('', m.result, m.id); break;
+          }
+        }
+        requestAnimationFrame(() => chat.classList.remove('no-animate'));
+      }
+      break;
+    }
+
+    case 'sessions_list':
+      sessions = data.sessions || [];
+      renderSessionList();
+      break;
+
+    case 'avatar_update':
+      if (!data.session_id || data.session_id === currentSessionId) {
+        applySessionAvatar(data.avatar || null);
+      }
+      break;
+
+    case 'start':
+      if (data.avatar !== undefined) applySessionAvatar(data.avatar || null);
+      finishAssistantStream({ discardIfEmpty: true });
+      beginAssistantStream();
+      break;
+
+    case 'delta':
+      if (currentMsg) {
+        pendingAssistantText += data.content;
+        scheduleAssistantFlush();
+      }
+      break;
+
+    case 'done':
+      finishAssistantStream({ discardIfEmpty: true });
+      finishReasoningStream();
+      reasoningPanel = null;
+      setBusy(false);
+      break;
+
+    case 'thinking_start': {
+      const panel = document.createElement('div');
+      panel.className = 'reasoning-panel reasoning-active';
+      panel.innerHTML = `
+        <div class="reasoning-header" onclick="toggleTool(this)">
+          <span class="reasoning-icon">💭</span>
+          <span class="reasoning-label">Reasoning</span>
+          <span class="reasoning-status">推理中</span>
+          <span class="chevron open">▸</span>
+        </div>
+        <div class="reasoning-body show"></div>
+      `;
+      const currentRow = currentMsg ? currentMsg.closest('.msg-row') : null;
+      if (currentRow) {
+        chat.insertBefore(panel, currentRow);
+      } else {
+        chat.appendChild(panel);
+      }
+      reasoningPanel = panel;
+      hideWelcome();
+      scrollDown();
+      break;
+    }
+
+    case 'thinking_delta':
+      if (reasoningPanel) {
+        pendingReasoningText += data.content;
+        scheduleReasoningFlush();
+      }
+      break;
+
+    case 'thinking_done':
+      if (reasoningPanel) {
+        finishReasoningStream();
+        reasoningPanel.classList.remove('reasoning-active');
+        const status = reasoningPanel.querySelector('.reasoning-status');
+        if (status) status.textContent = '完成';
+        const body = reasoningPanel.querySelector('.reasoning-body');
+        const chevron = reasoningPanel.querySelector('.chevron');
+        setTimeout(() => {
+          if (body) body.classList.remove('show');
+          if (chevron) chevron.classList.remove('open');
+        }, 600);
+        reasoningPanel = null;
+      }
+      break;
+
+    case 'tool_call':
+      addToolCall(data.name, data.arguments, data.id);
+      break;
+
+    case 'tool_result':
+      addToolResult(data.name, data.result, data.id);
+      break;
+
+    case 'progress':
+      addSystem(data.content);
+      break;
+
+    case 'success':
+      addSystem(data.content, 'success');
+      setBusy(false);
+      break;
+
+    case 'system':
+      addSystem(data.content);
+      setBusy(false);
+      break;
+
+    case 'error':
+      finishAssistantStream({ discardIfEmpty: true });
+      finishReasoningStream();
+      addError(data.content);
+      reasoningPanel = null;
+      setBusy(false);
+      break;
+  }
+}
+
+// ── Message rendering ──
+function addMsg(cls, text, timestamp) {
+  const isChat = (cls === 'user' || cls === 'assistant');
+  const row = document.createElement('div');
+  row.className = `msg-row ${cls}`;
+
+  if (isChat) {
+    const avatar = document.createElement('div');
+    avatar.className = 'msg-avatar';
+    if (cls === 'user') {
+      avatar.textContent = 'U';
+    } else {
+      setAssistantAvatar(avatar, sessionAvatar);
+    }
+    row.appendChild(avatar);
+  }
+
+  const el = document.createElement('div');
+  el.className = `msg ${cls}`;
+  el.textContent = text;
+
+  if (isChat) {
+    const content = document.createElement('div');
+    content.className = 'msg-content';
+    content.appendChild(el);
+    const time = document.createElement('div');
+    time.className = 'msg-time';
+    time.textContent = timestamp ? formatTime(new Date(timestamp * 1000)) : formatTime(new Date());
+    content.appendChild(time);
+    row.appendChild(content);
+  } else {
+    row.appendChild(el);
+  }
+
+  chat.appendChild(row);
+  if (isChat) hideWelcome();
+  scrollDown();
+  return el;
+}
+
+function addAssistant(text) { return addMsg('assistant', text); }
+
+function addSystem(t, kind = 'info') {
+  const row = document.createElement('div');
+  row.className = 'msg-row system';
+  const card = document.createElement('div');
+  card.className = 'system-card';
+  const icon = kind === 'success' ? '✅' : 'ℹ️';
+  if (kind === 'success') card.classList.add('success-card');
+  const isBlock = t.includes('\n') || t.length > 80;
+  if (isBlock) {
+    card.innerHTML = `<div class="system-header"><span class="system-icon">📋</span> System</div><pre class="system-body">${escHtml(t)}</pre>`;
+  } else {
+    card.classList.add('system-inline');
+    card.innerHTML = `<span class="system-icon">${icon}</span> <span>${escHtml(t)}</span>`;
+  }
+  row.appendChild(card);
+  chat.appendChild(row);
+  scrollDown();
+}
+
+function addError(t) {
+  const row = document.createElement('div');
+  row.className = 'msg-row error';
+  const card = document.createElement('div');
+  card.className = 'system-card system-inline error-card';
+  card.innerHTML = `<span class="system-icon">⚠️</span> <span style="color:var(--accent-error)">${escHtml(t)}</span>`;
+  row.appendChild(card);
+  chat.appendChild(row);
+  scrollDown();
+}
+
+function addToolCall(name, args, id) {
+  const panel = document.createElement('div');
+  panel.className = 'tool-panel';
+  panel.dataset.toolId = id;
+
+  let argsDisplay = args;
+  try { argsDisplay = JSON.stringify(JSON.parse(args), null, 2); } catch(e) {}
+
+  panel.innerHTML = `
+    <div class="tool-header" onclick="toggleTool(this)">
+      <span class="tool-icon">⚡</span>
+      <span class="tool-name">${escHtml(name)}</span>
+      <span style="color:var(--dim);font-size:12px">${escHtml(truncateStr(args, 80))}</span>
+      <span class="chevron">▸</span>
+    </div>
+    <div class="tool-body">${escHtml(argsDisplay)}</div>
+  `;
+  chat.appendChild(panel);
+  hideWelcome();
+  scrollDown();
+}
+
+function addToolResult(name, result, id) {
+  const panels = chat.querySelectorAll('.tool-panel');
+  for (const p of panels) {
+    if (p.dataset.toolId === id) {
+      const body = p.querySelector('.tool-body');
+      body.textContent += '\n─── result ───\n' + result;
+      return;
+    }
+  }
+  // Fallback: standalone result
+  const el = document.createElement('div');
+  el.className = 'tool-panel tool-result';
+  el.innerHTML = `
+    <div class="tool-header" onclick="toggleTool(this)">
+      <span class="tool-icon">📋</span>
+      <span class="tool-name">${escHtml(name)} result</span>
+      <span class="chevron">▸</span>
+    </div>
+    <div class="tool-body show">${escHtml(result)}</div>
+  `;
+  chat.appendChild(el);
+  scrollDown();
+}
+
+function renderMarkdown(el) {
+  const raw = el._rawText || el.textContent;
+  const html = marked.parse(raw);
+  el.innerHTML = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : html;
+
+  el.querySelectorAll('pre').forEach(pre => {
+    pre.style.position = 'relative';
+    const codeEl = pre.querySelector('code');
+    if (codeEl) {
+      const cls = [...codeEl.classList].find(c => c.startsWith('language-'));
+      if (cls) {
+        const label = document.createElement('span');
+        label.className = 'code-lang-label';
+        label.textContent = cls.replace('language-', '');
+        pre.appendChild(label);
+      }
+    }
+    const btn = document.createElement('button');
+    btn.className = 'copy-btn';
+    btn.textContent = 'Copy';
+    btn.onclick = () => {
+      const code = pre.querySelector('code');
+      const text = code?.textContent || pre.textContent;
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
+      } else {
+        fallbackCopy(text);
+      }
+      btn.textContent = 'Copied!';
+      setTimeout(() => btn.textContent = 'Copy', 1500);
+    };
+    pre.appendChild(btn);
+  });
+
+  el.querySelectorAll('pre code').forEach(block => {
+    hljs.highlightElement(block);
+  });
+}
+
+// ── Session sidebar ──
+function renderSessionList() {
+  sessionList.innerHTML = '';
+  sessions.sort((a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0));
+  for (const s of sessions) {
+    const item = document.createElement('div');
+    item.className = `session-item${s.id === currentSessionId ? ' active' : ''}`;
+    const ts = s.updated_at || s.created_at;
+    item.innerHTML = `
+      <div class="session-top">
+        <span class="name">${escHtml(s.name)}</span>
+        <span class="meta">${s.messages || 0}msg</span>
+      </div>
+      <span class="session-time">${ts ? timeAgo(ts) : ''}</span>
+    `;
+    item.onclick = () => {
+      if (s.id !== currentSessionId) {
+        sendCmd(`/switch ${s.id}`);
+      }
+    };
+    sessionList.appendChild(item);
+  }
+  const active = sessions.find(s => s.id === currentSessionId);
+  if (active) {
+    sessionNameEl.textContent = active.name;
+    sessionIdEl.textContent = active.id.slice(0, 12);
+  }
+}
+
+function newSession() {
+  if (confirm('开启新的对话？')) {
+    sendCmd('/session_new');
+  }
+}
+
+function toggleSidebar() {
+  const sidebar = document.getElementById('sidebar');
+  sidebar.classList.toggle('collapsed');
+  const btn = document.querySelector('.toggle-sidebar');
+  btn.setAttribute('aria-expanded', !sidebar.classList.contains('collapsed'));
+}
+
+// ── Helpers ──
+function fallbackCopy(text) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.cssText = 'position:fixed;left:-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand('copy');
+  document.body.removeChild(ta);
+}
+
+function escHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+function truncateStr(s, max) {
+  return s.length > max ? s.slice(0, max) + '…' : s;
+}
+function scrollDown() { chat.scrollTop = chat.scrollHeight; }
+
+function setAssistantAvatar(node, avatarValue) {
+  node.replaceChildren();
+  if (avatarValue && (avatarValue.startsWith('http') || avatarValue.startsWith('data:'))) {
+    const img = document.createElement('img');
+    img.src = avatarValue;
+    img.style.cssText = 'width:100%;height:100%;border-radius:50%;object-fit:cover';
+    node.appendChild(img);
+    return;
+  }
+  node.textContent = avatarValue || '🦀';
+}
+
+function applySessionAvatar(nextAvatar) {
+  sessionAvatar = nextAvatar;
+  chat.querySelectorAll('.msg-row.assistant .msg-avatar').forEach(node => {
+    setAssistantAvatar(node, sessionAvatar);
+  });
+}
+
+function formatTime(d) {
+  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+}
+
+function timeAgo(ts) {
+  const diff = Date.now() - ts * 1000;
+  const sec = Math.floor(diff / 1000);
+  if (sec < 60) return '刚刚';
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}分钟前`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}小时前`;
+  const day = Math.floor(hr / 24);
+  if (day < 30) return `${day}天前`;
+  return new Date(ts * 1000).toLocaleDateString('zh-CN');
+}
+
+function hideWelcome() {
+  const w = document.getElementById('welcome');
+  if (w) w.remove();
+}
+
+function showWelcome() {
+  if (document.getElementById('welcome')) return;
+  const w = document.createElement('div');
+  w.className = 'welcome';
+  w.id = 'welcome';
+  w.innerHTML = `
+    <div class="welcome-logo">🦀</div>
+    <div class="welcome-title">LingClaw</div>
+    <div class="welcome-hint">
+      你的私人 AI 助手已就绪<br>
+      输入消息开始对话，或使用 <strong>/</strong> 命令
+    </div>
+    <div class="welcome-shortcuts">
+      <button onclick="sendCmd('/status')">📊 Status</button>
+      <button onclick="sendCmd('/help')">❓ Help</button>
+      <button onclick="newSession()">✨ New Chat</button>
+    </div>
+  `;
+  chat.appendChild(w);
+}
+
+function setBusy(b) {
+  busy = b;
+  sendBtn.disabled = b;
+  sendIcon.innerHTML = b ? '<span class="spinner"></span>' : '↑';
+}
+
+function toggleTool(header) {
+  header.querySelector('.chevron').classList.toggle('open');
+  header.nextElementSibling.classList.toggle('show');
+}
+
+// ── Input ──
+function send() {
+  const text = input.value.trim();
+  if (!text || busy || !ws || ws.readyState !== 1) return;
+
+  if (!text.startsWith('/')) {
+    addMsg('user', text);
+  }
+
+  setBusy(true);
+  ws.send(text);
+  input.value = '';
+  input.style.height = 'auto';
+}
+
+function sendCmd(cmd) {
+  if (busy || !ws || ws.readyState !== 1) return;
+  setBusy(true);
+  ws.send(cmd);
+}
+
+input.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+input.addEventListener('input', () => {
+  input.style.height = 'auto';
+  input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+});
+sendBtn.addEventListener('click', send);
+
+connect();

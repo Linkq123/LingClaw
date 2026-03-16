@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::json;
 
 fn test_config() -> Config {
     Config {
@@ -77,6 +78,120 @@ fn resolve_model_uses_config_for_plain_model_id() {
     assert_eq!(resolved.api_base, "https://api.openai.com/v1");
     assert_eq!(resolved.api_key, "test-key");
     assert_eq!(resolved.max_tokens, Some(16384));
+}
+
+#[test]
+fn legacy_settings_provider_fields_deserialize() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "settings": {
+                "port": 3001,
+                "provider": "anthropic",
+                "apiKey": "legacy-key",
+                "apiBase": "https://legacy.example",
+                "execTimeout": 12,
+                "maxContextTokens": 64000,
+                "maxOutputBytes": 1024,
+                "maxFileBytes": 2048
+            }
+        }"#,
+    )
+    .expect("legacy settings fields should deserialize for backward compatibility");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.port, Some(3001));
+    assert_eq!(settings.provider.as_deref(), Some("anthropic"));
+    assert_eq!(settings.api_key.as_deref(), Some("legacy-key"));
+    assert_eq!(settings.api_base.as_deref(), Some("https://legacy.example"));
+    assert_eq!(settings.exec_timeout, Some(12));
+    assert_eq!(settings.max_context_tokens, Some(64000));
+    assert_eq!(settings.max_output_bytes, Some(1024));
+    assert_eq!(settings.max_file_bytes, Some(2048));
+}
+
+#[test]
+fn provider_detect_accepts_provider_prefixed_model_refs() {
+    assert_eq!(
+        Provider::detect(
+            "anthropic/claude-sonnet-4-20250514",
+            "https://api.openai.com/v1",
+            None,
+        ),
+        Provider::Anthropic
+    );
+    assert_eq!(
+        Provider::detect("openai/gpt-4o-mini", "https://api.anthropic.com", None),
+        Provider::OpenAI
+    );
+}
+
+#[test]
+fn cli_default_model_marker_uses_canonical_model_ref() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-a".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api-a.example/v1".to_string(),
+            api_key: "key-a".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "shared-model".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(4096),
+                compat: None,
+            }],
+        },
+    );
+    providers.insert(
+        "openai-b".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api-b.example/v1".to_string(),
+            api_key: "key-b".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "shared-model".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+
+    let config = Config {
+        api_key: "key-a".to_string(),
+        api_base: "https://api-a.example/v1".to_string(),
+        model: "shared-model".to_string(),
+        provider: Provider::OpenAI,
+        providers,
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+    };
+
+    assert!(crate::cli::is_default_model_row(
+        &config,
+        "openai-a",
+        "shared-model"
+    ));
+    assert_eq!(
+        config.resolved_model_ref("shared-model"),
+        "openai-a/shared-model"
+    );
+    assert!(!crate::cli::is_default_model_row(
+        &config,
+        "openai-b",
+        "shared-model"
+    ));
 }
 
 #[test]
@@ -202,6 +317,345 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
 }
 
 #[test]
+fn canonical_model_ref_expands_unique_plain_id() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "anthropic".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "anthropic-key".to_string(),
+            api: "anthropic".to_string(),
+            models: vec![JsonModelEntry {
+                id: "claude-sonnet-4-20250514".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(200000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+
+    let config = Config {
+        api_key: "env-key".to_string(),
+        api_base: "https://fallback.example/v1".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        provider: Provider::OpenAI,
+        providers,
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+    };
+
+    let canonical = config
+        .canonical_model_ref("claude-sonnet-4-20250514")
+        .expect("unique model id should expand to provider/model");
+
+    assert_eq!(canonical, "anthropic/claude-sonnet-4-20250514");
+}
+
+#[test]
+fn canonical_model_ref_rejects_ambiguous_plain_id() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-a".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api-a.example/v1".to_string(),
+            api_key: "key-a".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "shared-model".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(4096),
+                compat: None,
+            }],
+        },
+    );
+    providers.insert(
+        "openai-b".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api-b.example/v1".to_string(),
+            api_key: "key-b".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "shared-model".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+
+    let config = Config {
+        api_key: "key-a".to_string(),
+        api_base: "https://api-a.example/v1".to_string(),
+        model: "shared-model".to_string(),
+        provider: Provider::OpenAI,
+        providers,
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+    };
+
+    let err = config
+        .canonical_model_ref("shared-model")
+        .expect_err("ambiguous plain model id should be rejected");
+
+    assert!(err.contains("ambiguous"));
+    assert!(err.contains("openai-a/shared-model"));
+    assert!(err.contains("openai-b/shared-model"));
+}
+
+#[test]
+fn available_models_omits_ambiguous_plain_default_alias() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-a".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api-a.example/v1".to_string(),
+            api_key: "key-a".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "shared-model".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(4096),
+                compat: None,
+            }],
+        },
+    );
+    providers.insert(
+        "openai-b".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api-b.example/v1".to_string(),
+            api_key: "key-b".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "shared-model".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+
+    let config = Config {
+        api_key: "key-a".to_string(),
+        api_base: "https://api-a.example/v1".to_string(),
+        model: "shared-model".to_string(),
+        provider: Provider::OpenAI,
+        providers,
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+    };
+
+    let available = config.available_models();
+
+    assert!(available.contains(&"openai-a/shared-model".to_string()));
+    assert!(available.contains(&"openai-b/shared-model".to_string()));
+    assert!(!available.contains(&"shared-model".to_string()));
+}
+
+#[test]
+fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "test-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "gpt-4o".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(16384),
+                compat: None,
+            }],
+        },
+    );
+
+    let config = Config {
+        api_key: "env-key".to_string(),
+        api_base: "https://fallback.example/v1".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        provider: Provider::OpenAI,
+        providers,
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+    };
+
+    let err = config
+        .canonical_model_ref("does-not-exist")
+        .expect_err("unknown plain model id should be rejected");
+
+    assert!(err.contains("Unknown model 'does-not-exist'"));
+}
+
+#[test]
+fn canonical_model_ref_preserves_explicit_provider_model() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "test-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "gpt-4o".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(16384),
+                compat: None,
+            }],
+        },
+    );
+
+    let config = Config {
+        api_key: "env-key".to_string(),
+        api_base: "https://fallback.example/v1".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        provider: Provider::OpenAI,
+        providers,
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+    };
+
+    let canonical = config
+        .canonical_model_ref("openai/gpt-4o")
+        .expect("configured provider/model should be preserved");
+
+    assert_eq!(canonical, "openai/gpt-4o");
+}
+
+#[test]
+fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
+    let config = Config {
+        api_key: "env-key".to_string(),
+        api_base: "https://api.openai.com/v1".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        provider: Provider::OpenAI,
+        providers: HashMap::new(),
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+    };
+
+    let canonical = config
+        .canonical_model_ref("openai/gpt-4o-mini")
+        .expect("env-only mode should allow explicit provider/model refs");
+
+    assert_eq!(canonical, "openai/gpt-4o-mini");
+}
+
+#[test]
+fn resolve_model_strips_provider_prefix_without_provider_config() {
+    let config = Config {
+        api_key: "env-key".to_string(),
+        api_base: "https://api.openai.com/v1".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        provider: Provider::OpenAI,
+        providers: HashMap::new(),
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+    };
+
+    let resolved = config.resolve_model("anthropic/claude-sonnet-4-20250514");
+
+    assert_eq!(resolved.provider, Provider::Anthropic);
+    assert_eq!(resolved.api_base, "https://api.anthropic.com");
+    assert_eq!(resolved.model_id, "claude-sonnet-4-20250514");
+}
+
+#[test]
+fn build_session_status_reports_resolved_target() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "anthropic".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "anthropic-key".to_string(),
+            api: "anthropic".to_string(),
+            models: vec![JsonModelEntry {
+                id: "claude-sonnet-4-20250514".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(200000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+
+    let config = Config {
+        api_key: "env-key".to_string(),
+        api_base: "https://fallback.example/v1".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        provider: Provider::OpenAI,
+        providers,
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+    };
+    let mut session = test_session("abc", "Test", Some("anthropic/claude-sonnet-4-20250514"));
+    session.think_level = "medium".to_string();
+
+    let status = build_session_status(&session, &config);
+
+    assert!(status.contains("model: anthropic/claude-sonnet-4-20250514"));
+    assert!(status.contains("resolved_provider: anthropic"));
+    assert!(status.contains("resolved_api_base: https://api.anthropic.com"));
+    assert!(status.contains("resolved_model_id: claude-sonnet-4-20250514"));
+    assert!(status.contains("max_tokens: 8192"));
+    assert!(status.contains("think: medium"));
+}
+
+#[test]
 fn resolve_session_target_accepts_unique_prefix() {
     let known_ids = HashSet::from([
         "main".to_string(),
@@ -209,21 +663,16 @@ fn resolve_session_target_accepts_unique_prefix() {
         "def9999999999".to_string(),
     ]);
 
-    let resolved =
-        resolve_session_target("abc123", &known_ids).expect("prefix should resolve");
+    let resolved = resolve_session_target("abc123", &known_ids).expect("prefix should resolve");
 
     assert_eq!(resolved, "abc1234567890");
 }
 
 #[test]
 fn resolve_session_target_rejects_ambiguous_prefix() {
-    let known_ids = HashSet::from([
-        "abc1234567890".to_string(),
-        "abc1239999999".to_string(),
-    ]);
+    let known_ids = HashSet::from(["abc1234567890".to_string(), "abc1239999999".to_string()]);
 
-    let err =
-        resolve_session_target("abc123", &known_ids).expect_err("prefix should be ambiguous");
+    let err = resolve_session_target("abc123", &known_ids).expect_err("prefix should be ambiguous");
 
     assert!(err.contains("ambiguous"));
 }
@@ -234,8 +683,7 @@ fn list_saved_session_ids_in_dir_uses_filenames_even_for_invalid_json() {
     std::fs::create_dir_all(&base).expect("temp dir should be created");
     std::fs::write(base.join("good-session.json"), "not valid json")
         .expect("invalid json file should be created");
-    std::fs::write(base.join("ignored.txt"), "ignore me")
-        .expect("non-json file should be created");
+    std::fs::write(base.join("ignored.txt"), "ignore me").expect("non-json file should be created");
 
     let ids = list_saved_session_ids_in_dir(&base);
 
@@ -291,4 +739,385 @@ fn build_active_session_lines_lists_only_active_sessions_with_full_ids() {
     assert!(lines[0].contains(MAIN_SESSION_ID));
     assert!(lines[0].contains("Main"));
     assert!(!lines[0].contains("Idle"));
+}
+
+#[test]
+fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
+    let mut messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("system".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("a".repeat(500)),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("b".repeat(500)),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("keep".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    ];
+
+    prune_messages(&mut messages, 50);
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "system");
+    assert_eq!(messages[1].content.as_deref(), Some("keep"));
+}
+
+#[test]
+fn sanitize_session_messages_removes_empty_assistant_reply() {
+    let mut messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("system".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(1),
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some(String::new()),
+            tool_calls: Some(vec![ToolCall {
+                id: "call-1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "exec".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: Some(2),
+        },
+    ];
+
+    sanitize_session_messages(&mut messages);
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "system");
+    assert_eq!(messages[1].role, "assistant");
+    assert!(messages[1].has_tool_calls());
+}
+
+#[test]
+fn load_session_from_disk_drops_empty_assistant_reply() {
+    let session_id = format!("sanitize-load-{}", now_epoch());
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let payload = json!({
+        "id": session_id,
+        "name": "Test",
+        "messages": [
+            {
+                "role": "system",
+                "content": "system"
+            },
+            {
+                "role": "assistant",
+                "timestamp": 1773669433
+            },
+            {
+                "role": "user",
+                "content": "next"
+            }
+        ],
+        "created_at": 1,
+        "updated_at": 1,
+        "tool_calls_count": 0,
+        "think_level": "auto"
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&payload).expect("payload should serialize"),
+    )
+    .expect("session file should be written");
+
+    let session = load_session_from_disk(
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("session id should be valid"),
+    )
+    .expect("session should load");
+
+    assert_eq!(session.messages.len(), 2);
+    assert_eq!(session.messages[0].role, "system");
+    assert_eq!(session.messages[1].role, "user");
+
+    let _ = std::fs::remove_file(&path);
+    let workspace = session_workspace_path(&session.id)
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
+    let session_id = format!("sanitize-save-{}", now_epoch());
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let workspace = session_workspace_path(&session_id);
+    let session = Session {
+        id: session_id.clone(),
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("system".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: Some(1773669433),
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("next".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+        ],
+        created_at: 1,
+        updated_at: 1,
+        tool_calls_count: 0,
+        model_override: None,
+        think_level: default_think_level(),
+        workspace: workspace.clone(),
+        avatar: None,
+    };
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    runtime
+        .block_on(save_session_to_disk(&session))
+        .expect("session should save");
+
+    let data = std::fs::read_to_string(&path).expect("session file should be readable");
+    let payload: serde_json::Value =
+        serde_json::from_str(&data).expect("session file should contain valid json");
+    let messages = payload["messages"]
+        .as_array()
+        .expect("messages should serialize as an array");
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[1]["role"], "user");
+    assert!(messages.iter().all(|message| {
+        message["role"] != "assistant"
+            || message
+                .get("content")
+                .and_then(|content| content.as_str())
+                .is_some_and(|content| !content.is_empty())
+            || message
+                .get("tool_calls")
+                .and_then(|tool_calls| tool_calls.as_array())
+                .is_some_and(|tool_calls| !tool_calls.is_empty())
+    }));
+
+    let _ = std::fs::remove_file(&path);
+    let session_dir = workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn resolve_path_clamps_parent_escape_attempts() {
+    let base = std::env::temp_dir().join(format!("lingclaw-resolve-{}", now_epoch()));
+    std::fs::create_dir_all(&base).expect("temp dir should be created");
+
+    let resolved = resolve_path("../../outside.txt", &base);
+
+    assert_eq!(resolved, base.canonicalize().unwrap_or(base.clone()));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn resolve_path_checked_rejects_absolute_paths_outside_workspace() {
+    let base = std::env::temp_dir().join(format!("lingclaw-resolve-check-{}", now_epoch()));
+    let outside = std::env::temp_dir().join(format!("lingclaw-outside-{}.txt", now_epoch()));
+    std::fs::create_dir_all(&base).expect("temp dir should be created");
+
+    let message = resolve_path_checked(&outside.to_string_lossy(), &base)
+        .expect_err("outside path should be rejected");
+
+    assert!(message.contains("outside the session workspace"));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn resolve_path_checked_allows_workspace_root_absolute_path() {
+    let base = std::env::temp_dir().join(format!("lingclaw-resolve-root-{}", now_epoch()));
+    std::fs::create_dir_all(&base).expect("temp dir should be created");
+
+    let resolved = resolve_path_checked(&base.to_string_lossy(), &base)
+        .expect("workspace root path should be allowed");
+
+    assert_eq!(resolved, base.canonicalize().unwrap_or(base.clone()));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn resolve_path_checked_allows_relative_path_that_normalizes_to_workspace_root() {
+    let base = std::env::temp_dir().join(format!("lingclaw-resolve-normalized-{}", now_epoch()));
+    let nested = base.join("nested");
+    std::fs::create_dir_all(&nested).expect("nested dir should be created");
+
+    let resolved = resolve_path_checked("nested/..", &base)
+        .expect("normalized in-workspace path should be allowed");
+
+    assert_eq!(resolved, base.canonicalize().unwrap_or(base.clone()));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn read_file_reports_workspace_escape_clearly() {
+    let base = std::env::temp_dir().join(format!("lingclaw-read-file-{}", now_epoch()));
+    let outside = std::env::temp_dir().join(format!("lingclaw-outside-read-{}.txt", now_epoch()));
+    std::fs::create_dir_all(&base).expect("temp dir should be created");
+    std::fs::write(&outside, "outside").expect("outside file should be written");
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let result = runtime.block_on(tools::fs::tool_read_file(
+        &json!({ "path": outside.to_string_lossy().to_string() }),
+        &test_config(),
+        &base,
+    ));
+
+    assert!(result.contains("read_file error: path '"));
+    assert!(result.contains("outside the session workspace"));
+
+    let _ = std::fs::remove_file(&outside);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn generate_shutdown_token_returns_64_hex_chars() {
+    let token = generate_shutdown_token();
+
+    assert_eq!(token.len(), 64);
+    assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
+}
+
+#[test]
+fn parse_identity_avatar_treats_none_as_unset() {
+    let base = std::env::temp_dir().join(format!("lingclaw-avatar-none-{}", now_epoch()));
+    std::fs::create_dir_all(&base).expect("temp dir should be created");
+    std::fs::write(base.join("IDENTITY.md"), "- 头像：none\n")
+        .expect("identity file should be written");
+
+    let avatar = prompts::parse_identity_avatar(&base);
+
+    assert_eq!(avatar, None);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn parse_identity_avatar_ignores_legacy_unset_placeholder_value() {
+    let base = std::env::temp_dir().join(format!("lingclaw-avatar-placeholder-{}", now_epoch()));
+    std::fs::create_dir_all(&base).expect("temp dir should be created");
+    std::fs::write(base.join("IDENTITY.md"), "- 头像：暂未设置\n")
+        .expect("identity file should be written");
+
+    let avatar = prompts::parse_identity_avatar(&base);
+
+    assert_eq!(avatar, None);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn parse_identity_avatar_keeps_real_text_avatar() {
+    let base = std::env::temp_dir().join(format!("lingclaw-avatar-text-{}", now_epoch()));
+    std::fs::create_dir_all(&base).expect("temp dir should be created");
+    std::fs::write(base.join("IDENTITY.md"), "- 头像：✨\n")
+        .expect("identity file should be written");
+
+    let avatar = prompts::parse_identity_avatar(&base);
+
+    assert_eq!(avatar.as_deref(), Some("✨"));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn find_static_dir_from_prefers_exe_ancestors() {
+    let base = std::env::temp_dir().join(format!("lingclaw-static-exe-{}", now_epoch()));
+    let exe_dir = base.join("bin");
+    let static_dir = base.join("static");
+    std::fs::create_dir_all(&exe_dir).expect("bin dir should be created");
+    std::fs::create_dir_all(&static_dir).expect("static dir should be created");
+    std::fs::write(static_dir.join("index.html"), "ok").expect("index should be written");
+
+    let resolved = find_static_dir_from(Some(&exe_dir.join("lingclaw.exe")), None);
+
+    assert_eq!(resolved, static_dir);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn find_static_dir_from_falls_back_to_cwd() {
+    let base = std::env::temp_dir().join(format!("lingclaw-static-cwd-{}", now_epoch()));
+    let static_dir = base.join("static");
+    std::fs::create_dir_all(&static_dir).expect("static dir should be created");
+    std::fs::write(static_dir.join("index.html"), "ok").expect("index should be written");
+
+    let resolved = find_static_dir_from(None, Some(&base));
+
+    assert_eq!(resolved, static_dir);
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn find_static_dir_from_does_not_walk_past_expected_exe_ancestors() {
+    let base = std::env::temp_dir().join(format!("lingclaw-static-boundary-{}", now_epoch()));
+    let outer_static = base.join("outer").join("static");
+    let exe_dir = base
+        .join("outer")
+        .join("project")
+        .join("target")
+        .join("debug");
+    std::fs::create_dir_all(&outer_static).expect("outer static dir should be created");
+    std::fs::create_dir_all(&exe_dir).expect("exe dir should be created");
+    std::fs::write(outer_static.join("index.html"), "wrong").expect("outer index should exist");
+
+    let resolved = find_static_dir_from(Some(&exe_dir.join("lingclaw.exe")), None);
+
+    assert_eq!(resolved, PathBuf::from("static"));
+
+    let _ = std::fs::remove_dir_all(&base);
 }

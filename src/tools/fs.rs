@@ -2,16 +2,28 @@ use std::path::{Path, PathBuf};
 
 use regex::Regex;
 
-use crate::{format_size, matches_glob, resolve_path, truncate, Config};
+use crate::{format_size, matches_glob, resolve_path_checked, truncate, Config};
+
+fn resolve_tool_path(path_str: &str, workspace: &Path, tool_name: &str) -> Result<PathBuf, String> {
+    resolve_path_checked(path_str, workspace)
+        .map_err(|message| format!("{tool_name} error: {message}"))
+}
 
 // ── read_file ────────────────────────────────────────────────────────────────
 
-pub(crate) async fn tool_read_file(args: &serde_json::Value, config: &Config, workspace: &Path) -> String {
+pub(crate) async fn tool_read_file(
+    args: &serde_json::Value,
+    config: &Config,
+    workspace: &Path,
+) -> String {
     let path_str = match args["path"].as_str() {
         Some(p) => p,
         None => return "Error: 'path' parameter is required".into(),
     };
-    let path = resolve_path(path_str, workspace);
+    let path = match resolve_tool_path(path_str, workspace, "read_file") {
+        Ok(path) => path,
+        Err(message) => return message,
+    };
 
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => {
@@ -29,8 +41,17 @@ pub(crate) async fn tool_read_file(args: &serde_json::Value, config: &Config, wo
                         .enumerate()
                         .map(|(i, l)| format!("{:>5} | {}", s + i + 1, l))
                         .collect();
-                    let header = format!("[{} — lines {}-{} of {}]\n", path.display(), s + 1, e, total);
-                    truncate(&format!("{header}{}", numbered.join("\n")), config.max_file_bytes)
+                    let header = format!(
+                        "[{} — lines {}-{} of {}]\n",
+                        path.display(),
+                        s + 1,
+                        e,
+                        total
+                    );
+                    truncate(
+                        &format!("{header}{}", numbered.join("\n")),
+                        config.max_file_bytes,
+                    )
                 }
                 (Some(s), None) => {
                     let s = s.saturating_sub(1).min(total);
@@ -39,8 +60,17 @@ pub(crate) async fn tool_read_file(args: &serde_json::Value, config: &Config, wo
                         .enumerate()
                         .map(|(i, l)| format!("{:>5} | {}", s + i + 1, l))
                         .collect();
-                    let header = format!("[{} — lines {}-{} of {}]\n", path.display(), s + 1, total, total);
-                    truncate(&format!("{header}{}", numbered.join("\n")), config.max_file_bytes)
+                    let header = format!(
+                        "[{} — lines {}-{} of {}]\n",
+                        path.display(),
+                        s + 1,
+                        total,
+                        total
+                    );
+                    truncate(
+                        &format!("{header}{}", numbered.join("\n")),
+                        config.max_file_bytes,
+                    )
                 }
                 _ => {
                     let header = format!("[{} — {} lines]\n", path.display(), total);
@@ -54,7 +84,11 @@ pub(crate) async fn tool_read_file(args: &serde_json::Value, config: &Config, wo
 
 // ── write_file ───────────────────────────────────────────────────────────────
 
-pub(crate) async fn tool_write_file(args: &serde_json::Value, _config: &Config, workspace: &Path) -> String {
+pub(crate) async fn tool_write_file(
+    args: &serde_json::Value,
+    _config: &Config,
+    workspace: &Path,
+) -> String {
     let path_str = match args["path"].as_str() {
         Some(p) => p,
         None => return "Error: 'path' parameter is required".into(),
@@ -63,7 +97,10 @@ pub(crate) async fn tool_write_file(args: &serde_json::Value, _config: &Config, 
         Some(c) => c,
         None => return "Error: 'content' parameter is required".into(),
     };
-    let path = resolve_path(path_str, workspace);
+    let path = match resolve_tool_path(path_str, workspace, "write_file") {
+        Ok(path) => path,
+        Err(message) => return message,
+    };
 
     if let Some(parent) = path.parent() {
         if let Err(e) = tokio::fs::create_dir_all(parent).await {
@@ -79,7 +116,11 @@ pub(crate) async fn tool_write_file(args: &serde_json::Value, _config: &Config, 
 
 // ── patch_file ───────────────────────────────────────────────────────────────
 
-pub(crate) async fn tool_patch_file(args: &serde_json::Value, _config: &Config, workspace: &Path) -> String {
+pub(crate) async fn tool_patch_file(
+    args: &serde_json::Value,
+    _config: &Config,
+    workspace: &Path,
+) -> String {
     let path_str = match args["path"].as_str() {
         Some(p) => p,
         None => return "Error: 'path' parameter is required".into(),
@@ -92,7 +133,10 @@ pub(crate) async fn tool_patch_file(args: &serde_json::Value, _config: &Config, 
         Some(s) => s,
         None => return "Error: 'new_string' parameter is required".into(),
     };
-    let path = resolve_path(path_str, workspace);
+    let path = match resolve_tool_path(path_str, workspace, "patch_file") {
+        Ok(path) => path,
+        Err(message) => return message,
+    };
 
     match tokio::fs::read_to_string(&path).await {
         Ok(content) => {
@@ -119,9 +163,16 @@ pub(crate) async fn tool_patch_file(args: &serde_json::Value, _config: &Config, 
 
 // ── list_dir ─────────────────────────────────────────────────────────────────
 
-pub(crate) async fn tool_list_dir(args: &serde_json::Value, _config: &Config, workspace: &Path) -> String {
+pub(crate) async fn tool_list_dir(
+    args: &serde_json::Value,
+    _config: &Config,
+    workspace: &Path,
+) -> String {
     let path_str = args["path"].as_str().unwrap_or(".");
-    let path = resolve_path(path_str, workspace);
+    let path = match resolve_tool_path(path_str, workspace, "list_dir") {
+        Ok(path) => path,
+        Err(message) => return message,
+    };
 
     match tokio::fs::read_dir(&path).await {
         Ok(mut entries) => {
@@ -205,7 +256,11 @@ async fn collect_file_paths(
     files
 }
 
-pub(crate) async fn tool_search_files(args: &serde_json::Value, config: &Config, workspace: &Path) -> String {
+pub(crate) async fn tool_search_files(
+    args: &serde_json::Value,
+    config: &Config,
+    workspace: &Path,
+) -> String {
     let pattern_str = match args["pattern"].as_str() {
         Some(p) => p,
         None => return "Error: 'pattern' parameter is required".into(),
@@ -215,7 +270,10 @@ pub(crate) async fn tool_search_files(args: &serde_json::Value, config: &Config,
         Err(e) => return format!("Invalid regex pattern: {e}"),
     };
     let dir_str = args["path"].as_str().unwrap_or(".");
-    let dir = resolve_path(dir_str, workspace);
+    let dir = match resolve_tool_path(dir_str, workspace, "search_files") {
+        Ok(path) => path,
+        Err(message) => return message,
+    };
     let file_glob = args["file_glob"].as_str();
     let max_results = args["max_results"].as_u64().unwrap_or(50) as usize;
 
@@ -234,12 +292,7 @@ pub(crate) async fn tool_search_files(args: &serde_json::Value, config: &Config,
                 break;
             }
             if re.is_match(line) {
-                results.push(format!(
-                    "{}:{}:{}",
-                    file_path.display(),
-                    i + 1,
-                    line.trim()
-                ));
+                results.push(format!("{}:{}:{}", file_path.display(), i + 1, line.trim()));
             }
         }
     }
@@ -262,14 +315,20 @@ pub(crate) async fn tool_delete_file(args: &serde_json::Value, workspace: &Path)
         Some(p) => p,
         None => return "Error: 'path' parameter is required".into(),
     };
-    let path = resolve_path(path_str, workspace);
+    let path = match resolve_tool_path(path_str, workspace, "delete_file") {
+        Ok(path) => path,
+        Err(message) => return message,
+    };
 
     match tokio::fs::metadata(&path).await {
         Ok(meta) if meta.is_file() => match tokio::fs::remove_file(&path).await {
             Ok(()) => format!("Deleted {}", path.display()),
             Err(e) => format!("delete_file error: {e}"),
         },
-        Ok(_) => format!("delete_file error: {} is a directory, not a file", path.display()),
+        Ok(_) => format!(
+            "delete_file error: {} is a directory, not a file",
+            path.display()
+        ),
         Err(e) => format!("delete_file error: {e}"),
     }
 }

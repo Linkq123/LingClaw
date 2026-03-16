@@ -1,11 +1,14 @@
-use std::{collections::HashMap, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{tools, ChatMessage, FunctionCall, Provider, ToolCall, WsTx, ws_send};
+use crate::{tools, ws_send, ChatMessage, FunctionCall, Provider, ToolCall, WsTx};
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  Provider Types
@@ -110,7 +113,7 @@ fn convert_messages_to_openai(messages: &[ChatMessage]) -> Vec<serde_json::Value
             "assistant" => {
                 let mut item = json!({
                     "role": "assistant",
-                    "content": msg.content,
+                    "content": msg.content.as_deref().unwrap_or(""),
                 });
                 if let Some(tool_calls) = &msg.tool_calls {
                     item["tool_calls"] = json!(tool_calls);
@@ -215,10 +218,12 @@ pub(crate) async fn call_llm_simple(
             if let Some(mt) = resolved.max_tokens {
                 body["max_tokens"] = json!(mt);
             }
-            let resp = http.post(&url)
+            let resp = http
+                .post(&url)
                 .bearer_auth(&resolved.api_key)
                 .json(&body)
-                .send().await
+                .send()
+                .await
                 .map_err(|e| format!("HTTP error: {e}"))?;
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -226,7 +231,10 @@ pub(crate) async fn call_llm_simple(
                 return Err(format!("API {status}: {text}"));
             }
             let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            Ok(data["choices"][0]["message"]["content"].as_str().unwrap_or("").to_string())
+            Ok(data["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string())
         }
         Provider::Anthropic => {
             let url = format!("{}/v1/messages", resolved.api_base);
@@ -240,11 +248,13 @@ pub(crate) async fn call_llm_simple(
             if !system.is_empty() {
                 body["system"] = json!(system);
             }
-            let resp = http.post(&url)
+            let resp = http
+                .post(&url)
                 .header("x-api-key", &resolved.api_key)
                 .header("anthropic-version", "2023-06-01")
                 .json(&body)
-                .send().await
+                .send()
+                .await
                 .map_err(|e| format!("HTTP error: {e}"))?;
             if !resp.status().is_success() {
                 let status = resp.status();
@@ -252,7 +262,8 @@ pub(crate) async fn call_llm_simple(
                 return Err(format!("API {status}: {text}"));
             }
             let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            let content = data["content"].as_array()
+            let content = data["content"]
+                .as_array()
                 .and_then(|arr| arr.iter().find(|b| b["type"] == "text"))
                 .and_then(|b| b["text"].as_str())
                 .unwrap_or("")
@@ -303,8 +314,13 @@ pub(crate) async fn call_llm_stream(
         think_level
     };
     match resolved.provider {
-        Provider::OpenAI => call_llm_stream_openai(http, resolved, messages, tx, effective_level, extra_tools).await,
-        Provider::Anthropic => call_llm_stream_anthropic(http, resolved, messages, tx, effective_level, extra_tools).await,
+        Provider::OpenAI => {
+            call_llm_stream_openai(http, resolved, messages, tx, effective_level, extra_tools).await
+        }
+        Provider::Anthropic => {
+            call_llm_stream_anthropic(http, resolved, messages, tx, effective_level, extra_tools)
+                .await
+        }
     }
 }
 
@@ -319,7 +335,8 @@ async fn call_llm_stream_openai(
     let thinking_on = think_level != "off";
     let url = format!("{}/chat/completions", resolved.api_base);
     let api_messages = convert_messages_to_openai(messages);
-    let mut all_tools: Vec<serde_json::Value> = serde_json::from_value(tools::tool_definitions()).unwrap_or_default();
+    let mut all_tools: Vec<serde_json::Value> =
+        serde_json::from_value(tools::tool_definitions()).unwrap_or_default();
     all_tools.extend_from_slice(extra_tools);
     let mut body = json!({
         "model": resolved.model_id,
@@ -365,7 +382,9 @@ async fn call_llm_stream_openai(
     let mut client_gone = false;
 
     while let Some(chunk) = stream.next().await {
-        if client_gone { break; }
+        if client_gone {
+            break;
+        }
         let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
         partial_buf.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -391,12 +410,25 @@ async fn call_llm_stream_openai(
                                 if !think_text.is_empty() {
                                     if !in_thinking {
                                         in_thinking = true;
-                                        if !ws_send(tx, &json!({"type":"thinking_start"})).await { client_gone = true; break; }
+                                        if !ws_send(tx, &json!({"type":"thinking_start"})).await {
+                                            client_gone = true;
+                                            break;
+                                        }
                                     }
-                                    if !ws_send(tx, &json!({"type":"thinking_delta","content":think_text})).await { client_gone = true; break; }
+                                    if !ws_send(
+                                        tx,
+                                        &json!({"type":"thinking_delta","content":think_text}),
+                                    )
+                                    .await
+                                    {
+                                        client_gone = true;
+                                        break;
+                                    }
                                 }
                             }
-                            if client_gone { break; }
+                            if client_gone {
+                                break;
+                            }
                             // Content delta
                             if let Some(text) = &choice.delta.content {
                                 if in_thinking {
@@ -404,7 +436,10 @@ async fn call_llm_stream_openai(
                                     let _ = ws_send(tx, &json!({"type":"thinking_done"})).await;
                                 }
                                 content_buf.push_str(text);
-                                if !ws_send(tx, &json!({"type":"delta","content":text})).await { client_gone = true; break; }
+                                if !ws_send(tx, &json!({"type":"delta","content":text})).await {
+                                    client_gone = true;
+                                    break;
+                                }
                             }
                             // Tool call deltas
                             if let Some(tc_deltas) = &choice.delta.tool_calls {
@@ -475,7 +510,8 @@ async fn call_llm_stream_anthropic(
     } else {
         base_max
     };
-    let mut all_tools: Vec<serde_json::Value> = serde_json::from_value(tools::tool_definitions_anthropic()).unwrap_or_default();
+    let mut all_tools: Vec<serde_json::Value> =
+        serde_json::from_value(tools::tool_definitions_anthropic()).unwrap_or_default();
     all_tools.extend_from_slice(extra_tools);
     let mut body = json!({
         "model": resolved.model_id,
@@ -516,12 +552,15 @@ async fn call_llm_stream_anthropic(
     let mut partial_buf = String::new();
     // Track current content block index → tool_calls index mapping
     let mut block_tool_idx: HashMap<usize, usize> = HashMap::new();
-    let mut thinking_block_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut thinking_block_indices: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
     let mut in_thinking = false;
     let mut client_gone = false;
 
     while let Some(chunk) = stream.next().await {
-        if client_gone { break; }
+        if client_gone {
+            break;
+        }
         let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
         partial_buf.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -552,7 +591,10 @@ async fn call_llm_stream_anthropic(
                                         }
                                         if !in_thinking {
                                             in_thinking = true;
-                                            if !ws_send(tx, &json!({"type":"thinking_start"})).await { client_gone = true; }
+                                            if !ws_send(tx, &json!({"type":"thinking_start"})).await
+                                            {
+                                                client_gone = true;
+                                            }
                                         }
                                     }
                                     "tool_use" => {
@@ -586,25 +628,42 @@ async fn call_llm_stream_anthropic(
                                 match delta.delta_type.as_deref() {
                                     Some("thinking_delta") => {
                                         if let Some(text) = &delta.thinking {
-                                            if !ws_send(tx, &json!({"type":"thinking_delta","content":text})).await { client_gone = true; }
+                                            if !ws_send(
+                                                tx,
+                                                &json!({"type":"thinking_delta","content":text}),
+                                            )
+                                            .await
+                                            {
+                                                client_gone = true;
+                                            }
                                         }
                                     }
                                     Some("text_delta") => {
                                         if in_thinking {
                                             in_thinking = false;
-                                            let _ = ws_send(tx, &json!({"type":"thinking_done"})).await;
+                                            let _ =
+                                                ws_send(tx, &json!({"type":"thinking_done"})).await;
                                         }
                                         if let Some(text) = &delta.text {
                                             content_buf.push_str(text);
-                                            if !ws_send(tx, &json!({"type":"delta","content":text})).await { client_gone = true; }
+                                            if !ws_send(tx, &json!({"type":"delta","content":text}))
+                                                .await
+                                            {
+                                                client_gone = true;
+                                            }
                                         }
                                     }
                                     Some("input_json_delta") => {
                                         if let Some(json_str) = &delta.partial_json {
                                             if let Some(block_idx) = evt.index {
-                                                if let Some(&tc_idx) = block_tool_idx.get(&block_idx) {
+                                                if let Some(&tc_idx) =
+                                                    block_tool_idx.get(&block_idx)
+                                                {
                                                     if tc_idx < tool_calls.len() {
-                                                        tool_calls[tc_idx].function.arguments.push_str(json_str);
+                                                        tool_calls[tc_idx]
+                                                            .function
+                                                            .arguments
+                                                            .push_str(json_str);
                                                     }
                                                 }
                                             }
@@ -648,7 +707,10 @@ async fn call_llm_stream_anthropic(
     build_llm_response(content_buf, tool_calls)
 }
 
-fn build_llm_response(content_buf: String, tool_calls: Vec<ToolCall>) -> Result<LlmResponse, String> {
+fn build_llm_response(
+    content_buf: String,
+    tool_calls: Vec<ToolCall>,
+) -> Result<LlmResponse, String> {
     let tc = if tool_calls.is_empty() {
         None
     } else {

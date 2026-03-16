@@ -1,6 +1,6 @@
 # LingClaw Workspace Instructions
 
-This is **LingClaw** — a ~4400-line Rust personal AI assistant built on the **Skill + CLI** paradigm. Supports **OpenAI** and **Anthropic** APIs with auto-detection, including thinking/reasoning modes. Config via `~/.lingclaw/.lingclaw.json` (JSON config file) with first-run setup wizard.
+This is **LingClaw** — a ~7300-line Rust personal AI assistant built on the **Skill + CLI** paradigm. Supports **OpenAI** and **Anthropic** APIs with auto-detection, including thinking/reasoning modes. Config via `~/.lingclaw/.lingclaw.json` (JSON config file) with first-run setup wizard.
 
 **Skill** = LLM reasoning, system prompt, context management. **CLI** = Tool execution, safety, reliability. The entire project is one loop connecting them.
 
@@ -17,7 +17,7 @@ This is **LingClaw** — a ~4400-line Rust personal AI assistant built on the **
 - Config via `~/.lingclaw/.lingclaw.json` (JSON config file) with first-run setup wizard. Environment variables are supported as fallback overrides.
 - Model resolution must support both `provider/model` and plain model IDs. For plain IDs, prefer an exact match to the current runtime config, then same-provider candidates, with deterministic ordering.
 - No `.unwrap()` in production paths — use `?` or provide fallback defaults.
-- All tool exec must go through `check_dangerous_command()` and `resolve_path()` (sandboxed — paths are canonicalized and must stay inside the session workspace).
+- All tool exec must go through `check_dangerous_command()`. User-supplied tool paths must go through `resolve_path_checked()`; internal sandboxed path normalization uses `resolve_path()`.
 - Network tools must go through `check_ssrf()` (scheme validation + private IP / DNS resolution blocking) with redirects disabled.
 
 ## Extending
@@ -28,4 +28,4 @@ This is **LingClaw** — a ~4400-line Rust personal AI assistant built on the **
 - **New command** → Add match arm in `handle_command()`. This is Loop-side work.
 - **New CLI subcommand** → Add match arm in `handle_cli_command()` in `src/cli.rs`. CLI subcommands run before async runtime (synchronous). Use `--serve` for foreground mode.
 - **Config change** → Update `JsonConfig` / `JsonSettings` structs + `Config::load()` + `run_setup_wizard()` in `src/cli.rs` if interactive.
-- **Session prompt change** → Edit template files in `docs/reference/templates/`, or modify `init_session_prompt_files()` / `load_session_prompt_files()` in `src/prompts.rs`. This is Skill-side work.
+- **Session prompt change** → Edit template files in `docs/reference/templates/`, or modify `init_session_prompt_files()` / `load_session_prompt_files_with_snapshot()` in `src/prompts.rs`. This is Skill-side work.

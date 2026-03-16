@@ -1,5 +1,7 @@
 use std::io::{self, BufRead, Write};
 #[allow(unused_imports)]
+use std::net::SocketAddr;
+#[allow(unused_imports)]
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -28,7 +30,10 @@ fn prompt_choice(options: &[&str]) -> usize {
                 return n - 1;
             }
         }
-        println!("Invalid choice. Please enter a number between 1 and {}.", options.len());
+        println!(
+            "Invalid choice. Please enter a number between 1 and {}.",
+            options.len()
+        );
     }
 }
 
@@ -54,8 +59,11 @@ fn install_global_path() {
     {
         // Read current user PATH, append if not already present
         let output = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command",
-                   "[Environment]::GetEnvironmentVariable('Path','User')"])
+            .args([
+                "-NoProfile",
+                "-Command",
+                "[Environment]::GetEnvironmentVariable('Path','User')",
+            ])
             .output();
         match output {
             Ok(out) => {
@@ -116,7 +124,9 @@ fn install_global_path() {
             }
         }
         if added {
-            println!("   ✅ Added to PATH in shell config. Run `source ~/.bashrc` or restart terminal.");
+            println!(
+                "   ✅ Added to PATH in shell config. Run `source ~/.bashrc` or restart terminal."
+            );
         } else {
             println!("   ✅ Already in PATH (or no .bashrc/.zshrc found)");
         }
@@ -127,7 +137,10 @@ fn install_global_path() {
 /// Returns the `.old` path if a rename was performed, for cleanup after build.
 fn rename_target_exe_for_build(source_dir: &std::path::Path) -> Option<PathBuf> {
     #[cfg(not(windows))]
-    { let _ = source_dir; return None; }
+    {
+        let _ = source_dir;
+        return None;
+    }
     #[cfg(windows)]
     {
         let exe_name = "lingclaw.exe";
@@ -142,6 +155,53 @@ fn rename_target_exe_for_build(source_dir: &std::path::Path) -> Option<PathBuf> 
         }
         None
     }
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> io::Result<()> {
+    if !source.exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else if file_type.is_file() {
+            if let Some(parent) = target_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&source_path, &target_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn install_frontend_assets(source_dir: &Path, install_dir: &Path) -> io::Result<()> {
+    let source_static = source_dir.join("static");
+    if !source_static.is_dir() {
+        return Ok(());
+    }
+
+    let target_static = install_dir.join("static");
+    let same_dir = source_static
+        .canonicalize()
+        .ok()
+        .zip(target_static.canonicalize().ok())
+        .is_some_and(|(lhs, rhs)| lhs == rhs);
+    if same_dir {
+        return Ok(());
+    }
+
+    copy_dir_recursive(&source_static, &target_static)
+}
+
+pub(crate) fn is_default_model_row(config: &Config, provider: &str, model_id: &str) -> bool {
+    let full_ref = format!("{provider}/{model_id}");
+    let default_model = config.resolved_model_ref(&config.model);
+    full_ref == default_model || (config.providers.is_empty() && model_id == config.model)
 }
 
 // ── CLI Subcommands ──────────────────────────────────────────────────────────
@@ -161,12 +221,17 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             #[cfg(target_os = "windows")]
             {
                 use std::os::windows::process::CommandExt;
-                let _ = std::process::Command::new(&exe)
+                let mut command = std::process::Command::new(&exe);
+                command
                     .args(&extra_args)
                     .creation_flags(0x00000008) // DETACHED_PROCESS
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if let Some(parent) = exe.parent() {
+                    command.current_dir(parent);
+                }
+                let _ = command
                     .spawn()
                     .map(|c| println!("Started (PID {})", c.id()))
                     .map_err(|e| eprintln!("Failed to start: {e}"));
@@ -177,11 +242,19 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
                 for a in &extra_args {
                     nohup_args.push(a.into());
                 }
-                let _ = std::process::Command::new("nohup")
+                let mut command = std::process::Command::new("nohup");
+                command
                     .args(&nohup_args)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                if let Some(parent) = std::env::current_exe()
+                    .ok()
+                    .and_then(|path| path.parent().map(PathBuf::from))
+                {
+                    command.current_dir(parent);
+                }
+                let _ = command
                     .spawn()
                     .map(|c| println!("Started (PID {})", c.id()))
                     .map_err(|e| eprintln!("Failed to start: {e}"));
@@ -191,14 +264,12 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
         "stop" => {
             let config = Config::load();
             let port = port_override.unwrap_or(config.port);
+            let loopback = SocketAddr::from(([127, 0, 0, 1], port));
             println!("Stopping LingClaw on port {port}...");
 
             // Try graceful shutdown first via API
-            let graceful = std::net::TcpStream::connect_timeout(
-                &format!("127.0.0.1:{port}").parse().unwrap(),
-                Duration::from_secs(2),
-            )
-            .is_ok();
+            let graceful =
+                std::net::TcpStream::connect_timeout(&loopback, Duration::from_secs(2)).is_ok();
 
             if graceful {
                 // Read shutdown token from disk
@@ -232,9 +303,11 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
                     for _ in 0..10 {
                         std::thread::sleep(Duration::from_millis(500));
                         if std::net::TcpStream::connect_timeout(
-                            &format!("127.0.0.1:{port}").parse().unwrap(),
+                            &loopback,
                             Duration::from_millis(200),
-                        ).is_err() {
+                        )
+                        .is_err()
+                        {
                             println!("Stopped (graceful).");
                             return true;
                         }
@@ -257,9 +330,7 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             #[cfg(not(target_os = "windows"))]
             {
                 let _ = std::process::Command::new("sh")
-                    .args(["-c", &format!(
-                        "lsof -ti:{port} | xargs -r kill -9"
-                    )])
+                    .args(["-c", &format!("lsof -ti:{port} | xargs -r kill -9")])
                     .status();
             }
             std::thread::sleep(Duration::from_millis(500));
@@ -306,14 +377,14 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
         "update" => {
             let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
             if !workspace.join("Cargo.toml").exists() {
-                eprintln!("ERROR: Cargo.toml not found. Run `lingclaw update` from the source directory.");
+                eprintln!(
+                    "ERROR: Cargo.toml not found. Run `lingclaw update` from the source directory."
+                );
                 return true;
             }
             println!("Current version: v{VERSION}");
             println!("Pulling latest source...");
-            let pull = std::process::Command::new("git")
-                .args(["pull"])
-                .status();
+            let pull = std::process::Command::new("git").args(["pull"]).status();
             match pull {
                 Ok(s) if s.success() => println!("   ✅ git pull complete"),
                 _ => {
@@ -345,9 +416,12 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             let config = Config::load();
             let check_port = port_override.unwrap_or(config.port);
             let was_running = std::net::TcpStream::connect_timeout(
-                &format!("127.0.0.1:{check_port}").parse().expect("invalid addr"),
+                &format!("127.0.0.1:{check_port}")
+                    .parse()
+                    .expect("invalid addr"),
                 Duration::from_secs(2),
-            ).is_ok();
+            )
+            .is_ok();
             if was_running {
                 println!("Stopping service before build...");
                 handle_cli_command("stop", port_override);
@@ -383,7 +457,9 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
                 .status();
             match build {
                 Ok(s) if s.success() => {
-                    if let Some(ref p) = old_exe { let _ = std::fs::remove_file(p); }
+                    if let Some(ref p) = old_exe {
+                        let _ = std::fs::remove_file(p);
+                    }
                     println!("   ✅ Build complete (v{new_version})");
                     println!("Starting...");
                     handle_cli_command("start", port_override);
@@ -419,7 +495,14 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             println!("╚══════════════════════════════════════════════════════════╝");
             println!();
             println!("  Version:       v{VERSION}");
-            println!("  Service:       {}", if running { "✅ Running" } else { "❌ Stopped" });
+            println!(
+                "  Service:       {}",
+                if running {
+                    "✅ Running"
+                } else {
+                    "❌ Stopped"
+                }
+            );
             println!("  Address:       http://{addr}");
             println!("  Default model: {}", config.model);
             println!("  Provider:      {}", config.provider.label());
@@ -433,12 +516,21 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             } else {
                 println!("  Providers:");
                 println!();
-                println!("  {:<16} {:<10} {:<30} {:>8}", "NAME", "API", "BASE URL", "MODELS");
+                println!(
+                    "  {:<16} {:<10} {:<30} {:>8}",
+                    "NAME", "API", "BASE URL", "MODELS"
+                );
                 println!("  {}", "─".repeat(68));
                 for (name, pc) in &config.providers {
-                    println!("  {:<16} {:<10} {:<30} {:>8}",
-                        name, pc.api,
-                        if pc.base_url.len() > 30 { format!("{}…", &pc.base_url[..29]) } else { pc.base_url.clone() },
+                    println!(
+                        "  {:<16} {:<10} {:<30} {:>8}",
+                        name,
+                        pc.api,
+                        if pc.base_url.len() > 30 {
+                            format!("{}…", &pc.base_url[..29])
+                        } else {
+                            pc.base_url.clone()
+                        },
                         pc.models.len(),
                     );
                 }
@@ -446,30 +538,59 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             println!();
 
             // Collect all models across providers into a flat table
-            struct ModelRow { name: String, id: String, provider: String, ctx: String, max_out: String, flags: String }
-            let rows: Vec<ModelRow> = config.providers.iter().flat_map(|(pname, pc)| {
-                pc.models.iter().map(move |m| ModelRow {
-                    name: m.name.as_deref().unwrap_or(&m.id).to_string(),
-                    id: m.id.clone(),
-                    provider: pname.clone(),
-                    ctx: m.context_window.map(|w| format!("{w}")).unwrap_or_else(|| "-".into()),
-                    max_out: m.max_tokens.map(|t| format!("{t}")).unwrap_or_else(|| "-".into()),
-                    flags: if m.reasoning.unwrap_or(false) { "reasoning".into() } else { String::new() },
+            struct ModelRow {
+                name: String,
+                id: String,
+                provider: String,
+                ctx: String,
+                max_out: String,
+                flags: String,
+            }
+            let rows: Vec<ModelRow> = config
+                .providers
+                .iter()
+                .flat_map(|(pname, pc)| {
+                    pc.models.iter().map(move |m| ModelRow {
+                        name: m.name.as_deref().unwrap_or(&m.id).to_string(),
+                        id: m.id.clone(),
+                        provider: pname.clone(),
+                        ctx: m
+                            .context_window
+                            .map(|w| format!("{w}"))
+                            .unwrap_or_else(|| "-".into()),
+                        max_out: m
+                            .max_tokens
+                            .map(|t| format!("{t}"))
+                            .unwrap_or_else(|| "-".into()),
+                        flags: if m.reasoning.unwrap_or(false) {
+                            "reasoning".into()
+                        } else {
+                            String::new()
+                        },
+                    })
                 })
-            }).collect();
+                .collect();
 
             if rows.is_empty() {
                 println!("  Models: (none configured)");
             } else {
                 println!("  Models ({}):", rows.len());
                 println!();
-                println!("  {:<24} {:<30} {:<12} {:>8} {:>8}  FLAGS",
-                    "NAME", "ID", "PROVIDER", "CTX", "MAX OUT");
+                println!(
+                    "  {:<24} {:<30} {:<12} {:>8} {:>8}  FLAGS",
+                    "NAME", "ID", "PROVIDER", "CTX", "MAX OUT"
+                );
                 println!("  {}", "─".repeat(90));
                 for r in &rows {
-                    let dflt = if r.id == config.model { " *" } else { "" };
-                    println!("  {:<24} {:<30} {:<12} {:>8} {:>8}  {}{}",
-                        r.name, r.id, r.provider, r.ctx, r.max_out, r.flags, dflt);
+                    let dflt = if is_default_model_row(&config, &r.provider, &r.id) {
+                        " *"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "  {:<24} {:<30} {:<12} {:>8} {:>8}  {}{}",
+                        r.name, r.id, r.provider, r.ctx, r.max_out, r.flags, dflt
+                    );
                 }
                 println!();
                 println!("  (* = default model)");
@@ -539,7 +660,8 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
         "install" => {
             // Parse -d <dir> from args; default to current directory
             let args: Vec<String> = std::env::args().collect();
-            let source_dir = args.windows(2)
+            let source_dir = args
+                .windows(2)
                 .find(|w| w[0] == "-d")
                 .map(|w| PathBuf::from(&w[1]))
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
@@ -547,7 +669,9 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             let cargo_toml = source_dir.join("Cargo.toml");
             if !cargo_toml.exists() {
                 eprintln!("ERROR: Cargo.toml not found in {}", source_dir.display());
-                eprintln!("Use `lingclaw install -d <project-dir>` to specify the source directory.");
+                eprintln!(
+                    "Use `lingclaw install -d <project-dir>` to specify the source directory."
+                );
                 return true;
             }
             // Verify this is a LingClaw project
@@ -564,20 +688,26 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             }
 
             // Read source version
-            let source_version = cargo_content.lines().find_map(|line| {
-                let line = line.trim();
-                if line.starts_with("version") {
-                    line.split('"').nth(1).map(|v| v.to_string())
-                } else {
-                    None
-                }
-            }).unwrap_or_else(|| "0.0.0".to_string());
+            let source_version = cargo_content
+                .lines()
+                .find_map(|line| {
+                    let line = line.trim();
+                    if line.starts_with("version") {
+                        line.split('"').nth(1).map(|v| v.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| "0.0.0".to_string());
 
             println!("Source version:    v{source_version}");
             println!("Installed version: v{VERSION}");
 
             // Compare versions
-            let src_parts: Vec<u32> = source_version.split('.').filter_map(|s| s.parse().ok()).collect();
+            let src_parts: Vec<u32> = source_version
+                .split('.')
+                .filter_map(|s| s.parse().ok())
+                .collect();
             let cur_parts: Vec<u32> = VERSION.split('.').filter_map(|s| s.parse().ok()).collect();
             let cmp = src_parts.cmp(&cur_parts);
 
@@ -612,9 +742,12 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             let config = Config::load();
             let check_port = port_override.unwrap_or(config.port);
             let was_running = std::net::TcpStream::connect_timeout(
-                &format!("127.0.0.1:{check_port}").parse().expect("invalid addr"),
+                &format!("127.0.0.1:{check_port}")
+                    .parse()
+                    .expect("invalid addr"),
                 Duration::from_secs(2),
-            ).is_ok();
+            )
+            .is_ok();
             if was_running {
                 println!("Stopping service...");
                 handle_cli_command("stop", port_override);
@@ -637,20 +770,47 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
                 .status();
             match build {
                 Ok(s) if s.success() => {
-                    if let Some(ref p) = old_exe { let _ = std::fs::remove_file(p); }
+                    if let Some(ref p) = old_exe {
+                        let _ = std::fs::remove_file(p);
+                    }
                     // Copy built binary to current exe location
-                    let built_exe = source_dir.join("target").join("release")
-                        .join(if cfg!(windows) { "lingclaw.exe" } else { "lingclaw" });
+                    let built_exe =
+                        source_dir
+                            .join("target")
+                            .join("release")
+                            .join(if cfg!(windows) {
+                                "lingclaw.exe"
+                            } else {
+                                "lingclaw"
+                            });
                     if let Ok(current_exe) = std::env::current_exe() {
                         if built_exe != current_exe {
                             match std::fs::copy(&built_exe, &current_exe) {
-                                Ok(_) => println!("   ✅ Installed v{source_version} → {}", current_exe.display()),
+                                Ok(_) => println!(
+                                    "   ✅ Installed v{source_version} → {}",
+                                    current_exe.display()
+                                ),
                                 Err(e) => {
                                     eprintln!("   ❌ Failed to copy binary: {e}");
                                     if was_running {
                                         handle_cli_command("start", port_override);
                                     }
                                     return true;
+                                }
+                            }
+                            if let Some(install_dir) = current_exe.parent() {
+                                match install_frontend_assets(&source_dir, install_dir) {
+                                    Ok(()) => println!(
+                                        "   ✅ Frontend assets installed → {}",
+                                        install_dir.join("static").display()
+                                    ),
+                                    Err(e) => {
+                                        eprintln!("   ❌ Failed to install frontend assets: {e}");
+                                        if was_running {
+                                            handle_cli_command("start", port_override);
+                                        }
+                                        return true;
+                                    }
                                 }
                             }
                         } else {
@@ -711,7 +871,10 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
             }
         }
         if let Err(e) = std::fs::copy(&config_path, &bak_path) {
-            eprintln!("WARNING: Failed to backup config to {}: {e}", bak_path.display());
+            eprintln!(
+                "WARNING: Failed to backup config to {}: {e}",
+                bak_path.display()
+            );
         } else {
             eprintln!("Backed up existing config to {}", bak_path.display());
         }
@@ -796,7 +959,9 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
         println!();
         println!("   Configure models for your provider.");
         println!("   Enter model details (leave Name empty to finish):");
-        let prov_name = providers.keys().next().unwrap().clone();
+        let Some(prov_name) = providers.keys().next().cloned() else {
+            return true;
+        };
         let mut models_list: Vec<serde_json::Value> = Vec::new();
         loop {
             println!();
@@ -914,7 +1079,10 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     // Ensure ~/.lingclaw directory exists
     if let Some(dir) = config_dir_path() {
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!("ERROR: Failed to create config directory {}: {e}", dir.display());
+            eprintln!(
+                "ERROR: Failed to create config directory {}: {e}",
+                dir.display()
+            );
             return false;
         }
     }

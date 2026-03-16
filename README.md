@@ -1,26 +1,25 @@
 # 🦀 LingClaw
 
-A personal AI assistant in ~3100 lines of Rust. Three pillars: **Skill quality + Rich CLI tools + Intelligent agent loop**.
+LingClaw is a personal AI assistant built in Rust around a simple idea: **Skill + CLI + loop**.
+
+- **Skill**: prompt system, model routing, context pruning, thinking modes
+- **CLI**: safe tool execution, sandboxed file access, network protection, install/update workflow
+- **Loop**: WebSocket chat, multi-session state, streaming, slash commands, persistence
+
+The project is currently around 5500 lines of Rust, with the main loop in `src/main.rs` kept under a hard 3000-line budget.
 
 ## Features
 
-**9 Tools** — think, exec, read_file, write_file, patch_file, delete_file, list_dir, search_files, http_fetch
-
-**Smart Agent Loop** — Multi-round tool calling (up to 20 rounds), context window management with auto-pruning, per-session model override
-
-**Multi-Session** — Create, switch, rename, save/load sessions to disk. Each session has an isolated workspace with customizable prompt files and memory.
-
-**Dual Provider** — Native support for OpenAI and Anthropic APIs with auto-detection
-
-**Streaming** — Real-time SSE streaming with live WebSocket push to browser
-
-**Config File** — JSON config at `~/.lingclaw/.lingclaw.json` with multi-provider support + first-run setup wizard
-
-**Security** — Dangerous command detection, sandboxed file access, configurable exec timeout, output truncation
-
-**Single Binary** — One Rust binary, one `index.html`, zero database. Daemon mode by default.
-
-**Compact Modules** — `main.rs` (app loop) + `cli.rs` (CLI subcommands + setup wizard) + `providers.rs` (LLM streaming) + `prompts.rs` (session prompt templates) + `tools/` (registry + fs/net/exec implementations)
+- **9 standard tools**: `think`, `exec`, `read_file`, `write_file`, `patch_file`, `delete_file`, `list_dir`, `search_files`, `http_fetch`
+- **2 main-session admin tools**: `list_sessions`, `delete_session`
+- **12 slash commands**: `/new`, `/session_new`, `/switch`, `/rename`, `/model`, `/think`, `/skills`, `/status`, `/clear`, `/help`, `/sessions`, `/delete`
+- **Dual-provider model routing**: OpenAI and Anthropic, with support for both `provider/model` and plain model IDs
+- **Per-session model override**: switch models at runtime with `/model`
+- **Persistent multi-session workflow**: sessions are saved to disk and have isolated workspaces
+- **Bootstrap + normal prompt modes**: prompt files are copied into each session workspace and loaded dynamically
+- **Streaming browser UI**: Axum WebSocket backend with static frontend assets in `static/`
+- **Conversation compression on `/new`**: summarizes the conversation, appends it to daily memory, then clears context
+- **Security controls**: dangerous command detection, sandboxed path resolution, SSRF blocking, request redirect blocking, output/file size caps
 
 ## Quick Start
 
@@ -28,48 +27,81 @@ A personal AI assistant in ~3100 lines of Rust. Three pillars: **Skill quality +
 cargo build --release
 cargo install --path .
 
-# First run — setup wizard guides you through provider/model config
+# First run opens the setup wizard if no config exists
 lingclaw
 
-# CLI management
-lingclaw start       # Start daemon (default)
-lingclaw stop        # Stop daemon
-lingclaw restart     # Restart daemon
-lingclaw status      # Service status + version check
-lingclaw update      # Version-aware update from source
-lingclaw install     # Install from local source (current dir)
-lingclaw install -d /path/to/src  # Install from specified dir
-lingclaw health      # Health check (exit 0 = ok)
-lingclaw help        # Show usage
-lingclaw --version   # Show version
-
-# Open http://127.0.0.1:3000
+# Service management
+lingclaw start
+lingclaw stop
+lingclaw restart
+lingclaw status
+lingclaw update
+lingclaw install
+lingclaw install -d /path/to/source
+lingclaw health
+lingclaw help
+lingclaw --version
 ```
 
-Environment variable fallback (no config file needed):
+Open http://127.0.0.1:3000 after the service starts.
+
+Environment variable fallback also works without a config file:
 
 ```bash
 # OpenAI
 OPENAI_API_KEY=sk-xxx lingclaw
 
-# Anthropic (auto-detected from model name)
+# Anthropic
 ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 ```
 
-## Config File
+## Configuration
 
-LingClaw stores config at `~/.lingclaw/.lingclaw.json`. A first-run setup wizard creates it automatically.
+LingClaw stores config at `~/.lingclaw/.lingclaw.json`. The setup wizard writes it automatically on first run.
+
+Current example shape:
 
 ```json
 {
+  "settings": {
+    "port": 3000,
+    "execTimeout": 30,
+    "maxContextTokens": 32000,
+    "maxOutputBytes": 51200,
+    "maxFileBytes": 204800
+  },
   "models": {
     "providers": {
-      "my-provider": {
-        "baseUrl": "https://api.example.com/v1",
-        "apiKey": "sk-xxx",
+      "openai": {
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-your-openai-key",
         "api": "openai-completions",
         "models": [
-          { "id": "gpt-4o-mini" }
+          {
+            "id": "gpt-4o-mini",
+            "name": "gpt-4o-mini",
+            "reasoning": false,
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 128000,
+            "maxTokens": 16384
+          }
+        ]
+      },
+      "anthropic": {
+        "baseUrl": "https://api.anthropic.com",
+        "apiKey": "sk-ant-your-anthropic-key",
+        "api": "anthropic",
+        "models": [
+          {
+            "id": "claude-sonnet-4-20250514",
+            "name": "claude-sonnet-4-20250514",
+            "reasoning": false,
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 200000,
+            "maxTokens": 8192
+          }
         ]
       }
     }
@@ -77,90 +109,121 @@ LingClaw stores config at `~/.lingclaw/.lingclaw.json`. A first-run setup wizard
   "agents": {
     "defaults": {
       "model": {
-        "primary": "my-provider/gpt-4o-mini"
+        "primary": "openai/gpt-4o-mini"
+      },
+      "models": {
+        "openai/gpt-4o-mini": {},
+        "anthropic/claude-sonnet-4-20250514": {}
       }
     }
   }
 }
 ```
 
-Model references use `provider/model` format (e.g. `my-provider/gpt-4o-mini`). Switch at runtime with `/model`.
+Notes:
+
+- Preferred model references are `provider/model`
+- Plain model IDs are still accepted in some places, but when multiple providers expose the same ID, LingClaw requires an explicit `provider/model`
+- Legacy `settings.provider`, `settings.apiKey`, and `settings.apiBase` are still read for backward compatibility, but they are no longer part of the example template
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | *(required for OpenAI)* | OpenAI API key |
-| `ANTHROPIC_API_KEY` | *(required for Anthropic)* | Anthropic API key (fallback: `OPENAI_API_KEY`) |
-| `LINGCLAW_PROVIDER` | *auto-detect* | Force provider: `openai` or `anthropic` |
-| `OPENAI_API_BASE` | provider default | API endpoint |
-| `LINGCLAW_MODEL` | `gpt-4o-mini` | Model name (claude-* triggers Anthropic) |
-| `LINGCLAW_PORT` | `3000` | HTTP listen port |
-| `LINGCLAW_EXEC_TIMEOUT` | `30` | Shell command timeout (seconds) |
-| `LINGCLAW_MAX_CONTEXT_TOKENS` | `32000` | Context window token budget |
+| `OPENAI_API_KEY` | provider config or empty | OpenAI API key |
+| `ANTHROPIC_API_KEY` | provider config or `OPENAI_API_KEY` | Anthropic API key |
+| `LINGCLAW_PROVIDER` | auto-detect | Force `openai` or `anthropic` |
+| `OPENAI_API_BASE` | `https://api.openai.com/v1` | Fallback API base |
+| `LINGCLAW_MODEL` | `gpt-4o-mini` | Default model |
+| `LINGCLAW_PORT` | `3000` | HTTP port |
+| `LINGCLAW_EXEC_TIMEOUT` | `30` | Shell command timeout in seconds |
+| `LINGCLAW_MAX_CONTEXT_TOKENS` | `32000` | Default context token budget |
 
-## Commands
+## Slash Commands
 
 | Command | Description |
 |---|---|
-| `/new` | Clear context |
-| `/status` | Show agent/model/context/think status |
-| `/model [name]` | Show or switch model |
-| `/think [level]` | Set thinking mode (off\|minimal\|low\|medium\|high\|xhigh) |
-| `/skills` | List available skills |
-| `/rename <name>` | Rename current session |
-| `/clear` | Clear messages |
-| `/help` | Show all commands |
+| `/new` | Compress the conversation into daily memory and clear context |
+| `/session_new` | Create a new session |
+| `/switch <id>` | Switch to another session |
+| `/rename <name>` | Rename the current session |
+| `/model [name]` | Show available models or switch the current session model |
+| `/think [level]` | Set thinking mode: `auto`, `off`, `minimal`, `low`, `medium`, `high`, `xhigh` |
+| `/skills` | List available skills/tools help |
+| `/status` | Show resolved model, provider, API base, context estimate, and think level |
+| `/clear` | Clear messages but keep the system prompt |
+| `/help` | Show command help |
+| `/sessions` | Main session only: list active sessions |
+| `/delete <id>` | Main session only: delete a session by full ID or unique prefix |
 
 ## Tools
 
 | Tool | Description |
 |---|---|
-| `think` | Step-by-step reasoning scratchpad |
-| `exec` | Shell command execution with timeout |
-| `read_file` | Read files with optional line range |
+| `think` | Internal reasoning scratchpad |
+| `exec` | Run shell commands with timeout and dangerous-command filtering |
+| `read_file` | Read files with optional line ranges |
 | `write_file` | Create or overwrite files |
-| `patch_file` | Find and replace in files |
+| `patch_file` | Find-and-replace patches inside files |
 | `delete_file` | Delete a file from the workspace |
-| `list_dir` | Directory listing with metadata |
-| `search_files` | Regex search across files |
-| `http_fetch` | HTTP GET with size limits |
+| `list_dir` | List directory contents |
+| `search_files` | Regex search across the workspace |
+| `http_fetch` | HTTP GET with SSRF protection and redirect blocking |
+| `list_sessions` | Main session only: inspect session state |
+| `delete_session` | Main session only: delete a session |
 
 ## Architecture
 
-```
+```text
 Browser ←WebSocket→ axum ←HTTP/SSE→ OpenAI / Anthropic API
                       ↕
-         ┌────────────┴────────────┐
-         │    Agent Loop (≤20)     │
-         │  Context Manager        │
-         │  Session Store          │
-         └──┬─────────┬───────────┘
-            ↕         ↕
-     Tool Exec ×8  Prompt Templates ×7
+         ┌────────────┴─────────────┐
+         │    Agent Loop (≤200)     │
+         │  Context Manager         │
+         │  Session Store           │
+         │  Main Session Admin      │
+         └──┬──────────┬────────────┘
+            ↕          ↕
+      Tool Registry   Prompt Files ×7
 ```
 
-### Session Workspace
+Core files:
 
-Each session gets an isolated workspace at `~/.lingclaw/{sessionId}/workspace/` with 7 prompt files copied from `docs/reference/templates/`:
+- `src/main.rs`: config loading, sessions, slash commands, WebSocket loop, HTTP server
+- `src/cli.rs`: CLI subcommands, setup wizard, install/update flow
+- `src/providers.rs`: OpenAI and Anthropic request/stream handling
+- `src/prompts.rs`: prompt file initialization and loading
+- `src/tools/mod.rs`: tool registry and dispatch
+- `src/tools/fs.rs`, `src/tools/net.rs`, `src/tools/exec.rs`: tool implementations
+- `static/index.html`, `static/app.js`, `static/style.css`: browser frontend
+
+## Session Workspace
+
+Each session gets an isolated workspace at `~/.lingclaw/{sessionId}/workspace/` with these prompt files:
 
 | File | Purpose |
 |---|---|
-| `BOOTSTRAP.md` | System bootstrap instructions |
-| `AGENT.md` | Agent behavior and capabilities |
-| `IDENTITY.md` | Agent identity and persona |
-| `SOUL.md` | Core reasoning directives |
-| `USER.md` | User-specific preferences |
-| `TOOLS.md` | Tool usage guidelines |
-| `MEMORY.md` | Session memory and context |
+| `BOOTSTRAP.md` | Initial bootstrap instructions for fresh sessions |
+| `AGENT.md` | Core agent behavior |
+| `IDENTITY.md` | Identity/persona and avatar source |
+| `SOUL.md` | Higher-level reasoning rules |
+| `USER.md` | User-specific behavior guidance |
+| `TOOLS.md` | Tool usage guidance |
+| `MEMORY.md` | Persistent memory guidance |
 
-Edit these files to customize agent behavior per session. A `memory/` subdirectory holds daily logs.
+There is also a `memory/` subdirectory for daily logs such as `memory/YYYY-MM-DD.md`.
 
-## API
+Prompt loading works in two modes:
 
-- `GET /api/health` — Server status
-- `GET /api/sessions` — List sessions
-- `GET /ws` — WebSocket endpoint
+- **Bootstrap mode**: `BOOTSTRAP.md + AGENT.md`
+- **Normal mode**: `AGENT.md + IDENTITY.md + USER.md + SOUL.md`, then `MEMORY.md` and recent daily memory
+
+## HTTP API
+
+- `GET /api/health`: service health check
+- `GET /api/sessions`: list known sessions
+- `POST /api/shutdown`: authenticated local shutdown endpoint used by the CLI
+- `GET /ws`: chat WebSocket endpoint
 
 ## License
 

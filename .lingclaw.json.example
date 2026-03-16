@@ -1,9 +1,6 @@
 {
   "settings": {
     "port": 3000,
-    "provider": "auto",
-    "apiKey": "sk-your-api-key-here",
-    "apiBase": "https://api.openai.com/v1",
     "execTimeout": 30,
     "maxContextTokens": 32000,
     "maxOutputBytes": 51200,

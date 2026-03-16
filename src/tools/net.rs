@@ -15,7 +15,7 @@ fn is_private_ip(ip: &IpAddr) -> bool {
             v4.is_private()
                 || v4.is_link_local()
                 || v4.octets()[0] == 169 // 169.254.x.x link-local
-                || v4.octets()[0] == 0   // 0.0.0.0/8
+                || v4.octets()[0] == 0 // 0.0.0.0/8
         }
         IpAddr::V6(v6) => {
             let segs = v6.segments();
@@ -32,7 +32,9 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 fn check_ssrf(url: &str) -> Option<String> {
     // Only allow http and https schemes
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Some(format!("BLOCKED: unsupported URL scheme in '{url}'. Only http:// and https:// are allowed."));
+        return Some(format!(
+            "BLOCKED: unsupported URL scheme in '{url}'. Only http:// and https:// are allowed."
+        ));
     }
     // Use reqwest::Url for robust parsing (handles IPv6 brackets, userinfo, etc.)
     let parsed = match reqwest::Url::parse(url) {
@@ -48,7 +50,9 @@ fn check_ssrf(url: &str) -> Option<String> {
     // Try parsing as IP literal first
     if let Ok(ip) = bare_host.parse::<IpAddr>() {
         if is_private_ip(&ip) {
-            return Some(format!("BLOCKED: URL targets private/reserved address ({ip}). Refusing to fetch."));
+            return Some(format!(
+                "BLOCKED: URL targets private/reserved address ({ip}). Refusing to fetch."
+            ));
         }
     } else {
         // DNS resolution
@@ -105,7 +109,10 @@ pub(crate) async fn tool_http_fetch(
             match resp.text().await {
                 Ok(text) => {
                     let header = format!("HTTP {status} | {content_type}\n---\n");
-                    truncate(&format!("{header}{text}"), max_bytes.min(config.max_output_bytes))
+                    truncate(
+                        &format!("{header}{text}"),
+                        max_bytes.min(config.max_output_bytes),
+                    )
                 }
                 Err(e) => format!("http_fetch error reading body: {e}"),
             }

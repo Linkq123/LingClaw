@@ -23,7 +23,7 @@ OpenAI tools JSON, Anthropic tools JSON, `/skills` output, and tool dispatch are
 - [ ] JSON schema has clear `description` for each parameter
 - [ ] Implementation validates all required parameters (return error string, don't panic)
 - [ ] Output is truncated via `truncate()` if it could be large
-- [ ] Paths go through `resolve_path()` if the tool touches the filesystem
+- [ ] User-supplied filesystem paths go through `resolve_path_checked()`; only internal sandboxed normalization should use `resolve_path()`
 - [ ] Commands go through `check_dangerous_command()` if the tool runs shell commands
 - [ ] Run `cargo clippy` after implementation
 - [ ] Run `wc -l src/main.rs` to check line budget (≤ 3000)

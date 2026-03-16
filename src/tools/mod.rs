@@ -10,7 +10,8 @@ use std::{future::Future, pin::Pin};
 use crate::Config;
 
 type ToolFuture<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
-type ToolHandler = for<'a> fn(&'a serde_json::Value, &'a Config, &'a Client, &'a Path) -> ToolFuture<'a>;
+type ToolHandler =
+    for<'a> fn(&'a serde_json::Value, &'a Config, &'a Client, &'a Path) -> ToolFuture<'a>;
 
 pub(crate) struct ToolSpec {
     pub(crate) name: &'static str,
@@ -56,7 +57,7 @@ fn tool_parameters_read_file() -> serde_json::Value {
         "properties": {
             "path": {
                 "type": "string",
-                "description": "File path to read"
+                "description": "File path to read inside the session workspace"
             },
             "start_line": {
                 "type": "integer",
@@ -77,7 +78,7 @@ fn tool_parameters_write_file() -> serde_json::Value {
         "properties": {
             "path": {
                 "type": "string",
-                "description": "File path to write"
+                "description": "File path to write inside the session workspace"
             },
             "content": {
                 "type": "string",
@@ -94,7 +95,7 @@ fn tool_parameters_patch_file() -> serde_json::Value {
         "properties": {
             "path": {
                 "type": "string",
-                "description": "File path to patch"
+                "description": "File path to patch inside the session workspace"
             },
             "old_string": {
                 "type": "string",
@@ -115,7 +116,7 @@ fn tool_parameters_list_dir() -> serde_json::Value {
         "properties": {
             "path": {
                 "type": "string",
-                "description": "Directory path (default: workspace root)"
+                "description": "Directory path inside the session workspace (default: workspace root)"
             }
         },
         "required": []
@@ -132,7 +133,7 @@ fn tool_parameters_search_files() -> serde_json::Value {
             },
             "path": {
                 "type": "string",
-                "description": "Directory to search in (default: workspace root)"
+                "description": "Directory to search in inside the session workspace (default: workspace root)"
             },
             "file_glob": {
                 "type": "string",
@@ -170,7 +171,7 @@ fn tool_parameters_delete_file() -> serde_json::Value {
         "properties": {
             "path": {
                 "type": "string",
-                "description": "File path to delete"
+                "description": "File path to delete inside the session workspace"
             }
         },
         "required": ["path"]
@@ -190,24 +191,23 @@ fn tool_prompt_line_exec(config: &Config) -> String {
 }
 
 fn tool_prompt_line_read_file(_: &Config) -> String {
-    "**read_file** — Read file contents. Supports line range (start_line, end_line)."
-        .to_string()
+    "**read_file** — Read file contents from the session workspace. Supports line range (start_line, end_line).".to_string()
 }
 
 fn tool_prompt_line_write_file(_: &Config) -> String {
-    "**write_file** — Create or overwrite files.".to_string()
+    "**write_file** — Create or overwrite files inside the session workspace.".to_string()
 }
 
 fn tool_prompt_line_patch_file(_: &Config) -> String {
-    "**patch_file** — Find and replace exact strings in files.".to_string()
+    "**patch_file** — Find and replace exact strings in session workspace files.".to_string()
 }
 
 fn tool_prompt_line_list_dir(_: &Config) -> String {
-    "**list_dir** — List directory contents with file sizes.".to_string()
+    "**list_dir** — List session workspace directory contents with file sizes.".to_string()
 }
 
 fn tool_prompt_line_search_files(_: &Config) -> String {
-    "**search_files** — Regex search across files in a directory (like grep).".to_string()
+    "**search_files** — Regex search across files in the session workspace (like grep).".to_string()
 }
 
 fn tool_prompt_line_http_fetch(_: &Config) -> String {
@@ -215,42 +215,87 @@ fn tool_prompt_line_http_fetch(_: &Config) -> String {
 }
 
 fn tool_prompt_line_delete_file(_: &Config) -> String {
-    "**delete_file** — Delete a file from the workspace.".to_string()
+    "**delete_file** — Delete a file from the session workspace.".to_string()
 }
 
-fn tool_handler_think<'a>(args: &'a serde_json::Value, _: &'a Config, _: &'a Client, _: &'a Path) -> ToolFuture<'a> {
+fn tool_handler_think<'a>(
+    args: &'a serde_json::Value,
+    _: &'a Config,
+    _: &'a Client,
+    _: &'a Path,
+) -> ToolFuture<'a> {
     Box::pin(async move { exec::tool_think(args) })
 }
 
-fn tool_handler_exec<'a>(args: &'a serde_json::Value, config: &'a Config, _: &'a Client, workspace: &'a Path) -> ToolFuture<'a> {
+fn tool_handler_exec<'a>(
+    args: &'a serde_json::Value,
+    config: &'a Config,
+    _: &'a Client,
+    workspace: &'a Path,
+) -> ToolFuture<'a> {
     Box::pin(async move { exec::tool_exec(args, config, workspace).await })
 }
 
-fn tool_handler_read_file<'a>(args: &'a serde_json::Value, config: &'a Config, _: &'a Client, workspace: &'a Path) -> ToolFuture<'a> {
+fn tool_handler_read_file<'a>(
+    args: &'a serde_json::Value,
+    config: &'a Config,
+    _: &'a Client,
+    workspace: &'a Path,
+) -> ToolFuture<'a> {
     Box::pin(async move { fs::tool_read_file(args, config, workspace).await })
 }
 
-fn tool_handler_write_file<'a>(args: &'a serde_json::Value, config: &'a Config, _: &'a Client, workspace: &'a Path) -> ToolFuture<'a> {
+fn tool_handler_write_file<'a>(
+    args: &'a serde_json::Value,
+    config: &'a Config,
+    _: &'a Client,
+    workspace: &'a Path,
+) -> ToolFuture<'a> {
     Box::pin(async move { fs::tool_write_file(args, config, workspace).await })
 }
 
-fn tool_handler_patch_file<'a>(args: &'a serde_json::Value, config: &'a Config, _: &'a Client, workspace: &'a Path) -> ToolFuture<'a> {
+fn tool_handler_patch_file<'a>(
+    args: &'a serde_json::Value,
+    config: &'a Config,
+    _: &'a Client,
+    workspace: &'a Path,
+) -> ToolFuture<'a> {
     Box::pin(async move { fs::tool_patch_file(args, config, workspace).await })
 }
 
-fn tool_handler_list_dir<'a>(args: &'a serde_json::Value, config: &'a Config, _: &'a Client, workspace: &'a Path) -> ToolFuture<'a> {
+fn tool_handler_list_dir<'a>(
+    args: &'a serde_json::Value,
+    config: &'a Config,
+    _: &'a Client,
+    workspace: &'a Path,
+) -> ToolFuture<'a> {
     Box::pin(async move { fs::tool_list_dir(args, config, workspace).await })
 }
 
-fn tool_handler_search_files<'a>(args: &'a serde_json::Value, config: &'a Config, _: &'a Client, workspace: &'a Path) -> ToolFuture<'a> {
+fn tool_handler_search_files<'a>(
+    args: &'a serde_json::Value,
+    config: &'a Config,
+    _: &'a Client,
+    workspace: &'a Path,
+) -> ToolFuture<'a> {
     Box::pin(async move { fs::tool_search_files(args, config, workspace).await })
 }
 
-fn tool_handler_http_fetch<'a>(args: &'a serde_json::Value, config: &'a Config, http: &'a Client, _: &'a Path) -> ToolFuture<'a> {
+fn tool_handler_http_fetch<'a>(
+    args: &'a serde_json::Value,
+    config: &'a Config,
+    http: &'a Client,
+    _: &'a Path,
+) -> ToolFuture<'a> {
     Box::pin(async move { net::tool_http_fetch(args, http, config).await })
 }
 
-fn tool_handler_delete_file<'a>(args: &'a serde_json::Value, _: &'a Config, _: &'a Client, workspace: &'a Path) -> ToolFuture<'a> {
+fn tool_handler_delete_file<'a>(
+    args: &'a serde_json::Value,
+    _: &'a Config,
+    _: &'a Client,
+    workspace: &'a Path,
+) -> ToolFuture<'a> {
     Box::pin(async move { fs::tool_delete_file(args, workspace).await })
 }
 

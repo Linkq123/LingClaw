@@ -1,16 +1,64 @@
+use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Local};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Clone, Copy)]
+pub(crate) struct LocalTimeSnapshot {
+    now: DateTime<FixedOffset>,
+}
+
+impl LocalTimeSnapshot {
+    fn from_datetime(now: DateTime<FixedOffset>) -> Self {
+        Self { now }
+    }
+
+    pub(crate) fn today(self) -> String {
+        format_local_date(self.now)
+    }
+
+    fn yesterday(self) -> String {
+        format_local_date(self.now - ChronoDuration::days(1))
+    }
+
+    pub(crate) fn hhmm(self) -> String {
+        format_local_hhmm(self.now)
+    }
+
+    pub(crate) fn datetime_label(self) -> String {
+        format_local_datetime_label(self.now)
+    }
+}
 
 /// Template files to copy into each new session workspace.
 /// Each entry: (filename, compile-time embedded content as fallback).
 const TEMPLATE_FILES: &[(&str, &str)] = &[
-    ("BOOTSTRAP.md", include_str!("../docs/reference/templates/BOOTSTRAP.md")),
-    ("AGENT.md",     include_str!("../docs/reference/templates/AGENT.md")),
-    ("IDENTITY.md",  include_str!("../docs/reference/templates/IDENTITY.md")),
-    ("SOUL.md",      include_str!("../docs/reference/templates/SOUL.md")),
-    ("USER.md",      include_str!("../docs/reference/templates/USER.md")),
-    ("TOOLS.md",     include_str!("../docs/reference/templates/TOOLS.md")),
-    ("MEMORY.md",    include_str!("../docs/reference/templates/MEMORY.md")),
+    (
+        "BOOTSTRAP.md",
+        include_str!("../docs/reference/templates/BOOTSTRAP.md"),
+    ),
+    (
+        "AGENT.md",
+        include_str!("../docs/reference/templates/AGENT.md"),
+    ),
+    (
+        "IDENTITY.md",
+        include_str!("../docs/reference/templates/IDENTITY.md"),
+    ),
+    (
+        "SOUL.md",
+        include_str!("../docs/reference/templates/SOUL.md"),
+    ),
+    (
+        "USER.md",
+        include_str!("../docs/reference/templates/USER.md"),
+    ),
+    (
+        "TOOLS.md",
+        include_str!("../docs/reference/templates/TOOLS.md"),
+    ),
+    (
+        "MEMORY.md",
+        include_str!("../docs/reference/templates/MEMORY.md"),
+    ),
 ];
 
 fn write_missing_templates(workspace: &Path, include_bootstrap: bool) {
@@ -63,7 +111,10 @@ pub(crate) fn init_session_prompt_files(workspace: &Path) {
     // Ensure memory/ subdirectory exists
     let memory_dir = workspace.join("memory");
     if let Err(e) = std::fs::create_dir_all(&memory_dir) {
-        eprintln!("WARNING: failed to create memory dir {}: {e}", memory_dir.display());
+        eprintln!(
+            "WARNING: failed to create memory dir {}: {e}",
+            memory_dir.display()
+        );
     }
 
     write_missing_templates(workspace, true);
@@ -75,29 +126,26 @@ pub(crate) fn init_session_prompt_files(workspace: &Path) {
 pub(crate) fn ensure_session_workspace(workspace: &Path) {
     let memory_dir = workspace.join("memory");
     if let Err(e) = std::fs::create_dir_all(&memory_dir) {
-        eprintln!("WARNING: failed to create memory dir {}: {e}", memory_dir.display());
+        eprintln!(
+            "WARNING: failed to create memory dir {}: {e}",
+            memory_dir.display()
+        );
     }
 
     write_missing_templates(workspace, false);
 }
 
-/// Load session context for the system prompt.
-///
-/// **Bootstrap mode** (BOOTSTRAP.md exists): loads BOOTSTRAP.md + AGENT.md only —
-/// this is the first-run "who am I?" flow.
-///
-/// **Normal mode** (BOOTSTRAP.md deleted): loads AGENT.md + IDENTITY.md +
-/// USER.md + SOUL.md, then MEMORY.md and today's/yesterday's daily memory.
-///
-/// Files that don't exist or are empty are silently skipped.
-pub(crate) fn load_session_prompt_files(workspace: &Path) -> String {
+pub(crate) fn load_session_prompt_files_with_snapshot(
+    workspace: &Path,
+    snapshot: LocalTimeSnapshot,
+) -> String {
     let bootstrap = read_nonempty(workspace.join("BOOTSTRAP.md"));
 
     if let Some(bs_content) = bootstrap {
         // Bootstrap mode: first-run identity setup
-        let mut parts = vec![bs_content];
+        let mut parts = vec![format!("<!-- BOOTSTRAP.md -->\n{bs_content}")];
         if let Some(agent) = read_nonempty(workspace.join("AGENT.md")) {
-            parts.push(agent);
+            parts.push(format!("<!-- AGENT.md -->\n{agent}"));
         }
         return parts.join("\n\n---\n\n");
     }
@@ -106,16 +154,16 @@ pub(crate) fn load_session_prompt_files(workspace: &Path) -> String {
     let mut parts = Vec::new();
     for name in &["AGENT.md", "IDENTITY.md", "USER.md", "SOUL.md"] {
         if let Some(content) = read_nonempty(workspace.join(name)) {
-            parts.push(content);
+            parts.push(format!("<!-- {name} -->\n{content}"));
         }
     }
 
     if let Some(content) = read_nonempty(workspace.join("MEMORY.md")) {
-        parts.push(content);
+        parts.push(format!("<!-- MEMORY.md -->\n{content}"));
     }
 
-    let today = chrono_today();
-    let yesterday = chrono_yesterday();
+    let today = snapshot.today();
+    let yesterday = snapshot.yesterday();
     for date_str in &[today, yesterday] {
         let path = workspace.join("memory").join(format!("{date_str}.md"));
         if let Some(content) = read_nonempty(&path) {
@@ -128,7 +176,8 @@ pub(crate) fn load_session_prompt_files(workspace: &Path) -> String {
 
 /// Parse the IDENTITY.md file in the workspace and extract the avatar value.
 /// Looks for a line matching `- 头像：<value>` or `- 头像: <value>`.
-/// Returns None if the file doesn't exist, is empty, or no avatar is set.
+/// Returns None if the file doesn't exist, is empty, or the avatar is set to
+/// an explicit unset marker such as `none`.
 pub(crate) fn parse_identity_avatar(workspace: &Path) -> Option<String> {
     let content = read_nonempty(workspace.join("IDENTITY.md"))?;
     for line in content.lines() {
@@ -142,20 +191,40 @@ pub(crate) fn parse_identity_avatar(workspace: &Path) -> Option<String> {
             continue;
         };
         let rest = rest.trim();
-        if !rest.is_empty() && !rest.starts_with('（') && !rest.starts_with('(') {
-            // http(s) URLs and data URIs pass through directly
-            if rest.starts_with("http") || rest.starts_with("data:") {
-                return Some(rest.to_string());
-            }
-            // If it ends with a known image extension, resolve as file path; drop on failure
-            if has_image_ext(rest) {
-                return resolve_avatar_to_data_uri(workspace, rest);
-            }
-            // Otherwise treat as text/emoji avatar
+        if rest.is_empty() || rest.starts_with('（') || rest.starts_with('(') {
+            return None;
+        }
+
+        if is_none_avatar_value(rest) {
+            return None;
+        }
+
+        // http(s) URLs and data URIs pass through directly
+        if rest.starts_with("http") || rest.starts_with("data:") {
             return Some(rest.to_string());
         }
+        // If it ends with a known image extension, resolve as file path; drop on failure
+        if has_image_ext(rest) {
+            return resolve_avatar_to_data_uri(workspace, rest);
+        }
+        // Otherwise treat as text/emoji avatar
+        return Some(rest.to_string());
     }
     None
+}
+
+fn is_none_avatar_value(value: &str) -> bool {
+    let normalized = value
+        .trim()
+        .trim_matches(|ch: char| {
+            ch.is_whitespace() || matches!(ch, '。' | '.' | '！' | '!' | '？' | '?')
+        })
+        .to_ascii_lowercase();
+
+    matches!(
+        normalized.as_str(),
+        "none" | "null" | "unset" | "not set" | "未设置" | "暂未设置"
+    )
 }
 
 fn has_image_ext(s: &str) -> bool {
@@ -187,7 +256,10 @@ fn resolve_avatar_to_data_uri(workspace: &Path, rel_path: &str) -> Option<String
         _ => return None,
     };
     use base64::Engine;
-    Some(format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(&data)))
+    Some(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&data)
+    ))
 }
 
 /// Read a file and return its trimmed content if non-empty.
@@ -197,7 +269,11 @@ fn read_nonempty(path: impl AsRef<Path>) -> Option<String> {
     match std::fs::read_to_string(path) {
         Ok(content) => {
             let trimmed = content.trim();
-            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => {
@@ -207,52 +283,77 @@ fn read_nonempty(path: impl AsRef<Path>) -> Option<String> {
     }
 }
 
-/// Return today's date as "YYYY-MM-DD" using system time (no chrono crate needed).
-pub(crate) fn chrono_today() -> String {
-    // seconds since epoch → days → civil date
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    epoch_secs_to_date(secs)
+pub(crate) fn current_local_snapshot() -> LocalTimeSnapshot {
+    LocalTimeSnapshot::from_datetime(Local::now().fixed_offset())
 }
 
-/// Return yesterday's date as "YYYY-MM-DD".
-fn chrono_yesterday() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .saturating_sub(86400);
-    epoch_secs_to_date(secs)
+fn format_local_date(date_time: DateTime<FixedOffset>) -> String {
+    date_time.format("%Y-%m-%d").to_string()
 }
 
-/// Convert epoch seconds to "YYYY-MM-DD" (civil calendar, UTC).
-fn epoch_secs_to_date(secs: u64) -> String {
-    // Algorithm from Howard Hinnant's civil_from_days
-    let days = (secs / 86400) as i64;
-    let z = days + 719468;
-    let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as u64;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe as i64 + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}")
+fn format_local_hhmm(date_time: DateTime<FixedOffset>) -> String {
+    date_time.format("%H:%M").to_string()
+}
+
+fn format_local_datetime_label(date_time: DateTime<FixedOffset>) -> String {
+    date_time.format("%Y-%m-%d %H:%M:%S %:z").to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
-    fn test_epoch_to_date() {
-        // 2024-01-01 00:00:00 UTC = 1704067200
-        assert_eq!(epoch_secs_to_date(1704067200), "2024-01-01");
-        // 2026-03-14 00:00:00 UTC = 1773446400
-        assert_eq!(epoch_secs_to_date(1773446400), "2026-03-14");
+    fn test_local_datetime_formatters() {
+        let date_time = DateTime::parse_from_rfc3339("2026-03-16T00:05:07+08:00")
+            .expect("datetime should parse");
+
+        assert_eq!(format_local_date(date_time), "2026-03-16");
+        assert_eq!(format_local_hhmm(date_time), "00:05");
+        assert_eq!(
+            format_local_datetime_label(date_time),
+            "2026-03-16 00:05:07 +08:00"
+        );
+    }
+
+    #[test]
+    fn local_time_snapshot_uses_single_now_across_midnight_boundaries() {
+        let snapshot = LocalTimeSnapshot::from_datetime(
+            DateTime::parse_from_rfc3339("2026-03-16T00:05:07+08:00")
+                .expect("datetime should parse"),
+        );
+
+        assert_eq!(snapshot.today(), "2026-03-16");
+        assert_eq!(snapshot.yesterday(), "2026-03-15");
+        assert_eq!(snapshot.hhmm(), "00:05");
+        assert_eq!(snapshot.datetime_label(), "2026-03-16 00:05:07 +08:00");
+    }
+
+    #[test]
+    fn load_session_prompt_files_uses_same_snapshot_for_today_and_yesterday() {
+        let workspace = std::env::temp_dir().join("lingclaw-prompt-snapshot-test");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(workspace.join("memory")).expect("memory dir should be created");
+        fs::write(workspace.join("AGENT.md"), "agent").expect("agent file should be written");
+        fs::write(workspace.join("IDENTITY.md"), "identity")
+            .expect("identity file should be written");
+        fs::write(workspace.join("USER.md"), "user").expect("user file should be written");
+        fs::write(workspace.join("SOUL.md"), "soul").expect("soul file should be written");
+        fs::write(workspace.join("memory/2026-03-16.md"), "today memory")
+            .expect("today memory should be written");
+        fs::write(workspace.join("memory/2026-03-15.md"), "yesterday memory")
+            .expect("yesterday memory should be written");
+
+        let snapshot = LocalTimeSnapshot::from_datetime(
+            DateTime::parse_from_rfc3339("2026-03-16T00:05:07+08:00")
+                .expect("datetime should parse"),
+        );
+        let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
+
+        assert!(loaded.contains("<!-- memory/2026-03-16.md -->\ntoday memory"));
+        assert!(loaded.contains("<!-- memory/2026-03-15.md -->\nyesterday memory"));
+
+        let _ = fs::remove_dir_all(&workspace);
     }
 }

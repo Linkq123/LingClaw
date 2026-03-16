@@ -1,4 +1,4 @@
-use crate::{check_dangerous_command, resolve_path, truncate, Config};
+use crate::{check_dangerous_command, resolve_path_checked, truncate, Config};
 use std::path::Path;
 
 // ── think ────────────────────────────────────────────────────────────────────
@@ -10,7 +10,11 @@ pub(crate) fn tool_think(args: &serde_json::Value) -> String {
 
 // ── exec ─────────────────────────────────────────────────────────────────────
 
-pub(crate) async fn tool_exec(args: &serde_json::Value, config: &Config, workspace: &Path) -> String {
+pub(crate) async fn tool_exec(
+    args: &serde_json::Value,
+    config: &Config,
+    workspace: &Path,
+) -> String {
     let command = match args["command"].as_str() {
         Some(c) => c,
         None => return "Error: 'command' parameter is required".into(),
@@ -22,10 +26,13 @@ pub(crate) async fn tool_exec(args: &serde_json::Value, config: &Config, workspa
         );
     }
 
-    let work_dir = args["working_dir"]
-        .as_str()
-        .map(|d| resolve_path(d, workspace))
-        .unwrap_or_else(|| workspace.to_path_buf());
+    let work_dir = match args["working_dir"].as_str() {
+        Some(dir) => match resolve_path_checked(dir, workspace) {
+            Ok(path) => path,
+            Err(message) => return format!("exec error: {message}"),
+        },
+        None => workspace.to_path_buf(),
+    };
 
     let shell = if cfg!(windows) { "cmd" } else { "sh" };
     let flag = if cfg!(windows) { "/C" } else { "-c" };
