@@ -208,10 +208,13 @@ pub(crate) async fn call_llm_simple(
         Provider::OpenAI => {
             let url = format!("{}/chat/completions", resolved.api_base);
             let api_messages = convert_messages_to_openai(messages);
-            let body = json!({
+            let mut body = json!({
                 "model": resolved.model_id,
                 "messages": api_messages,
             });
+            if let Some(mt) = resolved.max_tokens {
+                body["max_tokens"] = json!(mt);
+            }
             let resp = http.post(&url)
                 .bearer_auth(&resolved.api_key)
                 .json(&body)
@@ -228,10 +231,11 @@ pub(crate) async fn call_llm_simple(
         Provider::Anthropic => {
             let url = format!("{}/v1/messages", resolved.api_base);
             let (system, msgs) = convert_messages_to_anthropic(messages);
+            let max_tokens = resolved.max_tokens.unwrap_or(4096);
             let mut body = json!({
                 "model": resolved.model_id,
                 "messages": msgs,
-                "max_tokens": 4096,
+                "max_tokens": max_tokens,
             });
             if !system.is_empty() {
                 body["system"] = json!(system);
@@ -286,6 +290,7 @@ pub(crate) async fn call_llm_stream(
     messages: &[ChatMessage],
     tx: &WsTx,
     think_level: &str,
+    extra_tools: &[serde_json::Value],
 ) -> Result<LlmResponse, String> {
     // Resolve "auto": enable thinking at medium level if model supports it, else off
     let effective_level = if think_level == "auto" {
@@ -298,8 +303,8 @@ pub(crate) async fn call_llm_stream(
         think_level
     };
     match resolved.provider {
-        Provider::OpenAI => call_llm_stream_openai(http, resolved, messages, tx, effective_level).await,
-        Provider::Anthropic => call_llm_stream_anthropic(http, resolved, messages, tx, effective_level).await,
+        Provider::OpenAI => call_llm_stream_openai(http, resolved, messages, tx, effective_level, extra_tools).await,
+        Provider::Anthropic => call_llm_stream_anthropic(http, resolved, messages, tx, effective_level, extra_tools).await,
     }
 }
 
@@ -309,14 +314,17 @@ async fn call_llm_stream_openai(
     messages: &[ChatMessage],
     tx: &WsTx,
     think_level: &str,
+    extra_tools: &[serde_json::Value],
 ) -> Result<LlmResponse, String> {
     let thinking_on = think_level != "off";
     let url = format!("{}/chat/completions", resolved.api_base);
     let api_messages = convert_messages_to_openai(messages);
+    let mut all_tools: Vec<serde_json::Value> = serde_json::from_value(tools::tool_definitions()).unwrap_or_default();
+    all_tools.extend_from_slice(extra_tools);
     let mut body = json!({
         "model": resolved.model_id,
         "messages": api_messages,
-        "tools": tools::tool_definitions(),
+        "tools": all_tools,
         "stream": true,
     });
     if thinking_on {
@@ -455,6 +463,7 @@ async fn call_llm_stream_anthropic(
     messages: &[ChatMessage],
     tx: &WsTx,
     think_level: &str,
+    extra_tools: &[serde_json::Value],
 ) -> Result<LlmResponse, String> {
     let thinking_on = think_level != "off";
     let (system_prompt, anthropic_msgs) = convert_messages_to_anthropic(messages);
@@ -466,10 +475,12 @@ async fn call_llm_stream_anthropic(
     } else {
         base_max
     };
+    let mut all_tools: Vec<serde_json::Value> = serde_json::from_value(tools::tool_definitions_anthropic()).unwrap_or_default();
+    all_tools.extend_from_slice(extra_tools);
     let mut body = json!({
         "model": resolved.model_id,
         "messages": anthropic_msgs,
-        "tools": tools::tool_definitions_anthropic(),
+        "tools": all_tools,
         "max_tokens": effective_max,
         "stream": true,
     });

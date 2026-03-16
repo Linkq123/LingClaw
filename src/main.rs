@@ -28,6 +28,7 @@ mod providers;
 mod tools;
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub(crate) const MAIN_SESSION_ID: &str = "main";
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  Config
@@ -161,31 +162,70 @@ impl Config {
     /// Resolve a model reference ("provider/model" or plain "model-name") to
     /// a concrete provider, API base, API key, and model ID.
     fn resolve_model(&self, model_ref: &str) -> providers::ResolvedModel {
+        let build_resolved = |pc: &JsonProviderConfig, model_id: &str, entry: Option<&JsonModelEntry>| {
+            let reasoning = entry.and_then(|e| e.reasoning).unwrap_or(false);
+            let thinking_format = entry
+                .and_then(|e| e.compat.as_ref())
+                .and_then(|c| c.get("thinkingFormat"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let max_tokens = entry.and_then(|e| e.max_tokens);
+            providers::ResolvedModel {
+                provider: match pc.api.as_str() {
+                    "anthropic" => Provider::Anthropic,
+                    _ => Provider::OpenAI,
+                },
+                api_base: pc.base_url.clone(),
+                api_key: pc.api_key.clone(),
+                model_id: model_id.to_string(),
+                reasoning,
+                thinking_format,
+                max_tokens,
+            }
+        };
+
         // Try "provider/model" format
         if let Some((prov_name, model_id)) = model_ref.split_once('/') {
             if let Some(pc) = self.providers.get(prov_name) {
                 let entry = pc.models.iter().find(|m| m.id == model_id);
-                let reasoning = entry.and_then(|e| e.reasoning).unwrap_or(false);
-                let thinking_format = entry
-                    .and_then(|e| e.compat.as_ref())
-                    .and_then(|c| c.get("thinkingFormat"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                let max_tokens = entry.and_then(|e| e.max_tokens);
-                return providers::ResolvedModel {
-                    provider: match pc.api.as_str() {
-                        "anthropic" => Provider::Anthropic,
-                        _ => Provider::OpenAI,
-                    },
-                    api_base: pc.base_url.clone(),
-                    api_key: pc.api_key.clone(),
-                    model_id: model_id.to_string(),
-                    reasoning,
-                    thinking_format,
-                    max_tokens,
-                };
+                return build_resolved(pc, model_id, entry);
             }
         }
+        // Fallback: search configured providers by plain model id, preferring
+        // an exact match to the current runtime config, then same provider
+        // type, all with stable provider-name ordering.
+        let mut provider_names: Vec<&str> = self.providers.keys().map(|name| name.as_str()).collect();
+        provider_names.sort_unstable_by(|left, right| {
+            let rank = |name: &str| {
+                let pc = self.providers.get(name).expect("provider missing during sort");
+                let pc_provider = match pc.api.as_str() {
+                    "anthropic" => Provider::Anthropic,
+                    _ => Provider::OpenAI,
+                };
+                if pc_provider == self.provider
+                    && pc.base_url == self.api_base
+                    && pc.api_key == self.api_key
+                {
+                    0_u8
+                } else if pc_provider == self.provider && pc.base_url == self.api_base {
+                    1_u8
+                } else if pc_provider == self.provider {
+                    2_u8
+                } else {
+                    3_u8
+                }
+            };
+
+            rank(left).cmp(&rank(right)).then_with(|| left.cmp(right))
+        });
+
+        for name in &provider_names {
+            let Some(pc) = self.providers.get(*name) else { continue };
+            if let Some(entry) = pc.models.iter().find(|m| m.id == model_ref) {
+                return build_resolved(pc, model_ref, Some(entry));
+            }
+        }
+
         // Fallback to env-based config
         providers::ResolvedModel {
             provider: self.provider,
@@ -433,14 +473,17 @@ fn session_workspace_path(session_id: &str) -> PathBuf {
 
 impl Session {
     fn new() -> Self {
-        let id = gen_session_id();
-        let workspace = session_workspace_path(&id);
+        Self::new_with_id(&gen_session_id(), "New Chat")
+    }
+
+    fn new_with_id(id: &str, name: &str) -> Self {
+        let workspace = session_workspace_path(id);
         std::fs::create_dir_all(&workspace).ok();
         prompts::init_session_prompt_files(&workspace);
         let avatar = prompts::parse_identity_avatar(&workspace);
         Self {
-            id,
-            name: "New Chat".into(),
+            id: id.to_string(),
+            name: name.to_string(),
             messages: Vec::new(),
             created_at: now_epoch(),
             updated_at: now_epoch(),
@@ -450,6 +493,10 @@ impl Session {
             workspace,
             avatar,
         }
+    }
+
+    fn is_main(&self) -> bool {
+        self.id == MAIN_SESSION_ID
     }
 
     fn effective_model<'a>(&'a self, default: &'a str) -> &'a str {
@@ -472,7 +519,7 @@ struct AppState {
 //  System Prompt
 // ══════════════════════════════════════════════════════════════════════════════
 
-fn build_system_prompt(config: &Config, workspace: &Path, model: &str) -> ChatMessage {
+fn build_system_prompt(config: &Config, workspace: &Path, model: &str, is_main: bool) -> ChatMessage {
     let os_name = if cfg!(windows) {
         "Windows"
     } else if cfg!(target_os = "macos") {
@@ -483,6 +530,16 @@ fn build_system_prompt(config: &Config, workspace: &Path, model: &str) -> ChatMe
     let cwd = workspace.display();
     let tool_lines = tools::render_tool_prompt_lines(config);
     let persona = prompts::load_session_prompt_files(workspace);
+
+    let admin_section = if is_main {
+        "\n\n## Admin Tools (Main Session Only)\n\
+         You have access to session management tools. When users ask about sessions, \
+         session counts, or want to manage/delete sessions, use these tools directly.\n\
+         - list_sessions: List all sessions with model, context usage, and configuration\n\
+         - delete_session: Delete a session by ID (cannot delete the main session)"
+    } else {
+        ""
+    };
 
     let prompt = format!(
         r#"{persona}
@@ -495,10 +552,11 @@ fn build_system_prompt(config: &Config, workspace: &Path, model: &str) -> ChatMe
 - Model: {model}
 
 ## Available Tools
-{tool_lines}"#,
+{tool_lines}{admin_section}"#,
         model = model,
         tool_lines = tool_lines,
         persona = persona,
+        admin_section = admin_section,
     );
 
     ChatMessage {
@@ -785,7 +843,7 @@ fn load_session_from_disk(id: &str) -> Option<Session> {
 
 fn refresh_session_system_prompt(state: &AppState, session: &mut Session) {
     let model = session.effective_model(&state.config.model).to_string();
-    let sys = build_system_prompt(&state.config, &session.workspace, &model);
+    let sys = build_system_prompt(&state.config, &session.workspace, &model, session.is_main());
     if let Some(first) = session.messages.first_mut() {
         if first.role == "system" {
             *first = sys;
@@ -846,11 +904,9 @@ async fn try_claim_session(id: &str, state: &AppState) -> ClaimSessionResult {
     ClaimSessionResult::Claimed(sid)
 }
 
-/// List all saved session summaries from disk, sorted by updated_at desc.
-fn list_saved_session_summaries() -> Vec<serde_json::Value> {
-    let dir = sessions_dir();
+fn list_saved_session_summaries_in_dir(dir: &Path) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
@@ -863,6 +919,16 @@ fn list_saved_session_summaries() -> Vec<serde_json::Value> {
                             "messages": msg_count,
                             "created_at": s.created_at,
                             "updated_at": s.updated_at,
+                            "corrupt": false,
+                        }));
+                    } else if let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) {
+                        out.push(json!({
+                            "id": id,
+                            "name": "[Corrupt Session]",
+                            "messages": 0,
+                            "created_at": 0,
+                            "updated_at": 0,
+                            "corrupt": true,
                         }));
                     }
                 }
@@ -875,6 +941,31 @@ fn list_saved_session_summaries() -> Vec<serde_json::Value> {
         b_ts.cmp(&a_ts)
     });
     out
+}
+
+/// List all saved session summaries from disk, sorted by updated_at desc.
+fn list_saved_session_summaries() -> Vec<serde_json::Value> {
+    list_saved_session_summaries_in_dir(&sessions_dir())
+}
+
+fn list_saved_session_ids_in_dir(dir: &Path) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                ids.insert(stem.to_string());
+            }
+        }
+    }
+    ids
+}
+
+fn list_saved_session_ids() -> HashSet<String> {
+    list_saved_session_ids_in_dir(&sessions_dir())
 }
 
 fn build_history_payload(session: &Session) -> serde_json::Value {
@@ -911,11 +1002,221 @@ fn build_history_payload(session: &Session) -> serde_json::Value {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+//  Admin Helpers (Main Session)
+// ══════════════════════════════════════════════════════════════════════════════
+
+fn resolve_session_target(target: &str, known_ids: &HashSet<String>) -> Result<String, String> {
+    if known_ids.contains(target) {
+        return Ok(target.to_string());
+    }
+
+    let mut matches: Vec<&String> = known_ids.iter().filter(|id| id.starts_with(target)).collect();
+    matches.sort_unstable();
+    match matches.len() {
+        0 => Err(format!("Session '{}' not found.", target)),
+        1 => Ok(matches[0].to_string()),
+        _ => Err(format!("Session '{}' is ambiguous. Use a longer ID.", target)),
+    }
+}
+
+fn build_active_session_lines(
+    sessions: &HashMap<String, Session>,
+    active_ids: &HashSet<String>,
+    config: &Config,
+) -> Vec<String> {
+    let mut ids: Vec<&String> = active_ids.iter().collect();
+    ids.sort_unstable();
+
+    ids.into_iter()
+        .filter_map(|id| {
+            let session = sessions.get(id)?;
+            let model = session.effective_model(&config.model).to_string();
+            let ctx_limit = config.context_limit_for_model(&model);
+            let resolved = config.resolve_model(&model);
+            let estimated = estimate_tokens(&session.messages);
+            let mt_str = resolved
+                .max_tokens
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".into());
+            Some(format!(
+                "  {id}  {}\n    model: {model}  context_est: {estimated}/{ctx_limit}  max_tokens: {mt_str}  [active]",
+                session.name,
+            ))
+        })
+        .collect()
+}
+
+/// Gather all sessions info for /sessions command and list_sessions tool.
+async fn gather_sessions_status(state: &AppState) -> String {
+    let active_ids: HashSet<String> = state.active_connections.lock().await.clone();
+
+    let lines = {
+        let sessions = state.sessions.lock().await;
+        build_active_session_lines(&sessions, &active_ids, &state.config)
+    };
+
+    if lines.is_empty() {
+        "No active sessions.".to_string()
+    } else {
+        format!("Active sessions ({}):\n{}", lines.len(), lines.join("\n"))
+    }
+}
+
+/// Delete a session by ID. Returns a status message.
+async fn delete_session_by_id(target: &str, state: &AppState) -> String {
+    let target = target.trim();
+    if target == MAIN_SESSION_ID {
+        return "Cannot delete the main session.".to_string();
+    }
+    if target.contains('/') || target.contains('\\') || target.contains("..") {
+        return "Invalid session ID.".to_string();
+    }
+
+    let known_ids: HashSet<String> = {
+        let mut ids = {
+            let sessions = state.sessions.lock().await;
+            sessions.keys().cloned().collect::<HashSet<_>>()
+        };
+        ids.extend(list_saved_session_ids());
+        ids
+    };
+
+    let resolved_id = match resolve_session_target(target, &known_ids) {
+        Ok(id) => id,
+        Err(message) => return message,
+    };
+
+    if resolved_id == MAIN_SESSION_ID {
+        return "Cannot delete the main session.".to_string();
+    }
+
+    let active = state.active_connections.lock().await;
+    if active.contains(&resolved_id) {
+        return format!("Session '{}' is currently in use.", resolved_id);
+    }
+
+    let removed_session = {
+        let mut sessions = state.sessions.lock().await;
+        sessions.remove(&resolved_id)
+    };
+
+    let path = sessions_dir().join(format!("{resolved_id}.json"));
+    let existed_on_disk = path.exists();
+    if existed_on_disk {
+        if let Err(e) = std::fs::remove_file(&path) {
+            if let Some(session) = removed_session {
+                state.sessions.lock().await.insert(resolved_id.clone(), session);
+            }
+            return format!("Failed to delete session file: {e}");
+        }
+    }
+
+    if removed_session.is_none() && !existed_on_disk {
+        return format!("Session '{}' not found.", target);
+    }
+
+    // Optionally clean up workspace directory
+    let ws_path = session_workspace_path(&resolved_id);
+    if let Some(session_dir) = ws_path.parent() {
+        if session_dir.exists() {
+            let _ = std::fs::remove_dir_all(session_dir);
+        }
+    }
+
+    format!("Deleted session '{}'.", resolved_id)
+}
+
+/// Admin tool definitions for the LLM (OpenAI format).
+fn admin_tool_definitions_openai() -> Vec<serde_json::Value> {
+    vec![
+        json!({
+            "type": "function",
+            "function": {
+                "name": "list_sessions",
+                "description": "List all sessions with their model, context usage, max_tokens, and status",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "delete_session",
+                "description": "Delete a session by its ID. Cannot delete the main session or an active session.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "The session ID to delete"
+                        }
+                    },
+                    "required": ["session_id"]
+                }
+            }
+        }),
+    ]
+}
+
+/// Admin tool definitions for the LLM (Anthropic format).
+fn admin_tool_definitions_anthropic() -> Vec<serde_json::Value> {
+    vec![
+        json!({
+            "name": "list_sessions",
+            "description": "List all sessions with their model, context usage, max_tokens, and status",
+            "input_schema": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }),
+        json!({
+            "name": "delete_session",
+            "description": "Delete a session by its ID. Cannot delete the main session or an active session.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "description": "The session ID to delete"
+                    }
+                },
+                "required": ["session_id"]
+            }
+        }),
+    ]
+}
+
+/// Execute an admin tool call. Returns the tool result string.
+async fn execute_admin_tool(name: &str, args_str: &str, state: &AppState) -> String {
+    match name {
+        "list_sessions" => gather_sessions_status(state).await,
+        "delete_session" => {
+            let args: serde_json::Value = serde_json::from_str(args_str).unwrap_or_default();
+            let session_id = args["session_id"].as_str().unwrap_or_default();
+            if session_id.is_empty() {
+                return "Error: session_id is required.".to_string();
+            }
+            delete_session_by_id(session_id, state).await
+        }
+        _ => format!("Unknown admin tool: {name}"),
+    }
+}
+
+fn is_admin_tool(name: &str) -> bool {
+    matches!(name, "list_sessions" | "delete_session")
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 //  Chat Commands
 // ══════════════════════════════════════════════════════════════════════════════
 
 struct CommandResult {
     response: String,
+    response_type: &'static str,
     new_session_id: Option<String>,
     sessions_changed: bool,
 }
@@ -924,6 +1225,7 @@ async fn handle_command(
     input: &str,
     current_session_id: &str,
     state: &AppState,
+    tx: &WsTx,
     cancel: &CancellationToken,
 ) -> Option<CommandResult> {
     let parts: Vec<&str> = input.splitn(2, ' ').collect();
@@ -939,6 +1241,7 @@ async fn handle_command(
                     Some(s) => s,
                     None => return Some(CommandResult {
                         response: "Session not found".into(),
+                        response_type: "system",
                         new_session_id: None,
                         sessions_changed: false,
                     }),
@@ -970,16 +1273,29 @@ async fn handle_command(
                 let mut sessions = state.sessions.lock().await;
                 if let Some(session) = sessions.get_mut(current_session_id) {
                     let model = session.effective_model(&state.config.model).to_string();
-                    let sys = build_system_prompt(&state.config, &session.workspace, &model);
+                    let is_main = session.is_main();
+                    let sys = build_system_prompt(&state.config, &session.workspace, &model, is_main);
                     session.messages = vec![sys];
                     session.tool_calls_count = 0;
                     session.updated_at = now_epoch();
                 }
                 return Some(CommandResult {
                     response: "Context cleared.".into(),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: false,
                 });
+            }
+
+            if !ws_send(
+                tx,
+                &json!({
+                    "type": "progress",
+                    "content": "Compressing conversation..."
+                }),
+            )
+            .await {
+                return None;
             }
 
             // Ask LLM to compress
@@ -1006,6 +1322,7 @@ async fn handle_command(
                 _ = cancel.cancelled() => {
                     return Some(CommandResult {
                         response: "Shutdown: compression skipped, context unchanged.".into(),
+                        response_type: "system",
                         new_session_id: None,
                         sessions_changed: false,
                     });
@@ -1016,6 +1333,7 @@ async fn handle_command(
                         Err(e) => {
                             return Some(CommandResult {
                                 response: format!("Failed to compress conversation: {e}"),
+                                response_type: "system",
                                 new_session_id: None,
                                 sessions_changed: false,
                             });
@@ -1023,6 +1341,17 @@ async fn handle_command(
                     }
                 }
             };
+
+            if !ws_send(
+                tx,
+                &json!({
+                    "type": "progress",
+                    "content": "Compression complete. Writing memory..."
+                }),
+            )
+            .await {
+                return None;
+            }
 
             // Append to memory/YYYY-MM-DD.md
             let today = prompts::chrono_today();
@@ -1054,6 +1383,7 @@ async fn handle_command(
             if let Err(e) = write_result {
                 return Some(CommandResult {
                     response: format!("Failed to write memory: {e}"),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: false,
                 });
@@ -1063,7 +1393,8 @@ async fn handle_command(
             let mut sessions = state.sessions.lock().await;
             if let Some(session) = sessions.get_mut(current_session_id) {
                 let model = session.effective_model(&state.config.model).to_string();
-                let sys = build_system_prompt(&state.config, &session.workspace, &model);
+                let is_main = session.is_main();
+                let sys = build_system_prompt(&state.config, &session.workspace, &model, is_main);
                 session.messages = vec![sys];
                 session.tool_calls_count = 0;
                 session.updated_at = now_epoch();
@@ -1071,6 +1402,7 @@ async fn handle_command(
 
             Some(CommandResult {
                 response: format!("Conversation compressed and saved to memory/{today}.md. Context cleared."),
+                response_type: "success",
                 new_session_id: None,
                 sessions_changed: false,
             })
@@ -1099,12 +1431,13 @@ async fn handle_command(
             // Create brand-new session
             let mut s = Session::new();
             let model = s.effective_model(&state.config.model).to_string();
-            let sys = build_system_prompt(&state.config, &s.workspace, &model);
+            let sys = build_system_prompt(&state.config, &s.workspace, &model, false);
             s.messages.push(sys);
             let new_id = s.id.clone();
             state.sessions.lock().await.insert(new_id.clone(), s);
             Some(CommandResult {
                 response: "A new journey begins.".into(),
+                response_type: "system",
                 new_session_id: Some(new_id),
                 sessions_changed: true,
             })
@@ -1114,6 +1447,7 @@ async fn handle_command(
             if arg.is_empty() {
                 return Some(CommandResult {
                     response: "Usage: /switch <session_id>".into(),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: false,
                 });
@@ -1122,6 +1456,7 @@ async fn handle_command(
             if target == current_session_id {
                 return Some(CommandResult {
                     response: "Already on this session.".into(),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: false,
                 });
@@ -1137,6 +1472,7 @@ async fn handle_command(
                         eprintln!("Warning: failed to save session {} before /switch: {e}; keeping in memory", s.id);
                         return Some(CommandResult {
                             response: "Failed to save current session; switch cancelled to avoid data loss.".into(),
+                            response_type: "system",
                             new_session_id: None,
                             sessions_changed: false,
                         });
@@ -1149,6 +1485,7 @@ async fn handle_command(
                     state.sessions.lock().await.remove(current_session_id);
                     Some(CommandResult {
                         response: format!("Loaded session {}", &id[..12.min(id.len())]),
+                        response_type: "system",
                         new_session_id: Some(id),
                         sessions_changed: true,
                     })
@@ -1156,6 +1493,7 @@ async fn handle_command(
                 ClaimSessionResult::InUse => {
                     Some(CommandResult {
                         response: format!("Session '{}' is in use by another connection.", &target[..12.min(target.len())]),
+                        response_type: "system",
                         new_session_id: None,
                         sessions_changed: false,
                     })
@@ -1163,6 +1501,7 @@ async fn handle_command(
                 ClaimSessionResult::NotFound => {
                     Some(CommandResult {
                         response: format!("Session '{}' not found.", &target[..12.min(target.len())]),
+                        response_type: "system",
                         new_session_id: None,
                         sessions_changed: false,
                     })
@@ -1174,6 +1513,7 @@ async fn handle_command(
             if arg.is_empty() {
                 return Some(CommandResult {
                     response: "Usage: /rename <new_name>".into(),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: false,
                 });
@@ -1183,12 +1523,14 @@ async fn handle_command(
                 session.name = arg.to_string();
                 Some(CommandResult {
                     response: format!("Renamed to: {arg}"),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: true,
                 })
             } else {
                 Some(CommandResult {
                     response: "Current session not found".into(),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: false,
                 })
@@ -1216,6 +1558,7 @@ async fn handle_command(
                     .join("\n");
                 Some(CommandResult {
                     response: format!("Available models:\n{list}\n\nUse /model <name> to switch."),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: false,
                 })
@@ -1225,12 +1568,14 @@ async fn handle_command(
                     session.model_override = Some(arg.to_string());
                     Some(CommandResult {
                         response: format!("Model switched to: {arg}"),
+                        response_type: "system",
                         new_session_id: None,
                         sessions_changed: true,
                     })
                 } else {
                     Some(CommandResult {
                         response: "Session not found".into(),
+                        response_type: "system",
                         new_session_id: None,
                         sessions_changed: false,
                     })
@@ -1243,22 +1588,30 @@ async fn handle_command(
             match sessions.get(current_session_id) {
                 Some(s) => {
                     let model_ref = s.effective_model(&state.config.model);
+                    let resolved = state.config.resolve_model(model_ref);
                     let ctx_limit = state.config.context_limit_for_model(model_ref);
-                    let tokens = estimate_tokens(&s.messages);
+                    let estimated_tokens = estimate_tokens(&s.messages);
+                    let model_max_tokens = resolved
+                        .max_tokens
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "-".into());
                     Some(CommandResult {
                         response: format!(
                             "agent: LingClaw\n\
                              model: {model_ref}\n\
-                             context: {tokens}/{ctx_limit}\n\
+                             max_tokens: {model_max_tokens}\n\
+                             context_est: {estimated_tokens}/{ctx_limit}\n\
                              think: {think}",
                             think = s.think_level,
                         ),
+                        response_type: "system",
                         new_session_id: None,
                         sessions_changed: false,
                     })
                 }
                 None => Some(CommandResult {
                     response: "No active session".into(),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: false,
                 }),
@@ -1269,18 +1622,21 @@ async fn handle_command(
             let mut sessions = state.sessions.lock().await;
             if let Some(session) = sessions.get_mut(current_session_id) {
                 let model = session.effective_model(&state.config.model).to_string();
-                let system_msg = build_system_prompt(&state.config, &session.workspace, &model);
+                let is_main = session.is_main();
+                let system_msg = build_system_prompt(&state.config, &session.workspace, &model, is_main);
                 session.messages = vec![system_msg];
                 session.tool_calls_count = 0;
                 session.updated_at = now_epoch();
                 Some(CommandResult {
                     response: "Session cleared. System prompt preserved.".into(),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: false,
                 })
             } else {
                 Some(CommandResult {
                     response: "Session not found".into(),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: false,
                 })
@@ -1298,6 +1654,7 @@ async fn handle_command(
                 .join("\n");
             Some(CommandResult {
                 response: format!("Skills:\n{list}"),
+                response_type: "system",
                 new_session_id: None,
                 sessions_changed: false,
             })
@@ -1313,6 +1670,7 @@ async fn handle_command(
                     .unwrap_or("auto");
                 return Some(CommandResult {
                     response: format!("think: {level}\nUsage: /think <auto|off|minimal|low|medium|high|xhigh>"),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: false,
                 });
@@ -1321,6 +1679,7 @@ async fn handle_command(
             if !VALID_LEVELS.contains(&level.as_str()) {
                 return Some(CommandResult {
                     response: format!("Invalid think level: {arg}\nValid: auto, off, minimal, low, medium, high, xhigh"),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: false,
                 });
@@ -1330,20 +1689,22 @@ async fn handle_command(
                 session.think_level = level.clone();
                 Some(CommandResult {
                     response: format!("Think mode set to: {level}"),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: true,
                 })
             } else {
                 Some(CommandResult {
                     response: "Session not found".into(),
+                    response_type: "system",
                     new_session_id: None,
                     sessions_changed: false,
                 })
             }
         }
 
-        "/help" => Some(CommandResult {
-            response: "\
+        "/help" => {
+            let mut help = "\
 Commands:
   /new             Compress conversation to memory & clear context
   /status          Show session status
@@ -1353,10 +1714,64 @@ Commands:
   /rename <name>   Rename current session
   /clear           Clear messages (keep system prompt)
   /help            Show this help"
-                .into(),
-            new_session_id: None,
-            sessions_changed: false,
-        }),
+                .to_string();
+            if current_session_id == MAIN_SESSION_ID {
+                help.push_str("\n\nMain session commands:\n\
+                  /sessions        List all active sessions\n\
+                                    /delete <id>     Delete a session by full ID or unique prefix");
+            }
+            Some(CommandResult {
+                response: help,
+                response_type: "system",
+                new_session_id: None,
+                sessions_changed: false,
+            })
+        }
+
+        "/sessions" => {
+            if current_session_id != MAIN_SESSION_ID {
+                return Some(CommandResult {
+                    response: "This command is only available in the main session.".into(),
+                    response_type: "error",
+                    new_session_id: None,
+                    sessions_changed: false,
+                });
+            }
+            let output = gather_sessions_status(state).await;
+            Some(CommandResult {
+                response: output,
+                response_type: "system",
+                new_session_id: None,
+                sessions_changed: false,
+            })
+        }
+
+        "/delete" => {
+            if current_session_id != MAIN_SESSION_ID {
+                return Some(CommandResult {
+                    response: "This command is only available in the main session.".into(),
+                    response_type: "error",
+                    new_session_id: None,
+                    sessions_changed: false,
+                });
+            }
+            if arg.is_empty() {
+                return Some(CommandResult {
+                    response: "Usage: /delete <session_id>".into(),
+                    response_type: "system",
+                    new_session_id: None,
+                    sessions_changed: false,
+                });
+            }
+            let result = delete_session_by_id(arg, state).await;
+            let changed = result.starts_with("Deleted");
+            Some(CommandResult {
+                response: result,
+                response_type: "system",
+                new_session_id: None,
+                sessions_changed: changed,
+            })
+        }
 
         _ => None,
     }
@@ -1430,19 +1845,28 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
     // Only fall back to "most recent saved session" when NO specific session was requested.
     // If the client asked for a specific session and it failed, create new (don't hijack another).
     if claimed.is_none() && requested_id.is_none() {
-        let saved_ids: Vec<String> = list_saved_session_summaries()
-            .iter()
-            .filter_map(|s| s["id"].as_str().map(|id| id.to_string()))
-            .collect();
+        // Prefer the main session first
+        match try_claim_session(MAIN_SESSION_ID, &state).await {
+            ClaimSessionResult::Claimed(id) => {
+                claimed = Some(id);
+            }
+            ClaimSessionResult::InUse | ClaimSessionResult::NotFound => {
+                // Main session in use or gone — fall back to most recent
+                let saved_ids: Vec<String> = list_saved_session_summaries()
+                    .iter()
+                    .filter_map(|s| s["id"].as_str().map(|id| id.to_string()))
+                    .collect();
 
-        for cid in &saved_ids {
-            match try_claim_session(cid, &state).await {
-                ClaimSessionResult::Claimed(id) => {
-                    claimed = Some(id);
-                    break;
-                }
-                ClaimSessionResult::InUse | ClaimSessionResult::NotFound => {
-                    continue;
+                for cid in &saved_ids {
+                    match try_claim_session(cid, &state).await {
+                        ClaimSessionResult::Claimed(id) => {
+                            claimed = Some(id);
+                            break;
+                        }
+                        ClaimSessionResult::InUse | ClaimSessionResult::NotFound => {
+                            continue;
+                        }
+                    }
                 }
             }
         }
@@ -1468,6 +1892,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             &state.config,
             &session.workspace,
             session.effective_model(&state.config.model),
+            false,
         );
         session.messages.push(sys);
         current_session_id = session.id.clone();
@@ -1528,14 +1953,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         }
 
         if trimmed.starts_with('/') {
-            let cmd_result = handle_command(trimmed, &current_session_id, &state, &cancel).await;
+            let cmd_result = handle_command(trimmed, &current_session_id, &state, &tx, &cancel).await;
             if cancel.is_cancelled() {
                 break;
             }
             if let Some(result) = cmd_result {
                 ws_send(
                     &tx,
-                    &json!({"type":"system","content":result.response}),
+                    &json!({"type":result.response_type,"content":result.response}),
                 )
                 .await;
 
@@ -1626,7 +2051,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     None => break,
                 };
                 let model_str = session.effective_model(&state.config.model).to_string();
-                let fresh_system = build_system_prompt(&state.config, &session.workspace, &model_str);
+                let is_main = session.is_main();
+                let fresh_system = build_system_prompt(&state.config, &session.workspace, &model_str, is_main);
                 if let Some(first) = session.messages.first_mut() {
                     if first.role == "system" {
                         *first = fresh_system;
@@ -1658,6 +2084,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
             let resolved = state.config.resolve_model(&model);
 
+            let is_main = current_session_id == MAIN_SESSION_ID;
+            let extra_tools: Vec<serde_json::Value> = if is_main {
+                match resolved.provider {
+                    Provider::Anthropic => admin_tool_definitions_anthropic(),
+                    Provider::OpenAI => admin_tool_definitions_openai(),
+                }
+            } else {
+                vec![]
+            };
+
             let llm_result = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
@@ -1673,6 +2109,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     &msgs_snapshot,
                     &tx,
                     &think_level,
+                    &extra_tools,
                 ) => r,
             };
             match llm_result {
@@ -1705,22 +2142,30 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             )
                             .await { break 'agent; }
 
-                            let result = tokio::select! {
-                                biased;
-                                _ = cancel.cancelled() => {
-                                    shutting_down = true;
-                                    break 'agent;
-                                }
-                                _ = connection_cancel.cancelled() => {
-                                    break 'agent;
-                                }
-                                r = execute_tool(
+                            let result = if is_main && is_admin_tool(&tc.function.name) {
+                                execute_admin_tool(
                                     &tc.function.name,
                                     &tc.function.arguments,
-                                    &state.config,
-                                    &state.http,
-                                    &workspace,
-                                ) => r,
+                                    &state,
+                                ).await
+                            } else {
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => {
+                                        shutting_down = true;
+                                        break 'agent;
+                                    }
+                                    _ = connection_cancel.cancelled() => {
+                                        break 'agent;
+                                    }
+                                    r = execute_tool(
+                                        &tc.function.name,
+                                        &tc.function.arguments,
+                                        &state.config,
+                                        &state.http,
+                                        &workspace,
+                                    ) => r,
+                                }
                             };
 
                             if !ws_send(
@@ -1872,7 +2317,11 @@ async fn send_sessions_list(tx: &WsTx, state: &AppState, active_id: &str) {
     });
     // Filter out empty sessions (0 user messages) from the sidebar — they're just
     // reconnect placeholders on disk, not useful for the user to see.
-    all.retain(|s| s["active"].as_bool() == Some(true) || s["messages"].as_u64().unwrap_or(0) > 0);
+    all.retain(|s| {
+        s["active"].as_bool() == Some(true)
+            || s["messages"].as_u64().unwrap_or(0) > 0
+            || s["corrupt"].as_bool() == Some(true)
+    });
     ws_send(tx, &json!({"type":"sessions_list","sessions":all})).await;
 }
 
@@ -2019,6 +2468,19 @@ async fn main() {
         shutdown_token,
     });
 
+    // Ensure main session exists (load from disk or create fresh)
+    {
+        let main_session = load_session_from_disk(MAIN_SESSION_ID).unwrap_or_else(|| {
+            let mut s = Session::new_with_id(MAIN_SESSION_ID, "Main");
+            let model = s.effective_model(&state.config.model).to_string();
+            let sys = build_system_prompt(&state.config, &s.workspace, &model, true);
+            s.messages.push(sys);
+            s
+        });
+        state.sessions.lock().await.insert(MAIN_SESSION_ID.to_string(), main_session);
+        eprintln!("  Main session: ready");
+    }
+
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/health", get(api_health))
@@ -2066,3 +2528,6 @@ async fn main() {
     }
     eprintln!("Server shut down, {} session(s) saved.", sessions.len());
 }
+
+#[cfg(test)]
+mod main_tests;

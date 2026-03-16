@@ -97,6 +97,7 @@ header .actions button:hover { border-color: var(--accent2); color: var(--text);
 .system-card { background: var(--surface); border: 1px solid var(--border); border-left: 3px solid var(--accent2); border-radius: 8px; padding: 10px 14px; font-size: 13px; color: var(--dim); animation: msgSlideIn .3s ease; box-shadow: 0 1px 4px rgba(0,0,0,.04); }
 .system-card.system-inline { display: flex; align-items: center; gap: 8px; padding: 8px 14px; }
 .system-card.error-card { border-left-color: var(--accent-error); }
+.system-card.success-card { border-left-color: var(--accent-success); }
 .system-icon { font-size: 14px; flex-shrink: 0; }
 .system-header { display: flex; align-items: center; gap: 6px; font-weight: 600; color: var(--text); margin-bottom: 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .5px; }
 .system-body { margin: 0; font-family: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace; font-size: 12px; line-height: 1.7; white-space: pre-wrap; color: var(--text); background: var(--bg); border-radius: 6px; padding: 10px 12px; border: 1px solid var(--border); overflow-x: auto; }
@@ -407,6 +408,15 @@ function handleMessage(data) {
       addToolResult(data.name, data.result, data.id);
       break;
 
+    case 'progress':
+      addSystem(data.content);
+      break;
+
+    case 'success':
+      addSystem(data.content, 'success');
+      setBusy(false);
+      break;
+
     case 'system':
       addSystem(data.content);
       setBusy(false);
@@ -462,17 +472,19 @@ function addMsg(cls, text, timestamp) {
 
 function addAssistant(text) { return addMsg('assistant', text); }
 
-function addSystem(t) {
+function addSystem(t, kind = 'info') {
   const row = document.createElement('div');
   row.className = 'msg-row system';
   const card = document.createElement('div');
   card.className = 'system-card';
+  const icon = kind === 'success' ? '✅' : 'ℹ️';
+  if (kind === 'success') card.classList.add('success-card');
   const isBlock = t.includes('\n') || t.length > 80;
   if (isBlock) {
     card.innerHTML = `<div class="system-header"><span class="system-icon">📋</span> System</div><pre class="system-body">${escHtml(t)}</pre>`;
   } else {
     card.classList.add('system-inline');
-    card.innerHTML = `<span class="system-icon">ℹ️</span> <span>${escHtml(t)}</span>`;
+    card.innerHTML = `<span class="system-icon">${icon}</span> <span>${escHtml(t)}</span>`;
   }
   row.appendChild(card);
   chat.appendChild(row);
@@ -695,8 +707,9 @@ function send() {
 
   if (!text.startsWith('/')) {
     addMsg('user', text);
-    setBusy(true);
   }
+
+  setBusy(true);
 
   ws.send(text);
   input.value = '';
@@ -704,7 +717,8 @@ function send() {
 }
 
 function sendCmd(cmd) {
-  if (!ws || ws.readyState !== 1) return;
+  if (busy || !ws || ws.readyState !== 1) return;
+  setBusy(true);
   ws.send(cmd);
 }
 

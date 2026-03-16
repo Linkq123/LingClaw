@@ -1,6 +1,6 @@
 [package]
 name = "lingclaw"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "A ~3400-line Rust personal AI assistant"
 

@@ -9,11 +9,13 @@ This is **LingClaw** — a ~4400-line Rust personal AI assistant built on the **
 - `src/main.rs` must stay ≤ 3000 lines. Check with `wc -l src/main.rs` before committing.
 - Backend entrypoint and main loop live in `src/main.rs`. CLI subcommands and setup wizard live in `src/cli.rs`. Provider streaming logic lives in `src/providers.rs`. Session prompt init/load logic lives in `src/prompts.rs`; prompt templates live on disk in `docs/reference/templates/`. Shared tool registry lives in `src/tools/mod.rs` with implementations split into `src/tools/exec.rs`, `src/tools/fs.rs`, `src/tools/net.rs`.
 - Each session has an isolated workspace at `~/.lingclaw/{sessionId}/workspace/` with 7 prompt files (BOOTSTRAP.md, AGENT.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md) copied from `docs/reference/templates/` on creation, plus a `memory/` subdirectory for daily logs. Bootstrap mode loads `BOOTSTRAP.md + AGENT.md`; after BOOTSTRAP.md is deleted, normal mode loads `AGENT.md + IDENTITY.md + USER.md + SOUL.md`, then `MEMORY.md` and today/yesterday daily memory. Existing sessions should not recreate BOOTSTRAP.md on reconnect.
+- `/new` only compresses conversation, appends to `memory/YYYY-MM-DD.md`, and clears context. It must not initialize a new session or recreate `BOOTSTRAP.md`.
 - Dependencies: axum, tokio, serde, serde_json, reqwest, futures, regex, tower-http, tokio-util. Do not add more without justification.
 - Rust edition 2021. Target stable Rust.
 - Use `cargo clippy` and `cargo fmt` before finalizing code.
 - Frontend (`static/index.html`) does not count toward the line budget.
 - Config via `~/.lingclaw/.lingclaw.json` (JSON config file) with first-run setup wizard. Environment variables are supported as fallback overrides.
+- Model resolution must support both `provider/model` and plain model IDs. For plain IDs, prefer an exact match to the current runtime config, then same-provider candidates, with deterministic ordering.
 - No `.unwrap()` in production paths — use `?` or provide fallback defaults.
 - All tool exec must go through `check_dangerous_command()` and `resolve_path()` (sandboxed — paths are canonicalized and must stay inside the session workspace).
 - Network tools must go through `check_ssrf()` (scheme validation + private IP / DNS resolution blocking) with redirects disabled.
