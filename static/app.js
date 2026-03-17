@@ -21,69 +21,65 @@ let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 50;
 let pendingAssistantText = '';
 let pendingReasoningText = '';
-let assistantFlushHandle = 0;
-let reasoningFlushHandle = 0;
+let flushHandle = 0;
+let _deferredHistory = [];
+const HISTORY_RENDER_LIMIT = 50;
 
 function flushAssistantText() {
-  assistantFlushHandle = 0;
-  if (!currentMsg || !pendingAssistantText) {
-    return;
-  }
-
+  if (!currentMsg || !pendingAssistantText) return;
   currentMsg._rawText = (currentMsg._rawText || '') + pendingAssistantText;
-  currentMsg.textContent = currentMsg._rawText;
+  if (!currentMsg._textNode) {
+    currentMsg._textNode = document.createTextNode(currentMsg._rawText);
+    currentMsg.replaceChildren(currentMsg._textNode);
+  } else {
+    currentMsg._textNode.nodeValue += pendingAssistantText;
+  }
   pendingAssistantText = '';
   revealCurrentAssistant();
-  scrollDown();
-}
-
-function scheduleAssistantFlush() {
-  if (assistantFlushHandle) {
-    return;
-  }
-
-  assistantFlushHandle = requestAnimationFrame(flushAssistantText);
-}
-
-function cancelAssistantFlush() {
-  if (assistantFlushHandle) {
-    cancelAnimationFrame(assistantFlushHandle);
-    assistantFlushHandle = 0;
-  }
-  pendingAssistantText = '';
 }
 
 function flushReasoningText() {
-  reasoningFlushHandle = 0;
-  if (!reasoningPanel || !pendingReasoningText) {
-    return;
-  }
-
+  if (!reasoningPanel || !pendingReasoningText) return;
   const body = reasoningPanel.querySelector('.reasoning-body');
-  if (!body) {
-    pendingReasoningText = '';
-    return;
+  if (!body) { pendingReasoningText = ''; return; }
+  if (!body._textNode) {
+    body._textNode = document.createTextNode(pendingReasoningText);
+    body.appendChild(body._textNode);
+  } else {
+    body._textNode.nodeValue += pendingReasoningText;
   }
-
-  body.textContent += pendingReasoningText;
   pendingReasoningText = '';
-  scrollDown();
 }
 
-function scheduleReasoningFlush() {
-  if (reasoningFlushHandle) {
-    return;
-  }
+function flushStreaming() {
+  flushHandle = 0;
+  const follow = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 80;
+  flushAssistantText();
+  flushReasoningText();
+  if (follow) scrollDown();
+}
 
-  reasoningFlushHandle = requestAnimationFrame(flushReasoningText);
+function scheduleFlush() {
+  if (!flushHandle) {
+    flushHandle = requestAnimationFrame(flushStreaming);
+  }
+}
+
+function cancelAssistantFlush() {
+  pendingAssistantText = '';
+  cancelFlushIfIdle();
 }
 
 function cancelReasoningFlush() {
-  if (reasoningFlushHandle) {
-    cancelAnimationFrame(reasoningFlushHandle);
-    reasoningFlushHandle = 0;
-  }
   pendingReasoningText = '';
+  cancelFlushIfIdle();
+}
+
+function cancelFlushIfIdle() {
+  if (!pendingAssistantText && !pendingReasoningText && flushHandle) {
+    cancelAnimationFrame(flushHandle);
+    flushHandle = 0;
+  }
 }
 
 function currentMsgRow() {
@@ -133,12 +129,14 @@ function finishAssistantStream({ discardIfEmpty = false } = {}) {
 
   revealCurrentAssistant();
   renderMarkdown(currentMsg);
+  scrollDown();
   currentMsg = null;
 }
 
 function finishReasoningStream() {
   flushReasoningText();
   cancelReasoningFlush();
+  scrollDown();
 }
 
 // ── Markdown setup ──
@@ -218,23 +216,24 @@ function handleMessage(data) {
 
     case 'history': {
       chat.innerHTML = '';
+      _deferredHistory = [];
       const msgs = data.messages || [];
       if (msgs.length === 0) {
         showWelcome();
       } else {
         chat.classList.add('no-animate');
-        for (const m of msgs) {
-          switch (m.role) {
-            case 'user': addMsg('user', m.content, m.timestamp); break;
-            case 'assistant': {
-              const el = addMsg('assistant', m.content, m.timestamp);
-              el._rawText = m.content;
-              renderMarkdown(el);
-              break;
-            }
-            case 'tool_call': addToolCall(m.name, m.arguments, m.id); break;
-            case 'tool_result': addToolResult('', m.result, m.id); break;
-          }
+        let startIdx = 0;
+        if (msgs.length > HISTORY_RENDER_LIMIT) {
+          startIdx = findHistoryRenderStart(msgs, msgs.length - HISTORY_RENDER_LIMIT);
+          _deferredHistory = msgs.slice(0, startIdx);
+          const loadMoreRow = document.createElement('div');
+          loadMoreRow.className = 'msg-row system';
+          loadMoreRow.id = 'load-more-row';
+          loadMoreRow.innerHTML = `<button class="load-more-btn" onclick="loadEarlierMessages()">↑ 加载更早的消息 (${_deferredHistory.length} 条)</button>`;
+          chat.appendChild(loadMoreRow);
+        }
+        for (let i = startIdx; i < msgs.length; i++) {
+          renderHistoryMessage(msgs[i]);
         }
         requestAnimationFrame(() => chat.classList.remove('no-animate'));
       }
@@ -270,7 +269,7 @@ function handleMessage(data) {
     case 'delta':
       if (currentMsg) {
         pendingAssistantText += data.content;
-        scheduleAssistantFlush();
+        scheduleFlush();
       }
       break;
 
@@ -320,7 +319,7 @@ function handleMessage(data) {
     case 'thinking_delta':
       if (reasoningPanel) {
         pendingReasoningText += data.content;
-        scheduleReasoningFlush();
+        scheduleFlush();
       }
       break;
 
@@ -661,6 +660,73 @@ function setBusy(b) {
 function toggleTool(header) {
   header.querySelector('.chevron').classList.toggle('open');
   header.nextElementSibling.classList.toggle('show');
+}
+
+// ── History lazy-load ──
+function findHistoryRenderStart(messages, preferredStart) {
+  let startIdx = Math.max(0, preferredStart);
+  if (startIdx === 0) {
+    return 0;
+  }
+
+  const toolCallById = new Map();
+  for (let i = 0; i < messages.length; i++) {
+    const message = messages[i];
+    if (message.role === 'tool_call' && message.id) {
+      toolCallById.set(message.id, i);
+    }
+  }
+
+  let expanded = true;
+  while (expanded) {
+    expanded = false;
+    for (let i = startIdx; i < messages.length; i++) {
+      const message = messages[i];
+      if (message.role !== 'tool_result' || !message.id) {
+        continue;
+      }
+
+      const callIdx = toolCallById.get(message.id);
+      if (callIdx !== undefined && callIdx < startIdx) {
+        startIdx = callIdx;
+        expanded = true;
+      }
+    }
+  }
+
+  return startIdx;
+}
+
+function renderHistoryMessage(m) {
+  switch (m.role) {
+    case 'user': addMsg('user', m.content, m.timestamp); break;
+    case 'assistant': {
+      const el = addMsg('assistant', m.content, m.timestamp);
+      el._rawText = m.content;
+      renderMarkdown(el);
+      break;
+    }
+    case 'tool_call': addToolCall(m.name, m.arguments, m.id); break;
+    case 'tool_result': addToolResult('', m.result, m.id); break;
+  }
+}
+
+function loadEarlierMessages() {
+  const msgs = _deferredHistory;
+  _deferredHistory = [];
+  const loadMoreRow = document.getElementById('load-more-row');
+  // The first child after load-more-row is the anchor we want to scroll to
+  const anchor = loadMoreRow ? loadMoreRow.nextElementSibling : chat.firstElementChild;
+  if (loadMoreRow) loadMoreRow.remove();
+  const existing = [...chat.children];
+  chat.replaceChildren();
+  chat.classList.add('no-animate');
+  for (const m of msgs) renderHistoryMessage(m);
+  for (const el of existing) chat.appendChild(el);
+  requestAnimationFrame(() => {
+    chat.classList.remove('no-animate');
+    if (anchor) anchor.scrollIntoView({ block: 'start' });
+  });
 }
 
 // ── Input ──

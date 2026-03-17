@@ -40,7 +40,7 @@ Architecture (single process, single binary):
 - **Session store**: `HashMap<String, Session>` + `HashSet<String>` (`active_connections`) behind dual `Mutex` — dual-state tracking distinguishes active connections from orphaned in-memory sessions; disk persistence, exclusive ownership via `try_claim_session()` (4-phase atomic claim), session-aware reconnect
 - **Main session**: Designated session (`MAIN_SESSION_ID = "main"`) with admin privileges — can list/delete other sessions via AI tools and slash commands; admin tools injected via `extra_tools` parameter; prefix-based session target resolution with atomic delete
 - **Graceful shutdown**: `CancellationToken` (tokio-util), `/api/shutdown` with per-port Bearer token auth, auto-save on exit
-- **Frontend**: static `index.html` with sidebar, markdown rendering, code highlighting
+- **Frontend**: static `index.html` + `app.js` + `style.css` — WebChat UI with incremental text node streaming (`TextNode.nodeValue +=`), unified `requestAnimationFrame` flush scheduler, pre-mutation scroll-follow detection, history lazy-load (last 50 messages rendered initially, tool_call/tool_result pairs kept intact via `findHistoryRenderStart()`), markdown-only-on-finish rendering
 
 Key files:
 - `Cargo.toml` — axum, tokio, serde, serde_json, reqwest (stream+json), futures, regex, tower-http, tokio-util

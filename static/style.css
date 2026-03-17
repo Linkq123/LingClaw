@@ -332,6 +332,22 @@ header .actions button:hover {
 }
 .typing::after { content: '▌'; animation: blink .6s infinite; }
 
+/* ── Load more button ── */
+.load-more-btn {
+  display: block;
+  margin: 8px auto;
+  padding: 6px 16px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 13px;
+  opacity: 0.7;
+  transition: opacity 0.2s;
+}
+.load-more-btn:hover { opacity: 1; }
+
 /* ── Reasoning panel ── */
 .reasoning-panel {
   align-self: flex-start;
