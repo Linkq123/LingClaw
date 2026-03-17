@@ -256,6 +256,15 @@ function handleMessage(data) {
       if (data.avatar !== undefined) applySessionAvatar(data.avatar || null);
       finishAssistantStream({ discardIfEmpty: true });
       beginAssistantStream();
+      if (data.react_visible && data.phase) {
+        const phaseLabel = {
+          analyze: 'Analyze',
+          act: 'Act',
+          observe: 'Observe',
+          finish: 'Finish'
+        }[data.phase] || data.phase;
+        addSystem(`[ReAct] ${phaseLabel}`);
+      }
       break;
 
     case 'delta':
@@ -271,6 +280,18 @@ function handleMessage(data) {
       reasoningPanel = null;
       setBusy(false);
       break;
+
+    case 'react_phase': {
+      const phaseLabel = {
+        analyze: 'Analyze',
+        act: 'Act',
+        observe: 'Observe',
+        finish: 'Finish'
+      }[data.phase] || data.phase || 'Unknown';
+      const cycle = Number.isInteger(data.cycle) ? ` · cycle ${data.cycle}` : '';
+      addSystem(`[ReAct] ${phaseLabel}${cycle}`);
+      break;
+    }
 
     case 'thinking_start': {
       const panel = document.createElement('div');

@@ -1301,6 +1301,7 @@ fn hard_cap_events_include_terminal_done_message() {
 
     assert_eq!(done_event["type"], "done");
     assert_eq!(done_event["phase"], "hard_cap");
+    assert_eq!(done_event["reason"], "hard_cap");
     assert_eq!(done_event["cycles"], 3);
     assert_eq!(done_event["tool_calls"], 7);
 }

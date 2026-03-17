@@ -21,7 +21,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
 - **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环，`evaluate_finish()` 结构化完成判定，`auto_think_level()` 按循环深度动态调整推理预算
 - **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留
-- **推理可见性控制**：`/react on|off` 开关控制 ReAct 阶段转换 WS 事件（`react_phase`），`done` 事件包含 `reason`（`complete` | `empty`）
+- **推理可见性控制**：`/react on|off` 开关控制 ReAct 阶段转换 WS 事件（`react_phase`），浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
 - **安全控制**：危险命令检测、沙盒路径解析、SSRF 阻断、重定向阻断、输出/文件大小上限
 
 ## Quick Start
@@ -258,7 +258,7 @@ Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的
 
 - **不回退到文本协议**：保留 OpenAI/Anthropic 原生结构化 tool calling，不使用文本版 `Action: tool_name\nAction Input: {...}` 解析
 - **不污染对话历史**：完整思维链仅在 `think` 工具内部或 provider reasoning stream 中存在，不写入主消息序列
-- **推理可见性已实现**：`/react on` 启用 `react_phase` WS 事件，`done` 事件包含结构化 `reason` 字段
+- **推理可见性已实现**：`/react on` 启用 `react_phase` WS 事件，前端会显示阶段切换；`done` 事件始终包含结构化 `reason` 字段
 - **provider 层感知状态**：`auto` 模式下 `auto_think_level()` 根据循环深度动态调整推理预算（首轮 medium / 有 observation 时 high / 深轮 low）
 
 ### Agent Loop 详解

@@ -1014,6 +1014,7 @@ fn build_agent_hard_cap_events(
         json!({
             "type": "done",
             "phase": "hard_cap",
+            "reason": "hard_cap",
             "cycles": cycles,
             "tool_calls": tool_calls,
         }),
@@ -2612,6 +2613,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             "round": round + 1,
                             "avatar": avatar,
                             "phase": react_ctx.phase().label(),
+                            "react_visible": react_ctx.show_react,
                         }),
                     )
                     .await
