@@ -33,6 +33,8 @@
     <span class="session-name" id="session-name">LingClaw</span>
     <span class="session-id" id="session-id"></span>
     <div class="actions">
+      <button id="toggle-tools-btn" onclick="toggleToolsVisibility()" aria-label="Toggle tools visibility">Tools: On</button>
+      <button id="toggle-reasoning-btn" onclick="toggleReasoningVisibility()" aria-label="Toggle reasoning visibility">Reasoning: On</button>
       <button onclick="sendCmd('/status')" aria-label="Show status">Status</button>
       <button onclick="sendCmd('/clear')" aria-label="Clear chat">Clear</button>
       <button onclick="sendCmd('/help')" aria-label="Show help">Help</button>
@@ -58,6 +60,28 @@
     <button id="send" aria-label="Send message"><span id="send-icon">↑</span></button>
   </div>
 </div>
+
+<div class="tool-drawer-backdrop" id="tool-drawer-backdrop" onclick="closeToolDrawer()"></div>
+<aside class="tool-drawer" id="tool-drawer" aria-hidden="true">
+  <div class="tool-drawer-header">
+    <div class="tool-drawer-title-wrap">
+      <span class="tool-drawer-kicker">Tool</span>
+      <h3 class="tool-drawer-title" id="tool-drawer-title">Tool details</h3>
+    </div>
+    <button class="tool-drawer-close" onclick="closeToolDrawer()" aria-label="Close tool drawer">×</button>
+  </div>
+  <div class="tool-drawer-meta" id="tool-drawer-meta"></div>
+  <div class="tool-drawer-content">
+    <section class="tool-drawer-section">
+      <div class="tool-drawer-section-title">Arguments</div>
+      <pre class="tool-drawer-code" id="tool-drawer-args"></pre>
+    </section>
+    <section class="tool-drawer-section" id="tool-drawer-result-section" hidden>
+      <div class="tool-drawer-section-title">Result</div>
+      <pre class="tool-drawer-code" id="tool-drawer-result"></pre>
+    </section>
+  </div>
+</aside>
 
 <script src="app.js"></script>
 </body>

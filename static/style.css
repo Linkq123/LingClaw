@@ -157,6 +157,11 @@ header .actions button:hover {
   color: var(--text);
   background: rgba(45,139,207,.06);
 }
+header .actions button.is-active {
+  border-color: rgba(45,139,207,.4);
+  color: var(--text);
+  background: rgba(45,139,207,.12);
+}
 
 .conn-badge { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--dim); flex-shrink: 0; }
 .conn-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; transition: background .3s, box-shadow .3s; }
@@ -229,7 +234,7 @@ header .actions button:hover {
   animation: msgSlideIn .35s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 .msg-row.user { align-self: flex-end; flex-direction: row-reverse; }
-.msg-row.assistant { align-self: flex-start; }
+.msg-row.assistant { align-self: flex-start; align-items: flex-start; }
 .msg-row.system, .msg-row.error { align-self: flex-start; max-width: 85%; }
 .no-animate .msg-row, .no-animate .tool-panel, .no-animate .reasoning-panel { animation: none !important; }
 
@@ -537,8 +542,14 @@ header .actions button:hover {
   font-size: 13px;
   animation: msgSlideIn .35s cubic-bezier(0.34, 1.56, 0.64, 1);
   flex-shrink: 0;
+  transition: border-color .2s ease, box-shadow .2s ease, transform .2s ease;
 }
 .tool-panel.tool-result { border-left-color: var(--accent-success); }
+.tool-panel.tool-panel-active {
+  border-color: color-mix(in srgb, var(--accent2) 50%, var(--tool-border));
+  box-shadow: 0 10px 24px rgba(45,139,207,.12);
+  transform: translateY(-1px);
+}
 .tool-header {
   padding: 6px 12px;
   background: var(--tool-bg);
@@ -552,21 +563,132 @@ header .actions button:hover {
 .tool-header:hover { background: var(--surface2); }
 .tool-header .tool-icon { color: var(--accent2); }
 .tool-header .tool-name { font-weight: 600; color: var(--text); }
-.tool-header .chevron { margin-left: auto; transition: transform .25s ease; }
-.tool-header .chevron.open { transform: rotate(90deg); }
-.tool-body {
-  max-height: 0;
-  overflow: hidden;
-  padding: 0 12px;
-  background: var(--tool-bg);
-  border-top: 1px solid transparent;
+.tool-open-hint {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--accent2);
+  background: rgba(45,139,207,.08);
+  border: 1px solid rgba(45,139,207,.16);
+  border-radius: 999px;
+  padding: 2px 8px;
+}
+
+.tool-drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(20,24,38,.06);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .22s ease;
+  z-index: 18;
+}
+.tool-drawer-backdrop.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+.tool-drawer {
+  position: fixed;
+  top: 16px;
+  bottom: 16px;
+  right: 16px;
+  width: min(430px, calc(100vw - 32px));
+  background: rgba(255,255,255,.96);
+  border: 1px solid rgba(226,229,238,.92);
+  border-radius: 16px;
+  box-shadow: 0 8px 18px rgba(20,24,38,.06);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  transform: translateX(calc(100% + 24px));
+  transition: transform .28s cubic-bezier(.22,1,.36,1);
+  z-index: 19;
+  display: flex;
+  flex-direction: column;
+}
+.tool-drawer.open {
+  transform: translateX(0);
+}
+.tool-drawer-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px 10px;
+  border-bottom: 1px solid rgba(226,229,238,.6);
+}
+.tool-drawer-title-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.tool-drawer-kicker {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--accent2);
+  opacity: .75;
+}
+.tool-drawer-title {
+  font-size: 15px;
+  line-height: 1.25;
+  font-weight: 600;
+  color: var(--text);
+}
+.tool-drawer-close {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(248,249,252,.72);
+  color: var(--dim);
+  font-size: 18px;
+  cursor: pointer;
+  transition: all .2s ease;
+}
+.tool-drawer-close:hover {
+  color: var(--text);
+  border-color: var(--accent2);
+  transform: rotate(90deg);
+}
+.tool-drawer-meta {
+  padding: 8px 14px 0;
+  font-size: 11px;
+  color: var(--dim);
+}
+.tool-drawer-content {
+  padding: 12px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow-y: auto;
+}
+.tool-drawer-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.tool-drawer-section-title {
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--dim);
+}
+.tool-drawer-code {
+  margin: 0;
+  padding: 14px 16px;
+  background: rgba(246,248,252,.9);
+  border: 1px solid rgba(226,229,238,.88);
+  border-radius: 14px;
   font-family: var(--font-mono);
   font-size: 12px;
+  line-height: 1.7;
   white-space: pre-wrap;
-  color: var(--dim);
-  transition: max-height .3s ease, padding .3s ease, border-color .3s ease;
+  word-break: break-word;
+  color: var(--text);
+  overflow: auto;
 }
-.tool-body.show { max-height: 300px; padding: 8px 12px; overflow-y: auto; border-top-color: var(--tool-border); }
 
 /* ── Copy button ── */
 .copy-btn {
@@ -662,6 +784,12 @@ pre:hover .copy-btn { opacity: 1; }
     max-width: 95%;
     min-width: 0;
   }
+  .tool-drawer {
+    top: 8px;
+    bottom: 8px;
+    right: 8px;
+    width: calc(100vw - 16px);
+  }
 }
 
 /* ── Dark Mode ── */
@@ -699,6 +827,37 @@ pre:hover .copy-btn { opacity: 1; }
     background: linear-gradient(180deg, rgba(38,40,68,.96), rgba(31,33,58,.94));
     border-color: var(--border);
     box-shadow: 0 10px 24px rgba(0,0,0,.22);
+  }
+
+  .tool-open-hint {
+    background: rgba(91,163,230,.14);
+    border-color: rgba(91,163,230,.24);
+    color: var(--accent2);
+  }
+
+  .tool-drawer-backdrop {
+    background: rgba(5,8,18,.16);
+  }
+
+  .tool-drawer {
+    background: rgba(35,37,64,.96);
+    border-color: rgba(58,60,88,.92);
+    box-shadow: 0 10px 22px rgba(0,0,0,.18);
+  }
+
+  .tool-drawer-header {
+    border-bottom-color: rgba(58,60,88,.62);
+  }
+
+  .tool-drawer-close {
+    background: rgba(38,40,68,.66);
+    border-color: var(--border);
+  }
+
+  .tool-drawer-code {
+    background: linear-gradient(180deg, rgba(38,40,68,.96), rgba(31,33,58,.94));
+    border-color: var(--border);
+    color: var(--text);
   }
 
   #input-area {

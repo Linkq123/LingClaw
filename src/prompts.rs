@@ -143,8 +143,8 @@ fn profile_file_has_user_edits(workspace: &Path, file_name: &str) -> bool {
     let Ok(content) = std::fs::read_to_string(workspace.join(file_name)) else {
         return false;
     };
-    let baseline = read_bootstrap_baseline(workspace, file_name)
-        .or_else(|| template_file_content(file_name));
+    let baseline =
+        read_bootstrap_baseline(workspace, file_name).or_else(|| template_file_content(file_name));
     let Some(baseline) = baseline else {
         return false;
     };
@@ -708,15 +708,17 @@ mod tests {
         let baseline_user = "old user template\n";
         fs::write(workspace.join("IDENTITY.md"), baseline_identity)
             .expect("identity file should be written");
-        fs::write(workspace.join("USER.md"), baseline_user)
-            .expect("user file should be written");
+        fs::write(workspace.join("USER.md"), baseline_user).expect("user file should be written");
         fs::write(
             bootstrap_baseline_path(&workspace, "IDENTITY.md"),
             baseline_identity,
         )
         .expect("identity baseline should be written");
-        fs::write(bootstrap_baseline_path(&workspace, "USER.md"), baseline_user)
-            .expect("user baseline should be written");
+        fs::write(
+            bootstrap_baseline_path(&workspace, "USER.md"),
+            baseline_user,
+        )
+        .expect("user baseline should be written");
 
         let snapshot = LocalTimeSnapshot::from_datetime(
             DateTime::parse_from_rfc3339("2026-03-16T00:05:07+08:00")

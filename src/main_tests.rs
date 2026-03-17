@@ -16,6 +16,17 @@ fn test_config() -> Config {
     }
 }
 
+fn test_app_state() -> AppState {
+    AppState {
+        config: test_config(),
+        http: reqwest::Client::new(),
+        sessions: Mutex::new(HashMap::new()),
+        active_connections: Mutex::new(HashSet::new()),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+    }
+}
+
 fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
     Session {
         id: id.to_string(),
@@ -33,6 +44,8 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         model_override: model_override.map(|value| value.to_string()),
         think_level: default_think_level(),
         show_react: false,
+        show_tools: true,
+        show_reasoning: true,
         version: 0,
         workspace: PathBuf::new(),
         avatar: None,
@@ -139,6 +152,8 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
+        show_tools: true,
+        show_reasoning: true,
         version: 0,
         workspace: PathBuf::new(),
         avatar: None,
@@ -960,6 +975,8 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
+        show_tools: true,
+        show_reasoning: true,
         version: 0,
         workspace: workspace.clone(),
         avatar: None,
@@ -1023,6 +1040,8 @@ fn save_session_to_disk_overwrites_existing_file() {
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
+        show_tools: true,
+        show_reasoning: true,
         version: 1,
         workspace: workspace.clone(),
         avatar: None,
@@ -1347,6 +1366,8 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
+        show_tools: true,
+        show_reasoning: true,
         version: 0,
         workspace: PathBuf::new(),
         avatar: None,
@@ -1539,6 +1560,100 @@ fn load_session_from_disk_migrates_show_react_to_true_for_older_sessions() {
         .map(PathBuf::from)
         .expect("session dir should exist");
     let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn load_session_from_disk_migrates_tool_and_reasoning_visibility_to_true_for_older_sessions() {
+    let session_id = format!("view-migrate-{}", now_epoch());
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let payload = json!({
+        "id": session_id,
+        "name": "Test",
+        "messages": [],
+        "created_at": 0,
+        "updated_at": 0,
+        "tool_calls_count": 0,
+        "show_react": true,
+        "version": 2
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&payload).expect("payload should serialize"),
+    )
+    .expect("session file should be written");
+
+    let session = load_session_from_disk(
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("session id should be valid"),
+    )
+    .expect("session should load");
+
+    assert!(session.show_tools);
+    assert!(session.show_reasoning);
+    assert_eq!(session.version, SESSION_VERSION);
+
+    let _ = std::fs::remove_file(&path);
+    let workspace = session_workspace_path(&session.id)
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
+fn handle_command_persists_tool_and_reasoning_visibility_changes() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("persist-view-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let mut session = test_session(&session_id, "Persist View", None);
+    session.workspace = workspace.clone();
+    session.version = SESSION_VERSION;
+
+    let state = test_app_state();
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+
+    let tool_result = rt
+        .block_on(handle_command(
+            "/tool off",
+            &session_id,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+    assert_eq!(tool_result.response_type, "system");
+
+    let reasoning_result = rt
+        .block_on(handle_command(
+            "/reasoning off",
+            &session_id,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+    assert_eq!(reasoning_result.response_type, "system");
+
+    let persisted = load_session_from_disk(&session_id).expect("session should load from disk");
+    assert!(!persisted.show_tools);
+    assert!(!persisted.show_reasoning);
+
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let _ = std::fs::remove_file(path);
+    let session_dir = workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(session_dir);
 }
 
 // ── Phase 4: Tool Protocol + Session Recovery ────────────────────────────────

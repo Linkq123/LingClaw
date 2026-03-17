@@ -8,6 +8,15 @@ const connLabel = document.getElementById('conn-label');
 const sessionNameEl = document.getElementById('session-name');
 const sessionIdEl = document.getElementById('session-id');
 const sessionList = document.getElementById('session-list');
+const toggleToolsBtn = document.getElementById('toggle-tools-btn');
+const toggleReasoningBtn = document.getElementById('toggle-reasoning-btn');
+const toolDrawer = document.getElementById('tool-drawer');
+const toolDrawerBackdrop = document.getElementById('tool-drawer-backdrop');
+const toolDrawerTitle = document.getElementById('tool-drawer-title');
+const toolDrawerMeta = document.getElementById('tool-drawer-meta');
+const toolDrawerArgs = document.getElementById('tool-drawer-args');
+const toolDrawerResult = document.getElementById('tool-drawer-result');
+const toolDrawerResultSection = document.getElementById('tool-drawer-result-section');
 
 let ws = null;
 let currentMsg = null;
@@ -27,6 +36,64 @@ let pendingReasoningText = '';
 let flushHandle = 0;
 let _deferredHistory = [];
 const HISTORY_RENDER_LIMIT = 50;
+let activeToolPanel = null;
+let showTools = true;
+let showReasoning = true;
+
+function updateViewToggleButtons() {
+  if (toggleToolsBtn) {
+    toggleToolsBtn.textContent = `Tools: ${showTools ? 'On' : 'Off'}`;
+    toggleToolsBtn.classList.toggle('is-active', showTools);
+  }
+  if (toggleReasoningBtn) {
+    toggleReasoningBtn.textContent = `Reasoning: ${showReasoning ? 'On' : 'Off'}`;
+    toggleReasoningBtn.classList.toggle('is-active', showReasoning);
+  }
+}
+
+function applyViewState(viewState) {
+  if (!viewState) return;
+
+  if (typeof viewState.show_tools === 'boolean') {
+    showTools = viewState.show_tools;
+    if (!showTools) {
+      closeToolDrawer();
+      activeToolPanel = null;
+      for (const panel of chat.querySelectorAll('.tool-panel')) {
+        panel.remove();
+      }
+    }
+  }
+
+  if (typeof viewState.show_reasoning === 'boolean') {
+    showReasoning = viewState.show_reasoning;
+    if (!showReasoning) {
+      finishReasoningStream();
+      if (reasoningPanel) reasoningPanel.remove();
+      reasoningPanel = null;
+    }
+  }
+
+  updateViewToggleButtons();
+}
+
+function toggleToolsVisibility() {
+  if (!ws || ws.readyState !== 1) return;
+  const nextShowTools = !showTools;
+  applyViewState({ show_tools: nextShowTools });
+  sendCmd(`/tool ${nextShowTools ? 'on' : 'off'}`);
+}
+
+function toggleReasoningVisibility() {
+  if (!ws || ws.readyState !== 1) return;
+  const nextShowReasoning = !showReasoning;
+  applyViewState({ show_reasoning: nextShowReasoning });
+  sendCmd(`/reasoning ${nextShowReasoning ? 'on' : 'off'}`);
+}
+
+function canSendWhileBusy(cmd) {
+  return /^\/(tool|reasoning)\b/i.test(cmd);
+}
 
 function flushAssistantText() {
   if (!currentMsg || !pendingAssistantText) return;
@@ -232,6 +299,7 @@ function connect() {
     connLabel.textContent = 'Offline';
     finishAssistantStream({ discardIfEmpty: true });
     finishReasoningStream();
+    closeToolDrawer();
     clearReactStatus();
     reasoningPanel = null;
     setBusy(false);
@@ -262,6 +330,7 @@ function handleMessage(data) {
       sessionIdEl.textContent = data.id.slice(0, 12);
       sessionStorage.setItem('lingclaw_session', data.id);
       applySessionAvatar(data.avatar || null);
+      applyViewState(data);
       break;
 
     case 'session_switched':
@@ -270,8 +339,10 @@ function handleMessage(data) {
       sessionIdEl.textContent = data.id.slice(0, 12);
       sessionStorage.setItem('lingclaw_session', data.id);
       applySessionAvatar(data.avatar || null);
+      applyViewState(data);
       finishAssistantStream({ discardIfEmpty: true });
       finishReasoningStream();
+      closeToolDrawer();
       clearReactStatus();
       chat.innerHTML = '';
       reasoningPanel = null;
@@ -279,6 +350,10 @@ function handleMessage(data) {
       break;
 
     case 'history': {
+      if (!showTools) {
+        data.messages = (data.messages || []).filter(m => m.role !== 'tool_call' && m.role !== 'tool_result');
+      }
+      closeToolDrawer();
       clearReactStatus();
       chat.innerHTML = '';
       _deferredHistory = [];
@@ -304,6 +379,10 @@ function handleMessage(data) {
       }
       break;
     }
+
+    case 'view_state':
+      applyViewState(data);
+      break;
 
     case 'sessions_list':
       sessions = data.sessions || [];
@@ -347,6 +426,7 @@ function handleMessage(data) {
     }
 
     case 'thinking_start': {
+      if (!showReasoning) break;
       const panel = document.createElement('div');
       panel.className = 'reasoning-panel reasoning-active';
       panel.innerHTML = `
@@ -371,6 +451,7 @@ function handleMessage(data) {
     }
 
     case 'thinking_delta':
+      if (!showReasoning) break;
       if (reasoningPanel) {
         pendingReasoningText += data.content;
         scheduleFlush();
@@ -378,6 +459,11 @@ function handleMessage(data) {
       break;
 
     case 'thinking_done':
+      if (!showReasoning) {
+        finishReasoningStream();
+        reasoningPanel = null;
+        break;
+      }
       if (reasoningPanel) {
         finishReasoningStream();
         reasoningPanel.classList.remove('reasoning-active');
@@ -394,10 +480,12 @@ function handleMessage(data) {
       break;
 
     case 'tool_call':
+      if (!showTools) break;
       addToolCall(data.name, data.arguments, data.id);
       break;
 
     case 'tool_result':
+      if (!showTools) break;
       addToolResult(data.name, data.result, data.id);
       break;
 
@@ -507,15 +595,18 @@ function addToolCall(name, args, id) {
 
   let argsDisplay = args;
   try { argsDisplay = JSON.stringify(JSON.parse(args), null, 2); } catch(e) {}
+  panel.dataset.toolName = name;
+  panel.dataset.toolArgs = argsDisplay;
+  panel.dataset.toolResult = '';
+  panel.dataset.toolHasResult = 'false';
 
   panel.innerHTML = `
-    <div class="tool-header" onclick="toggleTool(this)">
+    <div class="tool-header" onclick="openToolDrawerFromHeader(this)">
       <span class="tool-icon">⚡</span>
       <span class="tool-name">${escHtml(name)}</span>
       <span style="color:var(--dim);font-size:12px">${escHtml(truncateStr(args, 80))}</span>
-      <span class="chevron">▸</span>
+      <span class="tool-open-hint">查看详情</span>
     </div>
-    <div class="tool-body">${escHtml(argsDisplay)}</div>
   `;
   chat.appendChild(panel);
   hideWelcome();
@@ -526,22 +617,31 @@ function addToolResult(name, result, id) {
   const panels = chat.querySelectorAll('.tool-panel');
   for (const p of panels) {
     if (p.dataset.toolId === id) {
-      const body = p.querySelector('.tool-body');
-      body.textContent += '\n─── result ───\n' + result;
+      p.dataset.toolResult = result;
+      p.dataset.toolHasResult = 'true';
+      p.classList.add('tool-panel-ready');
+      if (activeToolPanel === p) {
+        syncToolDrawer(p);
+      }
       return;
     }
   }
   // Fallback: standalone result
   const el = document.createElement('div');
   el.className = 'tool-panel tool-result';
+  el.dataset.toolId = id || '';
+  el.dataset.toolName = name ? `${name} result` : 'Tool result';
+  el.dataset.toolArgs = '';
+  el.dataset.toolResult = result;
+  el.dataset.toolHasResult = 'true';
   el.innerHTML = `
-    <div class="tool-header" onclick="toggleTool(this)">
+    <div class="tool-header" onclick="openToolDrawerFromHeader(this)">
       <span class="tool-icon">📋</span>
       <span class="tool-name">${escHtml(name)} result</span>
-      <span class="chevron">▸</span>
+      <span class="tool-open-hint">查看详情</span>
     </div>
-    <div class="tool-body show">${escHtml(result)}</div>
   `;
+  el.classList.add('tool-panel-ready');
   chat.appendChild(el);
   scrollDown();
 }
@@ -714,6 +814,49 @@ function setBusy(b) {
   sendIcon.innerHTML = b ? '<span class="spinner"></span>' : '↑';
 }
 
+function syncToolDrawer(panel) {
+  if (!panel || !toolDrawer) return;
+  const toolName = panel.dataset.toolName || 'Tool';
+  const toolArgs = panel.dataset.toolArgs || '';
+  const toolResult = panel.dataset.toolResult || '';
+  const hasResult = panel.dataset.toolHasResult === 'true';
+  const statusText = hasResult ? '已返回结果' : '执行中';
+
+  toolDrawerTitle.textContent = toolName;
+  toolDrawerMeta.textContent = statusText;
+  toolDrawerArgs.textContent = toolArgs || '(empty)';
+  toolDrawerResult.textContent = toolResult;
+  toolDrawerResultSection.hidden = !hasResult;
+}
+
+function openToolDrawer(panel) {
+  if (!panel || !toolDrawer || !toolDrawerBackdrop) return;
+  if (activeToolPanel && activeToolPanel !== panel) {
+    activeToolPanel.classList.remove('tool-panel-active');
+  }
+  activeToolPanel = panel;
+  activeToolPanel.classList.add('tool-panel-active');
+  syncToolDrawer(panel);
+  toolDrawer.classList.add('open');
+  toolDrawerBackdrop.classList.add('open');
+  toolDrawer.setAttribute('aria-hidden', 'false');
+}
+
+function openToolDrawerFromHeader(header) {
+  openToolDrawer(header.closest('.tool-panel'));
+}
+
+function closeToolDrawer() {
+  if (!toolDrawer || !toolDrawerBackdrop) return;
+  toolDrawer.classList.remove('open');
+  toolDrawerBackdrop.classList.remove('open');
+  toolDrawer.setAttribute('aria-hidden', 'true');
+  if (activeToolPanel) {
+    activeToolPanel.classList.remove('tool-panel-active');
+    activeToolPanel = null;
+  }
+}
+
 function toggleTool(header) {
   header.querySelector('.chevron').classList.toggle('open');
   header.nextElementSibling.classList.toggle('show');
@@ -763,8 +906,8 @@ function renderHistoryMessage(m) {
       renderMarkdown(el);
       break;
     }
-    case 'tool_call': addToolCall(m.name, m.arguments, m.id); break;
-    case 'tool_result': addToolResult('', m.result, m.id); break;
+    case 'tool_call': if (showTools) addToolCall(m.name, m.arguments, m.id); break;
+    case 'tool_result': if (showTools) addToolResult('', m.result, m.id); break;
   }
 }
 
@@ -802,13 +945,20 @@ function send() {
 }
 
 function sendCmd(cmd) {
-  if (busy || !ws || ws.readyState !== 1) return;
+  if ((!canSendWhileBusy(cmd) && busy) || !ws || ws.readyState !== 1) return;
   setBusy(true);
   ws.send(cmd);
 }
 
+updateViewToggleButtons();
+
 input.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    closeToolDrawer();
+  }
 });
 input.addEventListener('input', () => {
   input.style.height = 'auto';

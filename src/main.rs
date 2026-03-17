@@ -611,7 +611,7 @@ fn gen_session_id() -> String {
     format!("{:x}{:04x}", t.as_secs(), t.subsec_nanos() % 0xFFFF)
 }
 
-const SESSION_VERSION: u32 = 2;
+const SESSION_VERSION: u32 = 3;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {
@@ -627,6 +627,10 @@ struct Session {
     think_level: String,
     #[serde(default = "default_show_react")]
     show_react: bool,
+    #[serde(default = "default_show_tools")]
+    show_tools: bool,
+    #[serde(default = "default_show_reasoning")]
+    show_reasoning: bool,
     #[serde(default)]
     version: u32,
     #[serde(skip)]
@@ -644,9 +648,21 @@ fn default_show_react() -> bool {
     true
 }
 
+fn default_show_tools() -> bool {
+    true
+}
+
+fn default_show_reasoning() -> bool {
+    true
+}
+
 fn migrate_session(session: &mut Session) {
     if session.version < 2 {
         session.show_react = default_show_react();
+    }
+    if session.version < 3 {
+        session.show_tools = default_show_tools();
+        session.show_reasoning = default_show_reasoning();
     }
     session.version = SESSION_VERSION;
 }
@@ -679,6 +695,8 @@ impl Session {
             model_override: None,
             think_level: default_think_level(),
             show_react: default_show_react(),
+            show_tools: default_show_tools(),
+            show_reasoning: default_show_reasoning(),
             version: SESSION_VERSION,
             workspace,
             avatar,
@@ -1387,20 +1405,33 @@ fn build_history_payload(session: &Session) -> serde_json::Value {
                     }
                 }
                 if let Some(tcs) = &msg.tool_calls {
-                    for tc in tcs {
-                        msgs.push(json!({"role":"tool_call","name":tc.function.name,"arguments":tc.function.arguments,"id":tc.id}));
+                    if session.show_tools {
+                        for tc in tcs {
+                            msgs.push(json!({"role":"tool_call","name":tc.function.name,"arguments":tc.function.arguments,"id":tc.id}));
+                        }
                     }
                 }
             }
             "tool" => {
-                if let Some(c) = &msg.content {
-                    msgs.push(json!({"role":"tool_result","result":c,"id":msg.tool_call_id.as_deref().unwrap_or("")}));
+                if session.show_tools {
+                    if let Some(c) = &msg.content {
+                        msgs.push(json!({"role":"tool_result","result":c,"id":msg.tool_call_id.as_deref().unwrap_or("")}));
+                    }
                 }
             }
             _ => {}
         }
     }
     json!({"type":"history","messages":msgs})
+}
+
+fn build_view_state_payload(session: &Session) -> serde_json::Value {
+    json!({
+        "type": "view_state",
+        "show_tools": session.show_tools,
+        "show_reasoning": session.show_reasoning,
+        "show_react": session.show_react,
+    })
 }
 
 // ── Admin Helpers (Main Session) ─────────────────────────────────────────────
@@ -1474,12 +1505,16 @@ fn build_session_status(session: &Session, config: &Config) -> String {
          max_tokens: {model_max_tokens}\n\
          context_est: {estimated_tokens}/{ctx_limit}\n\
          think: {}\n\
-         react: {}",
+         react: {}\n\
+         tools: {}\n\
+         reasoning: {}",
         resolved.provider.label(),
         resolved.api_base,
         resolved.model_id,
         session.think_level,
         if session.show_react { "on" } else { "off" },
+        if session.show_tools { "on" } else { "off" },
+        if session.show_reasoning { "on" } else { "off" },
     )
 }
 
@@ -1670,6 +1705,35 @@ async fn handle_command(
     let parts: Vec<&str> = input.splitn(2, ' ').collect();
     let cmd = parts[0];
     let arg = parts.get(1).map(|s| s.trim()).unwrap_or("");
+
+    async fn persist_session_toggle<F>(
+        state: &AppState,
+        current_session_id: &str,
+        update: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(&mut Session),
+    {
+        let (previous_session, session_to_save) = {
+            let mut sessions = state.sessions.lock().await;
+            let session = sessions
+                .get_mut(current_session_id)
+                .ok_or_else(|| "Session not found".to_string())?;
+            let previous = session.clone();
+            update(session);
+            (previous, session.clone())
+        };
+
+        if let Err(err) = save_session_to_disk(&session_to_save).await {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(current_session_id) {
+                *session = previous_session;
+            }
+            return Err(err);
+        }
+
+        Ok(())
+    }
 
     match cmd {
         "/new" => {
@@ -2210,6 +2274,118 @@ async fn handle_command(
             }
         }
 
+        "/tool" => {
+            if arg.is_empty() {
+                let sessions = state.sessions.lock().await;
+                let on = sessions
+                    .get(current_session_id)
+                    .map(|s| s.show_tools)
+                    .unwrap_or_else(default_show_tools);
+                return Some(CommandResult {
+                    response: format!(
+                        "tool: {}\nUsage: /tool <on|off>",
+                        if on { "on" } else { "off" }
+                    ),
+                    response_type: "system",
+                    new_session_id: None,
+                    sessions_changed: false,
+                });
+            }
+            let val = arg.to_lowercase();
+            let on = match val.as_str() {
+                "on" | "true" | "1" => true,
+                "off" | "false" | "0" => false,
+                _ => {
+                    return Some(CommandResult {
+                        response: format!("Invalid value: {arg}\nUsage: /tool <on|off>"),
+                        response_type: "system",
+                        new_session_id: None,
+                        sessions_changed: false,
+                    });
+                }
+            };
+            match persist_session_toggle(state, current_session_id, |session| {
+                session.show_tools = on;
+            })
+            .await
+            {
+                Ok(()) => Some(CommandResult {
+                    response: format!("Tool visibility: {}", if on { "on" } else { "off" }),
+                    response_type: "system",
+                    new_session_id: None,
+                    sessions_changed: false,
+                }),
+                Err(err) if err == "Session not found" => Some(CommandResult {
+                    response: err,
+                    response_type: "system",
+                    new_session_id: None,
+                    sessions_changed: false,
+                }),
+                Err(err) => Some(CommandResult {
+                    response: format!("Failed to persist tool visibility: {err}"),
+                    response_type: "error",
+                    new_session_id: None,
+                    sessions_changed: false,
+                }),
+            }
+        }
+
+        "/reasoning" => {
+            if arg.is_empty() {
+                let sessions = state.sessions.lock().await;
+                let on = sessions
+                    .get(current_session_id)
+                    .map(|s| s.show_reasoning)
+                    .unwrap_or_else(default_show_reasoning);
+                return Some(CommandResult {
+                    response: format!(
+                        "reasoning: {}\nUsage: /reasoning <on|off>",
+                        if on { "on" } else { "off" }
+                    ),
+                    response_type: "system",
+                    new_session_id: None,
+                    sessions_changed: false,
+                });
+            }
+            let val = arg.to_lowercase();
+            let on = match val.as_str() {
+                "on" | "true" | "1" => true,
+                "off" | "false" | "0" => false,
+                _ => {
+                    return Some(CommandResult {
+                        response: format!("Invalid value: {arg}\nUsage: /reasoning <on|off>"),
+                        response_type: "system",
+                        new_session_id: None,
+                        sessions_changed: false,
+                    });
+                }
+            };
+            match persist_session_toggle(state, current_session_id, |session| {
+                session.show_reasoning = on;
+            })
+            .await
+            {
+                Ok(()) => Some(CommandResult {
+                    response: format!("Reasoning visibility: {}", if on { "on" } else { "off" }),
+                    response_type: "system",
+                    new_session_id: None,
+                    sessions_changed: false,
+                }),
+                Err(err) if err == "Session not found" => Some(CommandResult {
+                    response: err,
+                    response_type: "system",
+                    new_session_id: None,
+                    sessions_changed: false,
+                }),
+                Err(err) => Some(CommandResult {
+                    response: format!("Failed to persist reasoning visibility: {err}"),
+                    response_type: "error",
+                    new_session_id: None,
+                    sessions_changed: false,
+                }),
+            }
+        }
+
         "/help" => {
             let mut help = "\
 Commands:
@@ -2218,6 +2394,8 @@ Commands:
   /model [name]    Show or switch model
   /think [level]   Set thinking mode (auto|off|minimal|low|medium|high|xhigh)
   /react [on|off]  Toggle ReAct phase visibility
+  /tool [on|off]   Toggle tool card visibility
+  /reasoning [on|off] Toggle reasoning visibility
   /skills          List available skills
   /rename <name>   Rename current session
   /clear           Clear messages (keep system prompt)
@@ -2382,17 +2560,23 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
     if let Some(id) = claimed {
         current_session_id = id.clone();
-        let (name, avatar, history) = {
+        let (name, avatar, history, view_state) = {
             let sessions = state.sessions.lock().await;
             // Safe: try_claim_session just inserted this id while holding the lock.
             // Use if-let to satisfy no-unwrap rule, though the None branch is unreachable.
             if let Some(s) = sessions.get(&id) {
-                (s.name.clone(), s.avatar.clone(), build_history_payload(s))
+                (
+                    s.name.clone(),
+                    s.avatar.clone(),
+                    build_history_payload(s),
+                    build_view_state_payload(s),
+                )
             } else {
                 (
                     "New Chat".into(),
                     None,
                     json!({"type":"history","messages":[]}),
+                    json!({"type":"view_state","show_tools":true,"show_reasoning":true,"show_react":true}),
                 )
             }
         };
@@ -2401,6 +2585,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             &json!({"type":"session","id":&id,"name":&name,"avatar":avatar}),
         )
         .await;
+        ws_send(&tx, &view_state).await;
         ws_send(&tx, &history).await;
     } else {
         let mut session = Session::new();
@@ -2424,6 +2609,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             &json!({"type":"session","id":&current_session_id,"name":"New Chat","avatar":avatar}),
         )
         .await;
+        if let Some(view_state) = {
+            let sessions = state.sessions.lock().await;
+            sessions
+                .get(&current_session_id)
+                .map(build_view_state_payload)
+        } {
+            ws_send(&tx, &view_state).await;
+        }
     }
 
     send_sessions_list(&tx, &state, &current_session_id).await;
@@ -2479,6 +2672,25 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                 break;
             }
             if let Some(result) = cmd_result {
+                let refresh_view_state = {
+                    let sessions = state.sessions.lock().await;
+                    sessions.get(&current_session_id).map(|session| {
+                        let view_state = build_view_state_payload(session);
+                        let history = if trimmed.starts_with("/tool") {
+                            Some(build_history_payload(session))
+                        } else {
+                            None
+                        };
+                        (view_state, history)
+                    })
+                };
+                if let Some((view_state, history)) = refresh_view_state {
+                    ws_send(&tx, &view_state).await;
+                    if let Some(history_payload) = history {
+                        ws_send(&tx, &history_payload).await;
+                    }
+                }
+
                 ws_send(
                     &tx,
                     &json!({"type":result.response_type,"content":result.response}),
@@ -2496,14 +2708,27 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         let mut active_id = current_session_ref.lock().await;
                         *active_id = current_session_id.clone();
                     }
-                    let (name, avatar) = {
+                    let (name, avatar, view_state) = {
                         let sessions = state.sessions.lock().await;
                         sessions
                             .get(&current_session_id)
-                            .map(|s| (s.name.clone(), s.avatar.clone()))
-                            .unwrap_or_else(|| ("New Chat".into(), None))
+                            .map(|s| {
+                                (
+                                    s.name.clone(),
+                                    s.avatar.clone(),
+                                    build_view_state_payload(s),
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                (
+                                    "New Chat".into(),
+                                    None,
+                                    json!({"type":"view_state","show_tools":true,"show_reasoning":true,"show_react":true}),
+                                )
+                            })
                     };
                     ws_send(&tx, &json!({"type":"session_switched","id":&new_id,"name":&name,"avatar":avatar})).await;
+                    ws_send(&tx, &view_state).await;
                     let history = {
                         let sessions = state.sessions.lock().await;
                         sessions.get(&current_session_id).map(build_history_payload)
