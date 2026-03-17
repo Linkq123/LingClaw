@@ -1001,6 +1001,133 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
 }
 
 #[test]
+fn save_session_to_disk_overwrites_existing_file() {
+    let session_id = format!("overwrite-save-{}", now_epoch());
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let workspace = session_workspace_path(&session_id);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+
+    let first = Session {
+        id: session_id.clone(),
+        name: "First".into(),
+        messages: vec![ChatMessage {
+            role: "system".into(),
+            content: Some("first".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        }],
+        created_at: 1,
+        updated_at: 1,
+        tool_calls_count: 0,
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: false,
+        version: 1,
+        workspace: workspace.clone(),
+        avatar: None,
+    };
+    runtime
+        .block_on(save_session_to_disk(&first))
+        .expect("first save should succeed");
+
+    let second = Session {
+        name: "Second".into(),
+        updated_at: 2,
+        ..first.clone()
+    };
+    runtime
+        .block_on(save_session_to_disk(&second))
+        .expect("second save should overwrite existing file");
+
+    let data = std::fs::read_to_string(&path).expect("session file should be readable");
+    let payload: serde_json::Value =
+        serde_json::from_str(&data).expect("session file should contain valid json");
+    assert_eq!(payload["name"], "Second");
+    assert_eq!(payload["updated_at"], 2);
+
+    let _ = std::fs::remove_file(&path);
+    let session_dir = workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn load_session_from_disk_trims_incomplete_tool_transaction() {
+    let session_id = format!("trim-load-{}", now_epoch());
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let payload = json!({
+        "id": session_id,
+        "name": "TrimLoad",
+        "messages": [
+            {
+                "role": "system",
+                "content": "system"
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "exec",
+                            "arguments": "{\"command\":\"echo hi\"}"
+                        }
+                    },
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {
+                            "name": "exec",
+                            "arguments": "{\"command\":\"echo bye\"}"
+                        }
+                    }
+                ]
+            },
+            {
+                "role": "tool",
+                "content": "hi",
+                "tool_call_id": "call_1"
+            },
+            {
+                "role": "user",
+                "content": "after"
+            }
+        ],
+        "created_at": 1,
+        "updated_at": 1,
+        "tool_calls_count": 1,
+        "version": 1
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&payload).expect("payload should serialize"),
+    )
+    .expect("session file should be written");
+
+    let session = load_session_from_disk(
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("session id should be valid"),
+    )
+    .expect("session should load");
+
+    assert_eq!(session.messages.len(), 1);
+    assert_eq!(session.messages[0].role, "system");
+
+    let _ = std::fs::remove_file(&path);
+    let workspace = session_workspace_path(&session.id)
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(workspace);
+}
+
+#[test]
 fn resolve_path_clamps_parent_escape_attempts() {
     let base = std::env::temp_dir().join(format!("lingclaw-resolve-{}", now_epoch()));
     std::fs::create_dir_all(&base).expect("temp dir should be created");
@@ -1433,6 +1560,31 @@ fn tool_outcome_error_detection_by_convention() {
     ));
     assert!(!outcome.is_error);
     assert!(outcome.duration_ms < 1000); // should be near-instant
+}
+
+#[test]
+fn tool_outcome_does_not_treat_raw_tool_output_as_failure() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let workspace = std::env::temp_dir().join(format!("lingclaw-tool-output-{}", now_epoch()));
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    std::fs::write(
+        workspace.join("notes.txt"),
+        "search output: exec error: command not found",
+    )
+    .expect("file should be written");
+
+    let outcome = rt.block_on(tools::execute_tool(
+        "read_file",
+        r#"{"path":"notes.txt"}"#,
+        &test_config(),
+        &reqwest::Client::new(),
+        &workspace,
+    ));
+
+    assert!(!outcome.is_error);
+    assert!(outcome.output.contains("exec error: command not found"));
+
+    let _ = std::fs::remove_dir_all(&workspace);
 }
 
 #[test]

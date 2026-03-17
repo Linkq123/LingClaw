@@ -458,7 +458,7 @@ pub(crate) async fn execute_tool(
 
     let output = (spec.handler)(&args, config, http, workspace).await;
     let duration_ms = start.elapsed().as_millis() as u64;
-    let is_error = is_tool_error_output(&output);
+    let is_error = is_tool_error_output(name, &output);
 
     ToolOutcome {
         output,
@@ -468,10 +468,12 @@ pub(crate) async fn execute_tool(
 }
 
 /// Check if tool output looks like an error by convention.
-/// Tool functions return strings beginning with "Error: " or containing
-/// " error: " when something goes wrong.
-fn is_tool_error_output(output: &str) -> bool {
-    output.starts_with("Error: ") || output.contains(" error: ")
+/// Tool functions report failures using either a generic `Error: ...` prefix
+/// or a tool-specific `<tool_name> error: ...` prefix. We intentionally avoid
+/// substring matching so raw file/log output is not misclassified as a tool
+/// failure.
+pub(crate) fn is_tool_error_output(tool_name: &str, output: &str) -> bool {
+    output.starts_with("Error: ") || output.starts_with(&format!("{tool_name} error: "))
 }
 
 /// Validate required parameters against the tool's JSON schema.

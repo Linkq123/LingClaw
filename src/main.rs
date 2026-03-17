@@ -1158,10 +1158,22 @@ async fn save_session_to_disk(session: &Session) -> Result<(), String> {
     let mut session = session.clone();
     sanitize_session_messages(&mut session.messages);
     let data = serde_json::to_string_pretty(&session).map_err(|e| e.to_string())?;
-    // Atomic save: write to temp file then rename to prevent corruption on crash
+    // Write through a temp file first. On Unix rename is atomic; on Windows we
+    // must remove the old target before renaming because overwrite is rejected.
     tokio::fs::write(&tmp_path, data)
         .await
         .map_err(|e| e.to_string())?;
+
+    #[cfg(windows)]
+    if tokio::fs::try_exists(&path)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        tokio::fs::remove_file(&path)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
     tokio::fs::rename(&tmp_path, &path)
         .await
         .map_err(|e| e.to_string())
@@ -1180,7 +1192,10 @@ fn trim_incomplete_tool_calls(messages: &mut Vec<ChatMessage>) {
     let ast_idx = messages.iter().rposition(|m| {
         m.role == "assistant" && m.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
     });
-    let Some(idx) = ast_idx else { return };
+    let Some(idx) = ast_idx else {
+        sanitize_session_messages(messages);
+        return;
+    };
     let expected = messages[idx]
         .tool_calls
         .as_ref()
@@ -1206,7 +1221,7 @@ fn load_session_from_disk(id: &str) -> Option<Session> {
     let path = sessions_dir().join(format!("{id}.json"));
     let data = std::fs::read_to_string(&path).ok()?;
     let mut session: Session = serde_json::from_str(&data).ok()?;
-    sanitize_session_messages(&mut session.messages);
+    trim_incomplete_tool_calls(&mut session.messages);
     session.workspace = session_workspace_path(&session.id);
     std::fs::create_dir_all(&session.workspace).ok();
     prompts::ensure_session_workspace(&session.workspace);
@@ -2763,8 +2778,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             )
                             .await;
                             let duration_ms = start.elapsed().as_millis() as u64;
-                            let is_error =
-                                output.starts_with("Error: ") || output.contains(" error: ");
+                            let is_error = tools::is_tool_error_output(&tc.function.name, &output);
                             tools::ToolOutcome {
                                 output,
                                 is_error,
