@@ -611,6 +611,8 @@ fn gen_session_id() -> String {
     format!("{:x}{:04x}", t.as_secs(), t.subsec_nanos() % 0xFFFF)
 }
 
+const SESSION_VERSION: u32 = 1;
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {
     id: String,
@@ -625,6 +627,8 @@ struct Session {
     think_level: String,
     #[serde(default)]
     show_react: bool,
+    #[serde(default)]
+    version: u32,
     #[serde(skip)]
     workspace: PathBuf,
     /// Avatar from IDENTITY.md (transient, not persisted)
@@ -664,6 +668,7 @@ impl Session {
             model_override: None,
             think_level: default_think_level(),
             show_react: false,
+            version: SESSION_VERSION,
             workspace,
             avatar,
         }
@@ -1053,7 +1058,7 @@ async fn execute_tool(
     config: &Config,
     http: &Client,
     workspace: &Path,
-) -> String {
+) -> tools::ToolOutcome {
     tools::execute_tool(name, args_str, config, http, workspace).await
 }
 
@@ -1149,10 +1154,15 @@ fn sessions_dir() -> PathBuf {
 
 async fn save_session_to_disk(session: &Session) -> Result<(), String> {
     let path = sessions_dir().join(format!("{}.json", session.id));
+    let tmp_path = sessions_dir().join(format!("{}.json.tmp", session.id));
     let mut session = session.clone();
     sanitize_session_messages(&mut session.messages);
     let data = serde_json::to_string_pretty(&session).map_err(|e| e.to_string())?;
-    tokio::fs::write(&path, data)
+    // Atomic save: write to temp file then rename to prevent corruption on crash
+    tokio::fs::write(&tmp_path, data)
+        .await
+        .map_err(|e| e.to_string())?;
+    tokio::fs::rename(&tmp_path, &path)
         .await
         .map_err(|e| e.to_string())
 }
@@ -2553,7 +2563,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
                     let had_observation_hint = last_observation_hint.is_some();
 
-                    let (msgs_snapshot, model, workspace, think_level, prev_avatar) = {
+                    let (msgs_snapshot, model, workspace, think_level, prev_avatar, pruned_count) = {
                         let mut sessions = state.sessions.lock().await;
                         let session = match sessions.get_mut(&current_session_id) {
                             Some(s) => s,
@@ -2579,10 +2589,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                                 *first = fresh_system;
                             }
                         }
+                        let msg_count_before = session.messages.len();
                         prune_messages(
                             &mut session.messages,
                             state.config.context_limit_for_model(&model_str),
                         );
+                        let pruned = msg_count_before - session.messages.len();
                         let prev_avatar = session.avatar.clone();
                         (
                             session.messages.clone(),
@@ -2590,8 +2602,21 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             session.workspace.clone(),
                             session.think_level.clone(),
                             prev_avatar,
+                            pruned,
                         )
                     };
+
+                    // Notify frontend when context was pruned
+                    if pruned_count > 0 {
+                        ws_send(
+                            &tx,
+                            &json!({
+                                "type": "context_pruned",
+                                "messages_removed": pruned_count,
+                            }),
+                        )
+                        .await;
+                    }
 
                     // Stash per-cycle state for Act phase
                     cycle_workspace = workspace.clone();
@@ -2730,8 +2755,21 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         }
 
                         let result = if cycle_is_main && is_admin_tool(&tc.function.name) {
-                            execute_admin_tool(&tc.function.name, &tc.function.arguments, &state)
-                                .await
+                            let start = std::time::Instant::now();
+                            let output = execute_admin_tool(
+                                &tc.function.name,
+                                &tc.function.arguments,
+                                &state,
+                            )
+                            .await;
+                            let duration_ms = start.elapsed().as_millis() as u64;
+                            let is_error =
+                                output.starts_with("Error: ") || output.contains(" error: ");
+                            tools::ToolOutcome {
+                                output,
+                                is_error,
+                                duration_ms,
+                            }
                         } else {
                             tokio::select! {
                                 biased;
@@ -2758,7 +2796,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                                 "type":"tool_result",
                                 "id": tc.id,
                                 "name": tc.function.name,
-                                "result": result,
+                                "result": result.output,
+                                "duration_ms": result.duration_ms,
+                                "is_error": result.is_error,
                             }),
                         )
                         .await
@@ -2770,7 +2810,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         collected_results.push(agent::ToolResultEntry {
                             id: tc.id.clone(),
                             name: tc.function.name.clone(),
-                            result: result.clone(),
+                            duration_ms: result.duration_ms,
+                            is_error: result.is_error,
+                            result: result.output.clone(),
                         });
 
                         {
@@ -2778,7 +2820,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             if let Some(session) = sessions.get_mut(&current_session_id) {
                                 session.messages.push(ChatMessage {
                                     role: "tool".into(),
-                                    content: Some(result),
+                                    content: Some(result.output),
                                     tool_calls: None,
                                     tool_call_id: Some(tc.id.clone()),
                                     timestamp: Some(now_epoch()),

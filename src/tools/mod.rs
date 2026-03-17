@@ -5,9 +5,17 @@ pub(crate) mod net;
 use reqwest::Client;
 use serde_json::json;
 use std::path::Path;
+use std::time::Instant;
 use std::{future::Future, pin::Pin};
 
 use crate::Config;
+
+/// Structured tool execution result with metadata.
+pub(crate) struct ToolOutcome {
+    pub output: String,
+    pub is_error: bool,
+    pub duration_ms: u64,
+}
 
 type ToolFuture<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
 type ToolHandler =
@@ -417,11 +425,72 @@ pub(crate) async fn execute_tool(
     config: &Config,
     http: &Client,
     workspace: &Path,
-) -> String {
-    let args: serde_json::Value = serde_json::from_str(args_str).unwrap_or_default();
-    if let Some(spec) = tool_specs().iter().find(|spec| spec.name == name) {
-        (spec.handler)(&args, config, http, workspace).await
-    } else {
-        format!("Unknown tool: {name}")
+) -> ToolOutcome {
+    let start = Instant::now();
+
+    let args: serde_json::Value = match serde_json::from_str(args_str) {
+        Ok(v) => v,
+        Err(e) => {
+            return ToolOutcome {
+                output: format!("{name} error: invalid arguments JSON: {e}"),
+                is_error: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    let Some(spec) = tool_specs().iter().find(|s| s.name == name) else {
+        return ToolOutcome {
+            output: format!("Unknown tool: {name}"),
+            is_error: true,
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
+    };
+
+    // Pre-validate required parameters against JSON schema
+    if let Some(err) = validate_required_params(name, &args, &(spec.parameters)()) {
+        return ToolOutcome {
+            output: err,
+            is_error: true,
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
     }
+
+    let output = (spec.handler)(&args, config, http, workspace).await;
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let is_error = is_tool_error_output(&output);
+
+    ToolOutcome {
+        output,
+        is_error,
+        duration_ms,
+    }
+}
+
+/// Check if tool output looks like an error by convention.
+/// Tool functions return strings beginning with "Error: " or containing
+/// " error: " when something goes wrong.
+fn is_tool_error_output(output: &str) -> bool {
+    output.starts_with("Error: ") || output.contains(" error: ")
+}
+
+/// Validate required parameters against the tool's JSON schema.
+/// Returns `Some(error_message)` when a required param is missing.
+fn validate_required_params(
+    tool_name: &str,
+    args: &serde_json::Value,
+    schema: &serde_json::Value,
+) -> Option<String> {
+    let required = schema.get("required")?.as_array()?;
+    let obj = args.as_object();
+    for req in required {
+        let key = req.as_str()?;
+        let present = obj.is_some_and(|o| o.get(key).is_some_and(|v| !v.is_null()));
+        if !present {
+            return Some(format!(
+                "{tool_name} error: missing required parameter '{key}'"
+            ));
+        }
+    }
+    None
 }

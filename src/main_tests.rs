@@ -33,6 +33,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         model_override: model_override.map(|value| value.to_string()),
         think_level: default_think_level(),
         show_react: false,
+        version: 0,
         workspace: PathBuf::new(),
         avatar: None,
     }
@@ -138,6 +139,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
+        version: 0,
         workspace: PathBuf::new(),
         avatar: None,
     };
@@ -958,6 +960,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
+        version: 0,
         workspace: workspace.clone(),
         avatar: None,
     };
@@ -1217,6 +1220,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
+        version: 0,
         workspace: PathBuf::new(),
         avatar: None,
     };
@@ -1239,11 +1243,15 @@ fn observation_summaries_are_independent_of_session_messages() {
             id: "c1".into(),
             name: "exec".into(),
             result: "short".into(),
+            duration_ms: 0,
+            is_error: false,
         },
         agent::ToolResultEntry {
             id: "c2".into(),
             name: "read_file".into(),
             result: "z\n".repeat(3000),
+            duration_ms: 0,
+            is_error: false,
         },
     ];
 
@@ -1366,4 +1374,144 @@ fn show_react_field_defaults_to_false_in_deserialized_session() {
     }"#;
     let session: Session = serde_json::from_str(json_str).unwrap();
     assert!(!session.show_react);
+}
+
+// ── Phase 4: Tool Protocol + Session Recovery ────────────────────────────────
+
+#[test]
+fn session_version_defaults_to_zero_for_old_sessions() {
+    let json_str = r#"{
+        "id": "legacy",
+        "name": "Legacy",
+        "messages": [],
+        "created_at": 0,
+        "updated_at": 0,
+        "tool_calls_count": 0
+    }"#;
+    let session: Session = serde_json::from_str(json_str).unwrap();
+    assert_eq!(session.version, 0);
+}
+
+#[test]
+fn session_version_is_preserved_in_serialization() {
+    let json_str = r#"{
+        "id": "v1",
+        "name": "V1",
+        "messages": [],
+        "created_at": 0,
+        "updated_at": 0,
+        "tool_calls_count": 0,
+        "version": 1
+    }"#;
+    let session: Session = serde_json::from_str(json_str).unwrap();
+    assert_eq!(session.version, 1);
+    let serialized = serde_json::to_string(&session).unwrap();
+    assert!(serialized.contains(r#""version":1"#) || serialized.contains(r#""version": 1"#));
+}
+
+#[test]
+fn tool_outcome_error_detection_by_convention() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    // Unknown tool → is_error
+    let outcome = rt.block_on(tools::execute_tool(
+        "nonexistent",
+        "{}",
+        &test_config(),
+        &reqwest::Client::new(),
+        std::path::Path::new("."),
+    ));
+    assert!(outcome.is_error);
+
+    // think tool is never an error
+    let outcome = rt.block_on(tools::execute_tool(
+        "think",
+        r#"{"thought":"test"}"#,
+        &test_config(),
+        &reqwest::Client::new(),
+        std::path::Path::new("."),
+    ));
+    assert!(!outcome.is_error);
+    assert!(outcome.duration_ms < 1000); // should be near-instant
+}
+
+#[test]
+fn tool_outcome_parameter_validation() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // write_file requires both path and content
+    let outcome = rt.block_on(tools::execute_tool(
+        "write_file",
+        r#"{}"#,
+        &test_config(),
+        &reqwest::Client::new(),
+        std::path::Path::new("."),
+    ));
+    assert!(outcome.is_error);
+    assert!(outcome.output.contains("missing required parameter"));
+}
+
+#[test]
+fn observation_summary_includes_error_tools() {
+    let results = vec![
+        agent::ToolResultEntry {
+            id: "ok".into(),
+            name: "read_file".into(),
+            result: "short ok".into(),
+            duration_ms: 5,
+            is_error: false,
+        },
+        agent::ToolResultEntry {
+            id: "err".into(),
+            name: "exec".into(),
+            result: "exec error: command not found".into(),
+            duration_ms: 10,
+            is_error: true,
+        },
+    ];
+    let summaries = agent::summarize_observations(&results);
+    // Short OK result should NOT be included; error result should be
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0].tool_name, "exec");
+    assert!(summaries[0].hint.contains("FAILED"));
+}
+
+#[test]
+fn prune_messages_tracks_removal_count() {
+    let mut messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("sys".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("a".repeat(200_000)),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("b".repeat(200_000)),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("latest".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    ];
+    let before = messages.len();
+    prune_messages(&mut messages, 1000); // very small limit → must prune
+    let pruned = before - messages.len();
+    assert!(pruned > 0, "should have removed at least one turn");
+    // System + latest user should remain
+    assert_eq!(messages[0].role, "system");
+    assert!(messages.last().unwrap().content.as_deref() == Some("latest"));
 }

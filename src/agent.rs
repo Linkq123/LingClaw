@@ -151,6 +151,8 @@ pub(crate) struct ToolResultEntry {
     pub id: String,
     pub name: String,
     pub result: String,
+    pub duration_ms: u64,
+    pub is_error: bool,
 }
 
 /// Non-destructive summary of a large tool result.
@@ -168,18 +170,25 @@ pub(crate) struct ObservationSummary {
 pub(crate) fn summarize_observations(results: &[ToolResultEntry]) -> Vec<ObservationSummary> {
     results
         .iter()
-        .filter(|r| r.result.len() > OBSERVATION_SUMMARY_THRESHOLD)
+        .filter(|r| r.result.len() > OBSERVATION_SUMMARY_THRESHOLD || r.is_error)
         .map(|r| {
             let line_count = r.result.lines().count();
             let byte_size = r.result.len();
+            let status = if r.is_error { "FAILED" } else { "ok" };
             ObservationSummary {
                 tool_call_id: r.id.clone(),
                 tool_name: r.name.clone(),
                 byte_size,
                 line_count,
                 hint: format!(
-                    "{} returned {line_count} lines / {byte_size} bytes — focus on key findings",
-                    r.name
+                    "{} [{status}, {}ms] returned {line_count} lines / {byte_size} bytes{}",
+                    r.name,
+                    r.duration_ms,
+                    if r.is_error {
+                        " — error occurred, review output"
+                    } else {
+                        " — focus on key findings"
+                    },
                 ),
             }
         })
@@ -401,6 +410,8 @@ mod tests {
             id: "c1".into(),
             name: "exec".into(),
             result: "short output".into(),
+            duration_ms: 0,
+            is_error: false,
         }];
         assert!(summarize_observations(&results).is_empty());
     }
@@ -413,11 +424,15 @@ mod tests {
                 id: "c1".into(),
                 name: "read_file".into(),
                 result: big.clone(),
+                duration_ms: 0,
+                is_error: false,
             },
             ToolResultEntry {
                 id: "c2".into(),
                 name: "exec".into(),
                 result: "ok".into(),
+                duration_ms: 0,
+                is_error: false,
             },
         ];
         let summaries = summarize_observations(&results);
