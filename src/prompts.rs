@@ -141,15 +141,6 @@ fn identity_profile_is_complete(workspace: &Path) -> bool {
     };
 
     has_required_field(&content, &["Name:", "**Name:**", "名称：", "名称:"])
-        && has_required_field(
-            &content,
-            &["Creature:", "**Creature:**", "生物类型：", "生物类型:"],
-        )
-        && has_required_field(&content, &["Vibe:", "**Vibe:**", "气质：", "气质:"])
-        && has_required_field(
-            &content,
-            &["Emoji:", "**Emoji:**", "表情符号：", "表情符号:"],
-        )
 }
 
 fn user_profile_is_complete(workspace: &Path) -> bool {
@@ -158,16 +149,6 @@ fn user_profile_is_complete(workspace: &Path) -> bool {
     };
 
     has_required_field(&content, &["Name:", "**Name:**", "姓名：", "姓名:"])
-        && has_required_field(
-            &content,
-            &[
-                "What to call them:",
-                "**What to call them:**",
-                "称呼方式：",
-                "称呼方式:",
-            ],
-        )
-        && has_required_field(&content, &["Timezone:", "**Timezone:**", "时区：", "时区:"])
 }
 
 fn has_required_field(content: &str, field_prefixes: &[&str]) -> bool {
@@ -516,12 +497,12 @@ mod tests {
         fs::write(workspace.join("AGENTS.md"), "agent").expect("agent file should be written");
         fs::write(
             workspace.join("IDENTITY.md"),
-            "- Name: Ling\n- Creature: assistant\n- Vibe: calm\n- Emoji: ✨\n- Avatar: none\n",
+            "- Name: Ling\n- Creature:\n- Vibe:\n- Emoji:\n- Avatar: none\n",
         )
         .expect("identity file should be written");
         fs::write(
             workspace.join("USER.md"),
-            "- **Name:** Alex\n- **What to call them:** Alex\n- **Timezone:** Asia/Shanghai\n",
+            "- **Name:** Alex\n- **What to call them:**\n- **Timezone:**\n",
         )
         .expect("user file should be written");
         fs::write(workspace.join("SOUL.md"), "soul").expect("soul file should be written");
@@ -556,7 +537,7 @@ mod tests {
         .expect("identity file should be written");
         fs::write(
             workspace.join("USER.md"),
-            "- **Name:** Alex\n- **What to call them:** Alex\n",
+            "- **Name:**\n- **What to call them:** Alex\n",
         )
         .expect("user file should be written");
 
@@ -582,12 +563,12 @@ mod tests {
         fs::write(workspace.join("AGENTS.md"), "agent").expect("agent file should be written");
         fs::write(
             workspace.join("IDENTITY.md"),
-            "- 名称：灵爪\n- 生物类型：AI 助手\n- 气质：冷静\n- 表情符号：✨\n- 头像：none\n",
+            "- 名称：灵爪\n- 生物类型：\n- 气质：\n- 表情符号：\n- 头像：none\n",
         )
         .expect("identity file should be written");
         fs::write(
             workspace.join("USER.md"),
-            "- 姓名：小李\n- 称呼方式：小李\n- 时区：Asia/Shanghai\n",
+            "- 姓名：小李\n- 称呼方式：\n- 时区：\n",
         )
         .expect("user file should be written");
 
