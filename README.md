@@ -329,7 +329,7 @@ static/
 ├── app.js                      — 前端逻辑
 └── style.css                   — 样式
 
-docs/reference/templates/       — 7 个提示模板文件 (BOOTSTRAP/AGENT/IDENTITY/SOUL/USER/TOOLS/MEMORY.md)
+docs/reference/templates/       — 7 个提示模板文件 (BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/TOOLS/MEMORY.md)
 ```
 
 ### 核心数据结构
@@ -448,7 +448,7 @@ think_level 映射：
 │   ├── main.json           — 主会话存档
 │   └── {uuid}.json         — 子会话存档
 ├── main/workspace/         — 主会话工作区
-│   ├── AGENT.md            — 核心代理行为
+│   ├── AGENTS.md           — 核心代理行为
 │   ├── IDENTITY.md         — 身份/头像
 │   ├── SOUL.md             — 高层推理规则
 │   ├── USER.md             — 用户特定行为
@@ -463,8 +463,8 @@ think_level 映射：
 
 | 模式 | 条件 | 加载文件 |
 |---|---|---|
-| **Bootstrap** | `BOOTSTRAP.md` 存在 | `BOOTSTRAP.md + AGENT.md` |
-| **Normal** | `BOOTSTRAP.md` 不存在 | `AGENT.md + IDENTITY.md + USER.md + SOUL.md`，然后加载 `MEMORY.md` + 今日/昨日记忆 |
+| **Bootstrap** | `BOOTSTRAP.md` 存在 | `BOOTSTRAP.md + AGENTS.md` |
+| **Normal** | `BOOTSTRAP.md` 不存在 | `AGENTS.md + IDENTITY.md + USER.md + SOUL.md`，然后加载当前 session 的 `MEMORY.md` + 今日/昨日记忆 |
 
 关键不变式：
 - `/new` 只压缩对话 + 写入记忆 + 清空上下文，不重建 session
@@ -522,7 +522,7 @@ think_level 映射：
 | 文件 | 用途 |
 |---|---|
 | `BOOTSTRAP.md` | 新会话的初始引导指令 |
-| `AGENT.md` | 核心代理行为 |
+| `AGENTS.md` | 核心代理行为 |
 | `IDENTITY.md` | 身份/人格/头像来源 |
 | `SOUL.md` | 高层推理规则 |
 | `USER.md` | 用户特定行为指导 |

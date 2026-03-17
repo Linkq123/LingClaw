@@ -290,7 +290,7 @@ volumes:
 lingclaw                        # 二进制
 static/
   index.html                    # WebChat 前端
-docs/reference/templates/       # 7 个 Prompt 模板（BOOTSTRAP/AGENT/IDENTITY/SOUL/USER/TOOLS/MEMORY.md）
+docs/reference/templates/       # 7 个 Prompt 模板（BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/TOOLS/MEMORY.md）
 ~/.lingclaw/
   .lingclaw.json                # 配置文件（Setup Wizard 自动创建）
   sessions/                     # 磁盘持久化的会话 JSON

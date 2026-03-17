@@ -36,8 +36,8 @@ const TEMPLATE_FILES: &[(&str, &str)] = &[
         include_str!("../docs/reference/templates/BOOTSTRAP.md"),
     ),
     (
-        "AGENT.md",
-        include_str!("../docs/reference/templates/AGENT.md"),
+        "AGENTS.md",
+        include_str!("../docs/reference/templates/AGENTS.md"),
     ),
     (
         "IDENTITY.md",
@@ -61,6 +61,9 @@ const TEMPLATE_FILES: &[(&str, &str)] = &[
     ),
 ];
 
+const PRIMARY_AGENT_FILE: &str = "AGENTS.md";
+const LEGACY_AGENT_FILE: &str = "AGENT.md";
+
 fn write_missing_templates(workspace: &Path, include_bootstrap: bool) {
     let tpl_dir = templates_dir(); // None is fine — we have embedded fallback
 
@@ -80,6 +83,35 @@ fn write_missing_templates(workspace: &Path, include_bootstrap: bool) {
             eprintln!("WARNING: failed to write {}: {e}", dest.display());
         }
     }
+}
+
+fn migrate_legacy_agent_file(workspace: &Path) {
+    let target = workspace.join(PRIMARY_AGENT_FILE);
+    if target.exists() {
+        return;
+    }
+
+    let legacy = workspace.join(LEGACY_AGENT_FILE);
+    if !legacy.exists() {
+        return;
+    }
+
+    if let Err(e) = std::fs::rename(&legacy, &target) {
+        eprintln!(
+            "WARNING: failed to migrate {} to {}: {e}",
+            legacy.display(),
+            target.display()
+        );
+    }
+}
+
+fn read_agent_prompt(workspace: &Path) -> Option<(&'static str, String)> {
+    for name in [PRIMARY_AGENT_FILE, LEGACY_AGENT_FILE] {
+        if let Some(content) = read_nonempty(workspace.join(name)) {
+            return Some((name, content));
+        }
+    }
+    None
 }
 
 /// Locate the templates directory on disk (prefer disk over embedded).
@@ -117,6 +149,7 @@ pub(crate) fn init_session_prompt_files(workspace: &Path) {
         );
     }
 
+    migrate_legacy_agent_file(workspace);
     write_missing_templates(workspace, true);
 }
 
@@ -132,6 +165,7 @@ pub(crate) fn ensure_session_workspace(workspace: &Path) {
         );
     }
 
+    migrate_legacy_agent_file(workspace);
     write_missing_templates(workspace, false);
 }
 
@@ -144,15 +178,19 @@ pub(crate) fn load_session_prompt_files_with_snapshot(
     if let Some(bs_content) = bootstrap {
         // Bootstrap mode: first-run identity setup
         let mut parts = vec![format!("<!-- BOOTSTRAP.md -->\n{bs_content}")];
-        if let Some(agent) = read_nonempty(workspace.join("AGENT.md")) {
-            parts.push(format!("<!-- AGENT.md -->\n{agent}"));
+        if let Some((name, agent)) = read_agent_prompt(workspace) {
+            parts.push(format!("<!-- {name} -->\n{agent}"));
         }
         return parts.join("\n\n---\n\n");
     }
 
     // Normal mode: full persona
     let mut parts = Vec::new();
-    for name in &["AGENT.md", "IDENTITY.md", "USER.md", "SOUL.md"] {
+    if let Some((name, content)) = read_agent_prompt(workspace) {
+        parts.push(format!("<!-- {name} -->\n{content}"));
+    }
+
+    for name in &["IDENTITY.md", "USER.md", "SOUL.md"] {
         if let Some(content) = read_nonempty(workspace.join(name)) {
             parts.push(format!("<!-- {name} -->\n{content}"));
         }
@@ -175,17 +213,25 @@ pub(crate) fn load_session_prompt_files_with_snapshot(
 }
 
 /// Parse the IDENTITY.md file in the workspace and extract the avatar value.
-/// Looks for a line matching `- 头像：<value>` or `- 头像: <value>`.
+/// Looks for a line matching `- 头像：<value>`, `- 头像: <value>`,
+/// `- Avatar: <value>`, or `- **Avatar:** <value>`.
 /// Returns None if the file doesn't exist, is empty, or the avatar is set to
 /// an explicit unset marker such as `none`.
 pub(crate) fn parse_identity_avatar(workspace: &Path) -> Option<String> {
     let content = read_nonempty(workspace.join("IDENTITY.md"))?;
     for line in content.lines() {
         let line = line.trim().trim_start_matches('-').trim();
-        // Must be exactly "头像：<value>" or "头像: <value>" (colon required immediately)
-        let rest = if let Some(r) = line.strip_prefix("头像：") {
+        let rest = if let Some(r) = line.strip_prefix("**Avatar:**") {
+            r
+        } else if let Some(r) = line.strip_prefix("**Avatar：**") {
+            r
+        } else if let Some(r) = line.strip_prefix("头像：") {
             r
         } else if let Some(r) = line.strip_prefix("头像:") {
+            r
+        } else if let Some(r) = line.strip_prefix("Avatar:") {
+            r
+        } else if let Some(r) = line.strip_prefix("Avatar：") {
             r
         } else {
             continue;
@@ -350,7 +396,7 @@ mod tests {
         let workspace = std::env::temp_dir().join("lingclaw-prompt-snapshot-test");
         let _ = fs::remove_dir_all(&workspace);
         fs::create_dir_all(workspace.join("memory")).expect("memory dir should be created");
-        fs::write(workspace.join("AGENT.md"), "agent").expect("agent file should be written");
+        fs::write(workspace.join("AGENTS.md"), "agent").expect("agent file should be written");
         fs::write(workspace.join("IDENTITY.md"), "identity")
             .expect("identity file should be written");
         fs::write(workspace.join("USER.md"), "user").expect("user file should be written");
@@ -368,6 +414,58 @@ mod tests {
 
         assert!(loaded.contains("<!-- memory/2026-03-16.md -->\ntoday memory"));
         assert!(loaded.contains("<!-- memory/2026-03-15.md -->\nyesterday memory"));
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn ensure_session_workspace_migrates_legacy_agent_file() {
+        let workspace = std::env::temp_dir().join("lingclaw-agent-rename-test");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::write(workspace.join("AGENT.md"), "legacy agent")
+            .expect("legacy agent should be written");
+
+        ensure_session_workspace(&workspace);
+
+        assert!(!workspace.join("AGENT.md").exists());
+        assert_eq!(
+            fs::read_to_string(workspace.join("AGENTS.md"))
+                .expect("renamed agent should be readable"),
+            "legacy agent"
+        );
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn parse_identity_avatar_supports_english_avatar_key() {
+        let workspace = std::env::temp_dir().join("lingclaw-avatar-english-key-test");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::write(workspace.join("IDENTITY.md"), "- Avatar: ✨\n")
+            .expect("identity file should be written");
+
+        let avatar = parse_identity_avatar(&workspace);
+
+        assert_eq!(avatar.as_deref(), Some("✨"));
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn parse_identity_avatar_supports_bold_avatar_key() {
+        let workspace = std::env::temp_dir().join("lingclaw-avatar-bold-key-test");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::write(workspace.join("IDENTITY.md"), "- **Avatar:** avatar.png\n")
+            .expect("identity file should be written");
+        fs::write(workspace.join("avatar.png"), "not a real png but present")
+            .expect("avatar file should be written");
+
+        let avatar = parse_identity_avatar(&workspace);
+
+        assert!(avatar.is_some());
 
         let _ = fs::remove_dir_all(&workspace);
     }

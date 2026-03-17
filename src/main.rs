@@ -716,7 +716,7 @@ fn build_system_prompt(
     let persona = prompts::load_session_prompt_files_with_snapshot(workspace, local_snapshot);
     let prompt_file_note = "## Preloaded Prompt Files\n\
 These prompt-file contents were already loaded into this system prompt from the session workspace.\n\
-Do not call file tools just to verify or re-read BOOTSTRAP.md, AGENT.md, IDENTITY.md, USER.md, SOUL.md, or MEMORY.md when their content is already present below.\n\
+Do not call file tools just to verify or re-read BOOTSTRAP.md, AGENTS.md, AGENT.md, IDENTITY.md, USER.md, SOUL.md, or MEMORY.md when their content is already present below.\n\
 Only read those files if the user explicitly asks to inspect them, if you need to edit them, or if a task depends on checking whether the on-disk file has changed.";
 
     let admin_section = if is_main {
