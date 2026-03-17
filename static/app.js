@@ -605,7 +605,6 @@ function addToolCall(name, args, id) {
       <span class="tool-icon">⚡</span>
       <span class="tool-name">${escHtml(name)}</span>
       <span style="color:var(--dim);font-size:12px">${escHtml(truncateStr(args, 80))}</span>
-      <span class="tool-open-hint">查看详情</span>
     </div>
   `;
   chat.appendChild(panel);
@@ -638,7 +637,6 @@ function addToolResult(name, result, id) {
     <div class="tool-header" onclick="openToolDrawerFromHeader(this)">
       <span class="tool-icon">📋</span>
       <span class="tool-name">${escHtml(name)} result</span>
-      <span class="tool-open-hint">查看详情</span>
     </div>
   `;
   el.classList.add('tool-panel-ready');
