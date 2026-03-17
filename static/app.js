@@ -15,6 +15,9 @@ let busy = false;
 let currentSessionId = '';
 let sessions = [];
 let reasoningPanel = null;
+let reactStatusRow = null;
+let reactStatusPhase = '';
+let reactStatusCycle = null;
 let sessionAvatar = null;
 let reconnectDelay = 1000;
 let reconnectAttempts = 0;
@@ -139,6 +142,65 @@ function finishReasoningStream() {
   scrollDown();
 }
 
+function reactPhaseLabel(phase) {
+  return {
+    analyze: 'Analyze',
+    act: 'Act',
+    observe: 'Observe'
+  }[phase] || phase || 'Analyze';
+}
+
+function renderReactStatus() {
+  if (!reactStatusRow) return;
+  const card = reactStatusRow.querySelector('.react-status-card');
+  const phase = reactStatusRow.querySelector('.react-status-phase');
+  const cycle = reactStatusRow.querySelector('.react-status-cycle');
+  if (!card || !phase || !cycle) return;
+  card.dataset.phase = reactStatusPhase || 'analyze';
+  phase.textContent = reactPhaseLabel(reactStatusPhase);
+  cycle.textContent = Number.isInteger(reactStatusCycle) ? `cycle ${reactStatusCycle}` : '';
+}
+
+function clearReactStatus() {
+  reactStatusPhase = '';
+  reactStatusCycle = null;
+  if (reactStatusRow) {
+    reactStatusRow.remove();
+    reactStatusRow = null;
+  }
+}
+
+function showReactStatus(phase, cycle = null) {
+  if (!phase || phase === 'finish') {
+    clearReactStatus();
+    return;
+  }
+
+  if (!reactStatusRow) {
+    reactStatusRow = document.createElement('div');
+    reactStatusRow.className = 'msg-row system react-status-row';
+    reactStatusRow.innerHTML = `
+      <div class="system-card system-inline react-status-card">
+        <span class="react-status-tag">ReAct</span>
+        <span class="react-status-phase"></span>
+        <span class="react-status-cycle"></span>
+        <span class="react-status-dots" aria-hidden="true">
+          <span></span>
+          <span></span>
+          <span></span>
+        </span>
+      </div>
+    `;
+    chat.appendChild(reactStatusRow);
+    hideWelcome();
+  }
+
+  reactStatusPhase = phase;
+  reactStatusCycle = Number.isInteger(cycle) ? cycle : null;
+  renderReactStatus();
+  scrollDown();
+}
+
 // ── Markdown setup ──
 marked.setOptions({
   highlight: (code, lang) => {
@@ -170,6 +232,7 @@ function connect() {
     connLabel.textContent = 'Offline';
     finishAssistantStream({ discardIfEmpty: true });
     finishReasoningStream();
+    clearReactStatus();
     reasoningPanel = null;
     setBusy(false);
     if (reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
@@ -209,12 +272,14 @@ function handleMessage(data) {
       applySessionAvatar(data.avatar || null);
       finishAssistantStream({ discardIfEmpty: true });
       finishReasoningStream();
+      clearReactStatus();
       chat.innerHTML = '';
       reasoningPanel = null;
       setBusy(false);
       break;
 
     case 'history': {
+      clearReactStatus();
       chat.innerHTML = '';
       _deferredHistory = [];
       const msgs = data.messages || [];
@@ -254,15 +319,10 @@ function handleMessage(data) {
     case 'start':
       if (data.avatar !== undefined) applySessionAvatar(data.avatar || null);
       finishAssistantStream({ discardIfEmpty: true });
+      clearReactStatus();
       beginAssistantStream();
       if (data.react_visible && data.phase) {
-        const phaseLabel = {
-          analyze: 'Analyze',
-          act: 'Act',
-          observe: 'Observe',
-          finish: 'Finish'
-        }[data.phase] || data.phase;
-        addSystem(`[ReAct] ${phaseLabel}`);
+        showReactStatus(data.phase, data.cycle);
       }
       break;
 
@@ -276,19 +336,13 @@ function handleMessage(data) {
     case 'done':
       finishAssistantStream({ discardIfEmpty: true });
       finishReasoningStream();
+      clearReactStatus();
       reasoningPanel = null;
       setBusy(false);
       break;
 
     case 'react_phase': {
-      const phaseLabel = {
-        analyze: 'Analyze',
-        act: 'Act',
-        observe: 'Observe',
-        finish: 'Finish'
-      }[data.phase] || data.phase || 'Unknown';
-      const cycle = Number.isInteger(data.cycle) ? ` · cycle ${data.cycle}` : '';
-      addSystem(`[ReAct] ${phaseLabel}${cycle}`);
+      showReactStatus(data.phase, data.cycle);
       break;
     }
 
@@ -352,11 +406,13 @@ function handleMessage(data) {
       break;
 
     case 'success':
+      clearReactStatus();
       addSystem(data.content, 'success');
       setBusy(false);
       break;
 
     case 'system':
+      clearReactStatus();
       addSystem(data.content);
       setBusy(false);
       break;
@@ -364,6 +420,7 @@ function handleMessage(data) {
     case 'error':
       finishAssistantStream({ discardIfEmpty: true });
       finishReasoningStream();
+      clearReactStatus();
       addError(data.content);
       reasoningPanel = null;
       setBusy(false);

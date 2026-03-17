@@ -73,6 +73,19 @@ git clone <repo-url> LingClaw
 cd LingClaw
 cargo build --release
 ```
+如果安装报错error: failed to run custom build command for `openssl-sys v0.9.112`
+- Ubuntu / Debian / Kali Linux
+```bash
+sudo apt-get update
+sudo apt-get install libssl-dev pkg-config
+```
+- CentOS / RHEL / Fedora / AlmaLinux
+```bash
+# CentOS/RHEL/AlmaLinux
+sudo yum install openssl-devel pkgconfig
+# Fedora
+sudo dnf install openssl-devel pkgconfig
+```
 
 产物位于 `target/release/lingclaw`。
 
@@ -128,6 +141,7 @@ WantedBy=multi-user.target
 
 ```bash
 # 部署
+sudo mkdir -p /opt/lingclaw
 sudo cp target/release/lingclaw /opt/lingclaw/
 sudo cp -r static /opt/lingclaw/
 sudo useradd -r -s /bin/false lingclaw
@@ -175,6 +189,7 @@ FROM rust:1.85-slim AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
 COPY src/ src/
+COPY docs/reference/templates/ docs/reference/templates/
 RUN cargo build --release --locked 2>/dev/null || cargo build --release
 
 # ── 运行阶段 ──
@@ -185,7 +200,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/lingclaw /usr/local/bin/
 COPY static/ /app/static/
-COPY docs/reference/templates/ /app/docs/reference/templates/
 
 WORKDIR /app
 EXPOSE 3000
@@ -194,7 +208,7 @@ ENV LINGCLAW_PORT=3000
 ENTRYPOINT ["lingclaw", "--serve"]
 ```
 
-> Docker 场景下可通过挂载 `~/.lingclaw/.lingclaw.json` 配置文件，也可通过 `-e` 传入环境变量作为覆盖。
+> Docker 场景下可通过挂载 `~/.lingclaw/.lingclaw.json` 配置文件，也可通过 `-e` 传入环境变量作为覆盖。Prompt 模板已在编译期内嵌，运行时不要求容器内存在 `docs/reference/templates/`；只有你想覆盖内嵌模板时才需要额外挂载该目录。
 
 ### 3.2 构建镜像
 
@@ -296,6 +310,11 @@ docs/reference/templates/       # 7 个 Prompt 模板（BOOTSTRAP/AGENTS/IDENTIT
   sessions/                     # 磁盘持久化的会话 JSON
   {sessionId}/workspace/        # 每会话隔离工作区（含 7 个 prompt 文件 + memory/ 日志）
 ```
+
+其中 `docs/reference/templates/` 是可选的磁盘覆盖目录：
+
+- 编译时：必须存在，二进制会把这些模板内嵌进去。
+- 运行时：不是必需目录；若存在，则优先使用磁盘上的模板内容。
 
 ## 验证部署
 

@@ -38,6 +38,10 @@ body {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
+@keyframes reactDotBounce {
+  0%, 80%, 100% { transform: translateY(0); opacity: .45; }
+  40% { transform: translateY(-3px); opacity: 1; }
+}
 
 /* ── Sidebar ── */
 .sidebar {
@@ -306,6 +310,70 @@ header .actions button:hover {
 .system-card.error-card { border-left-color: var(--accent-error); }
 .system-card.success-card { border-left-color: var(--accent-success); }
 .system-icon { font-size: 14px; flex-shrink: 0; }
+.react-status-row {
+  align-self: flex-start;
+  max-width: fit-content;
+}
+.react-status-card {
+  --react-phase-color: var(--accent2);
+  color: var(--text);
+  min-width: 240px;
+  gap: 8px;
+  padding: 7px 12px;
+  border-left: 0;
+  border-radius: 999px;
+  background: linear-gradient(135deg, rgba(255,255,255,.95), rgba(248,250,255,.88));
+  border-color: color-mix(in srgb, var(--react-phase-color) 28%, var(--border));
+  box-shadow: 0 8px 20px rgba(44,46,62,.05), inset 0 1px 0 rgba(255,255,255,.7);
+}
+.react-status-card[data-phase="analyze"] {
+  --react-phase-color: var(--accent2);
+}
+.react-status-card[data-phase="act"] {
+  --react-phase-color: var(--accent-warn);
+}
+.react-status-card[data-phase="observe"] {
+  --react-phase-color: var(--accent-success);
+}
+.react-status-tag {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--react-phase-color);
+  background: color-mix(in srgb, var(--react-phase-color) 12%, transparent);
+  border: 1px solid color-mix(in srgb, var(--react-phase-color) 20%, transparent);
+  border-radius: 999px;
+  padding: 2px 7px;
+}
+.react-status-phase {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+}
+.react-status-cycle {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--dim);
+}
+.react-status-dots {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 4px;
+  margin-left: 2px;
+  height: 12px;
+}
+.react-status-dots span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--react-phase-color);
+  display: inline-block;
+  animation: reactDotBounce .8s ease-in-out infinite;
+}
+.react-status-dots span:nth-child(2) { animation-delay: .12s; }
+.react-status-dots span:nth-child(3) { animation-delay: .24s; }
 .system-header {
   display: flex;
   align-items: center;
@@ -351,8 +419,9 @@ header .actions button:hover {
 /* ── Reasoning panel ── */
 .reasoning-panel {
   align-self: flex-start;
-  width: 85%;
-  max-width: 85%;
+  width: 42%;
+  max-width: 42%;
+  min-width: 320px;
   border: 1px solid var(--border);
   border-left: 3px solid var(--accent-warn);
   border-radius: 8px;
@@ -419,8 +488,9 @@ header .actions button:hover {
 /* ── Tool panels ── */
 .tool-panel {
   align-self: flex-start;
-  width: 85%;
-  max-width: 85%;
+  width: 42%;
+  max-width: 42%;
+  min-width: 320px;
   border: 1px solid var(--tool-border);
   border-left: 3px solid var(--accent2);
   border-radius: 8px;
@@ -548,6 +618,12 @@ pre:hover .copy-btn { opacity: 1; }
   .sidebar { position: absolute; z-index: 10; height: 100vh; }
   .sidebar.collapsed { margin-left: calc(-1 * var(--sidebar-w)); opacity: 0; pointer-events: none; }
   .msg-row { max-width: 95%; }
+  .reasoning-panel,
+  .tool-panel {
+    width: 95%;
+    max-width: 95%;
+    min-width: 0;
+  }
 }
 
 /* ── Dark Mode ── */

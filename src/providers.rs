@@ -295,6 +295,28 @@ fn think_level_to_budget(level: &str) -> u64 {
     }
 }
 
+fn buffered_reasoning_events(reasoning: &str) -> Vec<serde_json::Value> {
+    if reasoning.is_empty() {
+        return Vec::new();
+    }
+
+    vec![
+        json!({"type":"thinking_start"}),
+        json!({"type":"thinking_delta","content":reasoning}),
+        json!({"type":"thinking_done"}),
+    ]
+}
+
+async fn flush_reasoning_buffer(tx: &WsTx, reasoning_buf: &mut String) -> bool {
+    let reasoning = std::mem::take(reasoning_buf);
+    for event in buffered_reasoning_events(&reasoning) {
+        if !ws_send(tx, &event).await {
+            return false;
+        }
+    }
+    true
+}
+
 pub(crate) async fn call_llm_stream(
     http: &Client,
     resolved: &ResolvedModel,
@@ -376,9 +398,9 @@ async fn call_llm_stream_openai(
 
     let mut stream = resp.bytes_stream();
     let mut content_buf = String::new();
+    let mut reasoning_buf = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut partial_buf = String::new();
-    let mut in_thinking = false;
     let mut client_gone = false;
 
     while let Some(chunk) = stream.next().await {
@@ -405,25 +427,11 @@ async fn call_llm_stream_openai(
                 if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
                     if let Some(choices) = chunk.choices {
                         for choice in choices {
-                            // Thinking/reasoning delta (OpenAI/Qwen)
+                            // Buffer the whole round's reasoning and emit one
+                            // consolidated panel after the stream finishes.
                             if let Some(think_text) = &choice.delta.reasoning_content {
                                 if !think_text.is_empty() {
-                                    if !in_thinking {
-                                        in_thinking = true;
-                                        if !ws_send(tx, &json!({"type":"thinking_start"})).await {
-                                            client_gone = true;
-                                            break;
-                                        }
-                                    }
-                                    if !ws_send(
-                                        tx,
-                                        &json!({"type":"thinking_delta","content":think_text}),
-                                    )
-                                    .await
-                                    {
-                                        client_gone = true;
-                                        break;
-                                    }
+                                    reasoning_buf.push_str(think_text);
                                 }
                             }
                             if client_gone {
@@ -431,10 +439,6 @@ async fn call_llm_stream_openai(
                             }
                             // Content delta
                             if let Some(text) = &choice.delta.content {
-                                if in_thinking {
-                                    in_thinking = false;
-                                    let _ = ws_send(tx, &json!({"type":"thinking_done"})).await;
-                                }
                                 content_buf.push_str(text);
                                 if !ws_send(tx, &json!({"type":"delta","content":text})).await {
                                     client_gone = true;
@@ -483,10 +487,8 @@ async fn call_llm_stream_openai(
         return Err("Client disconnected".into());
     }
 
-    // Ensure thinking_done is sent if the stream ended while still in thinking
-    // (e.g. reasoning → tool_calls with no content delta)
-    if in_thinking {
-        ws_send(tx, &json!({"type":"thinking_done"})).await;
+    if !flush_reasoning_buffer(tx, &mut reasoning_buf).await {
+        return Err("Client disconnected".into());
     }
 
     build_llm_response(content_buf, tool_calls)
@@ -548,13 +550,11 @@ async fn call_llm_stream_anthropic(
 
     let mut stream = resp.bytes_stream();
     let mut content_buf = String::new();
+    let mut reasoning_buf = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut partial_buf = String::new();
     // Track current content block index → tool_calls index mapping
     let mut block_tool_idx: HashMap<usize, usize> = HashMap::new();
-    let mut thinking_block_indices: std::collections::HashSet<usize> =
-        std::collections::HashSet::new();
-    let mut in_thinking = false;
     let mut client_gone = false;
 
     while let Some(chunk) = stream.next().await {
@@ -585,18 +585,7 @@ async fn call_llm_stream_anthropic(
                         if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
                             if let Some(block) = &evt.content_block {
                                 match block.block_type.as_str() {
-                                    "thinking" => {
-                                        if let Some(block_idx) = evt.index {
-                                            thinking_block_indices.insert(block_idx);
-                                        }
-                                        if !in_thinking {
-                                            in_thinking = true;
-                                            if !ws_send(tx, &json!({"type":"thinking_start"})).await
-                                            {
-                                                client_gone = true;
-                                            }
-                                        }
-                                    }
+                                    "thinking" => {}
                                     "tool_use" => {
                                         let idx = tool_calls.len();
                                         tool_calls.push(ToolCall {
@@ -611,13 +600,7 @@ async fn call_llm_stream_anthropic(
                                             block_tool_idx.insert(block_idx, idx);
                                         }
                                     }
-                                    _ => {
-                                        // text or other block: end thinking if active
-                                        if in_thinking {
-                                            in_thinking = false;
-                                            ws_send(tx, &json!({"type":"thinking_done"})).await;
-                                        }
-                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -628,22 +611,10 @@ async fn call_llm_stream_anthropic(
                                 match delta.delta_type.as_deref() {
                                     Some("thinking_delta") => {
                                         if let Some(text) = &delta.thinking {
-                                            if !ws_send(
-                                                tx,
-                                                &json!({"type":"thinking_delta","content":text}),
-                                            )
-                                            .await
-                                            {
-                                                client_gone = true;
-                                            }
+                                            reasoning_buf.push_str(text);
                                         }
                                     }
                                     Some("text_delta") => {
-                                        if in_thinking {
-                                            in_thinking = false;
-                                            let _ =
-                                                ws_send(tx, &json!({"type":"thinking_done"})).await;
-                                        }
                                         if let Some(text) = &delta.text {
                                             content_buf.push_str(text);
                                             if !ws_send(tx, &json!({"type":"delta","content":text}))
@@ -674,17 +645,7 @@ async fn call_llm_stream_anthropic(
                             }
                         }
                     }
-                    "content_block_stop" => {
-                        // If a thinking block just stopped, send thinking_done
-                        if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
-                            if let Some(block_idx) = evt.index {
-                                if thinking_block_indices.remove(&block_idx) && in_thinking {
-                                    in_thinking = false;
-                                    let _ = ws_send(tx, &json!({"type":"thinking_done"})).await;
-                                }
-                            }
-                        }
-                    }
+                    "content_block_stop" => {}
                     "message_stop" => {
                         // End of message
                     }
@@ -700,8 +661,8 @@ async fn call_llm_stream_anthropic(
         return Err("Client disconnected".into());
     }
 
-    if in_thinking {
-        ws_send(tx, &json!({"type":"thinking_done"})).await;
+    if !flush_reasoning_buffer(tx, &mut reasoning_buf).await {
+        return Err("Client disconnected".into());
     }
 
     build_llm_response(content_buf, tool_calls)
@@ -938,5 +899,20 @@ mod tests {
         .unwrap();
         assert_eq!(resp.message.content.as_deref(), Some("thinking..."));
         assert_eq!(resp.message.tool_calls.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn buffered_reasoning_events_empty() {
+        assert!(buffered_reasoning_events("").is_empty());
+    }
+
+    #[test]
+    fn buffered_reasoning_events_emit_single_panel_sequence() {
+        let events = buffered_reasoning_events("comment_repo 的头几行");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["type"], "thinking_start");
+        assert_eq!(events[1]["type"], "thinking_delta");
+        assert_eq!(events[1]["content"], "comment_repo 的头几行");
+        assert_eq!(events[2]["type"], "thinking_done");
     }
 }
