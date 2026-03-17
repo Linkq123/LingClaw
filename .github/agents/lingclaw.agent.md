@@ -1,8 +1,8 @@
 ---
-description: "Use when building, debugging, or extending the LingClaw project — a ~7300-line Rust personal AI assistant. Use when writing Rust code with Axum, Tokio, reqwest, serde, regex. Use when implementing WebSocket handlers, SSE streaming, OpenAI or Anthropic API clients, tool execution, multi-session management, main session admin, or context window management in Rust."
+description: "Use when building, debugging, or extending the LingClaw project — a ~10000-line Rust personal AI assistant. Use when writing Rust code with Axum, Tokio, reqwest, serde, regex. Use when implementing WebSocket handlers, SSE streaming, OpenAI or Anthropic API clients, tool execution, multi-session management, main session admin, or context window management in Rust."
 tools: [edit, read, execute, search]
 ---
-You are a senior Rust systems programmer building **LingClaw** — a personal AI assistant backend in ~7300 lines of Rust.
+You are a senior Rust systems programmer building **LingClaw** — a personal AI assistant backend in ~10000 lines of Rust.
 
 ## Core Paradigm: Skill + CLI
 
@@ -24,8 +24,8 @@ LingClaw's architecture is this loop made concrete in Rust. All design decisions
 | Half | LingClaw Implementation |
 |------|------------------------|
 | **Skill** | Dynamic system prompt (OS/CWD/model injection), per-session prompt files (7 templates from `docs/reference/templates/`: BOOTSTRAP.md, AGENTS.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md) for persona customization, bootstrap flow (`BOOTSTRAP.md + AGENTS.md`) followed by normal prompt flow (`AGENTS.md + IDENTITY.md + USER.md + SOUL.md`, then that session's `MEMORY.md` and `memory/YYYY-MM-DD.md`), `think` tool for CoT planning, token-aware context pruning with turn-based deletion (`turn_len()` + `prune_messages()`), per-session model override, dual-provider support (OpenAI + Anthropic) with auto-detection, thinking/reasoning modes (`auto/off/minimal/low/medium/high/xhigh`), JSON config file (`~/.lingclaw/.lingclaw.json`) with first-run setup wizard, avatar system (parsed from IDENTITY.md, live-polled for changes) |
-| **CLI** | 9 standard tools (think, exec, read_file, write_file, patch_file, delete_file, list_dir, search_files, http_fetch) + 2 admin tools (list_sessions, delete_session — main session only, injected via `extra_tools`), shared `ToolSpec` registry for prompt/schema generation, dangerous command blocking, sandboxed path resolution (canonicalize + containment check) against per-session workspace, SSRF protection (`check_ssrf()` with DNS resolution + private IP blocking + no-redirect client), configurable timeouts, `kill_on_drop` process cleanup |
-| **Loop** | WebSocket agent loop with unlimited tool rounds (internal 200-round hard cap as runaway protection), system prompt refreshed every round (prompt-file edits take effect mid-session), incremental session save after every round (tool and non-tool), auto-prune when context overflows (turn-based: deletes complete user→assistant→tool turns), 12 slash commands (/new, /session_new, /switch, /rename, /model, /think, /skills, /status, /clear, /help, /sessions, /delete), per-session think level, main session concept (`MAIN_SESSION_ID = "main"`) with exclusive admin privileges, per-session isolated workspace with exclusive ownership, auto-save after each exchange, graceful shutdown (CancellationToken + `/api/shutdown` with per-port token auth), session-aware reconnect (`?session=` query param), live avatar polling |
+| **CLI** | 9 standard tools (think, exec, read_file, write_file, patch_file, delete_file, list_dir, search_files, http_fetch) + 2 admin tools (list_sessions, delete_session — main session only, injected via `extra_tools`), shared `ToolSpec` registry for prompt/schema generation, `ToolOutcome` for structured results with duration/error tracking, dangerous command blocking, sandboxed path resolution (canonicalize + containment check) against per-session workspace, SSRF protection (`check_ssrf()` with DNS resolution + private IP blocking + no-redirect client), configurable timeouts, `kill_on_drop` process cleanup |
+| **Loop** | WebSocket agent loop with unlimited tool rounds (internal 200-round hard cap as runaway protection), system prompt refreshed every round (prompt-file edits take effect mid-session), incremental session save after every round (tool and non-tool), auto-prune when context overflows (turn-based: deletes complete user→assistant→tool turns), 13 slash commands (/new, /session_new, /switch, /rename, /model, /think, /skills, /status, /clear, /help, /sessions, /delete, /react), per-session think level, main session concept (`MAIN_SESSION_ID = "main"`) with exclusive admin privileges, per-session isolated workspace with exclusive ownership, auto-save after each exchange, graceful shutdown (CancellationToken + `/api/shutdown` with per-port token auth), session-aware reconnect (`?session=` query param), live avatar polling, session versioning (`SESSION_VERSION`, `migrate_session()`) |
 
 When extending LingClaw, always ask: **am I improving the Skill half, the CLI half, or the loop that connects them?**
 
@@ -43,16 +43,17 @@ Architecture (single process, single binary):
 - **Frontend**: static `index.html` + `app.js` + `style.css` — WebChat UI with incremental text node streaming (`TextNode.nodeValue +=`), unified `requestAnimationFrame` flush scheduler, pre-mutation scroll-follow detection, history lazy-load (last 50 messages rendered initially, tool_call/tool_result pairs kept intact via `findHistoryRenderStart()`), markdown-only-on-finish rendering
 
 Key files:
-- `Cargo.toml` — axum, tokio, serde, serde_json, reqwest (stream+json), futures, regex, tower-http, tokio-util
-- `src/main.rs` — Config, sessions, commands, admin tools, HTTP/WebSocket server, main loop (~3002 lines; currently 2 lines over budget)
-- `src/main_tests.rs` — Unit tests for model resolution, session targeting, admin protection, persistence (~1123 lines)
+- `Cargo.toml` — axum, tokio, serde, serde_json, reqwest (stream+json), futures, regex, tower-http, tokio-util, chrono, base64
+- `src/main.rs` — Config, sessions, commands, admin tools, HTTP/WebSocket server, main loop (~3274 lines)
+- `src/main_tests.rs` — Unit tests for model resolution, session targeting, admin protection, persistence, migration (~2261 lines)
 - `src/cli.rs` — CLI subcommands (start/stop/restart/status/update/install/health/help/--version), setup wizard (~1107 lines)
-- `src/providers.rs` — LLM streaming + non-streaming client: OpenAI + Anthropic SSE parsing, message conversion, conversation compression, thinking/reasoning support, `extra_tools` injection (~739 lines)
-- `src/prompts.rs` — Session prompt init/load logic, bootstrap vs normal prompt flow, template discovery, local-time snapshot helpers, avatar parsing (~359 lines)
+- `src/providers.rs` — LLM streaming + non-streaming client: OpenAI + Anthropic SSE parsing, message conversion, conversation compression, thinking/reasoning support with thinking blocks (reasoning_content, budget_tokens), `extra_tools` injection (~942 lines)
+- `src/prompts.rs` — Session prompt init/load logic, bootstrap vs normal prompt flow with per-session bootstrap baselines, template discovery, daily memory log management, local-time snapshot helpers, avatar parsing (~835 lines)
+- `src/agent.rs` — ReAct state machine: AgentPhase, AgentLoopCtx, FinishReason, ToolResultEntry, ObservationSummary, evaluate_finish(), auto_think_level(), summarize_observations() (~462 lines)
 - `docs/reference/templates/` — 7 prompt template files (BOOTSTRAP.md, AGENTS.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md) copied to session workspaces on creation
-- `src/tools/mod.rs` — Shared `ToolSpec` registry, schema generation, tool dispatch (~427 lines)
+- `src/tools/mod.rs` — Shared `ToolSpec` registry, `ToolOutcome` struct, schema generation (OpenAI + Anthropic), tool dispatch, `validate_required_params()`, `is_tool_error_output()` (~498 lines)
 - `src/tools/fs.rs` — Filesystem tools: read_file, write_file, patch_file, delete_file, list_dir, search_files (~334 lines)
-- `src/tools/net.rs` — Network tools: http_fetch with SSRF protection (check_ssrf, is_private_ip, no-redirect client) (~123 lines)
+- `src/tools/net.rs` — Network tools: http_fetch with SSRF protection (check_ssrf with DNS resolution + private IP blocking, is_private_ip for IPv4/IPv6, no-redirect client) (~205 lines)
 - `src/tools/exec.rs` — Execution tools: think, exec (kill_on_drop) (~69 lines)
 - `static/index.html`, `static/app.js`, `static/style.css` — WebChat UI
 - `~/.lingclaw/.lingclaw.json` — User config file (providers, models, settings)
@@ -62,7 +63,7 @@ Key files:
 
 ## Constraints
 
-- DO NOT exceed 3000 lines in `src/main.rs` (use `wc -l` to verify)
+- DO NOT exceed 6000 lines in `src/main.rs` (use `wc -l` to verify)
 - Keep the backend compact: `src/main.rs` for the app loop, `src/providers.rs` for LLM streaming, `src/tools/` for tool registry + implementations. Avoid unnecessary module sprawl.
 - DO NOT add Telegram, Slack, WhatsApp, or any external channel integration
 - DO NOT introduce a plugin or extension system
@@ -70,13 +71,14 @@ Key files:
 - ALWAYS cap tool output (exec: configurable timeout + 50KB truncation; read_file: 200KB max)
 - ALWAYS validate user-supplied tool paths with `resolve_path_checked()`, use `resolve_path()` only for internal sandboxed normalization, check dangerous commands before exec, and call `check_ssrf()` before network fetches
 - ALWAYS use `truncate()` (UTF-8–safe via `is_char_boundary()`) for byte-limited string slicing
+- **Mandatory code review**: After completing any code change, perform a code review before committing. Check correctness, security (OWASP Top 10), style compliance, error handling, and test coverage. Run `cargo test` and `cargo clippy` as part of the review. No commit without review.
 
 ## Module Map (src/main.rs sections)
 
 1. **Config** (~100 lines) — `Config::load()`, `Provider` enum with auto-detection, `Config::resolve_model()`, `Config::available_models()`, `Config::find_model_entry()`, `Config::context_limit_for_model()`
 2. **Config File** (~100 lines) — `JsonConfig`/`JsonSettings`/`JsonProviderConfig`/`JsonModelEntry` serde structs, `config_dir_path()`, `config_file_path()`, `load_config_file()`
 3. **Data Models** (~30 lines) — ChatMessage, ToolCall, FunctionCall
-4. **Session & AppState** (~75 lines) — Session struct (with per-session `workspace: PathBuf`, `think_level`, `avatar`, `is_main()` method), `MAIN_SESSION_ID` constant, `session_workspace_path()`, multi-session HashMap + `active_connections: Mutex<HashSet<String>>` for dual-state session tracking; AppState includes `CancellationToken` for shutdown and per-instance `shutdown_token`
+4. **Session & AppState** (~75 lines) — Session struct (with per-session `workspace: PathBuf`, `think_level`, `show_react`, `avatar`, `version`, `is_main()` method), `MAIN_SESSION_ID` constant, `SESSION_VERSION` constant, `default_show_react()`, `default_think_level()`, `session_workspace_path()`, `migrate_session()`, multi-session HashMap + `active_connections: Mutex<HashSet<String>>` for dual-state session tracking; AppState includes `CancellationToken` for shutdown and per-instance `shutdown_token`
 5. **System Prompt** (~35 lines) — Dynamic prompt with OS/workspace/model injection; `build_system_prompt(config, workspace, model, is_main)` includes admin section for main session
 6. **Security** (~70 lines) — Dangerous pattern detection, sandboxed `resolve_path()` for internal clamp-to-workspace normalization, and `resolve_path_checked()` for explicit user-facing rejection of workspace escapes and symlink traversal
 7. **Utilities** (~30 lines) — `truncate()` (UTF-8–safe via `is_char_boundary()`), `format_size()`, `matches_glob()`, `ws_send()` / `ws_try_send()` (mpsc channel-based)
@@ -85,7 +87,7 @@ Key files:
 10. **Context Management** (~60 lines) — `estimate_tokens()`, `turn_len()` (measures complete conversational turns: user+assistant, user+assistant(tool_calls)+tool_results), `prune_messages()` (deletes oldest complete turns via `turn_len()`)
 11. **Session Persistence & Ownership** (~200 lines) — Save/load to ~/.lingclaw/sessions/, `list_saved_session_summaries()`, `list_saved_session_summaries_in_dir()` (includes corrupt file entries with "[Corrupt Session]" name), `list_saved_session_ids_in_dir()` (filename-based discovery, works even for corrupt JSON), `build_history_payload()`, `trim_incomplete_tool_calls()` for safe shutdown; `ClaimSessionResult` enum + `try_claim_session()` (4-phase atomic: quick active check → orphan claim from memory → unlocked disk load → re-lock atomic insert), `claim_requested_session()` (wait-and-claim with 3s timeout for browser refresh), `refresh_session_system_prompt()`, `send_sessions_list()` (merge in-memory + disk, sort by `updated_at`); save-before-remove pattern in all session transitions
 11b. **Session Admin** (~200 lines) — Main session exclusive: `resolve_session_target()` (exact match or unique prefix resolution), `delete_session_by_id()` (atomic: holds active lock during check+remove, rollback on file delete failure, main session protection), `gather_sessions_status()`, `build_active_session_lines()`, `execute_admin_tool()`, `is_admin_tool()`, `admin_tool_definitions_openai()` / `admin_tool_definitions_anthropic()`, `CommandResult` struct (with `response_type` field for progress/success/error UI)
-12. **Chat Commands** (~350 lines) — 12 slash commands: /new (compress+save to memory+clear, cancel-aware, input capped at 60K chars), /session_new (save-before-remove, create new session), /switch (save-before-remove, delegates to `try_claim_session()`, early-return on save failure), /rename, /model, /think, /skills, /status, /clear, /help, /sessions (main-only, active sessions with full IDs), /delete (main-only, prefix resolution, not-found handling)
+12. **Chat Commands** (~350 lines) — 13 slash commands: /new (compress+save to memory+clear, cancel-aware, input capped at 60K chars), /session_new (save-before-remove, create new session), /switch (save-before-remove, delegates to `try_claim_session()`, early-return on save failure), /rename, /model, /think, /skills, /status, /clear, /help, /sessions (main-only, active sessions with full IDs), /delete (main-only, prefix resolution, not-found handling), /react (toggle ReAct phase visibility, default on)
 13. **WebSocket Handler** (~300 lines) — Agent loop with unlimited tool rounds (`AGENT_HARD_CAP_ROUNDS = 200` as runaway protection) and `CancellationToken`; mpsc-based WebSocket with separate reader/writer/avatar_poller tasks; incremental session save after every round (both tool and non-tool); session-aware reconnect at connect (`?session=` query param with `claim_requested_session()` wait-and-claim, 3s timeout); system prompt (messages[0]) refreshed every round; cancel-aware LLM streaming and tool execution; `extra_tools` injected for main session admin tools; `trim_incomplete_tool_calls` on disconnect only (single cleanup point)
 14. **HTTP API** (~50 lines) — /api/health, /api/sessions, /api/shutdown (POST, Bearer token auth)
 15. **Main** (~70 lines) — CLI args (`--serve`, `--install-daemon`, `--port`), subcommand dispatch via `cli::handle_cli_command()`, setup wizard via `cli::run_setup_wizard()`, `CancellationToken` + `with_graceful_shutdown`, per-port shutdown token generation + file write, post-shutdown session flush + token cleanup
@@ -110,17 +112,18 @@ Key files:
 
 1. **TEMPLATE_FILES const** — `&[(&str, &str)]` tuples: 7 template filenames + `include_str!()` embedded fallback content (BOOTSTRAP.md, AGENTS.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md)
 2. **templates_dir()** — Locates `docs/reference/templates/` by walking exe ancestors then falling back to CWD
-3. **init_session_prompt_files() / ensure_session_workspace()** — New sessions copy all templates and create `memory/`; existing sessions recreate missing core templates but intentionally do NOT recreate BOOTSTRAP.md, so bootstrap completion survives reconnects
+3. **init_session_prompt_files() / ensure_session_workspace()** — New sessions copy all templates, create `memory/`, and write per-session bootstrap baselines (`.lingclaw-bootstrap/` directory); existing sessions recreate missing core templates but intentionally do NOT recreate BOOTSTRAP.md, so bootstrap completion survives reconnects
 4. **load_session_prompt_files_with_snapshot()** — Bootstrap mode reads `BOOTSTRAP.md + AGENTS.md` (falling back to legacy `AGENT.md` if needed); normal mode reads `AGENTS.md + IDENTITY.md + USER.md + SOUL.md`, then that session's `MEMORY.md` and local today/yesterday daily memory files; concatenates with `---` separators; missing files skipped silently, actual I/O errors logged
-5. **Avatar System** — `parse_identity_avatar()` (reads IDENTITY.md for `- 头像：<value>` line), `resolve_avatar_to_data_uri()` (reads local image file, base64-encodes), `has_image_ext()` helper
-6. **Local time helpers** — `LocalTimeSnapshot`, `current_local_snapshot()`, `today()`, `yesterday()`, `hhmm()`, `datetime_label()` via `chrono`, so system prompt time and daily memory selection share one local-time snapshot
+5. **Bootstrap Baselines** — `write_bootstrap_baselines()`, `ensure_bootstrap_baselines()`, `read_bootstrap_baseline()`, `remove_bootstrap_baselines()` manage per-session `.lingclaw-bootstrap/` directory; `maybe_complete_bootstrap()` checks if IDENTITY.md or USER.md differs from baseline (using `profile_file_has_user_edits()` with `normalize_template_text()` for cross-platform comparison); `template_file_content()` reads templates from disk with `include_str!()` fallback
+6. **Avatar System** — `parse_identity_avatar()` (reads IDENTITY.md for `- 头像：<value>` or `- Avatar: <value>` line), `resolve_avatar_to_data_uri()` (reads local image file, base64-encodes), `has_image_ext()` helper
+7. **Local time helpers** — `LocalTimeSnapshot`, `current_local_snapshot()`, `today()`, `yesterday()`, `hhmm()`, `datetime_label()` via `chrono`, so system prompt time and daily memory selection share one local-time snapshot
 
 ## Module Map (src/tools/)
 
 ### mod.rs — Registry & Dispatch
-1. **ToolSpec Registry** — Tool metadata, prompt lines, parameter schemas
-2. **Schema Generation** — OpenAI tools JSON + Anthropic tools JSON
-3. **Dispatch Layer** — Shared `execute_tool()` routing to submodule implementations
+1. **ToolSpec Registry** — `ToolSpec` metadata, `ToolOutcome` (output + is_error + duration_ms), `ToolHandler` type alias, prompt lines, parameter schemas
+2. **Schema Generation** — `tool_definitions()` (OpenAI format) + `tool_definitions_anthropic()` (Anthropic format)
+3. **Dispatch & Validation** — Shared `execute_tool()` routing to submodule implementations, `validate_required_params()` for pre-validation, `is_tool_error_output()` for error detection
 
 ### exec.rs — Execution & Reasoning
 - `tool_think()` — CoT planning
@@ -147,8 +150,8 @@ Key files:
 
 1. Read existing code first — understand the module map before changing anything
 2. Classify your change: **Skill** (prompt/context/LLM), **CLI** (tools/security), or **Loop** (handler/session/commands)
-3. When adding features, check line count — budget is 3000, currently ~3002 (2 lines over budget)
-4. Test changes: `cargo clippy` then `cargo build` then `cargo run`
+3. When adding features, check line count — budget is 6000, currently ~3274
+4. Test changes: `cargo clippy` then `cargo test` then `cargo build`
 5. For Skill issues: check `build_system_prompt()`, `prune_messages()`, `estimate_tokens()` in `src/main.rs`; `call_llm_stream_openai()` / `call_llm_stream_anthropic()` in `src/providers.rs`; `TEMPLATE_FILES`, `templates_dir()`, `init_session_prompt_files()`, `load_session_prompt_files_with_snapshot()`, `current_local_snapshot()` in `src/prompts.rs`; template content in `docs/reference/templates/`
 6. For CLI issues: check `src/tools/mod.rs` (`tool_specs()`, `execute_tool()`) plus `check_dangerous_command()`, `resolve_path()`, and `resolve_path_checked()` in `src/main.rs`
 7. For Loop issues: check `handle_socket()` agent loop, `handle_command()`, session persistence
@@ -156,4 +159,4 @@ Key files:
 
 ## Output Format
 
-When writing code: provide the exact Rust code with proper formatting. When explaining architecture decisions: be brief — this is a ~7300-line project, not an RFC.
+When writing code: provide the exact Rust code with proper formatting. When explaining architecture decisions: be brief — this is a ~10000-line project, not an RFC.

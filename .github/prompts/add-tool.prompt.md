@@ -26,4 +26,6 @@ OpenAI tools JSON, Anthropic tools JSON, `/skills` output, and tool dispatch are
 - [ ] User-supplied filesystem paths go through `resolve_path_checked()`; only internal sandboxed normalization should use `resolve_path()`
 - [ ] Commands go through `check_dangerous_command()` if the tool runs shell commands
 - [ ] Run `cargo clippy` after implementation
-- [ ] Run `wc -l src/main.rs` to check line budget (≤ 3000)
+- [ ] Run `cargo test` to verify existing tests pass
+- [ ] Run `wc -l src/main.rs` to check line budget (≤ 6000)
+- [ ] Perform code review before committing
