@@ -6,7 +6,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **CLI** — 工具执行层：安全的命令/文件/网络工具、沙盒路径、SSRF 防护、安装与更新
 - **Loop** — 连接层：WebSocket 会话、多会话状态、流式输出、斜杠命令、持久化
 
-整个后端约 7300 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
+整个后端约 8700 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
 
 ## Features
 
@@ -20,8 +20,12 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
 - **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环，`evaluate_finish()` 结构化完成判定，`auto_think_level()` 按循环深度动态调整推理预算
-- **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留
+- **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留；错误工具标记 `[FAILED]` 并附带耗时
 - **推理可见性控制**：`/react on|off` 开关控制 ReAct 阶段转换 WS 事件（`react_phase`），浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
+- **结构化工具结果**：`ToolOutcome`（output + is_error + duration_ms），前缀式错误检测，必填参数预校验，`tool_result` WS 事件携带耗时和错误标记
+- **原子持久化**：会话存档先写 `.tmp` 再 rename（Windows 兼容），加载时自动修剪不完整工具调用
+- **会话版本控制**：`Session.version` 字段，新会话 v1，旧存档默认 v0
+- **上下文裁剪追踪**：Analyze 阶段裁剪后发送 `context_pruned` WS 事件，包含移除消息数
 - **安全控制**：危险命令检测、沙盒路径解析、SSRF 阻断、重定向阻断、输出/文件大小上限
 
 ## Quick Start
@@ -308,17 +312,17 @@ handle_socket()
 
 ```text
 src/
-├── main.rs          (~3150 行) — Config, Session, Agent Loop (phase-driven), 命令处理, HTTP 路由
-├── main_tests.rs    (~1370 行) — 主流程测试 + observation 摘要 + finish heuristic + auto think 集成测试
-├── agent.rs         (~430 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
-├── cli.rs           (~1100 行) — CLI 子命令, 设置向导, 安装/更新
-├── providers.rs     (~740 行)  — OpenAI/Anthropic 流式调用, 模型解析
-├── prompts.rs       (~420 行)  — 提示文件初始化/加载, 头像解析
+├── main.rs          (~3000 行) — Config, Session, Agent Loop (phase-driven), 命令处理, HTTP 路由
+├── main_tests.rs    (~2000 行) — 主流程测试 + observation 摘要 + finish heuristic + 工具协议 + 持久化测试
+├── agent.rs         (~410 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
+├── cli.rs           (~1040 行) — CLI 子命令, 设置向导, 安装/更新
+├── providers.rs     (~880 行)  — OpenAI/Anthropic 流式调用, 模型解析
+├── prompts.rs       (~370 行)  — 提示文件初始化/加载, 头像解析
 └── tools/
-    ├── mod.rs       (~430 行)  — ToolSpec 注册表, tool_definitions(), execute_tool()
-    ├── fs.rs        (~330 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files
-    ├── net.rs       (~120 行)  — http_fetch, check_ssrf, is_private_ip
-    └── exec.rs      (~70 行)   — exec (shell), think (scratchpad)
+    ├── mod.rs       (~450 行)  — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验
+    ├── fs.rs        (~310 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files
+    ├── net.rs       (~180 行)  — http_fetch, check_ssrf, is_private_ip
+    └── exec.rs      (~60 行)   — exec (shell), think (scratchpad)
 
 static/
 ├── index.html                  — 主页面
@@ -347,6 +351,7 @@ struct Session {
     think_level: String,       // "auto"|"off"|"minimal"|"low"|"medium"|"high"|"xhigh"
     workspace: PathBuf,        // ~/.lingclaw/{id}/workspace/
     avatar: Option<String>,    // transient, 不序列化
+    version: u32,              // 会话版本 (旧存档 serde default=0, 新会话=1)
 }
 
 struct ChatMessage {
@@ -401,9 +406,9 @@ think_level 映射：
 |---|---|---|
 | off | — | — |
 | minimal | low | 1024 |
-| low | low | 2048 |
-| medium | medium | 5120 |
-| high | high | 10240 |
+| low | low | 4096 |
+| medium | medium | 10240 |
+| high | high | 16384 |
 | xhigh | high | 32768 |
 | auto | model 支持 reasoning? medium : off | 同左 |
 
@@ -464,8 +469,9 @@ think_level 映射：
 关键不变式：
 - `/new` 只压缩对话 + 写入记忆 + 清空上下文，不重建 session
 - 重连不重建 `BOOTSTRAP.md`
-- 每轮 agent loop 后增量保存 session
+- 每轮 agent loop 后增量保存 session（原子写入：write .tmp → rename）
 - 会话切换前先保存到磁盘，失败时保留内存副本供重连恢复
+- 加载时自动修剪不完整的工具调用事务（`trim_incomplete_tool_calls`）
 
 ### WebSocket 协议
 
@@ -484,8 +490,11 @@ think_level 映射：
 | `thinking_delta` | 思维流式片段 |
 | `thinking_done` | 思维模式结束 |
 | `tool_start` | 工具调用开始 |
-| `tool_result` | 工具执行结果 |
+| `tool_result` | 工具执行结果（含 `duration_ms`、`is_error`） |
 | `done` | 响应完成 |
+| `react_phase` | ReAct 阶段转换（需 `/react on` 启用） |
+| `observation` | 非破坏性工具结果摘要 |
+| `context_pruned` | 上下文裁剪通知（含 `removed_count`） |
 | `progress` | 命令处理中（不清除忙碌状态） |
 | `success` | 命令成功（成功样式） |
 | `system` | 中性系统消息 |

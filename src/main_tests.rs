@@ -1667,3 +1667,557 @@ fn prune_messages_tracks_removal_count() {
     assert_eq!(messages[0].role, "system");
     assert!(messages.last().unwrap().content.as_deref() == Some("latest"));
 }
+// ───── Phase 5: check_dangerous_command ─────
+
+#[test]
+fn dangerous_command_blocks_rm_rf_root() {
+    assert!(check_dangerous_command("rm -rf /").is_some());
+    assert!(check_dangerous_command("sudo rm -rf / --no-preserve-root").is_some());
+    assert!(check_dangerous_command("rm -rf /*").is_some());
+}
+
+#[test]
+fn dangerous_command_blocks_mkfs_and_dd() {
+    assert!(check_dangerous_command("mkfs.ext4 /dev/sda1").is_some());
+    assert!(check_dangerous_command("dd if=/dev/zero of=/dev/sda").is_some());
+}
+
+#[test]
+fn dangerous_command_blocks_fork_bomb_and_dev_overwrite() {
+    assert!(check_dangerous_command(":(){ :|:& };:").is_some());
+    assert!(check_dangerous_command("echo test > /dev/sda").is_some());
+}
+
+#[test]
+fn dangerous_command_blocks_windows_destructive_commands() {
+    assert!(check_dangerous_command("format c:").is_some());
+    assert!(check_dangerous_command("FORMAT C:").is_some()); // case-insensitive
+    assert!(check_dangerous_command("del /f /s /q c:\\windows").is_some());
+    assert!(check_dangerous_command("rd /s /q c:\\").is_some());
+}
+
+#[test]
+fn dangerous_command_allows_safe_commands() {
+    assert!(check_dangerous_command("ls -la").is_none());
+    assert!(check_dangerous_command("cat /dev/null").is_none());
+    assert!(check_dangerous_command("echo hello").is_none());
+    assert!(check_dangerous_command("cargo build").is_none());
+    assert!(check_dangerous_command("rm temp.txt").is_none());
+}
+
+// ───── Phase 5: truncate ─────
+
+#[test]
+fn truncate_short_string_unchanged() {
+    let s = "hello world";
+    assert_eq!(truncate(s, 100), s);
+}
+
+#[test]
+fn truncate_ascii_at_boundary() {
+    let s = "abcdefghij"; // 10 bytes
+    let result = truncate(s, 5);
+    assert!(result.starts_with("abcde"));
+    assert!(result.contains("[truncated at 5 bytes, total 10 bytes]"));
+}
+
+#[test]
+fn truncate_utf8_multibyte_boundary() {
+    let s = "\u{4f60}\u{597d}\u{4e16}\u{754c}"; // 12 bytes (3 per char)
+    let result = truncate(s, 7); // mid-char boundary
+                                 // Should cut at char boundary <= 7, which is 6 (after first 2 chars)
+    assert!(result.starts_with("\u{4f60}\u{597d}"));
+    assert!(result.contains("[truncated at 6 bytes"));
+}
+
+#[test]
+fn truncate_emoji_boundary() {
+    let s = "\u{1F980}\u{1F980}\u{1F980}"; // 12 bytes (4 per emoji)
+    let result = truncate(s, 5); // mid-emoji
+    assert!(result.starts_with("\u{1F980}"));
+    assert!(result.contains("[truncated at 4 bytes"));
+}
+
+// ───── Phase 5: format_size ─────
+
+#[test]
+fn format_size_bytes() {
+    assert_eq!(format_size(0), "0 B");
+    assert_eq!(format_size(512), "512 B");
+    assert_eq!(format_size(1023), "1023 B");
+}
+
+#[test]
+fn format_size_kilobytes() {
+    assert_eq!(format_size(1024), "1.0 KB");
+    assert_eq!(format_size(1536), "1.5 KB");
+}
+
+#[test]
+fn format_size_megabytes() {
+    assert_eq!(format_size(1024 * 1024), "1.0 MB");
+    assert_eq!(format_size(2 * 1024 * 1024), "2.0 MB");
+}
+
+// ───── Phase 5: matches_glob ─────
+
+#[test]
+fn matches_glob_extension_pattern() {
+    assert!(matches_glob("main.rs", "*.rs"));
+    assert!(!matches_glob("main.py", "*.rs"));
+    assert!(matches_glob("deeply.nested.test.rs", "*.rs"));
+}
+
+#[test]
+fn matches_glob_prefix_pattern() {
+    assert!(matches_glob("test_main.rs", "test_*"));
+    assert!(!matches_glob("main_test.rs", "test_*"));
+}
+
+#[test]
+fn matches_glob_exact_match() {
+    assert!(matches_glob("Cargo.toml", "Cargo.toml"));
+    assert!(!matches_glob("Cargo.lock", "Cargo.toml"));
+}
+
+// ───── Phase 5: estimate_tokens / message_token_len ─────
+
+#[test]
+fn message_token_len_empty_message() {
+    let msg = ChatMessage {
+        role: "user".into(),
+        content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    // (0 + 0 + 10) / 4 = 2
+    assert_eq!(message_token_len(&msg), 2);
+}
+
+#[test]
+fn message_token_len_content_only() {
+    let msg = ChatMessage {
+        role: "user".into(),
+        content: Some("hello world".into()), // 11 chars
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    // (11 + 0 + 10) / 4 = 5
+    assert_eq!(message_token_len(&msg), 5);
+}
+
+#[test]
+fn message_token_len_with_tool_calls() {
+    let msg = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        tool_calls: Some(vec![ToolCall {
+            id: "tc1".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "exec".into(),                 // 4
+                arguments: r#"{"cmd":"ls"}"#.into(), // 12
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: None,
+    };
+    // (0 + (4+12) + 10) / 4 = 26/4 = 6
+    assert_eq!(message_token_len(&msg), 6);
+}
+
+#[test]
+fn estimate_tokens_sums_messages() {
+    let messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("sys".into()), // 3
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("hello".into()), // 5
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    ];
+    // (3+0+10)/4 + (5+0+10)/4 = 3 + 3 = 6
+    assert_eq!(estimate_tokens(&messages), 6);
+}
+
+// ───── Phase 5: turn_len ─────
+
+#[test]
+fn turn_len_standalone_user() {
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hi".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    assert_eq!(turn_len(&messages, 0), 1);
+}
+
+#[test]
+fn turn_len_user_plus_assistant() {
+    let messages = vec![
+        ChatMessage {
+            role: "user".into(),
+            content: Some("hi".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("hello".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    ];
+    assert_eq!(turn_len(&messages, 0), 2);
+}
+
+#[test]
+fn turn_len_user_assistant_with_tool_calls_and_results() {
+    let messages = vec![
+        ChatMessage {
+            role: "user".into(),
+            content: Some("list files".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "tc1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "list_dir".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("file1.txt\nfile2.txt".into()),
+            tool_calls: None,
+            tool_call_id: Some("tc1".into()),
+            timestamp: None,
+        },
+    ];
+    // user + assistant(tool_calls) + 1 tool result = 3
+    assert_eq!(turn_len(&messages, 0), 3);
+}
+
+#[test]
+fn turn_len_orphan_assistant_with_tool_results() {
+    let messages = vec![
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "tc1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "exec".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("ok".into()),
+            tool_calls: None,
+            tool_call_id: Some("tc1".into()),
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("ok2".into()),
+            tool_calls: None,
+            tool_call_id: Some("tc2".into()),
+            timestamp: None,
+        },
+    ];
+    // assistant + 2 tool results = 3
+    assert_eq!(turn_len(&messages, 0), 3);
+}
+
+#[test]
+fn turn_len_standalone_assistant_text() {
+    let messages = vec![ChatMessage {
+        role: "assistant".into(),
+        content: Some("just text".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    assert_eq!(turn_len(&messages, 0), 1);
+}
+
+// ───── Phase 5: ChatMessage predicates ─────
+
+#[test]
+fn chat_message_has_nonempty_content() {
+    let none_content = ChatMessage {
+        role: "user".into(),
+        content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    assert!(!none_content.has_nonempty_content());
+
+    let empty_content = ChatMessage {
+        role: "user".into(),
+        content: Some(String::new()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    assert!(!empty_content.has_nonempty_content());
+
+    let with_content = ChatMessage {
+        role: "user".into(),
+        content: Some("hello".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    assert!(with_content.has_nonempty_content());
+}
+
+#[test]
+fn chat_message_has_tool_calls() {
+    let none_tc = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    assert!(!none_tc.has_tool_calls());
+
+    let empty_tc = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        tool_calls: Some(vec![]),
+        tool_call_id: None,
+        timestamp: None,
+    };
+    assert!(!empty_tc.has_tool_calls());
+
+    let with_tc = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        tool_calls: Some(vec![ToolCall {
+            id: "tc1".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "exec".into(),
+                arguments: "{}".into(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: None,
+    };
+    assert!(with_tc.has_tool_calls());
+}
+
+#[test]
+fn chat_message_is_empty_assistant_message() {
+    let empty_asst = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    assert!(empty_asst.is_empty_assistant_message());
+
+    let with_content = ChatMessage {
+        role: "assistant".into(),
+        content: Some("reply".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    assert!(!with_content.is_empty_assistant_message());
+
+    let user_msg = ChatMessage {
+        role: "user".into(),
+        content: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    assert!(!user_msg.is_empty_assistant_message());
+}
+
+// ───── Phase 5: is_admin_tool ─────
+
+#[test]
+fn is_admin_tool_recognizes_admin_tools() {
+    assert!(is_admin_tool("list_sessions"));
+    assert!(is_admin_tool("delete_session"));
+}
+
+#[test]
+fn is_admin_tool_rejects_regular_tools() {
+    assert!(!is_admin_tool("exec"));
+    assert!(!is_admin_tool("read_file"));
+    assert!(!is_admin_tool("think"));
+    assert!(!is_admin_tool("http_fetch"));
+}
+
+// ───── Phase 5: prune_messages with tool_calls turn ─────
+
+#[test]
+fn prune_messages_removes_complete_tool_turn() {
+    let big = "x".repeat(200_000);
+    let mut messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("sys".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some(big.clone()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "tc1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "exec".into(),
+                    arguments: big.clone(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some(big.clone()),
+            tool_calls: None,
+            tool_call_id: Some("tc1".into()),
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("latest".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    ];
+    let before = messages.len();
+    prune_messages(&mut messages, 1000);
+    let pruned = before - messages.len();
+    assert!(
+        pruned >= 3,
+        "should remove complete tool turn, pruned={pruned}"
+    );
+    assert_eq!(messages[0].role, "system");
+    assert!(messages.last().unwrap().content.as_deref() == Some("latest"));
+}
+
+// ───── Phase 5: trim_incomplete_tool_calls no-op on complete transaction ─────
+
+#[test]
+fn trim_incomplete_tool_calls_preserves_complete_transaction() {
+    let mut messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("sys".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("do something".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![
+                ToolCall {
+                    id: "tc1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "exec".into(),
+                        arguments: r#"{"cmd":"ls"}"#.into(),
+                    },
+                },
+                ToolCall {
+                    id: "tc2".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"a.txt"}"#.into(),
+                    },
+                },
+            ]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("result1".into()),
+            tool_calls: None,
+            tool_call_id: Some("tc1".into()),
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("result2".into()),
+            tool_calls: None,
+            tool_call_id: Some("tc2".into()),
+            timestamp: None,
+        },
+    ];
+    let before_len = messages.len();
+    trim_incomplete_tool_calls(&mut messages);
+    assert_eq!(messages.len(), before_len);
+}
+
+// ───── Phase 5: tool_think ─────
+
+#[test]
+fn tool_think_records_thought() {
+    let result = tools::exec::tool_think(&json!({"thought": "analyze the problem"}));
+    assert!(result.contains("analyze the problem"));
+    assert!(result.contains("Thought recorded:"));
+}
+
+#[test]
+fn tool_think_fallback_when_no_thought() {
+    let result = tools::exec::tool_think(&json!({}));
+    assert!(result.contains("(no thought provided)"));
+}
