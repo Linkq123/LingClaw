@@ -21,7 +21,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
 - **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环，`evaluate_finish()` 结构化完成判定，`auto_think_level()` 按循环深度动态调整推理预算
 - **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留；错误工具标记 `[FAILED]` 并附带耗时
-- **推理可见性控制**：`/react on|off` 开关控制 ReAct 阶段转换 WS 事件（`react_phase`），浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
+- **推理可见性控制**：默认开启 ReAct 阶段转换 WS 事件（`react_phase`），可通过 `/react on|off` 手动切换；浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
 - **结构化工具结果**：`ToolOutcome`（output + is_error + duration_ms），前缀式错误检测，必填参数预校验，`tool_result` WS 事件携带耗时和错误标记
 - **原子持久化**：会话存档先写 `.tmp` 再 rename（Windows 兼容），加载时自动修剪不完整工具调用
 - **会话版本控制**：`Session.version` 字段，新会话 v1，旧存档默认 v0
@@ -154,7 +154,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `/rename <name>` | 重命名当前会话 |
 | `/model [name]` | 查看可用模型或切换当前会话模型 |
 | `/think [level]` | 设置思维模式：`auto`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh` |
-| `/react [on\|off]` | 切换 ReAct 阶段可见性（启用后每次阶段转换发送 `react_phase` WS 事件） |
+| `/react [on\|off]` | 切换 ReAct 阶段可见性（默认开启；启用后每次阶段转换发送 `react_phase` WS 事件） |
 | `/skills` | 列出可用工具帮助 |
 | `/status` | 显示模型、provider、上下文估算、思维级别 |
 | `/clear` | 清空消息但保留系统提示 |
@@ -262,7 +262,7 @@ Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的
 
 - **不回退到文本协议**：保留 OpenAI/Anthropic 原生结构化 tool calling，不使用文本版 `Action: tool_name\nAction Input: {...}` 解析
 - **不污染对话历史**：完整思维链仅在 `think` 工具内部或 provider reasoning stream 中存在，不写入主消息序列
-- **推理可见性已实现**：`/react on` 启用 `react_phase` WS 事件，前端会显示阶段切换；`done` 事件始终包含结构化 `reason` 字段
+- **推理可见性已实现**：默认启用 `react_phase` WS 事件，前端会显示阶段切换；可通过 `/react off` 关闭；`done` 事件始终包含结构化 `reason` 字段
 - **provider 层感知状态**：`auto` 模式下 `auto_think_level()` 根据循环深度动态调整推理预算（首轮 medium / 有 observation 时 high / 深轮 low）
 
 ### Agent Loop 详解
@@ -493,7 +493,7 @@ think_level 映射：
 | `tool_start` | 工具调用开始 |
 | `tool_result` | 工具执行结果（含 `duration_ms`、`is_error`） |
 | `done` | 响应完成 |
-| `react_phase` | ReAct 阶段转换（需 `/react on` 启用） |
+| `react_phase` | ReAct 阶段转换（默认启用，可通过 `/react off` 关闭） |
 | `observation` | 非破坏性工具结果摘要 |
 | `context_pruned` | 上下文裁剪通知（含 `removed_count`） |
 | `progress` | 命令处理中（不清除忙碌状态） |

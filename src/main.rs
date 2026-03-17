@@ -611,7 +611,7 @@ fn gen_session_id() -> String {
     format!("{:x}{:04x}", t.as_secs(), t.subsec_nanos() % 0xFFFF)
 }
 
-const SESSION_VERSION: u32 = 1;
+const SESSION_VERSION: u32 = 2;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {
@@ -625,7 +625,7 @@ struct Session {
     model_override: Option<String>,
     #[serde(default = "default_think_level")]
     think_level: String,
-    #[serde(default)]
+    #[serde(default = "default_show_react")]
     show_react: bool,
     #[serde(default)]
     version: u32,
@@ -638,6 +638,17 @@ struct Session {
 
 fn default_think_level() -> String {
     "auto".to_string()
+}
+
+fn default_show_react() -> bool {
+    true
+}
+
+fn migrate_session(session: &mut Session) {
+    if session.version < 2 {
+        session.show_react = default_show_react();
+    }
+    session.version = SESSION_VERSION;
 }
 
 /// Per-session workspace: ~/.lingclaw/{sessionId}/workspace
@@ -667,7 +678,7 @@ impl Session {
             tool_calls_count: 0,
             model_override: None,
             think_level: default_think_level(),
-            show_react: false,
+            show_react: default_show_react(),
             version: SESSION_VERSION,
             workspace,
             avatar,
@@ -1221,6 +1232,7 @@ fn load_session_from_disk(id: &str) -> Option<Session> {
     let path = sessions_dir().join(format!("{id}.json"));
     let data = std::fs::read_to_string(&path).ok()?;
     let mut session: Session = serde_json::from_str(&data).ok()?;
+    migrate_session(&mut session);
     trim_incomplete_tool_calls(&mut session.messages);
     session.workspace = session_workspace_path(&session.id);
     std::fs::create_dir_all(&session.workspace).ok();
@@ -2155,7 +2167,7 @@ async fn handle_command(
                 let on = sessions
                     .get(current_session_id)
                     .map(|s| s.show_react)
-                    .unwrap_or(false);
+                    .unwrap_or_else(default_show_react);
                 return Some(CommandResult {
                     response: format!(
                         "react: {}\nUsage: /react <on|off>",

@@ -1490,7 +1490,7 @@ fn auto_think_adapts_in_agent_loop_context() {
 }
 
 #[test]
-fn show_react_field_defaults_to_false_in_deserialized_session() {
+fn show_react_field_defaults_to_true_in_deserialized_session() {
     let json_str = r#"{
         "id": "test",
         "name": "Test",
@@ -1500,7 +1500,45 @@ fn show_react_field_defaults_to_false_in_deserialized_session() {
         "tool_calls_count": 0
     }"#;
     let session: Session = serde_json::from_str(json_str).unwrap();
-    assert!(!session.show_react);
+    assert!(session.show_react);
+}
+
+#[test]
+fn load_session_from_disk_migrates_show_react_to_true_for_older_sessions() {
+    let session_id = format!("react-migrate-{}", now_epoch());
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let payload = json!({
+        "id": session_id,
+        "name": "Test",
+        "messages": [],
+        "created_at": 0,
+        "updated_at": 0,
+        "tool_calls_count": 0,
+        "show_react": false,
+        "version": 1
+    });
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&payload).expect("payload should serialize"),
+    )
+    .expect("session file should be written");
+
+    let session = load_session_from_disk(
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .expect("session id should be valid"),
+    )
+    .expect("session should load");
+
+    assert!(session.show_react);
+    assert_eq!(session.version, SESSION_VERSION);
+
+    let _ = std::fs::remove_file(&path);
+    let workspace = session_workspace_path(&session.id)
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(workspace);
 }
 
 // ── Phase 4: Tool Protocol + Session Recovery ────────────────────────────────
