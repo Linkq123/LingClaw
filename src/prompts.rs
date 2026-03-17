@@ -63,6 +63,7 @@ const TEMPLATE_FILES: &[(&str, &str)] = &[
 
 const PRIMARY_AGENT_FILE: &str = "AGENTS.md";
 const LEGACY_AGENT_FILE: &str = "AGENT.md";
+const BOOTSTRAP_FILE: &str = "BOOTSTRAP.md";
 
 fn write_missing_templates(workspace: &Path, include_bootstrap: bool) {
     let tpl_dir = templates_dir(); // None is fine — we have embedded fallback
@@ -112,6 +113,91 @@ fn read_agent_prompt(workspace: &Path) -> Option<(&'static str, String)> {
         }
     }
     None
+}
+
+fn maybe_complete_bootstrap(workspace: &Path) {
+    let bootstrap_path = workspace.join(BOOTSTRAP_FILE);
+    if !bootstrap_path.exists() {
+        return;
+    }
+
+    if !identity_profile_is_complete(workspace) || !user_profile_is_complete(workspace) {
+        return;
+    }
+
+    match std::fs::remove_file(&bootstrap_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!(
+            "WARNING: failed to remove {} after bootstrap completion: {e}",
+            bootstrap_path.display()
+        ),
+    }
+}
+
+fn identity_profile_is_complete(workspace: &Path) -> bool {
+    let Some(content) = read_nonempty(workspace.join("IDENTITY.md")) else {
+        return false;
+    };
+
+    has_required_field(&content, &["Name:", "**Name:**", "名称：", "名称:"])
+        && has_required_field(
+            &content,
+            &["Creature:", "**Creature:**", "生物类型：", "生物类型:"],
+        )
+        && has_required_field(&content, &["Vibe:", "**Vibe:**", "气质：", "气质:"])
+        && has_required_field(
+            &content,
+            &["Emoji:", "**Emoji:**", "表情符号：", "表情符号:"],
+        )
+}
+
+fn user_profile_is_complete(workspace: &Path) -> bool {
+    let Some(content) = read_nonempty(workspace.join("USER.md")) else {
+        return false;
+    };
+
+    has_required_field(&content, &["Name:", "**Name:**", "姓名：", "姓名:"])
+        && has_required_field(
+            &content,
+            &[
+                "What to call them:",
+                "**What to call them:**",
+                "称呼方式：",
+                "称呼方式:",
+            ],
+        )
+        && has_required_field(&content, &["Timezone:", "**Timezone:**", "时区：", "时区:"])
+}
+
+fn has_required_field(content: &str, field_prefixes: &[&str]) -> bool {
+    extract_field_value(content, field_prefixes).is_some()
+}
+
+fn extract_field_value(content: &str, field_prefixes: &[&str]) -> Option<String> {
+    for line in content.lines() {
+        let line = line.trim().trim_start_matches('-').trim();
+        for prefix in field_prefixes {
+            let Some(rest) = line.strip_prefix(prefix) else {
+                continue;
+            };
+            let rest = rest.trim();
+            if is_placeholder_field_value(rest) {
+                continue;
+            }
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+fn is_placeholder_field_value(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.is_empty()
+        || trimmed.starts_with('(')
+        || trimmed.starts_with('（')
+        || trimmed.starts_with("_(")
+        || trimmed.starts_with("_（")
 }
 
 /// Locate the templates directory on disk (prefer disk over embedded).
@@ -173,11 +259,12 @@ pub(crate) fn load_session_prompt_files_with_snapshot(
     workspace: &Path,
     snapshot: LocalTimeSnapshot,
 ) -> String {
-    let bootstrap = read_nonempty(workspace.join("BOOTSTRAP.md"));
+    maybe_complete_bootstrap(workspace);
+    let bootstrap = read_nonempty(workspace.join(BOOTSTRAP_FILE));
 
     if let Some(bs_content) = bootstrap {
         // Bootstrap mode: first-run identity setup
-        let mut parts = vec![format!("<!-- BOOTSTRAP.md -->\n{bs_content}")];
+        let mut parts = vec![format!("<!-- {BOOTSTRAP_FILE} -->\n{bs_content}")];
         if let Some((name, agent)) = read_agent_prompt(workspace) {
             parts.push(format!("<!-- {name} -->\n{agent}"));
         }
@@ -414,6 +501,138 @@ mod tests {
 
         assert!(loaded.contains("<!-- memory/2026-03-16.md -->\ntoday memory"));
         assert!(loaded.contains("<!-- memory/2026-03-15.md -->\nyesterday memory"));
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn load_session_prompt_files_auto_completes_bootstrap_when_profiles_are_ready() {
+        let workspace = std::env::temp_dir().join("lingclaw-bootstrap-autocomplete-test");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::create_dir_all(workspace.join("memory")).expect("memory dir should be created");
+        fs::write(workspace.join("BOOTSTRAP.md"), "bootstrap")
+            .expect("bootstrap file should be written");
+        fs::write(workspace.join("AGENTS.md"), "agent").expect("agent file should be written");
+        fs::write(
+            workspace.join("IDENTITY.md"),
+            "- Name: Ling\n- Creature: assistant\n- Vibe: calm\n- Emoji: ✨\n- Avatar: none\n",
+        )
+        .expect("identity file should be written");
+        fs::write(
+            workspace.join("USER.md"),
+            "- **Name:** Alex\n- **What to call them:** Alex\n- **Timezone:** Asia/Shanghai\n",
+        )
+        .expect("user file should be written");
+        fs::write(workspace.join("SOUL.md"), "soul").expect("soul file should be written");
+
+        let snapshot = LocalTimeSnapshot::from_datetime(
+            DateTime::parse_from_rfc3339("2026-03-16T00:05:07+08:00")
+                .expect("datetime should parse"),
+        );
+        let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
+
+        assert!(!workspace.join("BOOTSTRAP.md").exists());
+        assert!(!loaded.contains("<!-- BOOTSTRAP.md -->"));
+        assert!(loaded.contains("<!-- AGENTS.md -->\nagent"));
+        assert!(loaded.contains("<!-- IDENTITY.md -->"));
+        assert!(loaded.contains("<!-- USER.md -->"));
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn load_session_prompt_files_keeps_bootstrap_until_profiles_are_ready() {
+        let workspace = std::env::temp_dir().join("lingclaw-bootstrap-incomplete-test");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::write(workspace.join("BOOTSTRAP.md"), "bootstrap")
+            .expect("bootstrap file should be written");
+        fs::write(workspace.join("AGENTS.md"), "agent").expect("agent file should be written");
+        fs::write(
+            workspace.join("IDENTITY.md"),
+            "- Name:\n- Creature:\n- Vibe:\n- Emoji:\n",
+        )
+        .expect("identity file should be written");
+        fs::write(
+            workspace.join("USER.md"),
+            "- **Name:** Alex\n- **What to call them:** Alex\n",
+        )
+        .expect("user file should be written");
+
+        let snapshot = LocalTimeSnapshot::from_datetime(
+            DateTime::parse_from_rfc3339("2026-03-16T00:05:07+08:00")
+                .expect("datetime should parse"),
+        );
+        let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
+
+        assert!(workspace.join("BOOTSTRAP.md").exists());
+        assert!(loaded.contains("<!-- BOOTSTRAP.md -->\nbootstrap"));
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn load_session_prompt_files_auto_completes_bootstrap_for_legacy_chinese_profiles() {
+        let workspace = std::env::temp_dir().join("lingclaw-bootstrap-legacy-profile-test");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::write(workspace.join("BOOTSTRAP.md"), "bootstrap")
+            .expect("bootstrap file should be written");
+        fs::write(workspace.join("AGENTS.md"), "agent").expect("agent file should be written");
+        fs::write(
+            workspace.join("IDENTITY.md"),
+            "- 名称：灵爪\n- 生物类型：AI 助手\n- 气质：冷静\n- 表情符号：✨\n- 头像：none\n",
+        )
+        .expect("identity file should be written");
+        fs::write(
+            workspace.join("USER.md"),
+            "- 姓名：小李\n- 称呼方式：小李\n- 时区：Asia/Shanghai\n",
+        )
+        .expect("user file should be written");
+
+        let snapshot = LocalTimeSnapshot::from_datetime(
+            DateTime::parse_from_rfc3339("2026-03-16T00:05:07+08:00")
+                .expect("datetime should parse"),
+        );
+        let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
+
+        assert!(!workspace.join("BOOTSTRAP.md").exists());
+        assert!(!loaded.contains("<!-- BOOTSTRAP.md -->"));
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn load_session_prompt_files_auto_completes_bootstrap_when_values_are_appended_below_placeholders(
+    ) {
+        let workspace = std::env::temp_dir().join("lingclaw-bootstrap-appended-values-test");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::write(workspace.join("BOOTSTRAP.md"), "bootstrap")
+            .expect("bootstrap file should be written");
+        fs::write(workspace.join("AGENTS.md"), "agent").expect("agent file should be written");
+        fs::write(
+            workspace.join("IDENTITY.md"),
+            "- Name:\n- Creature:\n- Vibe:\n- Emoji:\n- Name: Ling\n- Creature: assistant\n- Vibe: calm\n- Emoji: ✨\n",
+        )
+        .expect("identity file should be written");
+        fs::write(
+            workspace.join("USER.md"),
+            "- **Name:**\n- **What to call them:**\n- **Timezone:**\n- **Name:** Alex\n- **What to call them:** Alex\n- **Timezone:** Asia/Shanghai\n",
+        )
+        .expect("user file should be written");
+
+        let snapshot = LocalTimeSnapshot::from_datetime(
+            DateTime::parse_from_rfc3339("2026-03-16T00:05:07+08:00")
+                .expect("datetime should parse"),
+        );
+        let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
+
+        assert!(!workspace.join("BOOTSTRAP.md").exists());
+        assert!(!loaded.contains("<!-- BOOTSTRAP.md -->"));
+        assert!(loaded.contains("<!-- IDENTITY.md -->"));
+        assert!(loaded.contains("<!-- USER.md -->"));
 
         let _ = fs::remove_dir_all(&workspace);
     }
