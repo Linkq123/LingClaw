@@ -64,6 +64,8 @@ const TEMPLATE_FILES: &[(&str, &str)] = &[
 const PRIMARY_AGENT_FILE: &str = "AGENTS.md";
 const LEGACY_AGENT_FILE: &str = "AGENT.md";
 const BOOTSTRAP_FILE: &str = "BOOTSTRAP.md";
+const BOOTSTRAP_BASELINE_DIR: &str = ".lingclaw-bootstrap";
+const BOOTSTRAP_PROFILE_FILES: &[&str] = &["IDENTITY.md", "USER.md"];
 
 fn write_missing_templates(workspace: &Path, include_bootstrap: bool) {
     let tpl_dir = templates_dir(); // None is fine — we have embedded fallback
@@ -121,12 +123,14 @@ fn maybe_complete_bootstrap(workspace: &Path) {
         return;
     }
 
-    if !identity_profile_is_complete(workspace) || !user_profile_is_complete(workspace) {
+    if !profile_file_has_user_edits(workspace, "IDENTITY.md")
+        && !profile_file_has_user_edits(workspace, "USER.md")
+    {
         return;
     }
 
     match std::fs::remove_file(&bootstrap_path) {
-        Ok(()) => {}
+        Ok(()) => remove_bootstrap_baselines(workspace),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => eprintln!(
             "WARNING: failed to remove {} after bootstrap completion: {e}",
@@ -135,50 +139,119 @@ fn maybe_complete_bootstrap(workspace: &Path) {
     }
 }
 
-fn identity_profile_is_complete(workspace: &Path) -> bool {
-    let Some(content) = read_nonempty(workspace.join("IDENTITY.md")) else {
+fn profile_file_has_user_edits(workspace: &Path, file_name: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string(workspace.join(file_name)) else {
+        return false;
+    };
+    let baseline = read_bootstrap_baseline(workspace, file_name)
+        .or_else(|| template_file_content(file_name));
+    let Some(baseline) = baseline else {
         return false;
     };
 
-    has_required_field(&content, &["Name:", "**Name:**", "名称：", "名称:"])
+    normalize_template_text(&content) != normalize_template_text(&baseline)
 }
 
-fn user_profile_is_complete(workspace: &Path) -> bool {
-    let Some(content) = read_nonempty(workspace.join("USER.md")) else {
-        return false;
-    };
-
-    has_required_field(&content, &["Name:", "**Name:**", "姓名：", "姓名:"])
+fn bootstrap_baseline_path(workspace: &Path, file_name: &str) -> PathBuf {
+    workspace.join(BOOTSTRAP_BASELINE_DIR).join(file_name)
 }
 
-fn has_required_field(content: &str, field_prefixes: &[&str]) -> bool {
-    extract_field_value(content, field_prefixes).is_some()
+fn read_bootstrap_baseline(workspace: &Path, file_name: &str) -> Option<String> {
+    std::fs::read_to_string(bootstrap_baseline_path(workspace, file_name)).ok()
 }
 
-fn extract_field_value(content: &str, field_prefixes: &[&str]) -> Option<String> {
-    for line in content.lines() {
-        let line = line.trim().trim_start_matches('-').trim();
-        for prefix in field_prefixes {
-            let Some(rest) = line.strip_prefix(prefix) else {
-                continue;
-            };
-            let rest = rest.trim();
-            if is_placeholder_field_value(rest) {
-                continue;
-            }
-            return Some(rest.to_string());
+fn write_bootstrap_baselines(workspace: &Path) {
+    let baseline_dir = workspace.join(BOOTSTRAP_BASELINE_DIR);
+    if let Err(e) = std::fs::create_dir_all(&baseline_dir) {
+        eprintln!(
+            "WARNING: failed to create bootstrap baseline dir {}: {e}",
+            baseline_dir.display()
+        );
+        return;
+    }
+
+    for &file_name in BOOTSTRAP_PROFILE_FILES {
+        let target = bootstrap_baseline_path(workspace, file_name);
+        if target.exists() {
+            continue;
+        }
+
+        let Some(template) = template_file_content(file_name) else {
+            continue;
+        };
+
+        if let Err(e) = std::fs::write(&target, template) {
+            eprintln!(
+                "WARNING: failed to write bootstrap baseline {}: {e}",
+                target.display()
+            );
         }
     }
-    None
 }
 
-fn is_placeholder_field_value(value: &str) -> bool {
-    let trimmed = value.trim();
-    trimmed.is_empty()
-        || trimmed.starts_with('(')
-        || trimmed.starts_with('（')
-        || trimmed.starts_with("_(")
-        || trimmed.starts_with("_（")
+fn ensure_bootstrap_baselines(workspace: &Path) {
+    if !workspace.join(BOOTSTRAP_FILE).exists() {
+        return;
+    }
+
+    let baseline_dir = workspace.join(BOOTSTRAP_BASELINE_DIR);
+    if let Err(e) = std::fs::create_dir_all(&baseline_dir) {
+        eprintln!(
+            "WARNING: failed to create bootstrap baseline dir {}: {e}",
+            baseline_dir.display()
+        );
+        return;
+    }
+
+    for &file_name in BOOTSTRAP_PROFILE_FILES {
+        let target = bootstrap_baseline_path(workspace, file_name);
+        if target.exists() {
+            continue;
+        }
+
+        let Some(template) = template_file_content(file_name) else {
+            continue;
+        };
+        let Ok(content) = std::fs::read_to_string(workspace.join(file_name)) else {
+            continue;
+        };
+
+        if normalize_template_text(&content) != normalize_template_text(&template) {
+            continue;
+        }
+
+        if let Err(e) = std::fs::write(&target, template) {
+            eprintln!(
+                "WARNING: failed to write bootstrap baseline {}: {e}",
+                target.display()
+            );
+        }
+    }
+}
+
+fn remove_bootstrap_baselines(workspace: &Path) {
+    let baseline_dir = workspace.join(BOOTSTRAP_BASELINE_DIR);
+    match std::fs::remove_dir_all(&baseline_dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!(
+            "WARNING: failed to remove bootstrap baseline dir {}: {e}",
+            baseline_dir.display()
+        ),
+    }
+}
+
+fn template_file_content(file_name: &str) -> Option<String> {
+    let (_, embedded) = TEMPLATE_FILES.iter().find(|(name, _)| *name == file_name)?;
+    Some(
+        templates_dir()
+            .and_then(|dir| std::fs::read_to_string(dir.join(file_name)).ok())
+            .unwrap_or_else(|| (*embedded).to_string()),
+    )
+}
+
+fn normalize_template_text(content: &str) -> String {
+    content.replace("\r\n", "\n").trim().to_string()
 }
 
 /// Locate the templates directory on disk (prefer disk over embedded).
@@ -218,6 +291,7 @@ pub(crate) fn init_session_prompt_files(workspace: &Path) {
 
     migrate_legacy_agent_file(workspace);
     write_missing_templates(workspace, true);
+    write_bootstrap_baselines(workspace);
 }
 
 /// Ensure essential workspace directories exist for an existing session loaded
@@ -234,6 +308,7 @@ pub(crate) fn ensure_session_workspace(workspace: &Path) {
 
     migrate_legacy_agent_file(workspace);
     write_missing_templates(workspace, false);
+    ensure_bootstrap_baselines(workspace);
 }
 
 pub(crate) fn load_session_prompt_files_with_snapshot(
@@ -487,8 +562,8 @@ mod tests {
     }
 
     #[test]
-    fn load_session_prompt_files_auto_completes_bootstrap_when_profiles_are_ready() {
-        let workspace = std::env::temp_dir().join("lingclaw-bootstrap-autocomplete-test");
+    fn load_session_prompt_files_auto_completes_bootstrap_when_identity_is_edited() {
+        let workspace = std::env::temp_dir().join("lingclaw-bootstrap-identity-edit-test");
         let _ = fs::remove_dir_all(&workspace);
         fs::create_dir_all(&workspace).expect("workspace should be created");
         fs::create_dir_all(workspace.join("memory")).expect("memory dir should be created");
@@ -502,7 +577,7 @@ mod tests {
         .expect("identity file should be written");
         fs::write(
             workspace.join("USER.md"),
-            "- **Name:** Alex\n- **What to call them:**\n- **Timezone:**\n",
+            template_file_content("USER.md").expect("user template should exist"),
         )
         .expect("user file should be written");
         fs::write(workspace.join("SOUL.md"), "soul").expect("soul file should be written");
@@ -523,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn load_session_prompt_files_keeps_bootstrap_until_profiles_are_ready() {
+    fn load_session_prompt_files_keeps_bootstrap_until_profile_files_change() {
         let workspace = std::env::temp_dir().join("lingclaw-bootstrap-incomplete-test");
         let _ = fs::remove_dir_all(&workspace);
         fs::create_dir_all(&workspace).expect("workspace should be created");
@@ -532,12 +607,12 @@ mod tests {
         fs::write(workspace.join("AGENTS.md"), "agent").expect("agent file should be written");
         fs::write(
             workspace.join("IDENTITY.md"),
-            "- Name:\n- Creature:\n- Vibe:\n- Emoji:\n",
+            template_file_content("IDENTITY.md").expect("identity template should exist"),
         )
         .expect("identity file should be written");
         fs::write(
             workspace.join("USER.md"),
-            "- **Name:**\n- **What to call them:** Alex\n",
+            template_file_content("USER.md").expect("user template should exist"),
         )
         .expect("user file should be written");
 
@@ -554,8 +629,8 @@ mod tests {
     }
 
     #[test]
-    fn load_session_prompt_files_auto_completes_bootstrap_for_legacy_chinese_profiles() {
-        let workspace = std::env::temp_dir().join("lingclaw-bootstrap-legacy-profile-test");
+    fn load_session_prompt_files_auto_completes_bootstrap_when_user_is_edited() {
+        let workspace = std::env::temp_dir().join("lingclaw-bootstrap-user-edit-test");
         let _ = fs::remove_dir_all(&workspace);
         fs::create_dir_all(&workspace).expect("workspace should be created");
         fs::write(workspace.join("BOOTSTRAP.md"), "bootstrap")
@@ -563,12 +638,12 @@ mod tests {
         fs::write(workspace.join("AGENTS.md"), "agent").expect("agent file should be written");
         fs::write(
             workspace.join("IDENTITY.md"),
-            "- 名称：灵爪\n- 生物类型：\n- 气质：\n- 表情符号：\n- 头像：none\n",
+            template_file_content("IDENTITY.md").expect("identity template should exist"),
         )
         .expect("identity file should be written");
         fs::write(
             workspace.join("USER.md"),
-            "- 姓名：小李\n- 称呼方式：\n- 时区：\n",
+            "- **Name:** Alex\n- **What to call them:**\n- **Timezone:**\n",
         )
         .expect("user file should be written");
 
@@ -614,6 +689,43 @@ mod tests {
         assert!(!loaded.contains("<!-- BOOTSTRAP.md -->"));
         assert!(loaded.contains("<!-- IDENTITY.md -->"));
         assert!(loaded.contains("<!-- USER.md -->"));
+
+        let _ = fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn bootstrap_completion_uses_session_baseline_instead_of_current_template() {
+        let workspace = std::env::temp_dir().join("lingclaw-bootstrap-baseline-test");
+        let _ = fs::remove_dir_all(&workspace);
+        fs::create_dir_all(&workspace).expect("workspace should be created");
+        fs::create_dir_all(workspace.join(BOOTSTRAP_BASELINE_DIR))
+            .expect("baseline dir should be created");
+        fs::write(workspace.join("BOOTSTRAP.md"), "bootstrap")
+            .expect("bootstrap file should be written");
+        fs::write(workspace.join("AGENTS.md"), "agent").expect("agent file should be written");
+
+        let baseline_identity = "old identity template\n";
+        let baseline_user = "old user template\n";
+        fs::write(workspace.join("IDENTITY.md"), baseline_identity)
+            .expect("identity file should be written");
+        fs::write(workspace.join("USER.md"), baseline_user)
+            .expect("user file should be written");
+        fs::write(
+            bootstrap_baseline_path(&workspace, "IDENTITY.md"),
+            baseline_identity,
+        )
+        .expect("identity baseline should be written");
+        fs::write(bootstrap_baseline_path(&workspace, "USER.md"), baseline_user)
+            .expect("user baseline should be written");
+
+        let snapshot = LocalTimeSnapshot::from_datetime(
+            DateTime::parse_from_rfc3339("2026-03-16T00:05:07+08:00")
+                .expect("datetime should parse"),
+        );
+        let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
+
+        assert!(workspace.join("BOOTSTRAP.md").exists());
+        assert!(loaded.contains("<!-- BOOTSTRAP.md -->\nbootstrap"));
 
         let _ = fs::remove_dir_all(&workspace);
     }
