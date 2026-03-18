@@ -31,10 +31,12 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 ## Quick Start
 
 ```bash
-bash scripts/install-linux.sh   # Linux 一键安装/构建/可选 daemon 配置
+bash scripts/install-linux.sh   # Linux 一键安装/构建/部署 static/ 并执行安装后自检
 
 cargo build --release
 cargo install --path .
+mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin/static"
+cp -R static/. "${CARGO_HOME:-$HOME/.cargo}/bin/static/"
 
 # 首次运行打开设置向导
 lingclaw
@@ -52,6 +54,8 @@ lingclaw health
 lingclaw help
 lingclaw --version
 ```
+
+手动执行 `cargo install --path .` 时，必须把 `static/` 一并复制到安装目录旁边，否则 `http://127.0.0.1:18989/` 会返回 404。优先推荐直接使用 `bash scripts/install-linux.sh`。
 
 服务启动后访问 http://127.0.0.1:18989 。
 

@@ -77,7 +77,50 @@ install_build_deps() {
 install_release() {
   local cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
   cargo install --path . --force
+  if [[ -d "$ROOT_DIR/static" ]]; then
+    mkdir -p "$cargo_bin/static"
+    cp -R "$ROOT_DIR/static/." "$cargo_bin/static/"
+    info "Installed frontend assets to $cargo_bin/static"
+  else
+    warn 'Static frontend assets directory not found; web UI may return 404.'
+  fi
   export PATH="$cargo_bin:$PATH"
+}
+
+post_install_self_check() {
+  local cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+  local lingclaw_bin="$cargo_bin/lingclaw"
+  local static_index="$cargo_bin/static/index.html"
+  local failed=0
+
+  info 'Running post-install self-check.'
+
+  if [[ -x "$lingclaw_bin" ]]; then
+    info "Binary check passed: $lingclaw_bin"
+  else
+    warn "Binary check failed: $lingclaw_bin is missing or not executable."
+    failed=1
+  fi
+
+  if [[ -f "$static_index" ]]; then
+    info "Frontend asset check passed: $static_index"
+  else
+    warn "Frontend asset check failed: $static_index is missing. Web UI may return 404."
+    failed=1
+  fi
+
+  if [[ $failed -eq 0 ]]; then
+    if "$lingclaw_bin" --version >/dev/null 2>&1; then
+      info 'CLI self-check passed: lingclaw --version'
+      info 'Install self-check passed.'
+      return 0
+    fi
+    warn 'CLI self-check failed: lingclaw --version returned non-zero status.'
+    failed=1
+  fi
+
+  warn 'Install self-check failed. Re-run the installer or manually verify ~/.cargo/bin and ~/.cargo/bin/static.'
+  return 1
 }
 
 run_install_choice() {
@@ -88,6 +131,7 @@ run_install_choice() {
     Install)
       info 'Installing LingClaw into the global cargo bin directory.'
       install_release
+      post_install_self_check
       if prompt_yes_no 'Add LingClaw to PATH for future shells?'; then
         "$lingclaw_bin" path-install
       fi
@@ -98,6 +142,7 @@ run_install_choice() {
     Install-daemon)
       info 'Installing LingClaw and launching the setup wizard.'
       install_release
+      post_install_self_check
       "$lingclaw_bin" --install-daemon
       ;;
     'Skip for now')

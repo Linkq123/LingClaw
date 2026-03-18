@@ -76,6 +76,8 @@ bash scripts/install-linux.sh
 - 检查 Rust 环境；若未安装则自动安装，已安装时跳过 Rust 安装本身
 - 按 Linux 发行版安装 `openssl` / `pkg-config` 构建依赖
 - 执行 `cargo build --release`
+- 将 `static/` 前端资源部署到 cargo bin 目录旁边，避免首页 404
+- 执行安装后自检，确认 `lingclaw` 二进制和 `static/index.html` 都已就位
 - 最后让你选择 `Install`、`Install-daemon` 或 `Skip for now`
 - `Install` 路径会继续询问是否持久化 PATH、是否添加 systemd 服务
 
@@ -90,7 +92,12 @@ source "$HOME/.cargo/env"
 git clone <repo-url> LingClaw
 cd LingClaw
 cargo build --release
+cargo install --path .
+mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin/static"
+cp -R static/. "${CARGO_HOME:-$HOME/.cargo}/bin/static/"
 ```
+如果只执行 `cargo install --path .` 而没有同步 `static/` 到安装目录旁边，`/api/health` 仍可能正常，但访问首页 `http://127.0.0.1:18989/` 会返回 404。
+
 如果安装报错 `error: failed to run custom build command for openssl-sys`：
 - Ubuntu / Debian / Kali Linux
 ```bash

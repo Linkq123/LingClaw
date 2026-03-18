@@ -446,6 +446,45 @@ fn install_frontend_assets(source_dir: &Path, install_dir: &Path) -> io::Result<
     copy_dir_recursive(&source_static, &target_static)
 }
 
+fn install_built_binary(built_exe: &Path, current_exe: &Path) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        std::fs::copy(built_exe, current_exe)?;
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let install_dir = current_exe.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot determine install directory",
+            )
+        })?;
+        let file_name = current_exe.file_name().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot determine executable name",
+            )
+        })?;
+        let temp_exe = install_dir.join(format!(
+            ".{}.tmp-{}",
+            file_name.to_string_lossy(),
+            std::process::id()
+        ));
+
+        let _ = std::fs::remove_file(&temp_exe);
+        std::fs::copy(built_exe, &temp_exe)?;
+
+        if let Err(e) = std::fs::rename(&temp_exe, current_exe) {
+            let _ = std::fs::remove_file(&temp_exe);
+            return Err(e);
+        }
+
+        Ok(())
+    }
+}
+
 pub(crate) fn is_default_model_row(config: &Config, provider: &str, model_id: &str) -> bool {
     let full_ref = format!("{provider}/{model_id}");
     let default_model = config.resolved_model_ref(&config.model);
@@ -1125,7 +1164,7 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
                             });
                     if let Ok(current_exe) = std::env::current_exe() {
                         if built_exe != current_exe {
-                            match std::fs::copy(&built_exe, &current_exe) {
+                            match install_built_binary(&built_exe, &current_exe) {
                                 Ok(_) => println!(
                                     "   ✅ Installed v{source_version} → {}",
                                     current_exe.display()
