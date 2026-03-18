@@ -30,10 +30,14 @@ let reasoningPanel = null;
 let reactStatusRow = null;
 let reactStatusPhase = '';
 let reactStatusCycle = null;
+let reactPhaseShownAt = 0;
+let reactPhaseTimer = 0;
+let reactPhaseQueue = [];
 let sessionAvatar = null;
 let reconnectDelay = 1000;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 50;
+const MIN_REACT_PHASE_VISIBLE_MS = 320;
 let pendingAssistantText = '';
 let pendingReasoningText = '';
 let flushHandle = 0;
@@ -213,16 +217,133 @@ function canSendWhileBusy(cmd) {
   return /^\/(tool|reasoning)\b/i.test(cmd);
 }
 
+// ── Progressive segmented markdown ──
+
+function findProgressiveSplitPoint(text) {
+  let inFence = false;
+  let lastSplit = -1;
+  let i = 0;
+  while (i < text.length) {
+    const atLineStart = (i === 0 || text[i - 1] === '\n');
+    if (atLineStart && i + 2 < text.length &&
+        text[i] === '`' && text[i + 1] === '`' && text[i + 2] === '`') {
+      const wasFenced = inFence;
+      inFence = !inFence;
+      let j = i + 3;
+      while (j < text.length && text[j] !== '\n') j++;
+      i = j < text.length ? j + 1 : text.length;
+      if (wasFenced && !inFence && i < text.length) {
+        lastSplit = i;
+      }
+      continue;
+    }
+    if (!inFence && text[i] === '\n' && i + 1 < text.length && text[i + 1] === '\n') {
+      let j = i + 2;
+      while (j < text.length && text[j] === '\n') j++;
+      lastSplit = j;
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return lastSplit;
+}
+
+function decorateCodeBlocks(container) {
+  container.querySelectorAll('pre').forEach(pre => {
+    pre.style.position = 'relative';
+    const codeEl = pre.querySelector('code');
+    if (codeEl) {
+      const cls = [...codeEl.classList].find(c => c.startsWith('language-'));
+      if (cls) {
+        const label = document.createElement('span');
+        label.className = 'code-lang-label';
+        label.textContent = cls.replace('language-', '');
+        pre.appendChild(label);
+      }
+    }
+    const btn = document.createElement('button');
+    btn.className = 'copy-btn';
+    btn.textContent = 'Copy';
+    btn.onclick = () => {
+      const code = pre.querySelector('code');
+      const text = code?.textContent || pre.textContent;
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
+      } else {
+        fallbackCopy(text);
+      }
+      btn.textContent = 'Copied!';
+      setTimeout(() => btn.textContent = 'Copy', 1500);
+    };
+    pre.appendChild(btn);
+  });
+}
+
+function appendRenderedSegment(el, markdownText) {
+  const html = marked.parse(markdownText);
+  const sanitized = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : html;
+  const temp = document.createElement('div');
+  temp.innerHTML = sanitized;
+  decorateCodeBlocks(temp);
+  temp.querySelectorAll('pre code').forEach(block => {
+    if ((block.textContent || '').length <= 4000) {
+      hljs.highlightElement(block);
+    }
+  });
+  const tail = el._liveTail;
+  while (temp.firstChild) {
+    if (tail && tail.parentNode === el) {
+      el.insertBefore(temp.firstChild, tail);
+    } else {
+      el.appendChild(temp.firstChild);
+    }
+  }
+}
+
+function updateLiveTail(el, text) {
+  if (!el._liveTail) {
+    el._liveTail = document.createTextNode(text);
+    el.appendChild(el._liveTail);
+  } else {
+    el._liveTail.nodeValue = text;
+  }
+}
+
+function removeLiveTail(el) {
+  if (el._liveTail) {
+    if (el._liveTail.parentNode) el._liveTail.parentNode.removeChild(el._liveTail);
+    el._liveTail = null;
+  }
+}
+
 function flushAssistantText() {
   if (!currentMsg || !pendingAssistantText) return;
   currentMsg._rawText = (currentMsg._rawText || '') + pendingAssistantText;
-  if (!currentMsg._textNode) {
-    currentMsg._textNode = document.createTextNode(currentMsg._rawText);
-    currentMsg.replaceChildren(currentMsg._textNode);
-  } else {
-    currentMsg._textNode.nodeValue += pendingAssistantText;
-  }
   pendingAssistantText = '';
+
+  const raw = currentMsg._rawText;
+  const offset = currentMsg._renderedOffset || 0;
+  const splitAt = findProgressiveSplitPoint(raw);
+
+  if (splitAt > offset) {
+    if (currentMsg._textNode) {
+      currentMsg._textNode.remove();
+      currentMsg._textNode = null;
+    }
+    appendRenderedSegment(currentMsg, raw.substring(offset, splitAt));
+    currentMsg._renderedOffset = splitAt;
+    updateLiveTail(currentMsg, raw.substring(splitAt));
+  } else if (offset > 0) {
+    updateLiveTail(currentMsg, raw.substring(offset));
+  } else {
+    if (!currentMsg._textNode) {
+      currentMsg._textNode = document.createTextNode(raw);
+      currentMsg.replaceChildren(currentMsg._textNode);
+    } else {
+      currentMsg._textNode.nodeValue = raw;
+    }
+  }
   revealCurrentAssistant();
 }
 
@@ -283,6 +404,7 @@ function beginAssistantStream() {
   }
   message.classList.add('typing');
   message._rawText = '';
+  message._renderedOffset = 0;
   currentMsg = message;
 }
 
@@ -316,7 +438,17 @@ function finishAssistantStream({ discardIfEmpty = false } = {}) {
   }
 
   revealCurrentAssistant();
-  scheduleMarkdownRender(currentMsg);
+
+  const offset = currentMsg._renderedOffset || 0;
+  if (offset > 0) {
+    removeLiveTail(currentMsg);
+    const tail = raw.substring(offset).trim();
+    if (tail) {
+      appendRenderedSegment(currentMsg, tail);
+    }
+  } else {
+    scheduleMarkdownRender(currentMsg);
+  }
   currentMsg = null;
 }
 
@@ -352,20 +484,21 @@ function renderReactStatus() {
 }
 
 function clearReactStatus() {
+  if (reactPhaseTimer) {
+    clearTimeout(reactPhaseTimer);
+    reactPhaseTimer = 0;
+  }
+  reactPhaseQueue = [];
   reactStatusPhase = '';
   reactStatusCycle = null;
+  reactPhaseShownAt = 0;
   if (reactStatusRow) {
     reactStatusRow.remove();
     reactStatusRow = null;
   }
 }
 
-function showReactStatus(phase, cycle = null) {
-  if (!phase || phase === 'finish') {
-    clearReactStatus();
-    return;
-  }
-
+function ensureReactStatusRow() {
   if (!reactStatusRow) {
     reactStatusRow = document.createElement('div');
     reactStatusRow.className = 'msg-row system react-status-row';
@@ -384,11 +517,61 @@ function showReactStatus(phase, cycle = null) {
     chat.appendChild(reactStatusRow);
     hideWelcome();
   }
+}
 
+function scheduleNextReactPhase() {
+  if (reactPhaseTimer || reactPhaseQueue.length === 0 || !reactStatusPhase) {
+    return;
+  }
+
+  const elapsed = performance.now() - reactPhaseShownAt;
+  const delay = Math.max(0, MIN_REACT_PHASE_VISIBLE_MS - elapsed);
+  reactPhaseTimer = setTimeout(() => {
+    reactPhaseTimer = 0;
+    const next = reactPhaseQueue.shift();
+    if (!next) return;
+    applyReactStatusNow(next.phase, next.cycle);
+  }, delay);
+}
+
+function applyReactStatusNow(phase, cycle = null) {
+  ensureReactStatusRow();
   reactStatusPhase = phase;
   reactStatusCycle = Number.isInteger(cycle) ? cycle : null;
+  reactPhaseShownAt = performance.now();
   renderReactStatus();
   scrollDown();
+  scheduleNextReactPhase();
+}
+
+function showReactStatus(phase, cycle = null) {
+  if (!phase || phase === 'finish') {
+    clearReactStatus();
+    return;
+  }
+
+  if (!reactStatusPhase && reactPhaseQueue.length === 0 && !reactPhaseTimer) {
+    applyReactStatusNow(phase, cycle);
+    return;
+  }
+
+  if (reactStatusPhase === phase && reactPhaseQueue.length === 0) {
+    reactStatusCycle = Number.isInteger(cycle) ? cycle : null;
+    renderReactStatus();
+    return;
+  }
+
+  const lastQueued = reactPhaseQueue[reactPhaseQueue.length - 1];
+  if (lastQueued && lastQueued.phase === phase) {
+    lastQueued.cycle = Number.isInteger(cycle) ? cycle : null;
+    return;
+  }
+
+  reactPhaseQueue.push({
+    phase,
+    cycle: Number.isInteger(cycle) ? cycle : null,
+  });
+  scheduleNextReactPhase();
 }
 
 // ── Markdown setup ──
@@ -774,34 +957,7 @@ function renderMarkdown(el) {
   el.innerHTML = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : html;
   el._markdownIdleHandle = 0;
 
-  el.querySelectorAll('pre').forEach(pre => {
-    pre.style.position = 'relative';
-    const codeEl = pre.querySelector('code');
-    if (codeEl) {
-      const cls = [...codeEl.classList].find(c => c.startsWith('language-'));
-      if (cls) {
-        const label = document.createElement('span');
-        label.className = 'code-lang-label';
-        label.textContent = cls.replace('language-', '');
-        pre.appendChild(label);
-      }
-    }
-    const btn = document.createElement('button');
-    btn.className = 'copy-btn';
-    btn.textContent = 'Copy';
-    btn.onclick = () => {
-      const code = pre.querySelector('code');
-      const text = code?.textContent || pre.textContent;
-      if (navigator.clipboard) {
-        navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
-      } else {
-        fallbackCopy(text);
-      }
-      btn.textContent = 'Copied!';
-      setTimeout(() => btn.textContent = 'Copy', 1500);
-    };
-    pre.appendChild(btn);
-  });
+  decorateCodeBlocks(el);
 
   const codeBlocks = [...el.querySelectorAll('pre code')];
   const highlightQueue = codeBlocks.filter((block, index) => {
