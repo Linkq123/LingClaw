@@ -3368,24 +3368,24 @@ async fn handle_command(
         "/help" => {
             let mut help = "\
 Commands:
-  /new             Compress conversation to memory & clear context
+    /new             Compress conversation to memory & clear context
     /status          Show session status
     /usage           Show session token usage
-  /model [name]    Show or switch model
-  /think [level]   Set thinking mode (auto|off|minimal|low|medium|high|xhigh)
-  /react [on|off]  Toggle ReAct phase visibility
-  /tool [on|off]   Toggle tool card visibility
-  /reasoning [on|off] Toggle reasoning visibility
-  /skills          List available skills
-  /rename <name>   Rename current session
-  /clear           Clear messages (keep system prompt)
-  /help            Show this help"
+    /model [name]    Show or switch model
+    /think [level]   Set thinking mode (auto|off|minimal|low|medium|high|xhigh)
+    /react [on|off]  Toggle ReAct phase visibility
+    /tool [on|off]   Toggle tool card visibility
+    /reasoning [on|off] Toggle reasoning visibility
+    /skills          List available skills
+    /rename <name>   Rename current session
+    /clear           Clear messages (keep system prompt)
+    /help            Show this help"
                 .to_string();
             if current_session_id == MAIN_SESSION_ID {
                 help.push_str(
                     "\n\nMain session commands:\n\
-    /sessions        List all active sessions\n\
-    /delete <id>     Delete a session by full ID or unique prefix",
+        /sessions        List all active sessions\n\
+        /delete <id>     Delete a session by full ID or unique prefix",
                 );
             }
             Some(CommandResult {
