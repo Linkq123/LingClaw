@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::{config_dir_path, config_file_path, Config, VERSION};
+use crate::{config_dir_path, config_file_path, Config, DEFAULT_PORT, VERSION};
 
 // ── Interactive Helpers ──────────────────────────────────────────────────────
 
@@ -34,6 +34,204 @@ fn prompt_choice(options: &[&str]) -> usize {
             "Invalid choice. Please enter a number between 1 and {}.",
             options.len()
         );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+const SYSTEMD_SERVICE_NAME: &str = "lingclaw.service";
+
+#[cfg(not(target_os = "windows"))]
+const SYSTEMD_SERVICE_PATH: &str = "/etc/systemd/system/lingclaw.service";
+
+#[cfg(not(target_os = "windows"))]
+fn shell_profile_paths(home: &Path) -> Vec<PathBuf> {
+    vec![
+        home.join(".profile"),
+        home.join(".bashrc"),
+        home.join(".zshrc"),
+    ]
+}
+
+#[cfg(not(target_os = "windows"))]
+fn append_export_once(rc_path: &Path, dir: &str, export_line: &str) -> io::Result<bool> {
+    let content = std::fs::read_to_string(rc_path).unwrap_or_default();
+    if content.contains(export_line) || content.contains(dir) {
+        return Ok(false);
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(rc_path)?;
+    if !content.is_empty() && !content.ends_with('\n') {
+        writeln!(file)?;
+    }
+    writeln!(file, "# LingClaw")?;
+    writeln!(file, "{export_line}")?;
+    Ok(true)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn systemd_service_path() -> PathBuf {
+    PathBuf::from(SYSTEMD_SERVICE_PATH)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn systemd_available() -> bool {
+    std::process::Command::new("systemctl")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn systemd_service_installed() -> bool {
+    systemd_available() && systemd_service_path().exists()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn systemd_query(args: &[&str]) -> bool {
+    std::process::Command::new("systemctl")
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn systemd_service_active() -> bool {
+    systemd_query(&["is-active", "--quiet", SYSTEMD_SERVICE_NAME])
+}
+
+#[cfg(not(target_os = "windows"))]
+fn systemd_service_enabled() -> bool {
+    systemd_query(&["is-enabled", "--quiet", SYSTEMD_SERVICE_NAME])
+}
+
+#[cfg(not(target_os = "windows"))]
+fn running_as_root() -> bool {
+    std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn privileged_command(program: &str) -> std::process::Command {
+    if running_as_root() {
+        std::process::Command::new(program)
+    } else {
+        let mut command = std::process::Command::new("sudo");
+        command.arg(program);
+        command
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_systemctl(args: &[&str]) -> io::Result<bool> {
+    let mut command = privileged_command("systemctl");
+    let status = command.args(args).status()?;
+    Ok(status.success())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn build_systemd_service_unit(exe: &Path, working_dir: &Path, user: &str, home: &str) -> String {
+    format!(
+        "[Unit]\nDescription=LingClaw AI Assistant\nAfter=network.target\n\n[Service]\nType=simple\nUser={user}\nWorkingDirectory={}\nEnvironment=HOME={}\nExecStart={} --serve\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+        working_dir.display(),
+        home,
+        exe.display()
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+fn install_systemd_service() -> bool {
+    if !systemd_available() {
+        eprintln!("❌ systemctl not available on this system.");
+        return true;
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("❌ Cannot determine executable path: {e}");
+            return true;
+        }
+    };
+    let working_dir = exe
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"));
+    let user = std::env::var("SUDO_USER")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "root".to_string());
+    let home = std::env::var("HOME").unwrap_or_else(|_| format!("/home/{user}"));
+    let service_body = build_systemd_service_unit(&exe, &working_dir, &user, &home);
+
+    let temp_dir = config_dir_path().unwrap_or_else(|| PathBuf::from("."));
+    if let Err(e) = std::fs::create_dir_all(&temp_dir) {
+        eprintln!(
+            "❌ Failed to prepare temp directory {}: {e}",
+            temp_dir.display()
+        );
+        return true;
+    }
+    let temp_service = temp_dir.join(SYSTEMD_SERVICE_NAME);
+    if let Err(e) = std::fs::write(&temp_service, service_body) {
+        eprintln!(
+            "❌ Failed to write service file {}: {e}",
+            temp_service.display()
+        );
+        return true;
+    }
+
+    let temp_service_str = temp_service.to_string_lossy().to_string();
+    let service_path_str = systemd_service_path().to_string_lossy().to_string();
+    let install_status = privileged_command("install")
+        .args(["-m", "0644", &temp_service_str, &service_path_str])
+        .status();
+    match install_status {
+        Ok(status) if status.success() => {}
+        Ok(_) => {
+            eprintln!(
+                "❌ Failed to install systemd unit into {}",
+                service_path_str
+            );
+            return true;
+        }
+        Err(e) => {
+            eprintln!("❌ Failed to run install for systemd unit: {e}");
+            return true;
+        }
+    }
+
+    if !run_systemctl(&["daemon-reload"]).unwrap_or(false) {
+        eprintln!("❌ Failed to reload systemd daemon.");
+        return true;
+    }
+    if !run_systemctl(&["enable", "--now", SYSTEMD_SERVICE_NAME]).unwrap_or(false) {
+        eprintln!("❌ Failed to enable/start {}.", SYSTEMD_SERVICE_NAME);
+        return true;
+    }
+
+    println!("✅ systemd service installed: {}", service_path_str);
+    println!("   Service: {SYSTEMD_SERVICE_NAME}");
+    println!("   Logs: journalctl -u {SYSTEMD_SERVICE_NAME} -f");
+    true
+}
+
+fn print_start_details(port: u16, manager: &str) {
+    println!("  Manager: {manager}");
+    println!("  Address: http://127.0.0.1:{port}");
+    if let Some(path) = config_file_path() {
+        println!("  Config:  {}", path.display());
     }
 }
 
@@ -101,34 +299,39 @@ fn install_global_path() {
 
     #[cfg(not(target_os = "windows"))]
     {
-        // Append to ~/.bashrc and ~/.zshrc if not already present
         let home = std::env::var("HOME").unwrap_or_default();
         if home.is_empty() {
             eprintln!("   ❌ Cannot determine HOME directory");
             return;
         }
+        let home_path = PathBuf::from(&home);
         let export_line = format!("export PATH=\"{dir}:$PATH\"");
         let mut added = false;
-        for rc in &[".bashrc", ".zshrc"] {
-            let rc_path = Path::new(&home).join(rc);
-            if !rc_path.exists() {
-                continue;
-            }
-            let content = std::fs::read_to_string(&rc_path).unwrap_or_default();
-            if content.contains(&dir) {
-                continue;
-            }
-            if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&rc_path) {
-                let _ = writeln!(f, "\n# LingClaw\n{export_line}");
-                added = true;
+        for rc_path in shell_profile_paths(&home_path) {
+            match append_export_once(&rc_path, &dir, &export_line) {
+                Ok(changed) => {
+                    added |= changed;
+                }
+                Err(e) => {
+                    eprintln!("   ❌ Failed to update {}: {e}", rc_path.display());
+                }
             }
         }
+        let current_path = std::env::var("PATH").unwrap_or_default();
+        let already_in_current = current_path.split(':').any(|entry| entry == dir);
+        if !already_in_current {
+            let next_path = if current_path.is_empty() {
+                dir.clone()
+            } else {
+                format!("{dir}:{current_path}")
+            };
+            std::env::set_var("PATH", next_path);
+        }
         if added {
-            println!(
-                "   ✅ Added to PATH in shell config. Run `source ~/.bashrc` or restart terminal."
-            );
+            println!("   ✅ Added to PATH for current shell and future login shells.");
+            println!("   Updated: ~/.profile, ~/.bashrc, ~/.zshrc (when available)");
         } else {
-            println!("   ✅ Already in PATH (or no .bashrc/.zshrc found)");
+            println!("   ✅ Already in PATH");
         }
     }
 }
@@ -209,15 +412,51 @@ pub(crate) fn is_default_model_row(config: &Config, provider: &str, model_id: &s
 pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool {
     match cmd {
         "start" => {
+            let config = Config::load();
+            #[cfg(not(target_os = "windows"))]
+            let managed_by_systemd = systemd_service_installed();
+            #[cfg(target_os = "windows")]
+            let managed_by_systemd = false;
+            let effective_port = if managed_by_systemd {
+                if let Some(port) = port_override {
+                    if port != config.port {
+                        eprintln!(
+                            "Warning: --port is ignored when LingClaw is managed by systemd. Update config and restart the service instead."
+                        );
+                    }
+                }
+                config.port
+            } else {
+                port_override.unwrap_or(config.port)
+            };
+
+            #[cfg(not(target_os = "windows"))]
+            if managed_by_systemd {
+                println!("Starting LingClaw via systemd...");
+                print_start_details(effective_port, "systemd");
+                match run_systemctl(&["start", SYSTEMD_SERVICE_NAME]) {
+                    Ok(true) => println!("Started {}.", SYSTEMD_SERVICE_NAME),
+                    Ok(false) => eprintln!("Failed to start {}.", SYSTEMD_SERVICE_NAME),
+                    Err(e) => eprintln!("Failed to start {}: {e}", SYSTEMD_SERVICE_NAME),
+                }
+                return true;
+            }
+
             let exe = std::env::current_exe().expect("cannot find executable");
             let mut extra_args: Vec<String> = vec!["--serve".to_string()];
             if let Some(p) = port_override {
                 extra_args.push("--port".to_string());
                 extra_args.push(p.to_string());
-                println!("Starting LingClaw daemon on port {p}...");
-            } else {
-                println!("Starting LingClaw daemon...");
             }
+            println!("Starting LingClaw daemon...");
+            print_start_details(
+                effective_port,
+                if cfg!(target_os = "windows") {
+                    "detached-process"
+                } else {
+                    "nohup"
+                },
+            );
             #[cfg(target_os = "windows")]
             {
                 use std::os::windows::process::CommandExt;
@@ -264,6 +503,16 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
         "stop" => {
             let config = Config::load();
             let port = port_override.unwrap_or(config.port);
+            #[cfg(not(target_os = "windows"))]
+            if systemd_service_installed() {
+                println!("Stopping LingClaw systemd service...");
+                match run_systemctl(&["stop", SYSTEMD_SERVICE_NAME]) {
+                    Ok(true) => println!("Stopped {}.", SYSTEMD_SERVICE_NAME),
+                    Ok(false) => eprintln!("Failed to stop {}.", SYSTEMD_SERVICE_NAME),
+                    Err(e) => eprintln!("Failed to stop {}: {e}", SYSTEMD_SERVICE_NAME),
+                }
+                return true;
+            }
             let loopback = SocketAddr::from(([127, 0, 0, 1], port));
             println!("Stopping LingClaw on port {port}...");
 
@@ -341,6 +590,18 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             true
         }
         "restart" => {
+            #[cfg(not(target_os = "windows"))]
+            if systemd_service_installed() {
+                let config = Config::load();
+                println!("Restarting LingClaw via systemd...");
+                print_start_details(config.port, "systemd");
+                match run_systemctl(&["restart", SYSTEMD_SERVICE_NAME]) {
+                    Ok(true) => println!("Restarted {}.", SYSTEMD_SERVICE_NAME),
+                    Ok(false) => eprintln!("Failed to restart {}.", SYSTEMD_SERVICE_NAME),
+                    Err(e) => eprintln!("Failed to restart {}: {e}", SYSTEMD_SERVICE_NAME),
+                }
+                return true;
+            }
             handle_cli_command("stop", port_override);
             std::thread::sleep(Duration::from_secs(1));
             handle_cli_command("start", port_override);
@@ -482,6 +743,14 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             let config = Config::load();
             let port = port_override.unwrap_or(config.port);
             let addr = format!("127.0.0.1:{port}");
+            #[cfg(not(target_os = "windows"))]
+            let manager = if systemd_service_installed() {
+                "systemd"
+            } else {
+                "nohup"
+            };
+            #[cfg(target_os = "windows")]
+            let manager = "detached-process";
 
             // Check if running
             let running = std::net::TcpStream::connect_timeout(
@@ -503,7 +772,25 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
                     "❌ Stopped"
                 }
             );
+            println!("  Manager:       {}", manager);
             println!("  Address:       http://{addr}");
+            #[cfg(not(target_os = "windows"))]
+            if systemd_service_installed() {
+                println!(
+                    "  systemd:       {} / {}",
+                    if systemd_service_enabled() {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    if systemd_service_active() {
+                        "active"
+                    } else {
+                        "inactive"
+                    }
+                );
+                println!("  Service file:  {}", SYSTEMD_SERVICE_PATH);
+            }
             println!("  Default model: {}", config.model);
             println!("  Provider:      {}", config.provider.label());
             println!("  API base:      {}", config.api_base);
@@ -642,6 +929,8 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             println!("  status             Show detailed service status");
             println!("  update             Check for updates, rebuild if newer");
             println!("  install [-d DIR]   Install from local source directory");
+            #[cfg(not(target_os = "windows"))]
+            println!("  systemd-install    Install and enable lingclaw.service");
             println!("  help               Show this help message");
             println!();
             println!("Options:");
@@ -657,6 +946,8 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             println!("lingclaw v{VERSION}");
             true
         }
+        #[cfg(not(target_os = "windows"))]
+        "systemd-install" => install_systemd_service(),
         "install" => {
             // Parse -d <dir> from args; default to current directory
             let args: Vec<String> = std::env::args().collect();
@@ -1034,8 +1325,21 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     }
     println!();
 
+    #[cfg(not(target_os = "windows"))]
+    let add_systemd = {
+        println!("5. Add systemd service?");
+        println!("   If enabled, LingClaw will be managed by lingclaw.service.");
+        println!();
+        let choice = prompt_choice(&["YES", "NO"]);
+        println!();
+        choice == 0
+    };
+
     // ── Step 5: Install ──────────────────────────────────────────────────
+    #[cfg(target_os = "windows")]
     println!("5. Start installation");
+    #[cfg(not(target_os = "windows"))]
+    println!("6. Start installation");
     prompt_line("   Press Enter to continue...");
     println!();
 
@@ -1054,7 +1358,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     // Build config JSON
     let mut config = json!({
         "settings": {
-            "port": 3000,
+            "port": DEFAULT_PORT,
             "execTimeout": 30,
             "maxContextTokens": 32000,
         },
@@ -1102,6 +1406,11 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     }
 
     println!("   ✅ Configuration saved to {}", config_path.display());
+    #[cfg(not(target_os = "windows"))]
+    if add_systemd {
+        println!();
+        install_systemd_service();
+    }
     println!();
     true
 }

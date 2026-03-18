@@ -9,12 +9,17 @@ fn test_config() -> Config {
         model: "gpt-4o-mini".to_string(),
         provider: Provider::OpenAI,
         providers: HashMap::new(),
-        port: 3000,
+        port: DEFAULT_PORT,
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
     }
+}
+
+#[test]
+fn default_port_constant_is_18989() {
+    assert_eq!(DEFAULT_PORT, 18989);
 }
 
 fn test_app_state() -> AppState {

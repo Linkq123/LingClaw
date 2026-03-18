@@ -33,6 +33,7 @@ mod tools;
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const MAIN_SESSION_ID: &str = "main";
+pub(crate) const DEFAULT_PORT: u16 = 18989;
 
 // ── Config ──────────────────────────────────────────────────────────────────────────
 
@@ -158,7 +159,7 @@ impl Config {
             port: settings
                 .port
                 .or_else(|| std::env::var("LINGCLAW_PORT").ok()?.parse().ok())
-                .unwrap_or(3000),
+                .unwrap_or(DEFAULT_PORT),
             max_context_tokens: settings
                 .max_context_tokens
                 .or_else(|| {

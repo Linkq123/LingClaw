@@ -1,6 +1,6 @@
 {
   "settings": {
-    "port": 3000,
+    "port": 18989,
     "execTimeout": 30,
     "maxContextTokens": 32000,
     "maxOutputBytes": 51200,

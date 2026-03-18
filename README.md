@@ -31,6 +31,8 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 ## Quick Start
 
 ```bash
+bash scripts/install-linux.sh   # Linux 一键安装/构建/可选 daemon 配置
+
 cargo build --release
 cargo install --path .
 
@@ -45,12 +47,13 @@ lingclaw status
 lingclaw update
 lingclaw install
 lingclaw install -d /path/to/source
+lingclaw systemd-install        # Linux: 安装并启用 lingclaw.service
 lingclaw health
 lingclaw help
 lingclaw --version
 ```
 
-服务启动后访问 http://127.0.0.1:3000 。
+服务启动后访问 http://127.0.0.1:18989 。
 
 也可以只用环境变量：
 
@@ -69,7 +72,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 ```json
 {
   "settings": {
-    "port": 3000,
+    "port": 18989,
     "execTimeout": 30,
     "maxContextTokens": 32000,
     "maxOutputBytes": 51200,
@@ -140,7 +143,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `LINGCLAW_PROVIDER` | 自动检测 | 强制指定 `openai` 或 `anthropic` |
 | `OPENAI_API_BASE` | `https://api.openai.com/v1` | 备用 API Base |
 | `LINGCLAW_MODEL` | `gpt-4o-mini` | 默认模型 |
-| `LINGCLAW_PORT` | `3000` | HTTP 端口 |
+| `LINGCLAW_PORT` | `18989` | HTTP 端口 |
 | `LINGCLAW_EXEC_TIMEOUT` | `30` | Shell 命令超时（秒） |
 | `LINGCLAW_MAX_CONTEXT_TOKENS` | `32000` | 默认上下文 token 预算 |
 

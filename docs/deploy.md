@@ -2,6 +2,8 @@
 
 LingClaw 是单二进制 + 单静态文件的架构，部署极其简单。首次启动时会进入交互式 Setup Wizard，引导你配置 API Provider、Key 和默认模型，配置保存在 `~/.lingclaw/.lingclaw.json`。
 
+默认 Web 端口为 `18989`。
+
 ---
 
 ## 1. Windows
@@ -47,14 +49,14 @@ lingclaw help       # 查看帮助信息
 lingclaw --version  # 显示版本号
 ```
 
-浏览器打开 `http://127.0.0.1:3000`。
+浏览器打开 `http://127.0.0.1:18989`。
 
 ### 1.3 防火墙
 
 如需局域网访问，放通端口：
 
 ```powershell
-New-NetFirewallRule -DisplayName "LingClaw" -Direction Inbound -LocalPort 3000 -Protocol TCP -Action Allow
+New-NetFirewallRule -DisplayName "LingClaw" -Direction Inbound -LocalPort 18989 -Protocol TCP -Action Allow
 ```
 
 ---
@@ -62,6 +64,21 @@ New-NetFirewallRule -DisplayName "LingClaw" -Direction Inbound -LocalPort 3000 -
 ## 2. Linux
 
 ### 2.1 从源码构建
+
+推荐直接使用安装脚本：
+
+```bash
+bash scripts/install-linux.sh
+```
+
+脚本会自动：
+
+- 检查 Rust 环境，已安装时直接跳过
+- 按 Linux 发行版安装 `openssl` / `pkg-config` 构建依赖
+- 执行 `cargo build --release`
+- 最后让你选择 `Install`、`Install-daemon` 或 `Skip for now`
+
+手动构建流程如下：
 
 ```bash
 # 安装 Rust（如尚未安装）
@@ -73,18 +90,18 @@ git clone <repo-url> LingClaw
 cd LingClaw
 cargo build --release
 ```
-如果安装报错error: failed to run custom build command for `openssl-sys v0.9.112`
+如果安装报错 `error: failed to run custom build command for openssl-sys`：
 - Ubuntu / Debian / Kali Linux
 ```bash
 sudo apt-get update
-sudo apt-get install libssl-dev pkg-config
+sudo apt-get install -y libssl-dev pkg-config
 ```
 - CentOS / RHEL / Fedora / AlmaLinux
 ```bash
 # CentOS/RHEL/AlmaLinux
-sudo yum install openssl-devel pkgconfig
+sudo yum install -y openssl-devel pkgconfig
 # Fedora
-sudo dnf install openssl-devel pkgconfig
+sudo dnf install -y openssl-devel pkgconfig
 ```
 
 产物位于 `target/release/lingclaw`。
@@ -99,7 +116,7 @@ sudo dnf install openssl-devel pkgconfig
 ./target/release/lingclaw --install-daemon
 ```
 
-配置文件位于 `~/.lingclaw/.lingclaw.json`，支持手动编辑。
+配置文件位于 `~/.lingclaw/.lingclaw.json`，支持手动编辑。Linux 下 Setup Wizard 会额外询问是否添加 `systemd` 服务（yes/no）。
 
 CLI 管理命令（开启 PATH 后可直接使用）：
 
@@ -112,45 +129,24 @@ lingclaw status     # 详细状态（含版本号）
 lingclaw update     # 检查版本，有更新时 rebuild 并重启
 lingclaw install    # 从本地源码安装（当前目录）
 lingclaw install -d /path/to/src  # 从指定目录安装
+lingclaw systemd-install    # 安装并启用 lingclaw.service
 lingclaw help       # 查看帮助信息
 lingclaw --version  # 显示版本号
 ```
 
 ### 2.3 systemd 服务（可选）
 
-> LingClaw 已内置守护进程管理（`lingclaw start/stop/restart`），通常无需 systemd。如需开机自启可配置 systemd 服务。
-
-创建 `/etc/systemd/system/lingclaw.service`：
-
-```ini
-[Unit]
-Description=LingClaw AI Assistant
-After=network.target
-
-[Service]
-Type=simple
-User=lingclaw
-WorkingDirectory=/opt/lingclaw
-ExecStart=/opt/lingclaw/lingclaw --serve
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
+推荐直接在 Setup Wizard 里选择 `YES`，或在安装完成后运行：
 
 ```bash
-# 部署
-sudo mkdir -p /opt/lingclaw
-sudo cp target/release/lingclaw /opt/lingclaw/
-sudo cp -r static /opt/lingclaw/
-sudo useradd -r -s /bin/false lingclaw
-sudo chown -R lingclaw:lingclaw /opt/lingclaw
+lingclaw systemd-install
 
-sudo systemctl daemon-reload
-sudo systemctl enable --now lingclaw
-sudo systemctl status lingclaw
+# 查看状态与日志
+sudo systemctl status lingclaw.service
+journalctl -u lingclaw.service -f
 ```
+
+配置了 `systemd` 后，`lingclaw start`、`stop`、`restart` 会自动转为管理 `lingclaw.service`。`install` / `update` 触发服务恢复时，也会重启这个服务，而不是再额外起一个 `nohup` 进程。
 
 ### 2.4 反向代理（可选）
 
@@ -165,7 +161,7 @@ server {
     ssl_certificate_key /etc/ssl/private/lingclaw.key;
 
     location / {
-        proxy_pass http://127.0.0.1:3000;
+        proxy_pass http://127.0.0.1:18989;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
@@ -202,9 +198,9 @@ COPY --from=builder /build/target/release/lingclaw /usr/local/bin/
 COPY static/ /app/static/
 
 WORKDIR /app
-EXPOSE 3000
+EXPOSE 18989
 
-ENV LINGCLAW_PORT=3000
+ENV LINGCLAW_PORT=18989
 ENTRYPOINT ["lingclaw", "--serve"]
 ```
 
@@ -223,7 +219,7 @@ docker build -t lingclaw:latest .
 ```bash
 docker run -d \
   --name lingclaw \
-  -p 3000:3000 \
+  -p 18989:18989 \
   -v lingclaw-data:/root/.lingclaw \
   -v /path/to/.lingclaw.json:/root/.lingclaw/.lingclaw.json:ro \
   lingclaw:latest
@@ -241,7 +237,7 @@ services:
   lingclaw:
     build: .
     ports:
-      - "3000:3000"
+      - "18989:18989"
     volumes:
       - lingclaw-data:/root/.lingclaw
       - ./lingclaw.json:/root/.lingclaw/.lingclaw.json:ro
@@ -287,7 +283,7 @@ volumes:
 
 | JSON 字段 | 默认值 | 说明 | 环境变量覆盖 |
 |-----------|--------|------|--------------|
-| `port` | `3000` | HTTP 监听端口 | `LINGCLAW_PORT` |
+| `port` | `18989` | HTTP 监听端口 | `LINGCLAW_PORT` |
 | `provider` | `"auto"` | 强制指定：`openai` / `anthropic` / `auto` | `LINGCLAW_PROVIDER` |
 | `apiKey` | — | 通用 API Key（若未使用 providers 多配置） | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` |
 | `apiBase` | 按 provider 默认 | API 端点地址 | `OPENAI_API_BASE` |
@@ -320,10 +316,10 @@ docs/reference/templates/       # 7 个 Prompt 模板（BOOTSTRAP/AGENTS/IDENTIT
 
 ```bash
 # 健康检查
-curl http://127.0.0.1:3000/api/health
+curl http://127.0.0.1:18989/api/health
 
 # 预期返回
 # {"status":"ok","model":"gpt-4o-mini","sessions":0}
 ```
 
-浏览器打开 `http://<host>:3000` 即可使用。
+浏览器打开 `http://<host>:18989` 即可使用。
