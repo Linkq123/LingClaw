@@ -34,8 +34,8 @@ body {
 /* ── Animations ── */
 @keyframes blink { 50% { opacity: 0; } }
 @keyframes msgSlideIn {
-  from { opacity: 0; transform: translateY(16px) scale(0.97); }
-  to   { opacity: 1; transform: translateY(0) scale(1); }
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }
@@ -299,6 +299,10 @@ header .actions button.is-active {
   border-radius: 0;
   box-shadow: none;
   padding: 4px 2px 2px 2px;
+  transition: opacity .18s ease;
+}
+.msg.assistant.markdown-pending {
+  opacity: .92;
 }
 .msg.assistant p { margin: 0 0 8px; }
 .msg.assistant p:last-child { margin-bottom: 0; }
@@ -484,8 +488,18 @@ header .actions button.is-active {
   margin: 2px 0;
   overflow: hidden;
   font-size: 13px;
-  animation: msgSlideIn .35s cubic-bezier(0.34, 1.56, 0.64, 1);
   flex-shrink: 0;
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity .2s ease, transform .24s cubic-bezier(.22,1,.36,1), box-shadow .2s ease;
+}
+.reasoning-panel.panel-enter {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.reasoning-panel.panel-enter.panel-enter-active {
+  opacity: 1;
+  transform: translateY(0);
 }
 .reasoning-header {
   padding: 6px 12px;
@@ -504,7 +518,8 @@ header .actions button.is-active {
 .reasoning-header .chevron { margin-left: 8px; transition: transform .25s ease; }
 .reasoning-header .chevron.open { transform: rotate(90deg); }
 .reasoning-body {
-  max-height: 0;
+  height: 0;
+  opacity: 0;
   overflow: hidden;
   padding: 0 12px;
   background: rgba(212,150,10,.02);
@@ -513,9 +528,16 @@ header .actions button.is-active {
   line-height: 1.7;
   white-space: pre-wrap;
   color: var(--dim);
-  transition: max-height .3s ease, padding .3s ease;
+  transition: height .28s cubic-bezier(.22,1,.36,1), padding .22s ease, opacity .18s ease;
 }
-.reasoning-body.show { max-height: 400px; padding: 8px 12px; overflow-y: auto; }
+.reasoning-body.show {
+  opacity: 1;
+  padding: 8px 12px;
+  overflow-y: auto;
+}
+.reasoning-body.is-open {
+  opacity: 1;
+}
 .reasoning-active .reasoning-status::after {
   content: '';
   display: inline-block;
@@ -553,9 +575,18 @@ header .actions button.is-active {
   margin: 2px 0;
   overflow: hidden;
   font-size: 13px;
-  animation: msgSlideIn .35s cubic-bezier(0.34, 1.56, 0.64, 1);
   flex-shrink: 0;
-  transition: border-color .2s ease, box-shadow .2s ease, transform .2s ease;
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity .2s ease, transform .24s cubic-bezier(.22,1,.36,1), border-color .2s ease, box-shadow .2s ease;
+}
+.tool-panel.panel-enter {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.tool-panel.panel-enter.panel-enter-active {
+  opacity: 1;
+  transform: translateY(0);
 }
 .tool-panel.tool-result { border-left-color: var(--accent-success); }
 .tool-panel.tool-panel-active {
@@ -576,10 +607,13 @@ header .actions button.is-active {
 .tool-header:hover {
   background: var(--surface2);
   color: var(--text);
-  transform: translateX(1px);
 }
 .tool-header .tool-icon { color: var(--accent2); }
 .tool-header .tool-name { font-weight: 600; color: var(--text); }
+
+.code-highlight-deferred {
+  opacity: .96;
+}
 
 .tool-drawer-backdrop {
   position: fixed;

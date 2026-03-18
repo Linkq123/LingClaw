@@ -42,6 +42,110 @@ const HISTORY_RENDER_LIMIT = 50;
 let activeToolPanel = null;
 let showTools = true;
 let showReasoning = true;
+const markdownRenderQueue = [];
+let markdownQueueHandle = 0;
+
+function afterNextPaint(callback) {
+  requestAnimationFrame(() => requestAnimationFrame(callback));
+}
+
+function animatePanelIn(panel) {
+  if (!panel) return;
+  panel.classList.add('panel-enter');
+  afterNextPaint(() => {
+    if (!panel.isConnected) return;
+    panel.classList.add('panel-enter-active');
+  });
+}
+
+function cancelScheduledMarkdownRender(el) {
+  if (!el) return;
+  if (el._markdownIdleHandle) {
+    if (typeof cancelIdleCallback === 'function') {
+      cancelIdleCallback(el._markdownIdleHandle);
+    } else {
+      clearTimeout(el._markdownIdleHandle);
+    }
+    el._markdownIdleHandle = 0;
+  }
+}
+
+function scheduleBackgroundTask(callback, timeout = 180) {
+  if (typeof requestIdleCallback === 'function') {
+    return requestIdleCallback(callback, { timeout });
+  }
+  return setTimeout(callback, 16);
+}
+
+function cancelBackgroundTask(handle) {
+  if (!handle) return;
+  if (typeof cancelIdleCallback === 'function') {
+    cancelIdleCallback(handle);
+  } else {
+    clearTimeout(handle);
+  }
+}
+
+function shouldHighlightBlock(block, index, totalBlocks) {
+  const code = block.textContent || '';
+  if (code.length > 4000) return false;
+  if (totalBlocks > 6 && index >= 4) return false;
+  return true;
+}
+
+function scheduleMarkdownRender(el, options = {}) {
+  if (!el) return;
+  const { followScroll } = options;
+  cancelScheduledMarkdownRender(el);
+  const queuedIndex = markdownRenderQueue.indexOf(el);
+  if (queuedIndex !== -1) {
+    markdownRenderQueue.splice(queuedIndex, 1);
+  }
+  el.classList.add('markdown-pending');
+  el._markdownShouldFollow = typeof followScroll === 'boolean'
+    ? followScroll
+    : chat.scrollHeight - chat.scrollTop - chat.clientHeight < 80;
+  markdownRenderQueue.push(el);
+  if (!markdownQueueHandle) {
+    markdownQueueHandle = scheduleBackgroundTask(processMarkdownQueue);
+  }
+}
+
+function processMarkdownQueue() {
+  markdownQueueHandle = 0;
+  const el = markdownRenderQueue.shift();
+  if (!el) return;
+  el._markdownIdleHandle = 0;
+  if (el.isConnected) {
+    renderMarkdown(el);
+    el.classList.remove('markdown-pending');
+    if (el._markdownShouldFollow) scrollDown();
+  }
+  el._markdownShouldFollow = false;
+  if (markdownRenderQueue.length) {
+    markdownQueueHandle = scheduleBackgroundTask(processMarkdownQueue);
+  }
+}
+
+function animateCollapsibleSection(body, expand) {
+  if (!body) return;
+
+  const startHeight = body.getBoundingClientRect().height;
+  body.classList.toggle('show', expand);
+  const targetHeight = expand ? body.scrollHeight : 0;
+
+  body.style.height = `${startHeight}px`;
+  body.getBoundingClientRect();
+  body.classList.toggle('is-open', expand);
+  body.style.height = `${targetHeight}px`;
+
+  const finalize = () => {
+    body.style.height = expand ? 'auto' : '0px';
+    body.removeEventListener('transitionend', finalize);
+  };
+
+  body.addEventListener('transitionend', finalize);
+}
 
 function syncToolDrawerBounds() {
   if (!inputArea) return;
@@ -212,14 +316,19 @@ function finishAssistantStream({ discardIfEmpty = false } = {}) {
   }
 
   revealCurrentAssistant();
-  renderMarkdown(currentMsg);
-  scrollDown();
+  scheduleMarkdownRender(currentMsg);
   currentMsg = null;
 }
 
 function finishReasoningStream() {
   flushReasoningText();
   cancelReasoningFlush();
+  if (reasoningPanel) {
+    const body = reasoningPanel.querySelector('.reasoning-body');
+    if (body && body.classList.contains('show')) {
+      body.style.height = 'auto';
+    }
+  }
   scrollDown();
 }
 
@@ -459,6 +568,7 @@ function handleMessage(data) {
       } else {
         chat.appendChild(panel);
       }
+      animatePanelIn(panel);
       reasoningPanel = panel;
       hideWelcome();
       scrollDown();
@@ -487,7 +597,7 @@ function handleMessage(data) {
         const body = reasoningPanel.querySelector('.reasoning-body');
         const chevron = reasoningPanel.querySelector('.chevron');
         setTimeout(() => {
-          if (body) body.classList.remove('show');
+          if (body) animateCollapsibleSection(body, false);
           if (chevron) chevron.classList.remove('open');
         }, 600);
         reasoningPanel = null;
@@ -620,6 +730,7 @@ function addToolCall(name, args, id) {
     </div>
   `;
   chat.appendChild(panel);
+  animatePanelIn(panel);
   hideWelcome();
   scrollDown();
 }
@@ -653,6 +764,7 @@ function addToolResult(name, result, id) {
   `;
   el.classList.add('tool-panel-ready');
   chat.appendChild(el);
+  animatePanelIn(el);
   scrollDown();
 }
 
@@ -660,6 +772,7 @@ function renderMarkdown(el) {
   const raw = el._rawText || el.textContent;
   const html = marked.parse(raw);
   el.innerHTML = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : html;
+  el._markdownIdleHandle = 0;
 
   el.querySelectorAll('pre').forEach(pre => {
     pre.style.position = 'relative';
@@ -690,9 +803,29 @@ function renderMarkdown(el) {
     pre.appendChild(btn);
   });
 
-  el.querySelectorAll('pre code').forEach(block => {
-    hljs.highlightElement(block);
+  const codeBlocks = [...el.querySelectorAll('pre code')];
+  const highlightQueue = codeBlocks.filter((block, index) => {
+    if (!shouldHighlightBlock(block, index, codeBlocks.length)) {
+      block.classList.add('code-highlight-deferred');
+      return false;
+    }
+    return true;
   });
+
+  const highlightChunk = () => {
+    let processed = 0;
+    while (highlightQueue.length && processed < 2) {
+      hljs.highlightElement(highlightQueue.shift());
+      processed += 1;
+    }
+    if (highlightQueue.length) {
+      scheduleBackgroundTask(highlightChunk, 120);
+    }
+  };
+
+  if (highlightQueue.length) {
+    scheduleBackgroundTask(highlightChunk, 120);
+  }
 }
 
 // ── Session sidebar ──
@@ -883,8 +1016,11 @@ function closeToolDrawer() {
 }
 
 function toggleTool(header) {
-  header.querySelector('.chevron').classList.toggle('open');
-  header.nextElementSibling.classList.toggle('show');
+  const chevron = header.querySelector('.chevron');
+  const body = header.nextElementSibling;
+  const nextOpen = !body.classList.contains('show');
+  if (chevron) chevron.classList.toggle('open', nextOpen);
+  animateCollapsibleSection(body, nextOpen);
 }
 
 // ── History lazy-load ──
@@ -922,13 +1058,14 @@ function findHistoryRenderStart(messages, preferredStart) {
   return startIdx;
 }
 
-function renderHistoryMessage(m) {
+function renderHistoryMessage(m, options = {}) {
+  const { followMarkdown = true } = options;
   switch (m.role) {
     case 'user': addMsg('user', m.content, m.timestamp); break;
     case 'assistant': {
       const el = addMsg('assistant', m.content, m.timestamp);
       el._rawText = m.content;
-      renderMarkdown(el);
+      scheduleMarkdownRender(el, { followScroll: followMarkdown });
       break;
     }
     case 'tool_call': if (showTools) addToolCall(m.name, m.arguments, m.id); break;
@@ -946,7 +1083,7 @@ function loadEarlierMessages() {
   const existing = [...chat.children];
   chat.replaceChildren();
   chat.classList.add('no-animate');
-  for (const m of msgs) renderHistoryMessage(m);
+  for (const m of msgs) renderHistoryMessage(m, { followMarkdown: false });
   for (const el of existing) chat.appendChild(el);
   requestAnimationFrame(() => {
     chat.classList.remove('no-animate');
