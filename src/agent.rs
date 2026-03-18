@@ -264,6 +264,49 @@ pub(crate) fn evaluate_finish(has_content: bool, has_tool_calls: bool) -> Option
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────────────
+//  Hook System — lifecycle extension points
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Extension points in the agent loop lifecycle.
+///
+/// Hooks fire at well-defined phase boundaries. Concrete hook implementations
+/// (trait + registry) live in `src/main.rs` where they have access to session
+/// types, config, and the HTTP client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum HookPoint {
+    /// Before each Analyze phase — context compression, prompt injection.
+    BeforeAnalyze,
+    /// After Observe completes — post-processing, metrics.
+    AfterObserve,
+    /// Agent loop finished — cleanup, final logging.
+    OnFinish,
+}
+
+impl HookPoint {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::BeforeAnalyze => "before_analyze",
+            Self::AfterObserve => "after_observe",
+            Self::OnFinish => "on_finish",
+        }
+    }
+}
+
+impl std::fmt::Display for HookPoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Result of a hook execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum HookResult {
+    /// Continue normal flow.
+    Continue,
+}
+
 /// Compute effective think level when session mode is "auto".
 /// Adapts reasoning budget based on cycle depth and observation context.
 /// Called only for auto-mode sessions with reasoning-capable models.

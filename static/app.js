@@ -97,6 +97,35 @@ function shouldHighlightBlock(block, index, totalBlocks) {
   return true;
 }
 
+function scheduleCodeHighlight(blocks) {
+  const codeBlocks = [...blocks];
+  const highlightQueue = codeBlocks.filter((block, index) => {
+    if (!block.isConnected || !shouldHighlightBlock(block, index, codeBlocks.length)) {
+      block.classList.add('code-highlight-deferred');
+      return false;
+    }
+    return true;
+  });
+
+  const highlightChunk = () => {
+    let processed = 0;
+    while (highlightQueue.length && processed < 2) {
+      const block = highlightQueue.shift();
+      if (block?.isConnected) {
+        hljs.highlightElement(block);
+      }
+      processed += 1;
+    }
+    if (highlightQueue.length) {
+      scheduleBackgroundTask(highlightChunk, 120);
+    }
+  };
+
+  if (highlightQueue.length) {
+    scheduleBackgroundTask(highlightChunk, 120);
+  }
+}
+
 function scheduleMarkdownRender(el, options = {}) {
   if (!el) return;
   const { followScroll } = options;
@@ -286,11 +315,7 @@ function appendRenderedSegment(el, markdownText) {
   const temp = document.createElement('div');
   temp.innerHTML = sanitized;
   decorateCodeBlocks(temp);
-  temp.querySelectorAll('pre code').forEach(block => {
-    if ((block.textContent || '').length <= 4000) {
-      hljs.highlightElement(block);
-    }
-  });
+  const codeBlocks = [...temp.querySelectorAll('pre code')];
   const tail = el._liveTail;
   while (temp.firstChild) {
     if (tail && tail.parentNode === el) {
@@ -299,6 +324,7 @@ function appendRenderedSegment(el, markdownText) {
       el.appendChild(temp.firstChild);
     }
   }
+  scheduleCodeHighlight(codeBlocks);
 }
 
 function updateLiveTail(el, text) {
@@ -422,7 +448,8 @@ function finishAssistantStream({ discardIfEmpty = false } = {}) {
   }
 
   const row = currentMsgRow();
-  const raw = (currentMsg._rawText || '').trim();
+  const rawText = currentMsg._rawText || '';
+  const raw = rawText.trim();
   currentMsg.classList.remove('typing');
 
   if (!raw && discardIfEmpty) {
@@ -442,7 +469,7 @@ function finishAssistantStream({ discardIfEmpty = false } = {}) {
   const offset = currentMsg._renderedOffset || 0;
   if (offset > 0) {
     removeLiveTail(currentMsg);
-    const tail = raw.substring(offset).trim();
+    const tail = rawText.substring(offset);
     if (tail) {
       appendRenderedSegment(currentMsg, tail);
     }
@@ -958,30 +985,7 @@ function renderMarkdown(el) {
   el._markdownIdleHandle = 0;
 
   decorateCodeBlocks(el);
-
-  const codeBlocks = [...el.querySelectorAll('pre code')];
-  const highlightQueue = codeBlocks.filter((block, index) => {
-    if (!shouldHighlightBlock(block, index, codeBlocks.length)) {
-      block.classList.add('code-highlight-deferred');
-      return false;
-    }
-    return true;
-  });
-
-  const highlightChunk = () => {
-    let processed = 0;
-    while (highlightQueue.length && processed < 2) {
-      hljs.highlightElement(highlightQueue.shift());
-      processed += 1;
-    }
-    if (highlightQueue.length) {
-      scheduleBackgroundTask(highlightChunk, 120);
-    }
-  };
-
-  if (highlightQueue.length) {
-    scheduleBackgroundTask(highlightChunk, 120);
-  }
+  scheduleCodeHighlight(el.querySelectorAll('pre code'));
 }
 
 // ── Session sidebar ──

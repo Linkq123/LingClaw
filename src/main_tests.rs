@@ -33,6 +33,7 @@ fn test_app_state() -> AppState {
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
+        hooks: HookRegistry::new(),
     }
 }
 

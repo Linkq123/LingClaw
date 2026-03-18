@@ -14,7 +14,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -742,6 +744,7 @@ struct AppState {
     next_connection_id: AtomicU64,
     shutdown: CancellationToken,
     shutdown_token: String,
+    hooks: HookRegistry,
 }
 
 #[derive(Clone)]
@@ -1567,6 +1570,149 @@ fn prune_messages(messages: &mut Vec<ChatMessage>, max_tokens: usize) {
         messages.drain(1..1 + count);
         estimated = estimated.saturating_sub(removed);
     }
+}
+
+// ── Hook Infrastructure ──────────────────────────────────────────────────────
+
+/// Owned snapshot of session state for hook execution (lock-free).
+#[allow(dead_code)]
+struct HookInput {
+    messages: Vec<ChatMessage>,
+    model: String,
+    workspace: PathBuf,
+    ctx_limit: usize,
+    cycle: usize,
+}
+
+/// Mutations a hook can request.
+#[allow(dead_code)]
+enum HookOutput {
+    /// No changes needed.
+    NoOp,
+    /// Replace session messages with these.
+    ReplaceMessages(Vec<ChatMessage>),
+}
+
+/// Agent lifecycle hook.
+///
+/// Hooks follow a two-phase pattern to avoid holding the session lock during I/O:
+///   1. `should_run` — fast eligibility check, called **under** session lock.
+///   2. `run` — async execution, called **without** session lock.
+trait AgentHook: Send + Sync {
+    /// Human-readable name for logging.
+    fn name(&self) -> &'static str;
+
+    /// Which lifecycle point this hook fires at.
+    fn point(&self) -> agent::HookPoint;
+
+    /// Fast eligibility check. Called under session lock — must not do I/O.
+    fn should_run(&self, messages: &[ChatMessage], ctx_limit: usize, cycle: usize) -> bool;
+
+    /// Execute the hook asynchronously. Called WITHOUT session lock.
+    fn run<'a>(
+        &'a self,
+        input: HookInput,
+        config: &'a Config,
+        http: &'a Client,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>>;
+}
+
+/// Registry of agent lifecycle hooks, populated at startup.
+struct HookRegistry {
+    hooks: Vec<Box<dyn AgentHook>>,
+}
+
+impl HookRegistry {
+    fn new() -> Self {
+        Self { hooks: Vec::new() }
+    }
+
+    #[allow(dead_code)]
+    fn register(&mut self, hook: Box<dyn AgentHook>) {
+        self.hooks.push(hook);
+    }
+
+    fn hooks_at(&self, point: agent::HookPoint) -> impl Iterator<Item = &dyn AgentHook> {
+        self.hooks
+            .iter()
+            .filter(move |h| h.point() == point)
+            .map(|h| h.as_ref())
+    }
+}
+
+/// Run all hooks registered at the given point for the specified session.
+///
+/// Handles the lock → check → unlock → run → relock → apply pattern:
+///   1. Lock session, call `should_run` for each hook at this point.
+///   2. Drop lock, call `run` for each eligible hook (safe for async I/O).
+///   3. Re-lock, apply any `ReplaceMessages` mutations.
+///
+/// Returns how many hooks actually fired.
+async fn run_hooks(
+    registry: &HookRegistry,
+    point: agent::HookPoint,
+    sessions: &Mutex<HashMap<String, Session>>,
+    session_id: &str,
+    config: &Config,
+    http: &Client,
+    cycle: usize,
+) -> usize {
+    // Collect eligible hook names under lock.
+    let eligible: Vec<&'static str> = {
+        let sessions_guard = sessions.lock().await;
+        let session = match sessions_guard.get(session_id) {
+            Some(s) => s,
+            None => return 0,
+        };
+        let model = session.effective_model(&config.model);
+        let ctx_limit = config.context_limit_for_model(model);
+        registry
+            .hooks_at(point)
+            .filter(|h| h.should_run(&session.messages, ctx_limit, cycle))
+            .map(|h| h.name())
+            .collect()
+    }; // lock dropped
+
+    let mut fired = 0usize;
+    for hook_name in &eligible {
+        let hook = match registry.hooks_at(point).find(|h| h.name() == *hook_name) {
+            Some(h) => h,
+            None => continue,
+        };
+
+        // Build owned input without lock.
+        let input = {
+            let sessions_guard = sessions.lock().await;
+            let session = match sessions_guard.get(session_id) {
+                Some(s) => s,
+                None => break,
+            };
+            let model = session.effective_model(&config.model).to_string();
+            let ctx_limit = config.context_limit_for_model(&model);
+            HookInput {
+                messages: session.messages.clone(),
+                model,
+                workspace: session.workspace.clone(),
+                ctx_limit,
+                cycle,
+            }
+        }; // lock dropped
+
+        let output = hook.run(input, config, http).await;
+
+        match output {
+            HookOutput::ReplaceMessages(new_msgs) => {
+                let mut sessions_guard = sessions.lock().await;
+                if let Some(session) = sessions_guard.get_mut(session_id) {
+                    session.messages = new_msgs;
+                    session.updated_at = now_epoch();
+                }
+            }
+            HookOutput::NoOp => {}
+        }
+        fired += 1;
+    }
+    fired
 }
 
 // ── Session Persistence ──────────────────────────────────────────────────────
@@ -3333,6 +3479,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
                     let had_observation_hint = last_observation_hint.is_some();
 
+                    // ── BeforeAnalyze hooks (e.g. auto-compress context) ──
+                    run_hooks(
+                        &state.hooks,
+                        agent::HookPoint::BeforeAnalyze,
+                        &state.sessions,
+                        &current_session_id,
+                        &state.config,
+                        &state.http,
+                        react_ctx.cycles,
+                    )
+                    .await;
+
                     let (msgs_snapshot, model, workspace, think_level, prev_avatar, pruned_count) = {
                         let mut sessions = state.sessions.lock().await;
                         let session = match sessions.get_mut(&current_session_id) {
@@ -3649,6 +3807,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         let _ = save_session_to_disk(s).await;
                     }
 
+                    // ── AfterObserve hooks ──
+                    run_hooks(
+                        &state.hooks,
+                        agent::HookPoint::AfterObserve,
+                        &state.sessions,
+                        &current_session_id,
+                        &state.config,
+                        &state.http,
+                        react_ctx.cycles,
+                    )
+                    .await;
+
                     react_ctx.transition_to_analyze();
                     if react_ctx.show_react {
                         let _ = live_send(
@@ -3669,6 +3839,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     if let Some(ref s) = snapshot {
                         let _ = save_session_to_disk(s).await;
                     }
+
+                    // ── OnFinish hooks ──
+                    run_hooks(
+                        &state.hooks,
+                        agent::HookPoint::OnFinish,
+                        &state.sessions,
+                        &current_session_id,
+                        &state.config,
+                        &state.http,
+                        react_ctx.cycles,
+                    )
+                    .await;
 
                     let finish_label = react_ctx
                         .finish_reason
@@ -3968,6 +4150,10 @@ async fn main() {
         let _ = std::fs::write(dir.join(format!("shutdown-{port}.token")), &shutdown_token);
     }
 
+    let hooks = HookRegistry::new();
+    // Register hooks here:
+    // hooks.register(Box::new(MyHook::new()));
+
     let state = Arc::new(AppState {
         config,
         http: Client::new(),
@@ -3978,6 +4164,7 @@ async fn main() {
         next_connection_id: AtomicU64::new(1),
         shutdown: shutdown.clone(),
         shutdown_token,
+        hooks,
     });
 
     // Ensure main session exists (load from disk or create fresh)
