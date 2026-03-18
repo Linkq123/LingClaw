@@ -1450,10 +1450,7 @@ fn accumulate_daily_token_usage<'a>(sessions: impl IntoIterator<Item = &'a Sessi
 
 fn format_usage_block(label: &str, input_tokens: u64, output_tokens: u64) -> String {
     format!(
-        "{label}:\n\
-         input_tokens: {}\n\
-         output_tokens: {}\n\
-         total_tokens: {}",
+        "{label}:\n\tinput_tokens: {}\n\toutput_tokens: {}\n\ttotal_tokens: {}",
         format_token_count(input_tokens),
         format_token_count(output_tokens),
         format_token_count(input_tokens.saturating_add(output_tokens)),
@@ -1932,21 +1929,18 @@ fn build_session_status(session: &Session, config: &Config) -> String {
 
 fn build_session_usage(session: &Session) -> String {
     let (today_input_tokens, today_output_tokens) = current_daily_token_usage(session);
+    let total_tokens = session.input_tokens.saturating_add(session.output_tokens);
+    let today_total_tokens = today_input_tokens.saturating_add(today_output_tokens);
 
     format!(
-        "usage_est:\n\
-         input_tokens: {}\n\
-         output_tokens: {}\n\
-         total_tokens: {}\n\
-         today_input_tokens: {}\n\
-         today_output_tokens: {}\n\
-         today_total_tokens: {}",
-        format_token_count(session.input_tokens),
-        format_token_count(session.output_tokens),
-        format_token_count(session.input_tokens.saturating_add(session.output_tokens)),
+        "today_usage_est:\n\tinput_tokens: {}\n\toutput_tokens: {}\n\n\
+total_usage_est:\n\ttotal_tokens: {}\n\ttoday_input_tokens: {}\n\ttoday_output_tokens: {}\n\ttoday_total_tokens: {}",
         format_token_count(today_input_tokens),
         format_token_count(today_output_tokens),
-        format_token_count(today_input_tokens.saturating_add(today_output_tokens)),
+        format_token_count(total_tokens),
+        format_token_count(today_input_tokens),
+        format_token_count(today_output_tokens),
+        format_token_count(today_total_tokens),
     )
 }
 
@@ -2873,7 +2867,7 @@ async fn handle_command(
             let mut help = "\
 Commands:
   /new             Compress conversation to memory & clear context
-  /status          Show session status
+    /status          Show session status
     /usage           Show session token usage
   /model [name]    Show or switch model
   /think [level]   Set thinking mode (auto|off|minimal|low|medium|high|xhigh)
@@ -2888,8 +2882,8 @@ Commands:
             if current_session_id == MAIN_SESSION_ID {
                 help.push_str(
                     "\n\nMain session commands:\n\
-                  /sessions        List all active sessions\n\
-                                    /delete <id>     Delete a session by full ID or unique prefix",
+    /sessions        List all active sessions\n\
+    /delete <id>     Delete a session by full ID or unique prefix",
                 );
             }
             Some(CommandResult {

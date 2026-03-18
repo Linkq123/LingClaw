@@ -758,10 +758,11 @@ fn build_session_usage_formats_totals() {
 
     let usage = build_session_usage(&session);
 
-    assert!(usage.contains("usage_est:"));
-    assert!(usage.contains("input_tokens: 12.3K"));
-    assert!(usage.contains("output_tokens: 4.6K"));
-    assert!(usage.contains("total_tokens: 16.9K"));
+    assert!(usage.contains("today_usage_est:"));
+    assert!(usage.contains("\tinput_tokens: 2.3K"));
+    assert!(usage.contains("\toutput_tokens: 560"));
+    assert!(usage.contains("total_usage_est:"));
+    assert!(usage.contains("\ttotal_tokens: 16.9K"));
     assert!(usage.contains("today_input_tokens: 2.3K"));
     assert!(usage.contains("today_output_tokens: 560"));
     assert!(usage.contains("today_total_tokens: 2.9K"));
@@ -778,6 +779,8 @@ fn build_session_usage_resets_today_window_when_day_changes() {
 
     let usage = build_session_usage(&session);
 
+    assert!(usage.contains("\tinput_tokens: 0"));
+    assert!(usage.contains("\toutput_tokens: 0"));
     assert!(usage.contains("today_input_tokens: 0"));
     assert!(usage.contains("today_output_tokens: 0"));
     assert!(usage.contains("today_total_tokens: 0"));
@@ -861,15 +864,16 @@ fn build_usage_report_includes_session_and_global_sections() {
 
     let report = build_usage_report(
         &current,
-        "global_today_usage_est:\ninput_tokens: 3K\noutput_tokens: 1K\ntotal_tokens: 4K",
+        "global_today_usage_est:\n\tinput_tokens: 3K\n\toutput_tokens: 1K\n\ttotal_tokens: 4K",
     );
 
-    assert!(report.contains("usage_est:"));
+    assert!(report.contains("today_usage_est:"));
+    assert!(report.contains("total_usage_est:"));
     assert!(report.contains("today_total_tokens: 2.9K"));
     assert!(report.contains("global_today_usage_est:"));
-    assert!(report.contains("input_tokens: 3K"));
-    assert!(report.contains("output_tokens: 1K"));
-    assert!(report.contains("total_tokens: 4K"));
+    assert!(report.contains("\tinput_tokens: 3K"));
+    assert!(report.contains("\toutput_tokens: 1K"));
+    assert!(report.contains("\ttotal_tokens: 4K"));
 }
 
 #[test]
@@ -1837,6 +1841,32 @@ fn handle_command_persists_tool_and_reasoning_visibility_changes() {
         .map(PathBuf::from)
         .expect("session dir should exist");
     let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn help_command_lists_usage_without_extra_indent() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+
+    let result = rt
+        .block_on(handle_command(
+            "/help",
+            MAIN_SESSION_ID,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+
+    assert!(result
+        .response
+        .contains("  /status          Show session status"));
+    assert!(result
+        .response
+        .contains("/usage           Show session token usage"));
 }
 
 #[test]
