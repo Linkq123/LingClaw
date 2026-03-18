@@ -1,6 +1,7 @@
 // ── State ──
 const chat = document.getElementById('chat');
 const input = document.getElementById('input');
+const inputArea = document.getElementById('input-area');
 const sendBtn = document.getElementById('send');
 const sendIcon = document.getElementById('send-icon');
 const connDot = document.getElementById('conn-dot');
@@ -39,6 +40,17 @@ const HISTORY_RENDER_LIMIT = 50;
 let activeToolPanel = null;
 let showTools = true;
 let showReasoning = true;
+
+function syncToolDrawerBounds() {
+  if (!inputArea) return;
+  const viewport = window.visualViewport;
+  const rect = inputArea.getBoundingClientRect();
+  const viewportBottom = viewport
+    ? viewport.offsetTop + viewport.height
+    : window.innerHeight;
+  const bottomInset = Math.max(16, Math.ceil(viewportBottom - rect.top + 8));
+  document.documentElement.style.setProperty('--tool-drawer-bottom', `${bottomInset}px`);
+}
 
 function updateViewToggleButtons() {
   if (toggleToolsBtn) {
@@ -520,17 +532,14 @@ function handleMessage(data) {
 // ── Message rendering ──
 function addMsg(cls, text, timestamp) {
   const isChat = (cls === 'user' || cls === 'assistant');
+  const hasAvatar = cls === 'assistant';
   const row = document.createElement('div');
   row.className = `msg-row ${cls}`;
 
-  if (isChat) {
+  if (hasAvatar) {
     const avatar = document.createElement('div');
     avatar.className = 'msg-avatar';
-    if (cls === 'user') {
-      avatar.textContent = 'U';
-    } else {
-      setAssistantAvatar(avatar, sessionAvatar);
-    }
+    setAssistantAvatar(avatar, sessionAvatar);
     row.appendChild(avatar);
   }
 
@@ -830,6 +839,7 @@ function syncToolDrawer(panel) {
 
 function openToolDrawer(panel) {
   if (!panel || !toolDrawer || !toolDrawerBackdrop) return;
+  syncToolDrawerBounds();
   if (activeToolPanel && activeToolPanel !== panel) {
     activeToolPanel.classList.remove('tool-panel-active');
   }
@@ -941,6 +951,7 @@ function send() {
   ws.send(text);
   input.value = '';
   input.style.height = 'auto';
+  syncToolDrawerBounds();
 }
 
 function sendCmd(cmd) {
@@ -950,6 +961,7 @@ function sendCmd(cmd) {
 }
 
 updateViewToggleButtons();
+syncToolDrawerBounds();
 
 input.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
@@ -962,7 +974,13 @@ document.addEventListener('keydown', (e) => {
 input.addEventListener('input', () => {
   input.style.height = 'auto';
   input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+  syncToolDrawerBounds();
 });
+window.addEventListener('resize', syncToolDrawerBounds);
+if (window.visualViewport) {
+  window.visualViewport.addEventListener('resize', syncToolDrawerBounds);
+  window.visualViewport.addEventListener('scroll', syncToolDrawerBounds);
+}
 sendBtn.addEventListener('click', send);
 
 connect();
