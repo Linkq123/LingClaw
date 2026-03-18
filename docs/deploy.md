@@ -73,7 +73,7 @@ bash scripts/install-linux.sh
 
 脚本会自动：
 
-- 检查 Rust 环境，已安装时直接跳过
+- 检查 Rust 环境；若未安装则自动安装，已安装时跳过 Rust 安装本身
 - 按 Linux 发行版安装 `openssl` / `pkg-config` 构建依赖
 - 执行 `cargo build --release`
 - 最后让你选择 `Install`、`Install-daemon` 或 `Skip for now`

@@ -6,7 +6,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **CLI** — 工具执行层：安全的命令/文件/网络工具、沙盒路径、SSRF 防护、安装与更新
 - **Loop** — 连接层：WebSocket 会话、多会话状态、流式输出、斜杠命令、持久化
 
-整个后端约 8700 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
+整个后端约 10200 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
 
 ## Features
 
@@ -24,7 +24,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **推理可见性控制**：默认开启 ReAct 阶段转换 WS 事件（`react_phase`），可通过 `/react on|off` 手动切换；浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
 - **结构化工具结果**：`ToolOutcome`（output + is_error + duration_ms），前缀式错误检测，必填参数预校验，`tool_result` WS 事件携带耗时和错误标记
 - **原子持久化**：会话存档先写 `.tmp` 再 rename（Windows 兼容），加载时自动修剪不完整工具调用
-- **会话版本控制**：`Session.version` 字段，新会话 v1，旧存档默认 v0
+- **会话版本控制**：`SESSION_VERSION = 3`，旧存档自动迁移并补齐 `show_tools` / `show_reasoning` 等字段默认值
 - **上下文裁剪追踪**：Analyze 阶段裁剪后发送 `context_pruned` WS 事件，包含移除消息数
 - **安全控制**：危险命令检测、沙盒路径解析、SSRF 阻断、重定向阻断、输出/文件大小上限
 
@@ -202,8 +202,8 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 ┌────────────────────────▼─────────────────────────────────────────┐
 │                    Connection Layer (Loop)                        │
 │   handle_socket() · handle_command() · session persistence       │
-│   active_connections · session ownership · avatar polling         │
-│   CancellationToken cooperative shutdown                         │
+│   active_connections · session_clients · live_rounds             │
+│   avatar polling · replay/rebind · cooperative shutdown          │
 └───────┬──────────────────┬───────────────────┬───────────────────┘
         │                  │                   │
 ┌───────▼───────┐  ┌───────▼────────┐  ┌──────▼────────┐
@@ -315,12 +315,12 @@ handle_socket()
 
 ```text
 src/
-├── main.rs          (~3000 行) — Config, Session, Agent Loop (phase-driven), 命令处理, HTTP 路由
-├── main_tests.rs    (~2000 行) — 主流程测试 + observation 摘要 + finish heuristic + 工具协议 + 持久化测试
+├── main.rs          (~3560 行) — Config, Session, Agent Loop (phase-driven), 命令处理, HTTP 路由
+├── main_tests.rs    (~2290 行) — 主流程测试 + observation 摘要 + replay/resume + 工具协议 + 持久化测试
 ├── agent.rs         (~410 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
-├── cli.rs           (~1040 行) — CLI 子命令, 设置向导, 安装/更新
-├── providers.rs     (~880 行)  — OpenAI/Anthropic 流式调用, 模型解析
-├── prompts.rs       (~370 行)  — 提示文件初始化/加载, 头像解析
+├── cli.rs           (~1370 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新
+├── providers.rs     (~840 行)  — OpenAI/Anthropic 流式调用, 模型解析
+├── prompts.rs       (~720 行)  — 提示文件初始化/加载, bootstrap baseline, 头像解析
 └── tools/
     ├── mod.rs       (~450 行)  — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验
     ├── fs.rs        (~310 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files
@@ -354,7 +354,9 @@ struct Session {
     think_level: String,       // "auto"|"off"|"minimal"|"low"|"medium"|"high"|"xhigh"
     workspace: PathBuf,        // ~/.lingclaw/{id}/workspace/
     avatar: Option<String>,    // transient, 不序列化
-    version: u32,              // 会话版本 (旧存档 serde default=0, 新会话=1)
+    show_tools: bool,
+    show_reasoning: bool,
+    version: u32,              // 会话版本 (当前 SESSION_VERSION = 3)
 }
 
 struct ChatMessage {
@@ -489,11 +491,16 @@ think_level 映射：
 
 | type | 用途 |
 |---|---|
-| `chunk` | 流式文本片段 |
+| `session` | 首次连接时的当前会话信息 |
+| `history` | 当前会话历史消息 |
+| `view_state` | `show_tools` / `show_reasoning` / `show_react` 状态同步 |
+| `avatar_update` | 会话头像更新 |
+| `start` | 新一轮回复开始 |
+| `delta` | 流式文本片段 |
 | `thinking_start` | 思维模式开始 |
 | `thinking_delta` | 思维流式片段 |
 | `thinking_done` | 思维模式结束 |
-| `tool_start` | 工具调用开始 |
+| `tool_call` | 工具调用开始 |
 | `tool_result` | 工具执行结果（含 `duration_ms`、`is_error`） |
 | `done` | 响应完成 |
 | `react_phase` | ReAct 阶段转换（默认启用，可通过 `/react off` 关闭） |
@@ -508,7 +515,7 @@ think_level 映射：
 | `session_deleted` | 会话已删除 |
 | `session_renamed` | 会话已重命名 |
 | `sessions_list` | 会话列表 |
-| `avatar` | 头像数据（data URI 或 null） |
+| `session` / `session_switched` | 当前会话已初始化或切换 |
 
 ## HTTP API
 
