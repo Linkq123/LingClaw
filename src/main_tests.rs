@@ -1209,6 +1209,20 @@ fn resolve_path_checked_allows_relative_path_that_normalizes_to_workspace_root()
 }
 
 #[test]
+fn resolve_path_checked_rejects_bootstrap_baseline_dir() {
+    let base = std::env::temp_dir().join(format!("lingclaw-resolve-bootstrap-{}", now_epoch()));
+    let bootstrap_dir = base.join(".lingclaw-bootstrap");
+    std::fs::create_dir_all(&bootstrap_dir).expect("bootstrap dir should be created");
+
+    let message = resolve_path_checked(".lingclaw-bootstrap/IDENTITY.md", &base)
+        .expect_err("bootstrap baseline dir should be protected");
+
+    assert!(message.contains("protected internal workspace data"));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
 fn read_file_reports_workspace_escape_clearly() {
     let base = std::env::temp_dir().join(format!("lingclaw-read-file-{}", now_epoch()));
     let outside = std::env::temp_dir().join(format!("lingclaw-outside-read-{}.txt", now_epoch()));

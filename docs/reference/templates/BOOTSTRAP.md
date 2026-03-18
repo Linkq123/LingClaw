@@ -35,6 +35,9 @@ Update these files with what you learned:
 - `IDENTITY.md` — your name, creature, vibe, emoji
 - `USER.md` — their name, how to address them, timezone, notes
 
+Only edit the workspace root prompt files that are part of the bootstrap flow.
+Do not read from, write to, or modify `.lingclaw-bootstrap/` — it is internal system state used to detect whether bootstrap is complete.
+
 Then open `SOUL.md` together and talk about:
 
 - What matters to them
@@ -45,7 +48,8 @@ Write it down. Make it real.
 
 ## When You're Done
 
-Delete this file. You don't need a bootstrap script anymore — you're you now.
+Once `IDENTITY.md` or `USER.md` has been updated, the backend will automatically retire this bootstrap flow and remove `BOOTSTRAP.md` for you.
+You do not need to delete files manually, and you should never modify `.lingclaw-bootstrap/` yourself.
 
 ---
 

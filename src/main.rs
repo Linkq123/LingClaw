@@ -937,6 +937,15 @@ fn resolve_path_checked(path_str: &str, workspace: &Path) -> Result<PathBuf, Str
         raw.to_path_buf()
     };
 
+    if relative.components().any(|component| {
+        matches!(component, std::path::Component::Normal(part) if part == ".lingclaw-bootstrap")
+    }) {
+        return Err(format!(
+            "path '{}' targets protected internal workspace data",
+            path_str
+        ));
+    }
+
     let mut resolved = workspace_root.clone();
     for component in relative.components() {
         match component {
