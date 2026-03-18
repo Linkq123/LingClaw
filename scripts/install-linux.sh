@@ -23,7 +23,7 @@ ensure_rust() {
   if command -v cargo >/dev/null 2>&1 && command -v rustc >/dev/null 2>&1; then
     info "Rust environment already installed: $(rustc --version)"
     info 'No additional Rust environment installation is required.'
-    return 1
+    return 0
   fi
 
   info 'Rust environment not found. Installing via rustup.'
@@ -37,8 +37,6 @@ ensure_rust() {
     warn 'Rust installation did not finish correctly. Please check rustup output and retry.'
     exit 1
   fi
-
-  return 0
 }
 
 install_build_deps() {
@@ -90,6 +88,9 @@ run_install_choice() {
     Install)
       info 'Installing LingClaw into the global cargo bin directory.'
       install_release
+      if prompt_yes_no 'Add LingClaw to PATH for future shells?'; then
+        "$lingclaw_bin" path-install
+      fi
       if prompt_yes_no 'Add systemd service now?'; then
         "$lingclaw_bin" systemd-install
       fi
@@ -110,9 +111,8 @@ run_install_choice() {
 }
 
 main() {
-  if ensure_rust; then
-    install_build_deps
-  fi
+  ensure_rust
+  install_build_deps
 
   info 'Building LingClaw release binary.'
   cargo build --release

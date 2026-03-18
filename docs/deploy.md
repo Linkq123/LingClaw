@@ -77,6 +77,7 @@ bash scripts/install-linux.sh
 - 按 Linux 发行版安装 `openssl` / `pkg-config` 构建依赖
 - 执行 `cargo build --release`
 - 最后让你选择 `Install`、`Install-daemon` 或 `Skip for now`
+- `Install` 路径会继续询问是否持久化 PATH、是否添加 systemd 服务
 
 手动构建流程如下：
 

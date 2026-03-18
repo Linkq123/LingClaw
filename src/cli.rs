@@ -142,6 +142,51 @@ fn run_systemctl(args: &[&str]) -> io::Result<bool> {
 }
 
 #[cfg(not(target_os = "windows"))]
+fn passwd_home_dir(user: &str) -> Option<String> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let mut parts = line.split(':');
+        let name = parts.next()?;
+        if name != user {
+            return None;
+        }
+        let _password = parts.next()?;
+        let _uid = parts.next()?;
+        let _gid = parts.next()?;
+        let _gecos = parts.next()?;
+        let home = parts.next()?;
+        if home.is_empty() {
+            None
+        } else {
+            Some(home.to_string())
+        }
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_home_for_user(user: &str) -> String {
+    if std::env::var("SUDO_USER").ok().as_deref() == Some(user) {
+        return passwd_home_dir(user).unwrap_or_else(|| format!("/home/{user}"));
+    }
+
+    if std::env::var("USER").ok().as_deref() == Some(user) {
+        if let Ok(home) = std::env::var("HOME") {
+            if !home.is_empty() {
+                return home;
+            }
+        }
+    }
+
+    passwd_home_dir(user).unwrap_or_else(|| {
+        if user == "root" {
+            "/root".to_string()
+        } else {
+            format!("/home/{user}")
+        }
+    })
+}
+
+#[cfg(not(target_os = "windows"))]
 fn build_systemd_service_unit(exe: &Path, working_dir: &Path, user: &str, home: &str) -> String {
     format!(
         "[Unit]\nDescription=LingClaw AI Assistant\nAfter=network.target\n\n[Service]\nType=simple\nUser={user}\nWorkingDirectory={}\nEnvironment=HOME={}\nExecStart={} --serve\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
@@ -172,7 +217,7 @@ fn install_systemd_service() -> bool {
     let user = std::env::var("SUDO_USER")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "root".to_string());
-    let home = std::env::var("HOME").unwrap_or_else(|_| format!("/home/{user}"));
+    let home = resolve_home_for_user(&user);
     let service_body = build_systemd_service_unit(&exe, &working_dir, &user, &home);
 
     let temp_dir = config_dir_path().unwrap_or_else(|| PathBuf::from("."));
@@ -944,6 +989,10 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
         }
         "--version" | "-V" => {
             println!("lingclaw v{VERSION}");
+            true
+        }
+        "path-install" => {
+            install_global_path();
             true
         }
         #[cfg(not(target_os = "windows"))]
