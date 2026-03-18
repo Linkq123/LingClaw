@@ -18,6 +18,8 @@ const toolDrawerMeta = document.getElementById('tool-drawer-meta');
 const toolDrawerArgs = document.getElementById('tool-drawer-args');
 const toolDrawerResult = document.getElementById('tool-drawer-result');
 const toolDrawerResultSection = document.getElementById('tool-drawer-result-section');
+const DEFAULT_BRAND_AVATAR = 'branding/avatar.png';
+const DEFAULT_WELCOME_LOGO = 'branding/logo-wordmark.png';
 
 let ws = null;
 let currentMsg = null;
@@ -763,7 +765,21 @@ function setAssistantAvatar(node, avatarValue) {
     node.appendChild(img);
     return;
   }
-  node.textContent = avatarValue || '🦀';
+
+  if (avatarValue) {
+    node.textContent = avatarValue;
+    return;
+  }
+
+  const img = document.createElement('img');
+  img.src = DEFAULT_BRAND_AVATAR;
+  img.alt = 'LingClaw avatar';
+  img.style.cssText = 'width:100%;height:100%;border-radius:50%;object-fit:cover';
+  img.onerror = () => {
+    node.replaceChildren();
+    node.textContent = '🦀';
+  };
+  node.appendChild(img);
 }
 
 function applySessionAvatar(nextAvatar) {
@@ -801,7 +817,7 @@ function showWelcome() {
   w.className = 'welcome';
   w.id = 'welcome';
   w.innerHTML = `
-    <div class="welcome-logo">🦀</div>
+    <div class="welcome-logo"><img src="${DEFAULT_WELCOME_LOGO}" alt="LingClaw"></div>
     <div class="welcome-title">LingClaw</div>
     <div class="welcome-hint">
       你的私人 AI 助手已就绪<br>

@@ -50,6 +50,11 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         created_at: 0,
         updated_at: 0,
         tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        token_usage_day: prompts::current_local_snapshot().today(),
         model_override: model_override.map(|value| value.to_string()),
         think_level: default_think_level(),
         show_react: false,
@@ -158,6 +163,11 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         created_at: 0,
         updated_at: 0,
         tool_calls_count: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        token_usage_day: prompts::current_local_snapshot().today(),
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
@@ -725,8 +735,141 @@ fn build_session_status_reports_resolved_target() {
     assert!(status.contains("resolved_provider: anthropic"));
     assert!(status.contains("resolved_api_base: https://api.anthropic.com"));
     assert!(status.contains("resolved_model_id: claude-sonnet-4-20250514"));
-    assert!(status.contains("max_tokens: 8192"));
+    assert!(status.contains("max_tokens: 8.2K"));
+    assert!(status.contains("context_est: 4/200K"));
     assert!(status.contains("think: medium"));
+}
+
+#[test]
+fn format_token_count_uses_k_and_m_units() {
+    assert_eq!(format_token_count(999), "999");
+    assert_eq!(format_token_count(1_200), "1.2K");
+    assert_eq!(format_token_count(128_000), "128K");
+    assert_eq!(format_token_count(1_250_000), "1.3M");
+}
+
+#[test]
+fn build_session_usage_formats_totals() {
+    let mut session = test_session("usage", "Usage", None);
+    session.input_tokens = 12_300;
+    session.output_tokens = 4_560;
+    session.daily_input_tokens = 2_300;
+    session.daily_output_tokens = 560;
+
+    let usage = build_session_usage(&session);
+
+    assert!(usage.contains("usage_est:"));
+    assert!(usage.contains("input_tokens: 12.3K"));
+    assert!(usage.contains("output_tokens: 4.6K"));
+    assert!(usage.contains("total_tokens: 16.9K"));
+    assert!(usage.contains("today_input_tokens: 2.3K"));
+    assert!(usage.contains("today_output_tokens: 560"));
+    assert!(usage.contains("today_total_tokens: 2.9K"));
+}
+
+#[test]
+fn build_session_usage_resets_today_window_when_day_changes() {
+    let mut session = test_session("usage-day", "Usage Day", None);
+    session.input_tokens = 12_300;
+    session.output_tokens = 4_560;
+    session.daily_input_tokens = 2_300;
+    session.daily_output_tokens = 560;
+    session.token_usage_day = "1999-01-01".to_string();
+
+    let usage = build_session_usage(&session);
+
+    assert!(usage.contains("today_input_tokens: 0"));
+    assert!(usage.contains("today_output_tokens: 0"));
+    assert!(usage.contains("today_total_tokens: 0"));
+}
+
+#[test]
+fn build_global_today_usage_sums_all_sessions() {
+    let mut first = test_session("one", "One", None);
+    first.daily_input_tokens = 2_300;
+    first.daily_output_tokens = 560;
+
+    let mut second = test_session("two", "Two", None);
+    second.daily_input_tokens = 700;
+    second.daily_output_tokens = 440;
+
+    let mut third = test_session("three", "Three", None);
+    third.daily_input_tokens = 999;
+    third.daily_output_tokens = 1;
+    third.token_usage_day = "1999-01-01".to_string();
+
+    let sessions = HashMap::from([
+        (first.id.clone(), first),
+        (second.id.clone(), second),
+        (third.id.clone(), third),
+    ]);
+
+    let usage = build_global_today_usage(&sessions);
+
+    assert!(usage.contains("global_today_usage_est:"));
+    assert!(usage.contains("input_tokens: 3K"));
+    assert!(usage.contains("output_tokens: 1K"));
+    assert!(usage.contains("total_tokens: 4K"));
+}
+
+#[test]
+fn gather_global_today_usage_includes_saved_sessions_not_loaded_in_memory() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let mut current = test_session("current", "Current", None);
+    current.daily_input_tokens = 2_300;
+    current.daily_output_tokens = 560;
+
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(current.id.clone(), current);
+    }
+
+    let saved_id = format!("saved-usage-{}", now_epoch());
+    let workspace = session_workspace_path(&saved_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let mut saved = test_session(&saved_id, "Saved", None);
+    saved.workspace = workspace.clone();
+    saved.daily_input_tokens = 700;
+    saved.daily_output_tokens = 440;
+    rt.block_on(save_session_to_disk(&saved))
+        .expect("saved session should persist");
+
+    let usage = rt.block_on(gather_global_today_usage(&state));
+
+    assert!(usage.contains("global_today_usage_est:"));
+    assert!(usage.contains("input_tokens: 3K"));
+    assert!(usage.contains("output_tokens: 1K"));
+    assert!(usage.contains("total_tokens: 4K"));
+
+    let _ = std::fs::remove_file(sessions_dir().join(format!("{saved_id}.json")));
+    let session_dir = workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn build_usage_report_includes_session_and_global_sections() {
+    let mut current = test_session("current", "Current", None);
+    current.input_tokens = 12_300;
+    current.output_tokens = 4_560;
+    current.daily_input_tokens = 2_300;
+    current.daily_output_tokens = 560;
+
+    let report = build_usage_report(
+        &current,
+        "global_today_usage_est:\ninput_tokens: 3K\noutput_tokens: 1K\ntotal_tokens: 4K",
+    );
+
+    assert!(report.contains("usage_est:"));
+    assert!(report.contains("today_total_tokens: 2.9K"));
+    assert!(report.contains("global_today_usage_est:"));
+    assert!(report.contains("input_tokens: 3K"));
+    assert!(report.contains("output_tokens: 1K"));
+    assert!(report.contains("total_tokens: 4K"));
 }
 
 #[test]
@@ -981,6 +1124,11 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         created_at: 1,
         updated_at: 1,
         tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        token_usage_day: prompts::current_local_snapshot().today(),
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
@@ -1046,6 +1194,11 @@ fn save_session_to_disk_overwrites_existing_file() {
         created_at: 1,
         updated_at: 1,
         tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        token_usage_day: prompts::current_local_snapshot().today(),
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
@@ -1386,6 +1539,11 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         created_at: 0,
         updated_at: 0,
         tool_calls_count: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        token_usage_day: prompts::current_local_snapshot().today(),
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
@@ -1719,6 +1877,178 @@ fn claim_requested_session_waits_for_active_connection_release() {
     ));
     assert_eq!(claimed.as_deref(), Some(session_id.as_str()));
 
+    let _ = rt
+        .block_on(state.active_connections.lock())
+        .remove(&session_id);
+    let _ = rt.block_on(state.sessions.lock()).remove(&session_id);
+}
+
+#[test]
+fn claim_requested_session_waits_for_bound_client_release_during_refresh() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("reclaim-bound-refresh-{}", now_epoch());
+    let state = Arc::new(test_app_state());
+    let old_connection_id = 10;
+    let new_connection_id = 11;
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(4);
+
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(
+            session_id.clone(),
+            test_session(&session_id, "Reconnect", None),
+        );
+    }
+    {
+        let mut active = rt.block_on(state.active_connections.lock());
+        active.insert(session_id.clone(), old_connection_id);
+    }
+    {
+        let mut clients = rt.block_on(state.session_clients.lock());
+        clients.insert(
+            session_id.clone(),
+            SessionClientBinding {
+                connection_id: old_connection_id,
+                tx: bound_tx,
+                replay_ready: true,
+                pending_events: Vec::new(),
+            },
+        );
+    }
+
+    let release_state = state.clone();
+    let release_id = session_id.clone();
+    rt.spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        release_state
+            .session_clients
+            .lock()
+            .await
+            .remove(&release_id);
+        release_state
+            .active_connections
+            .lock()
+            .await
+            .remove(&release_id);
+    });
+
+    let claimed = rt.block_on(claim_requested_session(
+        &session_id,
+        &state,
+        new_connection_id,
+    ));
+    assert_eq!(claimed.as_deref(), Some(session_id.as_str()));
+
+    let _ = rt
+        .block_on(state.session_clients.lock())
+        .remove(&session_id);
+    let _ = rt
+        .block_on(state.active_connections.lock())
+        .remove(&session_id);
+    let _ = rt.block_on(state.sessions.lock()).remove(&session_id);
+}
+
+#[test]
+fn try_claim_session_rejects_orphaned_bound_client() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("orphan-bound-client-{}", now_epoch());
+    let state = test_app_state();
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(4);
+
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(
+            session_id.clone(),
+            test_session(&session_id, "Reconnect", None),
+        );
+    }
+    {
+        let mut clients = rt.block_on(state.session_clients.lock());
+        clients.insert(
+            session_id.clone(),
+            SessionClientBinding {
+                connection_id: 10,
+                tx: bound_tx,
+                replay_ready: true,
+                pending_events: Vec::new(),
+            },
+        );
+    }
+
+    let claimed = rt.block_on(try_claim_session(&session_id, &state, 11));
+    assert!(matches!(claimed, ClaimSessionResult::InUse));
+
+    let _ = rt
+        .block_on(state.session_clients.lock())
+        .remove(&session_id);
+    let _ = rt.block_on(state.sessions.lock()).remove(&session_id);
+}
+
+#[test]
+fn claim_requested_session_waits_for_bound_client_release_after_active_disconnect() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("reclaim-release-order-{}", now_epoch());
+    let state = Arc::new(test_app_state());
+    let old_connection_id = 20;
+    let new_connection_id = 21;
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(4);
+
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(
+            session_id.clone(),
+            test_session(&session_id, "Reconnect", None),
+        );
+    }
+    {
+        let mut active = rt.block_on(state.active_connections.lock());
+        active.insert(session_id.clone(), old_connection_id);
+    }
+    {
+        let mut clients = rt.block_on(state.session_clients.lock());
+        clients.insert(
+            session_id.clone(),
+            SessionClientBinding {
+                connection_id: old_connection_id,
+                tx: bound_tx,
+                replay_ready: true,
+                pending_events: Vec::new(),
+            },
+        );
+    }
+
+    let release_state = state.clone();
+    let release_id = session_id.clone();
+    rt.spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        release_state
+            .active_connections
+            .lock()
+            .await
+            .remove(&release_id);
+        tokio::time::sleep(Duration::from_millis(650)).await;
+        release_state
+            .session_clients
+            .lock()
+            .await
+            .remove(&release_id);
+    });
+
+    let started = std::time::Instant::now();
+    let claimed = rt.block_on(claim_requested_session(
+        &session_id,
+        &state,
+        new_connection_id,
+    ));
+    assert_eq!(claimed.as_deref(), Some(session_id.as_str()));
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "claim should wait until the bound client is gone even after active_connections clears"
+    );
+
+    let _ = rt
+        .block_on(state.session_clients.lock())
+        .remove(&session_id);
     let _ = rt
         .block_on(state.active_connections.lock())
         .remove(&session_id);

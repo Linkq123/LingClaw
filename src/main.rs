@@ -625,6 +625,16 @@ struct Session {
     created_at: u64,
     updated_at: u64,
     tool_calls_count: usize,
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    daily_input_tokens: u64,
+    #[serde(default)]
+    daily_output_tokens: u64,
+    #[serde(default)]
+    token_usage_day: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_override: Option<String>,
     #[serde(default = "default_think_level")]
@@ -696,6 +706,11 @@ impl Session {
             created_at: now_epoch(),
             updated_at: now_epoch(),
             tool_calls_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            daily_input_tokens: 0,
+            daily_output_tokens: 0,
+            token_usage_day: prompts::current_local_snapshot().today(),
             model_override: None,
             think_level: default_think_level(),
             show_react: default_show_react(),
@@ -1393,6 +1408,96 @@ fn estimate_tokens(messages: &[ChatMessage]) -> usize {
     messages.iter().map(message_token_len).sum()
 }
 
+fn format_token_count(value: u64) -> String {
+    fn format_scaled(value: u64, divisor: u64, unit: &str) -> String {
+        let scaled_tenths = (value * 10 + divisor / 2) / divisor;
+        if scaled_tenths.is_multiple_of(10) {
+            format!("{}{}", scaled_tenths / 10, unit)
+        } else {
+            format!("{}.{}{}", scaled_tenths / 10, scaled_tenths % 10, unit)
+        }
+    }
+
+    if value >= 1_000_000 {
+        format_scaled(value, 1_000_000, "M")
+    } else if value >= 1_000 {
+        format_scaled(value, 1_000, "K")
+    } else {
+        value.to_string()
+    }
+}
+
+fn current_daily_token_usage(session: &Session) -> (u64, u64) {
+    let today = prompts::current_local_snapshot().today();
+    if session.token_usage_day == today {
+        (session.daily_input_tokens, session.daily_output_tokens)
+    } else {
+        (0, 0)
+    }
+}
+
+fn accumulate_daily_token_usage<'a>(sessions: impl IntoIterator<Item = &'a Session>) -> (u64, u64) {
+    sessions.into_iter().map(current_daily_token_usage).fold(
+        (0_u64, 0_u64),
+        |(input_acc, output_acc), (input, output)| {
+            (
+                input_acc.saturating_add(input),
+                output_acc.saturating_add(output),
+            )
+        },
+    )
+}
+
+fn format_usage_block(label: &str, input_tokens: u64, output_tokens: u64) -> String {
+    format!(
+        "{label}:\n\
+         input_tokens: {}\n\
+         output_tokens: {}\n\
+         total_tokens: {}",
+        format_token_count(input_tokens),
+        format_token_count(output_tokens),
+        format_token_count(input_tokens.saturating_add(output_tokens)),
+    )
+}
+
+fn load_saved_sessions_excluding(excluded_ids: &HashSet<String>) -> Vec<Session> {
+    let mut sessions = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(sessions_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+
+            let Ok(data) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(session) = serde_json::from_str::<Session>(&data) else {
+                continue;
+            };
+            if excluded_ids.contains(&session.id) {
+                continue;
+            }
+
+            sessions.push(session);
+        }
+    }
+    sessions
+}
+
+fn update_session_token_usage(session: &mut Session, input_tokens: u64, output_tokens: u64) {
+    let today = prompts::current_local_snapshot().today();
+    if session.token_usage_day != today {
+        session.daily_input_tokens = 0;
+        session.daily_output_tokens = 0;
+        session.token_usage_day = today;
+    }
+    session.input_tokens = session.input_tokens.saturating_add(input_tokens);
+    session.output_tokens = session.output_tokens.saturating_add(output_tokens);
+    session.daily_input_tokens = session.daily_input_tokens.saturating_add(input_tokens);
+    session.daily_output_tokens = session.daily_output_tokens.saturating_add(output_tokens);
+}
+
 fn message_token_len(message: &ChatMessage) -> usize {
     let content_len = message.content.as_ref().map(|c| c.len()).unwrap_or(0);
     let tc_len = message
@@ -1580,11 +1685,17 @@ async fn try_claim_session(id: &str, state: &AppState, connection_id: u64) -> Cl
     if state.active_connections.lock().await.contains_key(id) {
         return ClaimSessionResult::InUse;
     }
+    if state.session_clients.lock().await.contains_key(id) {
+        return ClaimSessionResult::InUse;
+    }
 
     // Phase 2: try claiming from in-memory orphan (no disk I/O)
     {
         let mut active = state.active_connections.lock().await;
         if active.contains_key(id) {
+            return ClaimSessionResult::InUse;
+        }
+        if state.session_clients.lock().await.contains_key(id) {
             return ClaimSessionResult::InUse;
         }
         let mut sessions = state.sessions.lock().await;
@@ -1604,6 +1715,9 @@ async fn try_claim_session(id: &str, state: &AppState, connection_id: u64) -> Cl
     // Phase 4: re-acquire locks and atomically claim
     let mut active = state.active_connections.lock().await;
     if active.contains_key(id) {
+        return ClaimSessionResult::InUse;
+    }
+    if state.session_clients.lock().await.contains_key(id) {
         return ClaimSessionResult::InUse;
     }
     let mut sessions = state.sessions.lock().await;
@@ -1789,7 +1903,7 @@ fn build_session_status(session: &Session, config: &Config) -> String {
     let estimated_tokens = estimate_tokens(&session.messages);
     let model_max_tokens = resolved
         .max_tokens
-        .map(|value| value.to_string())
+        .map(format_token_count)
         .unwrap_or_else(|| "-".into());
 
     format!(
@@ -1799,7 +1913,7 @@ fn build_session_status(session: &Session, config: &Config) -> String {
          resolved_api_base: {}\n\
          resolved_model_id: {}\n\
          max_tokens: {model_max_tokens}\n\
-         context_est: {estimated_tokens}/{ctx_limit}\n\
+         context_est: {}/{}\n\
          think: {}\n\
          react: {}\n\
          tools: {}\n\
@@ -1807,11 +1921,56 @@ fn build_session_status(session: &Session, config: &Config) -> String {
         resolved.provider.label(),
         resolved.api_base,
         resolved.model_id,
+        format_token_count(estimated_tokens as u64),
+        format_token_count(ctx_limit as u64),
         session.think_level,
         if session.show_react { "on" } else { "off" },
         if session.show_tools { "on" } else { "off" },
         if session.show_reasoning { "on" } else { "off" },
     )
+}
+
+fn build_session_usage(session: &Session) -> String {
+    let (today_input_tokens, today_output_tokens) = current_daily_token_usage(session);
+
+    format!(
+        "usage_est:\n\
+         input_tokens: {}\n\
+         output_tokens: {}\n\
+         total_tokens: {}\n\
+         today_input_tokens: {}\n\
+         today_output_tokens: {}\n\
+         today_total_tokens: {}",
+        format_token_count(session.input_tokens),
+        format_token_count(session.output_tokens),
+        format_token_count(session.input_tokens.saturating_add(session.output_tokens)),
+        format_token_count(today_input_tokens),
+        format_token_count(today_output_tokens),
+        format_token_count(today_input_tokens.saturating_add(today_output_tokens)),
+    )
+}
+
+fn build_global_today_usage(sessions: &HashMap<String, Session>) -> String {
+    let (global_today_input_tokens, global_today_output_tokens) =
+        accumulate_daily_token_usage(sessions.values());
+    format_usage_block(
+        "global_today_usage_est",
+        global_today_input_tokens,
+        global_today_output_tokens,
+    )
+}
+
+fn build_usage_report(session: &Session, global_today_usage: &str) -> String {
+    format!("{}\n\n{}", build_session_usage(session), global_today_usage)
+}
+
+async fn gather_global_today_usage(state: &AppState) -> String {
+    let mut sessions_snapshot = state.sessions.lock().await.clone();
+    let in_memory_ids = sessions_snapshot.keys().cloned().collect::<HashSet<_>>();
+    for session in load_saved_sessions_excluding(&in_memory_ids) {
+        sessions_snapshot.insert(session.id.clone(), session);
+    }
+    build_global_today_usage(&sessions_snapshot)
 }
 
 /// Gather all sessions info for /sessions command and list_sessions tool.
@@ -2435,6 +2594,27 @@ async fn handle_command(
             }
         }
 
+        "/usage" => {
+            let session = {
+                let sessions = state.sessions.lock().await;
+                sessions.get(current_session_id).cloned()
+            };
+            match session {
+                Some(s) => Some(CommandResult {
+                    response: build_usage_report(&s, &gather_global_today_usage(state).await),
+                    response_type: "system",
+                    new_session_id: None,
+                    sessions_changed: false,
+                }),
+                None => Some(CommandResult {
+                    response: "No active session".into(),
+                    response_type: "system",
+                    new_session_id: None,
+                    sessions_changed: false,
+                }),
+            }
+        }
+
         "/clear" => {
             let mut sessions = state.sessions.lock().await;
             if let Some(session) = sessions.get_mut(current_session_id) {
@@ -2694,6 +2874,7 @@ async fn handle_command(
 Commands:
   /new             Compress conversation to memory & clear context
   /status          Show session status
+    /usage           Show session token usage
   /model [name]    Show or switch model
   /think [level]   Set thinking mode (auto|off|minimal|low|medium|high|xhigh)
   /react [on|off]  Toggle ReAct phase visibility
@@ -3281,9 +3462,22 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     };
                     match llm_result {
                         Ok(resp) => {
+                            let input_tokens = estimate_tokens(&msgs_snapshot) as u64;
+                            let output_tokens = message_token_len(&resp.message) as u64;
                             let has_content = resp.message.has_nonempty_content();
                             let has_tools = resp.message.has_tool_calls();
                             let should_persist = !resp.message.is_empty_assistant_message();
+
+                            {
+                                let mut sessions = state.sessions.lock().await;
+                                if let Some(session) = sessions.get_mut(&current_session_id) {
+                                    update_session_token_usage(
+                                        session,
+                                        input_tokens,
+                                        output_tokens,
+                                    );
+                                }
+                            }
 
                             if should_persist {
                                 let mut sessions = state.sessions.lock().await;
@@ -3578,17 +3772,20 @@ async fn claim_requested_session(id: &str, state: &AppState, connection_id: u64)
     if id.contains('/') || id.contains('\\') || id.contains("..") {
         return None;
     }
+    // Browser refresh can race the old socket disconnect: the new connection may arrive
+    // while the previous client binding still exists for the same session. Give that
+    // binding a short grace window to disappear before treating it as a different live client.
+    const REFRESH_CLIENT_GRACE_POLLS: usize = 6;
+
     // Wait up to 30 seconds for an in-flight generation round to finish and release the session.
-    // If the old connection still has an active client binding (socket not disconnected),
-    // the session is genuinely in use — bail out immediately instead of blocking.
-    for _ in 0..60 {
+    for attempt in 0..60 {
         let active = state.active_connections.lock().await.contains_key(id);
-        if !active {
+        let has_bound_client = state.session_clients.lock().await.contains_key(id);
+        if !active && !has_bound_client {
             break;
         }
-        let has_bound_client = state.session_clients.lock().await.contains_key(id);
-        if has_bound_client {
-            // Old connection is still alive and bound — not a refresh scenario.
+        if has_bound_client && attempt >= REFRESH_CLIENT_GRACE_POLLS {
+            // Another client is still actively bound after the refresh grace window.
             return None;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;

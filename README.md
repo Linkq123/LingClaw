@@ -1,4 +1,8 @@
-# 🦀 LingClaw
+# LingClaw
+
+<p align="center">
+  <img src="static/branding/logo-wordmark.png" alt="LingClaw" width="420">
+</p>
 
 LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Loop** 三层架构设计。
 
@@ -12,7 +16,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 
 - **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
 - **2 主会话管理工具**：`list_sessions`、`delete_session`
-- **13 斜杠命令**：`/new`、`/session_new`、`/switch`、`/rename`、`/model`、`/think`、`/react`、`/skills`、`/status`、`/clear`、`/help`、`/sessions`、`/delete`
+- **14 斜杠命令**：`/new`、`/session_new`、`/switch`、`/rename`、`/model`、`/think`、`/react`、`/skills`、`/status`、`/usage`、`/clear`、`/help`、`/sessions`、`/delete`
 - **双 Provider 模型路由**：OpenAI + Anthropic，支持 `provider/model` 和纯 model ID
 - **Per-session 模型覆盖**：运行时通过 `/model` 切换
 - **持久化多会话**：每个会话有独立工作区和磁盘存档
@@ -163,7 +167,8 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `/think [level]` | 设置思维模式：`auto`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh` |
 | `/react [on\|off]` | 切换 ReAct 阶段可见性（默认开启；启用后每次阶段转换发送 `react_phase` WS 事件） |
 | `/skills` | 列出可用工具帮助 |
-| `/status` | 显示模型、provider、上下文估算、思维级别 |
+| `/status` | 显示模型、provider、上下文估算、最大输出 token、思维级别，token 数值按 K/M 显示 |
+| `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；同时显示内存与磁盘上所有 session 合并后的今日总 token 估算，按 K/M 显示 |
 | `/clear` | 清空消息但保留系统提示 |
 | `/help` | 命令帮助 |
 | `/sessions` | 仅主会话：列出活跃会话 |

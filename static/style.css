@@ -65,11 +65,23 @@ body {
   background: linear-gradient(180deg, rgba(214,86,110,.06), transparent);
 }
 .sidebar-header h2 {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
   font-size: 15px;
   background: linear-gradient(135deg, var(--accent), var(--accent2));
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
+}
+.sidebar-header h2 img {
+  width: 18px;
+  height: 18px;
+  display: block;
+  flex: 0 0 auto;
+}
+.sidebar-header h2 span {
+  display: inline-block;
 }
 .sidebar-header button {
   background: none;
@@ -187,15 +199,21 @@ header .actions button.is-active {
   padding: 40px;
 }
 .welcome-logo {
-  font-size: 52px;
-  width: 96px;
-  height: 96px;
+  width: min(72vw, 720px);
+  max-width: 100%;
+  min-height: 96px;
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(135deg, rgba(214,86,110,.08), rgba(45,139,207,.08));
-  border-radius: 24px;
-  box-shadow: 0 8px 32px rgba(214,86,110,.08), 0 2px 8px rgba(0,0,0,.03);
+  padding: 8px 12px;
+}
+.welcome-logo img {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-width: 720px;
+  object-fit: contain;
+  filter: drop-shadow(0 10px 28px rgba(117, 87, 190, .10));
 }
 .welcome-title {
   font-size: 22px;
@@ -254,6 +272,7 @@ header .actions button.is-active {
   background: linear-gradient(135deg, #eef1fa, #dde2f0);
   border: 1px solid var(--border);
   font-size: 16px;
+  overflow: hidden;
 }
 
 .msg-content { min-width: 0; }
@@ -852,8 +871,8 @@ pre:hover .copy-btn { opacity: 1; }
   }
 
   .welcome-logo {
-    background: linear-gradient(135deg, rgba(232,112,136,.1), rgba(91,163,230,.1));
-    box-shadow: 0 8px 32px rgba(232,112,136,.08);
+    background: transparent;
+    box-shadow: none;
   }
 
   .welcome-shortcuts button { background: var(--surface2); }
