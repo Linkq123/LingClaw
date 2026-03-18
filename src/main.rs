@@ -15,7 +15,10 @@ use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, Mutex};
@@ -716,12 +719,46 @@ struct AppState {
     config: Config,
     http: Client,
     sessions: Mutex<HashMap<String, Session>>,
-    /// Session IDs with a live WebSocket connection. Used to distinguish
-    /// "actively connected" from "orphaned in memory (save-on-disconnect failed)".
-    active_connections: Mutex<HashSet<String>>,
+    /// Session IDs with the connection currently attached to live streaming output.
+    active_connections: Mutex<HashMap<String, u64>>,
+    session_clients: Mutex<HashMap<String, SessionClientBinding>>,
+    live_rounds: Mutex<HashMap<String, LiveRoundState>>,
+    next_connection_id: AtomicU64,
     shutdown: CancellationToken,
     shutdown_token: String,
 }
+
+#[derive(Clone)]
+struct SessionClientBinding {
+    connection_id: u64,
+    tx: WsTx,
+    replay_ready: bool,
+    pending_events: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Default)]
+struct LiveToolState {
+    id: String,
+    name: String,
+    arguments: String,
+    result: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct LiveRoundState {
+    round: usize,
+    avatar: Option<String>,
+    react_visible: bool,
+    phase: Option<String>,
+    cycle: Option<usize>,
+    assistant_text: String,
+    reasoning_text: String,
+    reasoning_done: bool,
+    tools: Vec<LiveToolState>,
+}
+
+/// Cap for replay buffer strings (128 KB). Keeps memory bounded for long outputs.
+const LIVE_REPLAY_CAP: usize = 128 * 1024;
 
 // ── System Prompt ────────────────────────────────────────────────────────────
 
@@ -1023,13 +1060,262 @@ fn matches_glob(name: &str, pattern: &str) -> bool {
 }
 
 pub(crate) type WsTx = mpsc::Sender<String>;
+pub(crate) type LiveTx = mpsc::Sender<serde_json::Value>;
 
 pub(crate) async fn ws_send(tx: &WsTx, data: &serde_json::Value) -> bool {
     tx.send(data.to_string()).await.is_ok()
 }
 
+pub(crate) async fn live_send(tx: &LiveTx, data: serde_json::Value) -> bool {
+    tx.send(data).await.is_ok()
+}
+
 fn ws_try_send(tx: &WsTx, data: &serde_json::Value) -> bool {
     tx.try_send(data.to_string()).is_ok()
+}
+
+async fn bind_session_connection(
+    state: &AppState,
+    session_id: &str,
+    connection_id: u64,
+    tx: &WsTx,
+    replay_ready: bool,
+) {
+    state
+        .active_connections
+        .lock()
+        .await
+        .insert(session_id.to_string(), connection_id);
+    state.session_clients.lock().await.insert(
+        session_id.to_string(),
+        SessionClientBinding {
+            connection_id,
+            tx: tx.clone(),
+            replay_ready,
+            pending_events: Vec::new(),
+        },
+    );
+}
+
+async fn finish_session_replay(state: &AppState, session_id: &str, connection_id: u64) {
+    let (tx, pending_events) = {
+        let mut clients = state.session_clients.lock().await;
+        let Some(binding) = clients.get_mut(session_id) else {
+            return;
+        };
+        if binding.connection_id != connection_id {
+            return;
+        }
+
+        binding.replay_ready = true;
+        (
+            binding.tx.clone(),
+            std::mem::take(&mut binding.pending_events),
+        )
+    };
+
+    for event in pending_events {
+        if !ws_send(&tx, &event).await {
+            unbind_session_connection_if_matches(state, session_id, connection_id).await;
+            break;
+        }
+    }
+}
+
+async fn unbind_session_connection_if_matches(
+    state: &AppState,
+    session_id: &str,
+    connection_id: u64,
+) {
+    {
+        let mut active = state.active_connections.lock().await;
+        if active.get(session_id).copied() == Some(connection_id) {
+            active.remove(session_id);
+        }
+    }
+
+    let mut clients = state.session_clients.lock().await;
+    if clients.get(session_id).map(|binding| binding.connection_id) == Some(connection_id) {
+        clients.remove(session_id);
+    }
+}
+
+async fn dispatch_live_event(state: &AppState, session_id: &str, event: serde_json::Value) {
+    let event_type = event["type"].as_str().unwrap_or_default();
+
+    {
+        let mut live_rounds = state.live_rounds.lock().await;
+        match event_type {
+            "start" => {
+                live_rounds.insert(
+                    session_id.to_string(),
+                    LiveRoundState {
+                        round: event["round"].as_u64().unwrap_or(1) as usize,
+                        avatar: event["avatar"].as_str().map(str::to_string),
+                        react_visible: event["react_visible"].as_bool().unwrap_or(false),
+                        phase: event["phase"].as_str().map(str::to_string),
+                        cycle: event["cycle"].as_u64().map(|value| value as usize),
+                        assistant_text: String::new(),
+                        reasoning_text: String::new(),
+                        reasoning_done: false,
+                        tools: Vec::new(),
+                    },
+                );
+            }
+            "delta" => {
+                if let Some(round) = live_rounds.get_mut(session_id) {
+                    if let Some(content) = event["content"].as_str() {
+                        if round.assistant_text.len() < LIVE_REPLAY_CAP {
+                            round.assistant_text.push_str(content);
+                            round.assistant_text.truncate(LIVE_REPLAY_CAP);
+                        }
+                    }
+                }
+            }
+            "thinking_start" => {
+                if let Some(round) = live_rounds.get_mut(session_id) {
+                    round.reasoning_text.clear();
+                    round.reasoning_done = false;
+                }
+            }
+            "thinking_delta" => {
+                if let Some(round) = live_rounds.get_mut(session_id) {
+                    if let Some(content) = event["content"].as_str() {
+                        if round.reasoning_text.len() < LIVE_REPLAY_CAP {
+                            round.reasoning_text.push_str(content);
+                            round.reasoning_text.truncate(LIVE_REPLAY_CAP);
+                        }
+                    }
+                }
+            }
+            "thinking_done" => {
+                if let Some(round) = live_rounds.get_mut(session_id) {
+                    round.reasoning_done = true;
+                }
+            }
+            "tool_call" => {
+                if let Some(round) = live_rounds.get_mut(session_id) {
+                    round.tools.push(LiveToolState {
+                        id: event["id"].as_str().unwrap_or_default().to_string(),
+                        name: event["name"].as_str().unwrap_or_default().to_string(),
+                        arguments: event["arguments"].as_str().unwrap_or_default().to_string(),
+                        result: None,
+                    });
+                }
+            }
+            "tool_result" => {
+                if let Some(round) = live_rounds.get_mut(session_id) {
+                    let tool_id = event["id"].as_str().unwrap_or_default();
+                    let mut result = event["result"].as_str().unwrap_or_default().to_string();
+                    result.truncate(LIVE_REPLAY_CAP);
+                    if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
+                        tool.result = Some(result);
+                    } else {
+                        round.tools.push(LiveToolState {
+                            id: tool_id.to_string(),
+                            name: event["name"].as_str().unwrap_or_default().to_string(),
+                            arguments: String::new(),
+                            result: Some(result),
+                        });
+                    }
+                }
+            }
+            "react_phase" => {
+                if let Some(round) = live_rounds.get_mut(session_id) {
+                    round.phase = event["phase"].as_str().map(str::to_string);
+                    round.cycle = event["cycle"].as_u64().map(|value| value as usize);
+                }
+            }
+            "done" | "error" => {
+                live_rounds.remove(session_id);
+            }
+            _ => {}
+        }
+    }
+
+    let binding = {
+        let mut clients = state.session_clients.lock().await;
+        if let Some(binding) = clients.get_mut(session_id) {
+            if !binding.replay_ready {
+                binding.pending_events.push(event.clone());
+                None
+            } else {
+                Some(binding.clone())
+            }
+        } else {
+            None
+        }
+    };
+    if let Some(binding) = binding {
+        if !ws_send(&binding.tx, &event).await {
+            unbind_session_connection_if_matches(state, session_id, binding.connection_id).await;
+        }
+    }
+}
+
+async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
+    let live_round = { state.live_rounds.lock().await.get(session_id).cloned() };
+    let Some(live_round) = live_round else {
+        return;
+    };
+
+    ws_send(
+        tx,
+        &json!({
+            "type":"start",
+            "round": live_round.round,
+            "avatar": live_round.avatar,
+            "phase": live_round.phase.as_deref().unwrap_or("analyze"),
+            "cycle": live_round.cycle,
+            "react_visible": live_round.react_visible,
+        }),
+    )
+    .await;
+
+    if !live_round.reasoning_text.is_empty() {
+        ws_send(tx, &json!({"type":"thinking_start"})).await;
+        ws_send(
+            tx,
+            &json!({"type":"thinking_delta","content": live_round.reasoning_text}),
+        )
+        .await;
+        if live_round.reasoning_done {
+            ws_send(tx, &json!({"type":"thinking_done"})).await;
+        }
+    }
+
+    for tool in &live_round.tools {
+        ws_send(
+            tx,
+            &json!({
+                "type":"tool_call",
+                "id": tool.id,
+                "name": tool.name,
+                "arguments": tool.arguments,
+            }),
+        )
+        .await;
+        if let Some(result) = &tool.result {
+            ws_send(
+                tx,
+                &json!({
+                    "type":"tool_result",
+                    "id": tool.id,
+                    "name": tool.name,
+                    "result": result,
+                }),
+            )
+            .await;
+        }
+    }
+
+    if !live_round.assistant_text.is_empty() {
+        ws_send(
+            tx,
+            &json!({"type":"delta","content": live_round.assistant_text}),
+        )
+        .await;
+    }
 }
 
 fn build_agent_hard_cap_events(
@@ -1275,26 +1561,26 @@ enum ClaimSessionResult {
     NotFound,
 }
 
-async fn try_claim_session(id: &str, state: &AppState) -> ClaimSessionResult {
+async fn try_claim_session(id: &str, state: &AppState, connection_id: u64) -> ClaimSessionResult {
     if id.contains('/') || id.contains('\\') || id.contains("..") {
         return ClaimSessionResult::NotFound;
     }
 
     // Phase 1: quick check — is there an active connection?
-    if state.active_connections.lock().await.contains(id) {
+    if state.active_connections.lock().await.contains_key(id) {
         return ClaimSessionResult::InUse;
     }
 
     // Phase 2: try claiming from in-memory orphan (no disk I/O)
     {
         let mut active = state.active_connections.lock().await;
-        if active.contains(id) {
+        if active.contains_key(id) {
             return ClaimSessionResult::InUse;
         }
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(id) {
             refresh_session_system_prompt(state, session);
-            active.insert(id.to_string());
+            active.insert(id.to_string(), connection_id);
             return ClaimSessionResult::Claimed(id.to_string());
         }
     }
@@ -1307,7 +1593,7 @@ async fn try_claim_session(id: &str, state: &AppState) -> ClaimSessionResult {
 
     // Phase 4: re-acquire locks and atomically claim
     let mut active = state.active_connections.lock().await;
-    if active.contains(id) {
+    if active.contains_key(id) {
         return ClaimSessionResult::InUse;
     }
     let mut sessions = state.sessions.lock().await;
@@ -1318,7 +1604,7 @@ async fn try_claim_session(id: &str, state: &AppState) -> ClaimSessionResult {
 
     let sid = session.id.clone();
     sessions.insert(sid.clone(), session);
-    active.insert(sid.clone());
+    active.insert(sid.clone(), connection_id);
     ClaimSessionResult::Claimed(sid)
 }
 
@@ -1520,7 +1806,13 @@ fn build_session_status(session: &Session, config: &Config) -> String {
 
 /// Gather all sessions info for /sessions command and list_sessions tool.
 async fn gather_sessions_status(state: &AppState) -> String {
-    let active_ids: HashSet<String> = state.active_connections.lock().await.clone();
+    let active_ids: HashSet<String> = state
+        .active_connections
+        .lock()
+        .await
+        .keys()
+        .cloned()
+        .collect();
 
     let lines = {
         let sessions = state.sessions.lock().await;
@@ -1563,7 +1855,7 @@ async fn delete_session_by_id(target: &str, state: &AppState) -> String {
     }
 
     let active = state.active_connections.lock().await;
-    if active.contains(&resolved_id) {
+    if active.contains_key(&resolved_id) {
         return format!("Session '{}' is currently in use.", resolved_id);
     }
 
@@ -1698,6 +1990,7 @@ struct CommandResult {
 async fn handle_command(
     input: &str,
     current_session_id: &str,
+    connection_id: u64,
     state: &AppState,
     tx: &WsTx,
     cancel: &CancellationToken,
@@ -1995,7 +2288,7 @@ async fn handle_command(
                     }
                 }
             }
-            match try_claim_session(&target, state).await {
+            match try_claim_session(&target, state, connection_id).await {
                 ClaimSessionResult::Claimed(id) => {
                     // Claim succeeded — safe to remove old session from memory
                     state.sessions.lock().await.remove(current_session_id);
@@ -2484,6 +2777,7 @@ async fn ws_handler(
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Option<String>) {
     let (mut socket_tx, mut rx) = socket.split();
     let (tx, mut outbound_rx) = mpsc::channel::<String>(256);
+    let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
     let connection_cancel = CancellationToken::new();
     let writer_cancel = connection_cancel.clone();
     let writer = tokio::spawn(async move {
@@ -2523,7 +2817,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
     let mut claimed = if let Some(ref req_id) = requested_id {
         // Client requested a specific session — wait briefly for the old connection to release it
-        claim_requested_session(req_id, &state).await
+        claim_requested_session(req_id, &state, connection_id).await
     } else {
         None
     };
@@ -2532,7 +2826,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
     // If the client asked for a specific session and it failed, create new (don't hijack another).
     if claimed.is_none() && requested_id.is_none() {
         // Prefer the main session first
-        match try_claim_session(MAIN_SESSION_ID, &state).await {
+        match try_claim_session(MAIN_SESSION_ID, &state, connection_id).await {
             ClaimSessionResult::Claimed(id) => {
                 claimed = Some(id);
             }
@@ -2544,7 +2838,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     .collect();
 
                 for cid in &saved_ids {
-                    match try_claim_session(cid, &state).await {
+                    match try_claim_session(cid, &state, connection_id).await {
                         ClaimSessionResult::Claimed(id) => {
                             claimed = Some(id);
                             break;
@@ -2602,7 +2896,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             let mut active = state.active_connections.lock().await;
             let mut sessions = state.sessions.lock().await;
             sessions.insert(current_session_id.clone(), session);
-            active.insert(current_session_id.clone());
+            active.insert(current_session_id.clone(), connection_id);
         }
         ws_send(
             &tx,
@@ -2619,10 +2913,38 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         }
     }
 
+    bind_session_connection(&state, &current_session_id, connection_id, &tx, false).await;
+    replay_live_round(&tx, &state, &current_session_id).await;
+    finish_session_replay(&state, &current_session_id, connection_id).await;
     send_sessions_list(&tx, &state, &current_session_id).await;
 
     let cancel = state.shutdown.clone();
     let current_session_ref = Arc::new(Mutex::new(current_session_id.clone()));
+    let (live_tx, mut live_rx) = mpsc::channel::<serde_json::Value>(256);
+    let live_state = state.clone();
+    let live_session_ref = current_session_ref.clone();
+    let live_dispatcher = tokio::spawn(async move {
+        while let Some(event) = live_rx.recv().await {
+            let session_id = {
+                let guard = live_session_ref.lock().await;
+                guard.clone()
+            };
+            dispatch_live_event(&live_state, &session_id, event).await;
+        }
+    });
+
+    let disconnect_state = state.clone();
+    let disconnect_session_ref = current_session_ref.clone();
+    let disconnect_cancel = connection_cancel.clone();
+    let disconnect_watcher = tokio::spawn(async move {
+        disconnect_cancel.cancelled().await;
+        let session_id = {
+            let guard = disconnect_session_ref.lock().await;
+            guard.clone()
+        };
+        unbind_session_connection_if_matches(&disconnect_state, &session_id, connection_id).await;
+    });
+
     let poll_cancel = connection_cancel.clone();
     let poll_state = state.clone();
     let poll_tx = tx.clone();
@@ -2666,8 +2988,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         }
 
         if trimmed.starts_with('/') {
-            let cmd_result =
-                handle_command(trimmed, &current_session_id, &state, &tx, &cancel).await;
+            let cmd_result = handle_command(
+                trimmed,
+                &current_session_id,
+                connection_id,
+                &state,
+                &tx,
+                &cancel,
+            )
+            .await;
             if cancel.is_cancelled() {
                 break;
             }
@@ -2698,12 +3027,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                 .await;
 
                 if let Some(new_id) = result.new_session_id {
-                    {
-                        let mut ac = state.active_connections.lock().await;
-                        ac.remove(&current_session_id);
-                        ac.insert(new_id.clone());
-                    }
+                    unbind_session_connection_if_matches(
+                        &state,
+                        &current_session_id,
+                        connection_id,
+                    )
+                    .await;
+                    state.live_rounds.lock().await.remove(&current_session_id);
                     current_session_id = new_id.clone();
+                    bind_session_connection(&state, &current_session_id, connection_id, &tx, true)
+                        .await;
                     {
                         let mut active_id = current_session_ref.lock().await;
                         *active_id = current_session_id.clone();
@@ -2806,10 +3139,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             react_ctx.cycles,
                             react_ctx.tool_calls,
                         );
-                        if !ws_send(&tx, &system_event).await {
+                        if !live_send(&live_tx, system_event).await {
                             break;
                         }
-                        ws_send(&tx, &done_event).await;
+                        let _ = live_send(&live_tx, done_event).await;
                         break;
                     }
 
@@ -2860,9 +3193,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
                     // Notify frontend when context was pruned
                     if pruned_count > 0 {
-                        ws_send(
-                            &tx,
-                            &json!({
+                        let _ = live_send(
+                            &live_tx,
+                            json!({
                                 "type": "context_pruned",
                                 "messages_removed": pruned_count,
                             }),
@@ -2883,9 +3216,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         }
                     }
 
-                    if !ws_send(
-                        &tx,
-                        &json!({
+                    if !live_send(
+                        &live_tx,
+                        json!({
                             "type":"start",
                             "round": round + 1,
                             "avatar": avatar,
@@ -2927,14 +3260,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             shutting_down = true;
                             break;
                         }
-                        _ = connection_cancel.cancelled() => {
-                            break;
-                        }
                         r = providers::call_llm_stream(
                             &state.http,
                             &resolved,
                             &msgs_snapshot,
-                            &tx,
+                            &live_tx,
                             &effective_think,
                             &extra_tools,
                         ) => r,
@@ -2956,9 +3286,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             if let Some(reason) = agent::evaluate_finish(has_content, has_tools) {
                                 react_ctx.transition_to_finish(reason);
                                 if react_ctx.show_react {
-                                    ws_send(
-                                        &tx,
-                                        &json!({"type":"react_phase","phase":"finish","cycle":react_ctx.cycles}),
+                                    let _ = live_send(
+                                        &live_tx,
+                                        json!({"type":"react_phase","phase":"finish","cycle":react_ctx.cycles}),
                                     )
                                     .await;
                                 }
@@ -2966,9 +3296,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                                 pending_tool_calls = resp.message.tool_calls.unwrap_or_default();
                                 react_ctx.transition_to_act();
                                 if react_ctx.show_react {
-                                    ws_send(
-                                        &tx,
-                                        &json!({"type":"react_phase","phase":"act","cycle":react_ctx.cycles}),
+                                    let _ = live_send(
+                                        &live_tx,
+                                        json!({"type":"react_phase","phase":"act","cycle":react_ctx.cycles}),
                                     )
                                     .await;
                                 }
@@ -2976,7 +3306,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             round += 1;
                         }
                         Err(e) => {
-                            ws_send(&tx, &json!({"type":"error","content":e})).await;
+                            let _ = live_send(&live_tx, json!({"type":"error","content":e})).await;
                             break;
                         }
                     }
@@ -2992,9 +3322,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             break 'agent;
                         }
 
-                        if !ws_send(
-                            &tx,
-                            &json!({
+                        if !live_send(
+                            &live_tx,
+                            json!({
                                 "type":"tool_call",
                                 "id": tc.id,
                                 "name": tc.function.name,
@@ -3028,9 +3358,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                                     shutting_down = true;
                                     break 'agent;
                                 }
-                                _ = connection_cancel.cancelled() => {
-                                    break 'agent;
-                                }
                                 r = execute_tool(
                                     &tc.function.name,
                                     &tc.function.arguments,
@@ -3041,9 +3368,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             }
                         };
 
-                        if !ws_send(
-                            &tx,
-                            &json!({
+                        if !live_send(
+                            &live_tx,
+                            json!({
                                 "type":"tool_result",
                                 "id": tc.id,
                                 "name": tc.function.name,
@@ -3085,9 +3412,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     pending_tool_calls.clear();
                     react_ctx.transition_to_observe(tc_count);
                     if react_ctx.show_react {
-                        ws_send(
-                            &tx,
-                            &json!({"type":"react_phase","phase":"observe","cycle":react_ctx.cycles}),
+                        let _ = live_send(
+                            &live_tx,
+                            json!({"type":"react_phase","phase":"observe","cycle":react_ctx.cycles}),
                         )
                         .await;
                     }
@@ -3098,9 +3425,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     // Non-destructive observation summaries
                     let summaries = agent::summarize_observations(&collected_results);
                     for s in &summaries {
-                        ws_send(
-                            &tx,
-                            &json!({
+                        let _ = live_send(
+                            &live_tx,
+                            json!({
                                 "type": "observation",
                                 "tool_call_id": s.tool_call_id,
                                 "tool_name": s.tool_name,
@@ -3126,9 +3453,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
                     react_ctx.transition_to_analyze();
                     if react_ctx.show_react {
-                        ws_send(
-                            &tx,
-                            &json!({"type":"react_phase","phase":"analyze","cycle":react_ctx.cycles}),
+                        let _ = live_send(
+                            &live_tx,
+                            json!({"type":"react_phase","phase":"analyze","cycle":react_ctx.cycles}),
                         )
                         .await;
                     }
@@ -3150,9 +3477,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         .map(|r| r.label())
                         .unwrap_or("complete");
 
-                    ws_send(
-                        &tx,
-                        &json!({
+                    let _ = live_send(
+                        &live_tx,
+                        json!({
                             "type":"done",
                             "phase":"finish",
                             "reason": finish_label,
@@ -3167,9 +3494,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         } // end 'agent loop
 
         if shutting_down {
-            ws_send(
-                &tx,
-                &json!({"type":"system","content":"Server shutting down."}),
+            let _ = live_send(
+                &live_tx,
+                json!({"type":"system","content":"Server shutting down."}),
             )
             .await;
         }
@@ -3195,8 +3522,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
     if let Some(ref s) = snapshot {
         match save_session_to_disk(s).await {
             Ok(()) => {
-                let mut sessions = state.sessions.lock().await;
-                sessions.remove(&current_session_id);
+                let has_active_connection = state
+                    .active_connections
+                    .lock()
+                    .await
+                    .contains_key(&current_session_id);
+                if !has_active_connection {
+                    let mut sessions = state.sessions.lock().await;
+                    sessions.remove(&current_session_id);
+                }
             }
             Err(e) => {
                 eprintln!(
@@ -3206,15 +3540,22 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             }
         }
     } else {
-        let mut sessions = state.sessions.lock().await;
-        sessions.remove(&current_session_id);
+        let has_active_connection = state
+            .active_connections
+            .lock()
+            .await
+            .contains_key(&current_session_id);
+        if !has_active_connection {
+            let mut sessions = state.sessions.lock().await;
+            sessions.remove(&current_session_id);
+        }
     }
-    state
-        .active_connections
-        .lock()
-        .await
-        .remove(&current_session_id);
+    unbind_session_connection_if_matches(&state, &current_session_id, connection_id).await;
+    state.live_rounds.lock().await.remove(&current_session_id);
     drop(tx);
+    drop(live_tx);
+    let _ = disconnect_watcher.await;
+    let _ = live_dispatcher.await;
     let _ = avatar_poller.await;
     let _ = reader.await;
     let _ = writer.await;
@@ -3222,20 +3563,27 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
 /// Wait for a specific session to become available (old connection releasing it),
 /// then load from disk and claim it. Returns None if unavailable after timeout.
-async fn claim_requested_session(id: &str, state: &AppState) -> Option<String> {
+async fn claim_requested_session(id: &str, state: &AppState, connection_id: u64) -> Option<String> {
     // Validate ID format
     if id.contains('/') || id.contains('\\') || id.contains("..") {
         return None;
     }
-    // Wait up to 3 seconds for the active connection to release the session
-    for _ in 0..6 {
-        let active = state.active_connections.lock().await.contains(id);
+    // Wait up to 30 seconds for an in-flight generation round to finish and release the session.
+    // If the old connection still has an active client binding (socket not disconnected),
+    // the session is genuinely in use — bail out immediately instead of blocking.
+    for _ in 0..60 {
+        let active = state.active_connections.lock().await.contains_key(id);
         if !active {
             break;
         }
+        let has_bound_client = state.session_clients.lock().await.contains_key(id);
+        if has_bound_client {
+            // Old connection is still alive and bound — not a refresh scenario.
+            return None;
+        }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    match try_claim_session(id, state).await {
+    match try_claim_session(id, state, connection_id).await {
         ClaimSessionResult::Claimed(id) => Some(id),
         ClaimSessionResult::InUse | ClaimSessionResult::NotFound => None,
     }
@@ -3423,7 +3771,10 @@ async fn main() {
         config,
         http: Client::new(),
         sessions: Mutex::new(HashMap::new()),
-        active_connections: Mutex::new(HashSet::new()),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
         shutdown: shutdown.clone(),
         shutdown_token,
     });

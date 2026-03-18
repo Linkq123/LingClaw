@@ -8,7 +8,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{tools, ws_send, ChatMessage, FunctionCall, Provider, ToolCall, WsTx};
+use crate::{live_send, tools, ChatMessage, FunctionCall, LiveTx, Provider, ToolCall};
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  Provider Types
@@ -307,10 +307,10 @@ fn buffered_reasoning_events(reasoning: &str) -> Vec<serde_json::Value> {
     ]
 }
 
-async fn flush_reasoning_buffer(tx: &WsTx, reasoning_buf: &mut String) -> bool {
+async fn flush_reasoning_buffer(tx: &LiveTx, reasoning_buf: &mut String) -> bool {
     let reasoning = std::mem::take(reasoning_buf);
     for event in buffered_reasoning_events(&reasoning) {
-        if !ws_send(tx, &event).await {
+        if !live_send(tx, event).await {
             return false;
         }
     }
@@ -321,7 +321,7 @@ pub(crate) async fn call_llm_stream(
     http: &Client,
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
-    tx: &WsTx,
+    tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
 ) -> Result<LlmResponse, String> {
@@ -350,7 +350,7 @@ async fn call_llm_stream_openai(
     http: &Client,
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
-    tx: &WsTx,
+    tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
 ) -> Result<LlmResponse, String> {
@@ -404,9 +404,6 @@ async fn call_llm_stream_openai(
     let mut client_gone = false;
 
     while let Some(chunk) = stream.next().await {
-        if client_gone {
-            break;
-        }
         let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
         partial_buf.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -434,15 +431,13 @@ async fn call_llm_stream_openai(
                                     reasoning_buf.push_str(think_text);
                                 }
                             }
-                            if client_gone {
-                                break;
-                            }
                             // Content delta
                             if let Some(text) = &choice.delta.content {
                                 content_buf.push_str(text);
-                                if !ws_send(tx, &json!({"type":"delta","content":text})).await {
+                                if !client_gone
+                                    && !live_send(tx, json!({"type":"delta","content":text})).await
+                                {
                                     client_gone = true;
-                                    break;
                                 }
                             }
                             // Tool call deltas
@@ -483,11 +478,7 @@ async fn call_llm_stream_openai(
         partial_buf = leftover.to_string();
     }
 
-    if client_gone {
-        return Err("Client disconnected".into());
-    }
-
-    if !flush_reasoning_buffer(tx, &mut reasoning_buf).await {
+    if !client_gone && !flush_reasoning_buffer(tx, &mut reasoning_buf).await {
         return Err("Client disconnected".into());
     }
 
@@ -498,7 +489,7 @@ async fn call_llm_stream_anthropic(
     http: &Client,
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
-    tx: &WsTx,
+    tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
 ) -> Result<LlmResponse, String> {
@@ -558,9 +549,6 @@ async fn call_llm_stream_anthropic(
     let mut client_gone = false;
 
     while let Some(chunk) = stream.next().await {
-        if client_gone {
-            break;
-        }
         let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
         partial_buf.push_str(&String::from_utf8_lossy(&chunk));
 
@@ -617,7 +605,11 @@ async fn call_llm_stream_anthropic(
                                     Some("text_delta") => {
                                         if let Some(text) = &delta.text {
                                             content_buf.push_str(text);
-                                            if !ws_send(tx, &json!({"type":"delta","content":text}))
+                                            if !client_gone
+                                                && !live_send(
+                                                    tx,
+                                                    json!({"type":"delta","content":text}),
+                                                )
                                                 .await
                                             {
                                                 client_gone = true;
@@ -657,11 +649,7 @@ async fn call_llm_stream_anthropic(
         partial_buf = leftover.to_string();
     }
 
-    if client_gone {
-        return Err("Client disconnected".into());
-    }
-
-    if !flush_reasoning_buffer(tx, &mut reasoning_buf).await {
+    if !client_gone && !flush_reasoning_buffer(tx, &mut reasoning_buf).await {
         return Err("Client disconnected".into());
     }
 

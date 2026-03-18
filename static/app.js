@@ -397,6 +397,7 @@ function handleMessage(data) {
 
     case 'start':
       if (data.avatar !== undefined) applySessionAvatar(data.avatar || null);
+      setBusy(true);
       finishAssistantStream({ discardIfEmpty: true });
       clearReactStatus();
       beginAssistantStream();

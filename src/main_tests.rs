@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+use std::sync::atomic::AtomicU64;
 
 fn test_config() -> Config {
     Config {
@@ -21,7 +22,10 @@ fn test_app_state() -> AppState {
         config: test_config(),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
-        active_connections: Mutex::new(HashSet::new()),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
     }
@@ -1625,6 +1629,7 @@ fn handle_command_persists_tool_and_reasoning_visibility_changes() {
         .block_on(handle_command(
             "/tool off",
             &session_id,
+            1,
             &state,
             &tx,
             &cancel,
@@ -1636,6 +1641,7 @@ fn handle_command_persists_tool_and_reasoning_visibility_changes() {
         .block_on(handle_command(
             "/reasoning off",
             &session_id,
+            1,
             &state,
             &tx,
             &cancel,
@@ -1654,6 +1660,167 @@ fn handle_command_persists_tool_and_reasoning_visibility_changes() {
         .map(PathBuf::from)
         .expect("session dir should exist");
     let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn claim_requested_session_waits_for_active_connection_release() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("reclaim-refresh-{}", now_epoch());
+    let state = Arc::new(test_app_state());
+    let old_connection_id = 1;
+    let new_connection_id = 2;
+
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(
+            session_id.clone(),
+            test_session(&session_id, "Reconnect", None),
+        );
+    }
+    {
+        let mut active = rt.block_on(state.active_connections.lock());
+        active.insert(session_id.clone(), old_connection_id);
+    }
+
+    let release_state = state.clone();
+    let release_id = session_id.clone();
+    rt.spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        release_state
+            .active_connections
+            .lock()
+            .await
+            .remove(&release_id);
+    });
+
+    let claimed = rt.block_on(claim_requested_session(
+        &session_id,
+        &state,
+        new_connection_id,
+    ));
+    assert_eq!(claimed.as_deref(), Some(session_id.as_str()));
+
+    let _ = rt
+        .block_on(state.active_connections.lock())
+        .remove(&session_id);
+    let _ = rt.block_on(state.sessions.lock()).remove(&session_id);
+}
+
+#[test]
+fn replay_live_round_rehydrates_inflight_round_state() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-replay-{}", now_epoch());
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        json!({
+            "type": "start",
+            "round": 3,
+            "avatar": "avatar-data",
+            "phase": "act",
+            "cycle": 2,
+            "react_visible": true,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        json!({"type": "thinking_start"}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        json!({"type": "thinking_delta", "content": "step-1"}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        json!({"type": "thinking_done"}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        json!({
+            "type": "tool_call",
+            "id": "tool-1",
+            "name": "read_file",
+            "arguments": "{\"path\":\"README.md\"}",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        json!({
+            "type": "tool_result",
+            "id": "tool-1",
+            "name": "read_file",
+            "result": "file contents",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        json!({"type": "delta", "content": "final answer"}),
+    ));
+
+    assert!(bound_rx.try_recv().is_err());
+
+    rt.block_on(finish_session_replay(&state, &session_id, 1));
+
+    for _ in 0..7 {
+        let _ = rt
+            .block_on(bound_rx.recv())
+            .expect("bound client should receive live event");
+    }
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed = (0..7)
+        .map(|_| {
+            let raw = rt
+                .block_on(replay_rx.recv())
+                .expect("replay should produce serialized event");
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .expect("replayed event should be valid json")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[0]["round"], 3);
+    assert_eq!(replayed[0]["phase"], "act");
+    assert_eq!(replayed[0]["cycle"], 2);
+    assert_eq!(replayed[0]["react_visible"], true);
+    assert_eq!(replayed[1]["type"], "thinking_start");
+    assert_eq!(replayed[2]["type"], "thinking_delta");
+    assert_eq!(replayed[2]["content"], "step-1");
+    assert_eq!(replayed[3]["type"], "thinking_done");
+    assert_eq!(replayed[4]["type"], "tool_call");
+    assert_eq!(replayed[4]["id"], "tool-1");
+    assert_eq!(replayed[5]["type"], "tool_result");
+    assert_eq!(replayed[5]["result"], "file contents");
+    assert_eq!(replayed[6]["type"], "delta");
+    assert_eq!(replayed[6]["content"], "final answer");
+
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        json!({"type": "done"}),
+    ));
+    assert!(rt
+        .block_on(state.live_rounds.lock())
+        .get(&session_id)
+        .is_none());
 }
 
 // ── Phase 4: Tool Protocol + Session Recovery ────────────────────────────────
