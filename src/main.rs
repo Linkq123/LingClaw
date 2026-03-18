@@ -95,6 +95,8 @@ pub(crate) struct Config {
     pub(crate) api_base: String,
     pub(crate) model: String,
     pub(crate) provider: Provider,
+    pub(crate) openai_stream_include_usage: bool,
+    pub(crate) anthropic_prompt_caching: bool,
     pub(crate) providers: HashMap<String, JsonProviderConfig>,
     pub(crate) port: u16,
     pub(crate) max_context_tokens: usize,
@@ -157,6 +159,30 @@ impl Config {
             api_base,
             model,
             provider,
+            openai_stream_include_usage: settings
+                .openai_stream_include_usage
+                .or_else(|| {
+                    std::env::var("LINGCLAW_OPENAI_STREAM_INCLUDE_USAGE")
+                        .ok()
+                        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                            "1" | "true" | "yes" | "on" => Some(true),
+                            "0" | "false" | "no" | "off" => Some(false),
+                            _ => None,
+                        })
+                })
+                .unwrap_or(false),
+            anthropic_prompt_caching: settings
+                .anthropic_prompt_caching
+                .or_else(|| {
+                    std::env::var("LINGCLAW_ANTHROPIC_PROMPT_CACHING")
+                        .ok()
+                        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                            "1" | "true" | "yes" | "on" => Some(true),
+                            "0" | "false" | "no" | "off" => Some(false),
+                            _ => None,
+                        })
+                })
+                .unwrap_or(false),
             providers,
             port: settings
                 .port
@@ -208,6 +234,8 @@ impl Config {
             reasoning: false,
             thinking_format: None,
             max_tokens: None,
+            stream_include_usage: self.openai_stream_include_usage,
+            anthropic_prompt_caching: self.anthropic_prompt_caching,
         };
 
         let build_resolved =
@@ -230,6 +258,8 @@ impl Config {
                     reasoning,
                     thinking_format,
                     max_tokens,
+                    stream_include_usage: self.openai_stream_include_usage,
+                    anthropic_prompt_caching: self.anthropic_prompt_caching,
                 }
             };
 
@@ -457,6 +487,10 @@ struct JsonConfig {
 struct JsonSettings {
     port: Option<u16>,
     provider: Option<String>,
+    #[serde(rename = "openaiStreamIncludeUsage")]
+    openai_stream_include_usage: Option<bool>,
+    #[serde(rename = "anthropicPromptCaching")]
+    anthropic_prompt_caching: Option<bool>,
     #[serde(rename = "apiKey")]
     api_key: Option<String>,
     #[serde(rename = "apiBase")]
@@ -617,7 +651,7 @@ fn gen_session_id() -> String {
     format!("{:x}{:04x}", t.as_secs(), t.subsec_nanos() % 0xFFFF)
 }
 
-const SESSION_VERSION: u32 = 3;
+const SESSION_VERSION: u32 = 4;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {
@@ -635,6 +669,10 @@ struct Session {
     daily_input_tokens: u64,
     #[serde(default)]
     daily_output_tokens: u64,
+    #[serde(default = "default_token_usage_source")]
+    input_token_source: String,
+    #[serde(default = "default_token_usage_source")]
+    output_token_source: String,
     #[serde(default)]
     token_usage_day: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -660,6 +698,10 @@ fn default_think_level() -> String {
     "auto".to_string()
 }
 
+fn default_token_usage_source() -> String {
+    "estimated".to_string()
+}
+
 fn default_show_react() -> bool {
     true
 }
@@ -679,6 +721,10 @@ fn migrate_session(session: &mut Session) {
     if session.version < 3 {
         session.show_tools = default_show_tools();
         session.show_reasoning = default_show_reasoning();
+    }
+    if session.version < 4 {
+        session.input_token_source = default_token_usage_source();
+        session.output_token_source = default_token_usage_source();
     }
     session.version = SESSION_VERSION;
 }
@@ -712,6 +758,8 @@ impl Session {
             output_tokens: 0,
             daily_input_tokens: 0,
             daily_output_tokens: 0,
+            input_token_source: default_token_usage_source(),
+            output_token_source: default_token_usage_source(),
             token_usage_day: prompts::current_local_snapshot().today(),
             model_override: None,
             think_level: default_think_level(),
@@ -1411,6 +1459,72 @@ fn estimate_tokens(messages: &[ChatMessage]) -> usize {
     messages.iter().map(message_token_len).sum()
 }
 
+const OPENAI_TOOL_CALL_OVERHEAD_TOKENS: usize = 8;
+const OPENAI_TOOL_RESULT_OVERHEAD_TOKENS: usize = 6;
+const ANTHROPIC_TOOL_USE_OVERHEAD_TOKENS: usize = 16;
+const ANTHROPIC_TOOL_RESULT_OVERHEAD_TOKENS: usize = 14;
+const OPENAI_MIN_REPLY_RESERVE_TOKENS: usize = 2_048;
+const ANTHROPIC_MIN_REPLY_RESERVE_TOKENS: usize = 4_096;
+const CONTEXT_REPLY_RESERVE_RATIO_DIVISOR: usize = 10;
+const CONTEXT_REPLY_RESERVE_CAP_DIVISOR: usize = 5;
+
+fn message_token_len_for_provider(provider: Provider, message: &ChatMessage) -> usize {
+    let base = message_token_len(message);
+    match provider {
+        Provider::OpenAI => {
+            let tool_call_overhead = message
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls.len() * OPENAI_TOOL_CALL_OVERHEAD_TOKENS)
+                .unwrap_or(0);
+            let tool_result_overhead = if message.role == "tool" {
+                OPENAI_TOOL_RESULT_OVERHEAD_TOKENS
+            } else {
+                0
+            };
+            base + tool_call_overhead + tool_result_overhead
+        }
+        Provider::Anthropic => {
+            let tool_use_overhead = message
+                .tool_calls
+                .as_ref()
+                .map(|calls| calls.len() * ANTHROPIC_TOOL_USE_OVERHEAD_TOKENS)
+                .unwrap_or(0);
+            let tool_result_overhead = if message.role == "tool" {
+                ANTHROPIC_TOOL_RESULT_OVERHEAD_TOKENS
+            } else {
+                0
+            };
+            base + tool_use_overhead + tool_result_overhead
+        }
+    }
+}
+
+fn estimate_tokens_for_provider(provider: Provider, messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .map(|message| message_token_len_for_provider(provider, message))
+        .sum()
+}
+
+fn context_input_budget_for_model(config: &Config, model_ref: &str) -> usize {
+    let ctx_limit = config.context_limit_for_model(model_ref);
+    let resolved = config.resolve_model(model_ref);
+    let provider_floor = match resolved.provider {
+        Provider::OpenAI => OPENAI_MIN_REPLY_RESERVE_TOKENS,
+        Provider::Anthropic => ANTHROPIC_MIN_REPLY_RESERVE_TOKENS,
+    };
+    let ratio_reserve = ctx_limit / CONTEXT_REPLY_RESERVE_RATIO_DIVISOR;
+    let model_reserve = resolved
+        .max_tokens
+        .map(|value| value as usize)
+        .unwrap_or(provider_floor)
+        .min(ctx_limit / CONTEXT_REPLY_RESERVE_CAP_DIVISOR);
+    let reserve = provider_floor.max(ratio_reserve).max(model_reserve);
+    let minimum_budget = ctx_limit.min(1_024);
+    ctx_limit.saturating_sub(reserve).max(minimum_budget)
+}
+
 fn format_token_count(value: u64) -> String {
     fn format_scaled(value: u64, divisor: u64, unit: &str) -> String {
         let scaled_tenths = (value * 10 + divisor / 2) / divisor;
@@ -1485,7 +1599,13 @@ fn load_saved_sessions_excluding(excluded_ids: &HashSet<String>) -> Vec<Session>
     sessions
 }
 
-fn update_session_token_usage(session: &mut Session, input_tokens: u64, output_tokens: u64) {
+fn update_session_token_usage(
+    session: &mut Session,
+    input_tokens: u64,
+    output_tokens: u64,
+    input_source: &str,
+    output_source: &str,
+) {
     let today = prompts::current_local_snapshot().today();
     if session.token_usage_day != today {
         session.daily_input_tokens = 0;
@@ -1496,6 +1616,8 @@ fn update_session_token_usage(session: &mut Session, input_tokens: u64, output_t
     session.output_tokens = session.output_tokens.saturating_add(output_tokens);
     session.daily_input_tokens = session.daily_input_tokens.saturating_add(input_tokens);
     session.daily_output_tokens = session.daily_output_tokens.saturating_add(output_tokens);
+    session.input_token_source = input_source.to_string();
+    session.output_token_source = output_source.to_string();
 }
 
 fn message_token_len(message: &ChatMessage) -> usize {
@@ -1579,8 +1701,9 @@ fn prune_messages(messages: &mut Vec<ChatMessage>, max_tokens: usize) {
 struct HookInput {
     messages: Vec<ChatMessage>,
     model: String,
+    provider: Provider,
     workspace: PathBuf,
-    ctx_limit: usize,
+    input_budget: usize,
     cycle: usize,
 }
 
@@ -1589,8 +1712,11 @@ struct HookInput {
 enum HookOutput {
     /// No changes needed.
     NoOp,
-    /// Replace session messages with these.
-    ReplaceMessages(Vec<ChatMessage>),
+    /// Replace session messages and optionally emit frontend events.
+    ReplaceMessages {
+        messages: Vec<ChatMessage>,
+        events: Vec<serde_json::Value>,
+    },
 }
 
 /// Agent lifecycle hook.
@@ -1600,13 +1726,20 @@ enum HookOutput {
 ///   2. `run` — async execution, called **without** session lock.
 trait AgentHook: Send + Sync {
     /// Human-readable name for logging.
+    #[allow(dead_code)]
     fn name(&self) -> &'static str;
 
     /// Which lifecycle point this hook fires at.
     fn point(&self) -> agent::HookPoint;
 
     /// Fast eligibility check. Called under session lock — must not do I/O.
-    fn should_run(&self, messages: &[ChatMessage], ctx_limit: usize, cycle: usize) -> bool;
+    fn should_run(
+        &self,
+        messages: &[ChatMessage],
+        provider: Provider,
+        input_budget: usize,
+        cycle: usize,
+    ) -> bool;
 
     /// Execute the hook asynchronously. Called WITHOUT session lock.
     fn run<'a>(
@@ -1632,11 +1765,219 @@ impl HookRegistry {
         self.hooks.push(hook);
     }
 
-    fn hooks_at(&self, point: agent::HookPoint) -> impl Iterator<Item = &dyn AgentHook> {
-        self.hooks
-            .iter()
-            .filter(move |h| h.point() == point)
-            .map(|h| h.as_ref())
+    fn hook(&self, index: usize) -> Option<&dyn AgentHook> {
+        self.hooks.get(index).map(|h| h.as_ref())
+    }
+
+    fn len(&self) -> usize {
+        self.hooks.len()
+    }
+}
+
+const AUTO_COMPRESS_THRESHOLD_PERCENT: usize = 90;
+const AUTO_COMPRESS_KEEP_RECENT_TURNS: usize = 8;
+const AUTO_COMPRESS_INPUT_CHAR_LIMIT: usize = 60_000;
+const AUTO_COMPRESS_SUMMARY_CHAR_LIMIT: usize = 12_000;
+
+fn find_auto_compress_cutoff(messages: &[ChatMessage], keep_recent_turns: usize) -> Option<usize> {
+    if messages.len() <= 2 {
+        return None;
+    }
+
+    let mut turn_starts = Vec::new();
+    let mut idx = 1;
+    while idx < messages.len() {
+        turn_starts.push(idx);
+        idx += turn_len(messages, idx);
+    }
+
+    if turn_starts.len() <= keep_recent_turns {
+        return None;
+    }
+
+    let keep_from = turn_starts[turn_starts.len() - keep_recent_turns];
+    (keep_from > 1).then_some(keep_from)
+}
+
+fn build_compression_source_text(messages: &[ChatMessage]) -> String {
+    let mut lines = Vec::new();
+    for msg in messages {
+        match msg.role.as_str() {
+            "user" => {
+                if let Some(content) = msg.content.as_deref() {
+                    if !content.is_empty() {
+                        lines.push(format!("User: {content}"));
+                    }
+                }
+            }
+            "assistant" => {
+                if let Some(content) = msg.content.as_deref() {
+                    if !content.is_empty() {
+                        lines.push(format!("Assistant: {content}"));
+                    }
+                }
+                if let Some(tool_calls) = msg.tool_calls.as_ref() {
+                    for tc in tool_calls {
+                        lines.push(format!(
+                            "Assistant tool call [{}]: {} {}",
+                            tc.id,
+                            tc.function.name,
+                            truncate(&tc.function.arguments, 1_500)
+                        ));
+                    }
+                }
+            }
+            "tool" => {
+                if let Some(content) = msg.content.as_deref() {
+                    lines.push(format!(
+                        "Tool result [{}]: {}",
+                        msg.tool_call_id.as_deref().unwrap_or(""),
+                        truncate(content, 4_000)
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    truncate(&lines.join("\n"), AUTO_COMPRESS_INPUT_CHAR_LIMIT)
+}
+
+fn build_auto_summary_message(summary: &str) -> ChatMessage {
+    ChatMessage {
+        role: "assistant".into(),
+        content: Some(format!(
+            "## Context Summary (auto-generated)\n{}",
+            truncate(summary.trim(), AUTO_COMPRESS_SUMMARY_CHAR_LIMIT)
+        )),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: Some(now_epoch()),
+    }
+}
+
+fn build_compressed_messages(
+    messages: &[ChatMessage],
+    compress_end: usize,
+    summary: &str,
+) -> Vec<ChatMessage> {
+    let mut out = Vec::with_capacity(messages.len() - compress_end + 2);
+    out.push(messages[0].clone());
+    out.push(build_auto_summary_message(summary));
+    out.extend(messages[compress_end..].iter().cloned());
+    out
+}
+
+fn build_context_compressed_event(
+    removed_messages: usize,
+    before_estimate: usize,
+    after_estimate: usize,
+) -> serde_json::Value {
+    json!({
+        "type": "context_compressed",
+        "messages_removed": removed_messages,
+        "before_estimate": before_estimate,
+        "after_estimate": after_estimate,
+    })
+}
+
+struct AutoCompressContextHook {
+    threshold_percent: usize,
+    keep_recent_turns: usize,
+}
+
+impl AutoCompressContextHook {
+    fn new() -> Self {
+        Self {
+            threshold_percent: AUTO_COMPRESS_THRESHOLD_PERCENT,
+            keep_recent_turns: AUTO_COMPRESS_KEEP_RECENT_TURNS,
+        }
+    }
+}
+
+impl AgentHook for AutoCompressContextHook {
+    fn name(&self) -> &'static str {
+        "auto_compress_context"
+    }
+
+    fn point(&self) -> agent::HookPoint {
+        agent::HookPoint::BeforeAnalyze
+    }
+
+    fn should_run(
+        &self,
+        messages: &[ChatMessage],
+        provider: Provider,
+        input_budget: usize,
+        _cycle: usize,
+    ) -> bool {
+        if input_budget == 0 {
+            return false;
+        }
+        if find_auto_compress_cutoff(messages, self.keep_recent_turns).is_none() {
+            return false;
+        }
+        estimate_tokens_for_provider(provider, messages).saturating_mul(100)
+            >= input_budget.saturating_mul(self.threshold_percent)
+    }
+
+    fn run<'a>(
+        &'a self,
+        input: HookInput,
+        config: &'a Config,
+        http: &'a Client,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(compress_end) =
+                find_auto_compress_cutoff(&input.messages, self.keep_recent_turns)
+            else {
+                return HookOutput::NoOp;
+            };
+
+            let before_estimate = estimate_tokens_for_provider(input.provider, &input.messages);
+            let source_text = build_compression_source_text(&input.messages[1..compress_end]);
+            if source_text.trim().is_empty() {
+                return HookOutput::NoOp;
+            }
+
+            let prompt = vec![
+                ChatMessage {
+                    role: "system".into(),
+                    content: Some(
+                        "You compress older conversation context for an AI coding assistant. Produce a concise markdown summary that preserves: user goal, important constraints, files or components touched, key tool findings, decisions made, failed attempts, and remaining open issues. Keep it factual and compact. Do not wrap in code blocks. Keep the same language as the source conversation."
+                            .into(),
+                    ),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: None,
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: Some(source_text),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: Some(now_epoch()),
+                },
+            ];
+
+            let resolved = config.resolve_model(&input.model);
+            let summary = match providers::call_llm_simple(http, &resolved, &prompt).await {
+                Ok(summary) if !summary.trim().is_empty() => summary,
+                _ => return HookOutput::NoOp,
+            };
+
+            let messages = build_compressed_messages(&input.messages, compress_end, &summary);
+            let after_estimate = estimate_tokens_for_provider(input.provider, &messages);
+            let removed_messages = compress_end.saturating_sub(1);
+
+            HookOutput::ReplaceMessages {
+                messages,
+                events: vec![build_context_compressed_event(
+                    removed_messages,
+                    before_estimate,
+                    after_estimate,
+                )],
+            }
+        })
     }
 }
 
@@ -1656,29 +1997,31 @@ async fn run_hooks(
     config: &Config,
     http: &Client,
     cycle: usize,
-) -> usize {
-    // Collect eligible hook names under lock.
-    let eligible: Vec<&'static str> = {
-        let sessions_guard = sessions.lock().await;
-        let session = match sessions_guard.get(session_id) {
-            Some(s) => s,
-            None => return 0,
-        };
-        let model = session.effective_model(&config.model);
-        let ctx_limit = config.context_limit_for_model(model);
-        registry
-            .hooks_at(point)
-            .filter(|h| h.should_run(&session.messages, ctx_limit, cycle))
-            .map(|h| h.name())
-            .collect()
-    }; // lock dropped
-
-    let mut fired = 0usize;
-    for hook_name in &eligible {
-        let hook = match registry.hooks_at(point).find(|h| h.name() == *hook_name) {
+) -> Vec<serde_json::Value> {
+    let mut events = Vec::new();
+    for index in 0..registry.len() {
+        let hook = match registry.hook(index) {
             Some(h) => h,
             None => continue,
         };
+        if hook.point() != point {
+            continue;
+        }
+
+        let should_run = {
+            let sessions_guard = sessions.lock().await;
+            let session = match sessions_guard.get(session_id) {
+                Some(s) => s,
+                None => break,
+            };
+            let model = session.effective_model(&config.model);
+            let provider = config.resolve_model(model).provider;
+            let input_budget = context_input_budget_for_model(config, model);
+            hook.should_run(&session.messages, provider, input_budget, cycle)
+        };
+        if !should_run {
+            continue;
+        }
 
         // Build owned input without lock.
         let input = {
@@ -1688,12 +2031,14 @@ async fn run_hooks(
                 None => break,
             };
             let model = session.effective_model(&config.model).to_string();
-            let ctx_limit = config.context_limit_for_model(&model);
+            let provider = config.resolve_model(&model).provider;
+            let input_budget = context_input_budget_for_model(config, &model);
             HookInput {
                 messages: session.messages.clone(),
                 model,
+                provider,
                 workspace: session.workspace.clone(),
-                ctx_limit,
+                input_budget,
                 cycle,
             }
         }; // lock dropped
@@ -1701,18 +2046,21 @@ async fn run_hooks(
         let output = hook.run(input, config, http).await;
 
         match output {
-            HookOutput::ReplaceMessages(new_msgs) => {
+            HookOutput::ReplaceMessages {
+                messages: new_msgs,
+                events: hook_events,
+            } => {
                 let mut sessions_guard = sessions.lock().await;
                 if let Some(session) = sessions_guard.get_mut(session_id) {
                     session.messages = new_msgs;
                     session.updated_at = now_epoch();
                 }
+                events.extend(hook_events);
             }
             HookOutput::NoOp => {}
         }
-        fired += 1;
     }
-    fired
+    events
 }
 
 // ── Session Persistence ──────────────────────────────────────────────────────
@@ -2022,15 +2370,18 @@ fn build_active_session_lines(
             let session = sessions.get(id)?;
             let model = session.effective_model(&config.model).to_string();
             let ctx_limit = config.context_limit_for_model(&model);
+            let input_budget = context_input_budget_for_model(config, &model);
             let resolved = config.resolve_model(&model);
-            let estimated = estimate_tokens(&session.messages);
+            let estimated = estimate_tokens_for_provider(resolved.provider, &session.messages);
             let mt_str = resolved
                 .max_tokens
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "-".into());
             Some(format!(
-                "  {id}  {}\n    model: {model}  context_est: {estimated}/{ctx_limit}  max_tokens: {mt_str}  [active]",
+                "  {id}  {}\n    model: {model}  context_est: {estimated}/{input_budget} (limit {ctx_limit})  token_usage_source: in={} out={}  max_tokens: {mt_str}  [active]",
                 session.name,
+                session.input_token_source,
+                session.output_token_source,
             ))
         })
         .collect()
@@ -2043,7 +2394,8 @@ fn build_session_status(session: &Session, config: &Config) -> String {
         .unwrap_or_else(|_| model_ref.to_string());
     let resolved = config.resolve_model(&canonical_model);
     let ctx_limit = config.context_limit_for_model(&canonical_model);
-    let estimated_tokens = estimate_tokens(&session.messages);
+    let input_budget = context_input_budget_for_model(config, &canonical_model);
+    let estimated_tokens = estimate_tokens_for_provider(resolved.provider, &session.messages);
     let model_max_tokens = resolved
         .max_tokens
         .map(format_token_count)
@@ -2056,7 +2408,8 @@ fn build_session_status(session: &Session, config: &Config) -> String {
          resolved_api_base: {}\n\
          resolved_model_id: {}\n\
          max_tokens: {model_max_tokens}\n\
-         context_est: {}/{}\n\
+         context_est: {}/{} (limit {})\n\
+         token_usage_source: input={} output={}\n\
          think: {}\n\
          react: {}\n\
          tools: {}\n\
@@ -2065,7 +2418,10 @@ fn build_session_status(session: &Session, config: &Config) -> String {
         resolved.api_base,
         resolved.model_id,
         format_token_count(estimated_tokens as u64),
+        format_token_count(input_budget as u64),
         format_token_count(ctx_limit as u64),
+        session.input_token_source,
+        session.output_token_source,
         session.think_level,
         if session.show_react { "on" } else { "off" },
         if session.show_tools { "on" } else { "off" },
@@ -3480,7 +3836,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     let had_observation_hint = last_observation_hint.is_some();
 
                     // ── BeforeAnalyze hooks (e.g. auto-compress context) ──
-                    run_hooks(
+                    let mut before_analyze_events = run_hooks(
                         &state.hooks,
                         agent::HookPoint::BeforeAnalyze,
                         &state.sessions,
@@ -3520,7 +3876,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         let msg_count_before = session.messages.len();
                         prune_messages(
                             &mut session.messages,
-                            state.config.context_limit_for_model(&model_str),
+                            context_input_budget_for_model(&state.config, &model_str),
                         );
                         let pruned = msg_count_before - session.messages.len();
                         let prev_avatar = session.avatar.clone();
@@ -3533,6 +3889,22 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             pruned,
                         )
                     };
+
+                    let final_context_estimate = estimate_tokens_for_provider(
+                        state.config.resolve_model(&model).provider,
+                        &msgs_snapshot,
+                    );
+                    for event in &mut before_analyze_events {
+                        if event["type"] == "context_compressed" {
+                            event["after_estimate"] = json!(final_context_estimate);
+                        }
+                    }
+
+                    for event in before_analyze_events {
+                        if !live_send(&live_tx, event).await {
+                            break 'agent;
+                        }
+                    }
 
                     // Notify frontend when context was pruned
                     if pruned_count > 0 {
@@ -3614,8 +3986,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     };
                     match llm_result {
                         Ok(resp) => {
-                            let input_tokens = estimate_tokens(&msgs_snapshot) as u64;
-                            let output_tokens = message_token_len(&resp.message) as u64;
+                            let input_tokens = resp.input_tokens.unwrap_or_else(|| {
+                                estimate_tokens_for_provider(resolved.provider, &msgs_snapshot)
+                                    as u64
+                            });
+                            let output_tokens = resp.output_tokens.unwrap_or_else(|| {
+                                message_token_len_for_provider(resolved.provider, &resp.message)
+                                    as u64
+                            });
                             let has_content = resp.message.has_nonempty_content();
                             let has_tools = resp.message.has_tool_calls();
                             let should_persist = !resp.message.is_empty_assistant_message();
@@ -3623,10 +4001,22 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             {
                                 let mut sessions = state.sessions.lock().await;
                                 if let Some(session) = sessions.get_mut(&current_session_id) {
+                                    let input_source = if resp.input_tokens.is_some() {
+                                        "provider"
+                                    } else {
+                                        "estimated"
+                                    };
+                                    let output_source = if resp.output_tokens.is_some() {
+                                        "provider"
+                                    } else {
+                                        "estimated"
+                                    };
                                     update_session_token_usage(
                                         session,
                                         input_tokens,
                                         output_tokens,
+                                        input_source,
+                                        output_source,
                                     );
                                 }
                             }
@@ -3808,7 +4198,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     }
 
                     // ── AfterObserve hooks ──
-                    run_hooks(
+                    let after_observe_events = run_hooks(
                         &state.hooks,
                         agent::HookPoint::AfterObserve,
                         &state.sessions,
@@ -3818,6 +4208,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         react_ctx.cycles,
                     )
                     .await;
+
+                    for event in after_observe_events {
+                        let _ = live_send(&live_tx, event).await;
+                    }
 
                     react_ctx.transition_to_analyze();
                     if react_ctx.show_react {
@@ -3841,7 +4235,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     }
 
                     // ── OnFinish hooks ──
-                    run_hooks(
+                    let on_finish_events = run_hooks(
                         &state.hooks,
                         agent::HookPoint::OnFinish,
                         &state.sessions,
@@ -3851,6 +4245,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         react_ctx.cycles,
                     )
                     .await;
+
+                    for event in on_finish_events {
+                        let _ = live_send(&live_tx, event).await;
+                    }
 
                     let finish_label = react_ctx
                         .finish_reason
@@ -4150,9 +4548,8 @@ async fn main() {
         let _ = std::fs::write(dir.join(format!("shutdown-{port}.token")), &shutdown_token);
     }
 
-    let hooks = HookRegistry::new();
-    // Register hooks here:
-    // hooks.register(Box::new(MyHook::new()));
+    let mut hooks = HookRegistry::new();
+    hooks.register(Box::new(AutoCompressContextHook::new()));
 
     let state = Arc::new(AppState {
         config,

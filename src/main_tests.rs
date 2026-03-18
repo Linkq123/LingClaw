@@ -8,12 +8,14 @@ fn test_config() -> Config {
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
         provider: Provider::OpenAI,
+        anthropic_prompt_caching: false,
         providers: HashMap::new(),
         port: DEFAULT_PORT,
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
     }
 }
 
@@ -55,6 +57,8 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         output_tokens: 0,
         daily_input_tokens: 0,
         daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
         model_override: model_override.map(|value| value.to_string()),
         think_level: default_think_level(),
@@ -65,6 +69,58 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         workspace: PathBuf::new(),
         avatar: None,
     }
+}
+
+fn make_message(role: &str, content: &str) -> ChatMessage {
+    ChatMessage {
+        role: role.to_string(),
+        content: Some(content.to_string()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }
+}
+
+#[test]
+fn auto_compress_cutoff_preserves_recent_turns() {
+    let messages = vec![
+        make_message("system", "system"),
+        make_message("user", "u1"),
+        make_message("assistant", "a1"),
+        make_message("user", "u2"),
+        make_message("assistant", "a2"),
+        make_message("user", "u3"),
+        make_message("assistant", "a3"),
+        make_message("user", "u4"),
+        make_message("assistant", "a4"),
+    ];
+
+    let cutoff = find_auto_compress_cutoff(&messages, 2);
+
+    assert_eq!(cutoff, Some(5));
+}
+
+#[test]
+fn build_compressed_messages_inserts_summary_and_keeps_recent_tail() {
+    let messages = vec![
+        make_message("system", "system"),
+        make_message("user", "old-user"),
+        make_message("assistant", "old-assistant"),
+        make_message("user", "recent-user"),
+        make_message("assistant", "recent-assistant"),
+    ];
+
+    let compressed = build_compressed_messages(&messages, 3, "summary body");
+
+    assert_eq!(compressed.len(), 4);
+    assert_eq!(compressed[0].role, "system");
+    assert_eq!(compressed[1].role, "assistant");
+    assert!(compressed[1]
+        .content
+        .as_deref()
+        .is_some_and(|text| text.starts_with("## Context Summary (auto-generated)")));
+    assert_eq!(compressed[2].content.as_deref(), Some("recent-user"));
+    assert_eq!(compressed[3].content.as_deref(), Some("recent-assistant"));
 }
 
 #[test]
@@ -94,12 +150,14 @@ fn resolve_model_uses_config_for_plain_model_id() {
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
         provider: Provider::OpenAI,
+        anthropic_prompt_caching: false,
         providers,
         port: 3000,
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
     };
 
     let resolved = config.resolve_model("gpt-4o-mini");
@@ -140,6 +198,36 @@ fn legacy_settings_provider_fields_deserialize() {
 }
 
 #[test]
+fn settings_openai_stream_include_usage_deserializes() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "settings": {
+                "openaiStreamIncludeUsage": true
+            }
+        }"#,
+    )
+    .expect("openaiStreamIncludeUsage should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.openai_stream_include_usage, Some(true));
+}
+
+#[test]
+fn settings_anthropic_prompt_caching_deserializes() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "settings": {
+                "anthropicPromptCaching": true
+            }
+        }"#,
+    )
+    .expect("anthropicPromptCaching should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.anthropic_prompt_caching, Some(true));
+}
+
+#[test]
 fn build_history_payload_preserves_raw_tool_result_content() {
     let long_raw_result = format!("{{\"ok\":true,\"payload\":\"{}\"}}", "x".repeat(5000));
     let session = Session {
@@ -168,6 +256,8 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         output_tokens: 0,
         daily_input_tokens: 0,
         daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
         model_override: None,
         think_level: default_think_level(),
@@ -255,12 +345,14 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         api_base: "https://api-a.example/v1".to_string(),
         model: "shared-model".to_string(),
         provider: Provider::OpenAI,
+        anthropic_prompt_caching: false,
         providers,
         port: 3000,
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
     };
 
     assert!(crate::cli::is_default_model_row(
@@ -324,12 +416,14 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         api_base: "https://fallback.example/v1".to_string(),
         model: "shared-model".to_string(),
         provider: Provider::OpenAI,
+        anthropic_prompt_caching: false,
         providers,
         port: 3000,
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -385,12 +479,14 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         api_base: "https://api-b.example/v1".to_string(),
         model: "shared-model".to_string(),
         provider: Provider::OpenAI,
+        anthropic_prompt_caching: false,
         providers,
         port: 3000,
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -428,12 +524,14 @@ fn canonical_model_ref_expands_unique_plain_id() {
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
         provider: Provider::OpenAI,
+        anthropic_prompt_caching: false,
         providers,
         port: 3000,
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
     };
 
     let canonical = config
@@ -488,12 +586,14 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         api_base: "https://api-a.example/v1".to_string(),
         model: "shared-model".to_string(),
         provider: Provider::OpenAI,
+        anthropic_prompt_caching: false,
         providers,
         port: 3000,
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
     };
 
     let err = config
@@ -550,12 +650,14 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         api_base: "https://api-a.example/v1".to_string(),
         model: "shared-model".to_string(),
         provider: Provider::OpenAI,
+        anthropic_prompt_caching: false,
         providers,
         port: 3000,
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
     };
 
     let available = config.available_models();
@@ -592,12 +694,14 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
         provider: Provider::OpenAI,
+        anthropic_prompt_caching: false,
         providers,
         port: 3000,
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
     };
 
     let err = config
@@ -634,12 +738,14 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
         provider: Provider::OpenAI,
+        anthropic_prompt_caching: false,
         providers,
         port: 3000,
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
     };
 
     let canonical = config
@@ -656,12 +762,14 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         api_base: "https://api.openai.com/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
         provider: Provider::OpenAI,
+        anthropic_prompt_caching: false,
         providers: HashMap::new(),
         port: 3000,
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
     };
 
     let canonical = config
@@ -678,12 +786,14 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         api_base: "https://api.openai.com/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
         provider: Provider::OpenAI,
+        anthropic_prompt_caching: false,
         providers: HashMap::new(),
         port: 3000,
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
     };
 
     let resolved = config.resolve_model("anthropic/claude-sonnet-4-20250514");
@@ -720,12 +830,14 @@ fn build_session_status_reports_resolved_target() {
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
         provider: Provider::OpenAI,
+        anthropic_prompt_caching: false,
         providers,
         port: 3000,
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
     };
     let mut session = test_session("abc", "Test", Some("anthropic/claude-sonnet-4-20250514"));
     session.think_level = "medium".to_string();
@@ -737,7 +849,8 @@ fn build_session_status_reports_resolved_target() {
     assert!(status.contains("resolved_api_base: https://api.anthropic.com"));
     assert!(status.contains("resolved_model_id: claude-sonnet-4-20250514"));
     assert!(status.contains("max_tokens: 8.2K"));
-    assert!(status.contains("context_est: 4/200K"));
+    assert!(status.contains("context_est: 4/180K (limit 200K)"));
+    assert!(status.contains("token_usage_source: input=estimated output=estimated"));
     assert!(status.contains("think: medium"));
 }
 
@@ -943,11 +1056,11 @@ fn resolved_main_prefix_is_still_protected() {
 #[test]
 fn build_active_session_lines_lists_only_active_sessions_with_full_ids() {
     let config = test_config();
+    let mut active_session = test_session(MAIN_SESSION_ID, "Main", None);
+    active_session.input_token_source = "provider".to_string();
+    active_session.output_token_source = "estimated".to_string();
     let sessions = HashMap::from([
-        (
-            MAIN_SESSION_ID.to_string(),
-            test_session(MAIN_SESSION_ID, "Main", None),
-        ),
+        (MAIN_SESSION_ID.to_string(), active_session),
         (
             "idle-session-123".to_string(),
             test_session("idle-session-123", "Idle", Some("custom-model")),
@@ -960,6 +1073,7 @@ fn build_active_session_lines_lists_only_active_sessions_with_full_ids() {
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains(MAIN_SESSION_ID));
     assert!(lines[0].contains("Main"));
+    assert!(lines[0].contains("token_usage_source: in=provider out=estimated"));
     assert!(!lines[0].contains("Idle"));
 }
 
@@ -1133,6 +1247,8 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         output_tokens: 0,
         daily_input_tokens: 0,
         daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
         model_override: None,
         think_level: default_think_level(),
@@ -1203,6 +1319,8 @@ fn save_session_to_disk_overwrites_existing_file() {
         output_tokens: 0,
         daily_input_tokens: 0,
         daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
         model_override: None,
         think_level: default_think_level(),
@@ -1548,6 +1666,8 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         output_tokens: 0,
         daily_input_tokens: 0,
         daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
         model_override: None,
         think_level: default_think_level(),
@@ -2548,6 +2668,82 @@ fn estimate_tokens_sums_messages() {
     ];
     // (3+0+10)/4 + (5+0+10)/4 = 3 + 3 = 6
     assert_eq!(estimate_tokens(&messages), 6);
+}
+
+#[test]
+fn provider_aware_estimate_adds_tool_protocol_overhead() {
+    let messages = vec![
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "tc1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "exec".into(),
+                    arguments: r#"{"cmd":"ls"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("file-a\nfile-b".into()),
+            tool_calls: None,
+            tool_call_id: Some("tc1".into()),
+            timestamp: None,
+        },
+    ];
+
+    let base = estimate_tokens(&messages);
+    let openai = estimate_tokens_for_provider(Provider::OpenAI, &messages);
+    let anthropic = estimate_tokens_for_provider(Provider::Anthropic, &messages);
+
+    assert!(openai > base);
+    assert!(anthropic > openai);
+}
+
+#[test]
+fn context_input_budget_reserves_headroom() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "anthropic".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "anthropic-key".to_string(),
+            api: "anthropic".to_string(),
+            models: vec![JsonModelEntry {
+                id: "claude-sonnet-4-20250514".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(200000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+
+    let config = Config {
+        api_key: "env-key".to_string(),
+        api_base: "https://fallback.example/v1".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        provider: Provider::OpenAI,
+        anthropic_prompt_caching: false,
+        providers,
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
+    };
+
+    let budget = context_input_budget_for_model(&config, "anthropic/claude-sonnet-4-20250514");
+
+    assert_eq!(budget, 180_000);
 }
 
 // ───── Phase 5: turn_len ─────

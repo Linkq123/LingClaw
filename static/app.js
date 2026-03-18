@@ -824,6 +824,12 @@ function handleMessage(data) {
       addToolResult(data.name, data.result, data.id);
       break;
 
+    case 'context_compressed':
+      addSystem(
+        `Context auto-compressed: removed ${data.messages_removed || 0} messages, token estimate ${data.before_estimate || 0} -> ${data.after_estimate || 0}`
+      );
+      break;
+
     case 'progress':
       addSystem(data.content);
       break;

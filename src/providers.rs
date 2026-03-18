@@ -24,10 +24,14 @@ pub(crate) struct ResolvedModel {
     pub(crate) thinking_format: Option<String>,
     /// From model config `maxTokens`.
     pub(crate) max_tokens: Option<u64>,
+    pub(crate) stream_include_usage: bool,
+    pub(crate) anthropic_prompt_caching: bool,
 }
 
 pub(crate) struct LlmResponse {
     pub(crate) message: ChatMessage,
+    pub(crate) input_tokens: Option<u64>,
+    pub(crate) output_tokens: Option<u64>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -63,6 +67,13 @@ struct StreamDelta {
 #[derive(Deserialize, Debug)]
 struct StreamChunk {
     choices: Option<Vec<StreamChoice>>,
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OpenAiUsage {
+    prompt_tokens: Option<u64>,
+    completion_tokens: Option<u64>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -74,6 +85,21 @@ struct AnthropicEvent {
     index: Option<usize>,
     delta: Option<AnthropicDelta>,
     content_block: Option<AnthropicContentBlock>,
+    message: Option<AnthropicMessage>,
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Deserialize, Debug)]
+struct AnthropicMessage {
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct AnthropicUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -240,13 +266,14 @@ pub(crate) async fn call_llm_simple(
             let url = format!("{}/v1/messages", resolved.api_base);
             let (system, msgs) = convert_messages_to_anthropic(messages);
             let max_tokens = resolved.max_tokens.unwrap_or(4096);
+            let cache_enabled = anthropic_prompt_caching_enabled(resolved);
             let mut body = json!({
                 "model": resolved.model_id,
                 "messages": msgs,
                 "max_tokens": max_tokens,
             });
             if !system.is_empty() {
-                body["system"] = json!(system);
+                body["system"] = anthropic_system_payload(&system, cache_enabled);
             }
             let resp = http
                 .post(&url)
@@ -292,6 +319,32 @@ fn think_level_to_budget(level: &str) -> u64 {
         "high" => 16384,
         "xhigh" => 32768,
         _ => 10240,
+    }
+}
+
+fn anthropic_prompt_caching_enabled(resolved: &ResolvedModel) -> bool {
+    resolved.provider == Provider::Anthropic
+        && (resolved.api_base.contains("api.anthropic.com") || resolved.anthropic_prompt_caching)
+}
+
+fn anthropic_system_payload(system_prompt: &str, cache_enabled: bool) -> serde_json::Value {
+    if cache_enabled {
+        json!([{
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }])
+    } else {
+        json!(system_prompt)
+    }
+}
+
+fn maybe_apply_anthropic_tool_cache_control(tools: &mut [serde_json::Value], cache_enabled: bool) {
+    if !cache_enabled {
+        return;
+    }
+    if let Some(last_tool) = tools.last_mut() {
+        last_tool["cache_control"] = json!({"type": "ephemeral"});
     }
 }
 
@@ -366,6 +419,11 @@ async fn call_llm_stream_openai(
         "tools": all_tools,
         "stream": true,
     });
+    if resolved.provider == Provider::OpenAI
+        && (resolved.api_base.contains("api.openai.com") || resolved.stream_include_usage)
+    {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
     if thinking_on {
         let fmt = resolved.thinking_format.as_deref().unwrap_or("openai");
         match fmt {
@@ -400,6 +458,8 @@ async fn call_llm_stream_openai(
     let mut content_buf = String::new();
     let mut reasoning_buf = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut input_tokens: Option<u64> = None;
+    let mut output_tokens: Option<u64> = None;
     let mut partial_buf = String::new();
     let mut client_gone = false;
 
@@ -422,6 +482,14 @@ async fn call_llm_stream_openai(
                     break;
                 }
                 if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
+                    if let Some(usage) = &chunk.usage {
+                        if let Some(value) = usage.prompt_tokens {
+                            input_tokens = Some(value);
+                        }
+                        if let Some(value) = usage.completion_tokens {
+                            output_tokens = Some(value);
+                        }
+                    }
                     if let Some(choices) = chunk.choices {
                         for choice in choices {
                             // Buffer the whole round's reasoning and emit one
@@ -482,7 +550,7 @@ async fn call_llm_stream_openai(
         return Err("Client disconnected".into());
     }
 
-    build_llm_response(content_buf, tool_calls)
+    build_llm_response(content_buf, tool_calls, input_tokens, output_tokens)
 }
 
 async fn call_llm_stream_anthropic(
@@ -506,6 +574,8 @@ async fn call_llm_stream_anthropic(
     let mut all_tools: Vec<serde_json::Value> =
         serde_json::from_value(tools::tool_definitions_anthropic()).unwrap_or_default();
     all_tools.extend_from_slice(extra_tools);
+    let cache_enabled = anthropic_prompt_caching_enabled(resolved);
+    maybe_apply_anthropic_tool_cache_control(&mut all_tools, cache_enabled);
     let mut body = json!({
         "model": resolved.model_id,
         "messages": anthropic_msgs,
@@ -520,7 +590,7 @@ async fn call_llm_stream_anthropic(
         });
     }
     if !system_prompt.is_empty() {
-        body["system"] = json!(system_prompt);
+        body["system"] = anthropic_system_payload(&system_prompt, cache_enabled);
     }
 
     let resp = http
@@ -543,6 +613,8 @@ async fn call_llm_stream_anthropic(
     let mut content_buf = String::new();
     let mut reasoning_buf = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut input_tokens: Option<u64> = None;
+    let mut output_tokens: Option<u64> = None;
     let mut partial_buf = String::new();
     // Track current content block index → tool_calls index mapping
     let mut block_tool_idx: HashMap<usize, usize> = HashMap::new();
@@ -569,6 +641,26 @@ async fn call_llm_stream_anthropic(
             if let Some(data) = line.strip_prefix("data: ") {
                 let data = data.trim();
                 match current_event_type.as_str() {
+                    "message_start" => {
+                        if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
+                            if let Some(message) = evt.message.as_ref() {
+                                if let Some(usage) = message.usage.as_ref() {
+                                    input_tokens = Some(total_anthropic_input_tokens(usage));
+                                    output_tokens = usage.output_tokens;
+                                }
+                            }
+                        }
+                    }
+                    "message_delta" => {
+                        if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
+                            if let Some(usage) = evt.usage.as_ref() {
+                                input_tokens = Some(total_anthropic_input_tokens(usage));
+                                if let Some(value) = usage.output_tokens {
+                                    output_tokens = Some(value);
+                                }
+                            }
+                        }
+                    }
                     "content_block_start" => {
                         if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
                             if let Some(block) = &evt.content_block {
@@ -653,12 +745,14 @@ async fn call_llm_stream_anthropic(
         return Err("Client disconnected".into());
     }
 
-    build_llm_response(content_buf, tool_calls)
+    build_llm_response(content_buf, tool_calls, input_tokens, output_tokens)
 }
 
 fn build_llm_response(
     content_buf: String,
     tool_calls: Vec<ToolCall>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
 ) -> Result<LlmResponse, String> {
     let tc = if tool_calls.is_empty() {
         None
@@ -684,7 +778,15 @@ fn build_llm_response(
                     .as_secs(),
             ),
         },
+        input_tokens,
+        output_tokens,
     })
+}
+
+fn total_anthropic_input_tokens(usage: &AnthropicUsage) -> u64 {
+    usage.input_tokens.unwrap_or(0)
+        + usage.cache_creation_input_tokens.unwrap_or(0)
+        + usage.cache_read_input_tokens.unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -865,7 +967,7 @@ mod tests {
 
     #[test]
     fn build_llm_response_empty_content_and_no_tools() {
-        let resp = build_llm_response(String::new(), vec![]).unwrap();
+        let resp = build_llm_response(String::new(), vec![], None, None).unwrap();
         assert!(resp.message.content.is_none());
         assert!(resp.message.tool_calls.is_none());
         assert_eq!(resp.message.role, "assistant");
@@ -883,10 +985,116 @@ mod tests {
                     arguments: "{}".into(),
                 },
             }],
+            Some(123),
+            Some(45),
         )
         .unwrap();
         assert_eq!(resp.message.content.as_deref(), Some("thinking..."));
         assert_eq!(resp.message.tool_calls.as_ref().unwrap().len(), 1);
+        assert_eq!(resp.input_tokens, Some(123));
+        assert_eq!(resp.output_tokens, Some(45));
+    }
+
+    #[test]
+    fn total_anthropic_input_tokens_sums_cache_components() {
+        let usage = AnthropicUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            cache_creation_input_tokens: Some(20),
+            cache_read_input_tokens: Some(30),
+        };
+
+        assert_eq!(total_anthropic_input_tokens(&usage), 150);
+    }
+
+    #[test]
+    fn anthropic_system_payload_uses_structured_cache_blocks_when_enabled() {
+        let system_prompt = "You are a helpful assistant.";
+        let system_val = anthropic_system_payload(system_prompt, true);
+        let blocks = system_val.as_array().unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], system_prompt);
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn anthropic_system_payload_stays_plain_string_when_disabled() {
+        let system_val = anthropic_system_payload("You are a helpful assistant.", false);
+        assert_eq!(system_val.as_str(), Some("You are a helpful assistant."));
+    }
+
+    #[test]
+    fn anthropic_tools_last_has_cache_control_when_enabled() {
+        let mut tools: Vec<serde_json::Value> = vec![
+            json!({"name": "tool_a", "description": "A"}),
+            json!({"name": "tool_b", "description": "B"}),
+        ];
+        maybe_apply_anthropic_tool_cache_control(&mut tools, true);
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn anthropic_tools_do_not_add_cache_control_when_disabled() {
+        let mut tools: Vec<serde_json::Value> = vec![
+            json!({"name": "tool_a", "description": "A"}),
+            json!({"name": "tool_b", "description": "B"}),
+        ];
+        maybe_apply_anthropic_tool_cache_control(&mut tools, false);
+        assert!(tools[0].get("cache_control").is_none());
+        assert!(tools[1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn anthropic_prompt_caching_is_enabled_for_official_api() {
+        let resolved = ResolvedModel {
+            provider: Provider::Anthropic,
+            api_base: "https://api.anthropic.com".into(),
+            api_key: "key".into(),
+            model_id: "claude".into(),
+            reasoning: false,
+            thinking_format: None,
+            max_tokens: None,
+            stream_include_usage: false,
+            anthropic_prompt_caching: false,
+        };
+
+        assert!(anthropic_prompt_caching_enabled(&resolved));
+    }
+
+    #[test]
+    fn anthropic_prompt_caching_is_disabled_for_compatible_api_by_default() {
+        let resolved = ResolvedModel {
+            provider: Provider::Anthropic,
+            api_base: "https://anthropic-compatible.example".into(),
+            api_key: "key".into(),
+            model_id: "claude".into(),
+            reasoning: false,
+            thinking_format: None,
+            max_tokens: None,
+            stream_include_usage: false,
+            anthropic_prompt_caching: false,
+        };
+
+        assert!(!anthropic_prompt_caching_enabled(&resolved));
+    }
+
+    #[test]
+    fn anthropic_prompt_caching_can_be_forced_for_compatible_api() {
+        let resolved = ResolvedModel {
+            provider: Provider::Anthropic,
+            api_base: "https://anthropic-compatible.example".into(),
+            api_key: "key".into(),
+            model_id: "claude".into(),
+            reasoning: false,
+            thinking_format: None,
+            max_tokens: None,
+            stream_include_usage: false,
+            anthropic_prompt_caching: true,
+        };
+
+        assert!(anthropic_prompt_caching_enabled(&resolved));
     }
 
     #[test]
