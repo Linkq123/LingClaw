@@ -969,6 +969,36 @@ fn gather_global_today_usage_includes_saved_sessions_not_loaded_in_memory() {
 }
 
 #[test]
+fn gather_sessions_status_includes_saved_inactive_sessions() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+
+    let saved_id = format!("saved-status-{}", now_epoch());
+    let workspace = session_workspace_path(&saved_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let mut saved = test_session(&saved_id, "Saved Status", None);
+    saved.workspace = workspace.clone();
+    saved.messages.push(make_message("user", "persisted"));
+    rt.block_on(save_session_to_disk(&saved))
+        .expect("saved session should persist");
+
+    let status = rt.block_on(gather_sessions_status(&state));
+
+    assert!(status.contains("Sessions ("));
+    assert!(status.contains(saved_id.as_str()));
+    assert!(status.contains("Saved Status"));
+    assert!(status.contains("[saved]"));
+
+    let _ = std::fs::remove_file(sessions_dir().join(format!("{saved_id}.json")));
+    let session_dir = workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
 fn build_usage_report_includes_session_and_global_sections() {
     let mut current = test_session("current", "Current", None);
     current.input_tokens = 12_300;
@@ -1042,6 +1072,113 @@ fn list_saved_session_summaries_in_dir_includes_corrupt_files() {
     assert_eq!(summaries[0]["corrupt"].as_bool(), Some(true));
 
     let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn list_saved_session_summaries_in_dir_counts_messages_after_sanitization() {
+    let session_id = format!("summary-sanitize-{}", now_epoch());
+    let base = std::env::temp_dir().join(format!("lingclaw-summary-sanitize-test-{}", now_epoch()));
+    std::fs::create_dir_all(&base).expect("temp dir should be created");
+    let payload = json!({
+        "id": session_id,
+        "name": "Sanitized Summary",
+        "messages": [
+            {
+                "role": "system",
+                "content": "system"
+            },
+            {
+                "role": "assistant",
+                "timestamp": 1
+            }
+        ],
+        "created_at": 1,
+        "updated_at": 1,
+        "tool_calls_count": 0,
+        "version": SESSION_VERSION
+    });
+    std::fs::write(
+        base.join(format!("{session_id}.json")),
+        serde_json::to_string_pretty(&payload).expect("payload should serialize"),
+    )
+    .expect("session file should be written");
+
+    let summaries = list_saved_session_summaries_in_dir(&base);
+
+    assert_eq!(summaries.len(), 1);
+    assert_eq!(summaries[0]["id"].as_str(), Some(session_id.as_str()));
+    assert_eq!(summaries[0]["messages"].as_u64(), Some(0));
+    assert_eq!(summaries[0]["corrupt"].as_bool(), Some(false));
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn send_sessions_list_omits_in_memory_session_that_is_empty_after_sanitization() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("sidebar-sanitize-{}", now_epoch());
+    let (tx, mut rx) = mpsc::channel::<String>(4);
+
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(
+            session_id.clone(),
+            Session {
+                id: session_id.clone(),
+                name: "Sidebar Sanitized".into(),
+                messages: vec![
+                    ChatMessage {
+                        role: "system".into(),
+                        content: Some("system".into()),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        timestamp: None,
+                    },
+                    ChatMessage {
+                        role: "assistant".into(),
+                        content: None,
+                        tool_calls: None,
+                        tool_call_id: None,
+                        timestamp: Some(1),
+                    },
+                ],
+                created_at: 0,
+                updated_at: 0,
+                tool_calls_count: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                daily_input_tokens: 0,
+                daily_output_tokens: 0,
+                input_token_source: default_token_usage_source(),
+                output_token_source: default_token_usage_source(),
+                token_usage_day: prompts::current_local_snapshot().today(),
+                model_override: None,
+                think_level: default_think_level(),
+                show_react: false,
+                show_tools: true,
+                show_reasoning: true,
+                version: SESSION_VERSION,
+                workspace: PathBuf::new(),
+                avatar: None,
+            },
+        );
+    }
+
+    rt.block_on(send_sessions_list(&tx, &state, "another-session"));
+
+    let payload = rt
+        .block_on(rx.recv())
+        .expect("sessions list payload should be sent");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload).expect("payload should be valid json");
+    let sessions = parsed["sessions"]
+        .as_array()
+        .expect("sessions list should be an array");
+
+    assert!(!sessions
+        .iter()
+        .any(|session| session["id"].as_str() == Some(session_id.as_str())));
 }
 
 #[test]
@@ -1938,6 +2075,8 @@ fn handle_command_persists_tool_and_reasoning_visibility_changes() {
         ))
         .expect("command should return a result");
     assert_eq!(tool_result.response_type, "system");
+    assert!(tool_result.sessions_changed);
+    assert!(tool_result.refresh_history);
 
     let reasoning_result = rt
         .block_on(handle_command(
@@ -1950,10 +2089,494 @@ fn handle_command_persists_tool_and_reasoning_visibility_changes() {
         ))
         .expect("command should return a result");
     assert_eq!(reasoning_result.response_type, "system");
+    assert!(reasoning_result.sessions_changed);
+    assert!(!reasoning_result.refresh_history);
 
     let persisted = load_session_from_disk(&session_id).expect("session should load from disk");
     assert!(!persisted.show_tools);
     assert!(!persisted.show_reasoning);
+
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let _ = std::fs::remove_file(path);
+    let session_dir = workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn handle_command_persists_model_think_react_and_rename_changes() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("persist-command-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let mut session = test_session(&session_id, "Before Rename", None);
+    session.workspace = workspace.clone();
+    session.version = SESSION_VERSION;
+
+    let state = test_app_state();
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+
+    let model_result = rt
+        .block_on(handle_command(
+            "/model openai/gpt-4o-mini",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+    assert_eq!(model_result.response_type, "system");
+    assert!(model_result.sessions_changed);
+
+    let think_result = rt
+        .block_on(handle_command(
+            "/think high",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+    assert_eq!(think_result.response_type, "system");
+    assert!(think_result.sessions_changed);
+
+    let react_result = rt
+        .block_on(handle_command(
+            "/react off",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+    assert_eq!(react_result.response_type, "system");
+    assert!(react_result.sessions_changed);
+
+    let rename_result = rt
+        .block_on(handle_command(
+            "/rename After Rename",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+    assert_eq!(rename_result.response_type, "system");
+    assert!(rename_result.sessions_changed);
+
+    let persisted = load_session_from_disk(&session_id).expect("session should load from disk");
+    assert_eq!(persisted.model_override.as_deref(), Some("openai/gpt-4o-mini"));
+    assert_eq!(persisted.think_level, "high");
+    assert!(!persisted.show_react);
+    assert_eq!(persisted.name, "After Rename");
+    assert!(persisted.updated_at > 0);
+
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let _ = std::fs::remove_file(path);
+    let session_dir = workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn handle_command_persists_clear_changes() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("persist-clear-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let mut session = test_session(&session_id, "Persist Clear", None);
+    session.workspace = workspace.clone();
+    session.version = SESSION_VERSION;
+    session.messages.push(make_message("user", "keep me?"));
+    session.messages.push(make_message("assistant", "no"));
+
+    let state = test_app_state();
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(session_id.clone(), session.clone());
+    }
+    rt.block_on(save_session_to_disk(&session))
+        .expect("session should be saved before clear");
+
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+
+    let clear_result = rt
+        .block_on(handle_command(
+            "/clear",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+    assert_eq!(clear_result.response_type, "system");
+    assert!(clear_result.sessions_changed);
+    assert!(clear_result.refresh_history);
+
+    let persisted = load_session_from_disk(&session_id).expect("session should load from disk");
+    assert_eq!(persisted.messages.len(), 1);
+    assert_eq!(persisted.messages[0].role, "system");
+    assert_eq!(persisted.tool_calls_count, 0);
+    assert!(persisted.updated_at > 0);
+
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let _ = std::fs::remove_file(path);
+    let session_dir = workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn handle_command_persists_new_on_empty_context() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("persist-new-empty-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let mut session = test_session(&session_id, "Persist New Empty", None);
+    session.workspace = workspace.clone();
+    session.version = SESSION_VERSION;
+
+    let state = test_app_state();
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(session_id.clone(), session.clone());
+    }
+    rt.block_on(save_session_to_disk(&session))
+        .expect("session should be saved before new");
+
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+
+    let new_result = rt
+        .block_on(handle_command(
+            "/new",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+    assert_eq!(new_result.response_type, "system");
+    assert!(new_result.sessions_changed);
+    assert!(new_result.refresh_history);
+
+    let persisted = load_session_from_disk(&session_id).expect("session should load from disk");
+    assert_eq!(persisted.messages.len(), 1);
+    assert_eq!(persisted.messages[0].role, "system");
+    assert_eq!(persisted.tool_calls_count, 0);
+    assert!(persisted.updated_at > 0);
+
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let _ = std::fs::remove_file(path);
+    let session_dir = workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn handle_command_session_new_persists_created_session() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("persist-session-new-source-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let mut session = test_session(&session_id, "Source Session", None);
+    session.workspace = workspace.clone();
+    session.version = SESSION_VERSION;
+
+    let state = test_app_state();
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+
+    let result = rt
+        .block_on(handle_command(
+            "/session_new",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+
+    let new_id = result
+        .new_session_id
+        .clone()
+        .expect("session_new should return a new session id");
+    let persisted = load_session_from_disk(&new_id).expect("new session should be saved to disk");
+    assert_eq!(persisted.id, new_id);
+    assert_eq!(persisted.messages.len(), 1);
+    assert_eq!(persisted.messages[0].role, "system");
+
+    let new_path = sessions_dir().join(format!("{new_id}.json"));
+    let _ = std::fs::remove_file(new_path);
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let _ = std::fs::remove_file(path);
+    let source_session_dir = workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(source_session_dir);
+    let new_workspace = session_workspace_path(&new_id);
+    let new_session_dir = new_workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("new session dir should exist");
+    let _ = std::fs::remove_dir_all(new_session_dir);
+}
+
+#[test]
+fn handle_command_session_new_removes_abandoned_empty_session_artifacts() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("abandon-empty-session-new-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let mut session = test_session(&session_id, "Empty Source", None);
+    session.workspace = workspace.clone();
+    session.version = SESSION_VERSION;
+
+    let state = test_app_state();
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(session_id.clone(), session.clone());
+    }
+    rt.block_on(save_session_to_disk(&session))
+        .expect("empty source session should be saved");
+
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+
+    let result = rt
+        .block_on(handle_command(
+            "/session_new",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+    let new_id = result
+        .new_session_id
+        .clone()
+        .expect("session_new should return a new session id");
+
+    assert!(!sessions_dir().join(format!("{session_id}.json")).exists());
+    assert!(!workspace.parent().expect("source session dir should exist").exists());
+
+    let new_path = sessions_dir().join(format!("{new_id}.json"));
+    let _ = std::fs::remove_file(new_path);
+    let new_workspace = session_workspace_path(&new_id);
+    let new_session_dir = new_workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("new session dir should exist");
+    let _ = std::fs::remove_dir_all(new_session_dir);
+}
+
+#[test]
+fn handle_command_switch_removes_abandoned_empty_session_artifacts() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let source_id = format!("abandon-empty-switch-source-{}", now_epoch());
+    let source_workspace = session_workspace_path(&source_id);
+    std::fs::create_dir_all(&source_workspace).expect("source workspace should be created");
+
+    let mut source = test_session(&source_id, "Empty Source", None);
+    source.workspace = source_workspace.clone();
+    source.version = SESSION_VERSION;
+
+    let target_id = format!("abandon-empty-switch-target-{}", now_epoch());
+    let target_workspace = session_workspace_path(&target_id);
+    std::fs::create_dir_all(&target_workspace).expect("target workspace should be created");
+
+    let mut target = test_session(&target_id, "Target Session", None);
+    target.workspace = target_workspace.clone();
+    target.version = SESSION_VERSION;
+
+    let state = test_app_state();
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(source_id.clone(), source.clone());
+        sessions.insert(target_id.clone(), target.clone());
+    }
+    rt.block_on(save_session_to_disk(&source))
+        .expect("empty source session should be saved");
+    rt.block_on(save_session_to_disk(&target))
+        .expect("target session should be saved");
+
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+
+    let result = rt
+        .block_on(handle_command(
+            &format!("/switch {target_id}"),
+            &source_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+
+    assert_eq!(result.new_session_id.as_deref(), Some(target_id.as_str()));
+    assert!(!sessions_dir().join(format!("{source_id}.json")).exists());
+    assert!(!source_workspace.parent().expect("source session dir should exist").exists());
+
+    let target_path = sessions_dir().join(format!("{target_id}.json"));
+    let _ = std::fs::remove_file(target_path);
+    let target_session_dir = target_workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("target session dir should exist");
+    let _ = std::fs::remove_dir_all(target_session_dir);
+}
+
+#[test]
+fn recoverable_session_ids_skip_empty_and_corrupt_sessions() {
+    let summaries = vec![
+        json!({
+            "id": "empty-session",
+            "messages": 0,
+            "corrupt": false,
+        }),
+        json!({
+            "id": "corrupt-session",
+            "messages": 99,
+            "corrupt": true,
+        }),
+        json!({
+            "id": "real-session",
+            "messages": 3,
+            "corrupt": false,
+        }),
+    ];
+
+    let recoverable = recoverable_session_ids_from_summaries(&summaries);
+
+    assert_eq!(recoverable, vec!["real-session".to_string()]);
+}
+
+#[test]
+fn delete_session_rejects_bound_client_without_active_connection() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("delete-bound-client-{}", now_epoch());
+    let state = test_app_state();
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(4);
+
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(
+            session_id.clone(),
+            test_session(&session_id, "Delete Guard", None),
+        );
+    }
+    {
+        let mut clients = rt.block_on(state.session_clients.lock());
+        clients.insert(
+            session_id.clone(),
+            SessionClientBinding {
+                connection_id: 42,
+                tx: bound_tx,
+                replay_ready: true,
+                pending_events: Vec::new(),
+            },
+        );
+    }
+
+    let result = rt.block_on(delete_session_by_id(&session_id, &state));
+
+    assert!(result.contains("currently in use"));
+    assert!(rt.block_on(state.sessions.lock()).contains_key(&session_id));
+
+    let _ = rt
+        .block_on(state.session_clients.lock())
+        .remove(&session_id);
+    let _ = rt.block_on(state.sessions.lock()).remove(&session_id);
+}
+
+#[test]
+fn finalize_connection_removes_unbound_session_from_memory() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("finalize-cleanup-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let mut session = test_session(&session_id, "Finalize Cleanup", None);
+    session.workspace = workspace.clone();
+    session.version = SESSION_VERSION;
+
+    let state = test_app_state();
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(session_id.clone(), session);
+    }
+    {
+        let mut active = rt.block_on(state.active_connections.lock());
+        active.insert(session_id.clone(), 7);
+    }
+
+    let connection_cancel = CancellationToken::new();
+    let (tx, _rx) = mpsc::channel::<String>(4);
+    let (live_tx, _live_rx) = mpsc::channel::<serde_json::Value>(4);
+    let disconnect_watcher = rt.spawn(async {});
+    let live_dispatcher = rt.spawn(async {});
+    let avatar_poller = rt.spawn(async {});
+    let reader = rt.spawn(async {});
+    let writer = rt.spawn(async {});
+
+    rt.block_on(finalize_connection(
+        &state,
+        &session_id,
+        7,
+        &connection_cancel,
+        ConnectionCleanup {
+            tx,
+            live_tx,
+            tasks: socket_tasks::SocketTaskHandles {
+                live_dispatcher,
+                disconnect_watcher,
+                avatar_poller,
+            },
+            reader,
+            writer,
+        },
+    ));
+
+    assert!(rt.block_on(state.sessions.lock()).get(&session_id).is_none());
+    assert!(rt
+        .block_on(state.active_connections.lock())
+        .get(&session_id)
+        .is_none());
 
     let path = sessions_dir().join(format!("{session_id}.json"));
     let _ = std::fs::remove_file(path);

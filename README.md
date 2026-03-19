@@ -16,7 +16,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 
 - **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
 - **2 主会话管理工具**：`list_sessions`、`delete_session`
-- **14 斜杠命令**：`/new`、`/session_new`、`/switch`、`/rename`、`/model`、`/think`、`/react`、`/skills`、`/status`、`/usage`、`/clear`、`/help`、`/sessions`、`/delete`
+- **16 斜杠命令**：`/new`、`/session_new`、`/switch`、`/rename`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/skills`、`/status`、`/usage`、`/clear`、`/help`、`/sessions`、`/delete`
 - **双 Provider 模型路由**：OpenAI + Anthropic，支持 `provider/model` 和纯 model ID
 - **Per-session 模型覆盖**：运行时通过 `/model` 切换
 - **持久化多会话**：每个会话有独立工作区和磁盘存档
@@ -28,7 +28,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **推理可见性控制**：默认开启 ReAct 阶段转换 WS 事件（`react_phase`），可通过 `/react on|off` 手动切换；浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
 - **结构化工具结果**：`ToolOutcome`（output + is_error + duration_ms），前缀式错误检测，必填参数预校验，`tool_result` WS 事件携带耗时和错误标记
 - **原子持久化**：会话存档先写 `.tmp` 再 rename（Windows 兼容），加载时自动修剪不完整工具调用
-- **会话版本控制**：`SESSION_VERSION = 3`，旧存档自动迁移并补齐 `show_tools` / `show_reasoning` 等字段默认值
+- **会话版本控制**：`SESSION_VERSION = 4`，旧存档自动迁移并补齐 `show_tools` / `show_reasoning` / `show_react` 等字段默认值
 - **上下文裁剪追踪**：Analyze 阶段裁剪后发送 `context_pruned` WS 事件，包含移除消息数
 - **安全控制**：危险命令检测、沙盒路径解析、SSRF 阻断、重定向阻断、输出/文件大小上限
 
@@ -166,6 +166,8 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `/model [name]` | 查看可用模型或切换当前会话模型 |
 | `/think [level]` | 设置思维模式：`auto`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh` |
 | `/react [on\|off]` | 切换 ReAct 阶段可见性（默认开启；启用后每次阶段转换发送 `react_phase` WS 事件） |
+| `/tool [on\|off]` | 切换工具卡片显示；该设置会持久化到当前 session 的视图状态 |
+| `/reasoning [on\|off]` | 切换 reasoning 面板显示；该设置会持久化到当前 session 的视图状态 |
 | `/skills` | 列出可用工具帮助 |
 | `/status` | 显示模型、provider、上下文估算、最大输出 token、思维级别，token 数值按 K/M 显示 |
 | `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；同时显示内存与磁盘上所有 session 合并后的今日总 token 估算，按 K/M 显示 |
@@ -365,7 +367,7 @@ struct Session {
     avatar: Option<String>,    // transient, 不序列化
     show_tools: bool,
     show_reasoning: bool,
-    version: u32,              // 会话版本 (当前 SESSION_VERSION = 3)
+    version: u32,              // 会话版本 (当前 SESSION_VERSION = 4)
 }
 
 struct ChatMessage {
