@@ -214,7 +214,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 │                    Connection Layer (Loop)                        │
 │   handle_socket() · handle_command() · session persistence       │
 │   active_connections · session_clients · live_rounds             │
-│   avatar polling · replay/rebind · cooperative shutdown          │
+│   replay/rebind · cooperative shutdown                           │
 └───────┬──────────────────┬───────────────────┬───────────────────┘
         │                  │                   │
 ┌───────▼───────┐  ┌───────▼────────┐  ┌──────▼────────┐
@@ -331,7 +331,7 @@ src/
 ├── agent.rs         (~410 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
 ├── cli.rs           (~1370 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新
 ├── providers.rs     (~840 行)  — OpenAI/Anthropic 流式调用, 模型解析
-├── prompts.rs       (~720 行)  — 提示文件初始化/加载, bootstrap baseline, 头像解析
+├── prompts.rs       (~720 行)  — 提示文件初始化/加载, bootstrap baseline, 本地时间/记忆加载
 └── tools/
     ├── mod.rs       (~450 行)  — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验
     ├── fs.rs        (~310 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files
@@ -364,7 +364,6 @@ struct Session {
     model_override: Option<String>,
     think_level: String,       // "auto"|"off"|"minimal"|"low"|"medium"|"high"|"xhigh"
     workspace: PathBuf,        // ~/.lingclaw/{id}/workspace/
-    avatar: Option<String>,    // transient, 不序列化
     show_tools: bool,
     show_reasoning: bool,
     version: u32,              // 会话版本 (当前 SESSION_VERSION = 4)
@@ -465,7 +464,7 @@ think_level 映射：
 │   └── {uuid}.json         — 子会话存档
 ├── main/workspace/         — 主会话工作区
 │   ├── AGENTS.md           — 核心代理行为
-│   ├── IDENTITY.md         — 身份/头像
+│   ├── IDENTITY.md         — 身份信息
 │   ├── SOUL.md             — 高层推理规则
 │   ├── USER.md             — 用户特定行为
 │   ├── TOOLS.md            — 工具使用指南
@@ -505,7 +504,6 @@ think_level 映射：
 | `session` | 首次连接时的当前会话信息 |
 | `history` | 当前会话历史消息 |
 | `view_state` | `show_tools` / `show_reasoning` / `show_react` 状态同步 |
-| `avatar_update` | 会话头像更新 |
 | `start` | 新一轮回复开始 |
 | `delta` | 流式文本片段 |
 | `thinking_start` | 思维模式开始 |
@@ -545,7 +543,7 @@ think_level 映射：
 |---|---|
 | `BOOTSTRAP.md` | 新会话的初始引导指令 |
 | `AGENTS.md` | 核心代理行为 |
-| `IDENTITY.md` | 身份/人格/头像来源 |
+| `IDENTITY.md` | 身份/人格信息 |
 | `SOUL.md` | 高层推理规则 |
 | `USER.md` | 用户特定行为指导 |
 | `TOOLS.md` | 工具使用指导 |

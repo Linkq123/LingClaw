@@ -93,7 +93,6 @@ pub(crate) fn load_session_from_disk(id: &str) -> Option<Session> {
     session.workspace = super::session_workspace_path(&session.id);
     std::fs::create_dir_all(&session.workspace).ok();
     prompts::ensure_session_workspace(&session.workspace);
-    session.avatar = prompts::parse_identity_avatar(&session.workspace);
     Some(session)
 }
 

@@ -12,43 +12,32 @@ fn default_view_state_payload() -> serde_json::Value {
 }
 
 pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, session_id: &str) {
-    let (name, avatar, history, view_state) = {
+    let (name, history, view_state) = {
         let sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get(session_id) {
             (
                 session.name.clone(),
-                session.avatar.clone(),
                 build_history_payload(session),
                 build_view_state_payload(session),
             )
         } else {
             (
                 "New Chat".to_string(),
-                None,
                 default_history_payload(),
                 default_view_state_payload(),
             )
         }
     };
 
-    ws_send(
-        tx,
-        &json!({"type":"session","id":session_id,"name":name,"avatar":avatar}),
-    )
-    .await;
+    ws_send(tx, &json!({"type":"session","id":session_id,"name":name})).await;
     ws_send(tx, &view_state).await;
     ws_send(tx, &history).await;
 }
 
-pub(crate) async fn send_new_session_payload(
-    tx: &WsTx,
-    state: &AppState,
-    session_id: &str,
-    avatar: Option<String>,
-) {
+pub(crate) async fn send_new_session_payload(tx: &WsTx, state: &AppState, session_id: &str) {
     ws_send(
         tx,
-        &json!({"type":"session","id":session_id,"name":"New Chat","avatar":avatar}),
+        &json!({"type":"session","id":session_id,"name":"New Chat"}),
     )
     .await;
 
@@ -89,28 +78,22 @@ pub(crate) async fn send_command_refresh(
 }
 
 pub(crate) async fn send_session_switched_payloads(tx: &WsTx, state: &AppState, session_id: &str) {
-    let (name, avatar, view_state, history) = {
+    let (name, view_state, history) = {
         let sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get(session_id) {
             (
                 session.name.clone(),
-                session.avatar.clone(),
                 build_view_state_payload(session),
                 Some(build_history_payload(session)),
             )
         } else {
-            (
-                "New Chat".to_string(),
-                None,
-                default_view_state_payload(),
-                None,
-            )
+            ("New Chat".to_string(), default_view_state_payload(), None)
         }
     };
 
     ws_send(
         tx,
-        &json!({"type":"session_switched","id":session_id,"name":name,"avatar":avatar}),
+        &json!({"type":"session_switched","id":session_id,"name":name}),
     )
     .await;
     ws_send(tx, &view_state).await;

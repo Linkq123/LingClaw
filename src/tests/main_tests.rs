@@ -67,7 +67,6 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         show_reasoning: true,
         version: 0,
         workspace: PathBuf::new(),
-        avatar: None,
     }
 }
 
@@ -266,7 +265,6 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         show_reasoning: true,
         version: 0,
         workspace: PathBuf::new(),
-        avatar: None,
     };
 
     let payload = build_history_payload(&session);
@@ -1160,7 +1158,6 @@ fn send_sessions_list_omits_in_memory_session_that_is_empty_after_sanitization()
                 show_reasoning: true,
                 version: SESSION_VERSION,
                 workspace: PathBuf::new(),
-                avatar: None,
             },
         );
     }
@@ -1394,7 +1391,6 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         show_reasoning: true,
         version: 0,
         workspace: workspace.clone(),
-        avatar: None,
     };
 
     let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
@@ -1466,7 +1462,6 @@ fn save_session_to_disk_overwrites_existing_file() {
         show_reasoning: true,
         version: 1,
         workspace: workspace.clone(),
-        avatar: None,
     };
     runtime
         .block_on(save_session_to_disk(&first))
@@ -1665,48 +1660,6 @@ fn generate_shutdown_token_returns_64_hex_chars() {
 }
 
 #[test]
-fn parse_identity_avatar_treats_none_as_unset() {
-    let base = std::env::temp_dir().join(format!("lingclaw-avatar-none-{}", now_epoch()));
-    std::fs::create_dir_all(&base).expect("temp dir should be created");
-    std::fs::write(base.join("IDENTITY.md"), "- 头像：none\n")
-        .expect("identity file should be written");
-
-    let avatar = prompts::parse_identity_avatar(&base);
-
-    assert_eq!(avatar, None);
-
-    let _ = std::fs::remove_dir_all(&base);
-}
-
-#[test]
-fn parse_identity_avatar_ignores_legacy_unset_placeholder_value() {
-    let base = std::env::temp_dir().join(format!("lingclaw-avatar-placeholder-{}", now_epoch()));
-    std::fs::create_dir_all(&base).expect("temp dir should be created");
-    std::fs::write(base.join("IDENTITY.md"), "- 头像：暂未设置\n")
-        .expect("identity file should be written");
-
-    let avatar = prompts::parse_identity_avatar(&base);
-
-    assert_eq!(avatar, None);
-
-    let _ = std::fs::remove_dir_all(&base);
-}
-
-#[test]
-fn parse_identity_avatar_keeps_real_text_avatar() {
-    let base = std::env::temp_dir().join(format!("lingclaw-avatar-text-{}", now_epoch()));
-    std::fs::create_dir_all(&base).expect("temp dir should be created");
-    std::fs::write(base.join("IDENTITY.md"), "- 头像：✨\n")
-        .expect("identity file should be written");
-
-    let avatar = prompts::parse_identity_avatar(&base);
-
-    assert_eq!(avatar.as_deref(), Some("✨"));
-
-    let _ = std::fs::remove_dir_all(&base);
-}
-
-#[test]
 fn find_static_dir_from_prefers_exe_ancestors() {
     let base = std::env::temp_dir().join(format!("lingclaw-static-exe-{}", now_epoch()));
     let exe_dir = base.join("bin");
@@ -1813,7 +1766,6 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         show_reasoning: true,
         version: 0,
         workspace: PathBuf::new(),
-        avatar: None,
     };
 
     let payload = build_history_payload(&session);
@@ -2178,7 +2130,10 @@ fn handle_command_persists_model_think_react_and_rename_changes() {
     assert!(rename_result.sessions_changed);
 
     let persisted = load_session_from_disk(&session_id).expect("session should load from disk");
-    assert_eq!(persisted.model_override.as_deref(), Some("openai/gpt-4o-mini"));
+    assert_eq!(
+        persisted.model_override.as_deref(),
+        Some("openai/gpt-4o-mini")
+    );
     assert_eq!(persisted.think_level, "high");
     assert!(!persisted.show_react);
     assert_eq!(persisted.name, "After Rename");
@@ -2269,14 +2224,7 @@ fn handle_command_persists_new_on_empty_context() {
     let cancel = CancellationToken::new();
 
     let new_result = rt
-        .block_on(handle_command(
-            "/new",
-            &session_id,
-            1,
-            &state,
-            &tx,
-            &cancel,
-        ))
+        .block_on(handle_command("/new", &session_id, 1, &state, &tx, &cancel))
         .expect("command should return a result");
     assert_eq!(new_result.response_type, "system");
     assert!(new_result.sessions_changed);
@@ -2392,7 +2340,10 @@ fn handle_command_session_new_removes_abandoned_empty_session_artifacts() {
         .expect("session_new should return a new session id");
 
     assert!(!sessions_dir().join(format!("{session_id}.json")).exists());
-    assert!(!workspace.parent().expect("source session dir should exist").exists());
+    assert!(!workspace
+        .parent()
+        .expect("source session dir should exist")
+        .exists());
 
     let new_path = sessions_dir().join(format!("{new_id}.json"));
     let _ = std::fs::remove_file(new_path);
@@ -2450,7 +2401,10 @@ fn handle_command_switch_removes_abandoned_empty_session_artifacts() {
 
     assert_eq!(result.new_session_id.as_deref(), Some(target_id.as_str()));
     assert!(!sessions_dir().join(format!("{source_id}.json")).exists());
-    assert!(!source_workspace.parent().expect("source session dir should exist").exists());
+    assert!(!source_workspace
+        .parent()
+        .expect("source session dir should exist")
+        .exists());
 
     let target_path = sessions_dir().join(format!("{target_id}.json"));
     let _ = std::fs::remove_file(target_path);
@@ -2550,7 +2504,6 @@ fn finalize_connection_removes_unbound_session_from_memory() {
     let (live_tx, _live_rx) = mpsc::channel::<serde_json::Value>(4);
     let disconnect_watcher = rt.spawn(async {});
     let live_dispatcher = rt.spawn(async {});
-    let avatar_poller = rt.spawn(async {});
     let reader = rt.spawn(async {});
     let writer = rt.spawn(async {});
 
@@ -2565,14 +2518,16 @@ fn finalize_connection_removes_unbound_session_from_memory() {
             tasks: socket_tasks::SocketTaskHandles {
                 live_dispatcher,
                 disconnect_watcher,
-                avatar_poller,
             },
             reader,
             writer,
         },
     ));
 
-    assert!(rt.block_on(state.sessions.lock()).get(&session_id).is_none());
+    assert!(rt
+        .block_on(state.sessions.lock())
+        .get(&session_id)
+        .is_none());
     assert!(rt
         .block_on(state.active_connections.lock())
         .get(&session_id)
@@ -2849,7 +2804,6 @@ fn replay_live_round_rehydrates_inflight_round_state() {
         json!({
             "type": "start",
             "round": 3,
-            "avatar": "avatar-data",
             "phase": "act",
             "cycle": 2,
             "react_visible": true,

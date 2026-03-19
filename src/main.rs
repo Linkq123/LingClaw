@@ -73,10 +73,9 @@ use session_admin::{delete_session_by_id, gather_global_today_usage, gather_sess
 #[cfg(test)]
 use session_store::{
     build_active_session_lines, build_global_today_usage, build_history_payload,
-    build_session_status, build_session_usage, build_usage_report,
-    list_saved_session_ids_in_dir, list_saved_session_summaries_in_dir,
-    recoverable_session_ids_from_summaries, resolve_session_target,
-    sanitize_session_messages, sessions_dir, trim_incomplete_tool_calls,
+    build_session_status, build_session_usage, build_usage_report, list_saved_session_ids_in_dir,
+    list_saved_session_summaries_in_dir, recoverable_session_ids_from_summaries,
+    resolve_session_target, sanitize_session_messages, sessions_dir, trim_incomplete_tool_calls,
 };
 #[cfg(test)]
 use std::collections::HashSet;
@@ -185,9 +184,6 @@ struct Session {
     version: u32,
     #[serde(skip)]
     workspace: PathBuf,
-    /// Avatar from IDENTITY.md (transient, not persisted)
-    #[serde(skip)]
-    avatar: Option<String>,
 }
 
 fn default_think_level() -> String {
@@ -242,7 +238,6 @@ impl Session {
         let workspace = session_workspace_path(id);
         std::fs::create_dir_all(&workspace).ok();
         prompts::init_session_prompt_files(&workspace);
-        let avatar = prompts::parse_identity_avatar(&workspace);
         Self {
             id: id.to_string(),
             name: name.to_string(),
@@ -264,7 +259,6 @@ impl Session {
             show_reasoning: default_show_reasoning(),
             version: SESSION_VERSION,
             workspace,
-            avatar,
         }
     }
 
@@ -310,7 +304,6 @@ struct LiveToolState {
 #[derive(Clone, Default)]
 struct LiveRoundState {
     round: usize,
-    avatar: Option<String>,
     react_visible: bool,
     phase: Option<String>,
     cycle: Option<usize>,
@@ -642,10 +635,6 @@ pub(crate) async fn live_send(tx: &LiveTx, data: serde_json::Value) -> bool {
     tx.send(data).await.is_ok()
 }
 
-fn ws_try_send(tx: &WsTx, data: &serde_json::Value) -> bool {
-    tx.try_send(data.to_string()).is_ok()
-}
-
 async fn bind_session_connection(
     state: &AppState,
     session_id: &str,
@@ -723,7 +712,6 @@ async fn dispatch_live_event(state: &AppState, session_id: &str, event: serde_js
                     session_id.to_string(),
                     LiveRoundState {
                         round: event["round"].as_u64().unwrap_or(1) as usize,
-                        avatar: event["avatar"].as_str().map(str::to_string),
                         react_visible: event["react_visible"].as_bool().unwrap_or(false),
                         phase: event["phase"].as_str().map(str::to_string),
                         cycle: event["cycle"].as_u64().map(|value| value as usize),
@@ -836,7 +824,6 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
         &json!({
             "type":"start",
             "round": live_round.round,
-            "avatar": live_round.avatar,
             "phase": live_round.phase.as_deref().unwrap_or("analyze"),
             "cycle": live_round.cycle,
             "react_visible": live_round.react_visible,
@@ -911,30 +898,6 @@ fn build_agent_hard_cap_events(
             "tool_calls": tool_calls,
         }),
     )
-}
-
-async fn detect_session_avatar_update(
-    session_id: &str,
-    state: &AppState,
-) -> Option<Option<String>> {
-    let (workspace, current_avatar) = {
-        let sessions = state.sessions.lock().await;
-        let session = sessions.get(session_id)?;
-        (session.workspace.clone(), session.avatar.clone())
-    };
-    let fresh = prompts::parse_identity_avatar(&workspace);
-    if fresh != current_avatar {
-        Some(fresh)
-    } else {
-        None
-    }
-}
-
-async fn commit_session_avatar(session_id: &str, avatar: Option<String>, state: &AppState) {
-    let mut sessions = state.sessions.lock().await;
-    if let Some(session) = sessions.get_mut(session_id) {
-        session.avatar = avatar;
-    }
 }
 
 // ── Tool Dispatch ────────────────────────────────────────────────────────────
@@ -1119,7 +1082,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         );
         session.messages.push(sys);
         current_session_id = session.id.clone();
-        let avatar = session.avatar.clone();
         if let Err(error) = save_session_to_disk(&session).await {
             eprintln!(
                 "Warning: failed to persist new session {} on creation: {error}; keeping in memory",
@@ -1132,7 +1094,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             sessions.insert(current_session_id.clone(), session);
             active.insert(current_session_id.clone(), connection_id);
         }
-        send_new_session_payload(&tx, &state, &current_session_id, avatar).await;
+        send_new_session_payload(&tx, &state, &current_session_id).await;
     }
 
     bind_session_connection(&state, &current_session_id, connection_id, &tx, false).await;
@@ -1144,7 +1106,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
     let current_session_ref = Arc::new(Mutex::new(current_session_id.clone()));
     let (live_tx, socket_tasks) = spawn_connection_tasks(
         state.clone(),
-        tx.clone(),
         connection_cancel.clone(),
         current_session_ref.clone(),
         connection_id,
@@ -1180,13 +1141,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                 break;
             }
             if let Some(result) = cmd_result {
-                send_command_refresh(
-                    &tx,
-                    &state,
-                    &current_session_id,
-                    result.refresh_history,
-                )
-                .await;
+                send_command_refresh(&tx, &state, &current_session_id, result.refresh_history)
+                    .await;
 
                 ws_send(
                     &tx,
@@ -1213,13 +1169,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                 }
                 if result.sessions_changed {
                     send_sessions_list(&tx, &state, &current_session_id).await;
-                }
-                if let Some(avatar) =
-                    detect_session_avatar_update(&current_session_id, &state).await
-                {
-                    if ws_send(&tx, &json!({"type":"avatar_update","avatar":avatar,"session_id":&current_session_id})).await {
-                        commit_session_avatar(&current_session_id, avatar, &state).await;
-                    }
                 }
             } else {
                 ws_send(
@@ -1301,7 +1250,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     )
                     .await;
 
-                    let (msgs_snapshot, model, workspace, think_level, prev_avatar, pruned_count) = {
+                    let (msgs_snapshot, model, workspace, think_level, pruned_count) = {
                         let mut sessions = state.sessions.lock().await;
                         let session = match sessions.get_mut(&current_session_id) {
                             Some(s) => s,
@@ -1333,13 +1282,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             context_input_budget_for_model(&state.config, &model_str),
                         );
                         let pruned = msg_count_before - session.messages.len();
-                        let prev_avatar = session.avatar.clone();
                         (
                             session.messages.clone(),
                             model_str,
                             session.workspace.clone(),
                             session.think_level.clone(),
-                            prev_avatar,
                             pruned,
                         )
                     };
@@ -1376,21 +1323,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     cycle_workspace = workspace.clone();
                     cycle_is_main = current_session_id == MAIN_SESSION_ID;
 
-                    // Parse avatar outside lock (does sync I/O)
-                    let avatar = prompts::parse_identity_avatar(&workspace);
-                    if avatar != prev_avatar {
-                        let mut sessions = state.sessions.lock().await;
-                        if let Some(session) = sessions.get_mut(&current_session_id) {
-                            session.avatar = avatar.clone();
-                        }
-                    }
-
                     if !live_send(
                         &live_tx,
                         json!({
                             "type":"start",
                             "round": round + 1,
-                            "avatar": avatar,
                             "phase": react_ctx.phase().label(),
                             "react_visible": react_ctx.show_react,
                         }),

@@ -128,7 +128,13 @@ async fn reset_session_context_and_persist(
     persist_session_update(
         state,
         current_session_id,
-        |session| (session.messages.clone(), session.tool_calls_count, session.updated_at),
+        |session| {
+            (
+                session.messages.clone(),
+                session.tool_calls_count,
+                session.updated_at,
+            )
+        },
         |session| {
             let model = session.effective_model(&state.config.model).to_string();
             let is_main = session.is_main();
@@ -294,13 +300,8 @@ async fn handle_new_command(
     tokio::fs::create_dir_all(&memory_dir).await.ok();
     let memory_path = memory_dir.join(format!("{today}.md"));
 
-    let write_result = append_daily_memory_entry(
-        &memory_path,
-        &today,
-        &local_snapshot.hhmm(),
-        &summary,
-    )
-    .await;
+    let write_result =
+        append_daily_memory_entry(&memory_path, &today, &local_snapshot.hhmm(), &summary).await;
 
     if let Err(e) = write_result {
         return Some(command_result(
@@ -392,8 +393,9 @@ async fn handle_switch_command(
         let sessions = state.sessions.lock().await;
         sessions.get(current_session_id).cloned()
     };
-    let should_delete_current_if_switch_succeeds =
-        snapshot.as_ref().is_some_and(|session| session.messages.len() <= 1);
+    let should_delete_current_if_switch_succeeds = snapshot
+        .as_ref()
+        .is_some_and(|session| session.messages.len() <= 1);
     if let Some(ref s) = snapshot {
         if s.messages.len() > 1 {
             if let Err(e) = save_session_to_disk(s).await {

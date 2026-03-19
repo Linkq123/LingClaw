@@ -1,6 +1,5 @@
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
-use serde_json::json;
 use tokio::{
     sync::{mpsc, Mutex},
     task::JoinHandle,
@@ -9,13 +8,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     session_store::{save_session_to_disk, trim_incomplete_tool_calls},
-    ws_try_send, AppState, LiveTx, WsTx,
+    AppState, LiveTx, WsTx,
 };
 
 pub(crate) struct SocketTaskHandles {
     pub(crate) live_dispatcher: JoinHandle<()>,
     pub(crate) disconnect_watcher: JoinHandle<()>,
-    pub(crate) avatar_poller: JoinHandle<()>,
 }
 
 pub(crate) struct ConnectionCleanup {
@@ -28,7 +26,6 @@ pub(crate) struct ConnectionCleanup {
 
 pub(crate) fn spawn_connection_tasks(
     state: Arc<AppState>,
-    tx: WsTx,
     connection_cancel: CancellationToken,
     current_session_ref: Arc<Mutex<String>>,
     connection_id: u64,
@@ -60,37 +57,11 @@ pub(crate) fn spawn_connection_tasks(
             .await;
     });
 
-    let poll_cancel = connection_cancel.clone();
-    let poll_state = state;
-    let poll_session_ref = current_session_ref;
-    let avatar_poller = tokio::spawn(async move {
-        let mut avatar_poll = tokio::time::interval(Duration::from_secs(1));
-        avatar_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                biased;
-                _ = poll_cancel.cancelled() => break,
-                _ = avatar_poll.tick() => {
-                    let session_id = {
-                        let guard = poll_session_ref.lock().await;
-                        guard.clone()
-                    };
-                    if let Some(avatar) = super::detect_session_avatar_update(&session_id, &poll_state).await {
-                        if ws_try_send(&tx, &json!({"type":"avatar_update","avatar":avatar,"session_id":&session_id})) {
-                            super::commit_session_avatar(&session_id, avatar, &poll_state).await;
-                        }
-                    }
-                }
-            }
-        }
-    });
-
     (
         live_tx,
         SocketTaskHandles {
             live_dispatcher,
             disconnect_watcher,
-            avatar_poller,
         },
     )
 }
@@ -157,7 +128,6 @@ pub(crate) async fn finalize_connection(
 
     let _ = cleanup.tasks.disconnect_watcher.await;
     let _ = cleanup.tasks.live_dispatcher.await;
-    let _ = cleanup.tasks.avatar_poller.await;
     let _ = cleanup.reader.await;
     let _ = cleanup.writer.await;
 }

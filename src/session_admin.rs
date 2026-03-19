@@ -81,9 +81,11 @@ pub(crate) async fn gather_sessions_status(state: &AppState) -> String {
             } else {
                 "saved"
             };
-            let status_block = build_session_status(session, &state.config)
-                .replace('\n', "\n    ");
-            format!("  {}  {}  [{}]\n    {}", session.id, session.name, status, status_block)
+            let status_block = build_session_status(session, &state.config).replace('\n', "\n    ");
+            format!(
+                "  {}  {}  [{}]\n    {}",
+                session.id, session.name, status, status_block
+            )
         })
         .collect::<Vec<_>>();
 
@@ -128,7 +130,11 @@ pub(crate) async fn delete_session_by_id(target: &str, state: &AppState) -> Stri
             true
         } else {
             drop(active);
-            state.session_clients.lock().await.contains_key(&resolved_id)
+            state
+                .session_clients
+                .lock()
+                .await
+                .contains_key(&resolved_id)
         }
     };
     if session_in_use {

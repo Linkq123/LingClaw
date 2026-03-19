@@ -62,7 +62,7 @@ fn load_session_prompt_files_auto_completes_bootstrap_when_identity_is_edited() 
     fs::write(workspace.join("AGENTS.md"), "agent").expect("agent file should be written");
     fs::write(
         workspace.join("IDENTITY.md"),
-        "- Name: Ling\n- Creature:\n- Vibe:\n- Emoji:\n- Avatar: none\n",
+        "- Name: Ling\n- Creature:\n- Vibe:\n- Emoji:\n",
     )
     .expect("identity file should be written");
     fs::write(
@@ -231,89 +231,6 @@ fn ensure_session_workspace_migrates_legacy_agent_file() {
         fs::read_to_string(workspace.join("AGENTS.md")).expect("renamed agent should be readable"),
         "legacy agent"
     );
-
-    let _ = fs::remove_dir_all(&workspace);
-}
-
-#[test]
-fn parse_identity_avatar_supports_english_avatar_key() {
-    let workspace = std::env::temp_dir().join("lingclaw-avatar-english-key-test");
-    let _ = fs::remove_dir_all(&workspace);
-    fs::create_dir_all(&workspace).expect("workspace should be created");
-    fs::write(workspace.join("IDENTITY.md"), "- Avatar: ✨\n")
-        .expect("identity file should be written");
-
-    let avatar = parse_identity_avatar(&workspace);
-
-    assert_eq!(avatar.as_deref(), Some("✨"));
-
-    let _ = fs::remove_dir_all(&workspace);
-}
-
-#[test]
-fn parse_identity_avatar_supports_bold_avatar_key() {
-    let workspace = std::env::temp_dir().join("lingclaw-avatar-bold-key-test");
-    let _ = fs::remove_dir_all(&workspace);
-    fs::create_dir_all(&workspace).expect("workspace should be created");
-    fs::write(workspace.join("IDENTITY.md"), "- **Avatar:** avatar.png\n")
-        .expect("identity file should be written");
-    fs::write(workspace.join("avatar.png"), "not a real png but present")
-        .expect("avatar file should be written");
-
-    let avatar = parse_identity_avatar(&workspace);
-
-    assert!(avatar.is_some());
-
-    let _ = fs::remove_dir_all(&workspace);
-}
-
-#[test]
-fn parse_identity_avatar_treats_inline_none_guidance_as_unset() {
-    let workspace = std::env::temp_dir().join("lingclaw-avatar-inline-none-test");
-    let _ = fs::remove_dir_all(&workspace);
-    fs::create_dir_all(&workspace).expect("workspace should be created");
-    fs::write(
-        workspace.join("IDENTITY.md"),
-        "- 头像：none （未设置时填写 none；也可填写工作区相对路径、http(s) URL、data URI）\n",
-    )
-    .expect("identity file should be written");
-
-    let avatar = parse_identity_avatar(&workspace);
-
-    assert_eq!(avatar, None);
-
-    let _ = fs::remove_dir_all(&workspace);
-}
-
-#[test]
-fn parse_identity_avatar_keeps_text_that_only_starts_with_none() {
-    let workspace = std::env::temp_dir().join("lingclaw-avatar-none-prefix-text-test");
-    let _ = fs::remove_dir_all(&workspace);
-    fs::create_dir_all(&workspace).expect("workspace should be created");
-    fs::write(workspace.join("IDENTITY.md"), "- 头像：none-core\n")
-        .expect("identity file should be written");
-
-    let avatar = parse_identity_avatar(&workspace);
-
-    assert_eq!(avatar.as_deref(), Some("none-core"));
-
-    let _ = fs::remove_dir_all(&workspace);
-}
-
-#[test]
-fn parse_identity_avatar_treats_case_mixed_inline_none_guidance_as_unset() {
-    let workspace = std::env::temp_dir().join("lingclaw-avatar-none-mixed-case-test");
-    let _ = fs::remove_dir_all(&workspace);
-    fs::create_dir_all(&workspace).expect("workspace should be created");
-    fs::write(
-        workspace.join("IDENTITY.md"),
-        "- 头像：None (leave unset)\n",
-    )
-    .expect("identity file should be written");
-
-    let avatar = parse_identity_avatar(&workspace);
-
-    assert_eq!(avatar, None);
 
     let _ = fs::remove_dir_all(&workspace);
 }

@@ -33,7 +33,6 @@ let reactStatusCycle = null;
 let reactPhaseShownAt = 0;
 let reactPhaseTimer = 0;
 let reactPhaseQueue = [];
-let sessionAvatar = null;
 let reconnectDelay = 1000;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 50;
@@ -662,7 +661,6 @@ function handleMessage(data) {
       sessionNameEl.textContent = data.name || 'New Chat';
       sessionIdEl.textContent = data.id.slice(0, 12);
       sessionStorage.setItem('lingclaw_session', data.id);
-      applySessionAvatar(data.avatar || null);
       applyViewState(data);
       break;
 
@@ -671,7 +669,6 @@ function handleMessage(data) {
       sessionNameEl.textContent = data.name || 'New Chat';
       sessionIdEl.textContent = data.id.slice(0, 12);
       sessionStorage.setItem('lingclaw_session', data.id);
-      applySessionAvatar(data.avatar || null);
       applyViewState(data);
       finishAssistantStream({ discardIfEmpty: true });
       finishReasoningStream();
@@ -722,14 +719,7 @@ function handleMessage(data) {
       renderSessionList();
       break;
 
-    case 'avatar_update':
-      if (!data.session_id || data.session_id === currentSessionId) {
-        applySessionAvatar(data.avatar || null);
-      }
-      break;
-
     case 'start':
-      if (data.avatar !== undefined) applySessionAvatar(data.avatar || null);
       setBusy(true);
       finishAssistantStream({ discardIfEmpty: true });
       clearReactStatus();
@@ -867,7 +857,7 @@ function addMsg(cls, text, timestamp) {
   if (hasAvatar) {
     const avatar = document.createElement('div');
     avatar.className = 'msg-avatar';
-    setAssistantAvatar(avatar, sessionAvatar);
+    setAssistantAvatar(avatar);
     row.appendChild(avatar);
   }
 
@@ -1055,21 +1045,8 @@ function truncateStr(s, max) {
 }
 function scrollDown() { chat.scrollTop = chat.scrollHeight; }
 
-function setAssistantAvatar(node, avatarValue) {
+function setAssistantAvatar(node) {
   node.replaceChildren();
-  if (avatarValue && (avatarValue.startsWith('http') || avatarValue.startsWith('data:'))) {
-    const img = document.createElement('img');
-    img.src = avatarValue;
-    img.style.cssText = 'width:100%;height:100%;border-radius:50%;object-fit:cover';
-    node.appendChild(img);
-    return;
-  }
-
-  if (avatarValue) {
-    node.textContent = avatarValue;
-    return;
-  }
-
   const img = document.createElement('img');
   img.src = DEFAULT_BRAND_AVATAR;
   img.alt = 'LingClaw avatar';
@@ -1079,13 +1056,6 @@ function setAssistantAvatar(node, avatarValue) {
     node.textContent = '🦀';
   };
   node.appendChild(img);
-}
-
-function applySessionAvatar(nextAvatar) {
-  sessionAvatar = nextAvatar;
-  chat.querySelectorAll('.msg-row.assistant .msg-avatar').forEach(node => {
-    setAssistantAvatar(node, sessionAvatar);
-  });
 }
 
 function formatTime(d) {
