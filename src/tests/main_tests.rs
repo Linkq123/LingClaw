@@ -870,14 +870,13 @@ fn build_session_usage_formats_totals() {
 
     let usage = build_session_usage(&session);
 
-    assert!(usage.contains("today_usage_est:"));
+    assert!(usage.contains("today_usage_est: # 当前会话今日 token 使用估算"));
     assert!(usage.contains("\tinput_tokens: 2.3K"));
     assert!(usage.contains("\toutput_tokens: 560"));
-    assert!(usage.contains("total_usage_est:"));
+    assert!(usage.contains("total_usage_est: # 当前会话累计 token 使用估算"));
     assert!(usage.contains("\ttotal_tokens: 16.9K"));
-    assert!(usage.contains("today_input_tokens: 2.3K"));
-    assert!(usage.contains("today_output_tokens: 560"));
-    assert!(usage.contains("today_total_tokens: 2.9K"));
+    assert!(usage.contains("total_input_tokens: 12.3K"));
+    assert!(usage.contains("total_output_tokens: 4.6K"));
 }
 
 #[test]
@@ -893,9 +892,8 @@ fn build_session_usage_resets_today_window_when_day_changes() {
 
     assert!(usage.contains("\tinput_tokens: 0"));
     assert!(usage.contains("\toutput_tokens: 0"));
-    assert!(usage.contains("today_input_tokens: 0"));
-    assert!(usage.contains("today_output_tokens: 0"));
-    assert!(usage.contains("today_total_tokens: 0"));
+    assert!(usage.contains("total_input_tokens: 12.3K"));
+    assert!(usage.contains("total_output_tokens: 4.6K"));
 }
 
 #[test]
@@ -921,7 +919,7 @@ fn build_global_today_usage_sums_all_sessions() {
 
     let usage = build_global_today_usage(&sessions);
 
-    assert!(usage.contains("global_today_usage_est:"));
+    assert!(usage.contains("global_today_usage_est: # 所有会话今日 token 使用估算"));
     assert!(usage.contains("input_tokens: 3K"));
     assert!(usage.contains("output_tokens: 1K"));
     assert!(usage.contains("total_tokens: 4K"));
@@ -953,7 +951,7 @@ fn gather_global_today_usage_includes_saved_sessions_not_loaded_in_memory() {
 
     let usage = rt.block_on(gather_global_today_usage(&state));
 
-    assert!(usage.contains("global_today_usage_est:"));
+    assert!(usage.contains("global_today_usage_est: # 所有会话今日 token 使用估算"));
     assert!(usage.contains("input_tokens: 3K"));
     assert!(usage.contains("output_tokens: 1K"));
     assert!(usage.contains("total_tokens: 4K"));
@@ -1006,13 +1004,13 @@ fn build_usage_report_includes_session_and_global_sections() {
 
     let report = build_usage_report(
         &current,
-        "global_today_usage_est:\n\tinput_tokens: 3K\n\toutput_tokens: 1K\n\ttotal_tokens: 4K",
+        "global_today_usage_est: # 所有会话今日 token 使用估算\n\tinput_tokens: 3K\n\toutput_tokens: 1K\n\ttotal_tokens: 4K",
     );
 
-    assert!(report.contains("today_usage_est:"));
-    assert!(report.contains("total_usage_est:"));
-    assert!(report.contains("today_total_tokens: 2.9K"));
-    assert!(report.contains("global_today_usage_est:"));
+    assert!(report.contains("today_usage_est: # 当前会话今日 token 使用估算"));
+    assert!(report.contains("total_usage_est: # 当前会话累计 token 使用估算"));
+    assert!(report.contains("total_input_tokens: 12.3K"));
+    assert!(report.contains("global_today_usage_est: # 所有会话今日 token 使用估算"));
     assert!(report.contains("\tinput_tokens: 3K"));
     assert!(report.contains("\toutput_tokens: 1K"));
     assert!(report.contains("\ttotal_tokens: 4K"));

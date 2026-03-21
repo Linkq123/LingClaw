@@ -341,18 +341,18 @@ pub(crate) fn build_session_status(session: &Session, config: &Config) -> String
 
 pub(crate) fn build_session_usage(session: &Session) -> String {
     let (today_input_tokens, today_output_tokens) = super::current_daily_token_usage(session);
+    let total_input_tokens = session.input_tokens;
+    let total_output_tokens = session.output_tokens;
     let total_tokens = session.input_tokens.saturating_add(session.output_tokens);
-    let today_total_tokens = today_input_tokens.saturating_add(today_output_tokens);
 
     format!(
-        "today_usage_est:\n\tinput_tokens: {}\n\toutput_tokens: {}\n\n\
-total_usage_est:\n\ttotal_tokens: {}\n\ttoday_input_tokens: {}\n\ttoday_output_tokens: {}\n\ttoday_total_tokens: {}",
+        "today_usage_est: # 当前会话今日 token 使用估算\n\tinput_tokens: {}\n\toutput_tokens: {}\n\n\
+total_usage_est: # 当前会话累计 token 使用估算\n\ttotal_tokens: {}\n\ttotal_input_tokens: {}\n\ttotal_output_tokens: {}",
         format_token_count(today_input_tokens),
         format_token_count(today_output_tokens),
         format_token_count(total_tokens),
-        format_token_count(today_input_tokens),
-        format_token_count(today_output_tokens),
-        format_token_count(today_total_tokens),
+        format_token_count(total_input_tokens),
+        format_token_count(total_output_tokens),
     )
 }
 
@@ -361,6 +361,7 @@ pub(crate) fn build_global_today_usage(sessions: &HashMap<String, Session>) -> S
         super::accumulate_daily_token_usage(sessions.values());
     format_usage_block(
         "global_today_usage_est",
+        "所有会话今日 token 使用估算",
         global_today_input_tokens,
         global_today_output_tokens,
     )

@@ -114,9 +114,14 @@ pub(crate) fn accumulate_daily_token_usage<'a>(
     )
 }
 
-pub(crate) fn format_usage_block(label: &str, input_tokens: u64, output_tokens: u64) -> String {
+pub(crate) fn format_usage_block(
+    label: &str,
+    description: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> String {
     format!(
-        "{label}:\n\tinput_tokens: {}\n\toutput_tokens: {}\n\ttotal_tokens: {}",
+        "{label}: # {description}\n\tinput_tokens: {}\n\toutput_tokens: {}\n\ttotal_tokens: {}",
         format_token_count(input_tokens),
         format_token_count(output_tokens),
         format_token_count(input_tokens.saturating_add(output_tokens)),
