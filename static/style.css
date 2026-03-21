@@ -276,6 +276,10 @@ header .actions button.is-active {
 }
 
 .msg-content { min-width: 0; }
+.msg-row.assistant .msg-content {
+  flex: 1 1 auto;
+  width: 0;
+}
 .msg-time { font-size: 10px; color: var(--dim); margin-top: 3px; opacity: 0; transition: opacity .2s; }
 .msg-row:hover .msg-time { opacity: .6; }
 .msg-row.user .msg-time { text-align: right; }
@@ -299,6 +303,8 @@ header .actions button.is-active {
   border-radius: 0;
   box-shadow: none;
   padding: 4px 2px 2px 2px;
+  width: 100%;
+  box-sizing: border-box;
   transition: opacity .18s ease;
 }
 .msg.assistant.markdown-pending {
@@ -333,6 +339,8 @@ header .actions button.is-active {
 .msg.assistant pre {
   margin: 10px 0 14px;
   position: relative;
+  width: 100%;
+  box-sizing: border-box;
   background: linear-gradient(180deg, rgba(240,242,248,.92), rgba(232,236,245,.88));
   border: 1px solid var(--border);
   border-radius: 10px;
