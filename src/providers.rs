@@ -348,28 +348,6 @@ fn maybe_apply_anthropic_tool_cache_control(tools: &mut [serde_json::Value], cac
     }
 }
 
-fn buffered_reasoning_events(reasoning: &str) -> Vec<serde_json::Value> {
-    if reasoning.is_empty() {
-        return Vec::new();
-    }
-
-    vec![
-        json!({"type":"thinking_start"}),
-        json!({"type":"thinking_delta","content":reasoning}),
-        json!({"type":"thinking_done"}),
-    ]
-}
-
-async fn flush_reasoning_buffer(tx: &LiveTx, reasoning_buf: &mut String) -> bool {
-    let reasoning = std::mem::take(reasoning_buf);
-    for event in buffered_reasoning_events(&reasoning) {
-        if !live_send(tx, event).await {
-            return false;
-        }
-    }
-    true
-}
-
 pub(crate) async fn call_llm_stream(
     http: &Client,
     resolved: &ResolvedModel,
@@ -456,12 +434,12 @@ async fn call_llm_stream_openai(
 
     let mut stream = resp.bytes_stream();
     let mut content_buf = String::new();
-    let mut reasoning_buf = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut input_tokens: Option<u64> = None;
     let mut output_tokens: Option<u64> = None;
     let mut partial_buf = String::new();
     let mut client_gone = false;
+    let mut reasoning_started = false;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
@@ -492,15 +470,25 @@ async fn call_llm_stream_openai(
                     }
                     if let Some(choices) = chunk.choices {
                         for choice in choices {
-                            // Buffer the whole round's reasoning and emit one
-                            // consolidated panel after the stream finishes.
+                            // Stream reasoning deltas live so the panel
+                            // appears while the model is still thinking.
                             if let Some(think_text) = &choice.delta.reasoning_content {
-                                if !think_text.is_empty() {
-                                    reasoning_buf.push_str(think_text);
+                                if !think_text.is_empty() && !client_gone {
+                                    if !reasoning_started {
+                                        reasoning_started = true;
+                                        client_gone = !live_send(tx, json!({"type":"thinking_start"})).await;
+                                    }
+                                    if !client_gone {
+                                        client_gone = !live_send(tx, json!({"type":"thinking_delta","content":think_text})).await;
+                                    }
                                 }
                             }
-                            // Content delta
+                            // Content delta — close reasoning panel first
                             if let Some(text) = &choice.delta.content {
+                                if reasoning_started && !client_gone {
+                                    reasoning_started = false;
+                                    client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+                                }
                                 content_buf.push_str(text);
                                 if !client_gone
                                     && !live_send(tx, json!({"type":"delta","content":text})).await
@@ -546,7 +534,10 @@ async fn call_llm_stream_openai(
         partial_buf = leftover.to_string();
     }
 
-    if !client_gone && !flush_reasoning_buffer(tx, &mut reasoning_buf).await {
+    if reasoning_started && !client_gone {
+        client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+    }
+    if client_gone {
         return Err("Client disconnected".into());
     }
 
@@ -611,7 +602,6 @@ async fn call_llm_stream_anthropic(
 
     let mut stream = resp.bytes_stream();
     let mut content_buf = String::new();
-    let mut reasoning_buf = String::new();
     let mut tool_calls: Vec<ToolCall> = Vec::new();
     let mut input_tokens: Option<u64> = None;
     let mut output_tokens: Option<u64> = None;
@@ -619,6 +609,8 @@ async fn call_llm_stream_anthropic(
     // Track current content block index → tool_calls index mapping
     let mut block_tool_idx: HashMap<usize, usize> = HashMap::new();
     let mut client_gone = false;
+    let mut reasoning_started = false;
+    let mut thinking_block_idx: Option<usize> = None;
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
@@ -665,7 +657,13 @@ async fn call_llm_stream_anthropic(
                         if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
                             if let Some(block) = &evt.content_block {
                                 match block.block_type.as_str() {
-                                    "thinking" => {}
+                                    "thinking" => {
+                                        thinking_block_idx = evt.index;
+                                        if !client_gone {
+                                            reasoning_started = true;
+                                            client_gone = !live_send(tx, json!({"type":"thinking_start"})).await;
+                                        }
+                                    }
                                     "tool_use" => {
                                         let idx = tool_calls.len();
                                         tool_calls.push(ToolCall {
@@ -691,7 +689,9 @@ async fn call_llm_stream_anthropic(
                                 match delta.delta_type.as_deref() {
                                     Some("thinking_delta") => {
                                         if let Some(text) = &delta.thinking {
-                                            reasoning_buf.push_str(text);
+                                            if !text.is_empty() && !client_gone {
+                                                client_gone = !live_send(tx, json!({"type":"thinking_delta","content":text})).await;
+                                            }
                                         }
                                     }
                                     Some("text_delta") => {
@@ -729,7 +729,17 @@ async fn call_llm_stream_anthropic(
                             }
                         }
                     }
-                    "content_block_stop" => {}
+                    "content_block_stop" => {
+                        if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
+                            if thinking_block_idx.is_some() && evt.index == thinking_block_idx {
+                                thinking_block_idx = None;
+                                reasoning_started = false;
+                                if !client_gone {
+                                    client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+                                }
+                            }
+                        }
+                    }
                     "message_stop" => {
                         // End of message
                     }
@@ -741,7 +751,10 @@ async fn call_llm_stream_anthropic(
         partial_buf = leftover.to_string();
     }
 
-    if !client_gone && !flush_reasoning_buffer(tx, &mut reasoning_buf).await {
+    if reasoning_started && !client_gone {
+        client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+    }
+    if client_gone {
         return Err("Client disconnected".into());
     }
 

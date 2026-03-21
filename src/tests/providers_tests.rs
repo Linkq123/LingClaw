@@ -304,17 +304,3 @@ fn anthropic_prompt_caching_can_be_forced_for_compatible_api() {
     assert!(anthropic_prompt_caching_enabled(&resolved));
 }
 
-#[test]
-fn buffered_reasoning_events_empty() {
-    assert!(buffered_reasoning_events("").is_empty());
-}
-
-#[test]
-fn buffered_reasoning_events_emit_single_panel_sequence() {
-    let events = buffered_reasoning_events("comment_repo 的头几行");
-    assert_eq!(events.len(), 3);
-    assert_eq!(events[0]["type"], "thinking_start");
-    assert_eq!(events[1]["type"], "thinking_delta");
-    assert_eq!(events[1]["content"], "comment_repo 的头几行");
-    assert_eq!(events[2]["type"], "thinking_done");
-}
