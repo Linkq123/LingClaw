@@ -33,10 +33,14 @@ let reactStatusCycle = null;
 let reactPhaseShownAt = 0;
 let reactPhaseTimer = 0;
 let reactPhaseQueue = [];
+let reactPendingClear = false;
 let reconnectDelay = 1000;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 50;
-const MIN_REACT_PHASE_VISIBLE_MS = 320;
+const MIN_REACT_ANALYZE_VISIBLE_MS = 180;
+const MIN_REACT_ACT_VISIBLE_MS = 420;
+const MIN_REACT_OBSERVE_VISIBLE_MS = 650;
+const MAX_REACT_QUEUED_PHASES = 2;
 let pendingAssistantText = '';
 let pendingReasoningText = '';
 let flushHandle = 0;
@@ -515,6 +519,7 @@ function clearReactStatus() {
     reactPhaseTimer = 0;
   }
   reactPhaseQueue = [];
+  reactPendingClear = false;
   reactStatusPhase = '';
   reactStatusCycle = null;
   reactPhaseShownAt = 0;
@@ -522,6 +527,27 @@ function clearReactStatus() {
     reactStatusRow.remove();
     reactStatusRow = null;
   }
+}
+
+function reactPhaseMinVisibleMs(phase) {
+  switch (phase) {
+    case 'act':
+      return MIN_REACT_ACT_VISIBLE_MS;
+    case 'observe':
+      return MIN_REACT_OBSERVE_VISIBLE_MS;
+    case 'analyze':
+    default:
+      return MIN_REACT_ANALYZE_VISIBLE_MS;
+  }
+}
+
+function requestClearReactStatus() {
+  if (!reactStatusPhase && reactPhaseQueue.length === 0) {
+    clearReactStatus();
+    return;
+  }
+  reactPendingClear = true;
+  scheduleNextReactPhase();
 }
 
 function ensureReactStatusRow() {
@@ -546,17 +572,22 @@ function ensureReactStatusRow() {
 }
 
 function scheduleNextReactPhase() {
-  if (reactPhaseTimer || reactPhaseQueue.length === 0 || !reactStatusPhase) {
+  if (reactPhaseTimer || !reactStatusPhase) {
     return;
   }
 
   const elapsed = performance.now() - reactPhaseShownAt;
-  const delay = Math.max(0, MIN_REACT_PHASE_VISIBLE_MS - elapsed);
+  const delay = Math.max(0, reactPhaseMinVisibleMs(reactStatusPhase) - elapsed);
   reactPhaseTimer = setTimeout(() => {
     reactPhaseTimer = 0;
     const next = reactPhaseQueue.shift();
-    if (!next) return;
-    applyReactStatusNow(next.phase, next.cycle);
+    if (next) {
+      applyReactStatusNow(next.phase, next.cycle);
+      return;
+    }
+    if (reactPendingClear) {
+      clearReactStatus();
+    }
   }, delay);
 }
 
@@ -571,10 +602,17 @@ function applyReactStatusNow(phase, cycle = null) {
 }
 
 function showReactStatus(phase, cycle = null) {
-  if (!phase || phase === 'finish') {
-    clearReactStatus();
+  if (!phase) {
+    requestClearReactStatus();
     return;
   }
+
+  if (phase === 'finish') {
+    requestClearReactStatus();
+    return;
+  }
+
+  reactPendingClear = false;
 
   if (!reactStatusPhase && reactPhaseQueue.length === 0 && !reactPhaseTimer) {
     applyReactStatusNow(phase, cycle);
@@ -587,16 +625,22 @@ function showReactStatus(phase, cycle = null) {
     return;
   }
 
-  const lastQueued = reactPhaseQueue[reactPhaseQueue.length - 1];
-  if (lastQueued && lastQueued.phase === phase) {
-    lastQueued.cycle = Number.isInteger(cycle) ? cycle : null;
-    return;
+  for (let index = reactPhaseQueue.length - 1; index >= 0; index -= 1) {
+    if (reactPhaseQueue[index].phase === phase) {
+      reactPhaseQueue[index].cycle = Number.isInteger(cycle) ? cycle : null;
+      reactPhaseQueue.splice(index + 1);
+      scheduleNextReactPhase();
+      return;
+    }
   }
 
   reactPhaseQueue.push({
     phase,
     cycle: Number.isInteger(cycle) ? cycle : null,
   });
+  if (reactPhaseQueue.length > MAX_REACT_QUEUED_PHASES) {
+    reactPhaseQueue.splice(0, reactPhaseQueue.length - MAX_REACT_QUEUED_PHASES);
+  }
   scheduleNextReactPhase();
 }
 
@@ -722,7 +766,6 @@ function handleMessage(data) {
     case 'start':
       setBusy(true);
       finishAssistantStream({ discardIfEmpty: true });
-      clearReactStatus();
       beginAssistantStream();
       if (data.react_visible && data.phase) {
         showReactStatus(data.phase, data.cycle);
@@ -739,7 +782,7 @@ function handleMessage(data) {
     case 'done':
       finishAssistantStream({ discardIfEmpty: true });
       finishReasoningStream();
-      clearReactStatus();
+      requestClearReactStatus();
       reasoningPanel = null;
       setBusy(false);
       break;
