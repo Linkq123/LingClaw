@@ -253,7 +253,7 @@ header .actions button.is-active {
   animation: msgSlideIn .35s cubic-bezier(0.34, 1.56, 0.64, 1);
 }
 .msg-row.user { align-self: flex-end; flex-direction: row-reverse; }
-.msg-row.assistant { align-self: flex-start; align-items: flex-start; width: 33%; min-width: 320px; }
+.msg-row.assistant { align-self: flex-start; align-items: flex-start; width: 42%; min-width: 320px; }
 .msg-row.system, .msg-row.error { align-self: flex-start; max-width: 85%; }
 .no-animate .msg-row, .no-animate .tool-panel, .no-animate .reasoning-panel { animation: none !important; }
 
