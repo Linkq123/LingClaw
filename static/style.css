@@ -534,6 +534,7 @@ header .actions button.is-active {
   transition: height .28s cubic-bezier(.22,1,.36,1), padding .22s ease, opacity .18s ease;
 }
 .reasoning-body.show {
+  height: auto;
   opacity: 1;
   padding: 8px 12px;
   overflow-y: auto;
