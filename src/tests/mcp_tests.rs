@@ -1,6 +1,7 @@
 use super::*;
 use crate::{Provider, DEFAULT_PORT};
 use std::{collections::HashMap, time::Duration};
+use tokio::io::{AsyncWriteExt, BufReader};
 
 fn test_config_with_mcp() -> Config {
     let mut mcp_servers = HashMap::new();
@@ -123,4 +124,61 @@ fn resolve_server_cwd_rejects_workspace_escape() {
     assert!(err.contains("outside the session workspace"));
 
     let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn format_mcp_timeout_error_includes_phase_and_diagnostics() {
+    let error = format_mcp_timeout_error(
+        "tools/list",
+        120,
+        &["Starting Minimax MCP server".to_string()],
+        &["Traceback: missing key".to_string()],
+    );
+
+    assert!(error.contains("MCP tools/list timed out after 120s"));
+    assert!(error.contains("stdout: Starting Minimax MCP server"));
+    assert!(error.contains("stderr: Traceback: missing key"));
+}
+
+#[test]
+fn push_diagnostic_line_trims_and_limits_buffer() {
+    let mut lines = Vec::new();
+    for index in 0..8 {
+        push_diagnostic_line(&mut lines, &format!("line-{index}"));
+    }
+
+    assert_eq!(lines.len(), MCP_DIAGNOSTIC_LINE_LIMIT);
+    assert_eq!(lines.first().map(String::as_str), Some("line-2"));
+    assert_eq!(lines.last().map(String::as_str), Some("line-7"));
+}
+
+#[test]
+fn read_message_skips_stdout_noise_before_headers() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let message = rt.block_on(async {
+        let (mut writer, reader) = tokio::io::duplex(512);
+        let payload = json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}).to_string();
+        let frame = format!(
+            "Starting Minimax MCP server\n\nContent-Length: {}\r\n\r\n{}",
+            payload.len(),
+            payload
+        );
+        let writer_task = tokio::spawn(async move {
+            writer
+                .write_all(frame.as_bytes())
+                .await
+                .expect("frame should be written");
+        });
+        let stdout_lines = Arc::new(Mutex::new(Vec::new()));
+        let mut reader = BufReader::new(reader);
+        let message = read_message(&mut reader, &stdout_lines)
+            .await
+            .expect("message should parse");
+        writer_task.await.expect("writer task should finish");
+        let diagnostics = snapshot_diagnostic_lines(&stdout_lines);
+        (message, diagnostics)
+    });
+
+    assert_eq!(message.0.get("id").and_then(Value::as_u64), Some(1));
+    assert_eq!(message.1, vec!["Starting Minimax MCP server".to_string()]);
 }

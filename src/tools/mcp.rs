@@ -2,12 +2,12 @@ use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{ChildStdin, ChildStdout, Command},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
+    process::{ChildStderr, ChildStdin, Command},
 };
 
 use crate::{config::JsonMcpServerConfig, resolve_path_checked, Config, VERSION};
@@ -15,6 +15,8 @@ use crate::{config::JsonMcpServerConfig, resolve_path_checked, Config, VERSION};
 use super::ToolOutcome;
 
 const MCP_NAME_PREFIX: &str = "mcp__";
+const MCP_DIAGNOSTIC_LINE_LIMIT: usize = 6;
+const MCP_DIAGNOSTIC_CHAR_LIMIT: usize = 400;
 static MCP_TOOL_CACHE: OnceLock<Mutex<HashMap<String, Vec<McpToolDescriptor>>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
@@ -432,6 +434,73 @@ fn resolve_server_cwd(server: &JsonMcpServerConfig, workspace: &Path) -> Result<
     }
 }
 
+fn push_diagnostic_line(lines: &mut Vec<String>, line: &str) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+
+    let mut clipped = trimmed.to_string();
+    if clipped.len() > MCP_DIAGNOSTIC_CHAR_LIMIT {
+        clipped.truncate(MCP_DIAGNOSTIC_CHAR_LIMIT);
+        clipped.push_str("...");
+    }
+
+    if lines.len() == MCP_DIAGNOSTIC_LINE_LIMIT {
+        lines.remove(0);
+    }
+    lines.push(clipped);
+}
+
+fn record_diagnostic_line(lines: &Arc<Mutex<Vec<String>>>, line: &str) {
+    if let Ok(mut guard) = lines.lock() {
+        push_diagnostic_line(&mut guard, line);
+    }
+}
+
+fn snapshot_diagnostic_lines(lines: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
+    lines.lock().map(|guard| guard.clone()).unwrap_or_default()
+}
+
+fn format_mcp_diagnostics(stdout_lines: &[String], stderr_lines: &[String]) -> String {
+    let mut parts = Vec::new();
+    if !stdout_lines.is_empty() {
+        parts.push(format!("stdout: {}", stdout_lines.join(" | ")));
+    }
+    if !stderr_lines.is_empty() {
+        parts.push(format!("stderr: {}", stderr_lines.join(" | ")));
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" [{}]", parts.join("; "))
+    }
+}
+
+fn format_mcp_timeout_error(
+    phase: &str,
+    timeout_secs: u64,
+    stdout_lines: &[String],
+    stderr_lines: &[String],
+) -> String {
+    format!(
+        "MCP {phase} timed out after {timeout_secs}s{}",
+        format_mcp_diagnostics(stdout_lines, stderr_lines)
+    )
+}
+
+async fn collect_stderr_lines(stderr: ChildStderr, lines: Arc<Mutex<Vec<String>>>) {
+    let mut reader = BufReader::new(stderr);
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => record_diagnostic_line(&lines, &line),
+            Err(_) => break,
+        }
+    }
+}
+
 async fn call_server(
     server_name: &str,
     config: &Config,
@@ -454,7 +523,7 @@ async fn call_server(
         .args(&server.args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .current_dir(server_cwd);
     for (key, value) in &server.env {
@@ -463,7 +532,12 @@ async fn call_server(
 
     let timeout_secs = server_timeout_secs(server, config);
 
-    tokio::time::timeout(Duration::from_secs(timeout_secs), async move {
+    let stdout_lines = Arc::new(Mutex::new(Vec::new()));
+    let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+    let timeout_stdout = stdout_lines.clone();
+    let timeout_stderr = stderr_lines.clone();
+
+    async move {
         let mut child = command
             .spawn()
             .map_err(|error| format!("failed to spawn '{}': {error}", server.command))?;
@@ -475,7 +549,12 @@ async fn call_server(
             .stdout
             .take()
             .ok_or_else(|| format!("server '{server_name}' missing stdout"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| format!("server '{server_name}' missing stderr"))?;
         let mut reader = BufReader::new(stdout);
+        let stderr_task = tokio::spawn(collect_stderr_lines(stderr, stderr_lines.clone()));
 
         write_message(
             &mut stdin,
@@ -494,7 +573,19 @@ async fn call_server(
             }),
         )
         .await?;
-        let initialize = read_response(&mut reader, 1).await?;
+        let initialize = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            read_response(&mut reader, 1, &stdout_lines),
+        )
+        .await
+        .map_err(|_| {
+            format_mcp_timeout_error(
+                "initialize",
+                timeout_secs,
+                &snapshot_diagnostic_lines(&stdout_lines),
+                &snapshot_diagnostic_lines(&stderr_lines),
+            )
+        })??;
         if let Some(error) = initialize.get("error") {
             return Err(format!(
                 "initialize failed: {}",
@@ -522,11 +613,24 @@ async fn call_server(
             }),
         )
         .await?;
-        let response = read_response(&mut reader, 2).await?;
+        let response = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            read_response(&mut reader, 2, &stdout_lines),
+        )
+        .await
+        .map_err(|_| {
+            format_mcp_timeout_error(
+                method,
+                timeout_secs,
+                &snapshot_diagnostic_lines(&stdout_lines),
+                &snapshot_diagnostic_lines(&stderr_lines),
+            )
+        })??;
 
         let _ = stdin.shutdown().await;
         let _ = child.start_kill();
         let _ = child.wait().await;
+        let _ = stderr_task.await;
 
         if let Some(error) = response.get("error") {
             return Err(serde_json::to_string(error).unwrap_or_else(|_| error.to_string()));
@@ -536,9 +640,20 @@ async fn call_server(
             .get("result")
             .cloned()
             .ok_or_else(|| format!("server '{server_name}' response missing result"))
-    })
+    }
     .await
-    .map_err(|_| format!("MCP request timed out after {timeout_secs}s"))?
+    .map_err(|error| {
+        if error.contains("timed out after") || error.contains("initialize failed") {
+            return error;
+        }
+        format!(
+            "{error}{}",
+            format_mcp_diagnostics(
+                &snapshot_diagnostic_lines(&timeout_stdout),
+                &snapshot_diagnostic_lines(&timeout_stderr),
+            )
+        )
+    })
 }
 
 async fn write_message(stdin: &mut ChildStdin, message: &Value) -> Result<(), String> {
@@ -555,19 +670,29 @@ async fn write_message(stdin: &mut ChildStdin, message: &Value) -> Result<(), St
     stdin.flush().await.map_err(|error| error.to_string())
 }
 
-async fn read_response(
-    reader: &mut BufReader<ChildStdout>,
+async fn read_response<R>(
+    reader: &mut BufReader<R>,
     expected_id: u64,
-) -> Result<Value, String> {
+    stdout_lines: &Arc<Mutex<Vec<String>>>,
+) -> Result<Value, String>
+where
+    R: AsyncRead + Unpin,
+{
     loop {
-        let message = read_message(reader).await?;
+        let message = read_message(reader, stdout_lines).await?;
         if message.get("id").and_then(Value::as_u64) == Some(expected_id) {
             return Ok(message);
         }
     }
 }
 
-async fn read_message(reader: &mut BufReader<ChildStdout>) -> Result<Value, String> {
+async fn read_message<R>(
+    reader: &mut BufReader<R>,
+    stdout_lines: &Arc<Mutex<Vec<String>>>,
+) -> Result<Value, String>
+where
+    R: AsyncRead + Unpin,
+{
     let mut content_length = None;
     loop {
         let mut line = String::new();
@@ -580,6 +705,9 @@ async fn read_message(reader: &mut BufReader<ChildStdout>) -> Result<Value, Stri
         }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
+            if content_length.is_none() {
+                continue;
+            }
             break;
         }
         if let Some(value) = line.strip_prefix("Content-Length:") {
@@ -588,6 +716,8 @@ async fn read_message(reader: &mut BufReader<ChildStdout>) -> Result<Value, Stri
                 .parse::<usize>()
                 .map_err(|error| format!("invalid Content-Length: {error}"))?;
             content_length = Some(parsed);
+        } else {
+            record_diagnostic_line(stdout_lines, line);
         }
     }
 
