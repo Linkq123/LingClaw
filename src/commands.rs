@@ -577,6 +577,58 @@ fn handle_skills_command() -> CommandResult {
     command_result(format!("Skills:\n{list}"), "system", None, false)
 }
 
+fn format_mcp_reports(reports: &[tools::mcp::McpServerLoadReport]) -> String {
+    let mut lines = Vec::with_capacity(reports.len() * 2 + 1);
+    lines.push("MCP servers:".to_string());
+
+    for report in reports {
+        match &report.error {
+            Some(error) => {
+                lines.push(format!(
+                    "- {}: failed to load ({error})",
+                    report.server_name
+                ));
+            }
+            None if report.tool_names.is_empty() => {
+                lines.push(format!("- {}: loaded 0 tools", report.server_name));
+            }
+            None => {
+                lines.push(format!(
+                    "- {}: loaded {} tools",
+                    report.server_name,
+                    report.tool_names.len()
+                ));
+                lines.push(format!("  tools: {}", report.tool_names.join(", ")));
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+async fn handle_mcp_command(current_session_id: &str, state: &AppState) -> CommandResult {
+    let workspace = {
+        let sessions = state.sessions.lock().await;
+        match sessions.get(current_session_id) {
+            Some(session) => session.workspace.clone(),
+            None => return command_result("No active session", "system", None, false),
+        }
+    };
+
+    let enabled_servers = state
+        .config
+        .mcp_servers
+        .values()
+        .filter(|server| server.enabled)
+        .count();
+    if enabled_servers == 0 {
+        return command_result("No MCP servers enabled.", "system", None, false);
+    }
+
+    let reports = tools::mcp::inspect_servers(&state.config, &workspace).await;
+    command_result(format_mcp_reports(&reports), "system", None, false)
+}
+
 async fn handle_think_command(
     arg: &str,
     current_session_id: &str,
@@ -810,6 +862,7 @@ fn handle_help_command(current_session_id: &str) -> CommandResult {
 Commands:
     /new             Compress conversation to memory & clear context
     /status          Show session status
+    /mcp             Show MCP load status
     /usage           Show session token usage
     /model [name]    Show or switch model
     /think [level]   Set thinking mode (auto|off|minimal|low|medium|high|xhigh)
@@ -927,6 +980,7 @@ pub(crate) async fn handle_command(
 
         "/model" => Some(handle_model_command(arg, current_session_id, state).await),
         "/status" => Some(handle_status_command(current_session_id, state).await),
+        "/mcp" => Some(handle_mcp_command(current_session_id, state).await),
         "/usage" => Some(handle_usage_command(current_session_id, state).await),
         "/clear" => Some(handle_clear_command(current_session_id, state).await),
         "/skills" => Some(handle_skills_command()),

@@ -37,6 +37,61 @@ fn prompt_choice(options: &[&str]) -> usize {
     }
 }
 
+fn print_mcp_preflight(config: &Config) {
+    let enabled_count = config
+        .mcp_servers
+        .values()
+        .filter(|server| server.enabled)
+        .count();
+    if enabled_count == 0 {
+        return;
+    }
+
+    println!("MCP preflight:");
+
+    let workspace =
+        std::env::temp_dir().join(format!("lingclaw-mcp-preflight-{}", std::process::id()));
+    if let Err(error) = std::fs::create_dir_all(&workspace) {
+        eprintln!("  ⚠ Failed to create MCP preflight workspace: {error}");
+        return;
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build();
+    let reports = match runtime {
+        Ok(runtime) => runtime.block_on(crate::tools::mcp::inspect_servers(config, &workspace)),
+        Err(error) => {
+            eprintln!("  ⚠ Failed to build MCP preflight runtime: {error}");
+            let _ = std::fs::remove_dir_all(&workspace);
+            return;
+        }
+    };
+
+    for report in reports {
+        if let Some(error) = report.error {
+            eprintln!(
+                "  ⚠ {}: failed to load ({error}) — service startup will continue",
+                report.server_name
+            );
+            continue;
+        }
+
+        let summary = if report.tool_names.is_empty() {
+            "0 tools".to_string()
+        } else {
+            format!(
+                "{} tools: {}",
+                report.tool_names.len(),
+                report.tool_names.join(", ")
+            )
+        };
+        println!("  ✅ {}: loaded {summary}", report.server_name);
+    }
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
 #[cfg(not(target_os = "windows"))]
 const SYSTEMD_SERVICE_NAME: &str = "lingclaw.service";
 
@@ -497,6 +552,7 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
     match cmd {
         "start" => {
             let config = Config::load();
+            print_mcp_preflight(&config);
             #[cfg(not(target_os = "windows"))]
             let managed_by_systemd = systemd_service_installed();
             #[cfg(target_os = "windows")]
@@ -674,9 +730,10 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             true
         }
         "restart" => {
+            let config = Config::load();
+            print_mcp_preflight(&config);
             #[cfg(not(target_os = "windows"))]
             if systemd_service_installed() {
-                let config = Config::load();
                 println!("Restarting LingClaw via systemd...");
                 print_start_details(config.port, "systemd");
                 match run_systemctl(&["restart", SYSTEMD_SERVICE_NAME]) {

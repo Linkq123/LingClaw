@@ -26,6 +26,13 @@ struct McpToolDescriptor {
     input_schema: Value,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct McpServerLoadReport {
+    pub(crate) server_name: String,
+    pub(crate) tool_names: Vec<String>,
+    pub(crate) error: Option<String>,
+}
+
 pub(crate) fn runtime_tool_note(config: &Config) -> Option<String> {
     let mut names: Vec<&str> = config
         .mcp_servers
@@ -145,6 +152,34 @@ pub(crate) async fn execute_tool(
             duration_ms,
         }),
     }
+}
+
+pub(crate) async fn inspect_servers(config: &Config, workspace: &Path) -> Vec<McpServerLoadReport> {
+    let mut server_names: Vec<&str> = config
+        .mcp_servers
+        .iter()
+        .filter(|(_, server)| server.enabled)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    server_names.sort_unstable();
+
+    let mut reports = Vec::with_capacity(server_names.len());
+    for server_name in server_names {
+        match list_server_tools(server_name, config, workspace).await {
+            Ok(tools) => reports.push(McpServerLoadReport {
+                server_name: server_name.to_string(),
+                tool_names: tools.into_iter().map(|tool| tool.exposed_name).collect(),
+                error: None,
+            }),
+            Err(error) => reports.push(McpServerLoadReport {
+                server_name: server_name.to_string(),
+                tool_names: Vec::new(),
+                error: Some(error),
+            }),
+        }
+    }
+
+    reports
 }
 
 fn tool_cache() -> &'static Mutex<HashMap<String, Vec<McpToolDescriptor>>> {

@@ -86,6 +86,14 @@ function scheduleBackgroundTask(callback, timeout = 180) {
   return setTimeout(callback, 16);
 }
 
+function formatToolDuration(durationMs) {
+  if (durationMs == null) return '';
+  if (durationMs < 1000) {
+    return `${Math.max(1, Math.round(durationMs))}ms`;
+  }
+  return `${(durationMs / 1000).toFixed(durationMs < 10000 ? 1 : 0)}s`;
+}
+
 function cancelBackgroundTask(handle) {
   if (!handle) return;
   if (typeof cancelIdleCallback === 'function') {
@@ -1050,7 +1058,8 @@ function addToolResult(name, result, id, durationMs = null) {
     if (p.dataset.toolId === id) {
       p.dataset.toolResult = result;
       p.dataset.toolHasResult = 'true';
-      p.dataset.toolStatus = durationMs != null ? `已返回结果 (${(durationMs / 1000).toFixed(1)}s)` : '已返回结果';
+      const durationLabel = formatToolDuration(durationMs);
+      p.dataset.toolStatus = durationLabel ? `已返回结果 (${durationLabel})` : '已返回结果';
       const statusEl = p.querySelector('.tool-status');
       if (statusEl) {
         statusEl.textContent = p.dataset.toolStatus;
@@ -1070,7 +1079,8 @@ function addToolResult(name, result, id, durationMs = null) {
   el.dataset.toolArgs = '';
   el.dataset.toolResult = result;
   el.dataset.toolHasResult = 'true';
-  el.dataset.toolStatus = durationMs != null ? `已返回结果 (${(durationMs / 1000).toFixed(1)}s)` : '已返回结果';
+  const durationLabel = formatToolDuration(durationMs);
+  el.dataset.toolStatus = durationLabel ? `已返回结果 (${durationLabel})` : '已返回结果';
   el.innerHTML = `
     <div class="tool-header" onclick="openToolDrawerFromHeader(this)">
       <span class="tool-icon">📋</span>

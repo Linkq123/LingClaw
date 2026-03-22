@@ -1,6 +1,7 @@
 use super::*;
+use crate::config::JsonMcpServerConfig;
 use serde_json::json;
-use std::sync::atomic::AtomicU64;
+use std::{collections::HashMap, sync::atomic::AtomicU64};
 
 fn test_config() -> Config {
     Config {
@@ -29,6 +30,21 @@ fn default_port_constant_is_18989() {
 fn test_app_state() -> AppState {
     AppState {
         config: test_config(),
+        http: reqwest::Client::new(),
+        sessions: Mutex::new(HashMap::new()),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        hooks: HookRegistry::new(),
+    }
+}
+
+fn test_app_state_with_config(config: Config) -> AppState {
+    AppState {
+        config,
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -2604,7 +2620,63 @@ fn help_command_lists_usage_without_extra_indent() {
         .contains("  /status          Show session status"));
     assert!(result
         .response
+        .contains("/mcp             Show MCP load status"));
+    assert!(result
+        .response
         .contains("/usage           Show session token usage"));
+}
+
+#[test]
+fn handle_command_reports_mcp_load_failures() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("mcp-command-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let mut session = test_session(&session_id, "MCP Status", None);
+    session.workspace = workspace.clone();
+    session.version = SESSION_VERSION;
+
+    let mut config = test_config();
+    config.mcp_servers.insert(
+        "broken".to_string(),
+        JsonMcpServerConfig {
+            command: "definitely-not-a-real-command".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            cwd: None,
+            enabled: true,
+            timeout_secs: Some(1),
+        },
+    );
+
+    let state = test_app_state_with_config(config);
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+
+    let result = rt
+        .block_on(handle_command("/mcp", &session_id, 1, &state, &tx, &cancel))
+        .expect("command should return a result");
+
+    assert_eq!(result.response_type, "system");
+    assert!(result.response.contains("MCP servers:"));
+    assert!(result.response.contains("- broken: failed to load"));
+    assert!(result
+        .response
+        .contains("failed to spawn 'definitely-not-a-real-command'"));
+
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let _ = std::fs::remove_file(path);
+    let session_dir = workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(session_dir);
 }
 
 #[test]
