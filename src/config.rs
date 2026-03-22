@@ -62,6 +62,7 @@ impl Provider {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Config {
     pub(crate) api_key: String,
     pub(crate) api_base: String,

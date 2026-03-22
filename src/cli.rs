@@ -3,11 +3,14 @@ use std::io::{self, BufRead, Write};
 use std::net::SocketAddr;
 #[allow(unused_imports)]
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
 
 use crate::{config_dir_path, config_file_path, Config, DEFAULT_PORT, VERSION};
+
+static MCP_PREFLIGHT_ID: AtomicU64 = AtomicU64::new(1);
 
 // ── Interactive Helpers ──────────────────────────────────────────────────────
 
@@ -37,6 +40,50 @@ fn prompt_choice(options: &[&str]) -> usize {
     }
 }
 
+fn inspect_mcp_preflight(
+    config: &Config,
+) -> Result<Vec<crate::tools::mcp::McpServerLoadReport>, String> {
+    let enabled_count = config
+        .mcp_servers
+        .values()
+        .filter(|server| server.enabled)
+        .count();
+    if enabled_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let workspace = std::env::temp_dir().join(format!(
+        "lingclaw-mcp-preflight-{}-{}",
+        std::process::id(),
+        MCP_PREFLIGHT_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&workspace)
+        .map_err(|error| format!("failed to create MCP preflight workspace: {error}"))?;
+
+    let config = config.clone();
+    let thread_workspace = workspace.clone();
+    let thread = std::thread::Builder::new()
+        .name("lingclaw-mcp-preflight".to_string())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("failed to build MCP preflight runtime: {error}"))?;
+            Ok::<_, String>(runtime.block_on(crate::tools::mcp::inspect_servers(
+                &config,
+                &thread_workspace,
+            )))
+        })
+        .map_err(|error| format!("failed to spawn MCP preflight worker: {error}"))?;
+
+    let result = match thread.join() {
+        Ok(result) => result,
+        Err(_) => Err("MCP preflight worker panicked".to_string()),
+    };
+    let _ = std::fs::remove_dir_all(&workspace);
+    result
+}
+
 fn print_mcp_preflight(config: &Config) {
     let enabled_count = config
         .mcp_servers
@@ -49,21 +96,10 @@ fn print_mcp_preflight(config: &Config) {
 
     println!("MCP preflight:");
 
-    let workspace =
-        std::env::temp_dir().join(format!("lingclaw-mcp-preflight-{}", std::process::id()));
-    if let Err(error) = std::fs::create_dir_all(&workspace) {
-        eprintln!("  ⚠ Failed to create MCP preflight workspace: {error}");
-        return;
-    }
-
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build();
-    let reports = match runtime {
-        Ok(runtime) => runtime.block_on(crate::tools::mcp::inspect_servers(config, &workspace)),
+    let reports = match inspect_mcp_preflight(config) {
+        Ok(reports) => reports,
         Err(error) => {
-            eprintln!("  ⚠ Failed to build MCP preflight runtime: {error}");
-            let _ = std::fs::remove_dir_all(&workspace);
+            eprintln!("  ⚠ MCP preflight failed: {error} — service startup will continue");
             return;
         }
     };
@@ -88,8 +124,6 @@ fn print_mcp_preflight(config: &Config) {
         };
         println!("  ✅ {}: loaded {summary}", report.server_name);
     }
-
-    let _ = std::fs::remove_dir_all(&workspace);
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1561,3 +1595,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     println!();
     true
 }
+
+#[cfg(test)]
+#[path = "tests/cli_tests.rs"]
+mod cli_tests;
