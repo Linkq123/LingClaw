@@ -428,6 +428,15 @@ header .actions button.is-active {
   font-size: 11px;
   color: var(--dim);
 }
+.react-status-detail {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: color-mix(in srgb, var(--react-phase-color) 78%, var(--text));
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .react-status-dots {
   display: inline-flex;
   align-items: flex-end;
@@ -623,6 +632,13 @@ header .actions button.is-active {
 }
 .tool-header .tool-icon { color: var(--accent2); }
 .tool-header .tool-name { font-weight: 600; color: var(--text); }
+.tool-header .tool-status {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent2);
+  white-space: nowrap;
+}
 
 .code-highlight-deferred {
   opacity: .96;

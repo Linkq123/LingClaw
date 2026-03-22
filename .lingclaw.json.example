@@ -2,6 +2,7 @@
   "settings": {
     "port": 18989,
     "execTimeout": 30,
+    "toolTimeout": 30,
     "maxContextTokens": 32000,
     "maxOutputBytes": 51200,
     "maxFileBytes": 204800
@@ -61,6 +62,17 @@
         "openai/gpt-4o": {},
         "anthropic/claude-sonnet-4-20250514": {}
       }
+    }
+  },
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "."
+      ],
+      "timeoutSecs": 20
     }
   }
 }

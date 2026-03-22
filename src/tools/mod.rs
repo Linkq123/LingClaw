@@ -1,5 +1,6 @@
 pub(crate) mod exec;
 pub(crate) mod fs;
+pub(crate) mod mcp;
 pub(crate) mod net;
 
 use reqwest::Client;

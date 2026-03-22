@@ -879,6 +879,7 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             println!("  Provider:      {}", config.provider.label());
             println!("  API base:      {}", config.api_base);
             println!("  Exec timeout:  {}s", config.exec_timeout.as_secs());
+            println!("  Tool timeout:  {}s", config.tool_timeout.as_secs());
             println!("  Context limit: {} tokens", config.max_context_tokens);
             println!();
 
@@ -1448,6 +1449,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
         "settings": {
             "port": DEFAULT_PORT,
             "execTimeout": 30,
+            "toolTimeout": 30,
             "maxContextTokens": 32000,
         },
         "models": {

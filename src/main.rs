@@ -22,6 +22,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, Mutex};
+use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 
@@ -299,6 +300,7 @@ struct LiveToolState {
     name: String,
     arguments: String,
     result: Option<String>,
+    elapsed_ms: u64,
 }
 
 #[derive(Clone, Default)]
@@ -315,6 +317,7 @@ struct LiveRoundState {
 
 /// Cap for replay buffer strings (128 KB). Keeps memory bounded for long outputs.
 const LIVE_REPLAY_CAP: usize = 128 * 1024;
+const TOOL_PROGRESS_HEARTBEAT_SECS: u64 = 1;
 
 // ── System Prompt ────────────────────────────────────────────────────────────
 
@@ -340,6 +343,9 @@ fn build_system_prompt(
 These prompt-file contents were already loaded into this system prompt from the session workspace.\n\
 Do not call file tools just to verify or re-read BOOTSTRAP.md, AGENTS.md, AGENT.md, IDENTITY.md, USER.md, SOUL.md, or MEMORY.md when their content is already present below.\n\
 Only read those files if the user explicitly asks to inspect them, if you need to edit them, or if a task depends on checking whether the on-disk file has changed.";
+    let mcp_note = tools::mcp::runtime_tool_note(config)
+        .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
+        .unwrap_or_default();
 
     let admin_section = if is_main {
         "\n\n## Admin Tools (Main Session Only)\n\
@@ -365,13 +371,14 @@ Only read those files if the user explicitly asks to inspect them, if you need t
 {prompt_file_note}
 
 ## Available Tools
-{tool_lines}{admin_section}"#,
+{tool_lines}{admin_section}{mcp_note}"#,
         model = model,
         local_time = local_time,
         tool_lines = tool_lines,
         persona = persona,
         prompt_file_note = prompt_file_note,
         admin_section = admin_section,
+        mcp_note = mcp_note,
     );
 
     ChatMessage {
@@ -760,7 +767,25 @@ async fn dispatch_live_event(state: &AppState, session_id: &str, event: serde_js
                         name: event["name"].as_str().unwrap_or_default().to_string(),
                         arguments: event["arguments"].as_str().unwrap_or_default().to_string(),
                         result: None,
+                        elapsed_ms: 0,
                     });
+                }
+            }
+            "tool_progress" => {
+                if let Some(round) = live_rounds.get_mut(session_id) {
+                    let tool_id = event["id"].as_str().unwrap_or_default();
+                    let elapsed_ms = event["elapsed_ms"].as_u64().unwrap_or(0);
+                    if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
+                        tool.elapsed_ms = elapsed_ms;
+                    } else {
+                        round.tools.push(LiveToolState {
+                            id: tool_id.to_string(),
+                            name: event["name"].as_str().unwrap_or_default().to_string(),
+                            arguments: String::new(),
+                            result: None,
+                            elapsed_ms,
+                        });
+                    }
                 }
             }
             "tool_result" => {
@@ -770,12 +795,14 @@ async fn dispatch_live_event(state: &AppState, session_id: &str, event: serde_js
                     result.truncate(LIVE_REPLAY_CAP);
                     if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
                         tool.result = Some(result);
+                        tool.elapsed_ms = event["duration_ms"].as_u64().unwrap_or(tool.elapsed_ms);
                     } else {
                         round.tools.push(LiveToolState {
                             id: tool_id.to_string(),
                             name: event["name"].as_str().unwrap_or_default().to_string(),
                             arguments: String::new(),
                             result: Some(result),
+                            elapsed_ms: event["duration_ms"].as_u64().unwrap_or(0),
                         });
                     }
                 }
@@ -854,6 +881,18 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
             }),
         )
         .await;
+        if tool.result.is_none() && tool.elapsed_ms > 0 {
+            ws_send(
+                tx,
+                &json!({
+                    "type":"tool_progress",
+                    "id": tool.id,
+                    "name": tool.name,
+                    "elapsed_ms": tool.elapsed_ms,
+                }),
+            )
+            .await;
+        }
         if let Some(result) = &tool.result {
             ws_send(
                 tx,
@@ -862,6 +901,7 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
                     "id": tool.id,
                     "name": tool.name,
                     "result": result,
+                    "duration_ms": tool.elapsed_ms,
                 }),
             )
             .await;
@@ -909,7 +949,72 @@ async fn execute_tool(
     http: &Client,
     workspace: &Path,
 ) -> tools::ToolOutcome {
-    tools::execute_tool(name, args_str, config, http, workspace).await
+    if let Some(result) = tools::mcp::execute_tool(name, args_str, config, workspace).await {
+        result
+    } else {
+        tools::execute_tool(name, args_str, config, http, workspace).await
+    }
+}
+
+enum ToolRunState {
+    Completed(tools::ToolOutcome),
+    Abort,
+}
+
+async fn run_tool_with_feedback<F>(
+    live_tx: &LiveTx,
+    cancel: &CancellationToken,
+    tool_id: &str,
+    tool_name: &str,
+    timeout: Duration,
+    future: F,
+) -> ToolRunState
+where
+    F: std::future::Future<Output = tools::ToolOutcome>,
+{
+    let start = std::time::Instant::now();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(TOOL_PROGRESS_HEARTBEAT_SECS));
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+
+    let timeout_secs = timeout.as_secs();
+    let sleep = tokio::time::sleep(timeout);
+    tokio::pin!(sleep);
+    tokio::pin!(future);
+
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                return ToolRunState::Abort;
+            }
+            _ = &mut sleep => {
+                return ToolRunState::Completed(tools::ToolOutcome {
+                    output: format!("{tool_name} error: tool execution timed out ({}s)", timeout_secs),
+                    is_error: true,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                });
+            }
+            _ = heartbeat.tick() => {
+                if !live_send(
+                    live_tx,
+                    json!({
+                        "type": "tool_progress",
+                        "id": tool_id,
+                        "name": tool_name,
+                        "elapsed_ms": start.elapsed().as_millis() as u64,
+                    }),
+                )
+                .await
+                {
+                    return ToolRunState::Abort;
+                }
+            }
+            result = &mut future => {
+                return ToolRunState::Completed(result);
+            }
+        }
+    }
 }
 
 // ── Session Claim ────────────────────────────────────────────────────────────
@@ -1359,6 +1464,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     } else {
                         vec![]
                     };
+                    let mut extra_tools = extra_tools;
+                    let mut mcp_tools = match resolved.provider {
+                        Provider::Anthropic => {
+                            tools::mcp::tool_definitions_anthropic(&state.config, &cycle_workspace)
+                                .await
+                        }
+                        Provider::OpenAI => {
+                            tools::mcp::tool_definitions_openai(&state.config, &cycle_workspace)
+                                .await
+                        }
+                    };
+                    extra_tools.append(&mut mcp_tools);
 
                     let llm_result = tokio::select! {
                         biased;
@@ -1452,6 +1569,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                 // ── Act: execute pending tool calls ──────────────────────────
                 agent::AgentPhase::Act => {
                     collected_results.clear();
+                    let tool_timeout = state.config.tool_timeout;
 
                     for tc in &pending_tool_calls {
                         if cancel.is_cancelled() {
@@ -1473,35 +1591,55 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             break 'agent;
                         }
 
-                        let result = if cycle_is_main && is_admin_tool(&tc.function.name) {
-                            let start = std::time::Instant::now();
-                            let output = execute_admin_tool(
+                        let run_state = if cycle_is_main && is_admin_tool(&tc.function.name) {
+                            run_tool_with_feedback(
+                                &live_tx,
+                                &cancel,
+                                &tc.id,
                                 &tc.function.name,
-                                &tc.function.arguments,
-                                &state,
+                                tool_timeout,
+                                async {
+                                    let start = std::time::Instant::now();
+                                    let output = execute_admin_tool(
+                                        &tc.function.name,
+                                        &tc.function.arguments,
+                                        &state,
+                                    )
+                                    .await;
+                                    let duration_ms = start.elapsed().as_millis() as u64;
+                                    let is_error =
+                                        tools::is_tool_error_output(&tc.function.name, &output);
+                                    tools::ToolOutcome {
+                                        output,
+                                        is_error,
+                                        duration_ms,
+                                    }
+                                },
                             )
-                            .await;
-                            let duration_ms = start.elapsed().as_millis() as u64;
-                            let is_error = tools::is_tool_error_output(&tc.function.name, &output);
-                            tools::ToolOutcome {
-                                output,
-                                is_error,
-                                duration_ms,
-                            }
+                            .await
                         } else {
-                            tokio::select! {
-                                biased;
-                                _ = cancel.cancelled() => {
-                                    shutting_down = true;
-                                    break 'agent;
-                                }
-                                r = execute_tool(
+                            run_tool_with_feedback(
+                                &live_tx,
+                                &cancel,
+                                &tc.id,
+                                &tc.function.name,
+                                tool_timeout,
+                                execute_tool(
                                     &tc.function.name,
                                     &tc.function.arguments,
                                     &state.config,
                                     &state.http,
                                     &cycle_workspace,
-                                ) => r,
+                                ),
+                            )
+                            .await
+                        };
+
+                        let result = match run_state {
+                            ToolRunState::Completed(result) => result,
+                            ToolRunState::Abort => {
+                                shutting_down = cancel.is_cancelled();
+                                break 'agent;
                             }
                         };
 
@@ -1838,7 +1976,16 @@ async fn main() {
             total
         );
     }
+    let mcp_enabled = config
+        .mcp_servers
+        .values()
+        .filter(|server| server.enabled)
+        .count();
+    if mcp_enabled > 0 {
+        eprintln!("  MCP servers:   {} enabled", mcp_enabled);
+    }
     eprintln!("  Exec timeout:  {}s", config.exec_timeout.as_secs());
+    eprintln!("  Tool timeout:  {}s", config.tool_timeout.as_secs());
     eprintln!(
         "  Context limit: {} tokens",
         config.context_limit_for_model(&config.model)

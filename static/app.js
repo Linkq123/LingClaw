@@ -30,6 +30,8 @@ let reasoningPanel = null;
 let reactStatusRow = null;
 let reactStatusPhase = '';
 let reactStatusCycle = null;
+let reactStatusToolName = '';
+let reactStatusElapsedMs = 0;
 let reactPhaseShownAt = 0;
 let reactPhaseTimer = 0;
 let reactPhaseQueue = [];
@@ -507,10 +509,19 @@ function renderReactStatus() {
   const card = reactStatusRow.querySelector('.react-status-card');
   const phase = reactStatusRow.querySelector('.react-status-phase');
   const cycle = reactStatusRow.querySelector('.react-status-cycle');
-  if (!card || !phase || !cycle) return;
+  const detail = reactStatusRow.querySelector('.react-status-detail');
+  if (!card || !phase || !cycle || !detail) return;
   card.dataset.phase = reactStatusPhase || 'analyze';
   phase.textContent = reactPhaseLabel(reactStatusPhase);
   cycle.textContent = Number.isInteger(reactStatusCycle) ? `cycle ${reactStatusCycle}` : '';
+  if (reactStatusPhase === 'act' && reactStatusToolName) {
+    const seconds = Math.max(1, Math.floor((reactStatusElapsedMs || 0) / 1000));
+    detail.textContent = `${reactStatusToolName} · ${seconds}s`;
+    detail.hidden = false;
+  } else {
+    detail.textContent = '';
+    detail.hidden = true;
+  }
 }
 
 function clearReactStatus() {
@@ -522,6 +533,8 @@ function clearReactStatus() {
   reactPendingClear = false;
   reactStatusPhase = '';
   reactStatusCycle = null;
+  reactStatusToolName = '';
+  reactStatusElapsedMs = 0;
   reactPhaseShownAt = 0;
   if (reactStatusRow) {
     reactStatusRow.remove();
@@ -559,6 +572,7 @@ function ensureReactStatusRow() {
         <span class="react-status-tag">ReAct</span>
         <span class="react-status-phase"></span>
         <span class="react-status-cycle"></span>
+        <span class="react-status-detail" hidden></span>
         <span class="react-status-dots" aria-hidden="true">
           <span></span>
           <span></span>
@@ -595,10 +609,23 @@ function applyReactStatusNow(phase, cycle = null) {
   ensureReactStatusRow();
   reactStatusPhase = phase;
   reactStatusCycle = Number.isInteger(cycle) ? cycle : null;
+  if (phase !== 'act') {
+    reactStatusToolName = '';
+    reactStatusElapsedMs = 0;
+  }
   reactPhaseShownAt = performance.now();
   renderReactStatus();
   scrollDown();
   scheduleNextReactPhase();
+}
+
+function setReactActTool(name, elapsedMs = 0) {
+  if (!name) return;
+  reactStatusToolName = name;
+  reactStatusElapsedMs = elapsedMs;
+  if (reactStatusPhase === 'act') {
+    renderReactStatus();
+  }
 }
 
 function showReactStatus(phase, cycle = null) {
@@ -848,13 +875,24 @@ function handleMessage(data) {
       break;
 
     case 'tool_call':
+      setReactActTool(data.name, 0);
       if (!showTools) break;
       addToolCall(data.name, data.arguments, data.id);
       break;
 
-    case 'tool_result':
+    case 'tool_progress':
+      setReactActTool(data.name, data.elapsed_ms || 0);
       if (!showTools) break;
-      addToolResult(data.name, data.result, data.id);
+      updateToolProgress(data.id, data.elapsed_ms || 0);
+      break;
+
+    case 'tool_result':
+      if (reactStatusPhase === 'act' && reactStatusToolName === data.name) {
+        reactStatusElapsedMs = data.duration_ms || reactStatusElapsedMs;
+        renderReactStatus();
+      }
+      if (!showTools) break;
+      addToolResult(data.name, data.result, data.id, data.duration_ms ?? null);
       break;
 
     case 'context_compressed':
@@ -970,11 +1008,13 @@ function addToolCall(name, args, id) {
   panel.dataset.toolArgs = argsDisplay;
   panel.dataset.toolResult = '';
   panel.dataset.toolHasResult = 'false';
+  panel.dataset.toolStatus = '执行中';
 
   panel.innerHTML = `
     <div class="tool-header" onclick="openToolDrawerFromHeader(this)">
       <span class="tool-icon">⚡</span>
       <span class="tool-name">${escHtml(name)}</span>
+      <span class="tool-status">执行中</span>
       <span style="color:var(--dim);font-size:12px">${escHtml(truncateStr(args, 80))}</span>
     </div>
   `;
@@ -984,12 +1024,37 @@ function addToolCall(name, args, id) {
   scrollDown();
 }
 
-function addToolResult(name, result, id) {
+function updateToolProgress(id, elapsedMs) {
+  if (!id) return;
+  const seconds = Math.max(1, Math.floor((elapsedMs || 0) / 1000));
+  for (const panel of chat.querySelectorAll('.tool-panel')) {
+    if (panel.dataset.toolId !== id || panel.dataset.toolHasResult === 'true') {
+      continue;
+    }
+    const statusText = `执行中 ${seconds}s`;
+    panel.dataset.toolStatus = statusText;
+    const statusEl = panel.querySelector('.tool-status');
+    if (statusEl) {
+      statusEl.textContent = statusText;
+    }
+    if (activeToolPanel === panel) {
+      syncToolDrawer(panel);
+    }
+    return;
+  }
+}
+
+function addToolResult(name, result, id, durationMs = null) {
   const panels = chat.querySelectorAll('.tool-panel');
   for (const p of panels) {
     if (p.dataset.toolId === id) {
       p.dataset.toolResult = result;
       p.dataset.toolHasResult = 'true';
+      p.dataset.toolStatus = durationMs != null ? `已返回结果 (${(durationMs / 1000).toFixed(1)}s)` : '已返回结果';
+      const statusEl = p.querySelector('.tool-status');
+      if (statusEl) {
+        statusEl.textContent = p.dataset.toolStatus;
+      }
       p.classList.add('tool-panel-ready');
       if (activeToolPanel === p) {
         syncToolDrawer(p);
@@ -1005,10 +1070,12 @@ function addToolResult(name, result, id) {
   el.dataset.toolArgs = '';
   el.dataset.toolResult = result;
   el.dataset.toolHasResult = 'true';
+  el.dataset.toolStatus = durationMs != null ? `已返回结果 (${(durationMs / 1000).toFixed(1)}s)` : '已返回结果';
   el.innerHTML = `
     <div class="tool-header" onclick="openToolDrawerFromHeader(this)">
       <span class="tool-icon">📋</span>
       <span class="tool-name">${escHtml(name)} result</span>
+      <span class="tool-status">${escHtml(el.dataset.toolStatus)}</span>
     </div>
   `;
   el.classList.add('tool-panel-ready');
@@ -1156,7 +1223,7 @@ function syncToolDrawer(panel) {
   const toolArgs = panel.dataset.toolArgs || '';
   const toolResult = panel.dataset.toolResult || '';
   const hasResult = panel.dataset.toolHasResult === 'true';
-  const statusText = hasResult ? '已返回结果' : '执行中';
+  const statusText = panel.dataset.toolStatus || (hasResult ? '已返回结果' : '执行中');
 
   toolDrawerTitle.textContent = toolName;
   toolDrawerMeta.textContent = statusText;

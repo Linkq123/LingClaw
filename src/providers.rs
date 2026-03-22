@@ -476,10 +476,15 @@ async fn call_llm_stream_openai(
                                 if !think_text.is_empty() && !client_gone {
                                     if !reasoning_started {
                                         reasoning_started = true;
-                                        client_gone = !live_send(tx, json!({"type":"thinking_start"})).await;
+                                        client_gone =
+                                            !live_send(tx, json!({"type":"thinking_start"})).await;
                                     }
                                     if !client_gone {
-                                        client_gone = !live_send(tx, json!({"type":"thinking_delta","content":think_text})).await;
+                                        client_gone = !live_send(
+                                            tx,
+                                            json!({"type":"thinking_delta","content":think_text}),
+                                        )
+                                        .await;
                                     }
                                 }
                             }
@@ -487,7 +492,8 @@ async fn call_llm_stream_openai(
                             if let Some(text) = &choice.delta.content {
                                 if reasoning_started && !client_gone {
                                     reasoning_started = false;
-                                    client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+                                    client_gone =
+                                        !live_send(tx, json!({"type":"thinking_done"})).await;
                                 }
                                 content_buf.push_str(text);
                                 if !client_gone
@@ -661,7 +667,9 @@ async fn call_llm_stream_anthropic(
                                         thinking_block_idx = evt.index;
                                         if !client_gone {
                                             reasoning_started = true;
-                                            client_gone = !live_send(tx, json!({"type":"thinking_start"})).await;
+                                            client_gone =
+                                                !live_send(tx, json!({"type":"thinking_start"}))
+                                                    .await;
                                         }
                                     }
                                     "tool_use" => {
@@ -690,7 +698,11 @@ async fn call_llm_stream_anthropic(
                                     Some("thinking_delta") => {
                                         if let Some(text) = &delta.thinking {
                                             if !text.is_empty() && !client_gone {
-                                                client_gone = !live_send(tx, json!({"type":"thinking_delta","content":text})).await;
+                                                client_gone = !live_send(
+                                                    tx,
+                                                    json!({"type":"thinking_delta","content":text}),
+                                                )
+                                                .await;
                                             }
                                         }
                                     }
@@ -735,7 +747,8 @@ async fn call_llm_stream_anthropic(
                                 thinking_block_idx = None;
                                 reasoning_started = false;
                                 if !client_gone {
-                                    client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+                                    client_gone =
+                                        !live_send(tx, json!({"type":"thinking_done"})).await;
                                 }
                             }
                         }

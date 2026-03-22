@@ -70,9 +70,11 @@ pub(crate) struct Config {
     pub(crate) openai_stream_include_usage: bool,
     pub(crate) anthropic_prompt_caching: bool,
     pub(crate) providers: HashMap<String, JsonProviderConfig>,
+    pub(crate) mcp_servers: HashMap<String, JsonMcpServerConfig>,
     pub(crate) port: u16,
     pub(crate) max_context_tokens: usize,
     pub(crate) exec_timeout: Duration,
+    pub(crate) tool_timeout: Duration,
     pub(crate) max_output_bytes: usize,
     pub(crate) max_file_bytes: usize,
 }
@@ -85,6 +87,8 @@ impl Config {
             .models
             .and_then(|m| m.providers)
             .unwrap_or_default();
+        let mcp_servers: HashMap<String, JsonMcpServerConfig> =
+            json_cfg.mcp_servers.unwrap_or_default();
 
         // Default model: JSON agents.defaults.model.primary → env LINGCLAW_MODEL → "gpt-4o-mini"
         let default_from_json = json_cfg
@@ -156,6 +160,7 @@ impl Config {
                 })
                 .unwrap_or(false),
             providers,
+            mcp_servers,
             port: settings
                 .port
                 .or_else(|| std::env::var("LINGCLAW_PORT").ok()?.parse().ok())
@@ -173,6 +178,12 @@ impl Config {
                 settings
                     .exec_timeout
                     .or_else(|| std::env::var("LINGCLAW_EXEC_TIMEOUT").ok()?.parse().ok())
+                    .unwrap_or(30),
+            ),
+            tool_timeout: Duration::from_secs(
+                settings
+                    .tool_timeout
+                    .or_else(|| std::env::var("LINGCLAW_TOOL_TIMEOUT").ok()?.parse().ok())
                     .unwrap_or(30),
             ),
             max_output_bytes: settings.max_output_bytes.unwrap_or(50 * 1024),
@@ -451,6 +462,8 @@ pub(crate) struct JsonConfig {
     pub(crate) settings: Option<JsonSettings>,
     pub(crate) models: Option<JsonModelsConfig>,
     pub(crate) agents: Option<JsonAgentsConfig>,
+    #[serde(rename = "mcpServers")]
+    pub(crate) mcp_servers: Option<HashMap<String, JsonMcpServerConfig>>,
 }
 
 #[derive(Deserialize, Default)]
@@ -467,6 +480,8 @@ pub(crate) struct JsonSettings {
     pub(crate) api_base: Option<String>,
     #[serde(rename = "execTimeout")]
     pub(crate) exec_timeout: Option<u64>,
+    #[serde(rename = "toolTimeout")]
+    pub(crate) tool_timeout: Option<u64>,
     #[serde(rename = "maxContextTokens")]
     pub(crate) max_context_tokens: Option<usize>,
     #[serde(rename = "maxOutputBytes")]
@@ -494,6 +509,25 @@ pub(crate) struct JsonProviderConfig {
 
 fn default_api_protocol() -> String {
     "openai-completions".to_string()
+}
+
+fn default_mcp_enabled() -> bool {
+    true
+}
+
+#[derive(Deserialize, Serialize, Clone, Default)]
+pub(crate) struct JsonMcpServerConfig {
+    pub(crate) command: String,
+    #[serde(default)]
+    pub(crate) args: Vec<String>,
+    #[serde(default)]
+    pub(crate) env: HashMap<String, String>,
+    #[serde(default)]
+    pub(crate) cwd: Option<String>,
+    #[serde(default = "default_mcp_enabled")]
+    pub(crate) enabled: bool,
+    #[serde(rename = "timeoutSecs")]
+    pub(crate) timeout_secs: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize, Clone, Default)]

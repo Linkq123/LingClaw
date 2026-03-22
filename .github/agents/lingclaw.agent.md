@@ -24,8 +24,8 @@ LingClaw's architecture is this loop made concrete in Rust. All design decisions
 | Half | LingClaw Implementation |
 |------|------------------------|
 | **Skill** | Dynamic system prompt (OS/CWD/model injection), per-session prompt files (7 templates from `docs/reference/templates/`: BOOTSTRAP.md, AGENTS.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md) for persona customization, bootstrap flow (`BOOTSTRAP.md + AGENTS.md`) followed by normal prompt flow (`AGENTS.md + IDENTITY.md + USER.md + SOUL.md`, then that session's `MEMORY.md` and `memory/YYYY-MM-DD.md`), `think` tool for CoT planning, token-aware context pruning with turn-based deletion (`turn_len()` + `prune_messages()`), provider-aware token estimation (`estimate_tokens_for_provider()`) with protocol overhead constants, per-session model override, dual-provider support (OpenAI + Anthropic) with auto-detection, provider usage tracking (`input_tokens`/`output_tokens` from API with source labeling), Anthropic prompt caching (system blocks + tool `cache_control` with compatibility gate), thinking/reasoning modes (`auto/off/minimal/low/medium/high/xhigh`), JSON config file (`~/.lingclaw/.lingclaw.json`) with first-run setup wizard, fixed frontend brand avatar |
-| **CLI** | 9 standard tools (think, exec, read_file, write_file, patch_file, delete_file, list_dir, search_files, http_fetch) + 2 admin tools (list_sessions, delete_session — main session only, injected via `extra_tools`), shared `ToolSpec` registry for prompt/schema generation, `ToolOutcome` for structured results with duration/error tracking, dangerous command blocking, sandboxed path resolution (canonicalize + containment check) against per-session workspace, SSRF protection (`check_ssrf()` with DNS resolution + private IP blocking + no-redirect client), configurable timeouts, `kill_on_drop` process cleanup |
-| **Loop** | WebSocket agent loop with unlimited tool rounds (internal 200-round hard cap as runaway protection), system prompt refreshed every round (prompt-file edits take effect mid-session), incremental session save after every round (tool and non-tool), auto-prune when context overflows (turn-based: deletes complete user→assistant→tool turns), auto-compress context via hook system (`HookRegistry` + `AutoCompressContextHook`), 13 slash commands (/new, /session_new, /switch, /rename, /model, /think, /skills, /status, /clear, /help, /sessions, /delete, /react), per-session think level, main session concept (`MAIN_SESSION_ID = "main"`) with exclusive admin privileges, per-session isolated workspace with exclusive ownership, graceful shutdown (CancellationToken + `/api/shutdown` with per-port token auth), session-aware reconnect with live replay state (`active_connections` + `session_clients` + `live_rounds`), session versioning (`SESSION_VERSION`, `migrate_session()`) |
+| **CLI** | 9 standard tools (think, exec, read_file, write_file, patch_file, delete_file, list_dir, search_files, http_fetch) + 2 admin tools (list_sessions, delete_session — main session only, injected via `extra_tools`) + experimental stdio MCP tools injected at runtime with `mcp__...` prefixes, shared `ToolSpec` registry for built-in prompt/schema generation, `ToolOutcome` for structured results with duration/error tracking, dangerous command blocking, sandboxed path resolution against per-session workspace, SSRF protection (`check_ssrf()` with DNS resolution + private IP blocking + no-redirect client), split `execTimeout` / `toolTimeout` semantics, `kill_on_drop` process cleanup |
+| **Loop** | WebSocket agent loop with unlimited tool rounds (internal 200-round hard cap as runaway protection), system prompt refreshed every round (prompt-file edits take effect mid-session), incremental session save after every round (tool and non-tool), auto-prune when context overflows (turn-based: deletes complete user→assistant→tool turns), auto-compress context via hook system (`HookRegistry` + `AutoCompressContextHook`), 16 slash commands including `/tool`, `/reasoning`, and `/usage`, per-session think level, main session concept (`MAIN_SESSION_ID = "main"`) with exclusive admin privileges, per-session isolated workspace with exclusive ownership, graceful shutdown (CancellationToken + `/api/shutdown` with per-port token auth), session-aware reconnect with live replay state (`active_connections` + `session_clients` + `live_rounds`), `tool_progress` heartbeats for long-running Act steps, session versioning (`SESSION_VERSION`, `migrate_session()`) |
 
 When extending LingClaw, always ask: **am I improving the Skill half, the CLI half, or the loop that connects them?**
 
@@ -36,30 +36,44 @@ LingClaw is a deliberate rewrite of the bloated OpenClaw platform. Where OpenCla
 Architecture (single process, single binary):
 - **HTTP + WebSocket server**: Axum on Tokio
 - **Skill layer**: reqwest streaming → SSE parsing → OpenAI Chat Completions API + Anthropic Messages API (auto-detected), dynamic system prompt, context management, thinking/reasoning modes, provider usage tracking (token counts from API responses), Anthropic prompt caching with compatibility gate
-- **CLI layer**: 9 standard tools + 2 admin tools (main session only) with security checks (path sandboxing, dangerous command blocking, SSRF protection), configurable limits
+- **CLI layer**: 9 standard tools + 2 admin tools (main session only) + experimental stdio MCP bridge (`src/tools/mcp.rs`) with security checks (path sandboxing, dangerous command blocking, SSRF protection, MCP cwd validation), configurable limits
 - **Session store**: `HashMap<String, Session>` plus live connection state in `active_connections: Mutex<HashMap<String, u64>>`, `session_clients`, and `live_rounds` — supports exclusive ownership, disconnect/rebind, and in-flight replay when a browser reconnects; disk persistence still flows through `try_claim_session()` / `claim_requested_session()`
 - **Main session**: Designated session (`MAIN_SESSION_ID = "main"`) with admin privileges — can list/delete other sessions via AI tools and slash commands; admin tools injected via `extra_tools` parameter; prefix-based session target resolution with atomic delete
 - **Graceful shutdown**: `CancellationToken` (tokio-util), `/api/shutdown` with per-port Bearer token auth, auto-save on exit
 - **Frontend**: static `index.html` + `app.js` + `style.css` — WebChat UI with incremental text node streaming (`TextNode.nodeValue +=`), unified `requestAnimationFrame` flush scheduler, pre-mutation scroll-follow detection, history lazy-load (last 50 messages rendered initially, tool_call/tool_result pairs kept intact via `findHistoryRenderStart()`), markdown-only-on-finish rendering
 
 Key files:
-- `Cargo.toml` — axum, tokio, serde, serde_json, reqwest (stream+json), futures, regex, tower-http, tokio-util, chrono, base64
-- `src/main.rs` — Config, sessions, commands, admin tools, HTTP/WebSocket server, hook system, provider-aware token estimation, main loop (~4635 lines)
-- `src/main_tests.rs` — Unit tests for model resolution, session targeting, admin protection, persistence, replay, migration, token tracking, and hook system (~3119 lines)
-- `src/cli.rs` — CLI subcommands (start/stop/restart/status/update/install/systemd-install/health/help/--version plus internal `path-install`), setup wizard, PATH/systemd helpers (~1504 lines)
-- `src/providers.rs` — LLM streaming + non-streaming client: OpenAI + Anthropic SSE parsing, message conversion, conversation compression, usage tracking, prompt caching helpers, thinking/reasoning support with thinking blocks (reasoning_content, budget_tokens), `extra_tools` injection (~1113 lines)
-- `src/prompts.rs` — Session prompt init/load logic, bootstrap vs normal prompt flow with per-session bootstrap baselines, template discovery, daily memory log management, local-time snapshot helpers (~837 lines)
-- `src/agent.rs` — ReAct state machine: AgentPhase, AgentLoopCtx, FinishReason, ToolResultEntry, ObservationSummary, evaluate_finish(), auto_think_level(), summarize_observations() (~507 lines)
-- `docs/reference/templates/` — 7 prompt template files (BOOTSTRAP.md, AGENTS.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md) copied to session workspaces on creation
-- `src/tools/mod.rs` — Shared `ToolSpec` registry, `ToolOutcome` struct, schema generation (OpenAI + Anthropic), tool dispatch, `validate_required_params()`, `is_tool_error_output()` (~498 lines)
-- `src/tools/fs.rs` — Filesystem tools: read_file, write_file, patch_file, delete_file, list_dir, search_files (~334 lines)
-- `src/tools/net.rs` — Network tools: http_fetch with SSRF protection (check_ssrf with DNS resolution + private IP blocking, is_private_ip for IPv4/IPv6, no-redirect client) (~205 lines)
-- `src/tools/exec.rs` — Execution tools: think, exec (kill_on_drop) (~70 lines)
-- `static/index.html`, `static/app.js`, `static/style.css` — WebChat UI
-- `~/.lingclaw/.lingclaw.json` — User config file (providers, models, settings)
-- `~/.lingclaw/{sessionId}/workspace` — Per-session isolated workspace directory (with 7 prompt files from templates + `memory/` subdirectory for daily logs)
-- `~/.lingclaw/sessions/` — Persisted session JSON files
-- `scripts/install-linux.sh` — Linux install helper: Rust check, distro deps, release build, optional PATH persistence, optional systemd setup
+- `Cargo.toml` — dependency manifest (axum, tokio, serde, serde_json, reqwest, futures, regex, tower-http, tokio-util, chrono, base64, getrandom)
+- `src/main.rs` — app entrypoint, WebSocket/HTTP loop, live replay, tool progress dispatch, main runtime wiring
+- `src/agent.rs` — ReAct state machine and finish heuristics
+- `src/config.rs` — runtime config, provider/MCP config structs, model resolution, timeout loading
+- `src/context.rs` — token estimation, context budgets, pruning, usage formatting
+- `src/commands.rs` — slash command handlers and session-facing command mutations
+- `src/cli.rs` — CLI subcommands, setup wizard, install/update/service helpers
+- `src/providers.rs` — OpenAI/Anthropic streaming, reasoning modes, prompt caching, provider compatibility gates
+- `src/prompts.rs` — session prompt bootstrap/normal flow, baselines, local prompt composition
+- `src/hooks.rs` — hook registry and auto-compress context hook
+- `src/tools/mod.rs` — built-in tool registry, schemas, dispatch, validation
+- `src/tools/exec.rs`, `src/tools/fs.rs`, `src/tools/net.rs` — built-in tool implementations
+- `src/tools/mcp.rs` — stdio MCP tool discovery/execution bridge with workspace-safe cwd handling
+- `src/tests/` — module-scoped test files, including MCP/config/runtime coverage
+- `docs/reference/templates/` — 7 prompt template files copied into session workspaces
+- `static/index.html`, `static/app.js`, `static/style.css` — WebChat UI with ReAct/tool status rendering
+- `~/.lingclaw/.lingclaw.json` — user config file, including `settings`, `models.providers`, and optional top-level `mcpServers`
+
+## Current Module Ownership
+
+- `src/main.rs` — app loop, live replay state, WebSocket/HTTP handlers, `run_tool_with_feedback()`, shutdown wiring
+- `src/agent.rs` — Analyze/Act/Observe/Finish state machine, finish evaluation, observation summaries
+- `src/config.rs` — `Config`, `JsonConfig`, `JsonSettings`, `JsonMcpServerConfig`, model resolution, timeout/env loading
+- `src/context.rs` — token estimation, context input budget, turn-based pruning, usage formatting
+- `src/commands.rs` — slash commands, per-session view toggles, command persistence helpers
+- `src/cli.rs` — setup wizard, daemon/service helpers, CLI status/update/install commands
+- `src/providers.rs` — provider request/stream handling, reasoning/thinking blocks, compatibility gates, extra tool injection
+- `src/prompts.rs` — prompt template initialization, bootstrap baselines, normal-mode prompt loading, daily memory composition
+- `src/hooks.rs` — hook registry and auto-compress lifecycle behavior
+- `src/tools/mod.rs` — built-in tool registry and validation
+- `src/tools/mcp.rs` — runtime MCP tool discovery/execution; MCP server `cwd` must remain inside the session workspace and default request timeout inherits `tool_timeout`
 
 ## Constraints
 
@@ -70,73 +84,9 @@ Key files:
 - ALWAYS use `async`/`await` with Tokio — no blocking calls on the async runtime
 - ALWAYS cap tool output (exec: configurable timeout + 50KB truncation; read_file: 200KB max)
 - ALWAYS validate user-supplied tool paths with `resolve_path_checked()`, use `resolve_path()` only for internal sandboxed normalization, check dangerous commands before exec, and call `check_ssrf()` before network fetches
+- ALWAYS treat MCP server config as untrusted runtime input: `mcpServers.*.cwd` must stay inside the current session workspace, and MCP defaults should inherit `toolTimeout`, not `execTimeout`
 - ALWAYS use `truncate()` (UTF-8–safe via `is_char_boundary()`) for byte-limited string slicing
 - **Mandatory code review**: After completing any code change, perform a code review before committing. Check correctness, security (OWASP Top 10), style compliance, error handling, and test coverage. Run `cargo test` and `cargo clippy` as part of the review. No commit without review.
-
-## Module Map (src/main.rs sections)
-
-1. **Config** (~100 lines) — `Config::load()`, `Provider` enum with auto-detection, `Config::resolve_model()`, `Config::available_models()`, `Config::find_model_entry()`, `Config::context_limit_for_model()`
-2. **Config File** (~100 lines) — `JsonConfig`/`JsonSettings`/`JsonProviderConfig`/`JsonModelEntry` serde structs, `config_dir_path()`, `config_file_path()`, `load_config_file()`
-3. **Data Models** (~30 lines) — ChatMessage, ToolCall, FunctionCall
-4. **Session & AppState** (~110 lines) — Session struct (with per-session `workspace: PathBuf`, `think_level`, `show_react`, `show_tools`, `show_reasoning`, `version`, `input_token_source`, `output_token_source`, `is_main()` method), `MAIN_SESSION_ID` constant, `DEFAULT_PORT`, `SESSION_VERSION` constant (v4), `default_show_react()`, `default_think_level()`, `session_workspace_path()`, `migrate_session()`, plus live reconnect state in `active_connections`, `session_clients`, `live_rounds`, and `next_connection_id`; AppState includes `CancellationToken` for shutdown and per-instance `shutdown_token`
-5. **System Prompt** (~35 lines) — Dynamic prompt with OS/workspace/model injection; `build_system_prompt(config, workspace, model, is_main)` includes admin section for main session
-6. **Security** (~70 lines) — Dangerous pattern detection, sandboxed `resolve_path()` for internal clamp-to-workspace normalization, and `resolve_path_checked()` for explicit user-facing rejection of workspace escapes and symlink traversal
-7. **Utilities** (~30 lines) — `truncate()` (UTF-8–safe via `is_char_boundary()`), `format_size()`, `matches_glob()`, `ws_send()` / `ws_try_send()` (mpsc channel-based)
-8. **Tool Dispatch** (~5 lines) — Thin `execute_tool()` wrapper delegating to `tools::execute_tool()`
-10. **Context Management** (~120 lines) — `estimate_tokens()`, `estimate_tokens_for_provider()` (provider-aware with protocol overhead constants: `OPENAI_TOOL_CALL_OVERHEAD_TOKENS`, `ANTHROPIC_TOOL_USE_OVERHEAD_TOKENS`, etc.), `context_input_budget_for_model()` (input budget with reply reserve headroom), `turn_len()` (measures complete conversational turns: user+assistant, user+assistant(tool_calls)+tool_results), `prune_messages()` (deletes oldest complete turns via `turn_len()`), `update_session_token_usage()` (tracks input/output with provider vs estimated source labels)
-10b. **Hook System** (~150 lines) — `AgentHook` trait, `HookEvent` enum (`BeforeAnalyze`), `HookRegistry`, `run_hooks()` (returns `Vec<serde_json::Value>` events forwarded to client), `AutoCompressContextHook` (fires when context exceeds input budget, compresses oldest turns, emits `context_compressed` WS event with removed count and token estimate before/after)
-11. **Session Persistence & Ownership** (~280 lines) — Save/load to ~/.lingclaw/sessions/, `list_saved_session_summaries()`, `list_saved_session_summaries_in_dir()` (includes corrupt file entries with "[Corrupt Session]" name), `list_saved_session_ids_in_dir()` (filename-based discovery, works even for corrupt JSON), `build_history_payload()`, `trim_incomplete_tool_calls()` for safe shutdown; `ClaimSessionResult` enum + `try_claim_session()` (4-phase atomic claim), `claim_requested_session()` (wait-and-claim with active-binding detection), live event dispatch/replay helpers (`bind_session_connection()`, `dispatch_live_event()`, `replay_live_round()`), `refresh_session_system_prompt()`, `send_sessions_list()`; save-before-remove pattern in all session transitions
-11b. **Session Admin** (~200 lines) — Main session exclusive: `resolve_session_target()` (exact match or unique prefix resolution), `delete_session_by_id()` (atomic: holds active lock during check+remove, rollback on file delete failure, main session protection), `gather_sessions_status()`, `build_active_session_lines()`, `execute_admin_tool()`, `is_admin_tool()`, `admin_tool_definitions_openai()` / `admin_tool_definitions_anthropic()`, `CommandResult` struct (with `response_type` field for progress/success/error UI)
-12. **Chat Commands** (~380 lines) — 13 slash commands: /new (compress+save to memory+clear, cancel-aware, input capped at 60K chars), /session_new (save-before-remove, create new session), /switch (save-before-remove, delegates to `try_claim_session()`, clears stale live replay state), /rename, /model, /think, /skills, /status, /clear, /help, /sessions (main-only, active sessions with full IDs), /delete (main-only, prefix resolution, not-found handling), /react (toggle ReAct phase visibility, default on)
-13. **WebSocket Handler** (~420 lines) — Agent loop with unlimited tool rounds (`AGENT_HARD_CAP_ROUNDS = 200` as runaway protection) and `CancellationToken`; mpsc-based WebSocket with separate reader/writer tasks; incremental session save after every round (both tool and non-tool); session-aware reconnect at connect (`?session=` query param with `claim_requested_session()` plus live replay buffering); system prompt (messages[0]) refreshed every round; cancel-aware LLM streaming and tool execution through `LiveTx`; `extra_tools` injected for main session admin tools; `trim_incomplete_tool_calls` on disconnect only (single cleanup point)
-14. **HTTP API** (~50 lines) — /api/health, /api/sessions, /api/shutdown (POST, Bearer token auth)
-15. **Main** (~70 lines) — CLI args (`--serve`, `--install-daemon`, `--port`), subcommand dispatch via `cli::handle_cli_command()`, setup wizard via `cli::run_setup_wizard()`, `CancellationToken` + `with_graceful_shutdown`, per-port shutdown token generation + file write, post-shutdown session flush + token cleanup
-
-## Module Map (src/cli.rs)
-
-1. **Interactive Helpers** (~25 lines) — `prompt_line()`, `prompt_choice()` — terminal input wrappers
-2. **install_global_path()** (~110 lines) — Updates registry + current process PATH on Windows; appends to `.profile`/`.bashrc`/`.zshrc` on Unix
-3. **Linux service helpers** (~180 lines) — `systemd_available()`, `resolve_home_for_user()`, `install_systemd_service()`, and related helpers for generating `lingclaw.service`
-4. **handle_cli_command()** (~520 lines) — `pub(crate)` entry point for CLI subcommands: start/stop/restart/health/status/update/install/systemd-install/help/--version/-V plus internal `path-install`; Linux start/stop/restart auto-switch to systemd when installed; stop uses graceful shutdown first (reads per-port token from disk, POST `/api/shutdown` with Bearer auth, polls for exit) then force-kill fallback (PID dedup); update/install are version-aware with file-lock handling and service restart behavior
-5. **run_setup_wizard()** (~280 lines) — `pub(crate)` first-run terminal wizard; Linux flow includes PATH prompt, optional systemd setup, and writes config with default port `18989`; `--install-daemon` forces re-entry with config backup
-
-## Module Map (src/providers.rs)
-
-1. **Provider Types** — `ResolvedModel` (fields: `provider`, `api_base`, `api_key`, `model_id`, `reasoning: bool`, `thinking_format: Option<String>`, `max_tokens: Option<u64>`, `stream_include_usage: bool`, `anthropic_prompt_caching: bool`), `LlmResponse` (fields: `text`, `tool_calls`, `reasoning`, `input_tokens: Option<u64>`, `output_tokens: Option<u64>`)
-2. **SSE Models** — OpenAI: `StreamChunk`/`DeltaToolCall`; Anthropic: `AnthropicEvent`/`AnthropicDelta`/`AnthropicContentBlock`/`AnthropicUsage`
-3. **Message Conversion** — `convert_messages_to_openai()`, `convert_messages_to_anthropic()`
-4. **Non-streaming Client** — `call_llm_simple()` — plain-text LLM call for conversation compression (/new command), respects `resolved.max_tokens`
-5. **Thinking/Reasoning** — `think_level_to_reasoning_effort()` (maps to OpenAI reasoning_effort), `think_level_to_budget()` (maps to Anthropic thinking budget_tokens)
-6. **Prompt Caching Helpers** — `anthropic_prompt_caching_enabled()` (checks official API or config flag), `anthropic_system_payload()` (structured cache blocks when enabled, plain string when disabled), `maybe_apply_anthropic_tool_cache_control()` (adds `cache_control` to last tool when enabled), `total_anthropic_input_tokens()` (sums `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`)
-7. **Streaming Client** — `call_llm_stream(http, resolved, messages, tx, think_level, extra_tools)` dispatch → `call_llm_stream_openai()` / `call_llm_stream_anthropic()` — supports `reasoning_content` (o1/o3), `reasoning_effort` (OpenAI), thinking blocks with `budget_tokens` (Anthropic), Qwen `thinkingFormat` compat; `extra_tools` merged with standard tool definitions for admin tool injection; OpenAI `stream_options.include_usage` gated by compatibility check; Anthropic prompt caching applied conditionally via helpers
-
-## Module Map (src/prompts.rs)
-
-1. **TEMPLATE_FILES const** — `&[(&str, &str)]` tuples: 7 template filenames + `include_str!()` embedded fallback content (BOOTSTRAP.md, AGENTS.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md)
-2. **templates_dir()** — Locates `docs/reference/templates/` by walking exe ancestors then falling back to CWD
-3. **init_session_prompt_files() / ensure_session_workspace()** — New sessions copy all templates, create `memory/`, and write per-session bootstrap baselines (`.lingclaw-bootstrap/` directory); existing sessions recreate missing core templates but intentionally do NOT recreate BOOTSTRAP.md, so bootstrap completion survives reconnects
-4. **load_session_prompt_files_with_snapshot()** — Bootstrap mode reads `BOOTSTRAP.md + AGENTS.md` (falling back to legacy `AGENT.md` if needed); normal mode reads `AGENTS.md + IDENTITY.md + USER.md + SOUL.md`, then that session's `MEMORY.md` and local today/yesterday daily memory files; concatenates with `---` separators; missing files skipped silently, actual I/O errors logged
-5. **Bootstrap Baselines** — `write_bootstrap_baselines()`, `ensure_bootstrap_baselines()`, `read_bootstrap_baseline()`, `remove_bootstrap_baselines()` manage per-session `.lingclaw-bootstrap/` directory; `maybe_complete_bootstrap()` checks if IDENTITY.md or USER.md differs from baseline (using `profile_file_has_user_edits()` with `normalize_template_text()` for cross-platform comparison); `template_file_content()` reads templates from disk with `include_str!()` fallback
-6. **Local time helpers** — `LocalTimeSnapshot`, `current_local_snapshot()`, `today()`, `yesterday()`, `hhmm()`, `datetime_label()` via `chrono`, so system prompt time and daily memory selection share one local-time snapshot
-
-## Module Map (src/tools/)
-
-### mod.rs — Registry & Dispatch
-1. **ToolSpec Registry** — `ToolSpec` metadata, `ToolOutcome` (output + is_error + duration_ms), `ToolHandler` type alias, prompt lines, parameter schemas
-2. **Schema Generation** — `tool_definitions()` (OpenAI format) + `tool_definitions_anthropic()` (Anthropic format)
-3. **Dispatch & Validation** — Shared `execute_tool()` routing to submodule implementations, `validate_required_params()` for pre-validation, `is_tool_error_output()` for error detection
-
-### exec.rs — Execution & Reasoning
-- `tool_think()` — CoT planning
-- `tool_exec()` — Shell command execution with security checks, `kill_on_drop(true)` for automatic process cleanup
-
-### fs.rs — Filesystem
-- `tool_read_file()`, `tool_write_file()`, `tool_patch_file()`, `tool_delete_file()`, `tool_list_dir()`, `tool_search_files()`
-
-### net.rs — Network
-- `is_private_ip()` — Checks IPv4 (private, link-local, 0.0.0.0/8) and IPv6 (fc00::/7 unique-local, fe80::/10 link-local)
-- `check_ssrf()` — SSRF protection: HTTP/HTTPS only, `reqwest::Url::parse` for robust host extraction (handles IPv6 brackets, userinfo), IP literal check or DNS resolution against private ranges
-- `tool_http_fetch()` — SSRF check + one-off `Client::builder().redirect(Policy::none())` (prevents redirect-based SSRF); shared `http` client is NOT used for user-controlled URLs
 
 ## Coding Style
 
@@ -151,12 +101,12 @@ Key files:
 
 1. Read existing code first — understand the module map before changing anything
 2. Classify your change: **Skill** (prompt/context/LLM), **CLI** (tools/security), or **Loop** (handler/session/commands)
-3. When adding features, check line count — budget is 6000, currently ~3561
+3. When adding features, check line count — budget is 6000, verify the current count instead of relying on stale notes
 4. Test changes: `cargo clippy` then `cargo test` then `cargo build`
-5. For Skill issues: check `build_system_prompt()`, `prune_messages()`, `estimate_tokens()` in `src/main.rs`; `call_llm_stream_openai()` / `call_llm_stream_anthropic()` in `src/providers.rs`; `TEMPLATE_FILES`, `templates_dir()`, `init_session_prompt_files()`, `load_session_prompt_files_with_snapshot()`, `current_local_snapshot()` in `src/prompts.rs`; template content in `docs/reference/templates/`
-6. For CLI issues: check `src/tools/mod.rs` (`tool_specs()`, `execute_tool()`) plus `check_dangerous_command()`, `resolve_path()`, and `resolve_path_checked()` in `src/main.rs`
-7. For Loop issues: check `handle_socket()` agent loop, `handle_command()`, session persistence
-8. For Config issues: check `JsonConfig`/`JsonSettings` structs, `Config::load()`, `load_config_file()`, `run_setup_wizard()`
+5. For Skill issues: check `build_system_prompt()` in `src/main.rs`; token/context logic in `src/context.rs`; `call_llm_stream_openai()` / `call_llm_stream_anthropic()` in `src/providers.rs`; prompt loading in `src/prompts.rs`; template content in `docs/reference/templates/`
+6. For CLI issues: check `src/tools/mod.rs` for built-in tools, `src/tools/mcp.rs` for MCP-backed tools, plus `check_dangerous_command()`, `resolve_path()`, and `resolve_path_checked()` in `src/main.rs`
+7. For Loop issues: check `handle_socket()`, `run_tool_with_feedback()`, live replay helpers, and WebSocket event flow in `src/main.rs`
+8. For Config issues: check `src/config.rs` (`JsonConfig`, `JsonSettings`, `JsonMcpServerConfig`, `Config::load()`), then `run_setup_wizard()` in `src/cli.rs` and README/example config
 
 ## Output Format
 

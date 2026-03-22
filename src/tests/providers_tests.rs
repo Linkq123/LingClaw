@@ -303,4 +303,3 @@ fn anthropic_prompt_caching_can_be_forced_for_compatible_api() {
 
     assert!(anthropic_prompt_caching_enabled(&resolved));
 }
-

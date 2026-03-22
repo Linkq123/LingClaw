@@ -15,6 +15,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 ## Features
 
 - **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
+- **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表
 - **2 主会话管理工具**：`list_sessions`、`delete_session`
 - **16 斜杠命令**：`/new`、`/session_new`、`/switch`、`/rename`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/skills`、`/status`、`/usage`、`/clear`、`/help`、`/sessions`、`/delete`
 - **双 Provider 模型路由**：OpenAI + Anthropic，支持 `provider/model` 和纯 model ID
@@ -82,6 +83,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
   "settings": {
     "port": 18989,
     "execTimeout": 30,
+    "toolTimeout": 30,
     "maxContextTokens": 32000,
     "maxOutputBytes": 51200,
     "maxFileBytes": 204800
@@ -141,6 +143,8 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 - 推荐使用 `provider/model` 格式引用模型
 - 多个 provider 暴露同一 model ID 时，必须使用显式前缀
 - 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容
+- 可选的 `mcpServers` 顶层对象可声明 MCP server，例如 `command`、`args`、`env`、`cwd`、`timeoutSecs`
+- `mcpServers.*.cwd` 必须落在当前 session workspace 内；未设置 `timeoutSecs` 时默认继承 `toolTimeout`
 
 ## Environment Variables
 
@@ -153,6 +157,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `LINGCLAW_MODEL` | `gpt-4o-mini` | 默认模型 |
 | `LINGCLAW_PORT` | `18989` | HTTP 端口 |
 | `LINGCLAW_EXEC_TIMEOUT` | `30` | Shell 命令超时（秒） |
+| `LINGCLAW_TOOL_TIMEOUT` | `30` | 非 shell 的 Act 阶段工具超时（秒） |
 | `LINGCLAW_MAX_CONTEXT_TOKENS` | `32000` | 默认上下文 token 预算 |
 
 ## Slash Commands
