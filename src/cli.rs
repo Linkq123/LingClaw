@@ -11,6 +11,7 @@ use serde_json::json;
 use crate::{config_dir_path, config_file_path, Config, DEFAULT_PORT, VERSION};
 
 static MCP_PREFLIGHT_ID: AtomicU64 = AtomicU64::new(1);
+const MCP_PREFLIGHT_TIMEOUT_SECS: u64 = 5;
 
 // ── Interactive Helpers ──────────────────────────────────────────────────────
 
@@ -60,7 +61,7 @@ fn inspect_mcp_preflight(
     std::fs::create_dir_all(&workspace)
         .map_err(|error| format!("failed to create MCP preflight workspace: {error}"))?;
 
-    let config = config.clone();
+    let config = preflight_config(config);
     let thread_workspace = workspace.clone();
     let thread = std::thread::Builder::new()
         .name("lingclaw-mcp-preflight".to_string())
@@ -84,6 +85,21 @@ fn inspect_mcp_preflight(
     result
 }
 
+fn preflight_config(config: &Config) -> Config {
+    let mut preflight = config.clone();
+    let timeout = Duration::from_secs(MCP_PREFLIGHT_TIMEOUT_SECS);
+    preflight.tool_timeout = timeout;
+    for server in preflight.mcp_servers.values_mut() {
+        server.timeout_secs = Some(
+            server
+                .timeout_secs
+                .unwrap_or(MCP_PREFLIGHT_TIMEOUT_SECS)
+                .min(MCP_PREFLIGHT_TIMEOUT_SECS),
+        );
+    }
+    preflight
+}
+
 fn print_mcp_preflight(config: &Config) {
     let enabled_count = config
         .mcp_servers
@@ -94,7 +110,10 @@ fn print_mcp_preflight(config: &Config) {
         return;
     }
 
-    println!("MCP preflight:");
+    println!(
+        "MCP preflight: checking {enabled_count} server(s), timeout capped at {}s each...",
+        MCP_PREFLIGHT_TIMEOUT_SECS
+    );
 
     let reports = match inspect_mcp_preflight(config) {
         Ok(reports) => reports,

@@ -50,3 +50,46 @@ fn inspect_mcp_preflight_is_nonfatal_inside_runtime() {
         .unwrap_or_default()
         .contains("failed to spawn 'definitely-not-a-real-command'"));
 }
+
+#[test]
+fn preflight_config_caps_mcp_timeouts() {
+    let mut config = test_config_with_broken_mcp();
+    config.tool_timeout = Duration::from_secs(120);
+    config
+        .mcp_servers
+        .get_mut("broken")
+        .expect("broken server should exist")
+        .timeout_secs = Some(90);
+
+    let preflight = preflight_config(&config);
+    assert_eq!(
+        preflight.tool_timeout,
+        Duration::from_secs(MCP_PREFLIGHT_TIMEOUT_SECS)
+    );
+    assert_eq!(
+        preflight
+            .mcp_servers
+            .get("broken")
+            .and_then(|server| server.timeout_secs),
+        Some(MCP_PREFLIGHT_TIMEOUT_SECS)
+    );
+}
+
+#[test]
+fn preflight_config_sets_default_timeout_when_missing() {
+    let mut config = test_config_with_broken_mcp();
+    config
+        .mcp_servers
+        .get_mut("broken")
+        .expect("broken server should exist")
+        .timeout_secs = None;
+
+    let preflight = preflight_config(&config);
+    assert_eq!(
+        preflight
+            .mcp_servers
+            .get("broken")
+            .and_then(|server| server.timeout_secs),
+        Some(MCP_PREFLIGHT_TIMEOUT_SECS)
+    );
+}
