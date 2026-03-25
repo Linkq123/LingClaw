@@ -153,16 +153,32 @@ fn push_diagnostic_line_trims_and_limits_buffer() {
 }
 
 #[test]
-fn read_message_skips_stdout_noise_before_headers() {
+fn write_message_uses_newline_delimited_jsonrpc() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let bytes = rt.block_on(async {
+        write_message_for_test(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-03-26"}
+        }))
+        .await
+        .expect("message should be written")
+    });
+
+    let output = String::from_utf8(bytes).expect("output should be utf-8");
+    assert!(output.ends_with('\n'));
+    assert!(!output.contains("Content-Length:"));
+    assert!(output.trim_end().starts_with('{'));
+}
+
+#[test]
+fn read_message_accepts_newline_delimited_jsonrpc_and_ignores_noise() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let message = rt.block_on(async {
         let (mut writer, reader) = tokio::io::duplex(512);
         let payload = json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}).to_string();
-        let frame = format!(
-            "Starting Minimax MCP server\n\nContent-Length: {}\r\n\r\n{}",
-            payload.len(),
-            payload
-        );
+        let frame = format!("Starting Minimax MCP server\n{}\n", payload);
         let writer_task = tokio::spawn(async move {
             writer
                 .write_all(frame.as_bytes())
@@ -181,4 +197,29 @@ fn read_message_skips_stdout_noise_before_headers() {
 
     assert_eq!(message.0.get("id").and_then(Value::as_u64), Some(1));
     assert_eq!(message.1, vec!["Starting Minimax MCP server".to_string()]);
+}
+
+#[test]
+fn read_message_keeps_legacy_content_length_compatibility() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let message = rt.block_on(async {
+        let (mut writer, reader) = tokio::io::duplex(512);
+        let payload = json!({"jsonrpc": "2.0", "id": 2, "result": {"ok": true}}).to_string();
+        let frame = format!("Content-Length: {}\r\n\r\n{}", payload.len(), payload);
+        let writer_task = tokio::spawn(async move {
+            writer
+                .write_all(frame.as_bytes())
+                .await
+                .expect("frame should be written");
+        });
+        let stdout_lines = Arc::new(Mutex::new(Vec::new()));
+        let mut reader = BufReader::new(reader);
+        let message = read_message(&mut reader, &stdout_lines)
+            .await
+            .expect("message should parse");
+        writer_task.await.expect("writer task should finish");
+        message
+    });
+
+    assert_eq!(message.get("id").and_then(Value::as_u64), Some(2));
 }

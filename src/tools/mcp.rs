@@ -6,8 +6,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
-    process::{ChildStderr, ChildStdin, Command},
+    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    process::{ChildStderr, Command},
 };
 
 use crate::{config::JsonMcpServerConfig, resolve_path_checked, Config, VERSION};
@@ -15,6 +15,7 @@ use crate::{config::JsonMcpServerConfig, resolve_path_checked, Config, VERSION};
 use super::ToolOutcome;
 
 const MCP_NAME_PREFIX: &str = "mcp__";
+const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
 const MCP_DIAGNOSTIC_LINE_LIMIT: usize = 6;
 const MCP_DIAGNOSTIC_CHAR_LIMIT: usize = 400;
 static MCP_TOOL_CACHE: OnceLock<Mutex<HashMap<String, Vec<McpToolDescriptor>>>> = OnceLock::new();
@@ -563,7 +564,7 @@ async fn call_server(
                 "id": 1,
                 "method": "initialize",
                 "params": {
-                    "protocolVersion": "2024-11-05",
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
                     "capabilities": {},
                     "clientInfo": {
                         "name": "LingClaw",
@@ -656,13 +657,12 @@ async fn call_server(
     })
 }
 
-async fn write_message(stdin: &mut ChildStdin, message: &Value) -> Result<(), String> {
-    let body = serde_json::to_vec(message).map_err(|error| error.to_string())?;
-    let header = format!("Content-Length: {}\r\n\r\n", body.len());
-    stdin
-        .write_all(header.as_bytes())
-        .await
-        .map_err(|error| error.to_string())?;
+async fn write_message<W>(stdin: &mut W, message: &Value) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut body = serde_json::to_vec(message).map_err(|error| error.to_string())?;
+    body.push(b'\n');
     stdin
         .write_all(&body)
         .await
@@ -693,7 +693,6 @@ async fn read_message<R>(
 where
     R: AsyncRead + Unpin,
 {
-    let mut content_length = None;
     loop {
         let mut line = String::new();
         let read = reader
@@ -705,30 +704,75 @@ where
         }
         let line = line.trim_end_matches(['\r', '\n']);
         if line.is_empty() {
-            if content_length.is_none() {
-                continue;
-            }
-            break;
+            continue;
         }
+
+        if line.starts_with('{') || line.starts_with('[') {
+            match serde_json::from_str::<Value>(line) {
+                Ok(message) => return Ok(message),
+                Err(_) => record_diagnostic_line(stdout_lines, line),
+            }
+            continue;
+        }
+
         if let Some(value) = line.strip_prefix("Content-Length:") {
-            let parsed = value
+            let content_length = value
                 .trim()
                 .parse::<usize>()
                 .map_err(|error| format!("invalid Content-Length: {error}"))?;
-            content_length = Some(parsed);
-        } else {
-            record_diagnostic_line(stdout_lines, line);
+            return read_content_length_message(reader, content_length).await;
+        }
+
+        record_diagnostic_line(stdout_lines, line);
+    }
+}
+
+async fn read_content_length_message<R>(
+    reader: &mut BufReader<R>,
+    content_length: usize,
+) -> Result<Value, String>
+where
+    R: AsyncRead + Unpin,
+{
+    loop {
+        let mut header_line = String::new();
+        let read = reader
+            .read_line(&mut header_line)
+            .await
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Err("MCP server closed stdout while reading headers".into());
+        }
+        if header_line.trim_end_matches(['\r', '\n']).is_empty() {
+            break;
         }
     }
 
-    let content_length =
-        content_length.ok_or_else(|| "missing Content-Length header".to_string())?;
     let mut body = vec![0_u8; content_length];
     reader
         .read_exact(&mut body)
         .await
         .map_err(|error| error.to_string())?;
     serde_json::from_slice(&body).map_err(|error| format!("invalid MCP JSON: {error}"))
+}
+
+#[cfg(test)]
+async fn write_message_for_test(message: &Value) -> Result<Vec<u8>, String> {
+    let (mut writer, mut reader) = tokio::io::duplex(1024);
+    let payload = message.clone();
+    let writer_task = tokio::spawn(async move {
+        write_message(&mut writer, &payload)
+            .await
+            .expect("write should succeed");
+    });
+
+    let mut bytes = Vec::new();
+    reader
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    writer_task.await.map_err(|error| error.to_string())?;
+    Ok(bytes)
 }
 
 #[cfg(test)]
