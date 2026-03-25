@@ -1,7 +1,7 @@
 use super::*;
 use crate::{Provider, DEFAULT_PORT};
 use std::{collections::HashMap, time::Duration};
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 fn test_config_with_mcp() -> Config {
     let mut mcp_servers = HashMap::new();
@@ -160,7 +160,7 @@ fn write_message_uses_newline_delimited_jsonrpc() {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
-            "params": {"protocolVersion": "2025-03-26"}
+            "params": {"protocolVersion": "2025-11-25"}
         }))
         .await
         .expect("message should be written")
@@ -222,4 +222,49 @@ fn read_message_keeps_legacy_content_length_compatibility() {
     });
 
     assert_eq!(message.get("id").and_then(Value::as_u64), Some(2));
+}
+
+#[test]
+fn read_response_handles_ping_requests_while_waiting_for_expected_id() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let result = rt.block_on(async {
+        let (mut server_stdout, reader) = tokio::io::duplex(1024);
+        let (mut client_stdin, server_stdin) = tokio::io::duplex(1024);
+        let writer_task = tokio::spawn(async move {
+            let ping = json!({"jsonrpc": "2.0", "id": "ping-1", "method": "ping"});
+            let response = json!({"jsonrpc": "2.0", "id": 2, "result": {"tools": []}});
+            server_stdout
+                .write_all(format!("{}\n{}\n", ping, response).as_bytes())
+                .await
+                .expect("messages should be written");
+        });
+
+        let stdout_lines = Arc::new(Mutex::new(Vec::new()));
+        let mut reader = BufReader::new(reader);
+        let mut stdin_reader = BufReader::new(server_stdin);
+        let response = read_response(&mut reader, &mut client_stdin, 2, &stdout_lines)
+            .await
+            .expect("expected response should be returned");
+
+        let mut ping_reply = String::new();
+        stdin_reader
+            .read_line(&mut ping_reply)
+            .await
+            .expect("ping reply should be readable");
+        writer_task.await.expect("writer task should finish");
+
+        (
+            response,
+            ping_reply,
+            snapshot_diagnostic_lines(&stdout_lines),
+        )
+    });
+
+    assert_eq!(result.0.get("id").and_then(Value::as_u64), Some(2));
+    assert!(result.1.contains("\"id\":\"ping-1\""));
+    assert!(result.1.contains("\"result\":{}"));
+    assert!(result
+        .2
+        .iter()
+        .any(|line| line.contains("\"method\":\"ping\"")));
 }

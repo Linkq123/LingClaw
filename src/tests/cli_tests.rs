@@ -93,3 +93,81 @@ fn preflight_config_sets_default_timeout_when_missing() {
         Some(MCP_PREFLIGHT_TIMEOUT_SECS)
     );
 }
+
+#[test]
+fn with_preflight_timeout_returns_ready_result() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let value = rt
+        .block_on(async { with_preflight_timeout(async { 7_u8 }).await })
+        .expect("ready result should not time out");
+
+    assert_eq!(value, 7);
+}
+
+#[test]
+fn with_preflight_timeout_rejects_slow_future() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let err = rt
+        .block_on(async {
+            with_preflight_timeout(async {
+                tokio::time::sleep(Duration::from_secs(MCP_PREFLIGHT_TIMEOUT_SECS + 1)).await;
+            })
+            .await
+        })
+        .expect_err("slow future should time out");
+
+    assert!(err.contains("MCP preflight timed out after"));
+}
+
+#[test]
+fn run_mcp_inspection_without_timeout_returns_reports() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let workspace = std::env::temp_dir().join("lingclaw-mcp-inspection-test");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let reports = rt
+        .block_on(async {
+            run_mcp_inspection(&test_config_with_broken_mcp(), &workspace, None).await
+        })
+        .expect("inspection should complete without wrapper timeout");
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].server_name, "broken");
+    assert!(reports[0]
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("failed to spawn"));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn inspect_mcp_check_is_nonfatal_inside_runtime() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let reports = rt
+        .block_on(async { inspect_mcp_check(&test_config_with_broken_mcp()) })
+        .expect("mcp-check should return reports even when a server fails");
+
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0]
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("failed to spawn"));
+}
+
+#[test]
+fn mcp_check_succeeded_returns_false_when_any_server_fails() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let reports = rt
+        .block_on(async { inspect_mcp_check(&test_config_with_broken_mcp()) })
+        .expect("mcp-check should return reports even when a server fails");
+
+    assert!(!mcp_check_succeeded(&reports));
+}
+
+#[test]
+fn mcp_check_succeeded_returns_true_for_empty_reports() {
+    assert!(mcp_check_succeeded(&[]));
+}

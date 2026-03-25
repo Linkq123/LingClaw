@@ -15,7 +15,7 @@ use crate::{config::JsonMcpServerConfig, resolve_path_checked, Config, VERSION};
 use super::ToolOutcome;
 
 const MCP_NAME_PREFIX: &str = "mcp__";
-const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
+const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const MCP_DIAGNOSTIC_LINE_LIMIT: usize = 6;
 const MCP_DIAGNOSTIC_CHAR_LIMIT: usize = 400;
 static MCP_TOOL_CACHE: OnceLock<Mutex<HashMap<String, Vec<McpToolDescriptor>>>> = OnceLock::new();
@@ -556,91 +556,96 @@ async fn call_server(
             .ok_or_else(|| format!("server '{server_name}' missing stderr"))?;
         let mut reader = BufReader::new(stdout);
         let stderr_task = tokio::spawn(collect_stderr_lines(stderr, stderr_lines.clone()));
-
-        write_message(
-            &mut stdin,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": MCP_PROTOCOL_VERSION,
-                    "capabilities": {},
-                    "clientInfo": {
-                        "name": "LingClaw",
-                        "version": VERSION,
+        let result = async {
+            write_message(
+                &mut stdin,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": MCP_PROTOCOL_VERSION,
+                        "capabilities": {},
+                        "clientInfo": {
+                            "name": "LingClaw",
+                            "version": VERSION,
+                        }
                     }
-                }
-            }),
-        )
-        .await?;
-        let initialize = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            read_response(&mut reader, 1, &stdout_lines),
-        )
-        .await
-        .map_err(|_| {
-            format_mcp_timeout_error(
-                "initialize",
-                timeout_secs,
-                &snapshot_diagnostic_lines(&stdout_lines),
-                &snapshot_diagnostic_lines(&stderr_lines),
+                }),
             )
-        })??;
-        if let Some(error) = initialize.get("error") {
-            return Err(format!(
-                "initialize failed: {}",
-                serde_json::to_string(error).unwrap_or_else(|_| error.to_string())
-            ));
+            .await?;
+            let initialize = tokio::time::timeout(
+                Duration::from_secs(timeout_secs),
+                read_response(&mut reader, &mut stdin, 1, &stdout_lines),
+            )
+            .await
+            .map_err(|_| {
+                format_mcp_timeout_error(
+                    "initialize",
+                    timeout_secs,
+                    &snapshot_diagnostic_lines(&stdout_lines),
+                    &snapshot_diagnostic_lines(&stderr_lines),
+                )
+            })??;
+            if let Some(error) = initialize.get("error") {
+                return Err(format!(
+                    "initialize failed: {}",
+                    serde_json::to_string(error).unwrap_or_else(|_| error.to_string())
+                ));
+            }
+
+            write_message(
+                &mut stdin,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/initialized",
+                    "params": {}
+                }),
+            )
+            .await?;
+
+            write_message(
+                &mut stdin,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": method,
+                    "params": params,
+                }),
+            )
+            .await?;
+            let response = tokio::time::timeout(
+                Duration::from_secs(timeout_secs),
+                read_response(&mut reader, &mut stdin, 2, &stdout_lines),
+            )
+            .await
+            .map_err(|_| {
+                format_mcp_timeout_error(
+                    method,
+                    timeout_secs,
+                    &snapshot_diagnostic_lines(&stdout_lines),
+                    &snapshot_diagnostic_lines(&stderr_lines),
+                )
+            })??;
+
+            if let Some(error) = response.get("error") {
+                return Err(serde_json::to_string(error).unwrap_or_else(|_| error.to_string()));
+            }
+
+            response
+                .get("result")
+                .cloned()
+                .ok_or_else(|| format!("server '{server_name}' response missing result"))
         }
-
-        write_message(
-            &mut stdin,
-            &json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-                "params": {}
-            }),
-        )
-        .await?;
-
-        write_message(
-            &mut stdin,
-            &json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": method,
-                "params": params,
-            }),
-        )
-        .await?;
-        let response = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            read_response(&mut reader, 2, &stdout_lines),
-        )
-        .await
-        .map_err(|_| {
-            format_mcp_timeout_error(
-                method,
-                timeout_secs,
-                &snapshot_diagnostic_lines(&stdout_lines),
-                &snapshot_diagnostic_lines(&stderr_lines),
-            )
-        })??;
+        .await;
 
         let _ = stdin.shutdown().await;
         let _ = child.start_kill();
-        let _ = child.wait().await;
+        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+        stderr_task.abort();
         let _ = stderr_task.await;
 
-        if let Some(error) = response.get("error") {
-            return Err(serde_json::to_string(error).unwrap_or_else(|_| error.to_string()));
-        }
-
-        response
-            .get("result")
-            .cloned()
-            .ok_or_else(|| format!("server '{server_name}' response missing result"))
+        result
     }
     .await
     .map_err(|error| {
@@ -670,20 +675,60 @@ where
     stdin.flush().await.map_err(|error| error.to_string())
 }
 
-async fn read_response<R>(
+async fn read_response<R, W>(
     reader: &mut BufReader<R>,
+    stdin: &mut W,
     expected_id: u64,
     stdout_lines: &Arc<Mutex<Vec<String>>>,
 ) -> Result<Value, String>
 where
     R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
     loop {
         let message = read_message(reader, stdout_lines).await?;
         if message.get("id").and_then(Value::as_u64) == Some(expected_id) {
             return Ok(message);
         }
+        handle_server_message(stdin, &message, stdout_lines).await?;
     }
+}
+
+async fn handle_server_message<W>(
+    stdin: &mut W,
+    message: &Value,
+    stdout_lines: &Arc<Mutex<Vec<String>>>,
+) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
+    if let Some(method) = message.get("method").and_then(Value::as_str) {
+        record_diagnostic_line(
+            stdout_lines,
+            &serde_json::to_string(message).unwrap_or_else(|_| message.to_string()),
+        );
+
+        if let Some(id) = message.get("id") {
+            let response = match method {
+                "ping" => json!({
+                    "jsonrpc": "2.0",
+                    "id": id.clone(),
+                    "result": {}
+                }),
+                _ => json!({
+                    "jsonrpc": "2.0",
+                    "id": id.clone(),
+                    "error": {
+                        "code": -32601,
+                        "message": format!("Method not supported: {method}")
+                    }
+                }),
+            };
+            write_message(stdin, &response).await?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn read_message<R>(

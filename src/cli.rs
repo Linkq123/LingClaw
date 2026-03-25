@@ -1,8 +1,11 @@
+#[cfg(test)]
+use std::future::Future;
 use std::io::{self, BufRead, Write};
 #[allow(unused_imports)]
 use std::net::SocketAddr;
 #[allow(unused_imports)]
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -44,6 +47,19 @@ fn prompt_choice(options: &[&str]) -> usize {
 fn inspect_mcp_preflight(
     config: &Config,
 ) -> Result<Vec<crate::tools::mcp::McpServerLoadReport>, String> {
+    inspect_mcp_reports(preflight_config(config), Some(MCP_PREFLIGHT_TIMEOUT_SECS))
+}
+
+fn inspect_mcp_check(
+    config: &Config,
+) -> Result<Vec<crate::tools::mcp::McpServerLoadReport>, String> {
+    inspect_mcp_reports(config.clone(), None)
+}
+
+fn inspect_mcp_reports(
+    config: Config,
+    total_timeout_secs: Option<u64>,
+) -> Result<Vec<crate::tools::mcp::McpServerLoadReport>, String> {
     let enabled_count = config
         .mcp_servers
         .values()
@@ -61,7 +77,6 @@ fn inspect_mcp_preflight(
     std::fs::create_dir_all(&workspace)
         .map_err(|error| format!("failed to create MCP preflight workspace: {error}"))?;
 
-    let config = preflight_config(config);
     let thread_workspace = workspace.clone();
     let thread = std::thread::Builder::new()
         .name("lingclaw-mcp-preflight".to_string())
@@ -70,9 +85,10 @@ fn inspect_mcp_preflight(
                 .enable_all()
                 .build()
                 .map_err(|error| format!("failed to build MCP preflight runtime: {error}"))?;
-            Ok::<_, String>(runtime.block_on(crate::tools::mcp::inspect_servers(
+            Ok::<_, String>(runtime.block_on(run_mcp_inspection(
                 &config,
                 &thread_workspace,
+                total_timeout_secs,
             )))
         })
         .map_err(|error| format!("failed to spawn MCP preflight worker: {error}"))?;
@@ -81,8 +97,8 @@ fn inspect_mcp_preflight(
         Ok(result) => result,
         Err(_) => Err("MCP preflight worker panicked".to_string()),
     };
-    let _ = std::fs::remove_dir_all(&workspace);
-    result
+    std::fs::remove_dir_all(&workspace).ok();
+    result?
 }
 
 fn preflight_config(config: &Config) -> Config {
@@ -100,6 +116,35 @@ fn preflight_config(config: &Config) -> Config {
     preflight
 }
 
+#[cfg(test)]
+async fn with_preflight_timeout<F, T>(future: F) -> Result<T, String>
+where
+    F: Future<Output = T>,
+{
+    tokio::time::timeout(Duration::from_secs(MCP_PREFLIGHT_TIMEOUT_SECS), future)
+        .await
+        .map_err(|_| {
+            format!(
+                "MCP preflight timed out after {}s",
+                MCP_PREFLIGHT_TIMEOUT_SECS
+            )
+        })
+}
+
+async fn run_mcp_inspection(
+    config: &Config,
+    workspace: &Path,
+    total_timeout_secs: Option<u64>,
+) -> Result<Vec<crate::tools::mcp::McpServerLoadReport>, String> {
+    let inspection = crate::tools::mcp::inspect_servers(config, workspace);
+    match total_timeout_secs {
+        Some(timeout_secs) => tokio::time::timeout(Duration::from_secs(timeout_secs), inspection)
+            .await
+            .map_err(|_| format!("MCP preflight timed out after {timeout_secs}s")),
+        None => Ok(inspection.await),
+    }
+}
+
 fn print_mcp_preflight(config: &Config) {
     let enabled_count = config
         .mcp_servers
@@ -111,7 +156,7 @@ fn print_mcp_preflight(config: &Config) {
     }
 
     println!(
-        "MCP preflight: checking {enabled_count} server(s), timeout capped at {}s each...",
+        "MCP preflight: checking {enabled_count} server(s), total timeout capped at {}s...",
         MCP_PREFLIGHT_TIMEOUT_SECS
     );
 
@@ -143,6 +188,52 @@ fn print_mcp_preflight(config: &Config) {
         };
         println!("  ✅ {}: loaded {summary}", report.server_name);
     }
+}
+
+fn mcp_check_succeeded(reports: &[crate::tools::mcp::McpServerLoadReport]) -> bool {
+    reports.iter().all(|report| report.error.is_none())
+}
+
+fn print_mcp_check(config: &Config) -> bool {
+    let enabled_count = config
+        .mcp_servers
+        .values()
+        .filter(|server| server.enabled)
+        .count();
+    if enabled_count == 0 {
+        println!("No enabled MCP servers configured.");
+        return true;
+    }
+
+    println!("MCP check: inspecting {enabled_count} server(s) with configured runtime timeouts...");
+    let reports = match inspect_mcp_check(config) {
+        Ok(reports) => reports,
+        Err(error) => {
+            eprintln!("  ❌ MCP check failed: {error}");
+            return false;
+        }
+    };
+    let success = mcp_check_succeeded(&reports);
+
+    for report in reports {
+        if let Some(error) = report.error {
+            eprintln!("  ❌ {}: {error}", report.server_name);
+            continue;
+        }
+
+        let summary = if report.tool_names.is_empty() {
+            "0 tools".to_string()
+        } else {
+            format!(
+                "{} tools: {}",
+                report.tool_names.len(),
+                report.tool_names.join(", ")
+            )
+        };
+        println!("  ✅ {}: {summary}", report.server_name);
+    }
+
+    success
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -801,6 +892,13 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             handle_cli_command("start", port_override);
             true
         }
+        "mcp-check" => {
+            let config = Config::load();
+            if !print_mcp_check(&config) {
+                process::exit(1);
+            }
+            true
+        }
         "health" => {
             let config = Config::load();
             let port = port_override.unwrap_or(config.port);
@@ -1120,6 +1218,7 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
             println!("  start              Start the daemon");
             println!("  stop               Stop the daemon");
             println!("  restart            Restart the daemon");
+            println!("  mcp-check          Check MCP servers with runtime timeouts");
             println!("  health             Health check (exit 0 = ok)");
             println!("  status             Show detailed service status");
             println!("  update             Check for updates, rebuild if newer");
