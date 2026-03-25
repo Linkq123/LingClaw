@@ -1,6 +1,6 @@
 use super::*;
 use crate::{Provider, DEFAULT_PORT};
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, ffi::OsString, path::PathBuf, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 fn test_config_with_mcp() -> Config {
@@ -124,6 +124,53 @@ fn resolve_server_cwd_rejects_workspace_escape() {
     assert!(err.contains("outside the session workspace"));
 
     let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn resolve_server_command_falls_back_to_home_local_bin() {
+    let temp_home = std::env::temp_dir().join("lingclaw-mcp-command-home-test");
+    let local_bin = temp_home.join(".local").join("bin");
+    std::fs::create_dir_all(&local_bin).expect("local bin should be created");
+
+    let command_name = if cfg!(windows) { "uvx.exe" } else { "uvx" };
+    let command_path = local_bin.join(command_name);
+    std::fs::write(&command_path, b"echo test").expect("command file should be written");
+
+    let resolved = resolve_server_command_from_env(
+        "uvx",
+        Some(OsString::from("")),
+        Some(temp_home.clone().into_os_string()),
+        None,
+    );
+
+    if cfg!(windows) {
+        assert_eq!(
+            resolved.to_string_lossy().to_ascii_lowercase(),
+            command_path.to_string_lossy().to_ascii_lowercase()
+        );
+    } else {
+        assert_eq!(resolved, command_path);
+    }
+
+    let _ = std::fs::remove_dir_all(&temp_home);
+}
+
+#[test]
+fn resolve_server_command_keeps_explicit_paths() {
+    let explicit = if cfg!(windows) {
+        r"C:\tools\uvx.exe"
+    } else {
+        "/usr/local/bin/uvx"
+    };
+
+    let resolved = resolve_server_command_from_env(
+        explicit,
+        Some(OsString::from("")),
+        None,
+        None,
+    );
+
+    assert_eq!(resolved, PathBuf::from(explicit));
 }
 
 #[test]

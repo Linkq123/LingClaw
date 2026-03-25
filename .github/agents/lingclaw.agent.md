@@ -73,7 +73,7 @@ Key files:
 - `src/prompts.rs` — prompt template initialization, bootstrap baselines, normal-mode prompt loading, daily memory composition
 - `src/hooks.rs` — hook registry and auto-compress lifecycle behavior
 - `src/tools/mod.rs` — built-in tool registry and validation
-- `src/tools/mcp.rs` — runtime MCP tool discovery/execution; MCP server `cwd` must remain inside the session workspace and default request timeout inherits `tool_timeout`
+- `src/tools/mcp.rs` — runtime MCP tool discovery/execution; MCP server `cwd` must remain inside the session workspace, default request timeout inherits `tool_timeout`, and the stdio client should follow the current JSON-RPC framing/ping expectations
 
 ## Constraints
 

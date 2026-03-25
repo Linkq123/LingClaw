@@ -1,6 +1,7 @@
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
@@ -427,6 +428,83 @@ fn server_timeout_secs(server: &JsonMcpServerConfig, config: &Config) -> u64 {
     server.timeout_secs.unwrap_or(config.tool_timeout.as_secs())
 }
 
+fn resolve_server_command(command: &str) -> PathBuf {
+    resolve_server_command_from_env(
+        command,
+        std::env::var_os("PATH"),
+        std::env::var_os("HOME"),
+        std::env::var_os("USERPROFILE"),
+    )
+}
+
+fn resolve_server_command_from_env(
+    command: &str,
+    path_env: Option<OsString>,
+    home_env: Option<OsString>,
+    userprofile_env: Option<OsString>,
+) -> PathBuf {
+    let command_path = Path::new(command);
+    if command_path.is_absolute() || command.contains(['/', '\\']) {
+        return command_path.to_path_buf();
+    }
+
+    for dir in command_search_dirs(path_env, home_env, userprofile_env) {
+        for candidate in command_candidates(&dir, command) {
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    command_path.to_path_buf()
+}
+
+fn command_search_dirs(
+    path_env: Option<OsString>,
+    home_env: Option<OsString>,
+    userprofile_env: Option<OsString>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(path) = path_env {
+        dirs.extend(std::env::split_paths(&path));
+    }
+
+    let home_dir = home_env
+        .map(PathBuf::from)
+        .or_else(|| userprofile_env.map(PathBuf::from));
+    if let Some(home_dir) = home_dir {
+        dirs.push(home_dir.join(".local").join("bin"));
+    }
+
+    let mut seen = HashSet::new();
+    dirs.retain(|dir| seen.insert(dir.clone()));
+    dirs
+}
+
+fn command_candidates(dir: &Path, command: &str) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let command_path = Path::new(command);
+    if command_path.extension().is_some() {
+        candidates.push(dir.join(command));
+        return candidates;
+    }
+
+    candidates.push(dir.join(command));
+    if cfg!(windows) {
+        let pathext = std::env::var_os("PATHEXT")
+            .unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
+        for ext in pathext.to_string_lossy().split(';') {
+            let trimmed = ext.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            candidates.push(dir.join(format!("{command}{trimmed}")));
+        }
+    }
+
+    candidates
+}
+
 fn resolve_server_cwd(server: &JsonMcpServerConfig, workspace: &Path) -> Result<PathBuf, String> {
     match server.cwd.as_deref() {
         Some(cwd) if !cwd.is_empty() => resolve_path_checked(cwd, workspace)
@@ -519,7 +597,8 @@ async fn call_server(
 
     let server_cwd = resolve_server_cwd(server, workspace)?;
 
-    let mut command = Command::new(&server.command);
+    let resolved_command = resolve_server_command(&server.command);
+    let mut command = Command::new(&resolved_command);
     command
         .args(&server.args)
         .stdin(std::process::Stdio::piped())
