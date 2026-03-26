@@ -2,6 +2,7 @@
 const chat = document.getElementById('chat');
 const input = document.getElementById('input');
 const inputArea = document.getElementById('input-area');
+const stopBtn = document.getElementById('stop');
 const sendBtn = document.getElementById('send');
 const sendIcon = document.getElementById('send-icon');
 const connDot = document.getElementById('conn-dot');
@@ -1234,18 +1235,17 @@ function showWelcome() {
 
 function setBusy(b) {
   busy = b;
+  stopBtn.hidden = !b;
+  stopBtn.disabled = !b;
   sendBtn.disabled = false;
   if (b) {
-    sendBtn.classList.add('is-stop');
-    sendIcon.innerHTML = '■';
-    sendBtn.title = 'Stop';
-    sendBtn.setAttribute('aria-label', 'Stop agent');
+    input.placeholder = 'Message LingClaw... (运行中可发送干预，点击红色按钮停止)';
   } else {
-    sendBtn.classList.remove('is-stop');
-    sendIcon.innerHTML = '↑';
-    sendBtn.title = '';
-    sendBtn.setAttribute('aria-label', 'Send message');
+    input.placeholder = 'Message LingClaw... (/ for commands)';
   }
+  sendIcon.innerHTML = '↑';
+  sendBtn.title = '';
+  sendBtn.setAttribute('aria-label', 'Send message');
 }
 
 function syncToolDrawer(panel) {
@@ -1432,11 +1432,10 @@ if (window.visualViewport) {
   window.visualViewport.addEventListener('scroll', syncToolDrawerBounds);
 }
 sendBtn.addEventListener('click', () => {
-  if (busy) {
-    stopAgent();
-  } else {
-    send();
-  }
+  send();
+});
+stopBtn.addEventListener('click', () => {
+  stopAgent();
 });
 
 connect();

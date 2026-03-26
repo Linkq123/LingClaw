@@ -813,7 +813,8 @@ pre:hover .copy-btn { opacity: 1; }
   border-color: var(--accent2);
   box-shadow: 0 0 0 3px rgba(45,139,207,.12);
 }
-#send {
+#send,
+#stop {
   background: linear-gradient(135deg, var(--accent2), #1a6fad);
   border: none;
   color: #fff;
@@ -829,14 +830,17 @@ pre:hover .copy-btn { opacity: 1; }
   flex-shrink: 0;
   box-shadow: 0 2px 8px rgba(45,139,207,.25);
 }
-#send:hover:not(:disabled) { transform: scale(1.05); box-shadow: 0 4px 12px rgba(45,139,207,.3); }
-#send:active:not(:disabled) { transform: scale(.95); }
-#send:disabled { opacity: .4; cursor: not-allowed; box-shadow: none; }
-#send.is-stop {
+#send:hover:not(:disabled),
+#stop:hover:not(:disabled) { transform: scale(1.05); box-shadow: 0 4px 12px rgba(45,139,207,.3); }
+#send:active:not(:disabled),
+#stop:active:not(:disabled) { transform: scale(.95); }
+#send:disabled,
+#stop:disabled { opacity: .4; cursor: not-allowed; box-shadow: none; }
+#stop {
   background: linear-gradient(135deg, var(--accent-error, #d9534f), #b94a48);
   box-shadow: 0 2px 8px rgba(217,83,79,.25);
 }
-#send.is-stop:hover { box-shadow: 0 4px 12px rgba(217,83,79,.35); }
+#stop:hover:not(:disabled) { box-shadow: 0 4px 12px rgba(217,83,79,.35); }
 #send .spinner {
   width: 18px;
   height: 18px;
@@ -953,6 +957,8 @@ pre:hover .copy-btn { opacity: 1; }
 
   #send { box-shadow: 0 2px 8px rgba(91,163,230,.25); }
   #send:hover:not(:disabled) { box-shadow: 0 4px 12px rgba(91,163,230,.3); }
+  #stop { box-shadow: 0 2px 8px rgba(240,96,96,.3); }
+  #stop:hover:not(:disabled) { box-shadow: 0 4px 12px rgba(240,96,96,.4); }
 
   .sidebar-header { background: linear-gradient(180deg, rgba(232,112,136,.06), transparent); }
 
