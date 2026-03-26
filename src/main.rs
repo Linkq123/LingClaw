@@ -1215,88 +1215,98 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         connection_id,
     );
 
+    let mut rerun_agent = false;
     loop {
-        let text = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => break,
-            _ = connection_cancel.cancelled() => break,
-            result = inbound_rx.recv() => match result {
-                Some(text) => text,
-                None => break,
-            },
-        };
+        if !rerun_agent {
+            let text = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => break,
+                _ = connection_cancel.cancelled() => break,
+                result = inbound_rx.recv() => match result {
+                    Some(text) => text,
+                    None => break,
+                },
+            };
 
-        let trimmed = text.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if trimmed.starts_with('/') {
-            let cmd_result = handle_command(
-                trimmed,
-                &current_session_id,
-                connection_id,
-                &state,
-                &tx,
-                &cancel,
-            )
-            .await;
-            if cancel.is_cancelled() {
-                break;
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
             }
-            if let Some(result) = cmd_result {
-                send_command_refresh(&tx, &state, &current_session_id, result.refresh_history)
-                    .await;
 
-                ws_send(
+            if trimmed.starts_with('/') {
+                let cmd_result = handle_command(
+                    trimmed,
+                    &current_session_id,
+                    connection_id,
+                    &state,
                     &tx,
-                    &json!({"type":result.response_type,"content":result.response}),
+                    &cancel,
                 )
                 .await;
+                if cancel.is_cancelled() {
+                    break;
+                }
+                if let Some(result) = cmd_result {
+                    send_command_refresh(&tx, &state, &current_session_id, result.refresh_history)
+                        .await;
 
-                if let Some(new_id) = result.new_session_id {
-                    unbind_session_connection_if_matches(
-                        &state,
-                        &current_session_id,
-                        connection_id,
+                    ws_send(
+                        &tx,
+                        &json!({"type":result.response_type,"content":result.response}),
                     )
                     .await;
-                    state.live_rounds.lock().await.remove(&current_session_id);
-                    current_session_id = new_id.clone();
-                    bind_session_connection(&state, &current_session_id, connection_id, &tx, true)
-                        .await;
-                    {
-                        let mut active_id = current_session_ref.lock().await;
-                        *active_id = current_session_id.clone();
-                    }
-                    send_session_switched_payloads(&tx, &state, &new_id).await;
-                }
-                if result.sessions_changed {
-                    send_sessions_list(&tx, &state, &current_session_id).await;
-                }
-            } else {
-                ws_send(
-                    &tx,
-                    &json!({"type":"system","content":"Unknown command. Type /help."}),
-                )
-                .await;
-            }
-            continue;
-        }
 
-        {
-            let mut sessions = state.sessions.lock().await;
-            if let Some(session) = sessions.get_mut(&current_session_id) {
-                session.messages.push(ChatMessage {
-                    role: "user".into(),
-                    content: Some(text),
-                    tool_calls: None,
-                    tool_call_id: None,
-                    timestamp: Some(now_epoch()),
-                });
-                session.updated_at = now_epoch();
+                    if let Some(new_id) = result.new_session_id {
+                        unbind_session_connection_if_matches(
+                            &state,
+                            &current_session_id,
+                            connection_id,
+                        )
+                        .await;
+                        state.live_rounds.lock().await.remove(&current_session_id);
+                        current_session_id = new_id.clone();
+                        bind_session_connection(
+                            &state,
+                            &current_session_id,
+                            connection_id,
+                            &tx,
+                            true,
+                        )
+                        .await;
+                        {
+                            let mut active_id = current_session_ref.lock().await;
+                            *active_id = current_session_id.clone();
+                        }
+                        send_session_switched_payloads(&tx, &state, &new_id).await;
+                    }
+                    if result.sessions_changed {
+                        send_sessions_list(&tx, &state, &current_session_id).await;
+                    }
+                } else {
+                    ws_send(
+                        &tx,
+                        &json!({"type":"system","content":"Unknown command. Type /help."}),
+                    )
+                    .await;
+                }
+                continue;
             }
-        }
+
+            {
+                let mut sessions = state.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&current_session_id) {
+                    session.messages.push(ChatMessage {
+                        role: "user".into(),
+                        content: Some(text),
+                        tool_calls: None,
+                        tool_call_id: None,
+                        timestamp: Some(now_epoch()),
+                    });
+                    session.updated_at = now_epoch();
+                }
+            }
+        } // end if !rerun_agent
+        rerun_agent = false;
 
         let show_react = {
             let sessions = state.sessions.lock().await;
@@ -1854,6 +1864,28 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         {
             let mut runs = state.active_runs.lock().await;
             runs.remove(&current_session_id);
+        }
+
+        // If the agent finished normally but there are pending interventions
+        // that arrived during/after the last cycle, persist them and re-run
+        // the agent so the user's message gets a response.
+        if !run_stopped && !shutting_down && !pending_interventions.is_empty() {
+            {
+                let mut sessions = state.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&current_session_id) {
+                    for text in pending_interventions.drain(..) {
+                        session.messages.push(ChatMessage {
+                            role: "user".into(),
+                            content: Some(text),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            timestamp: Some(now_epoch()),
+                        });
+                    }
+                    session.updated_at = now_epoch();
+                }
+            }
+            rerun_agent = true;
         }
 
         if run_stopped {
