@@ -515,6 +515,7 @@ function reactPhaseLabel(phase) {
 
 function pinReactStatusToBottom() {
   if (!reactStatusRow?.isConnected) return;
+  if (chat.lastElementChild === reactStatusRow) return;
   chat.appendChild(reactStatusRow);
 }
 
@@ -524,19 +525,22 @@ function renderReactStatus() {
   const phase = reactStatusRow.querySelector('.react-status-phase');
   const cycle = reactStatusRow.querySelector('.react-status-cycle');
   const detail = reactStatusRow.querySelector('.react-status-detail');
-  if (!card || !phase || !cycle || !detail) return;
+  const detailTool = reactStatusRow.querySelector('.react-status-tool');
+  const detailTime = reactStatusRow.querySelector('.react-status-time');
+  if (!card || !phase || !cycle || !detail || !detailTool || !detailTime) return;
   card.dataset.phase = reactStatusPhase || 'analyze';
   phase.textContent = reactPhaseLabel(reactStatusPhase);
   cycle.textContent = Number.isInteger(reactStatusCycle) ? `cycle ${reactStatusCycle}` : '';
   if (reactStatusPhase === 'act' && reactStatusToolName) {
     const seconds = Math.max(1, Math.floor((reactStatusElapsedMs || 0) / 1000));
-    detail.textContent = `${reactStatusToolName} · ${seconds}s`;
+    detailTool.textContent = reactStatusToolName;
+    detailTime.textContent = `${seconds}s`;
     detail.hidden = false;
   } else {
-    detail.textContent = '';
+    detailTool.textContent = '';
+    detailTime.textContent = '';
     detail.hidden = true;
   }
-  pinReactStatusToBottom();
 }
 
 function clearReactStatus() {
@@ -587,7 +591,11 @@ function ensureReactStatusRow() {
         <span class="react-status-tag">ReAct</span>
         <span class="react-status-phase"></span>
         <span class="react-status-cycle"></span>
-        <span class="react-status-detail" hidden></span>
+        <span class="react-status-detail" hidden>
+          <span class="react-status-tool"></span>
+          <span class="react-status-separator">·</span>
+          <span class="react-status-time"></span>
+        </span>
         <span class="react-status-dots" aria-hidden="true">
           <span></span>
           <span></span>
