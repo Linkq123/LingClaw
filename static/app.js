@@ -976,6 +976,7 @@ function addMsg(cls, text, timestamp) {
   }
 
   chat.appendChild(row);
+  pinReactStatusToBottom();
   if (isChat) hideWelcome();
   scrollDown();
   return el;
