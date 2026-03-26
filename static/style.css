@@ -832,6 +832,11 @@ pre:hover .copy-btn { opacity: 1; }
 #send:hover:not(:disabled) { transform: scale(1.05); box-shadow: 0 4px 12px rgba(45,139,207,.3); }
 #send:active:not(:disabled) { transform: scale(.95); }
 #send:disabled { opacity: .4; cursor: not-allowed; box-shadow: none; }
+#send.is-stop {
+  background: linear-gradient(135deg, var(--accent-error, #d9534f), #b94a48);
+  box-shadow: 0 2px 8px rgba(217,83,79,.25);
+}
+#send.is-stop:hover { box-shadow: 0 4px 12px rgba(217,83,79,.35); }
 #send .spinner {
   width: 18px;
   height: 18px;

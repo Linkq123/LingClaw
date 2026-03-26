@@ -869,6 +869,7 @@ Commands:
     /react [on|off]  Toggle ReAct phase visibility
     /tool [on|off]   Toggle tool card visibility
     /reasoning [on|off] Toggle reasoning visibility
+    /stop            Stop the running agent
     /skills          List available skills
     /rename <name>   Rename current session
     /clear           Clear messages (keep system prompt)
@@ -991,6 +992,9 @@ pub(crate) async fn handle_command(
         "/help" => Some(handle_help_command(current_session_id)),
         "/sessions" => Some(handle_sessions_command(current_session_id, state).await),
         "/delete" => Some(handle_delete_command(arg, current_session_id, state).await),
+
+        // /stop when not busy — the in-flight case is handled by the agent loop drain
+        "/stop" => Some(command_result("No active run to stop.", "system", None, false)),
 
         _ => None,
     }

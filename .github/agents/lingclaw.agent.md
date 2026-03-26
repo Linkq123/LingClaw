@@ -25,7 +25,7 @@ LingClaw's architecture is this loop made concrete in Rust. All design decisions
 |------|------------------------|
 | **Skill** | Dynamic system prompt (OS/CWD/model injection), per-session prompt files (7 templates from `docs/reference/templates/`: BOOTSTRAP.md, AGENTS.md, IDENTITY.md, SOUL.md, USER.md, TOOLS.md, MEMORY.md) for persona customization, bootstrap flow (`BOOTSTRAP.md + AGENTS.md`) followed by normal prompt flow (`AGENTS.md + IDENTITY.md + USER.md + SOUL.md`, then that session's `MEMORY.md` and `memory/YYYY-MM-DD.md`), `think` tool for CoT planning, token-aware context pruning with turn-based deletion (`turn_len()` + `prune_messages()`), provider-aware token estimation (`estimate_tokens_for_provider()`) with protocol overhead constants, per-session model override, dual-provider support (OpenAI + Anthropic) with auto-detection, provider usage tracking (`input_tokens`/`output_tokens` from API with source labeling), Anthropic prompt caching (system blocks + tool `cache_control` with compatibility gate), thinking/reasoning modes (`auto/off/minimal/low/medium/high/xhigh`), JSON config file (`~/.lingclaw/.lingclaw.json`) with first-run setup wizard, fixed frontend brand avatar |
 | **CLI** | 9 standard tools (think, exec, read_file, write_file, patch_file, delete_file, list_dir, search_files, http_fetch) + 2 admin tools (list_sessions, delete_session — main session only, injected via `extra_tools`) + experimental stdio MCP tools injected at runtime with `mcp__...` prefixes, shared `ToolSpec` registry for built-in prompt/schema generation, `ToolOutcome` for structured results with duration/error tracking, dangerous command blocking, sandboxed path resolution against per-session workspace, SSRF protection (`check_ssrf()` with DNS resolution + private IP blocking + no-redirect client), split `execTimeout` / `toolTimeout` semantics, `kill_on_drop` process cleanup |
-| **Loop** | WebSocket agent loop with unlimited tool rounds (internal 200-round hard cap as runaway protection), system prompt refreshed every round (prompt-file edits take effect mid-session), incremental session save after every round (tool and non-tool), auto-prune when context overflows (turn-based: deletes complete user→assistant→tool turns), auto-compress context via hook system (`HookRegistry` + `AutoCompressContextHook`), 16 slash commands including `/tool`, `/reasoning`, and `/usage`, per-session think level, main session concept (`MAIN_SESSION_ID = "main"`) with exclusive admin privileges, per-session isolated workspace with exclusive ownership, graceful shutdown (CancellationToken + `/api/shutdown` with per-port token auth), session-aware reconnect with live replay state (`active_connections` + `session_clients` + `live_rounds`), `tool_progress` heartbeats for long-running Act steps, session versioning (`SESSION_VERSION`, `migrate_session()`) |
+| **Loop** | WebSocket agent loop with unlimited tool rounds (internal 200-round hard cap as runaway protection), system prompt refreshed every round (prompt-file edits take effect mid-session), incremental session save after every round (tool and non-tool), auto-prune when context overflows (turn-based: deletes complete user→assistant→tool turns), auto-compress context via hook system (`HookRegistry` + `AutoCompressContextHook`), 18 slash commands including `/tool`, `/reasoning`, `/usage`, and `/stop`, per-session think level, main session concept (`MAIN_SESSION_ID = "main"`) with exclusive admin privileges, per-session isolated workspace with exclusive ownership, graceful shutdown (CancellationToken + `/api/shutdown` with per-port token auth), session-aware reconnect with live replay state (`active_connections` + `session_clients` + `live_rounds`), `tool_progress` heartbeats for long-running Act steps, session versioning (`SESSION_VERSION`, `migrate_session()`), per-run cancellation (`active_runs` + `child_token()` + `/stop`), deferred user intervention (text sent while busy is queued and injected at Analyze boundary) |
 
 When extending LingClaw, always ask: **am I improving the Skill half, the CLI half, or the loop that connects them?**
 
@@ -53,6 +53,10 @@ Key files:
 - `src/providers.rs` — OpenAI/Anthropic streaming, reasoning modes, prompt caching, provider compatibility gates
 - `src/prompts.rs` — session prompt bootstrap/normal flow, baselines, local prompt composition
 - `src/hooks.rs` — hook registry and auto-compress context hook
+- `src/session_admin.rs` — admin tool implementations (list/delete sessions, main-session-only)
+- `src/session_store.rs` — session persistence, migration, and disk I/O
+- `src/socket_sync.rs` — WebSocket session claim, disconnect watch, rebind helpers
+- `src/socket_tasks.rs` — WebSocket reader/writer task setup
 - `src/tools/mod.rs` — built-in tool registry, schemas, dispatch, validation
 - `src/tools/exec.rs`, `src/tools/fs.rs`, `src/tools/net.rs` — built-in tool implementations
 - `src/tools/mcp.rs` — stdio MCP tool discovery/execution bridge with workspace-safe cwd handling
@@ -63,7 +67,7 @@ Key files:
 
 ## Current Module Ownership
 
-- `src/main.rs` — app loop, live replay state, WebSocket/HTTP handlers, `run_tool_with_feedback()`, shutdown wiring
+- `src/main.rs` — app loop, per-run cancellation (`active_runs`, `child_token()`), deferred intervention drain, WebSocket/HTTP handlers, `run_tool_with_feedback()`, shutdown wiring
 - `src/agent.rs` — Analyze/Act/Observe/Finish state machine, finish evaluation, observation summaries
 - `src/config.rs` — `Config`, `JsonConfig`, `JsonSettings`, `JsonMcpServerConfig`, model resolution, timeout/env loading
 - `src/context.rs` — token estimation, context input budget, turn-based pruning, usage formatting
@@ -72,6 +76,10 @@ Key files:
 - `src/providers.rs` — provider request/stream handling, reasoning/thinking blocks, compatibility gates, extra tool injection
 - `src/prompts.rs` — prompt template initialization, bootstrap baselines, normal-mode prompt loading, daily memory composition
 - `src/hooks.rs` — hook registry and auto-compress lifecycle behavior
+- `src/session_admin.rs` — admin tool implementations (list/delete sessions)
+- `src/session_store.rs` — session persistence, migration, disk I/O
+- `src/socket_sync.rs` — session claim, disconnect watch, rebind
+- `src/socket_tasks.rs` — WebSocket reader/writer task spawning
 - `src/tools/mod.rs` — built-in tool registry and validation
 - `src/tools/mcp.rs` — runtime MCP tool discovery/execution; MCP server `cwd` must remain inside the session workspace, default request timeout inherits `tool_timeout`, and the stdio client should follow the current JSON-RPC framing/ping expectations
 

@@ -280,6 +280,8 @@ struct AppState {
     active_connections: Mutex<HashMap<String, u64>>,
     session_clients: Mutex<HashMap<String, SessionClientBinding>>,
     live_rounds: Mutex<HashMap<String, LiveRoundState>>,
+    /// Per-session active agent run cancellation tokens.
+    active_runs: Mutex<HashMap<String, CancellationToken>>,
     next_connection_id: AtomicU64,
     shutdown: CancellationToken,
     shutdown_token: String,
@@ -1114,19 +1116,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         }
     });
     // Reader task: forward incoming text to a channel and signal disconnect
-    let (inbound_tx, mut inbound_rx) = mpsc::channel::<String>(32);
+    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<String>();
     let reader_cancel = connection_cancel.clone();
     let reader = tokio::spawn(async move {
         while let Some(result) = rx.next().await {
             match result {
                 Ok(WsMsg::Text(t)) => {
-                    // Use try_send to never block — if the inbound channel is full
-                    // (e.g. agent is busy), drop the message but keep reading so we
-                    // always detect Close / Error frames promptly.
-                    match inbound_tx.try_send(t.to_string()) {
-                        Ok(()) => {}
-                        Err(mpsc::error::TrySendError::Closed(_)) => break,
-                        Err(mpsc::error::TrySendError::Full(_)) => {}
+                    // Use an unbounded inbound channel so /stop and intervention
+                    // messages are not silently dropped while the agent is busy.
+                    if inbound_tx.send(t.to_string()).is_err() {
+                        break;
                     }
                 }
                 Ok(WsMsg::Close(_)) | Err(_) => break,
@@ -1308,9 +1307,17 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         };
 
         let mut shutting_down = false;
+        let mut run_stopped = false;
         let mut round: usize = 0;
         let mut react_ctx = agent::AgentLoopCtx::new(show_react);
         const AGENT_HARD_CAP_ROUNDS: usize = 200;
+
+        // Per-run cancellation: child of shutdown so server stop propagates automatically.
+        let run_cancel = cancel.child_token();
+        {
+            let mut runs = state.active_runs.lock().await;
+            runs.insert(current_session_id.clone(), run_cancel.clone());
+        }
 
         // Inter-phase state: Analyze → Act → Observe
         let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
@@ -1318,10 +1325,33 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         let mut cycle_workspace = std::path::PathBuf::new();
         let mut cycle_is_main = false;
         let mut last_observation_hint: Option<String> = None;
+        let mut pending_interventions: Vec<String> = Vec::new();
 
         'agent: loop {
             if cancel.is_cancelled() {
                 shutting_down = true;
+                break;
+            }
+            // Drain pending inbound messages — handle /stop and collect interventions
+            while let Ok(msg) = inbound_rx.try_recv() {
+                let m = msg.trim();
+                if m.eq_ignore_ascii_case("/stop") {
+                    run_cancel.cancel();
+                    run_stopped = true;
+                    break 'agent;
+                }
+                // Non-command text from user → queue as intervention for next Analyze
+                if !m.is_empty() && !m.starts_with('/') {
+                    pending_interventions.push(m.to_string());
+                    let _ = live_send(
+                        &live_tx,
+                        json!({"type":"progress","content":"📝 Intervention received — will apply at next reasoning cycle"}),
+                    )
+                    .await;
+                }
+            }
+            if run_cancel.is_cancelled() && !cancel.is_cancelled() {
+                run_stopped = true;
                 break;
             }
 
@@ -1342,6 +1372,23 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     }
 
                     let had_observation_hint = last_observation_hint.is_some();
+
+                    // ── Inject pending user interventions as messages ──
+                    if !pending_interventions.is_empty() {
+                        let mut sessions = state.sessions.lock().await;
+                        if let Some(session) = sessions.get_mut(&current_session_id) {
+                            for text in pending_interventions.drain(..) {
+                                session.messages.push(ChatMessage {
+                                    role: "user".into(),
+                                    content: Some(text),
+                                    tool_calls: None,
+                                    tool_call_id: None,
+                                    timestamp: Some(now_epoch()),
+                                });
+                            }
+                            session.updated_at = now_epoch();
+                        }
+                    }
 
                     // ── BeforeAnalyze hooks (e.g. auto-compress context) ──
                     let mut before_analyze_events = run_hooks(
@@ -1479,8 +1526,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
                     let llm_result = tokio::select! {
                         biased;
-                        _ = cancel.cancelled() => {
-                            shutting_down = true;
+                        _ = run_cancel.cancelled() => {
+                            shutting_down = cancel.is_cancelled();
+                            run_stopped = !shutting_down;
                             break;
                         }
                         r = providers::call_llm_stream(
@@ -1572,8 +1620,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     let tool_timeout = state.config.tool_timeout;
 
                     for tc in &pending_tool_calls {
-                        if cancel.is_cancelled() {
-                            shutting_down = true;
+                        if run_cancel.is_cancelled() {
+                            shutting_down = cancel.is_cancelled();
+                            run_stopped = !shutting_down;
                             break 'agent;
                         }
 
@@ -1594,7 +1643,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         let run_state = if cycle_is_main && is_admin_tool(&tc.function.name) {
                             run_tool_with_feedback(
                                 &live_tx,
-                                &cancel,
+                                &run_cancel,
                                 &tc.id,
                                 &tc.function.name,
                                 tool_timeout,
@@ -1620,7 +1669,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                         } else {
                             run_tool_with_feedback(
                                 &live_tx,
-                                &cancel,
+                                &run_cancel,
                                 &tc.id,
                                 &tc.function.name,
                                 tool_timeout,
@@ -1639,6 +1688,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                             ToolRunState::Completed(result) => result,
                             ToolRunState::Abort => {
                                 shutting_down = cancel.is_cancelled();
+                                run_stopped = !shutting_down;
                                 break 'agent;
                             }
                         };
@@ -1799,6 +1849,42 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                 } // end Finish
             } // end match
         } // end 'agent loop
+
+        // Clean up per-run cancellation token
+        {
+            let mut runs = state.active_runs.lock().await;
+            runs.remove(&current_session_id);
+        }
+
+        if run_stopped {
+            // Persist any pending interventions so they survive in history
+            if !pending_interventions.is_empty() {
+                let mut sessions = state.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&current_session_id) {
+                    for text in pending_interventions.drain(..) {
+                        session.messages.push(ChatMessage {
+                            role: "user".into(),
+                            content: Some(text),
+                            tool_calls: None,
+                            tool_call_id: None,
+                            timestamp: Some(now_epoch()),
+                        });
+                    }
+                }
+            }
+            // Trim incomplete tool calls from session history
+            {
+                let mut sessions = state.sessions.lock().await;
+                if let Some(session) = sessions.get_mut(&current_session_id) {
+                    session_store::trim_incomplete_tool_calls(&mut session.messages);
+                }
+            }
+            let _ = live_send(
+                &live_tx,
+                json!({"type":"done","phase":"stopped","reason":"user_stop","cycles":react_ctx.cycles,"tool_calls":react_ctx.tool_calls}),
+            )
+            .await;
+        }
 
         if shutting_down {
             let _ = live_send(
@@ -2009,6 +2095,7 @@ async fn main() {
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
         next_connection_id: AtomicU64::new(1),
         shutdown: shutdown.clone(),
         shutdown_token,

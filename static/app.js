@@ -256,7 +256,7 @@ function toggleReasoningVisibility() {
 }
 
 function canSendWhileBusy(cmd) {
-  return /^\/(tool|reasoning)\b/i.test(cmd);
+  return /^\/(tool|reasoning|stop)\b/i.test(cmd);
 }
 
 // ── Progressive segmented markdown ──
@@ -512,6 +512,11 @@ function reactPhaseLabel(phase) {
   }[phase] || phase || 'Analyze';
 }
 
+function pinReactStatusToBottom() {
+  if (!reactStatusRow?.isConnected) return;
+  chat.appendChild(reactStatusRow);
+}
+
 function renderReactStatus() {
   if (!reactStatusRow) return;
   const card = reactStatusRow.querySelector('.react-status-card');
@@ -530,6 +535,7 @@ function renderReactStatus() {
     detail.textContent = '';
     detail.hidden = true;
   }
+  pinReactStatusToBottom();
 }
 
 function clearReactStatus() {
@@ -846,6 +852,7 @@ function handleMessage(data) {
       } else {
         chat.appendChild(panel);
       }
+      pinReactStatusToBottom();
       animatePanelIn(panel);
       reasoningPanel = panel;
       hideWelcome();
@@ -991,6 +998,7 @@ function addSystem(t, kind = 'info') {
   }
   row.appendChild(card);
   chat.appendChild(row);
+  pinReactStatusToBottom();
   scrollDown();
 }
 
@@ -1002,6 +1010,7 @@ function addError(t) {
   card.innerHTML = `<span class="system-icon">⚠️</span> <span style="color:var(--accent-error)">${escHtml(t)}</span>`;
   row.appendChild(card);
   chat.appendChild(row);
+  pinReactStatusToBottom();
   scrollDown();
 }
 
@@ -1027,6 +1036,7 @@ function addToolCall(name, args, id) {
     </div>
   `;
   chat.appendChild(panel);
+  pinReactStatusToBottom();
   animatePanelIn(panel);
   hideWelcome();
   scrollDown();
@@ -1090,6 +1100,7 @@ function addToolResult(name, result, id, durationMs = null) {
   `;
   el.classList.add('tool-panel-ready');
   chat.appendChild(el);
+  pinReactStatusToBottom();
   animatePanelIn(el);
   scrollDown();
 }
@@ -1223,8 +1234,18 @@ function showWelcome() {
 
 function setBusy(b) {
   busy = b;
-  sendBtn.disabled = b;
-  sendIcon.innerHTML = b ? '<span class="spinner"></span>' : '↑';
+  sendBtn.disabled = false;
+  if (b) {
+    sendBtn.classList.add('is-stop');
+    sendIcon.innerHTML = '■';
+    sendBtn.title = 'Stop';
+    sendBtn.setAttribute('aria-label', 'Stop agent');
+  } else {
+    sendBtn.classList.remove('is-stop');
+    sendIcon.innerHTML = '↑';
+    sendBtn.title = '';
+    sendBtn.setAttribute('aria-label', 'Send message');
+  }
 }
 
 function syncToolDrawer(panel) {
@@ -1349,18 +1370,38 @@ function loadEarlierMessages() {
 
 // ── Input ──
 function send() {
-  const text = input.value.trim();
-  if (!text || busy || !ws || ws.readyState !== 1) return;
+  if (!ws || ws.readyState !== 1) return;
 
-  if (!text.startsWith('/')) {
-    addMsg('user', text);
+  const text = input.value.trim();
+  if (!text) return;
+
+  if (text.startsWith('/')) {
+    if (busy && !canSendWhileBusy(text)) {
+      addSystem('Agent 运行中时，只允许 /stop、/tool 和 /reasoning。');
+      return;
+    }
+    sendCmd(text);
+    input.value = '';
+    input.style.height = 'auto';
+    syncToolDrawerBounds();
+    return;
   }
 
-  setBusy(true);
+  addMsg('user', text);
+
+  if (!busy) {
+    setBusy(true);
+  }
+
   ws.send(text);
   input.value = '';
   input.style.height = 'auto';
   syncToolDrawerBounds();
+}
+
+function stopAgent() {
+  if (!busy || !ws || ws.readyState !== 1) return;
+  ws.send('/stop');
 }
 
 function sendCmd(cmd) {
@@ -1390,6 +1431,12 @@ if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', syncToolDrawerBounds);
   window.visualViewport.addEventListener('scroll', syncToolDrawerBounds);
 }
-sendBtn.addEventListener('click', send);
+sendBtn.addEventListener('click', () => {
+  if (busy) {
+    stopAgent();
+  } else {
+    send();
+  }
+});
 
 connect();
