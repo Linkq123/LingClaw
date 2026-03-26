@@ -1235,7 +1235,7 @@ function showWelcome() {
 
 function setBusy(b) {
   busy = b;
-  stopBtn.hidden = !b;
+  stopBtn.style.display = b ? 'flex' : 'none';
   stopBtn.disabled = !b;
   sendBtn.disabled = false;
   if (b) {
@@ -1391,6 +1391,8 @@ function send() {
 
   if (!busy) {
     setBusy(true);
+  } else {
+    addSystem('📝 干预消息已发送，将在下一个推理周期应用');
   }
 
   ws.send(text);
