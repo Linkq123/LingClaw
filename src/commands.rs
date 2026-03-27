@@ -606,7 +606,11 @@ fn format_mcp_reports(reports: &[tools::mcp::McpServerLoadReport]) -> String {
     lines.join("\n")
 }
 
-async fn handle_mcp_command(current_session_id: &str, state: &AppState) -> CommandResult {
+async fn handle_mcp_command_with_arg(
+    arg: &str,
+    current_session_id: &str,
+    state: &AppState,
+) -> CommandResult {
     let workspace = {
         let sessions = state.sessions.lock().await;
         match sessions.get(current_session_id) {
@@ -625,8 +629,27 @@ async fn handle_mcp_command(current_session_id: &str, state: &AppState) -> Comma
         return command_result("No MCP servers enabled.", "system", None, false);
     }
 
-    let reports = tools::mcp::inspect_servers(&state.config, &workspace).await;
-    command_result(format_mcp_reports(&reports), "system", None, false)
+    match arg {
+        "" => {
+            let reports = tools::mcp::inspect_servers(&state.config, &workspace).await;
+            command_result(format_mcp_reports(&reports), "system", None, false)
+        }
+        "refresh" => match tools::mcp::refresh_servers(&state.config, &workspace).await {
+            Ok(reports) => command_result(
+                format!("Refreshed MCP cache.\n\n{}", format_mcp_reports(&reports)),
+                "system",
+                None,
+                false,
+            ),
+            Err(error) => command_result(
+                format!("Failed to refresh MCP cache: {error}"),
+                "error",
+                None,
+                false,
+            ),
+        },
+        _ => command_result("Usage: /mcp [refresh]", "system", None, false),
+    }
 }
 
 async fn handle_think_command(
@@ -862,7 +885,7 @@ fn handle_help_command(current_session_id: &str) -> CommandResult {
 Commands:
     /new             Compress conversation to memory & clear context
     /status          Show session status
-    /mcp             Show MCP load status
+    /mcp [refresh]   Show MCP load status or refresh cache
     /usage           Show session token usage
     /model [name]    Show or switch model
     /think [level]   Set thinking mode (auto|off|minimal|low|medium|high|xhigh)
@@ -981,7 +1004,7 @@ pub(crate) async fn handle_command(
 
         "/model" => Some(handle_model_command(arg, current_session_id, state).await),
         "/status" => Some(handle_status_command(current_session_id, state).await),
-        "/mcp" => Some(handle_mcp_command(current_session_id, state).await),
+        "/mcp" => Some(handle_mcp_command_with_arg(arg, current_session_id, state).await),
         "/usage" => Some(handle_usage_command(current_session_id, state).await),
         "/clear" => Some(handle_clear_command(current_session_id, state).await),
         "/skills" => Some(handle_skills_command()),
@@ -994,7 +1017,12 @@ pub(crate) async fn handle_command(
         "/delete" => Some(handle_delete_command(arg, current_session_id, state).await),
 
         // /stop when not busy — the in-flight case is handled by the agent loop drain
-        "/stop" => Some(command_result("No active run to stop.", "system", None, false)),
+        "/stop" => Some(command_result(
+            "No active run to stop.",
+            "system",
+            None,
+            false,
+        )),
 
         _ => None,
     }

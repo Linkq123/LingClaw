@@ -1,7 +1,17 @@
 use super::*;
 use crate::{Provider, DEFAULT_PORT};
-use std::{collections::HashMap, ffi::OsString, path::PathBuf, time::Duration};
+use std::{
+    collections::HashMap,
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+    process::Command as StdCommand,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+const MOCK_MCP_SERVER_SOURCE: &str = include_str!("fixtures/mock_mcp_server.rs");
 
 fn test_config_with_mcp() -> Config {
     let mut mcp_servers = HashMap::new();
@@ -35,6 +45,101 @@ fn test_config_with_mcp() -> Config {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
     }
+}
+
+fn unique_temp_workspace(prefix: &str) -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{unique}"))
+}
+
+fn mcp_test_guard() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+async fn acquire_mcp_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    mcp_test_guard().lock().await
+}
+
+fn mock_server_binary() -> &'static PathBuf {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY.get_or_init(|| {
+        let helper_dir = std::env::temp_dir().join("lingclaw-mcp-test-helper");
+        fs::create_dir_all(&helper_dir).expect("helper dir should exist");
+        let source_path = helper_dir.join("mock_mcp_server.rs");
+        let binary_path = helper_dir.join(if cfg!(windows) {
+            "mock_mcp_server.exe"
+        } else {
+            "mock_mcp_server"
+        });
+
+        fs::write(&source_path, MOCK_MCP_SERVER_SOURCE).expect("helper source should write");
+        let status = StdCommand::new("rustc")
+            .arg("--edition=2021")
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&binary_path)
+            .status()
+            .expect("rustc should run");
+        assert!(status.success(), "mock MCP server should compile");
+
+        binary_path
+    })
+}
+
+fn test_config_with_mock_server(mode: &str, log_path: &Path) -> Config {
+    let mut config = test_config_with_mcp();
+    config.mcp_servers.clear();
+    config.mcp_servers.insert(
+        "mock".to_string(),
+        JsonMcpServerConfig {
+            command: mock_server_binary().display().to_string(),
+            args: Vec::new(),
+            env: HashMap::from([
+                ("LINGCLAW_MCP_MODE".to_string(), mode.to_string()),
+                (
+                    "LINGCLAW_MCP_LOG".to_string(),
+                    log_path.display().to_string(),
+                ),
+            ]),
+            cwd: None,
+            enabled: true,
+            timeout_secs: Some(5),
+        },
+    );
+    config
+}
+
+async fn clear_mcp_caches_for_test() {
+    if let Ok(mut cache) = tool_cache().lock() {
+        cache.clear();
+    }
+
+    let sessions = {
+        let Ok(mut cache) = session_cache().lock() else {
+            return;
+        };
+        cache
+            .drain()
+            .map(|(_, entry)| entry.session)
+            .collect::<Vec<_>>()
+    };
+
+    for session in sessions {
+        let mut guard = session.lock().await;
+        guard.shutdown().await;
+    }
+}
+
+fn log_line_count(log_path: &Path, needle: &str) -> usize {
+    fs::read_to_string(log_path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(needle))
+        .count()
 }
 
 #[test]
@@ -107,6 +212,18 @@ fn server_timeout_defaults_to_tool_timeout_when_override_missing() {
 }
 
 #[test]
+fn should_reset_mcp_session_matches_transport_failures() {
+    assert!(should_reset_mcp_session(
+        "MCP initialize timed out after 5s"
+    ));
+    assert!(should_reset_mcp_session("MCP server closed stdout"));
+    assert!(should_reset_mcp_session("failed to spawn 'npx': not found"));
+    assert!(!should_reset_mcp_session(
+        "{\"code\":-32602,\"message\":\"invalid args\"}"
+    ));
+}
+
+#[test]
 fn resolve_server_cwd_rejects_workspace_escape() {
     let workspace = std::env::temp_dir().join("lingclaw-mcp-cwd-test");
     std::fs::create_dir_all(&workspace).expect("workspace should be created");
@@ -163,12 +280,7 @@ fn resolve_server_command_keeps_explicit_paths() {
         "/usr/local/bin/uvx"
     };
 
-    let resolved = resolve_server_command_from_env(
-        explicit,
-        Some(OsString::from("")),
-        None,
-        None,
-    );
+    let resolved = resolve_server_command_from_env(explicit, Some(OsString::from("")), None, None);
 
     assert_eq!(resolved, PathBuf::from(explicit));
 }
@@ -289,9 +401,17 @@ fn read_response_handles_ping_requests_while_waiting_for_expected_id() {
         let stdout_lines = Arc::new(Mutex::new(Vec::new()));
         let mut reader = BufReader::new(reader);
         let mut stdin_reader = BufReader::new(server_stdin);
-        let response = read_response(&mut reader, &mut client_stdin, 2, &stdout_lines)
-            .await
-            .expect("expected response should be returned");
+        let response = read_response(
+            &mut reader,
+            &mut client_stdin,
+            2,
+            &stdout_lines,
+            "github",
+            Path::new("/tmp/workspace"),
+            "cache-key",
+        )
+        .await
+        .expect("expected response should be returned");
 
         let mut ping_reply = String::new();
         stdin_reader
@@ -314,4 +434,295 @@ fn read_response_handles_ping_requests_while_waiting_for_expected_id() {
         .2
         .iter()
         .any(|line| line.contains("\"method\":\"ping\"")));
+}
+
+#[test]
+fn read_response_handles_roots_list_requests_while_waiting_for_expected_id() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let result = rt.block_on(async {
+        let (mut server_stdout, reader) = tokio::io::duplex(1024);
+        let (mut client_stdin, server_stdin) = tokio::io::duplex(1024);
+        let writer_task = tokio::spawn(async move {
+            let roots_list = json!({"jsonrpc": "2.0", "id": 7, "method": "roots/list"});
+            let response = json!({"jsonrpc": "2.0", "id": 2, "result": {"tools": []}});
+            server_stdout
+                .write_all(format!("{}\n{}\n", roots_list, response).as_bytes())
+                .await
+                .expect("messages should be written");
+        });
+
+        let stdout_lines = Arc::new(Mutex::new(Vec::new()));
+        let workspace = if cfg!(windows) {
+            PathBuf::from(r"C:\tmp\workspace root")
+        } else {
+            PathBuf::from("/tmp/workspace root")
+        };
+        let mut reader = BufReader::new(reader);
+        let mut stdin_reader = BufReader::new(server_stdin);
+        let response = read_response(
+            &mut reader,
+            &mut client_stdin,
+            2,
+            &stdout_lines,
+            "github",
+            &workspace,
+            "cache-key",
+        )
+        .await
+        .expect("expected response should be returned");
+
+        let mut roots_reply = String::new();
+        stdin_reader
+            .read_line(&mut roots_reply)
+            .await
+            .expect("roots reply should be readable");
+        writer_task.await.expect("writer task should finish");
+        (response, roots_reply)
+    });
+
+    assert_eq!(result.0.get("id").and_then(Value::as_u64), Some(2));
+    assert!(result.1.contains("\"id\":7"));
+    assert!(result.1.contains("\"roots\""));
+    assert!(result.1.contains("file://"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn tools_list_changed_notification_invalidates_cached_descriptors() {
+    let _guard = acquire_mcp_test_guard().await;
+    clear_mcp_caches_for_test().await;
+
+    let workspace = unique_temp_workspace("lingclaw-mcp-tool-change");
+    fs::create_dir_all(&workspace).expect("workspace should be created");
+    let log_path = workspace.join("mock.log");
+    let config = test_config_with_mock_server("tool-change", &log_path);
+
+    let first = list_server_tools("mock", &config, &workspace)
+        .await
+        .expect("first tools/list should succeed");
+    assert_eq!(first[0].raw_name, "alpha");
+
+    call_server(
+        "mock",
+        &config,
+        &workspace,
+        "tools/call",
+        json!({"name": "alpha", "arguments": {}}),
+    )
+    .await
+    .expect("tools/call should consume invalidation notification");
+
+    let second = list_server_tools("mock", &config, &workspace)
+        .await
+        .expect("second tools/list should refetch after invalidation");
+    assert_eq!(second[0].raw_name, "beta");
+
+    clear_mcp_caches_for_test().await;
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn call_server_restarts_cached_session_after_server_exit() {
+    let _guard = acquire_mcp_test_guard().await;
+    clear_mcp_caches_for_test().await;
+
+    let workspace = unique_temp_workspace("lingclaw-mcp-restart");
+    fs::create_dir_all(&workspace).expect("workspace should be created");
+    let log_path = workspace.join("mock.log");
+    let config = test_config_with_mock_server("restart-once", &log_path);
+
+    let first = call_server(
+        "mock",
+        &config,
+        &workspace,
+        "tools/call",
+        json!({"name": "alpha", "arguments": {"value": "one"}}),
+    )
+    .await
+    .expect("first tools/call should succeed");
+    assert_eq!(first["content"][0]["text"], "ok");
+
+    let second = call_server(
+        "mock",
+        &config,
+        &workspace,
+        "tools/call",
+        json!({"name": "alpha", "arguments": {"value": "two"}}),
+    )
+    .await
+    .expect("second tools/call should respawn session and succeed");
+    assert_eq!(second["content"][0]["text"], "ok");
+    assert_eq!(log_line_count(&log_path, "start"), 2);
+
+    clear_mcp_caches_for_test().await;
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn refresh_servers_clears_cached_tools_and_sessions() {
+    let _guard = acquire_mcp_test_guard().await;
+    clear_mcp_caches_for_test().await;
+
+    let workspace = unique_temp_workspace("lingclaw-mcp-refresh");
+    fs::create_dir_all(&workspace).expect("workspace should be created");
+    let log_path = workspace.join("mock.log");
+    let config = test_config_with_mock_server("default", &log_path);
+
+    let _ = list_server_tools("mock", &config, &workspace)
+        .await
+        .expect("tools should load");
+    let _ = call_server(
+        "mock",
+        &config,
+        &workspace,
+        "tools/call",
+        json!({"name": "alpha", "arguments": {}}),
+    )
+    .await
+    .expect("session should be created");
+
+    assert_eq!(tool_cache().lock().expect("tool cache lock").len(), 1);
+    assert_eq!(session_cache().lock().expect("session cache lock").len(), 1);
+
+    let reports = refresh_servers(&config, &workspace)
+        .await
+        .expect("refresh should succeed");
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].server_name, "mock");
+    assert_eq!(tool_cache().lock().expect("tool cache lock").len(), 1);
+    assert_eq!(session_cache().lock().expect("session cache lock").len(), 0);
+    assert_eq!(log_line_count(&log_path, "start"), 2);
+
+    clear_mcp_caches_for_test().await;
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn reap_idle_server_sessions_removes_stale_entries() {
+    let _guard = acquire_mcp_test_guard().await;
+    clear_mcp_caches_for_test().await;
+
+    let workspace = unique_temp_workspace("lingclaw-mcp-idle");
+    fs::create_dir_all(&workspace).expect("workspace should be created");
+    let log_path = workspace.join("mock.log");
+    let config = test_config_with_mock_server("default", &log_path);
+
+    let (cache_key, _) = get_or_create_server_session("mock", &config, &workspace)
+        .await
+        .expect("session should be created");
+    {
+        let mut cache = session_cache().lock().expect("session cache lock");
+        let entry = cache
+            .get_mut(&cache_key)
+            .expect("cached session should exist");
+        entry.last_used_at = Instant::now() - session_idle_ttl() - Duration::from_secs(1);
+    }
+
+    reap_idle_server_sessions(Instant::now())
+        .await
+        .expect("idle reap should succeed");
+    assert_eq!(session_cache().lock().expect("session cache lock").len(), 0);
+
+    clear_mcp_caches_for_test().await;
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_calls_share_cached_session() {
+    let _guard = acquire_mcp_test_guard().await;
+    clear_mcp_caches_for_test().await;
+
+    let workspace = unique_temp_workspace("lingclaw-mcp-concurrent");
+    fs::create_dir_all(&workspace).expect("workspace should be created");
+    let log_path = workspace.join("mock.log");
+    let config = test_config_with_mock_server("concurrent", &log_path);
+
+    call_server(
+        "mock",
+        &config,
+        &workspace,
+        "tools/call",
+        json!({"name": "alpha", "arguments": {"value": "warmup"}}),
+    )
+    .await
+    .expect("warmup call should succeed");
+    assert_eq!(log_line_count(&log_path, "start"), 1);
+
+    let left = call_server(
+        "mock",
+        &config,
+        &workspace,
+        "tools/call",
+        json!({"name": "alpha", "arguments": {"value": "left"}}),
+    );
+    let right = call_server(
+        "mock",
+        &config,
+        &workspace,
+        "tools/call",
+        json!({"name": "alpha", "arguments": {"value": "right"}}),
+    );
+
+    let (left, right) = tokio::join!(left, right);
+    assert_eq!(
+        left.expect("left call should succeed")["content"][0]["text"],
+        "left"
+    );
+    assert_eq!(
+        right.expect("right call should succeed")["content"][0]["text"],
+        "right"
+    );
+    assert_eq!(log_line_count(&log_path, "start"), 1);
+
+    clear_mcp_caches_for_test().await;
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn inspect_servers_returns_reports_in_sorted_order() {
+    let mut config = test_config_with_mcp();
+    config.mcp_servers.insert(
+        "alpha".to_string(),
+        JsonMcpServerConfig {
+            command: "definitely-not-a-real-command".to_string(),
+            args: vec![],
+            env: HashMap::new(),
+            cwd: None,
+            enabled: true,
+            timeout_secs: Some(1),
+        },
+    );
+    config
+        .mcp_servers
+        .get_mut("github")
+        .expect("github server should exist")
+        .command = "definitely-not-a-real-command".to_string();
+
+    let workspace = std::env::temp_dir().join("lingclaw-mcp-inspect-order-test");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let reports = rt.block_on(async { inspect_servers(&config, &workspace).await });
+
+    assert_eq!(reports.len(), 2);
+    assert_eq!(reports[0].server_name, "alpha");
+    assert_eq!(reports[1].server_name, "github");
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn path_to_file_uri_encodes_spaces_and_non_ascii() {
+    let uri = path_to_file_uri(Path::new("/tmp/my workspace"));
+    assert_eq!(uri, "file:///tmp/my%20workspace");
+
+    let uri_cn = path_to_file_uri(Path::new("/home/用户/workspace"));
+    assert!(uri_cn.starts_with("file:///home/"));
+    assert!(
+        !uri_cn.contains("用户"),
+        "non-ASCII chars must be percent-encoded"
+    );
+    assert!(
+        uri_cn.contains('%'),
+        "non-ASCII bytes must be percent-encoded"
+    );
 }

@@ -1,3 +1,4 @@
+use futures::future::join_all;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
@@ -8,7 +9,9 @@ use std::{
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    process::{ChildStderr, Command},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
+    sync::Mutex as AsyncMutex,
+    task::JoinHandle,
 };
 
 use crate::{config::JsonMcpServerConfig, resolve_path_checked, Config, VERSION};
@@ -19,7 +22,10 @@ const MCP_NAME_PREFIX: &str = "mcp__";
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
 const MCP_DIAGNOSTIC_LINE_LIMIT: usize = 6;
 const MCP_DIAGNOSTIC_CHAR_LIMIT: usize = 400;
-static MCP_TOOL_CACHE: OnceLock<Mutex<HashMap<String, Vec<McpToolDescriptor>>>> = OnceLock::new();
+const MCP_TOOL_CACHE_TTL_SECS: u64 = 30;
+const MCP_SESSION_IDLE_TTL_SECS: u64 = 300;
+static MCP_TOOL_CACHE: OnceLock<Mutex<HashMap<String, CachedToolDescriptors>>> = OnceLock::new();
+static MCP_SESSION_CACHE: OnceLock<Mutex<HashMap<String, CachedMcpSession>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct McpToolDescriptor {
@@ -31,10 +37,35 @@ struct McpToolDescriptor {
 }
 
 #[derive(Clone, Debug)]
+struct CachedToolDescriptors {
+    descriptors: Vec<McpToolDescriptor>,
+    loaded_at: Instant,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct McpServerLoadReport {
     pub(crate) server_name: String,
     pub(crate) tool_names: Vec<String>,
     pub(crate) error: Option<String>,
+}
+
+struct CachedMcpSession {
+    session: Arc<AsyncMutex<McpServerSession>>,
+    last_used_at: Instant,
+}
+
+struct McpServerSession {
+    server_name: String,
+    workspace_root: PathBuf,
+    tool_cache_key: String,
+    timeout_secs: u64,
+    next_request_id: u64,
+    child: Child,
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
+    stderr_task: JoinHandle<()>,
+    stdout_lines: Arc<Mutex<Vec<String>>>,
+    stderr_lines: Arc<Mutex<Vec<String>>>,
 }
 
 pub(crate) fn runtime_tool_note(config: &Config) -> Option<String> {
@@ -167,27 +198,88 @@ pub(crate) async fn inspect_servers(config: &Config, workspace: &Path) -> Vec<Mc
         .collect();
     server_names.sort_unstable();
 
-    let mut reports = Vec::with_capacity(server_names.len());
-    for server_name in server_names {
-        match list_server_tools(server_name, config, workspace).await {
-            Ok(tools) => reports.push(McpServerLoadReport {
+    join_all(server_names.into_iter().map(|server_name| async move {
+        match list_server_tools_uncached(server_name, config, workspace).await {
+            Ok(tools) => McpServerLoadReport {
                 server_name: server_name.to_string(),
                 tool_names: tools.into_iter().map(|tool| tool.exposed_name).collect(),
                 error: None,
-            }),
-            Err(error) => reports.push(McpServerLoadReport {
+            },
+            Err(error) => McpServerLoadReport {
+                server_name: server_name.to_string(),
+                tool_names: Vec::new(),
+                error: Some(error),
+            },
+        }
+    }))
+    .await
+}
+
+pub(crate) async fn refresh_servers(
+    config: &Config,
+    workspace: &Path,
+) -> Result<Vec<McpServerLoadReport>, String> {
+    refresh_server_caches(config, workspace).await?;
+
+    let mut server_names: Vec<&str> = config
+        .mcp_servers
+        .iter()
+        .filter(|(_, server)| server.enabled)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    server_names.sort_unstable();
+
+    let results = join_all(server_names.into_iter().map(|server_name| async move {
+        match list_server_tools_uncached(server_name, config, workspace).await {
+            Ok(tools) => {
+                let server = config
+                    .mcp_servers
+                    .get(server_name)
+                    .ok_or_else(|| format!("unknown MCP server '{server_name}'"));
+                match server.and_then(|server| cache_key(server_name, server, workspace, config)) {
+                    Ok(cache_key) => {
+                        // Lock scope is synchronous — no .await while held.
+                        let mut cache = tool_cache()
+                            .lock()
+                            .map_err(|_| "MCP tool cache lock poisoned".to_string())?;
+                        cache.insert(
+                            cache_key,
+                            CachedToolDescriptors {
+                                descriptors: tools.clone(),
+                                loaded_at: Instant::now(),
+                            },
+                        );
+                        Ok(McpServerLoadReport {
+                            server_name: server_name.to_string(),
+                            tool_names: tools.into_iter().map(|tool| tool.exposed_name).collect(),
+                            error: None,
+                        })
+                    }
+                    Err(error) => Ok(McpServerLoadReport {
+                        server_name: server_name.to_string(),
+                        tool_names: Vec::new(),
+                        error: Some(error),
+                    }),
+                }
+            }
+            Err(error) => Ok(McpServerLoadReport {
                 server_name: server_name.to_string(),
                 tool_names: Vec::new(),
                 error: Some(error),
             }),
         }
-    }
+    }))
+    .await;
 
-    reports
+    results.into_iter().collect()
 }
 
-fn tool_cache() -> &'static Mutex<HashMap<String, Vec<McpToolDescriptor>>> {
+fn tool_cache() -> &'static Mutex<HashMap<String, CachedToolDescriptors>> {
     MCP_TOOL_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn session_cache() -> &'static Mutex<HashMap<String, CachedMcpSession>> {
+    MCP_SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn stable_name_suffix(server_name: &str, tool_name: &str) -> String {
@@ -289,12 +381,18 @@ async fn list_tools(config: &Config, workspace: &Path) -> Vec<McpToolDescriptor>
     server_names.sort_unstable();
 
     let mut tools = Vec::new();
-    for server_name in server_names {
-        match list_server_tools(server_name, config, workspace).await {
+    let results = join_all(server_names.into_iter().map(|server_name| async move {
+        (
+            server_name,
+            list_server_tools(server_name, config, workspace).await,
+        )
+    }))
+    .await;
+
+    for (server_name, result) in results {
+        match result {
             Ok(mut server_tools) => tools.append(&mut server_tools),
-            Err(error) => {
-                eprintln!("Warning: MCP server '{server_name}' unavailable: {error}");
-            }
+            Err(error) => eprintln!("Warning: MCP server '{server_name}' unavailable: {error}"),
         }
     }
     tools
@@ -365,18 +463,60 @@ async fn list_server_tools(
         .get(server_name)
         .ok_or_else(|| format!("unknown MCP server '{server_name}'"))?;
     let key = cache_key(server_name, server, workspace, config)?;
+    let now = Instant::now();
 
     let cached = {
-        let cache = tool_cache()
+        let mut cache = tool_cache()
             .lock()
             .map_err(|_| "MCP tool cache lock poisoned".to_string())?;
-        cache.get(&key).cloned()
+        match cache.get(&key) {
+            Some(entry) if now.duration_since(entry.loaded_at) < tool_cache_ttl() => {
+                Some(entry.descriptors.clone())
+            }
+            Some(_) => {
+                cache.remove(&key);
+                None
+            }
+            None => None,
+        }
     };
     if let Some(cached) = cached {
         return Ok(cached);
     }
 
     let response = call_server(server_name, config, workspace, "tools/list", json!({})).await?;
+    let descriptors = parse_tool_descriptors(server_name, &response)?;
+
+    {
+        let mut cache = tool_cache()
+            .lock()
+            .map_err(|_| "MCP tool cache lock poisoned".to_string())?;
+        cache.insert(
+            key,
+            CachedToolDescriptors {
+                descriptors: descriptors.clone(),
+                loaded_at: Instant::now(),
+            },
+        );
+    }
+
+    Ok(descriptors)
+}
+
+async fn list_server_tools_uncached(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+) -> Result<Vec<McpToolDescriptor>, String> {
+    let response =
+        call_server_once(server_name, config, workspace, "tools/list", json!({})).await?;
+    parse_tool_descriptors(server_name, &response)
+}
+
+fn parse_tool_descriptors(
+    server_name: &str,
+    response: &Value,
+) -> Result<Vec<McpToolDescriptor>, String> {
     let tools = response
         .get("tools")
         .and_then(Value::as_array)
@@ -414,18 +554,19 @@ async fn list_server_tools(
         });
     }
 
-    {
-        let mut cache = tool_cache()
-            .lock()
-            .map_err(|_| "MCP tool cache lock poisoned".to_string())?;
-        cache.insert(key, descriptors.clone());
-    }
-
     Ok(descriptors)
 }
 
 fn server_timeout_secs(server: &JsonMcpServerConfig, config: &Config) -> u64 {
     server.timeout_secs.unwrap_or(config.tool_timeout.as_secs())
+}
+
+fn tool_cache_ttl() -> Duration {
+    Duration::from_secs(MCP_TOOL_CACHE_TTL_SECS)
+}
+
+fn session_idle_ttl() -> Duration {
+    Duration::from_secs(MCP_SESSION_IDLE_TTL_SECS)
 }
 
 fn resolve_server_command(command: &str) -> PathBuf {
@@ -491,8 +632,8 @@ fn command_candidates(dir: &Path, command: &str) -> Vec<PathBuf> {
 
     candidates.push(dir.join(command));
     if cfg!(windows) {
-        let pathext = std::env::var_os("PATHEXT")
-            .unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
+        let pathext =
+            std::env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
         for ext in pathext.to_string_lossy().split(';') {
             let trimmed = ext.trim();
             if trimmed.is_empty() {
@@ -511,6 +652,90 @@ fn resolve_server_cwd(server: &JsonMcpServerConfig, workspace: &Path) -> Result<
             .map_err(|message| format!("MCP server cwd '{}' is invalid: {message}", cwd)),
         _ => Ok(workspace.to_path_buf()),
     }
+}
+
+fn path_to_file_uri(path: &Path) -> String {
+    let mut normalized = path.to_string_lossy().replace('\\', "/");
+    if cfg!(windows) && !normalized.starts_with('/') {
+        normalized.insert(0, '/');
+    }
+
+    let mut encoded = String::new();
+    for byte in normalized.as_bytes() {
+        let ch = *byte as char;
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '.' | '_' | '~' | '/' | ':') {
+            encoded.push(ch);
+        } else {
+            encoded.push_str(&format!("%{:02X}", byte));
+        }
+    }
+
+    format!("file://{encoded}")
+}
+
+fn workspace_roots_result(server_name: &str, workspace_root: &Path) -> Value {
+    let name = workspace_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(server_name);
+    json!({
+        "roots": [
+            {
+                "uri": path_to_file_uri(workspace_root),
+                "name": name,
+            }
+        ]
+    })
+}
+
+fn remove_cached_tool_descriptors(cache_key: &str) {
+    if let Ok(mut cache) = tool_cache().lock() {
+        cache.remove(cache_key);
+    }
+}
+
+async fn remove_cached_sessions(cache_keys: &[String]) {
+    let removed = {
+        let Ok(mut cache) = session_cache().lock() else {
+            return;
+        };
+        let mut removed = Vec::new();
+        for cache_key in cache_keys {
+            if let Some(entry) = cache.remove(cache_key) {
+                removed.push(entry.session);
+            }
+        }
+        removed
+    };
+
+    for session in removed {
+        let mut guard = session.lock().await;
+        guard.shutdown().await;
+    }
+}
+
+async fn refresh_server_caches(config: &Config, workspace: &Path) -> Result<(), String> {
+    let mut cache_keys = Vec::new();
+    for (server_name, server) in config
+        .mcp_servers
+        .iter()
+        .filter(|(_, server)| server.enabled)
+    {
+        cache_keys.push(cache_key(server_name, server, workspace, config)?);
+    }
+
+    {
+        let mut cache = tool_cache()
+            .lock()
+            .map_err(|_| "MCP tool cache lock poisoned".to_string())?;
+        for cache_key in &cache_keys {
+            cache.remove(cache_key);
+        }
+    }
+
+    remove_cached_sessions(&cache_keys).await;
+    Ok(())
 }
 
 fn push_diagnostic_line(lines: &mut Vec<String>, line: &str) {
@@ -580,6 +805,337 @@ async fn collect_stderr_lines(stderr: ChildStderr, lines: Arc<Mutex<Vec<String>>
     }
 }
 
+impl McpServerSession {
+    async fn initialize(&mut self) -> Result<(), String> {
+        write_message(
+            &mut self.stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": MCP_PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "LingClaw",
+                        "version": VERSION,
+                    }
+                }
+            }),
+        )
+        .await?;
+        let initialize = tokio::time::timeout(
+            Duration::from_secs(self.timeout_secs),
+            read_response(
+                &mut self.reader,
+                &mut self.stdin,
+                1,
+                &self.stdout_lines,
+                &self.server_name,
+                &self.workspace_root,
+                &self.tool_cache_key,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            format_mcp_timeout_error(
+                "initialize",
+                self.timeout_secs,
+                &snapshot_diagnostic_lines(&self.stdout_lines),
+                &snapshot_diagnostic_lines(&self.stderr_lines),
+            )
+        })??;
+        if let Some(error) = initialize.get("error") {
+            return Err(format!(
+                "initialize failed: {}",
+                serde_json::to_string(error).unwrap_or_else(|_| error.to_string())
+            ));
+        }
+
+        write_message(
+            &mut self.stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let request_id = self.next_request_id;
+        self.next_request_id += 1;
+
+        write_message(
+            &mut self.stdin,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": method,
+                "params": params,
+            }),
+        )
+        .await?;
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(self.timeout_secs),
+            read_response(
+                &mut self.reader,
+                &mut self.stdin,
+                request_id,
+                &self.stdout_lines,
+                &self.server_name,
+                &self.workspace_root,
+                &self.tool_cache_key,
+            ),
+        )
+        .await
+        .map_err(|_| {
+            format_mcp_timeout_error(
+                method,
+                self.timeout_secs,
+                &snapshot_diagnostic_lines(&self.stdout_lines),
+                &snapshot_diagnostic_lines(&self.stderr_lines),
+            )
+        })??;
+
+        if let Some(error) = response.get("error") {
+            return Err(serde_json::to_string(error).unwrap_or_else(|_| error.to_string()));
+        }
+
+        response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| format!("server response missing result for method '{method}'"))
+    }
+
+    fn decorate_error(&self, error: String) -> String {
+        if error.contains("timed out after") || error.contains("initialize failed") {
+            return error;
+        }
+
+        format!(
+            "{error}{}",
+            format_mcp_diagnostics(
+                &snapshot_diagnostic_lines(&self.stdout_lines),
+                &snapshot_diagnostic_lines(&self.stderr_lines),
+            )
+        )
+    }
+
+    async fn shutdown(&mut self) {
+        let _ = self.stdin.shutdown().await;
+        let _ = self.child.start_kill();
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.child.wait()).await;
+        self.stderr_task.abort();
+        let _ = (&mut self.stderr_task).await;
+    }
+}
+
+fn should_reset_mcp_session(error: &str) -> bool {
+    error.contains("timed out after")
+        || error.contains("initialize failed")
+        || error.contains("closed stdout")
+        || error.contains("failed to spawn")
+        || error.contains("missing stdin")
+        || error.contains("missing stdout")
+        || error.contains("missing stderr")
+        || error.contains("invalid Content-Length")
+        || error.contains("invalid MCP JSON")
+        || error.contains("pipe")
+}
+
+async fn spawn_server_session(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+) -> Result<McpServerSession, String> {
+    let server = config
+        .mcp_servers
+        .get(server_name)
+        .ok_or_else(|| format!("unknown MCP server '{server_name}'"))?;
+    let tool_cache_key = cache_key(server_name, server, workspace, config)?;
+    let server_cwd = resolve_server_cwd(server, workspace)?;
+    let resolved_command = resolve_server_command(&server.command);
+    let mut command = Command::new(&resolved_command);
+    command
+        .args(&server.args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .current_dir(server_cwd);
+    for (key, value) in &server.env {
+        command.env(key, value);
+    }
+
+    let stdout_lines = Arc::new(Mutex::new(Vec::new()));
+    let stderr_lines = Arc::new(Mutex::new(Vec::new()));
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("failed to spawn '{}': {error}", server.command))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("server '{server_name}' missing stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("server '{server_name}' missing stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("server '{server_name}' missing stderr"))?;
+    let stderr_task = tokio::spawn(collect_stderr_lines(stderr, stderr_lines.clone()));
+    let mut session = McpServerSession {
+        server_name: server_name.to_string(),
+        workspace_root: workspace.to_path_buf(),
+        tool_cache_key,
+        timeout_secs: server_timeout_secs(server, config),
+        next_request_id: 2,
+        child,
+        stdin,
+        reader: BufReader::new(stdout),
+        stderr_task,
+        stdout_lines,
+        stderr_lines,
+    };
+    if let Err(error) = session.initialize().await {
+        let decorated = session.decorate_error(error);
+        session.shutdown().await;
+        return Err(decorated);
+    }
+    Ok(session)
+}
+
+async fn get_or_create_server_session(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+) -> Result<(String, Arc<AsyncMutex<McpServerSession>>), String> {
+    let server = config
+        .mcp_servers
+        .get(server_name)
+        .ok_or_else(|| format!("unknown MCP server '{server_name}'"))?;
+    let key = cache_key(server_name, server, workspace, config)?;
+    let now = Instant::now();
+
+    reap_idle_server_sessions(now).await?;
+
+    if let Some(existing) = {
+        let mut cache = session_cache()
+            .lock()
+            .map_err(|_| "MCP session cache lock poisoned".to_string())?;
+        match cache.get_mut(&key) {
+            Some(entry) => {
+                entry.last_used_at = now;
+                Some(entry.session.clone())
+            }
+            None => None,
+        }
+    } {
+        return Ok((key, existing));
+    }
+
+    let created = Arc::new(AsyncMutex::new(
+        spawn_server_session(server_name, config, workspace).await?,
+    ));
+    let existing = {
+        let mut cache = session_cache()
+            .lock()
+            .map_err(|_| "MCP session cache lock poisoned".to_string())?;
+        if let Some(existing) = cache.get_mut(&key) {
+            existing.last_used_at = now;
+            Some(existing.session.clone())
+        } else {
+            cache.insert(
+                key.clone(),
+                CachedMcpSession {
+                    session: created.clone(),
+                    last_used_at: now,
+                },
+            );
+            None
+        }
+    };
+
+    if let Some(existing) = existing {
+        let mut created_guard = created.lock().await;
+        created_guard.shutdown().await;
+        Ok((key, existing))
+    } else {
+        Ok((key, created))
+    }
+}
+
+async fn reap_idle_server_sessions(now: Instant) -> Result<(), String> {
+    let stale = {
+        let mut cache = session_cache()
+            .lock()
+            .map_err(|_| "MCP session cache lock poisoned".to_string())?;
+        let stale_keys: Vec<String> = cache
+            .iter()
+            .filter_map(|(cache_key, entry)| {
+                if now.duration_since(entry.last_used_at) >= session_idle_ttl() {
+                    Some(cache_key.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut stale = Vec::with_capacity(stale_keys.len());
+        for cache_key in stale_keys {
+            if let Some(entry) = cache.remove(&cache_key) {
+                stale.push(entry.session);
+            }
+        }
+        stale
+    };
+
+    for session in stale {
+        let mut guard = session.lock().await;
+        guard.shutdown().await;
+    }
+
+    Ok(())
+}
+
+fn remove_cached_server_session(cache_key: &str, session: &Arc<AsyncMutex<McpServerSession>>) {
+    if let Ok(mut cache) = session_cache().lock() {
+        if let Some(existing) = cache.get(cache_key) {
+            if Arc::ptr_eq(&existing.session, session) {
+                cache.remove(cache_key);
+            }
+        }
+    }
+}
+
+async fn call_server_once(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let server = config
+        .mcp_servers
+        .get(server_name)
+        .ok_or_else(|| format!("unknown MCP server '{server_name}'"))?;
+    if !server.enabled {
+        return Err(format!("MCP server '{server_name}' is disabled"));
+    }
+
+    let mut session = spawn_server_session(server_name, config, workspace).await?;
+    let result = match session.request(method, params).await {
+        Ok(result) => Ok(result),
+        Err(error) => Err(session.decorate_error(error)),
+    };
+    session.shutdown().await;
+    result
+}
+
 async fn call_server(
     server_name: &str,
     config: &Config,
@@ -595,150 +1151,43 @@ async fn call_server(
         return Err(format!("MCP server '{server_name}' is disabled"));
     }
 
-    let server_cwd = resolve_server_cwd(server, workspace)?;
+    let (cache_key, mut session) =
+        get_or_create_server_session(server_name, config, workspace).await?;
 
-    let resolved_command = resolve_server_command(&server.command);
-    let mut command = Command::new(&resolved_command);
-    command
-        .args(&server.args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .current_dir(server_cwd);
-    for (key, value) in &server.env {
-        command.env(key, value);
-    }
-
-    let timeout_secs = server_timeout_secs(server, config);
-
-    let stdout_lines = Arc::new(Mutex::new(Vec::new()));
-    let stderr_lines = Arc::new(Mutex::new(Vec::new()));
-    let timeout_stdout = stdout_lines.clone();
-    let timeout_stderr = stderr_lines.clone();
-
-    async move {
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("failed to spawn '{}': {error}", server.command))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("server '{server_name}' missing stdin"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| format!("server '{server_name}' missing stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| format!("server '{server_name}' missing stderr"))?;
-        let mut reader = BufReader::new(stdout);
-        let stderr_task = tokio::spawn(collect_stderr_lines(stderr, stderr_lines.clone()));
-        let result = async {
-            write_message(
-                &mut stdin,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": MCP_PROTOCOL_VERSION,
-                        "capabilities": {},
-                        "clientInfo": {
-                            "name": "LingClaw",
-                            "version": VERSION,
-                        }
+    for attempt in 0..2 {
+        let request_result = {
+            let mut guard = session.lock().await;
+            match guard.request(method, params.clone()).await {
+                Ok(result) => return Ok(result),
+                Err(error) => {
+                    let decorated = guard.decorate_error(error);
+                    let should_reset = should_reset_mcp_session(&decorated);
+                    if should_reset {
+                        guard.shutdown().await;
                     }
-                }),
-            )
-            .await?;
-            let initialize = tokio::time::timeout(
-                Duration::from_secs(timeout_secs),
-                read_response(&mut reader, &mut stdin, 1, &stdout_lines),
-            )
-            .await
-            .map_err(|_| {
-                format_mcp_timeout_error(
-                    "initialize",
-                    timeout_secs,
-                    &snapshot_diagnostic_lines(&stdout_lines),
-                    &snapshot_diagnostic_lines(&stderr_lines),
-                )
-            })??;
-            if let Some(error) = initialize.get("error") {
-                return Err(format!(
-                    "initialize failed: {}",
-                    serde_json::to_string(error).unwrap_or_else(|_| error.to_string())
-                ));
+                    (decorated, should_reset)
+                }
             }
+        };
 
-            write_message(
-                &mut stdin,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "method": "notifications/initialized",
-                    "params": {}
-                }),
-            )
-            .await?;
-
-            write_message(
-                &mut stdin,
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": method,
-                    "params": params,
-                }),
-            )
-            .await?;
-            let response = tokio::time::timeout(
-                Duration::from_secs(timeout_secs),
-                read_response(&mut reader, &mut stdin, 2, &stdout_lines),
-            )
-            .await
-            .map_err(|_| {
-                format_mcp_timeout_error(
-                    method,
-                    timeout_secs,
-                    &snapshot_diagnostic_lines(&stdout_lines),
-                    &snapshot_diagnostic_lines(&stderr_lines),
-                )
-            })??;
-
-            if let Some(error) = response.get("error") {
-                return Err(serde_json::to_string(error).unwrap_or_else(|_| error.to_string()));
+        let (error, should_reset) = request_result;
+        if !should_reset || attempt == 1 {
+            if should_reset {
+                remove_cached_server_session(&cache_key, &session);
+                // Ensure the orphaned session is fully cleaned up (stderr_task, child).
+                let mut guard = session.lock().await;
+                guard.shutdown().await;
             }
-
-            response
-                .get("result")
-                .cloned()
-                .ok_or_else(|| format!("server '{server_name}' response missing result"))
+            return Err(error);
         }
-        .await;
 
-        let _ = stdin.shutdown().await;
-        let _ = child.start_kill();
-        let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
-        stderr_task.abort();
-        let _ = stderr_task.await;
-
-        result
+        remove_cached_server_session(&cache_key, &session);
+        session = get_or_create_server_session(server_name, config, workspace)
+            .await?
+            .1;
     }
-    .await
-    .map_err(|error| {
-        if error.contains("timed out after") || error.contains("initialize failed") {
-            return error;
-        }
-        format!(
-            "{error}{}",
-            format_mcp_diagnostics(
-                &snapshot_diagnostic_lines(&timeout_stdout),
-                &snapshot_diagnostic_lines(&timeout_stderr),
-            )
-        )
-    })
+
+    Err(format!("MCP call failed for '{server_name}'"))
 }
 
 async fn write_message<W>(stdin: &mut W, message: &Value) -> Result<(), String>
@@ -759,6 +1208,9 @@ async fn read_response<R, W>(
     stdin: &mut W,
     expected_id: u64,
     stdout_lines: &Arc<Mutex<Vec<String>>>,
+    server_name: &str,
+    workspace_root: &Path,
+    tool_cache_key: &str,
 ) -> Result<Value, String>
 where
     R: AsyncRead + Unpin,
@@ -769,7 +1221,15 @@ where
         if message.get("id").and_then(Value::as_u64) == Some(expected_id) {
             return Ok(message);
         }
-        handle_server_message(stdin, &message, stdout_lines).await?;
+        handle_server_message(
+            stdin,
+            &message,
+            stdout_lines,
+            server_name,
+            workspace_root,
+            tool_cache_key,
+        )
+        .await?;
     }
 }
 
@@ -777,6 +1237,9 @@ async fn handle_server_message<W>(
     stdin: &mut W,
     message: &Value,
     stdout_lines: &Arc<Mutex<Vec<String>>>,
+    server_name: &str,
+    workspace_root: &Path,
+    tool_cache_key: &str,
 ) -> Result<(), String>
 where
     W: AsyncWrite + Unpin,
@@ -787,12 +1250,21 @@ where
             &serde_json::to_string(message).unwrap_or_else(|_| message.to_string()),
         );
 
+        if method == "notifications/tools/list_changed" {
+            remove_cached_tool_descriptors(tool_cache_key);
+        }
+
         if let Some(id) = message.get("id") {
             let response = match method {
                 "ping" => json!({
                     "jsonrpc": "2.0",
                     "id": id.clone(),
                     "result": {}
+                }),
+                "roots/list" => json!({
+                    "jsonrpc": "2.0",
+                    "id": id.clone(),
+                    "result": workspace_roots_result(server_name, workspace_root)
                 }),
                 _ => json!({
                     "jsonrpc": "2.0",

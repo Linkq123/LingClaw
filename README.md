@@ -15,9 +15,9 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 ## Features
 
 - **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
-- **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；`start` / `restart` 会先做受限 preflight，`mcp-check` 可用于更深的运行时诊断
+- **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断
 - **2 主会话管理工具**：`list_sessions`、`delete_session`
-- **17 斜杠命令**：`/new`、`/session_new`、`/switch`、`/rename`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/status`、`/usage`、`/clear`、`/help`、`/sessions`、`/delete`
+- **18 斜杠命令**：`/new`、`/session_new`、`/switch`、`/rename`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/status`、`/mcp`、`/usage`、`/clear`、`/help`、`/sessions`、`/delete`
 - **双 Provider 模型路由**：OpenAI + Anthropic，支持 `provider/model` 和纯 model ID
 - **Per-session 模型覆盖**：运行时通过 `/model` 切换
 - **持久化多会话**：每个会话有独立工作区和磁盘存档
@@ -52,6 +52,7 @@ lingclaw start
 lingclaw stop
 lingclaw restart
 lingclaw status
+lingclaw mcp-check
 lingclaw update
 lingclaw install
 lingclaw install -d /path/to/source
@@ -146,7 +147,9 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 - 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容
 - 可选的 `mcpServers` 顶层对象可声明 MCP server，例如 `command`、`args`、`env`、`cwd`、`timeoutSecs`
 - `mcpServers.*.cwd` 必须落在当前 session workspace 内；未设置 `timeoutSecs` 时默认继承 `toolTimeout`
+- `start` / `restart` 的 MCP 预检使用受限的一次性探测，不会把预检进程保留为运行时 MCP 会话；`mcp-check` 会按配置的运行时超时做更深诊断
 - `/mcp` 会在聊天页面列出当前已加载的 MCP servers；如果某个 server 失败，页面会显示失败原因，便于排查启动、命令解析或超时问题
+- `/mcp refresh` 会清空当前 workspace 对应的 MCP 工具缓存并丢弃空闲会话，然后重新探测已启用 servers；运行时空闲 MCP 会话也会自动回收，`notifications/tools/list_changed` 会触发下一次工具发现时自动刷新
 
 聊天页运行时交互说明：
 
@@ -184,6 +187,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `/stop` | 中断当前运行中的 agent；聊天页停止按钮与该命令等价 |
 | `/skills` | 列出可用工具帮助 |
 | `/status` | 显示模型、provider、上下文估算、最大输出 token、思维级别，token 数值按 K/M 显示 |
+| `/mcp [refresh]` | 查看当前已加载的 MCP server 状态；加上 `refresh` 时强制刷新工具缓存并重建运行时 MCP 会话 |
 | `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；同时显示内存与磁盘上所有 session 合并后的今日总 token 估算，按 K/M 显示 |
 | `/clear` | 清空消息但保留系统提示 |
 | `/help` | 命令帮助 |

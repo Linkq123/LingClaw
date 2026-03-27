@@ -190,6 +190,64 @@ fn print_mcp_preflight(config: &Config) {
     }
 }
 
+fn loopback_addr(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+fn current_git_branch() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["branch", "--show-current"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if branch.is_empty() {
+        None
+    } else {
+        Some(branch)
+    }
+}
+
+fn remote_cargo_toml_refs() -> Vec<String> {
+    let mut refs = Vec::new();
+    if let Some(branch) = current_git_branch() {
+        refs.push(format!("origin/{branch}:Cargo.toml"));
+    }
+    refs.push("origin/main:Cargo.toml".to_string());
+    refs.push("origin/master:Cargo.toml".to_string());
+    refs.dedup();
+    refs
+}
+
+fn read_remote_version() -> Option<String> {
+    for git_ref in remote_cargo_toml_refs() {
+        let output = std::process::Command::new("git")
+            .args(["show", &git_ref])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            continue;
+        }
+
+        let remote_cargo = String::from_utf8_lossy(&output.stdout);
+        if let Some(version) = remote_cargo.lines().find_map(|line| {
+            let line = line.trim();
+            if line.starts_with("version") {
+                line.split('"').nth(1).map(|value| value.to_string())
+            } else {
+                None
+            }
+        }) {
+            return Some(version);
+        }
+    }
+
+    None
+}
+
 fn mcp_check_succeeded(reports: &[crate::tools::mcp::McpServerLoadReport]) -> bool {
     reports.iter().all(|report| report.error.is_none())
 }
@@ -386,12 +444,33 @@ fn resolve_home_for_user(user: &str) -> String {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn build_systemd_service_unit(exe: &Path, working_dir: &Path, user: &str, home: &str) -> String {
+fn sanitize_systemd_value(value: &str) -> String {
+    value.replace(|c: char| c.is_control(), "_")
+}
+
+#[cfg(not(target_os = "windows"))]
+fn quote_systemd_value(value: &str) -> String {
+    let sanitized = sanitize_systemd_value(value);
     format!(
-        "[Unit]\nDescription=LingClaw AI Assistant\nAfter=network.target\n\n[Service]\nType=simple\nUser={user}\nWorkingDirectory={}\nEnvironment=HOME={}\nExecStart={} --serve\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
-        working_dir.display(),
+        "\"{}\"",
+        sanitized.replace('\\', "\\\\").replace('"', "\\\"")
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+fn build_systemd_service_unit(exe: &Path, working_dir: &Path, user: &str, home: &str) -> String {
+    let user = sanitize_systemd_value(user);
+    let working_dir = quote_systemd_value(&working_dir.display().to_string());
+    let home = quote_systemd_value(&format!("HOME={}", sanitize_systemd_value(home)));
+    let exec_start = format!(
+        "{} --serve",
+        quote_systemd_value(&exe.display().to_string())
+    );
+    format!(
+        "[Unit]\nDescription=LingClaw AI Assistant\nAfter=network.target\n\n[Service]\nType=simple\nUser={user}\nWorkingDirectory={}\nEnvironment={}\nExecStart={}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
+        working_dir,
         home,
-        exe.display()
+        exec_start
     )
 }
 
@@ -692,550 +771,701 @@ pub(crate) fn is_default_model_row(config: &Config, provider: &str, model_id: &s
 
 // ── CLI Subcommands ──────────────────────────────────────────────────────────
 
-pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool {
-    match cmd {
-        "start" => {
-            let config = Config::load();
-            print_mcp_preflight(&config);
-            #[cfg(not(target_os = "windows"))]
-            let managed_by_systemd = systemd_service_installed();
-            #[cfg(target_os = "windows")]
-            let managed_by_systemd = false;
-            let effective_port = if managed_by_systemd {
-                if let Some(port) = port_override {
-                    if port != config.port {
-                        eprintln!(
-                            "Warning: --port is ignored when LingClaw is managed by systemd. Update config and restart the service instead."
-                        );
-                    }
-                }
-                config.port
-            } else {
-                port_override.unwrap_or(config.port)
-            };
-
-            #[cfg(not(target_os = "windows"))]
-            if managed_by_systemd {
-                println!("Starting LingClaw via systemd...");
-                print_start_details(effective_port, "systemd");
-                match run_systemctl(&["start", SYSTEMD_SERVICE_NAME]) {
-                    Ok(true) => println!("Started {}.", SYSTEMD_SERVICE_NAME),
-                    Ok(false) => eprintln!("Failed to start {}.", SYSTEMD_SERVICE_NAME),
-                    Err(e) => eprintln!("Failed to start {}: {e}", SYSTEMD_SERVICE_NAME),
-                }
-                return true;
+fn handle_start_command(port_override: Option<u16>) -> bool {
+    let config = Config::load();
+    print_mcp_preflight(&config);
+    #[cfg(not(target_os = "windows"))]
+    let managed_by_systemd = systemd_service_installed();
+    #[cfg(target_os = "windows")]
+    let managed_by_systemd = false;
+    let effective_port = if managed_by_systemd {
+        if let Some(port) = port_override {
+            if port != config.port {
+                eprintln!(
+                    "Warning: --port is ignored when LingClaw is managed by systemd. Update config and restart the service instead."
+                );
             }
-
-            let exe = std::env::current_exe().expect("cannot find executable");
-            let mut extra_args: Vec<String> = vec!["--serve".to_string()];
-            if let Some(p) = port_override {
-                extra_args.push("--port".to_string());
-                extra_args.push(p.to_string());
-            }
-            println!("Starting LingClaw daemon...");
-            print_start_details(
-                effective_port,
-                if cfg!(target_os = "windows") {
-                    "detached-process"
-                } else {
-                    "nohup"
-                },
-            );
-            #[cfg(target_os = "windows")]
-            {
-                use std::os::windows::process::CommandExt;
-                let mut command = std::process::Command::new(&exe);
-                command
-                    .args(&extra_args)
-                    .creation_flags(0x00000008) // DETACHED_PROCESS
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-                if let Some(parent) = exe.parent() {
-                    command.current_dir(parent);
-                }
-                let _ = command
-                    .spawn()
-                    .map(|c| println!("Started (PID {})", c.id()))
-                    .map_err(|e| eprintln!("Failed to start: {e}"));
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let mut nohup_args: Vec<std::ffi::OsString> = vec![exe.into()];
-                for a in &extra_args {
-                    nohup_args.push(a.into());
-                }
-                let mut command = std::process::Command::new("nohup");
-                command
-                    .args(&nohup_args)
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-                if let Some(parent) = std::env::current_exe()
-                    .ok()
-                    .and_then(|path| path.parent().map(PathBuf::from))
-                {
-                    command.current_dir(parent);
-                }
-                let _ = command
-                    .spawn()
-                    .map(|c| println!("Started (PID {})", c.id()))
-                    .map_err(|e| eprintln!("Failed to start: {e}"));
-            }
-            true
         }
-        "stop" => {
-            let config = Config::load();
-            let port = port_override.unwrap_or(config.port);
-            #[cfg(not(target_os = "windows"))]
-            if systemd_service_installed() {
-                println!("Stopping LingClaw systemd service...");
-                match run_systemctl(&["stop", SYSTEMD_SERVICE_NAME]) {
-                    Ok(true) => println!("Stopped {}.", SYSTEMD_SERVICE_NAME),
-                    Ok(false) => eprintln!("Failed to stop {}.", SYSTEMD_SERVICE_NAME),
-                    Err(e) => eprintln!("Failed to stop {}: {e}", SYSTEMD_SERVICE_NAME),
+        config.port
+    } else {
+        port_override.unwrap_or(config.port)
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    if managed_by_systemd {
+        println!("Starting LingClaw via systemd...");
+        print_start_details(effective_port, "systemd");
+        match run_systemctl(&["start", SYSTEMD_SERVICE_NAME]) {
+            Ok(true) => println!("Started {}.", SYSTEMD_SERVICE_NAME),
+            Ok(false) => eprintln!("Failed to start {}.", SYSTEMD_SERVICE_NAME),
+            Err(e) => eprintln!("Failed to start {}: {e}", SYSTEMD_SERVICE_NAME),
+        }
+        return true;
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("Failed to resolve current executable: {error}");
+            return true;
+        }
+    };
+    let mut extra_args: Vec<String> = vec!["--serve".to_string()];
+    if let Some(p) = port_override {
+        extra_args.push("--port".to_string());
+        extra_args.push(p.to_string());
+    }
+    println!("Starting LingClaw daemon...");
+    print_start_details(
+        effective_port,
+        if cfg!(target_os = "windows") {
+            "detached-process"
+        } else {
+            "nohup"
+        },
+    );
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut command = std::process::Command::new(&exe);
+        command
+            .args(&extra_args)
+            .creation_flags(0x00000008)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(parent) = exe.parent() {
+            command.current_dir(parent);
+        }
+        let _ = command
+            .spawn()
+            .map(|c| println!("Started (PID {})", c.id()))
+            .map_err(|e| eprintln!("Failed to start: {e}"));
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut nohup_args: Vec<std::ffi::OsString> = vec![exe.into()];
+        for a in &extra_args {
+            nohup_args.push(a.into());
+        }
+        let mut command = std::process::Command::new("nohup");
+        command
+            .args(&nohup_args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(parent) = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(PathBuf::from))
+        {
+            command.current_dir(parent);
+        }
+        let _ = command
+            .spawn()
+            .map(|c| println!("Started (PID {})", c.id()))
+            .map_err(|e| eprintln!("Failed to start: {e}"));
+    }
+    true
+}
+
+fn handle_stop_command(port_override: Option<u16>) -> bool {
+    let config = Config::load();
+    let port = port_override.unwrap_or(config.port);
+    #[cfg(not(target_os = "windows"))]
+    if systemd_service_installed() {
+        println!("Stopping LingClaw systemd service...");
+        match run_systemctl(&["stop", SYSTEMD_SERVICE_NAME]) {
+            Ok(true) => println!("Stopped {}.", SYSTEMD_SERVICE_NAME),
+            Ok(false) => eprintln!("Failed to stop {}.", SYSTEMD_SERVICE_NAME),
+            Err(e) => eprintln!("Failed to stop {}: {e}", SYSTEMD_SERVICE_NAME),
+        }
+        return true;
+    }
+    let loopback = SocketAddr::from(([127, 0, 0, 1], port));
+    println!("Stopping LingClaw on port {port}...");
+
+    let graceful = std::net::TcpStream::connect_timeout(&loopback, Duration::from_secs(2)).is_ok();
+
+    if graceful {
+        let token = config_dir_path()
+            .map(|d| d.join(format!("shutdown-{port}.token")))
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default();
+
+        let shutdown_ok = std::process::Command::new(if cfg!(windows) { "powershell" } else { "sh" })
+            .args(if cfg!(windows) {
+                vec![
+                    "-NoProfile".to_string(),
+                    "-Command".to_string(),
+                    format!(
+                        "try {{ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:{port}/api/shutdown -Headers @{{Authorization='Bearer {token}'}} -TimeoutSec 5 | Out-Null; $true }} catch {{ $false }}"
+                    ),
+                ]
+            } else {
+                vec![
+                    "-c".to_string(),
+                    format!("curl -sf -X POST http://127.0.0.1:{port}/api/shutdown -H 'Authorization: Bearer {token}' -o /dev/null 2>/dev/null"),
+                ]
+            })
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if shutdown_ok {
+            for _ in 0..10 {
+                std::thread::sleep(Duration::from_millis(500));
+                if std::net::TcpStream::connect_timeout(&loopback, Duration::from_millis(200))
+                    .is_err()
+                {
+                    println!("Stopped (graceful).");
+                    return true;
                 }
+            }
+            eprintln!("Graceful shutdown timed out, force-killing...");
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let _ = std::process::Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | \
+                 Select-Object -ExpandProperty OwningProcess -Unique | \
+                 ForEach-Object {{ Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }}"
+                ),
+            ])
+            .status();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("sh")
+            .args(["-c", &format!("lsof -ti:{port} | xargs -r kill -9")])
+            .status();
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    match std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
+        Ok(_) => eprintln!("Warning: port {port} still in use"),
+        Err(_) => println!("Stopped."),
+    }
+    true
+}
+
+fn handle_restart_command(port_override: Option<u16>) -> bool {
+    let config = Config::load();
+    print_mcp_preflight(&config);
+    #[cfg(not(target_os = "windows"))]
+    if systemd_service_installed() {
+        println!("Restarting LingClaw via systemd...");
+        print_start_details(config.port, "systemd");
+        match run_systemctl(&["restart", SYSTEMD_SERVICE_NAME]) {
+            Ok(true) => println!("Restarted {}.", SYSTEMD_SERVICE_NAME),
+            Ok(false) => eprintln!("Failed to restart {}.", SYSTEMD_SERVICE_NAME),
+            Err(e) => eprintln!("Failed to restart {}: {e}", SYSTEMD_SERVICE_NAME),
+        }
+        return true;
+    }
+    handle_stop_command(port_override);
+    std::thread::sleep(Duration::from_secs(1));
+    handle_start_command(port_override)
+}
+
+fn handle_mcp_check_command() -> bool {
+    let config = Config::load();
+    if !print_mcp_check(&config) {
+        process::exit(1);
+    }
+    true
+}
+
+fn handle_health_command(port_override: Option<u16>) -> bool {
+    let config = Config::load();
+    let port = port_override.unwrap_or(config.port);
+    let addr = format!("127.0.0.1:{port}");
+    match std::net::TcpStream::connect_timeout(&loopback_addr(port), Duration::from_secs(3)) {
+        Ok(mut stream) => {
+            use std::io::{Read, Write};
+            let req =
+                format!("GET /api/health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(req.as_bytes());
+            let mut buf = String::new();
+            let _ = stream.read_to_string(&mut buf);
+            if let Some(pos) = buf.find("\r\n\r\n") {
+                let body = buf[pos + 4..].trim();
+                println!("✅ {body}");
+            } else {
+                println!("✅ Running (port {port})");
+            }
+        }
+        Err(_) => eprintln!("❌ Not running (port {port} unreachable)"),
+    }
+    true
+}
+
+fn handle_update_command(port_override: Option<u16>) -> bool {
+    let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    if !workspace.join("Cargo.toml").exists() {
+        eprintln!("ERROR: Cargo.toml not found. Run `lingclaw update` from the source directory.");
+        return true;
+    }
+    println!("Current version: v{VERSION}");
+    println!("Pulling latest source...");
+    let pull = std::process::Command::new("git").args(["pull"]).status();
+    match pull {
+        Ok(s) if s.success() => println!("   ✅ git pull complete"),
+        _ => {
+            eprintln!("   ❌ git pull failed");
+            return true;
+        }
+    }
+
+    let new_version = std::fs::read_to_string(workspace.join("Cargo.toml"))
+        .ok()
+        .and_then(|content| {
+            content.lines().find_map(|line| {
+                let line = line.trim();
+                if line.starts_with("version") {
+                    line.split('"').nth(1).map(|v| v.to_string())
+                } else {
+                    None
+                }
+            })
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    if new_version == VERSION {
+        println!("Already up to date (v{VERSION}).");
+        return true;
+    }
+    println!("New version available: v{VERSION} → v{new_version}");
+
+    let config = Config::load();
+    let check_port = port_override.unwrap_or(config.port);
+    let was_running =
+        std::net::TcpStream::connect_timeout(&loopback_addr(check_port), Duration::from_secs(2))
+            .is_ok();
+    if was_running {
+        println!("Stopping service before build...");
+        handle_stop_command(port_override);
+        let exe = std::env::current_exe().ok();
+        let mut released = false;
+        for i in 0..10 {
+            if let Some(ref path) = exe {
+                if std::fs::OpenOptions::new().write(true).open(path).is_ok() {
+                    released = true;
+                    break;
+                }
+            } else {
+                std::thread::sleep(Duration::from_secs(2));
+                released = true;
+                break;
+            }
+            if i < 9 {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        }
+        if !released {
+            eprintln!(
+                "   ❌ Failed to release binary file lock after 5s. Is the process still running?"
+            );
+            return true;
+        }
+    }
+
+    println!("Building...");
+    let old_exe = rename_target_exe_for_build(&std::env::current_dir().unwrap_or_default());
+    let build = std::process::Command::new("cargo")
+        .args(["build", "--release"])
+        .status();
+    match build {
+        Ok(s) if s.success() => {
+            if let Some(ref p) = old_exe {
+                let _ = std::fs::remove_file(p);
+            }
+            println!("   ✅ Build complete (v{new_version})");
+            println!("Starting...");
+            handle_start_command(port_override);
+        }
+        _ => {
+            if let Some(ref p) = old_exe {
+                let target = p.with_extension("exe");
+                let _ = std::fs::rename(p, &target);
+            }
+            eprintln!("   ❌ Build failed");
+            if was_running {
+                println!("Restarting previous version...");
+                handle_start_command(port_override);
+            }
+        }
+    }
+    true
+}
+
+fn handle_status_command(port_override: Option<u16>) -> bool {
+    let config = Config::load();
+    let port = port_override.unwrap_or(config.port);
+    let addr = format!("127.0.0.1:{port}");
+    #[cfg(not(target_os = "windows"))]
+    let manager = if systemd_service_installed() {
+        "systemd"
+    } else {
+        "nohup"
+    };
+    #[cfg(target_os = "windows")]
+    let manager = "detached-process";
+
+    let running =
+        std::net::TcpStream::connect_timeout(&loopback_addr(port), Duration::from_secs(2)).is_ok();
+
+    println!("╔══════════════════════════════════════════════════════════╗");
+    println!("║             🦀 LingClaw v{VERSION}                        ║");
+    println!("╚══════════════════════════════════════════════════════════╝");
+    println!();
+    println!("  Version:       v{VERSION}");
+    println!(
+        "  Service:       {}",
+        if running {
+            "✅ Running"
+        } else {
+            "❌ Stopped"
+        }
+    );
+    println!("  Manager:       {}", manager);
+    println!("  Address:       http://{addr}");
+    #[cfg(not(target_os = "windows"))]
+    if systemd_service_installed() {
+        println!(
+            "  systemd:       {} / {}",
+            if systemd_service_enabled() {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            if systemd_service_active() {
+                "active"
+            } else {
+                "inactive"
+            }
+        );
+        println!("  Service file:  {}", SYSTEMD_SERVICE_PATH);
+    }
+    println!("  Default model: {}", config.model);
+    println!("  Provider:      {}", config.provider.label());
+    println!("  API base:      {}", config.api_base);
+    println!("  Exec timeout:  {}s", config.exec_timeout.as_secs());
+    println!("  Tool timeout:  {}s", config.tool_timeout.as_secs());
+    println!("  Context limit: {} tokens", config.max_context_tokens);
+    println!();
+
+    if config.providers.is_empty() {
+        println!("  Providers: (none configured)");
+    } else {
+        println!("  Providers:");
+        println!();
+        println!(
+            "  {:<16} {:<10} {:<30} {:>8}",
+            "NAME", "API", "BASE URL", "MODELS"
+        );
+        println!("  {}", "─".repeat(68));
+        for (name, pc) in &config.providers {
+            println!(
+                "  {:<16} {:<10} {:<30} {:>8}",
+                name,
+                pc.api,
+                if pc.base_url.len() > 30 {
+                    format!("{}…", &pc.base_url[..29])
+                } else {
+                    pc.base_url.clone()
+                },
+                pc.models.len(),
+            );
+        }
+    }
+    println!();
+
+    struct ModelRow {
+        name: String,
+        id: String,
+        provider: String,
+        ctx: String,
+        max_out: String,
+        flags: String,
+    }
+    let rows: Vec<ModelRow> = config
+        .providers
+        .iter()
+        .flat_map(|(pname, pc)| {
+            pc.models.iter().map(move |m| ModelRow {
+                name: m.name.as_deref().unwrap_or(&m.id).to_string(),
+                id: m.id.clone(),
+                provider: pname.clone(),
+                ctx: m
+                    .context_window
+                    .map(|w| format!("{w}"))
+                    .unwrap_or_else(|| "-".into()),
+                max_out: m
+                    .max_tokens
+                    .map(|t| format!("{t}"))
+                    .unwrap_or_else(|| "-".into()),
+                flags: if m.reasoning.unwrap_or(false) {
+                    "reasoning".into()
+                } else {
+                    String::new()
+                },
+            })
+        })
+        .collect();
+
+    if rows.is_empty() {
+        println!("  Models: (none configured)");
+    } else {
+        println!("  Models ({}):", rows.len());
+        println!();
+        println!(
+            "  {:<24} {:<30} {:<12} {:>8} {:>8}  FLAGS",
+            "NAME", "ID", "PROVIDER", "CTX", "MAX OUT"
+        );
+        println!("  {}", "─".repeat(90));
+        for r in &rows {
+            let dflt = if is_default_model_row(&config, &r.provider, &r.id) {
+                " *"
+            } else {
+                ""
+            };
+            println!(
+                "  {:<24} {:<30} {:<12} {:>8} {:>8}  {}{}",
+                r.name, r.id, r.provider, r.ctx, r.max_out, r.flags, dflt
+            );
+        }
+        println!();
+        println!("  (* = default model)");
+    }
+    println!();
+
+    let _ = std::process::Command::new("git")
+        .args(["fetch", "--quiet"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    if let Some(remote_ver) = read_remote_version() {
+        if remote_ver != VERSION {
+            println!("  💡 New version available: v{VERSION} → v{remote_ver}");
+            println!("     Run `lingclaw update` to upgrade.");
+            println!();
+        }
+    }
+
+    true
+}
+
+fn handle_help_command() -> bool {
+    println!("🦀 LingClaw v{VERSION} — Personal AI Assistant");
+    println!();
+    println!("Usage: lingclaw <command> [options]");
+    println!();
+    println!("Commands:");
+    println!("  start              Start the daemon");
+    println!("  stop               Stop the daemon");
+    println!("  restart            Restart the daemon");
+    println!("  mcp-check          Check MCP servers with runtime timeouts");
+    println!("  health             Health check (exit 0 = ok)");
+    println!("  status             Show detailed service status");
+    println!("  update             Check for updates, rebuild if newer");
+    println!("  install [-d DIR]   Install from local source directory");
+    #[cfg(not(target_os = "windows"))]
+    println!("  systemd-install    Install and enable lingclaw.service");
+    println!("  help               Show this help message");
+    println!();
+    println!("Options:");
+    println!("  --port <PORT>      Override listening port");
+    println!("  --install-daemon   Re-run Setup Wizard (backup existing config)");
+    println!("  --version, -V      Show version");
+    println!();
+    println!("Without a command, runs the Setup Wizard on first launch,");
+    println!("then starts the daemon in the background.");
+    true
+}
+
+fn handle_install_command(port_override: Option<u16>) -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    let source_dir = args
+        .windows(2)
+        .find(|w| w[0] == "-d")
+        .map(|w| PathBuf::from(&w[1]))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let cargo_toml = source_dir.join("Cargo.toml");
+    if !cargo_toml.exists() {
+        eprintln!("ERROR: Cargo.toml not found in {}", source_dir.display());
+        eprintln!("Use `lingclaw install -d <project-dir>` to specify the source directory.");
+        return true;
+    }
+    let cargo_content = match std::fs::read_to_string(&cargo_toml) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ERROR: Cannot read Cargo.toml: {e}");
+            return true;
+        }
+    };
+    if !cargo_content.contains("name = \"lingclaw\"") {
+        eprintln!("ERROR: {} is not a LingClaw project.", source_dir.display());
+        return true;
+    }
+
+    let source_version = cargo_content
+        .lines()
+        .find_map(|line| {
+            let line = line.trim();
+            if line.starts_with("version") {
+                line.split('"').nth(1).map(|v| v.to_string())
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| "0.0.0".to_string());
+
+    println!("Source version:    v{source_version}");
+    println!("Installed version: v{VERSION}");
+
+    let src_parts: Vec<u32> = source_version
+        .split('.')
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    let cur_parts: Vec<u32> = VERSION.split('.').filter_map(|s| s.parse().ok()).collect();
+    let cmp = src_parts.cmp(&cur_parts);
+
+    match cmp {
+        std::cmp::Ordering::Less => {
+            eprintln!("❌ Source version v{source_version} is older than installed v{VERSION}. Cannot install.");
+            return true;
+        }
+        std::cmp::Ordering::Equal => {
+            print!("Already at v{VERSION}. Reinstall? [y/N] ");
+            let _ = io::stdout().flush();
+            let mut answer = String::new();
+            let _ = io::stdin().read_line(&mut answer);
+            if !answer.trim().eq_ignore_ascii_case("y") {
+                println!("Cancelled.");
                 return true;
             }
-            let loopback = SocketAddr::from(([127, 0, 0, 1], port));
-            println!("Stopping LingClaw on port {port}...");
+        }
+        std::cmp::Ordering::Greater => {
+            print!("Upgrade v{VERSION} → v{source_version}? [y/N] ");
+            let _ = io::stdout().flush();
+            let mut answer = String::new();
+            let _ = io::stdin().read_line(&mut answer);
+            if !answer.trim().eq_ignore_ascii_case("y") {
+                println!("Cancelled.");
+                return true;
+            }
+        }
+    }
 
-            // Try graceful shutdown first via API
-            let graceful =
-                std::net::TcpStream::connect_timeout(&loopback, Duration::from_secs(2)).is_ok();
+    let config = Config::load();
+    let check_port = port_override.unwrap_or(config.port);
+    let was_running =
+        std::net::TcpStream::connect_timeout(&loopback_addr(check_port), Duration::from_secs(2))
+            .is_ok();
+    if was_running {
+        println!("Stopping service...");
+        handle_stop_command(port_override);
+        let exe = std::env::current_exe().ok();
+        for _ in 0..10 {
+            if let Some(ref path) = exe {
+                if std::fs::OpenOptions::new().write(true).open(path).is_ok() {
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
 
-            if graceful {
-                // Read shutdown token from disk
-                let token = config_dir_path()
-                    .map(|d| d.join(format!("shutdown-{port}.token")))
-                    .and_then(|p| std::fs::read_to_string(p).ok())
-                    .unwrap_or_default();
-
-                // Send POST /api/shutdown with auth token
-                let shutdown_ok = std::process::Command::new(if cfg!(windows) { "powershell" } else { "sh" })
-                    .args(if cfg!(windows) {
-                        vec![
-                            "-NoProfile".to_string(),
-                            "-Command".to_string(),
-                            format!(
-                                "try {{ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:{port}/api/shutdown -Headers @{{Authorization='Bearer {token}'}} -TimeoutSec 5 | Out-Null; $true }} catch {{ $false }}"
-                            ),
-                        ]
-                    } else {
-                        vec![
-                            "-c".to_string(),
-                            format!("curl -sf -X POST http://127.0.0.1:{port}/api/shutdown -H 'Authorization: Bearer {token}' -o /dev/null 2>/dev/null"),
-                        ]
-                    })
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false);
-
-                if shutdown_ok {
-                    // Wait for graceful shutdown to complete
-                    for _ in 0..10 {
-                        std::thread::sleep(Duration::from_millis(500));
-                        if std::net::TcpStream::connect_timeout(
-                            &loopback,
-                            Duration::from_millis(200),
-                        )
-                        .is_err()
-                        {
-                            println!("Stopped (graceful).");
+    println!("Building v{source_version}...");
+    let old_exe = rename_target_exe_for_build(&source_dir);
+    let build = std::process::Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(&source_dir)
+        .status();
+    match build {
+        Ok(s) if s.success() => {
+            if let Some(ref p) = old_exe {
+                let _ = std::fs::remove_file(p);
+            }
+            let built_exe = source_dir
+                .join("target")
+                .join("release")
+                .join(if cfg!(windows) {
+                    "lingclaw.exe"
+                } else {
+                    "lingclaw"
+                });
+            if let Ok(current_exe) = std::env::current_exe() {
+                if built_exe != current_exe {
+                    match install_built_binary(&built_exe, &current_exe) {
+                        Ok(_) => println!(
+                            "   ✅ Installed v{source_version} → {}",
+                            current_exe.display()
+                        ),
+                        Err(e) => {
+                            eprintln!("   ❌ Failed to copy binary: {e}");
+                            if was_running {
+                                handle_start_command(port_override);
+                            }
                             return true;
                         }
                     }
-                    eprintln!("Graceful shutdown timed out, force-killing...");
-                }
-            }
-
-            // Fallback: force-kill
-            #[cfg(target_os = "windows")]
-            {
-                let _ = std::process::Command::new("powershell")
-                    .args(["-NoProfile", "-Command", &format!(
-                        "Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | \
-                         Select-Object -ExpandProperty OwningProcess -Unique | \
-                         ForEach-Object {{ Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }}"
-                    )])
-                    .status();
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let _ = std::process::Command::new("sh")
-                    .args(["-c", &format!("lsof -ti:{port} | xargs -r kill -9")])
-                    .status();
-            }
-            std::thread::sleep(Duration::from_millis(500));
-            match std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
-                Ok(_) => eprintln!("Warning: port {port} still in use"),
-                Err(_) => println!("Stopped."),
-            }
-            true
-        }
-        "restart" => {
-            let config = Config::load();
-            print_mcp_preflight(&config);
-            #[cfg(not(target_os = "windows"))]
-            if systemd_service_installed() {
-                println!("Restarting LingClaw via systemd...");
-                print_start_details(config.port, "systemd");
-                match run_systemctl(&["restart", SYSTEMD_SERVICE_NAME]) {
-                    Ok(true) => println!("Restarted {}.", SYSTEMD_SERVICE_NAME),
-                    Ok(false) => eprintln!("Failed to restart {}.", SYSTEMD_SERVICE_NAME),
-                    Err(e) => eprintln!("Failed to restart {}: {e}", SYSTEMD_SERVICE_NAME),
-                }
-                return true;
-            }
-            handle_cli_command("stop", port_override);
-            std::thread::sleep(Duration::from_secs(1));
-            handle_cli_command("start", port_override);
-            true
-        }
-        "mcp-check" => {
-            let config = Config::load();
-            if !print_mcp_check(&config) {
-                process::exit(1);
-            }
-            true
-        }
-        "health" => {
-            let config = Config::load();
-            let port = port_override.unwrap_or(config.port);
-            let addr = format!("127.0.0.1:{port}");
-            match std::net::TcpStream::connect_timeout(
-                &addr.parse().expect("invalid addr"),
-                Duration::from_secs(3),
-            ) {
-                Ok(mut stream) => {
-                    use std::io::{Read, Write};
-                    let req = format!(
-                        "GET /api/health HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
-                    );
-                    let _ = stream.write_all(req.as_bytes());
-                    let mut buf = String::new();
-                    let _ = stream.read_to_string(&mut buf);
-                    // Extract JSON body after \r\n\r\n
-                    if let Some(pos) = buf.find("\r\n\r\n") {
-                        let body = buf[pos + 4..].trim();
-                        println!("✅ {body}");
-                    } else {
-                        println!("✅ Running (port {port})");
-                    }
-                }
-                Err(_) => eprintln!("❌ Not running (port {port} unreachable)"),
-            }
-            true
-        }
-        "update" => {
-            let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            if !workspace.join("Cargo.toml").exists() {
-                eprintln!(
-                    "ERROR: Cargo.toml not found. Run `lingclaw update` from the source directory."
-                );
-                return true;
-            }
-            println!("Current version: v{VERSION}");
-            println!("Pulling latest source...");
-            let pull = std::process::Command::new("git").args(["pull"]).status();
-            match pull {
-                Ok(s) if s.success() => println!("   ✅ git pull complete"),
-                _ => {
-                    eprintln!("   ❌ git pull failed");
-                    return true;
-                }
-            }
-            // Read version from updated Cargo.toml
-            let new_version = std::fs::read_to_string(workspace.join("Cargo.toml"))
-                .ok()
-                .and_then(|content| {
-                    content.lines().find_map(|line| {
-                        let line = line.trim();
-                        if line.starts_with("version") {
-                            line.split('"').nth(1).map(|v| v.to_string())
-                        } else {
-                            None
+                    if let Some(install_dir) = current_exe.parent() {
+                        match install_frontend_assets(&source_dir, install_dir) {
+                            Ok(()) => println!(
+                                "   ✅ Frontend assets installed → {}",
+                                install_dir.join("static").display()
+                            ),
+                            Err(e) => {
+                                eprintln!("   ❌ Failed to install frontend assets: {e}");
+                                if was_running {
+                                    handle_start_command(port_override);
+                                }
+                                return true;
+                            }
                         }
-                    })
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-            if new_version == VERSION {
-                println!("Already up to date (v{VERSION}).");
-                return true;
-            }
-            println!("New version available: v{VERSION} → v{new_version}");
-
-            // Stop running service first to release the binary file lock
-            let config = Config::load();
-            let check_port = port_override.unwrap_or(config.port);
-            let was_running = std::net::TcpStream::connect_timeout(
-                &format!("127.0.0.1:{check_port}")
-                    .parse()
-                    .expect("invalid addr"),
-                Duration::from_secs(2),
-            )
-            .is_ok();
-            if was_running {
-                println!("Stopping service before build...");
-                handle_cli_command("stop", port_override);
-                // Wait until the exe is writable (file lock released)
-                let exe = std::env::current_exe().ok();
-                let mut released = false;
-                for i in 0..10 {
-                    if let Some(ref path) = exe {
-                        if std::fs::OpenOptions::new().write(true).open(path).is_ok() {
-                            released = true;
-                            break;
-                        }
-                    } else {
-                        // Can't check, just wait a reasonable time
-                        std::thread::sleep(Duration::from_secs(2));
-                        released = true;
-                        break;
                     }
-                    if i < 9 {
-                        std::thread::sleep(Duration::from_millis(500));
-                    }
-                }
-                if !released {
-                    eprintln!("   ❌ Failed to release binary file lock after 5s. Is the process still running?");
-                    return true;
-                }
-            }
-
-            println!("Building...");
-            let old_exe = rename_target_exe_for_build(&std::env::current_dir().unwrap_or_default());
-            let build = std::process::Command::new("cargo")
-                .args(["build", "--release"])
-                .status();
-            match build {
-                Ok(s) if s.success() => {
-                    if let Some(ref p) = old_exe {
-                        let _ = std::fs::remove_file(p);
-                    }
-                    println!("   ✅ Build complete (v{new_version})");
-                    println!("Starting...");
-                    handle_cli_command("start", port_override);
-                }
-                _ => {
-                    if let Some(ref p) = old_exe {
-                        let target = p.with_extension("exe");
-                        let _ = std::fs::rename(p, &target);
-                    }
-                    eprintln!("   ❌ Build failed");
-                    if was_running {
-                        println!("Restarting previous version...");
-                        handle_cli_command("start", port_override);
-                    }
-                }
-            }
-            true
-        }
-        "status" => {
-            let config = Config::load();
-            let port = port_override.unwrap_or(config.port);
-            let addr = format!("127.0.0.1:{port}");
-            #[cfg(not(target_os = "windows"))]
-            let manager = if systemd_service_installed() {
-                "systemd"
-            } else {
-                "nohup"
-            };
-            #[cfg(target_os = "windows")]
-            let manager = "detached-process";
-
-            // Check if running
-            let running = std::net::TcpStream::connect_timeout(
-                &addr.parse().expect("invalid addr"),
-                Duration::from_secs(2),
-            )
-            .is_ok();
-
-            println!("╔══════════════════════════════════════════════════════════╗");
-            println!("║             🦀 LingClaw v{VERSION}                        ║");
-            println!("╚══════════════════════════════════════════════════════════╝");
-            println!();
-            println!("  Version:       v{VERSION}");
-            println!(
-                "  Service:       {}",
-                if running {
-                    "✅ Running"
                 } else {
-                    "❌ Stopped"
+                    println!("   ✅ Build complete (v{source_version})");
                 }
-            );
-            println!("  Manager:       {}", manager);
-            println!("  Address:       http://{addr}");
-            #[cfg(not(target_os = "windows"))]
-            if systemd_service_installed() {
-                println!(
-                    "  systemd:       {} / {}",
-                    if systemd_service_enabled() {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    },
-                    if systemd_service_active() {
-                        "active"
-                    } else {
-                        "inactive"
-                    }
-                );
-                println!("  Service file:  {}", SYSTEMD_SERVICE_PATH);
-            }
-            println!("  Default model: {}", config.model);
-            println!("  Provider:      {}", config.provider.label());
-            println!("  API base:      {}", config.api_base);
-            println!("  Exec timeout:  {}s", config.exec_timeout.as_secs());
-            println!("  Tool timeout:  {}s", config.tool_timeout.as_secs());
-            println!("  Context limit: {} tokens", config.max_context_tokens);
-            println!();
-
-            if config.providers.is_empty() {
-                println!("  Providers: (none configured)");
             } else {
-                println!("  Providers:");
-                println!();
-                println!(
-                    "  {:<16} {:<10} {:<30} {:>8}",
-                    "NAME", "API", "BASE URL", "MODELS"
-                );
-                println!("  {}", "─".repeat(68));
-                for (name, pc) in &config.providers {
-                    println!(
-                        "  {:<16} {:<10} {:<30} {:>8}",
-                        name,
-                        pc.api,
-                        if pc.base_url.len() > 30 {
-                            format!("{}…", &pc.base_url[..29])
-                        } else {
-                            pc.base_url.clone()
-                        },
-                        pc.models.len(),
-                    );
-                }
+                println!("   ✅ Build complete (v{source_version})");
             }
-            println!();
-
-            // Collect all models across providers into a flat table
-            struct ModelRow {
-                name: String,
-                id: String,
-                provider: String,
-                ctx: String,
-                max_out: String,
-                flags: String,
+            if was_running {
+                println!("Starting service...");
+                handle_start_command(port_override);
             }
-            let rows: Vec<ModelRow> = config
-                .providers
-                .iter()
-                .flat_map(|(pname, pc)| {
-                    pc.models.iter().map(move |m| ModelRow {
-                        name: m.name.as_deref().unwrap_or(&m.id).to_string(),
-                        id: m.id.clone(),
-                        provider: pname.clone(),
-                        ctx: m
-                            .context_window
-                            .map(|w| format!("{w}"))
-                            .unwrap_or_else(|| "-".into()),
-                        max_out: m
-                            .max_tokens
-                            .map(|t| format!("{t}"))
-                            .unwrap_or_else(|| "-".into()),
-                        flags: if m.reasoning.unwrap_or(false) {
-                            "reasoning".into()
-                        } else {
-                            String::new()
-                        },
-                    })
-                })
-                .collect();
-
-            if rows.is_empty() {
-                println!("  Models: (none configured)");
-            } else {
-                println!("  Models ({}):", rows.len());
-                println!();
-                println!(
-                    "  {:<24} {:<30} {:<12} {:>8} {:>8}  FLAGS",
-                    "NAME", "ID", "PROVIDER", "CTX", "MAX OUT"
-                );
-                println!("  {}", "─".repeat(90));
-                for r in &rows {
-                    let dflt = if is_default_model_row(&config, &r.provider, &r.id) {
-                        " *"
-                    } else {
-                        ""
-                    };
-                    println!(
-                        "  {:<24} {:<30} {:<12} {:>8} {:>8}  {}{}",
-                        r.name, r.id, r.provider, r.ctx, r.max_out, r.flags, dflt
-                    );
-                }
-                println!();
-                println!("  (* = default model)");
-            }
-            println!();
-
-            // Check for newer version via git
-            let _ = std::process::Command::new("git")
-                .args(["fetch", "--quiet"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            if let Ok(output) = std::process::Command::new("git")
-                .args(["show", "origin/main:Cargo.toml"])
-                .output()
-            {
-                if output.status.success() {
-                    let remote_cargo = String::from_utf8_lossy(&output.stdout);
-                    let remote_ver = remote_cargo.lines().find_map(|line| {
-                        let line = line.trim();
-                        if line.starts_with("version") {
-                            line.split('"').nth(1)
-                        } else {
-                            None
-                        }
-                    });
-                    if let Some(rv) = remote_ver {
-                        if rv != VERSION {
-                            println!("  💡 New version available: v{VERSION} → v{rv}");
-                            println!("     Run `lingclaw update` to upgrade.");
-                            println!();
-                        }
-                    }
-                }
-            }
-
-            true
         }
-        "help" | "--help" | "-h" => {
-            println!("🦀 LingClaw v{VERSION} — Personal AI Assistant");
-            println!();
-            println!("Usage: lingclaw <command> [options]");
-            println!();
-            println!("Commands:");
-            println!("  start              Start the daemon");
-            println!("  stop               Stop the daemon");
-            println!("  restart            Restart the daemon");
-            println!("  mcp-check          Check MCP servers with runtime timeouts");
-            println!("  health             Health check (exit 0 = ok)");
-            println!("  status             Show detailed service status");
-            println!("  update             Check for updates, rebuild if newer");
-            println!("  install [-d DIR]   Install from local source directory");
-            #[cfg(not(target_os = "windows"))]
-            println!("  systemd-install    Install and enable lingclaw.service");
-            println!("  help               Show this help message");
-            println!();
-            println!("Options:");
-            println!("  --port <PORT>      Override listening port");
-            println!("  --install-daemon   Re-run Setup Wizard (backup existing config)");
-            println!("  --version, -V      Show version");
-            println!();
-            println!("Without a command, runs the Setup Wizard on first launch,");
-            println!("then starts the daemon in the background.");
-            true
+        _ => {
+            if let Some(ref p) = old_exe {
+                let target = p.with_extension("exe");
+                let _ = std::fs::rename(p, &target);
+            }
+            eprintln!("   ❌ Build failed");
+            if was_running {
+                println!("Restarting previous version...");
+                handle_start_command(port_override);
+            }
         }
+    }
+    true
+}
+
+pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool {
+    match cmd {
+        "start" => handle_start_command(port_override),
+        "stop" => handle_stop_command(port_override),
+        "restart" => handle_restart_command(port_override),
+        "mcp-check" => handle_mcp_check_command(),
+        "health" => handle_health_command(port_override),
+        "update" => handle_update_command(port_override),
+        "status" => handle_status_command(port_override),
+        "help" | "--help" | "-h" => handle_help_command(),
         "--version" | "-V" => {
             println!("lingclaw v{VERSION}");
             true
@@ -1246,187 +1476,7 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
         }
         #[cfg(not(target_os = "windows"))]
         "systemd-install" => install_systemd_service(),
-        "install" => {
-            // Parse -d <dir> from args; default to current directory
-            let args: Vec<String> = std::env::args().collect();
-            let source_dir = args
-                .windows(2)
-                .find(|w| w[0] == "-d")
-                .map(|w| PathBuf::from(&w[1]))
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-            let cargo_toml = source_dir.join("Cargo.toml");
-            if !cargo_toml.exists() {
-                eprintln!("ERROR: Cargo.toml not found in {}", source_dir.display());
-                eprintln!(
-                    "Use `lingclaw install -d <project-dir>` to specify the source directory."
-                );
-                return true;
-            }
-            // Verify this is a LingClaw project
-            let cargo_content = match std::fs::read_to_string(&cargo_toml) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("ERROR: Cannot read Cargo.toml: {e}");
-                    return true;
-                }
-            };
-            if !cargo_content.contains("name = \"lingclaw\"") {
-                eprintln!("ERROR: {} is not a LingClaw project.", source_dir.display());
-                return true;
-            }
-
-            // Read source version
-            let source_version = cargo_content
-                .lines()
-                .find_map(|line| {
-                    let line = line.trim();
-                    if line.starts_with("version") {
-                        line.split('"').nth(1).map(|v| v.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| "0.0.0".to_string());
-
-            println!("Source version:    v{source_version}");
-            println!("Installed version: v{VERSION}");
-
-            // Compare versions
-            let src_parts: Vec<u32> = source_version
-                .split('.')
-                .filter_map(|s| s.parse().ok())
-                .collect();
-            let cur_parts: Vec<u32> = VERSION.split('.').filter_map(|s| s.parse().ok()).collect();
-            let cmp = src_parts.cmp(&cur_parts);
-
-            match cmp {
-                std::cmp::Ordering::Less => {
-                    eprintln!("❌ Source version v{source_version} is older than installed v{VERSION}. Cannot install.");
-                    return true;
-                }
-                std::cmp::Ordering::Equal => {
-                    print!("Already at v{VERSION}. Reinstall? [y/N] ");
-                    let _ = io::stdout().flush();
-                    let mut answer = String::new();
-                    let _ = io::stdin().read_line(&mut answer);
-                    if !answer.trim().eq_ignore_ascii_case("y") {
-                        println!("Cancelled.");
-                        return true;
-                    }
-                }
-                std::cmp::Ordering::Greater => {
-                    print!("Upgrade v{VERSION} → v{source_version}? [y/N] ");
-                    let _ = io::stdout().flush();
-                    let mut answer = String::new();
-                    let _ = io::stdin().read_line(&mut answer);
-                    if !answer.trim().eq_ignore_ascii_case("y") {
-                        println!("Cancelled.");
-                        return true;
-                    }
-                }
-            }
-
-            // Stop running service to release file lock
-            let config = Config::load();
-            let check_port = port_override.unwrap_or(config.port);
-            let was_running = std::net::TcpStream::connect_timeout(
-                &format!("127.0.0.1:{check_port}")
-                    .parse()
-                    .expect("invalid addr"),
-                Duration::from_secs(2),
-            )
-            .is_ok();
-            if was_running {
-                println!("Stopping service...");
-                handle_cli_command("stop", port_override);
-                let exe = std::env::current_exe().ok();
-                for _ in 0..10 {
-                    if let Some(ref path) = exe {
-                        if std::fs::OpenOptions::new().write(true).open(path).is_ok() {
-                            break;
-                        }
-                    }
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-            }
-
-            println!("Building v{source_version}...");
-            let old_exe = rename_target_exe_for_build(&source_dir);
-            let build = std::process::Command::new("cargo")
-                .args(["build", "--release"])
-                .current_dir(&source_dir)
-                .status();
-            match build {
-                Ok(s) if s.success() => {
-                    if let Some(ref p) = old_exe {
-                        let _ = std::fs::remove_file(p);
-                    }
-                    // Copy built binary to current exe location
-                    let built_exe =
-                        source_dir
-                            .join("target")
-                            .join("release")
-                            .join(if cfg!(windows) {
-                                "lingclaw.exe"
-                            } else {
-                                "lingclaw"
-                            });
-                    if let Ok(current_exe) = std::env::current_exe() {
-                        if built_exe != current_exe {
-                            match install_built_binary(&built_exe, &current_exe) {
-                                Ok(_) => println!(
-                                    "   ✅ Installed v{source_version} → {}",
-                                    current_exe.display()
-                                ),
-                                Err(e) => {
-                                    eprintln!("   ❌ Failed to copy binary: {e}");
-                                    if was_running {
-                                        handle_cli_command("start", port_override);
-                                    }
-                                    return true;
-                                }
-                            }
-                            if let Some(install_dir) = current_exe.parent() {
-                                match install_frontend_assets(&source_dir, install_dir) {
-                                    Ok(()) => println!(
-                                        "   ✅ Frontend assets installed → {}",
-                                        install_dir.join("static").display()
-                                    ),
-                                    Err(e) => {
-                                        eprintln!("   ❌ Failed to install frontend assets: {e}");
-                                        if was_running {
-                                            handle_cli_command("start", port_override);
-                                        }
-                                        return true;
-                                    }
-                                }
-                            }
-                        } else {
-                            println!("   ✅ Build complete (v{source_version})");
-                        }
-                    } else {
-                        println!("   ✅ Build complete (v{source_version})");
-                    }
-                    if was_running {
-                        println!("Starting service...");
-                        handle_cli_command("start", port_override);
-                    }
-                }
-                _ => {
-                    if let Some(ref p) = old_exe {
-                        let target = p.with_extension("exe");
-                        let _ = std::fs::rename(p, &target);
-                    }
-                    eprintln!("   ❌ Build failed");
-                    if was_running {
-                        println!("Restarting previous version...");
-                        handle_cli_command("start", port_override);
-                    }
-                }
-            }
-            true
-        }
+        "install" => handle_install_command(port_override),
         _ => false,
     }
 }

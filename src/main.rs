@@ -16,13 +16,12 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, Mutex};
-use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 
@@ -34,6 +33,7 @@ mod context;
 mod hooks;
 mod prompts;
 mod providers;
+mod runtime_loop;
 mod session_admin;
 mod session_store;
 mod socket_sync;
@@ -49,6 +49,10 @@ pub(crate) use context::{
 pub(crate) use hooks::{run_hooks, AutoCompressContextHook, HookRegistry};
 
 use commands::handle_command;
+use runtime_loop::{
+    handle_idle_socket_input, resolve_or_create_socket_session, run_agent_session,
+    IdleSocketInputAction,
+};
 use session_admin::{
     admin_tool_definitions_anthropic, admin_tool_definitions_openai, execute_admin_tool,
     is_admin_tool,
@@ -83,6 +87,7 @@ use std::collections::HashSet;
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const MAIN_SESSION_ID: &str = "main";
+const INBOUND_BUFFER_CAPACITY: usize = 128;
 
 // ── Data Models ──────────────────────────────────────────────────────────────
 
@@ -919,106 +924,6 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
     }
 }
 
-fn build_agent_hard_cap_events(
-    round_limit: usize,
-    cycles: usize,
-    tool_calls: usize,
-) -> (serde_json::Value, serde_json::Value) {
-    (
-        json!({
-            "type": "system",
-            "content": format!(
-                "Detected abnormal tool loop ({} consecutive rounds). Stopping.",
-                round_limit
-            ),
-        }),
-        json!({
-            "type": "done",
-            "phase": "hard_cap",
-            "reason": "hard_cap",
-            "cycles": cycles,
-            "tool_calls": tool_calls,
-        }),
-    )
-}
-
-// ── Tool Dispatch ────────────────────────────────────────────────────────────
-
-async fn execute_tool(
-    name: &str,
-    args_str: &str,
-    config: &Config,
-    http: &Client,
-    workspace: &Path,
-) -> tools::ToolOutcome {
-    if let Some(result) = tools::mcp::execute_tool(name, args_str, config, workspace).await {
-        result
-    } else {
-        tools::execute_tool(name, args_str, config, http, workspace).await
-    }
-}
-
-enum ToolRunState {
-    Completed(tools::ToolOutcome),
-    Abort,
-}
-
-async fn run_tool_with_feedback<F>(
-    live_tx: &LiveTx,
-    cancel: &CancellationToken,
-    tool_id: &str,
-    tool_name: &str,
-    timeout: Duration,
-    future: F,
-) -> ToolRunState
-where
-    F: std::future::Future<Output = tools::ToolOutcome>,
-{
-    let start = std::time::Instant::now();
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(TOOL_PROGRESS_HEARTBEAT_SECS));
-    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    heartbeat.tick().await;
-
-    let timeout_secs = timeout.as_secs();
-    let sleep = tokio::time::sleep(timeout);
-    tokio::pin!(sleep);
-    tokio::pin!(future);
-
-    loop {
-        tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                return ToolRunState::Abort;
-            }
-            _ = &mut sleep => {
-                return ToolRunState::Completed(tools::ToolOutcome {
-                    output: format!("{tool_name} error: tool execution timed out ({}s)", timeout_secs),
-                    is_error: true,
-                    duration_ms: start.elapsed().as_millis() as u64,
-                });
-            }
-            _ = heartbeat.tick() => {
-                if !live_send(
-                    live_tx,
-                    json!({
-                        "type": "tool_progress",
-                        "id": tool_id,
-                        "name": tool_name,
-                        "elapsed_ms": start.elapsed().as_millis() as u64,
-                    }),
-                )
-                .await
-                {
-                    return ToolRunState::Abort;
-                }
-            }
-            result = &mut future => {
-                return ToolRunState::Completed(result);
-            }
-        }
-    }
-}
-
 // ── Session Claim ────────────────────────────────────────────────────────────
 
 enum ClaimSessionResult {
@@ -1115,16 +1020,25 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             }
         }
     });
-    // Reader task: forward incoming text to a channel and signal disconnect
-    let (inbound_tx, mut inbound_rx) = mpsc::unbounded_channel::<String>();
+    // Reader task: use bounded buffering for user text while allowing /stop to
+    // bypass backlog via an atomic flag.
+    let (inbound_tx, mut inbound_rx) = mpsc::channel::<String>(INBOUND_BUFFER_CAPACITY);
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let run_active = Arc::new(AtomicBool::new(false));
+    let reader_stop_requested = stop_requested.clone();
+    let reader_run_active = run_active.clone();
     let reader_cancel = connection_cancel.clone();
     let reader = tokio::spawn(async move {
         while let Some(result) = rx.next().await {
             match result {
                 Ok(WsMsg::Text(t)) => {
-                    // Use an unbounded inbound channel so /stop and intervention
-                    // messages are not silently dropped while the agent is busy.
-                    if inbound_tx.send(t.to_string()).is_err() {
+                    if t.trim().eq_ignore_ascii_case("/stop")
+                        && reader_run_active.load(Ordering::Relaxed)
+                    {
+                        reader_stop_requested.store(true, Ordering::Relaxed);
+                        continue;
+                    }
+                    if inbound_tx.send(t.to_string()).await.is_err() {
                         break;
                     }
                 }
@@ -1135,71 +1049,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         reader_cancel.cancel();
     });
 
-    // Resume a session: prefer the explicitly requested one (browser refresh),
-    // then fall back to the most recent unclaimed saved session, then create new.
-    let mut current_session_id;
-
-    let mut claimed = if let Some(ref req_id) = requested_id {
-        // Client requested a specific session — wait briefly for the old connection to release it
-        claim_requested_session(req_id, &state, connection_id).await
-    } else {
-        None
-    };
-
-    // Only fall back to "most recent saved session" when NO specific session was requested.
-    // If the client asked for a specific session and it failed, create new (don't hijack another).
-    if claimed.is_none() && requested_id.is_none() {
-        // Prefer the main session first
-        match try_claim_session(MAIN_SESSION_ID, &state, connection_id).await {
-            ClaimSessionResult::Claimed(id) => {
-                claimed = Some(id);
-            }
-            ClaimSessionResult::InUse | ClaimSessionResult::NotFound => {
-                // Main session in use or gone — fall back to most recent
-                let saved_ids = list_recoverable_saved_session_ids();
-
-                for cid in &saved_ids {
-                    match try_claim_session(cid, &state, connection_id).await {
-                        ClaimSessionResult::Claimed(id) => {
-                            claimed = Some(id);
-                            break;
-                        }
-                        ClaimSessionResult::InUse | ClaimSessionResult::NotFound => {
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if let Some(id) = claimed {
-        current_session_id = id.clone();
-        send_existing_session_payloads(&tx, &state, &id).await;
-    } else {
-        let mut session = Session::new();
-        let sys = build_system_prompt(
-            &state.config,
-            &session.workspace,
-            session.effective_model(&state.config.model),
-            false,
-        );
-        session.messages.push(sys);
-        current_session_id = session.id.clone();
-        if let Err(error) = save_session_to_disk(&session).await {
-            eprintln!(
-                "Warning: failed to persist new session {} on creation: {error}; keeping in memory",
-                current_session_id
-            );
-        }
-        {
-            let mut active = state.active_connections.lock().await;
-            let mut sessions = state.sessions.lock().await;
-            sessions.insert(current_session_id.clone(), session);
-            active.insert(current_session_id.clone(), connection_id);
-        }
-        send_new_session_payload(&tx, &state, &current_session_id).await;
-    }
+    let mut current_session_id =
+        resolve_or_create_socket_session(&state, &tx, requested_id.as_deref(), connection_id).await;
 
     bind_session_connection(&state, &current_session_id, connection_id, &tx, false).await;
     replay_live_round(&tx, &state, &current_session_id).await;
@@ -1227,706 +1078,39 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                     None => break,
                 },
             };
-
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            if trimmed.starts_with('/') {
-                let cmd_result = handle_command(
-                    trimmed,
-                    &current_session_id,
-                    connection_id,
-                    &state,
-                    &tx,
-                    &cancel,
-                )
-                .await;
-                if cancel.is_cancelled() {
-                    break;
-                }
-                if let Some(result) = cmd_result {
-                    send_command_refresh(&tx, &state, &current_session_id, result.refresh_history)
-                        .await;
-
-                    ws_send(
-                        &tx,
-                        &json!({"type":result.response_type,"content":result.response}),
-                    )
-                    .await;
-
-                    if let Some(new_id) = result.new_session_id {
-                        unbind_session_connection_if_matches(
-                            &state,
-                            &current_session_id,
-                            connection_id,
-                        )
-                        .await;
-                        state.live_rounds.lock().await.remove(&current_session_id);
-                        current_session_id = new_id.clone();
-                        bind_session_connection(
-                            &state,
-                            &current_session_id,
-                            connection_id,
-                            &tx,
-                            true,
-                        )
-                        .await;
-                        {
-                            let mut active_id = current_session_ref.lock().await;
-                            *active_id = current_session_id.clone();
-                        }
-                        send_session_switched_payloads(&tx, &state, &new_id).await;
-                    }
-                    if result.sessions_changed {
-                        send_sessions_list(&tx, &state, &current_session_id).await;
-                    }
-                } else {
-                    ws_send(
-                        &tx,
-                        &json!({"type":"system","content":"Unknown command. Type /help."}),
-                    )
-                    .await;
-                }
-                continue;
-            }
-
+            match handle_idle_socket_input(
+                text,
+                &mut current_session_id,
+                &current_session_ref,
+                connection_id,
+                &state,
+                &tx,
+                &cancel,
+            )
+            .await
             {
-                let mut sessions = state.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(&current_session_id) {
-                    session.messages.push(ChatMessage {
-                        role: "user".into(),
-                        content: Some(text),
-                        tool_calls: None,
-                        tool_call_id: None,
-                        timestamp: Some(now_epoch()),
-                    });
-                    session.updated_at = now_epoch();
-                }
+                IdleSocketInputAction::Continue => continue,
+                IdleSocketInputAction::StartAgent => {}
+                IdleSocketInputAction::Break => break,
             }
         } // end if !rerun_agent
-        rerun_agent = false;
+        run_active.store(true, Ordering::Relaxed);
+        stop_requested.store(false, Ordering::Relaxed);
 
-        let show_react = {
-            let sessions = state.sessions.lock().await;
-            sessions
-                .get(&current_session_id)
-                .map(|s| s.show_react)
-                .unwrap_or(false)
-        };
+        let outcome = run_agent_session(
+            &state,
+            &current_session_id,
+            &cancel,
+            &live_tx,
+            &mut inbound_rx,
+            &stop_requested,
+        )
+        .await;
+        run_active.store(false, Ordering::Relaxed);
+        stop_requested.store(false, Ordering::Relaxed);
+        rerun_agent = outcome.rerun_agent;
 
-        let mut shutting_down = false;
-        let mut run_stopped = false;
-        let mut round: usize = 0;
-        let mut react_ctx = agent::AgentLoopCtx::new(show_react);
-        const AGENT_HARD_CAP_ROUNDS: usize = 200;
-
-        // Per-run cancellation: child of shutdown so server stop propagates automatically.
-        let run_cancel = cancel.child_token();
-        {
-            let mut runs = state.active_runs.lock().await;
-            runs.insert(current_session_id.clone(), run_cancel.clone());
-        }
-
-        // Inter-phase state: Analyze → Act → Observe
-        let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
-        let mut collected_results: Vec<agent::ToolResultEntry> = Vec::new();
-        let mut cycle_workspace = std::path::PathBuf::new();
-        let mut cycle_is_main = false;
-        let mut last_observation_hint: Option<String> = None;
-        let mut pending_interventions: Vec<String> = Vec::new();
-
-        'agent: loop {
-            if cancel.is_cancelled() {
-                shutting_down = true;
-                break;
-            }
-            // Drain pending inbound messages — handle /stop and collect interventions
-            while let Ok(msg) = inbound_rx.try_recv() {
-                let m = msg.trim();
-                if m.eq_ignore_ascii_case("/stop") {
-                    run_cancel.cancel();
-                    run_stopped = true;
-                    break 'agent;
-                }
-                // Non-command text from user → queue as intervention for next Analyze
-                if !m.is_empty() && !m.starts_with('/') {
-                    pending_interventions.push(m.to_string());
-                    let _ = live_send(
-                        &live_tx,
-                        json!({"type":"progress","content":"📝 Intervention received — will apply at next reasoning cycle"}),
-                    )
-                    .await;
-                }
-            }
-            if run_cancel.is_cancelled() && !cancel.is_cancelled() {
-                run_stopped = true;
-                break;
-            }
-
-            match react_ctx.phase() {
-                // ── Analyze: snapshot session, call LLM, decide next phase ───
-                agent::AgentPhase::Analyze => {
-                    if round >= AGENT_HARD_CAP_ROUNDS {
-                        let (system_event, done_event) = build_agent_hard_cap_events(
-                            AGENT_HARD_CAP_ROUNDS,
-                            react_ctx.cycles,
-                            react_ctx.tool_calls,
-                        );
-                        if !live_send(&live_tx, system_event).await {
-                            break;
-                        }
-                        let _ = live_send(&live_tx, done_event).await;
-                        break;
-                    }
-
-                    let had_observation_hint = last_observation_hint.is_some();
-
-                    // ── Inject pending user interventions as messages ──
-                    if !pending_interventions.is_empty() {
-                        let mut sessions = state.sessions.lock().await;
-                        if let Some(session) = sessions.get_mut(&current_session_id) {
-                            for text in pending_interventions.drain(..) {
-                                session.messages.push(ChatMessage {
-                                    role: "user".into(),
-                                    content: Some(text),
-                                    tool_calls: None,
-                                    tool_call_id: None,
-                                    timestamp: Some(now_epoch()),
-                                });
-                            }
-                            session.updated_at = now_epoch();
-                        }
-                    }
-
-                    // ── BeforeAnalyze hooks (e.g. auto-compress context) ──
-                    let mut before_analyze_events = run_hooks(
-                        &state.hooks,
-                        agent::HookPoint::BeforeAnalyze,
-                        &state.sessions,
-                        &current_session_id,
-                        &state.config,
-                        &state.http,
-                        react_ctx.cycles,
-                    )
-                    .await;
-
-                    let (msgs_snapshot, model, workspace, think_level, pruned_count) = {
-                        let mut sessions = state.sessions.lock().await;
-                        let session = match sessions.get_mut(&current_session_id) {
-                            Some(s) => s,
-                            None => break,
-                        };
-                        let model_str = session.effective_model(&state.config.model).to_string();
-                        let is_main_session = session.is_main();
-                        let mut fresh_system = build_system_prompt(
-                            &state.config,
-                            &session.workspace,
-                            &model_str,
-                            is_main_session,
-                        );
-                        // Inject observation context hint from previous cycle
-                        if let Some(hint) = last_observation_hint.take() {
-                            if let Some(ref mut content) = fresh_system.content {
-                                content.push_str("\n\n");
-                                content.push_str(&hint);
-                            }
-                        }
-                        if let Some(first) = session.messages.first_mut() {
-                            if first.role == "system" {
-                                *first = fresh_system;
-                            }
-                        }
-                        let msg_count_before = session.messages.len();
-                        prune_messages(
-                            &mut session.messages,
-                            context_input_budget_for_model(&state.config, &model_str),
-                        );
-                        let pruned = msg_count_before - session.messages.len();
-                        (
-                            session.messages.clone(),
-                            model_str,
-                            session.workspace.clone(),
-                            session.think_level.clone(),
-                            pruned,
-                        )
-                    };
-
-                    let final_context_estimate = estimate_tokens_for_provider(
-                        state.config.resolve_model(&model).provider,
-                        &msgs_snapshot,
-                    );
-                    for event in &mut before_analyze_events {
-                        if event["type"] == "context_compressed" {
-                            event["after_estimate"] = json!(final_context_estimate);
-                        }
-                    }
-
-                    for event in before_analyze_events {
-                        if !live_send(&live_tx, event).await {
-                            break 'agent;
-                        }
-                    }
-
-                    // Notify frontend when context was pruned
-                    if pruned_count > 0 {
-                        let _ = live_send(
-                            &live_tx,
-                            json!({
-                                "type": "context_pruned",
-                                "messages_removed": pruned_count,
-                            }),
-                        )
-                        .await;
-                    }
-
-                    // Stash per-cycle state for Act phase
-                    cycle_workspace = workspace.clone();
-                    cycle_is_main = current_session_id == MAIN_SESSION_ID;
-
-                    if !live_send(
-                        &live_tx,
-                        json!({
-                            "type":"start",
-                            "round": round + 1,
-                            "phase": react_ctx.phase().label(),
-                            "react_visible": react_ctx.show_react,
-                        }),
-                    )
-                    .await
-                    {
-                        break;
-                    }
-
-                    let resolved = state.config.resolve_model(&model);
-
-                    // Phase 3: adapt think level based on cycle depth
-                    let effective_think = if think_level == "auto" {
-                        if resolved.reasoning || resolved.thinking_format.is_some() {
-                            agent::auto_think_level(react_ctx.cycles, had_observation_hint)
-                                .to_owned()
-                        } else {
-                            "off".to_owned()
-                        }
-                    } else {
-                        think_level.clone()
-                    };
-
-                    let extra_tools: Vec<serde_json::Value> = if cycle_is_main {
-                        match resolved.provider {
-                            Provider::Anthropic => admin_tool_definitions_anthropic(),
-                            Provider::OpenAI => admin_tool_definitions_openai(),
-                        }
-                    } else {
-                        vec![]
-                    };
-                    let mut extra_tools = extra_tools;
-                    let mut mcp_tools = match resolved.provider {
-                        Provider::Anthropic => {
-                            tools::mcp::tool_definitions_anthropic(&state.config, &cycle_workspace)
-                                .await
-                        }
-                        Provider::OpenAI => {
-                            tools::mcp::tool_definitions_openai(&state.config, &cycle_workspace)
-                                .await
-                        }
-                    };
-                    extra_tools.append(&mut mcp_tools);
-
-                    let llm_result = tokio::select! {
-                        biased;
-                        _ = run_cancel.cancelled() => {
-                            shutting_down = cancel.is_cancelled();
-                            run_stopped = !shutting_down;
-                            break;
-                        }
-                        r = providers::call_llm_stream(
-                            &state.http,
-                            &resolved,
-                            &msgs_snapshot,
-                            &live_tx,
-                            &effective_think,
-                            &extra_tools,
-                        ) => r,
-                    };
-                    match llm_result {
-                        Ok(resp) => {
-                            let input_tokens = resp.input_tokens.unwrap_or_else(|| {
-                                estimate_tokens_for_provider(resolved.provider, &msgs_snapshot)
-                                    as u64
-                            });
-                            let output_tokens = resp.output_tokens.unwrap_or_else(|| {
-                                message_token_len_for_provider(resolved.provider, &resp.message)
-                                    as u64
-                            });
-                            let has_content = resp.message.has_nonempty_content();
-                            let has_tools = resp.message.has_tool_calls();
-                            let should_persist = !resp.message.is_empty_assistant_message();
-
-                            {
-                                let mut sessions = state.sessions.lock().await;
-                                if let Some(session) = sessions.get_mut(&current_session_id) {
-                                    let input_source = if resp.input_tokens.is_some() {
-                                        "provider"
-                                    } else {
-                                        "estimated"
-                                    };
-                                    let output_source = if resp.output_tokens.is_some() {
-                                        "provider"
-                                    } else {
-                                        "estimated"
-                                    };
-                                    update_session_token_usage(
-                                        session,
-                                        input_tokens,
-                                        output_tokens,
-                                        input_source,
-                                        output_source,
-                                    );
-                                }
-                            }
-
-                            if should_persist {
-                                let mut sessions = state.sessions.lock().await;
-                                if let Some(session) = sessions.get_mut(&current_session_id) {
-                                    session.messages.push(resp.message.clone());
-                                    session.updated_at = now_epoch();
-                                }
-                            }
-
-                            if let Some(reason) = agent::evaluate_finish(has_content, has_tools) {
-                                react_ctx.transition_to_finish(reason);
-                                if react_ctx.show_react {
-                                    let _ = live_send(
-                                        &live_tx,
-                                        json!({"type":"react_phase","phase":"finish","cycle":react_ctx.cycles}),
-                                    )
-                                    .await;
-                                }
-                            } else {
-                                pending_tool_calls = resp.message.tool_calls.unwrap_or_default();
-                                react_ctx.transition_to_act();
-                                if react_ctx.show_react {
-                                    let _ = live_send(
-                                        &live_tx,
-                                        json!({"type":"react_phase","phase":"act","cycle":react_ctx.cycles}),
-                                    )
-                                    .await;
-                                }
-                            }
-                            round += 1;
-                        }
-                        Err(e) => {
-                            let _ = live_send(&live_tx, json!({"type":"error","content":e})).await;
-                            break;
-                        }
-                    }
-                } // end Analyze
-
-                // ── Act: execute pending tool calls ──────────────────────────
-                agent::AgentPhase::Act => {
-                    collected_results.clear();
-                    let tool_timeout = state.config.tool_timeout;
-
-                    for tc in &pending_tool_calls {
-                        if run_cancel.is_cancelled() {
-                            shutting_down = cancel.is_cancelled();
-                            run_stopped = !shutting_down;
-                            break 'agent;
-                        }
-
-                        if !live_send(
-                            &live_tx,
-                            json!({
-                                "type":"tool_call",
-                                "id": tc.id,
-                                "name": tc.function.name,
-                                "arguments": tc.function.arguments,
-                            }),
-                        )
-                        .await
-                        {
-                            break 'agent;
-                        }
-
-                        let run_state = if cycle_is_main && is_admin_tool(&tc.function.name) {
-                            run_tool_with_feedback(
-                                &live_tx,
-                                &run_cancel,
-                                &tc.id,
-                                &tc.function.name,
-                                tool_timeout,
-                                async {
-                                    let start = std::time::Instant::now();
-                                    let output = execute_admin_tool(
-                                        &tc.function.name,
-                                        &tc.function.arguments,
-                                        &state,
-                                    )
-                                    .await;
-                                    let duration_ms = start.elapsed().as_millis() as u64;
-                                    let is_error =
-                                        tools::is_tool_error_output(&tc.function.name, &output);
-                                    tools::ToolOutcome {
-                                        output,
-                                        is_error,
-                                        duration_ms,
-                                    }
-                                },
-                            )
-                            .await
-                        } else {
-                            run_tool_with_feedback(
-                                &live_tx,
-                                &run_cancel,
-                                &tc.id,
-                                &tc.function.name,
-                                tool_timeout,
-                                execute_tool(
-                                    &tc.function.name,
-                                    &tc.function.arguments,
-                                    &state.config,
-                                    &state.http,
-                                    &cycle_workspace,
-                                ),
-                            )
-                            .await
-                        };
-
-                        let result = match run_state {
-                            ToolRunState::Completed(result) => result,
-                            ToolRunState::Abort => {
-                                shutting_down = cancel.is_cancelled();
-                                run_stopped = !shutting_down;
-                                break 'agent;
-                            }
-                        };
-
-                        if !live_send(
-                            &live_tx,
-                            json!({
-                                "type":"tool_result",
-                                "id": tc.id,
-                                "name": tc.function.name,
-                                "result": result.output,
-                                "duration_ms": result.duration_ms,
-                                "is_error": result.is_error,
-                            }),
-                        )
-                        .await
-                        {
-                            break 'agent;
-                        }
-
-                        // Collect for Observe phase before persisting
-                        collected_results.push(agent::ToolResultEntry {
-                            id: tc.id.clone(),
-                            name: tc.function.name.clone(),
-                            duration_ms: result.duration_ms,
-                            is_error: result.is_error,
-                            result: result.output.clone(),
-                        });
-
-                        {
-                            let mut sessions = state.sessions.lock().await;
-                            if let Some(session) = sessions.get_mut(&current_session_id) {
-                                session.messages.push(ChatMessage {
-                                    role: "tool".into(),
-                                    content: Some(result.output),
-                                    tool_calls: None,
-                                    tool_call_id: Some(tc.id.clone()),
-                                    timestamp: Some(now_epoch()),
-                                });
-                                session.tool_calls_count += 1;
-                            }
-                        }
-                    }
-
-                    let tc_count = pending_tool_calls.len();
-                    pending_tool_calls.clear();
-                    react_ctx.transition_to_observe(tc_count);
-                    if react_ctx.show_react {
-                        let _ = live_send(
-                            &live_tx,
-                            json!({"type":"react_phase","phase":"observe","cycle":react_ctx.cycles}),
-                        )
-                        .await;
-                    }
-                } // end Act
-
-                // ── Observe: summarize large results, save to disk ───────────
-                agent::AgentPhase::Observe => {
-                    // Non-destructive observation summaries
-                    let summaries = agent::summarize_observations(&collected_results);
-                    for s in &summaries {
-                        let _ = live_send(
-                            &live_tx,
-                            json!({
-                                "type": "observation",
-                                "tool_call_id": s.tool_call_id,
-                                "tool_name": s.tool_name,
-                                "byte_size": s.byte_size,
-                                "line_count": s.line_count,
-                                "hint": s.hint,
-                            }),
-                        )
-                        .await;
-                    }
-                    // Store hint for next Analyze round's system prompt
-                    last_observation_hint = agent::build_observation_context_hint(&summaries);
-                    collected_results.clear();
-
-                    // Incremental save so progress is not lost on crash.
-                    let snapshot = {
-                        let sessions = state.sessions.lock().await;
-                        sessions.get(&current_session_id).cloned()
-                    };
-                    if let Some(ref s) = snapshot {
-                        let _ = save_session_to_disk(s).await;
-                    }
-
-                    // ── AfterObserve hooks ──
-                    let after_observe_events = run_hooks(
-                        &state.hooks,
-                        agent::HookPoint::AfterObserve,
-                        &state.sessions,
-                        &current_session_id,
-                        &state.config,
-                        &state.http,
-                        react_ctx.cycles,
-                    )
-                    .await;
-
-                    for event in after_observe_events {
-                        let _ = live_send(&live_tx, event).await;
-                    }
-
-                    react_ctx.transition_to_analyze();
-                    if react_ctx.show_react {
-                        let _ = live_send(
-                            &live_tx,
-                            json!({"type":"react_phase","phase":"analyze","cycle":react_ctx.cycles}),
-                        )
-                        .await;
-                    }
-                } // end Observe
-
-                // ── Finish: send done, save, break ───────────────────────────
-                agent::AgentPhase::Finish => {
-                    // Incremental save (also covers no-tool responses)
-                    let snapshot = {
-                        let sessions = state.sessions.lock().await;
-                        sessions.get(&current_session_id).cloned()
-                    };
-                    if let Some(ref s) = snapshot {
-                        let _ = save_session_to_disk(s).await;
-                    }
-
-                    // ── OnFinish hooks ──
-                    let on_finish_events = run_hooks(
-                        &state.hooks,
-                        agent::HookPoint::OnFinish,
-                        &state.sessions,
-                        &current_session_id,
-                        &state.config,
-                        &state.http,
-                        react_ctx.cycles,
-                    )
-                    .await;
-
-                    for event in on_finish_events {
-                        let _ = live_send(&live_tx, event).await;
-                    }
-
-                    let finish_label = react_ctx
-                        .finish_reason
-                        .map(|r| r.label())
-                        .unwrap_or("complete");
-
-                    let _ = live_send(
-                        &live_tx,
-                        json!({
-                            "type":"done",
-                            "phase":"finish",
-                            "reason": finish_label,
-                            "cycles": react_ctx.cycles,
-                            "tool_calls": react_ctx.tool_calls,
-                        }),
-                    )
-                    .await;
-                    break;
-                } // end Finish
-            } // end match
-        } // end 'agent loop
-
-        // Clean up per-run cancellation token
-        {
-            let mut runs = state.active_runs.lock().await;
-            runs.remove(&current_session_id);
-        }
-
-        // If the agent finished normally but there are pending interventions
-        // that arrived during/after the last cycle, persist them and re-run
-        // the agent so the user's message gets a response.
-        if !run_stopped && !shutting_down && !pending_interventions.is_empty() {
-            {
-                let mut sessions = state.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(&current_session_id) {
-                    for text in pending_interventions.drain(..) {
-                        session.messages.push(ChatMessage {
-                            role: "user".into(),
-                            content: Some(text),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            timestamp: Some(now_epoch()),
-                        });
-                    }
-                    session.updated_at = now_epoch();
-                }
-            }
-            rerun_agent = true;
-        }
-
-        if run_stopped {
-            // Persist any pending interventions so they survive in history
-            if !pending_interventions.is_empty() {
-                let mut sessions = state.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(&current_session_id) {
-                    for text in pending_interventions.drain(..) {
-                        session.messages.push(ChatMessage {
-                            role: "user".into(),
-                            content: Some(text),
-                            tool_calls: None,
-                            tool_call_id: None,
-                            timestamp: Some(now_epoch()),
-                        });
-                    }
-                }
-            }
-            // Trim incomplete tool calls from session history
-            {
-                let mut sessions = state.sessions.lock().await;
-                if let Some(session) = sessions.get_mut(&current_session_id) {
-                    session_store::trim_incomplete_tool_calls(&mut session.messages);
-                }
-            }
-            let _ = live_send(
-                &live_tx,
-                json!({"type":"done","phase":"stopped","reason":"user_stop","cycles":react_ctx.cycles,"tool_calls":react_ctx.tool_calls}),
-            )
-            .await;
-        }
-
-        if shutting_down {
-            let _ = live_send(
-                &live_tx,
-                json!({"type":"system","content":"Server shutting down."}),
-            )
-            .await;
-        }
-
-        if shutting_down {
+        if outcome.shutting_down {
             break;
         }
     }
@@ -2166,9 +1350,13 @@ async fn main() {
     println!("🦀 LingClaw v2 listening on http://{addr}");
     println!("   Tools: think, exec, read_file, write_file, patch_file, list_dir, search_files, http_fetch");
 
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .expect("failed to bind");
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            eprintln!("Failed to bind {addr}: {error}");
+            return;
+        }
+    };
 
     let shutdown_signal = {
         let s = shutdown.clone();

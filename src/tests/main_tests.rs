@@ -1898,23 +1898,6 @@ fn system_prompt_with_observation_hint_preserves_original_content() {
 }
 
 #[test]
-fn hard_cap_events_include_terminal_done_message() {
-    let (system_event, done_event) = build_agent_hard_cap_events(200, 3, 7);
-
-    assert_eq!(system_event["type"], "system");
-    assert_eq!(
-        system_event["content"],
-        "Detected abnormal tool loop (200 consecutive rounds). Stopping."
-    );
-
-    assert_eq!(done_event["type"], "done");
-    assert_eq!(done_event["phase"], "hard_cap");
-    assert_eq!(done_event["reason"], "hard_cap");
-    assert_eq!(done_event["cycles"], 3);
-    assert_eq!(done_event["tool_calls"], 7);
-}
-
-#[test]
 fn finish_reason_label_appears_in_done_event_shape() {
     // Verify FinishReason labels are valid strings for the done event
     assert_eq!(agent::FinishReason::Complete.label(), "complete");
@@ -2622,7 +2605,7 @@ fn help_command_lists_usage_without_extra_indent() {
         .contains("  /status          Show session status"));
     assert!(result
         .response
-        .contains("/mcp             Show MCP load status"));
+        .contains("/mcp [refresh]   Show MCP load status or refresh cache"));
     assert!(result
         .response
         .contains("/usage           Show session token usage"));

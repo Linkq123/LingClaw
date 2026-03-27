@@ -22,6 +22,22 @@ fn think_level_to_budget_all_levels() {
 }
 
 #[test]
+fn drain_sse_lines_preserves_partial_tail() {
+    let mut partial = String::new();
+
+    let first = drain_sse_lines(&mut partial, "data: one\ndata: two");
+    assert_eq!(first, vec!["data: one".to_string()]);
+    assert_eq!(partial, "data: two");
+
+    let second = drain_sse_lines(&mut partial, "\ndata: three\n");
+    assert_eq!(
+        second,
+        vec!["data: two".to_string(), "data: three".to_string()]
+    );
+    assert!(partial.is_empty());
+}
+
+#[test]
 fn convert_messages_to_openai_all_roles() {
     let messages = vec![
         ChatMessage {
@@ -251,6 +267,63 @@ fn anthropic_tools_do_not_add_cache_control_when_disabled() {
     maybe_apply_anthropic_tool_cache_control(&mut tools, false);
     assert!(tools[0].get("cache_control").is_none());
     assert!(tools[1].get("cache_control").is_none());
+}
+
+#[test]
+fn process_openai_data_line_reports_done_marker() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let live_tx: LiveTx = tx;
+
+    let done = rt.block_on(async {
+        let mut state = OpenAiStreamState {
+            content_buf: String::new(),
+            tool_calls: Vec::new(),
+            input_tokens: None,
+            output_tokens: None,
+            client_gone: false,
+            reasoning_started: false,
+        };
+        process_openai_data_line("[DONE]", &live_tx, &mut state).await
+    });
+
+    assert!(done);
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn process_anthropic_sse_line_keeps_event_type_between_lines() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let live_tx: LiveTx = tx;
+
+    let content = rt.block_on(async {
+        let mut state = AnthropicStreamState {
+            current_event_type: String::new(),
+            content_buf: String::new(),
+            tool_calls: Vec::new(),
+            input_tokens: None,
+            output_tokens: None,
+            block_tool_idx: HashMap::new(),
+            client_gone: false,
+            reasoning_started: false,
+            thinking_block_idx: None,
+        };
+
+        process_anthropic_sse_line("event: content_block_delta", &live_tx, &mut state).await;
+
+        process_anthropic_sse_line(
+            r#"data: {"delta":{"type":"text_delta","text":"tail"},"index":0}"#,
+            &live_tx,
+            &mut state,
+        )
+        .await;
+
+        state.content_buf
+    });
+
+    assert_eq!(content, "tail");
+    assert!(rx.try_recv().is_ok());
 }
 
 #[test]

@@ -171,3 +171,23 @@ fn mcp_check_succeeded_returns_false_when_any_server_fails() {
 fn mcp_check_succeeded_returns_true_for_empty_reports() {
     assert!(mcp_check_succeeded(&[]));
 }
+
+#[test]
+fn remote_cargo_toml_refs_include_main_and_master_fallbacks() {
+    let refs = remote_cargo_toml_refs();
+
+    assert!(refs.iter().any(|value| value == "origin/main:Cargo.toml"));
+    assert!(refs.iter().any(|value| value == "origin/master:Cargo.toml"));
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn build_systemd_service_unit_quotes_paths_with_spaces() {
+    let exe = std::path::Path::new("/tmp/LingClaw Bin/lingclaw");
+    let working_dir = std::path::Path::new("/tmp/LingClaw Bin");
+    let unit = build_systemd_service_unit(exe, working_dir, "demo", "/home/demo user");
+
+    assert!(unit.contains("WorkingDirectory=\"/tmp/LingClaw Bin\""));
+    assert!(unit.contains("Environment=\"HOME=/home/demo user\""));
+    assert!(unit.contains("ExecStart=\"/tmp/LingClaw Bin/lingclaw\" --serve"));
+}

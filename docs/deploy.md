@@ -42,6 +42,7 @@ lingclaw stop       # 停止服务
 lingclaw restart    # 重启服务
 lingclaw health     # 健康检查
 lingclaw status     # 详细状态（地址、版本、providers、models）
+lingclaw mcp-check  # 深度检查 MCP server 连接与工具发现
 lingclaw update     # 检查版本，有更新时 rebuild 并重启
 lingclaw install    # 从本地源码安装（当前目录）
 lingclaw install -d E:\path\to\src  # 从指定目录安装
@@ -134,6 +135,7 @@ lingclaw stop       # 停止服务
 lingclaw restart    # 重启服务
 lingclaw health     # 健康检查
 lingclaw status     # 详细状态（含版本号）
+lingclaw mcp-check  # 深度检查 MCP server 连接与工具发现
 lingclaw update     # 检查版本，有更新时 rebuild 并重启
 lingclaw install    # 从本地源码安装（当前目录）
 lingclaw install -d /path/to/src  # 从指定目录安装
@@ -141,6 +143,14 @@ lingclaw systemd-install    # 安装并启用 lingclaw.service
 lingclaw help       # 查看帮助信息
 lingclaw --version  # 显示版本号
 ```
+
+说明：
+
+- `start` / `restart` 会先执行受限的一次性 MCP preflight；失败只会给出警告，不会阻止服务启动
+- `mcp-check` 会按运行时超时配置做更深的 MCP 诊断，适合排查 `command`、`cwd`、协议握手或工具发现问题
+- 浏览器聊天页可用 `/mcp` 查看当前已加载的 MCP server 状态，`/mcp refresh` 会清空缓存并重新探测 tools；服务端发出的 `notifications/tools/list_changed` 也会让下一次工具发现自动刷新
+- 运行时的 MCP 空闲会话会自动回收，因此 `mcp-check` 的一次性诊断进程和聊天页的长生命周期工具会话不会相互复用
+- `stop` 会优先走本地认证的优雅关停端点 `/api/shutdown`，超时后才回退到强制结束进程
 
 ### 2.3 systemd 服务（可选）
 
@@ -155,6 +165,7 @@ journalctl -u lingclaw.service -f
 ```
 
 配置了 `systemd` 后，`lingclaw start`、`stop`、`restart` 会自动转为管理 `lingclaw.service`。`install` / `update` 触发服务恢复时，也会重启这个服务，而不是再额外起一个 `nohup` 进程。
+`systemd-install` 生成的 unit 会对可执行文件、工作目录和 `HOME` 环境值做引用处理，因此安装路径或家目录包含空格时也能正确启动。
 
 ### 2.4 反向代理（可选）
 

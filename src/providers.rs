@@ -3,7 +3,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -32,6 +32,27 @@ pub(crate) struct LlmResponse {
     pub(crate) message: ChatMessage,
     pub(crate) input_tokens: Option<u64>,
     pub(crate) output_tokens: Option<u64>,
+}
+
+struct OpenAiStreamState {
+    content_buf: String,
+    tool_calls: Vec<ToolCall>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    client_gone: bool,
+    reasoning_started: bool,
+}
+
+struct AnthropicStreamState {
+    current_event_type: String,
+    content_buf: String,
+    tool_calls: Vec<ToolCall>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    block_tool_idx: HashMap<usize, usize>,
+    client_gone: bool,
+    reasoning_started: bool,
+    thinking_block_idx: Option<usize>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -186,8 +207,14 @@ fn convert_messages_to_anthropic(messages: &[ChatMessage]) -> (String, Vec<serde
                 }
                 if let Some(tool_calls) = &msg.tool_calls {
                     for tc in tool_calls {
-                        let input: serde_json::Value =
-                            serde_json::from_str(&tc.function.arguments).unwrap_or(json!({}));
+                        let input: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                            .unwrap_or_else(|e| {
+                                eprintln!(
+                                    "warn: failed to parse tool arguments for {}: {e}",
+                                    tc.function.name
+                                );
+                                json!({})
+                            });
                         content_blocks.push(json!({
                             "type": "tool_use",
                             "id": tc.id,
@@ -377,16 +404,232 @@ pub(crate) async fn call_llm_stream(
     }
 }
 
-async fn call_llm_stream_openai(
-    http: &Client,
+async fn process_openai_data_line(data: &str, tx: &LiveTx, state: &mut OpenAiStreamState) -> bool {
+    if data == "[DONE]" {
+        return true;
+    }
+
+    if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
+        if let Some(usage) = &chunk.usage {
+            if let Some(value) = usage.prompt_tokens {
+                state.input_tokens = Some(value);
+            }
+            if let Some(value) = usage.completion_tokens {
+                state.output_tokens = Some(value);
+            }
+        }
+        if let Some(choices) = chunk.choices {
+            for choice in choices {
+                if let Some(think_text) = &choice.delta.reasoning_content {
+                    if !think_text.is_empty() && !state.client_gone {
+                        if !state.reasoning_started {
+                            state.reasoning_started = true;
+                            state.client_gone =
+                                !live_send(tx, json!({"type":"thinking_start"})).await;
+                        }
+                        if !state.client_gone {
+                            state.client_gone = !live_send(
+                                tx,
+                                json!({"type":"thinking_delta","content":think_text}),
+                            )
+                            .await;
+                        }
+                    }
+                }
+                if let Some(text) = &choice.delta.content {
+                    if state.reasoning_started && !state.client_gone {
+                        state.reasoning_started = false;
+                        state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+                    }
+                    state.content_buf.push_str(text);
+                    if !state.client_gone
+                        && !live_send(tx, json!({"type":"delta","content":text})).await
+                    {
+                        state.client_gone = true;
+                    }
+                }
+                if let Some(tc_deltas) = &choice.delta.tool_calls {
+                    for d in tc_deltas {
+                        let idx = d.index.unwrap_or(0);
+                        while state.tool_calls.len() <= idx {
+                            state.tool_calls.push(ToolCall {
+                                id: String::new(),
+                                call_type: "function".into(),
+                                function: FunctionCall {
+                                    name: String::new(),
+                                    arguments: String::new(),
+                                },
+                            });
+                        }
+                        if let Some(id) = &d.id {
+                            state.tool_calls[idx].id.clone_from(id);
+                        }
+                        if let Some(f) = &d.function {
+                            if let Some(n) = &f.name {
+                                state.tool_calls[idx].function.name.push_str(n);
+                            }
+                            if let Some(a) = &f.arguments {
+                                state.tool_calls[idx].function.arguments.push_str(a);
+                            }
+                        }
+                    }
+                }
+                if choice.finish_reason.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+async fn process_anthropic_sse_line(line: &str, tx: &LiveTx, state: &mut AnthropicStreamState) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    if let Some(event) = line.strip_prefix("event: ") {
+        state.current_event_type = event.trim().to_string();
+        return;
+    }
+    if let Some(data) = line.strip_prefix("data: ") {
+        let data = data.trim();
+        match state.current_event_type.as_str() {
+            "message_start" => {
+                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
+                    if let Some(message) = evt.message.as_ref() {
+                        if let Some(usage) = message.usage.as_ref() {
+                            state.input_tokens = Some(total_anthropic_input_tokens(usage));
+                            state.output_tokens = usage.output_tokens;
+                        }
+                    }
+                }
+            }
+            "message_delta" => {
+                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
+                    if let Some(usage) = evt.usage.as_ref() {
+                        state.input_tokens = Some(total_anthropic_input_tokens(usage));
+                        if let Some(value) = usage.output_tokens {
+                            state.output_tokens = Some(value);
+                        }
+                    }
+                }
+            }
+            "content_block_start" => {
+                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
+                    if let Some(block) = &evt.content_block {
+                        match block.block_type.as_str() {
+                            "thinking" => {
+                                state.thinking_block_idx = evt.index;
+                                if !state.client_gone {
+                                    state.reasoning_started = true;
+                                    state.client_gone =
+                                        !live_send(tx, json!({"type":"thinking_start"})).await;
+                                }
+                            }
+                            "tool_use" => {
+                                let idx = state.tool_calls.len();
+                                state.tool_calls.push(ToolCall {
+                                    id: block.id.clone().unwrap_or_default(),
+                                    call_type: "function".into(),
+                                    function: FunctionCall {
+                                        name: block.name.clone().unwrap_or_default(),
+                                        arguments: String::new(),
+                                    },
+                                });
+                                if let Some(block_idx) = evt.index {
+                                    state.block_tool_idx.insert(block_idx, idx);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            "content_block_delta" => {
+                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
+                    if let Some(delta) = &evt.delta {
+                        match delta.delta_type.as_deref() {
+                            Some("thinking_delta") => {
+                                if let Some(text) = &delta.thinking {
+                                    if !text.is_empty() && !state.client_gone {
+                                        state.client_gone = !live_send(
+                                            tx,
+                                            json!({"type":"thinking_delta","content":text}),
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            Some("text_delta") => {
+                                if let Some(text) = &delta.text {
+                                    state.content_buf.push_str(text);
+                                    if !state.client_gone
+                                        && !live_send(tx, json!({"type":"delta","content":text}))
+                                            .await
+                                    {
+                                        state.client_gone = true;
+                                    }
+                                }
+                            }
+                            Some("input_json_delta") => {
+                                if let Some(json_str) = &delta.partial_json {
+                                    if let Some(block_idx) = evt.index {
+                                        if let Some(&tc_idx) = state.block_tool_idx.get(&block_idx)
+                                        {
+                                            if tc_idx < state.tool_calls.len() {
+                                                state.tool_calls[tc_idx]
+                                                    .function
+                                                    .arguments
+                                                    .push_str(json_str);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            "content_block_stop" => {
+                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
+                    if state.thinking_block_idx.is_some() && evt.index == state.thinking_block_idx {
+                        state.thinking_block_idx = None;
+                        state.reasoning_started = false;
+                        if !state.client_gone {
+                            state.client_gone =
+                                !live_send(tx, json!({"type":"thinking_done"})).await;
+                        }
+                    }
+                }
+            }
+            "message_stop" => {}
+            _ => {}
+        }
+        state.current_event_type.clear();
+    }
+}
+
+fn drain_sse_lines(partial_buf: &mut String, chunk: &str) -> Vec<String> {
+    partial_buf.push_str(chunk);
+    let mut lines: Vec<String> = partial_buf
+        .split('\n')
+        .map(|line| line.to_string())
+        .collect();
+    let leftover = lines.pop().unwrap_or_default();
+    *partial_buf = leftover;
+    lines
+}
+
+fn build_openai_stream_body(
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
-    tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
-) -> Result<LlmResponse, String> {
+) -> serde_json::Value {
     let thinking_on = think_level != "off";
-    let url = format!("{}/chat/completions", resolved.api_base);
     let api_messages = convert_messages_to_openai(messages);
     let mut all_tools: Vec<serde_json::Value> =
         serde_json::from_value(tools::tool_definitions()).unwrap_or_default();
@@ -403,168 +646,76 @@ async fn call_llm_stream_openai(
         body["stream_options"] = json!({ "include_usage": true });
     }
     if thinking_on {
-        let fmt = resolved.thinking_format.as_deref().unwrap_or("openai");
-        match fmt {
+        match resolved.thinking_format.as_deref().unwrap_or("openai") {
             "qwen" => {
                 body["enable_thinking"] = json!(true);
             }
             _ => {
-                // OpenAI-compatible reasoning_effort
                 body["reasoning_effort"] = json!(think_level_to_reasoning_effort(think_level));
             }
         }
     }
-    if let Some(mt) = resolved.max_tokens {
-        body["max_tokens"] = json!(mt);
+    if let Some(max_tokens) = resolved.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
     }
+    body
+}
 
-    let resp = http
-        .post(&url)
-        .bearer_auth(&resolved.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP error: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("API {status}: {text}"));
-    }
-
-    let mut stream = resp.bytes_stream();
-    let mut content_buf = String::new();
-    let mut tool_calls: Vec<ToolCall> = Vec::new();
-    let mut input_tokens: Option<u64> = None;
-    let mut output_tokens: Option<u64> = None;
+async fn consume_openai_stream<S, B>(
+    stream: &mut S,
+    tx: &LiveTx,
+    state: &mut OpenAiStreamState,
+) -> Result<(), String>
+where
+    S: Stream<Item = Result<B, reqwest::Error>> + Unpin,
+    B: AsRef<[u8]>,
+{
     let mut partial_buf = String::new();
-    let mut client_gone = false;
-    let mut reasoning_started = false;
+    let mut stream_done = false;
 
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
-        partial_buf.push_str(&String::from_utf8_lossy(&chunk));
+        let chunk = chunk.map_err(|error| format!("stream error: {error}"))?;
+        let lines = drain_sse_lines(&mut partial_buf, &String::from_utf8_lossy(chunk.as_ref()));
 
-        let lines: Vec<&str> = partial_buf.split('\n').collect();
-        let (complete, rest) = lines.split_at(lines.len() - 1);
-        let leftover = rest.first().copied().unwrap_or("");
-
-        for line in complete {
+        for line in lines {
             let line = line.trim();
             if line.is_empty() || line.starts_with(':') {
                 continue;
             }
             if let Some(data) = line.strip_prefix("data: ") {
-                let data = data.trim();
-                if data == "[DONE]" {
+                if process_openai_data_line(data.trim(), tx, state).await {
+                    stream_done = true;
                     break;
-                }
-                if let Ok(chunk) = serde_json::from_str::<StreamChunk>(data) {
-                    if let Some(usage) = &chunk.usage {
-                        if let Some(value) = usage.prompt_tokens {
-                            input_tokens = Some(value);
-                        }
-                        if let Some(value) = usage.completion_tokens {
-                            output_tokens = Some(value);
-                        }
-                    }
-                    if let Some(choices) = chunk.choices {
-                        for choice in choices {
-                            // Stream reasoning deltas live so the panel
-                            // appears while the model is still thinking.
-                            if let Some(think_text) = &choice.delta.reasoning_content {
-                                if !think_text.is_empty() && !client_gone {
-                                    if !reasoning_started {
-                                        reasoning_started = true;
-                                        client_gone =
-                                            !live_send(tx, json!({"type":"thinking_start"})).await;
-                                    }
-                                    if !client_gone {
-                                        client_gone = !live_send(
-                                            tx,
-                                            json!({"type":"thinking_delta","content":think_text}),
-                                        )
-                                        .await;
-                                    }
-                                }
-                            }
-                            // Content delta — close reasoning panel first
-                            if let Some(text) = &choice.delta.content {
-                                if reasoning_started && !client_gone {
-                                    reasoning_started = false;
-                                    client_gone =
-                                        !live_send(tx, json!({"type":"thinking_done"})).await;
-                                }
-                                content_buf.push_str(text);
-                                if !client_gone
-                                    && !live_send(tx, json!({"type":"delta","content":text})).await
-                                {
-                                    client_gone = true;
-                                }
-                            }
-                            // Tool call deltas
-                            if let Some(tc_deltas) = &choice.delta.tool_calls {
-                                for d in tc_deltas {
-                                    let idx = d.index.unwrap_or(0);
-                                    while tool_calls.len() <= idx {
-                                        tool_calls.push(ToolCall {
-                                            id: String::new(),
-                                            call_type: "function".into(),
-                                            function: FunctionCall {
-                                                name: String::new(),
-                                                arguments: String::new(),
-                                            },
-                                        });
-                                    }
-                                    if let Some(id) = &d.id {
-                                        tool_calls[idx].id.clone_from(id);
-                                    }
-                                    if let Some(f) = &d.function {
-                                        if let Some(n) = &f.name {
-                                            tool_calls[idx].function.name.push_str(n);
-                                        }
-                                        if let Some(a) = &f.arguments {
-                                            tool_calls[idx].function.arguments.push_str(a);
-                                        }
-                                    }
-                                }
-                            }
-                            if choice.finish_reason.is_some() {
-                                break;
-                            }
-                        }
-                    }
                 }
             }
         }
-        partial_buf = leftover.to_string();
+
+        if stream_done {
+            break;
+        }
     }
 
-    if reasoning_started && !client_gone {
-        client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
-    }
-    if client_gone {
-        return Err("Client disconnected".into());
+    if !stream_done {
+        let trailing = partial_buf.trim();
+        if let Some(data) = trailing.strip_prefix("data: ") {
+            let _ = process_openai_data_line(data.trim(), tx, state).await;
+        }
     }
 
-    build_llm_response(content_buf, tool_calls, input_tokens, output_tokens)
+    Ok(())
 }
 
-async fn call_llm_stream_anthropic(
-    http: &Client,
+fn build_anthropic_stream_body(
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
-    tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
-) -> Result<LlmResponse, String> {
+) -> serde_json::Value {
     let thinking_on = think_level != "off";
     let (system_prompt, anthropic_msgs) = convert_messages_to_anthropic(messages);
-    let url = format!("{}/v1/messages", resolved.api_base);
     let base_max = resolved.max_tokens.unwrap_or(8192);
     let effective_max = if thinking_on {
-        let budget = think_level_to_budget(think_level);
-        base_max + budget
+        base_max.saturating_add(think_level_to_budget(think_level))
     } else {
         base_max
     };
@@ -589,6 +740,97 @@ async fn call_llm_stream_anthropic(
     if !system_prompt.is_empty() {
         body["system"] = anthropic_system_payload(&system_prompt, cache_enabled);
     }
+    body
+}
+
+async fn consume_anthropic_stream<S, B>(
+    stream: &mut S,
+    tx: &LiveTx,
+    state: &mut AnthropicStreamState,
+) -> Result<(), String>
+where
+    S: Stream<Item = Result<B, reqwest::Error>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    let mut partial_buf = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("stream error: {error}"))?;
+        let lines = drain_sse_lines(&mut partial_buf, &String::from_utf8_lossy(chunk.as_ref()));
+
+        for line in lines {
+            process_anthropic_sse_line(&line, tx, state).await;
+        }
+    }
+
+    if !partial_buf.trim().is_empty() {
+        process_anthropic_sse_line(partial_buf.trim(), tx, state).await;
+    }
+
+    Ok(())
+}
+
+async fn call_llm_stream_openai(
+    http: &Client,
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+    tx: &LiveTx,
+    think_level: &str,
+    extra_tools: &[serde_json::Value],
+) -> Result<LlmResponse, String> {
+    let url = format!("{}/chat/completions", resolved.api_base);
+    let body = build_openai_stream_body(resolved, messages, think_level, extra_tools);
+
+    let resp = http
+        .post(&url)
+        .bearer_auth(&resolved.api_key)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP error: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(format!("API {status}: {text}"));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut stream_state = OpenAiStreamState {
+        content_buf: String::new(),
+        tool_calls: Vec::new(),
+        input_tokens: None,
+        output_tokens: None,
+        client_gone: false,
+        reasoning_started: false,
+    };
+    consume_openai_stream(&mut stream, tx, &mut stream_state).await?;
+
+    if stream_state.reasoning_started && !stream_state.client_gone {
+        stream_state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+    }
+    if stream_state.client_gone {
+        return Err("Client disconnected".into());
+    }
+
+    build_llm_response(
+        stream_state.content_buf,
+        stream_state.tool_calls,
+        stream_state.input_tokens,
+        stream_state.output_tokens,
+    )
+}
+
+async fn call_llm_stream_anthropic(
+    http: &Client,
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+    tx: &LiveTx,
+    think_level: &str,
+    extra_tools: &[serde_json::Value],
+) -> Result<LlmResponse, String> {
+    let url = format!("{}/v1/messages", resolved.api_base);
+    let body = build_anthropic_stream_body(resolved, messages, think_level, extra_tools);
 
     let resp = http
         .post(&url)
@@ -607,171 +849,32 @@ async fn call_llm_stream_anthropic(
     }
 
     let mut stream = resp.bytes_stream();
-    let mut content_buf = String::new();
-    let mut tool_calls: Vec<ToolCall> = Vec::new();
-    let mut input_tokens: Option<u64> = None;
-    let mut output_tokens: Option<u64> = None;
-    let mut partial_buf = String::new();
-    // Track current content block index → tool_calls index mapping
-    let mut block_tool_idx: HashMap<usize, usize> = HashMap::new();
-    let mut client_gone = false;
-    let mut reasoning_started = false;
-    let mut thinking_block_idx: Option<usize> = None;
+    let mut stream_state = AnthropicStreamState {
+        current_event_type: String::new(),
+        content_buf: String::new(),
+        tool_calls: Vec::new(),
+        input_tokens: None,
+        output_tokens: None,
+        block_tool_idx: HashMap::new(),
+        client_gone: false,
+        reasoning_started: false,
+        thinking_block_idx: None,
+    };
+    consume_anthropic_stream(&mut stream, tx, &mut stream_state).await?;
 
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("stream error: {e}"))?;
-        partial_buf.push_str(&String::from_utf8_lossy(&chunk));
-
-        let lines: Vec<&str> = partial_buf.split('\n').collect();
-        let (complete, rest) = lines.split_at(lines.len() - 1);
-        let leftover = rest.first().copied().unwrap_or("");
-
-        let mut current_event_type = String::new();
-        for line in complete {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(event) = line.strip_prefix("event: ") {
-                current_event_type = event.trim().to_string();
-                continue;
-            }
-            if let Some(data) = line.strip_prefix("data: ") {
-                let data = data.trim();
-                match current_event_type.as_str() {
-                    "message_start" => {
-                        if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
-                            if let Some(message) = evt.message.as_ref() {
-                                if let Some(usage) = message.usage.as_ref() {
-                                    input_tokens = Some(total_anthropic_input_tokens(usage));
-                                    output_tokens = usage.output_tokens;
-                                }
-                            }
-                        }
-                    }
-                    "message_delta" => {
-                        if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
-                            if let Some(usage) = evt.usage.as_ref() {
-                                input_tokens = Some(total_anthropic_input_tokens(usage));
-                                if let Some(value) = usage.output_tokens {
-                                    output_tokens = Some(value);
-                                }
-                            }
-                        }
-                    }
-                    "content_block_start" => {
-                        if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
-                            if let Some(block) = &evt.content_block {
-                                match block.block_type.as_str() {
-                                    "thinking" => {
-                                        thinking_block_idx = evt.index;
-                                        if !client_gone {
-                                            reasoning_started = true;
-                                            client_gone =
-                                                !live_send(tx, json!({"type":"thinking_start"}))
-                                                    .await;
-                                        }
-                                    }
-                                    "tool_use" => {
-                                        let idx = tool_calls.len();
-                                        tool_calls.push(ToolCall {
-                                            id: block.id.clone().unwrap_or_default(),
-                                            call_type: "function".into(),
-                                            function: FunctionCall {
-                                                name: block.name.clone().unwrap_or_default(),
-                                                arguments: String::new(),
-                                            },
-                                        });
-                                        if let Some(block_idx) = evt.index {
-                                            block_tool_idx.insert(block_idx, idx);
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    "content_block_delta" => {
-                        if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
-                            if let Some(delta) = &evt.delta {
-                                match delta.delta_type.as_deref() {
-                                    Some("thinking_delta") => {
-                                        if let Some(text) = &delta.thinking {
-                                            if !text.is_empty() && !client_gone {
-                                                client_gone = !live_send(
-                                                    tx,
-                                                    json!({"type":"thinking_delta","content":text}),
-                                                )
-                                                .await;
-                                            }
-                                        }
-                                    }
-                                    Some("text_delta") => {
-                                        if let Some(text) = &delta.text {
-                                            content_buf.push_str(text);
-                                            if !client_gone
-                                                && !live_send(
-                                                    tx,
-                                                    json!({"type":"delta","content":text}),
-                                                )
-                                                .await
-                                            {
-                                                client_gone = true;
-                                            }
-                                        }
-                                    }
-                                    Some("input_json_delta") => {
-                                        if let Some(json_str) = &delta.partial_json {
-                                            if let Some(block_idx) = evt.index {
-                                                if let Some(&tc_idx) =
-                                                    block_tool_idx.get(&block_idx)
-                                                {
-                                                    if tc_idx < tool_calls.len() {
-                                                        tool_calls[tc_idx]
-                                                            .function
-                                                            .arguments
-                                                            .push_str(json_str);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    "content_block_stop" => {
-                        if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
-                            if thinking_block_idx.is_some() && evt.index == thinking_block_idx {
-                                thinking_block_idx = None;
-                                reasoning_started = false;
-                                if !client_gone {
-                                    client_gone =
-                                        !live_send(tx, json!({"type":"thinking_done"})).await;
-                                }
-                            }
-                        }
-                    }
-                    "message_stop" => {
-                        // End of message
-                    }
-                    _ => {}
-                }
-                current_event_type.clear();
-            }
-        }
-        partial_buf = leftover.to_string();
+    if stream_state.reasoning_started && !stream_state.client_gone {
+        stream_state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
     }
-
-    if reasoning_started && !client_gone {
-        client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
-    }
-    if client_gone {
+    if stream_state.client_gone {
         return Err("Client disconnected".into());
     }
 
-    build_llm_response(content_buf, tool_calls, input_tokens, output_tokens)
+    build_llm_response(
+        stream_state.content_buf,
+        stream_state.tool_calls,
+        stream_state.input_tokens,
+        stream_state.output_tokens,
+    )
 }
 
 fn build_llm_response(
