@@ -1526,23 +1526,15 @@ fn handle_install_command(port_override: Option<u16>) -> bool {
                             }
                         }
                     }
-                    match install_system_skills(&source_dir) {
-                        Ok(()) => println!("   ✅ System skills installed"),
-                        Err(e) => eprintln!("   ⚠ Failed to install system skills: {e}"),
-                    }
                 } else {
                     println!("   ✅ Build complete (v{source_version})");
-                    match install_system_skills(&source_dir) {
-                        Ok(()) => println!("   ✅ System skills installed"),
-                        Err(e) => eprintln!("   ⚠ Failed to install system skills: {e}"),
-                    }
                 }
             } else {
                 println!("   ✅ Build complete (v{source_version})");
-                match install_system_skills(&source_dir) {
-                    Ok(()) => println!("   ✅ System skills installed"),
-                    Err(e) => eprintln!("   ⚠ Failed to install system skills: {e}"),
-                }
+            }
+            match install_system_skills(&source_dir) {
+                Ok(()) => println!("   ✅ System skills installed"),
+                Err(e) => eprintln!("   ⚠ Failed to install system skills: {e}"),
             }
             if was_running {
                 println!("Starting service...");

@@ -79,20 +79,27 @@ pub(crate) fn resolve_skill_path(virtual_path: &str) -> Option<PathBuf> {
     const SYSTEM_PREFIX: &str = "system://skills/";
     const GLOBAL_PREFIX: &str = "~/.lingclaw/skills/";
 
-    if let Some(relative) = virtual_path.strip_prefix(SYSTEM_PREFIX) {
-        let dir = system_skills_dir()?;
-        let full = dir.join(relative);
-        if full.exists() {
-            return Some(full);
-        }
-    } else if let Some(relative) = virtual_path.strip_prefix(GLOBAL_PREFIX) {
-        let dir = global_skills_dir()?;
-        let full = dir.join(relative);
-        if full.exists() {
-            return Some(full);
-        }
+    let (relative, base_dir) = if let Some(rel) = virtual_path.strip_prefix(SYSTEM_PREFIX) {
+        (rel, system_skills_dir()?)
+    } else if let Some(rel) = virtual_path.strip_prefix(GLOBAL_PREFIX) {
+        (rel, global_skills_dir()?)
+    } else {
+        return None;
+    };
+
+    // Reject path traversal attempts
+    if relative.contains("..") {
+        return None;
     }
-    None
+
+    let full = base_dir.join(relative);
+    // Canonicalize and verify the resolved path stays inside the base directory
+    let canonical = full.canonicalize().ok()?;
+    let canonical_base = base_dir.canonicalize().ok()?;
+    if !canonical.starts_with(&canonical_base) {
+        return None;
+    }
+    Some(canonical)
 }
 
 /// Global skills directory: `~/.lingclaw/skills/`.
