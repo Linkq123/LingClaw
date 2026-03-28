@@ -84,6 +84,15 @@ install_release() {
   else
     warn 'Static frontend assets directory not found; web UI may return 404.'
   fi
+  # Install system skills to ~/.lingclaw/system-skills/
+  local system_skills_src="$ROOT_DIR/docs/reference/skills"
+  local system_skills_dst="$HOME/.lingclaw/system-skills"
+  if [[ -d "$system_skills_src" ]]; then
+    rm -rf "$system_skills_dst"
+    mkdir -p "$system_skills_dst"
+    cp -R "$system_skills_src/." "$system_skills_dst/"
+    info "Installed system skills to $system_skills_dst"
+  fi
   export PATH="$cargo_bin:$PATH"
 }
 

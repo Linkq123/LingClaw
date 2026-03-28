@@ -724,6 +724,23 @@ fn install_frontend_assets(source_dir: &Path, install_dir: &Path) -> io::Result<
     copy_dir_recursive(&source_static, &target_static)
 }
 
+/// Copy system skills from source `docs/reference/skills/` to `~/.lingclaw/system-skills/`.
+fn install_system_skills(source_dir: &Path) -> io::Result<()> {
+    let source_skills = source_dir.join("docs").join("reference").join("skills");
+    if !source_skills.is_dir() {
+        return Ok(());
+    }
+    let target = match config_dir_path() {
+        Some(d) => d.join("system-skills"),
+        None => return Ok(()),
+    };
+    // Remove stale target so we get a clean copy
+    if target.is_dir() {
+        std::fs::remove_dir_all(&target)?;
+    }
+    copy_dir_recursive(&source_skills, &target)
+}
+
 fn install_built_binary(built_exe: &Path, current_exe: &Path) -> io::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -1084,6 +1101,10 @@ fn handle_update_command(port_override: Option<u16>) -> bool {
                 let _ = std::fs::remove_file(p);
             }
             println!("   ✅ Build complete (v{new_version})");
+            match install_system_skills(&workspace) {
+                Ok(()) => println!("   ✅ System skills updated"),
+                Err(e) => eprintln!("   ⚠ Failed to update system skills: {e}"),
+            }
             println!("Starting...");
             handle_start_command(port_override);
         }
@@ -1505,11 +1526,23 @@ fn handle_install_command(port_override: Option<u16>) -> bool {
                             }
                         }
                     }
+                    match install_system_skills(&source_dir) {
+                        Ok(()) => println!("   ✅ System skills installed"),
+                        Err(e) => eprintln!("   ⚠ Failed to install system skills: {e}"),
+                    }
                 } else {
                     println!("   ✅ Build complete (v{source_version})");
+                    match install_system_skills(&source_dir) {
+                        Ok(()) => println!("   ✅ System skills installed"),
+                        Err(e) => eprintln!("   ⚠ Failed to install system skills: {e}"),
+                    }
                 }
             } else {
                 println!("   ✅ Build complete (v{source_version})");
+                match install_system_skills(&source_dir) {
+                    Ok(()) => println!("   ✅ System skills installed"),
+                    Err(e) => eprintln!("   ⚠ Failed to install system skills: {e}"),
+                }
             }
             if was_running {
                 println!("Starting service...");

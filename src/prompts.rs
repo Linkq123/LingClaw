@@ -37,6 +37,7 @@ pub(crate) struct SkillMeta {
 /// Mirrors the `templates_dir()` pattern: searches relative to the executable
 /// then falls back to CWD for dev mode.
 fn system_skills_dir() -> Option<PathBuf> {
+    // 1. Search relative to executable (dev mode / cargo-bin layout)
     if let Ok(exe) = std::env::current_exe() {
         for ancestor in exe.ancestors().skip(1) {
             let candidate = ancestor.join("docs/reference/skills");
@@ -45,6 +46,14 @@ fn system_skills_dir() -> Option<PathBuf> {
             }
         }
     }
+    // 2. Installed location: ~/.lingclaw/system-skills/
+    if let Some(dir) = config_dir_path() {
+        let candidate = dir.join("system-skills");
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    // 3. CWD fallback (dev mode)
     let cwd = std::env::current_dir().ok()?;
     let candidate = cwd.join("docs/reference/skills");
     if candidate.is_dir() {
