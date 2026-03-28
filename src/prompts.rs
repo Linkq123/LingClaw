@@ -77,12 +77,18 @@ pub(crate) fn system_skills_resolved_path() -> Option<PathBuf> {
 /// workspace-relative resolution) or unknown prefixes.
 pub(crate) fn resolve_skill_path(virtual_path: &str) -> Option<PathBuf> {
     const SYSTEM_PREFIX: &str = "system://skills/";
+    const SYSTEM_BARE: &str = "system://skills";
     const GLOBAL_PREFIX: &str = "~/.lingclaw/skills/";
+    const GLOBAL_BARE: &str = "~/.lingclaw/skills";
 
     let (relative, base_dir) = if let Some(rel) = virtual_path.strip_prefix(SYSTEM_PREFIX) {
         (rel, system_skills_dir()?)
+    } else if virtual_path == SYSTEM_BARE {
+        ("", system_skills_dir()?)
     } else if let Some(rel) = virtual_path.strip_prefix(GLOBAL_PREFIX) {
         (rel, global_skills_dir()?)
+    } else if virtual_path == GLOBAL_BARE {
+        ("", global_skills_dir()?)
     } else {
         return None;
     };
@@ -257,8 +263,9 @@ pub(crate) fn render_skills_catalog(skills: &[SkillMeta]) -> Option<String> {
     lines.push(String::new());
     lines.push(
         "The following skills are installed. \
-         When a task matches a skill's description, read the full SKILL.md \
-         for detailed instructions before proceeding."
+         When a task matches a skill's description, use `read_file` with the \
+         SKILL.md path shown in parentheses (e.g. `system://skills/anthropics/pdf/SKILL.md`) \
+         to load the full instructions before proceeding."
             .to_string(),
     );
     lines.push(String::new());
