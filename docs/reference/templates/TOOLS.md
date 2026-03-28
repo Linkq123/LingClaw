@@ -7,7 +7,7 @@ read_when:
 
 # TOOLS.md - Local Notes
 
-Skills define _how_ tools work. This file is for _your_ specifics — the stuff that's unique to your setup.
+Skills define _how_ tools work — they are loaded from three layers: system (bundled), global (`~/.lingclaw/skills/`), and session (`skills/<name>/SKILL.md` in this workspace). This file is for _your_ specifics — the stuff that's unique to your setup.
 
 ## What Goes Here
 
@@ -40,7 +40,7 @@ Things like:
 
 ## Why Separate?
 
-Skills are shared. Your setup is yours. Keeping them apart means you can update skills without losing your notes, and share skills without leaking your infrastructure.
+Skills are shared and reusable — each is a self-contained `SKILL.md` in `skills/<name>/`, discoverable from system, global, and session layers. Your setup is yours. Keeping them apart means you can add or update skills without losing your notes, and share skills without leaking your infrastructure.
 
 ---
 

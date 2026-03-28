@@ -354,6 +354,11 @@ Only read those files if the user explicitly asks to inspect them, if you need t
         .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
         .unwrap_or_default();
 
+    let skills_section = prompts::discover_all_skills(workspace);
+    let skills_section = prompts::render_skills_catalog(&skills_section)
+        .map(|s| format!("\n\n{s}"))
+        .unwrap_or_default();
+
     let admin_section = if is_main {
         "\n\n## Admin Tools (Main Session Only)\n\
          You have access to session management tools. When users ask about sessions, \
@@ -378,7 +383,7 @@ Only read those files if the user explicitly asks to inspect them, if you need t
 {prompt_file_note}
 
 ## Available Tools
-{tool_lines}{admin_section}{mcp_note}"#,
+{tool_lines}{admin_section}{mcp_note}{skills_section}"#,
         model = model,
         local_time = local_time,
         tool_lines = tool_lines,
@@ -386,6 +391,7 @@ Only read those files if the user explicitly asks to inspect them, if you need t
         prompt_file_note = prompt_file_note,
         admin_section = admin_section,
         mcp_note = mcp_note,
+        skills_section = skills_section,
     );
 
     ChatMessage {

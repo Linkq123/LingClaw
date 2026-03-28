@@ -1,6 +1,231 @@
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Local};
 use std::path::{Path, PathBuf};
 
+use crate::config_dir_path;
+
+// ── Skills ───────────────────────────────────────────────────────────────────────────────
+
+const SKILLS_DIR: &str = "skills";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SkillSource {
+    System,
+    Global,
+    Session,
+}
+
+impl SkillSource {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SkillSource::System => "system",
+            SkillSource::Global => "global",
+            SkillSource::Session => "session",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SkillMeta {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) path: String,
+    pub(crate) source: SkillSource,
+}
+
+/// Locate the system-bundled skills directory on disk.
+/// Mirrors the `templates_dir()` pattern: searches relative to the executable
+/// then falls back to CWD for dev mode.
+fn system_skills_dir() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        for ancestor in exe.ancestors().skip(1) {
+            let candidate = ancestor.join("docs/reference/skills");
+            if candidate.is_dir() {
+                return Some(candidate);
+            }
+        }
+    }
+    let cwd = std::env::current_dir().ok()?;
+    let candidate = cwd.join("docs/reference/skills");
+    if candidate.is_dir() {
+        return Some(candidate);
+    }
+    None
+}
+
+/// Global skills directory: `~/.lingclaw/skills/`.
+fn global_skills_dir() -> Option<PathBuf> {
+    let dir = config_dir_path()?.join(SKILLS_DIR);
+    if dir.is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// Scan a single directory for skill subdirectories containing valid `SKILL.md`.
+fn discover_skills_in_dir(dir: &Path, source: SkillSource, path_prefix: &str) -> Vec<SkillMeta> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut skills = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let skill_file = path.join("SKILL.md");
+        let Ok(content) = std::fs::read_to_string(&skill_file) else {
+            continue;
+        };
+        if let Some(mut meta) = parse_skill_frontmatter(&content) {
+            let dir_name = entry.file_name();
+            meta.path = format!("{path_prefix}{}/SKILL.md", dir_name.to_string_lossy());
+            meta.source = source;
+            skills.push(meta);
+        }
+    }
+    skills
+}
+
+/// Discover skills from all three layers (system → global → session) and merge.
+/// Later sources can shadow earlier ones if names collide (session wins over global wins over system).
+pub(crate) fn discover_all_skills(workspace: &Path) -> Vec<SkillMeta> {
+    let mut all = Vec::new();
+
+    // Layer 1: system (bundled with binary)
+    if let Some(dir) = system_skills_dir() {
+        all.extend(discover_skills_in_dir(
+            &dir,
+            SkillSource::System,
+            "system://skills/",
+        ));
+    }
+
+    // Layer 2: global (~/.lingclaw/skills/)
+    if let Some(dir) = global_skills_dir() {
+        all.extend(discover_skills_in_dir(
+            &dir,
+            SkillSource::Global,
+            "~/.lingclaw/skills/",
+        ));
+    }
+
+    // Layer 3: session workspace (skills/)
+    let session_dir = workspace.join(SKILLS_DIR);
+    all.extend(discover_skills_in_dir(
+        &session_dir,
+        SkillSource::Session,
+        "skills/",
+    ));
+
+    // Deduplicate: later source wins (session > global > system)
+    let mut seen = std::collections::HashMap::new();
+    for (idx, skill) in all.iter().enumerate() {
+        seen.insert(skill.name.clone(), idx);
+    }
+    let mut deduped: Vec<SkillMeta> = seen.into_values().map(|idx| all[idx].clone()).collect();
+    deduped.sort_by(|a, b| a.name.cmp(&b.name));
+    deduped
+}
+
+/// Discover skills from a single source layer.
+pub(crate) fn discover_skills_by_source(workspace: &Path, source: SkillSource) -> Vec<SkillMeta> {
+    let mut skills = match source {
+        SkillSource::System => system_skills_dir()
+            .map(|dir| discover_skills_in_dir(&dir, SkillSource::System, "system://skills/"))
+            .unwrap_or_default(),
+        SkillSource::Global => global_skills_dir()
+            .map(|dir| discover_skills_in_dir(&dir, SkillSource::Global, "~/.lingclaw/skills/"))
+            .unwrap_or_default(),
+        SkillSource::Session => {
+            let session_dir = workspace.join(SKILLS_DIR);
+            discover_skills_in_dir(&session_dir, SkillSource::Session, "skills/")
+        }
+    };
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+}
+
+/// Parse YAML frontmatter from a SKILL.md file.
+/// Expects `---` delimited frontmatter with `name:` and `description:` fields.
+/// Only single-line values are supported (no YAML multi-line `|` or `>` folding).
+fn parse_skill_frontmatter(content: &str) -> Option<SkillMeta> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    let rest = &trimmed[3..];
+    let end = rest.find("\n---")?;
+    let frontmatter = &rest[..end];
+
+    let mut name = None;
+    let mut description = None;
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("name:") {
+            name = Some(unquote_yaml_value(val));
+        } else if let Some(val) = line.strip_prefix("description:") {
+            description = Some(unquote_yaml_value(val));
+        }
+    }
+
+    Some(SkillMeta {
+        name: name.filter(|s| !s.is_empty())?,
+        description: description.unwrap_or_default(),
+        path: String::new(),
+        source: SkillSource::Session, // placeholder — caller overrides
+    })
+}
+
+fn unquote_yaml_value(val: &str) -> String {
+    let val = val.trim();
+    if (val.starts_with('"') && val.ends_with('"'))
+        || (val.starts_with('\'') && val.ends_with('\''))
+    {
+        val[1..val.len() - 1].to_string()
+    } else {
+        val.to_string()
+    }
+}
+
+/// Render a skill catalog section for injection into the system prompt.
+/// Returns `None` if no skills are discovered.
+pub(crate) fn render_skills_catalog(skills: &[SkillMeta]) -> Option<String> {
+    if skills.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::with_capacity(skills.len() + 4);
+    lines.push("## Skills".to_string());
+    lines.push(String::new());
+    lines.push(
+        "The following skills are installed. \
+         When a task matches a skill's description, read the full SKILL.md \
+         for detailed instructions before proceeding."
+            .to_string(),
+    );
+    lines.push(String::new());
+
+    for skill in skills {
+        let source_tag = skill.source.label();
+        if skill.description.is_empty() {
+            lines.push(format!(
+                "- **{}** [`{}`] (`{}`)",
+                skill.name, source_tag, skill.path
+            ));
+        } else {
+            lines.push(format!(
+                "- **{}** [`{}`] — {} (`{}`)",
+                skill.name, source_tag, skill.description, skill.path
+            ));
+        }
+    }
+
+    Some(lines.join("\n"))
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct LocalTimeSnapshot {
     now: DateTime<FixedOffset>,
@@ -289,6 +514,15 @@ pub(crate) fn init_session_prompt_files(workspace: &Path) {
         );
     }
 
+    // Ensure skills/ subdirectory exists
+    let skills_dir = workspace.join(SKILLS_DIR);
+    if let Err(e) = std::fs::create_dir_all(&skills_dir) {
+        eprintln!(
+            "WARNING: failed to create skills dir {}: {e}",
+            skills_dir.display()
+        );
+    }
+
     migrate_legacy_agent_file(workspace);
     write_missing_templates(workspace, true);
     write_bootstrap_baselines(workspace);
@@ -303,6 +537,14 @@ pub(crate) fn ensure_session_workspace(workspace: &Path) {
         eprintln!(
             "WARNING: failed to create memory dir {}: {e}",
             memory_dir.display()
+        );
+    }
+
+    let skills_dir = workspace.join(SKILLS_DIR);
+    if let Err(e) = std::fs::create_dir_all(&skills_dir) {
+        eprintln!(
+            "WARNING: failed to create skills dir {}: {e}",
+            skills_dir.display()
         );
     }
 

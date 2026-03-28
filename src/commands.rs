@@ -561,20 +561,74 @@ async fn handle_clear_command(current_session_id: &str, state: &AppState) -> Com
     }
 }
 
-fn handle_skills_command() -> CommandResult {
-    let list = tools::tool_specs()
-        .iter()
-        .map(|spec| {
-            let short = spec
-                .description
-                .split('.')
-                .next()
-                .unwrap_or(spec.description);
-            format!("  {} → {}", spec.name, short)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    command_result(format!("Skills:\n{list}"), "system", None, false)
+async fn handle_skills_command(
+    filter: Option<prompts::SkillSource>,
+    current_session_id: &str,
+    state: &AppState,
+) -> CommandResult {
+    let workspace = state
+        .sessions
+        .lock()
+        .await
+        .get(current_session_id)
+        .map(|s| s.workspace.clone());
+
+    let ws = workspace.as_deref().unwrap_or(Path::new(""));
+
+    let skills = match filter {
+        Some(source) => prompts::discover_skills_by_source(ws, source),
+        None => prompts::discover_all_skills(ws),
+    };
+
+    let label = match filter {
+        Some(prompts::SkillSource::System) => "System skills",
+        Some(prompts::SkillSource::Global) => "Global skills",
+        Some(prompts::SkillSource::Session) => "Session skills",
+        None => "All skills",
+    };
+
+    let mut output = if filter.is_none() {
+        let tool_list = tools::tool_specs()
+            .iter()
+            .map(|spec| {
+                let short = spec
+                    .description
+                    .split('.')
+                    .next()
+                    .unwrap_or(spec.description);
+                format!("  {} → {}", spec.name, short)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("Tools:\n{tool_list}\n\n{label}:")
+    } else {
+        format!("{label}:")
+    };
+
+    if skills.is_empty() {
+        output.push_str("\n  (none)");
+    } else {
+        for skill in &skills {
+            let source_tag = if filter.is_none() {
+                format!(" [{}]", skill.source.label())
+            } else {
+                String::new()
+            };
+            if skill.description.is_empty() {
+                output.push_str(&format!(
+                    "\n  {}{} ({})",
+                    skill.name, source_tag, skill.path
+                ));
+            } else {
+                output.push_str(&format!(
+                    "\n  {}{} → {} ({})",
+                    skill.name, source_tag, skill.description, skill.path
+                ));
+            }
+        }
+    }
+
+    command_result(output, "system", None, false)
 }
 
 fn format_mcp_reports(reports: &[tools::mcp::McpServerLoadReport]) -> String {
@@ -893,7 +947,10 @@ Commands:
     /tool [on|off]   Toggle tool card visibility
     /reasoning [on|off] Toggle reasoning visibility
     /stop            Stop the running agent
-    /skills          List available skills
+    /skills          List available tools and skills
+    /skills-system   List system built-in skills
+    /skills-global   List global skills (~/.lingclaw/skills/)
+    /skills-session  List session-local skills
     /rename <name>   Rename current session
     /clear           Clear messages (keep system prompt)
     /help            Show this help"
@@ -1007,7 +1064,31 @@ pub(crate) async fn handle_command(
         "/mcp" => Some(handle_mcp_command_with_arg(arg, current_session_id, state).await),
         "/usage" => Some(handle_usage_command(current_session_id, state).await),
         "/clear" => Some(handle_clear_command(current_session_id, state).await),
-        "/skills" => Some(handle_skills_command()),
+        "/skills" => Some(handle_skills_command(None, current_session_id, state).await),
+        "/skills-system" => Some(
+            handle_skills_command(
+                Some(prompts::SkillSource::System),
+                current_session_id,
+                state,
+            )
+            .await,
+        ),
+        "/skills-global" => Some(
+            handle_skills_command(
+                Some(prompts::SkillSource::Global),
+                current_session_id,
+                state,
+            )
+            .await,
+        ),
+        "/skills-session" => Some(
+            handle_skills_command(
+                Some(prompts::SkillSource::Session),
+                current_session_id,
+                state,
+            )
+            .await,
+        ),
         "/think" => Some(handle_think_command(arg, current_session_id, state).await),
         "/react" => Some(handle_react_command(arg, current_session_id, state).await),
         "/tool" => Some(handle_tool_command(arg, current_session_id, state).await),

@@ -93,7 +93,9 @@ Humans in group chats do not respond to every single message. Neither should you
 
 ## Tools
 
-Skills provide your tools. When you need one, check its `SKILL.md`. Keep local notes such as camera names, SSH details, and voice preferences in `TOOLS.md`.
+Skills provide specialized knowledge for specific tasks. They are loaded from three layers — system (bundled), global (`~/.lingclaw/skills/`), and session (`skills/` in this workspace) — with later layers shadowing earlier ones on name collision. When a task matches a skill's description, read its `SKILL.md` before proceeding.
+
+Use `/skills` to see all tools and installed skills (with source tags), or `/skills-system`, `/skills-global`, `/skills-session` to filter by layer. Keep local notes such as camera names, SSH details, and voice preferences in `TOOLS.md`.
 
 ## Make It Yours
 

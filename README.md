@@ -185,7 +185,10 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `/tool [on\|off]` | 切换工具卡片显示；该设置会持久化到当前 session 的视图状态 |
 | `/reasoning [on\|off]` | 切换 reasoning 面板显示；该设置会持久化到当前 session 的视图状态 |
 | `/stop` | 中断当前运行中的 agent；聊天页停止按钮与该命令等价 |
-| `/skills` | 列出可用工具帮助 |
+| `/skills` | 列出可用工具和已安装的 Skills（含来源标签） |
+| `/skills-system` | 仅列出系统内置 Skills（`docs/reference/skills/`） |
+| `/skills-global` | 仅列出全局 Skills（`~/.lingclaw/skills/`） |
+| `/skills-session` | 仅列出当前 session Skills（workspace `skills/`） |
 | `/status` | 显示模型、provider、上下文估算、最大输出 token、思维级别，token 数值按 K/M 显示 |
 | `/mcp [refresh]` | 查看当前已加载的 MCP server 状态；加上 `refresh` 时强制刷新工具缓存并重建运行时 MCP 会话 |
 | `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；同时显示内存与磁盘上所有 session 合并后的今日总 token 估算，按 K/M 显示 |
@@ -209,6 +212,62 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `http_fetch` | HTTP GET，带 SSRF 防护和重定向阻断 |
 | `list_sessions` | 仅主会话：查看会话状态 |
 | `delete_session` | 仅主会话：删除会话 |
+
+## Skills
+
+Skills 是可安装的知识模块，教会 AI 助手如何完成特定领域的任务。每个 Skill 是一个独立目录，包含 `SKILL.md` 文件和可选的参考资源。
+
+### 三层来源
+
+Skills 从三个目录分层加载，后加载的同名 Skill 覆盖先前的：
+
+| 层级 | 目录 | 说明 |
+|------|------|------|
+| **System** | `docs/reference/skills/` | 随程序分发的内置 Skills |
+| **Global** | `~/.lingclaw/skills/` | 跨 session 共享的全局 Skills |
+| **Session** | `~/.lingclaw/{sessionId}/workspace/skills/` | 当前 session 专属 Skills |
+
+### 结构
+
+```text
+skills/
+├── my-skill/
+│   ├── SKILL.md          # 必需：YAML frontmatter + 指令正文
+│   ├── references/       # 可选：参考文档
+│   └── scripts/          # 可选：辅助脚本
+└── another-skill/
+    └── SKILL.md
+```
+
+### SKILL.md 格式
+
+```markdown
+---
+name: my-skill
+description: 描述这个 Skill 做什么以及何时触发
+---
+
+# 指令正文
+
+详细步骤、示例、规范等...
+```
+
+### 工作原理
+
+- **发现**：系统自动扫描三层目录下的 `skills/*/SKILL.md`
+- **元数据注入**：Skill 名称、来源标签和描述在每轮对话的系统提示中呈现（Level 1：始终可见）
+- **按需加载**：AI 在任务匹配时通过 `read_file` 读取完整 SKILL.md 内容（Level 2）
+- **资源引用**：Skill 目录中的参考文件按需读取（Level 3）
+- **去重**：同名 Skill 按 System → Global → Session 顺序加载，后加载的覆盖先前的
+- **查看命令**：
+  - `/skills` — 列出所有 Skills（含来源标签）和工具
+  - `/skills-system` — 仅列出系统内置 Skills
+  - `/skills-global` — 仅列出全局 Skills
+  - `/skills-session` — 仅列出当前 session Skills
+
+### 兼容性
+
+SKILL.md 的 YAML frontmatter 格式兼容 [Agent Skills 规范](https://agentskills.io)。你可以从 [anthropics/skills](https://github.com/anthropics/skills) 仓库获取社区 Skill 并放入任意层级的 `skills/` 目录。
 
 ---
 

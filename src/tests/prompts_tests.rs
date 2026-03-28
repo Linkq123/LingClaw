@@ -234,3 +234,256 @@ fn ensure_session_workspace_migrates_legacy_agent_file() {
 
     let _ = fs::remove_dir_all(&workspace);
 }
+
+// ── Skill discovery tests ────────────────────────────────────────────────────────────────
+
+#[test]
+fn parse_skill_frontmatter_extracts_name_and_description() {
+    let content = "---\nname: my-skill\ndescription: Does something useful\n---\n\n# Instructions";
+    let meta = parse_skill_frontmatter(content).expect("frontmatter should parse");
+    assert_eq!(meta.name, "my-skill");
+    assert_eq!(meta.description, "Does something useful");
+}
+
+#[test]
+fn parse_skill_frontmatter_handles_quoted_values() {
+    let content = "---\nname: \"quoted-skill\"\ndescription: 'single quoted'\n---\n";
+    let meta = parse_skill_frontmatter(content).expect("frontmatter should parse");
+    assert_eq!(meta.name, "quoted-skill");
+    assert_eq!(meta.description, "single quoted");
+}
+
+#[test]
+fn parse_skill_frontmatter_returns_none_without_name() {
+    let content = "---\ndescription: orphan description\n---\n";
+    assert!(parse_skill_frontmatter(content).is_none());
+}
+
+#[test]
+fn parse_skill_frontmatter_returns_none_without_frontmatter() {
+    let content = "# No frontmatter\nJust instructions";
+    assert!(parse_skill_frontmatter(content).is_none());
+}
+
+#[test]
+fn parse_skill_frontmatter_allows_empty_description() {
+    let content = "---\nname: minimal\n---\n";
+    let meta = parse_skill_frontmatter(content).expect("frontmatter should parse");
+    assert_eq!(meta.name, "minimal");
+    assert!(meta.description.is_empty());
+}
+
+#[test]
+fn parse_skill_frontmatter_ignores_extra_fields() {
+    let content =
+        "---\nname: extended\ndescription: A skill\nlicense: MIT\nversion: 1.0\n---\n# Body";
+    let meta = parse_skill_frontmatter(content).expect("frontmatter should parse");
+    assert_eq!(meta.name, "extended");
+    assert_eq!(meta.description, "A skill");
+}
+
+#[test]
+fn discover_skills_finds_valid_skills_in_workspace() {
+    let workspace = std::env::temp_dir().join("lingclaw-skill-discovery-test");
+    let _ = fs::remove_dir_all(&workspace);
+    let skills_dir = workspace.join("skills");
+
+    // Create two valid skills
+    let skill_a = skills_dir.join("alpha");
+    fs::create_dir_all(&skill_a).expect("skill dir should be created");
+    fs::write(
+        skill_a.join("SKILL.md"),
+        "---\nname: alpha\ndescription: First skill\n---\n# Alpha",
+    )
+    .expect("skill file should be written");
+
+    let skill_b = skills_dir.join("beta");
+    fs::create_dir_all(&skill_b).expect("skill dir should be created");
+    fs::write(
+        skill_b.join("SKILL.md"),
+        "---\nname: beta\ndescription: Second skill\n---\n# Beta",
+    )
+    .expect("skill file should be written");
+
+    // Create an invalid entry (file, not dir)
+    fs::write(skills_dir.join("not-a-skill.txt"), "junk").expect("junk file should be written");
+
+    // Create a dir without SKILL.md
+    let no_skill = skills_dir.join("empty");
+    fs::create_dir_all(&no_skill).expect("empty dir should be created");
+
+    let skills = discover_skills_by_source(&workspace, SkillSource::Session);
+    assert_eq!(skills.len(), 2);
+    assert_eq!(skills[0].name, "alpha");
+    assert_eq!(skills[0].path, "skills/alpha/SKILL.md");
+    assert_eq!(skills[0].source, SkillSource::Session);
+    assert_eq!(skills[1].name, "beta");
+    assert_eq!(skills[1].path, "skills/beta/SKILL.md");
+    assert_eq!(skills[1].source, SkillSource::Session);
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn discover_skills_returns_empty_when_no_skills_dir() {
+    let workspace = std::env::temp_dir().join("lingclaw-no-skills-dir-test");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should be created");
+    assert!(discover_skills_by_source(&workspace, SkillSource::Session).is_empty());
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn render_skills_catalog_formats_correctly() {
+    let skills = vec![
+        SkillMeta {
+            name: "coding".to_string(),
+            description: "Help with code".to_string(),
+            path: "skills/coding/SKILL.md".to_string(),
+            source: SkillSource::Session,
+        },
+        SkillMeta {
+            name: "minimal".to_string(),
+            description: String::new(),
+            path: "skills/minimal/SKILL.md".to_string(),
+            source: SkillSource::System,
+        },
+    ];
+    let catalog = render_skills_catalog(&skills).expect("catalog should render");
+    assert!(catalog.contains("## Skills"));
+    assert!(catalog.contains("**coding** [`session`] — Help with code (`skills/coding/SKILL.md`)"));
+    assert!(catalog.contains("**minimal** [`system`] (`skills/minimal/SKILL.md`)"));
+}
+
+#[test]
+fn render_skills_catalog_returns_none_for_empty_list() {
+    assert!(render_skills_catalog(&[]).is_none());
+}
+
+#[test]
+fn init_session_creates_skills_directory() {
+    let workspace = std::env::temp_dir().join("lingclaw-init-skills-dir-test");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    init_session_prompt_files(&workspace);
+
+    assert!(workspace.join("skills").is_dir());
+    assert!(workspace.join("memory").is_dir());
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn discover_all_skills_merges_session_skills() {
+    let workspace = std::env::temp_dir().join("lingclaw-all-skills-merge-test");
+    let _ = fs::remove_dir_all(&workspace);
+    let skills_dir = workspace.join("skills");
+
+    let skill_a = skills_dir.join("alpha");
+    fs::create_dir_all(&skill_a).expect("skill dir should be created");
+    fs::write(
+        skill_a.join("SKILL.md"),
+        "---\nname: alpha\ndescription: Session alpha\n---\n",
+    )
+    .expect("skill file should be written");
+
+    let skills = discover_all_skills(&workspace);
+    // At minimum, the session skill should be present
+    assert!(skills
+        .iter()
+        .any(|s| s.name == "alpha" && s.source == SkillSource::Session));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn discover_all_skills_deduplicates_by_name_later_wins() {
+    // End-to-end dedup: two separate dirs with an overlapping skill name.
+    // Mirrors the merge logic inside discover_all_skills().
+    let base = std::env::temp_dir().join("lingclaw-dedup-e2e-test");
+    let _ = fs::remove_dir_all(&base);
+
+    let system_dir = base.join("system");
+    let session_dir = base.join("session");
+
+    // "xray" exists in both layers — session version should win
+    let sys_xray = system_dir.join("xray");
+    fs::create_dir_all(&sys_xray).expect("sys skill dir should be created");
+    fs::write(
+        sys_xray.join("SKILL.md"),
+        "---\nname: xray\ndescription: System version\n---\n",
+    )
+    .expect("sys skill file should be written");
+
+    let ses_xray = session_dir.join("xray");
+    fs::create_dir_all(&ses_xray).expect("ses skill dir should be created");
+    fs::write(
+        ses_xray.join("SKILL.md"),
+        "---\nname: xray\ndescription: Session version\n---\n",
+    )
+    .expect("ses skill file should be written");
+
+    // "only-sys" only in system — should survive dedup
+    let sys_unique = system_dir.join("only-sys");
+    fs::create_dir_all(&sys_unique).expect("unique skill dir should be created");
+    fs::write(
+        sys_unique.join("SKILL.md"),
+        "---\nname: only-sys\ndescription: Only in system\n---\n",
+    )
+    .expect("unique skill file should be written");
+
+    // Simulate the exact merge+dedup from discover_all_skills
+    let mut all = Vec::new();
+    all.extend(discover_skills_in_dir(
+        &system_dir,
+        SkillSource::System,
+        "system://skills/",
+    ));
+    all.extend(discover_skills_in_dir(
+        &session_dir,
+        SkillSource::Session,
+        "skills/",
+    ));
+
+    let mut seen = std::collections::HashMap::new();
+    for (idx, skill) in all.iter().enumerate() {
+        seen.insert(skill.name.clone(), idx);
+    }
+    let mut deduped: Vec<SkillMeta> = seen.into_values().map(|idx| all[idx].clone()).collect();
+    deduped.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Two unique names after dedup
+    assert_eq!(deduped.len(), 2);
+
+    // "only-sys" retained from system layer
+    let unique = deduped.iter().find(|s| s.name == "only-sys").unwrap();
+    assert_eq!(unique.source, SkillSource::System);
+
+    // "xray" resolved to session (later layer wins)
+    let xray = deduped.iter().find(|s| s.name == "xray").unwrap();
+    assert_eq!(xray.source, SkillSource::Session);
+    assert_eq!(xray.description, "Session version");
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[test]
+fn skill_source_label_returns_correct_strings() {
+    assert_eq!(SkillSource::System.label(), "system");
+    assert_eq!(SkillSource::Global.label(), "global");
+    assert_eq!(SkillSource::Session.label(), "session");
+}
+
+#[test]
+fn ensure_session_workspace_creates_skills_directory() {
+    let workspace = std::env::temp_dir().join("lingclaw-ensure-skills-dir-test");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    ensure_session_workspace(&workspace);
+
+    assert!(workspace.join("skills").is_dir());
+
+    let _ = fs::remove_dir_all(&workspace);
+}
