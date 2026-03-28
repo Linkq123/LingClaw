@@ -10,14 +10,14 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **CLI** — 工具执行层：安全的命令/文件/网络工具、沙盒路径、SSRF 防护、安装与更新
 - **Loop** — 连接层：WebSocket 会话、多会话状态、流式输出、斜杠命令、持久化
 
-整个后端约 10200 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
+整个后端约 11200 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
 
 ## Features
 
 - **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
 - **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断
 - **2 主会话管理工具**：`list_sessions`、`delete_session`
-- **18 斜杠命令**：`/new`、`/session_new`、`/switch`、`/rename`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/status`、`/mcp`、`/usage`、`/clear`、`/help`、`/sessions`、`/delete`
+- **21 斜杠命令**：`/new`、`/session_new`、`/switch`、`/rename`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/status`、`/mcp`、`/usage`、`/clear`、`/help`、`/sessions`、`/delete`
 - **双 Provider 模型路由**：OpenAI + Anthropic，支持 `provider/model` 和纯 model ID
 - **Per-session 模型覆盖**：运行时通过 `/model` 切换
 - **持久化多会话**：每个会话有独立工作区和磁盘存档
@@ -186,7 +186,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `/reasoning [on\|off]` | 切换 reasoning 面板显示；该设置会持久化到当前 session 的视图状态 |
 | `/stop` | 中断当前运行中的 agent；聊天页停止按钮与该命令等价 |
 | `/skills` | 列出可用工具和已安装的 Skills（含来源标签） |
-| `/skills-system` | 仅列出系统内置 Skills（`docs/reference/skills/`） |
+| `/skills-system [install\|uninstall <pattern>]` | 列出系统内置 Skills 状态；`install`/`uninstall` 子命令可运行时启用/禁用 Skill 或 Skill 组（如 `anthropics`、`anthropics/pdf`） |
 | `/skills-global` | 仅列出全局 Skills（`~/.lingclaw/skills/`） |
 | `/skills-session` | 仅列出当前 session Skills（workspace `skills/`） |
 | `/status` | 显示模型、provider、上下文估算、最大输出 token、思维级别，token 数值按 K/M 显示 |
@@ -223,7 +223,7 @@ Skills 从三个目录分层加载，后加载的同名 Skill 覆盖先前的：
 
 | 层级 | 目录 | 说明 |
 |------|------|------|
-| **System** | `docs/reference/skills/` | 随程序分发的内置 Skills |
+| **System** | `docs/reference/skills/` 或 `~/.lingclaw/system-skills/` | 随程序分发的内置 Skills；安装时自动部署到 `~/.lingclaw/system-skills/` |
 | **Global** | `~/.lingclaw/skills/` | 跨 session 共享的全局 Skills |
 | **Session** | `~/.lingclaw/{sessionId}/workspace/skills/` | 当前 session 专属 Skills |
 
@@ -256,14 +256,17 @@ description: 描述这个 Skill 做什么以及何时触发
 
 - **发现**：系统自动扫描三层目录下的 `skills/*/SKILL.md`
 - **元数据注入**：Skill 名称、来源标签和描述在每轮对话的系统提示中呈现（Level 1：始终可见）
-- **按需加载**：AI 在任务匹配时通过 `read_file` 读取完整 SKILL.md 内容（Level 2）
+- **按需加载**：AI 在任务匹配时通过 `read_file` 读取完整 SKILL.md 内容（Level 2）。System 和 Global Skills 使用虚拟路径（如 `system://skills/anthropics/pdf/SKILL.md`、`~/.lingclaw/skills/xxx/SKILL.md`），`read_file`、`list_dir`、`search_files` 均可透明访问
 - **资源引用**：Skill 目录中的参考文件按需读取（Level 3）
 - **去重**：同名 Skill 按 System → Global → Session 顺序加载，后加载的覆盖先前的
-- **查看命令**：
+- **运行时管理**：
   - `/skills` — 列出所有 Skills（含来源标签）和工具
-  - `/skills-system` — 仅列出系统内置 Skills
+  - `/skills-system` — 列出系统内置 Skills 状态（loaded/disabled）
+  - `/skills-system install <pattern>` — 重新启用之前禁用的 Skill
+  - `/skills-system uninstall <pattern>` — 禁用 Skill（支持组级如 `anthropics` 或单个如 `anthropics/pdf`）
   - `/skills-global` — 仅列出全局 Skills
   - `/skills-session` — 仅列出当前 session Skills
+- **部署**：`lingclaw install` 和 `lingclaw update` 会自动将 `docs/reference/skills/` 复制到 `~/.lingclaw/system-skills/`，确保系统 Skills 在安装后可用
 
 ### 兼容性
 
@@ -405,17 +408,27 @@ handle_socket()
 
 ```text
 src/
-├── main.rs          (~3560 行) — Config, Session, Agent Loop (phase-driven), 命令处理, HTTP 路由
-├── main_tests.rs    (~2290 行) — 主流程测试 + observation 摘要 + replay/resume + 工具协议 + 持久化测试
-├── agent.rs         (~410 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
-├── cli.rs           (~1370 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新
-├── providers.rs     (~840 行)  — OpenAI/Anthropic 流式调用, 模型解析
-├── prompts.rs       (~720 行)  — 提示文件初始化/加载, bootstrap baseline, 本地时间/记忆加载
+├── main.rs            (~1290 行) — 共享类型, WebSocket/HTTP 处理, 系统提示构建, 安全检查
+├── runtime_loop.rs    (~790 行)  — 阶段执行循环, 工具进度, 运行取消, 干预持久化
+│   └── socket_input.rs (~185 行) — socket 空闲/忙碌输入辅助
+├── agent.rs           (~290 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
+├── commands.rs        (~1260 行) — 斜杠命令处理器 (handle_command, /skills-system install/uninstall 等)
+├── cli.rs             (~1730 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署
+├── config.rs          (~550 行)  — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
+├── context.rs         (~210 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
+├── providers.rs       (~860 行)  — OpenAI/Anthropic 流式调用, 推理模式, prompt caching
+├── prompts.rs         (~660 行)  — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
+├── hooks.rs           (~340 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
+├── session_admin.rs   (~240 行)  — 管理工具 (list/delete sessions, 仅主会话)
+├── session_store.rs   (~340 行)  — 会话持久化, 迁移, 磁盘 I/O
+├── socket_sync.rs     (~140 行)  — WebSocket 会话声明, 断线监听, 重绑定
+├── socket_tasks.rs    (~120 行)  — WebSocket 读写任务
 └── tools/
-    ├── mod.rs       (~450 行)  — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验
-    ├── fs.rs        (~310 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files
-    ├── net.rs       (~180 行)  — http_fetch, check_ssrf, is_private_ip
-    └── exec.rs      (~60 行)   — exec (shell), think (scratchpad)
+    ├── mod.rs         (~450 行)  — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验
+    ├── fs.rs          (~320 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files + 虚拟 skill 路径
+    ├── net.rs         (~120 行)  — http_fetch, check_ssrf, is_private_ip
+    ├── exec.rs        (~60 行)   — exec (shell), think (scratchpad)
+    └── mcp.rs         (~1250 行) — stdio MCP 工具发现/执行桥接, 会话缓存, preflight
 
 static/
 ├── index.html                  — 主页面
@@ -423,6 +436,9 @@ static/
 └── style.css                   — 样式
 
 docs/reference/templates/       — 7 个提示模板文件 (BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/TOOLS/MEMORY.md)
+docs/reference/skills/          — 17 个系统内置 Skills (安装时部署到 ~/.lingclaw/system-skills/)
+
+src/tests/                      — 模块测试文件 (~5470 行)
 ```
 
 ### 核心数据结构
@@ -445,6 +461,8 @@ struct Session {
     workspace: PathBuf,        // ~/.lingclaw/{id}/workspace/
     show_tools: bool,
     show_reasoning: bool,
+    show_react: bool,
+    disabled_system_skills: HashSet<String>,  // 运行时禁用的系统 Skill 模式
     version: u32,              // 会话版本 (当前 SESSION_VERSION = 4)
 }
 
@@ -538,6 +556,8 @@ think_level 映射：
 ```text
 ~/.lingclaw/
 ├── .lingclaw.json          — 全局配置
+├── system-skills/          — 安装时部署的系统 Skills (从 docs/reference/skills/ 复制)
+├── skills/                 — 全局 Skills (跨 session 共享)
 ├── sessions/
 │   ├── main.json           — 主会话存档
 │   └── {uuid}.json         — 子会话存档
@@ -548,6 +568,7 @@ think_level 映射：
 │   ├── USER.md             — 用户特定行为
 │   ├── TOOLS.md            — 工具使用指南
 │   ├── MEMORY.md           — 持久记忆指南
+│   ├── skills/             — session 专属 Skills
 │   └── memory/
 │       └── 2026-03-17.md   — 每日记忆
 └── {uuid}/workspace/       — 子会话工作区 (同结构)
