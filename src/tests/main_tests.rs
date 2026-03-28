@@ -3,6 +3,22 @@ use crate::config::JsonMcpServerConfig;
 use serde_json::json;
 use std::{collections::HashMap, sync::atomic::AtomicU64};
 
+/// RAII guard that cleans up a saved session's JSON file and workspace directory on drop.
+/// This ensures cleanup runs even if the test panics.
+struct SavedSessionGuard {
+    session_id: String,
+    workspace: PathBuf,
+}
+
+impl Drop for SavedSessionGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(sessions_dir().join(format!("{}.json", self.session_id)));
+        if let Some(session_dir) = self.workspace.parent() {
+            let _ = std::fs::remove_dir_all(session_dir);
+        }
+    }
+}
+
 fn test_config() -> Config {
     Config {
         api_key: "env-key".to_string(),
@@ -85,6 +101,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
         version: 0,
         workspace: PathBuf::new(),
     }
@@ -300,6 +317,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
         version: 0,
         workspace: PathBuf::new(),
     };
@@ -1000,6 +1018,10 @@ fn gather_global_today_usage_includes_saved_sessions_not_loaded_in_memory() {
     let saved_id = format!("saved-usage-{}", now_epoch());
     let workspace = session_workspace_path(&saved_id);
     std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: saved_id.clone(),
+        workspace: workspace.clone(),
+    };
 
     let mut saved = test_session(&saved_id, "Saved", None);
     saved.workspace = workspace.clone();
@@ -1014,13 +1036,6 @@ fn gather_global_today_usage_includes_saved_sessions_not_loaded_in_memory() {
     assert!(usage.contains("input_tokens: 3K"));
     assert!(usage.contains("output_tokens: 1K"));
     assert!(usage.contains("total_tokens: 4K"));
-
-    let _ = std::fs::remove_file(sessions_dir().join(format!("{saved_id}.json")));
-    let session_dir = workspace
-        .parent()
-        .map(PathBuf::from)
-        .expect("session dir should exist");
-    let _ = std::fs::remove_dir_all(session_dir);
 }
 
 #[test]
@@ -1031,6 +1046,10 @@ fn gather_sessions_status_includes_saved_inactive_sessions() {
     let saved_id = format!("saved-status-{}", now_epoch());
     let workspace = session_workspace_path(&saved_id);
     std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: saved_id.clone(),
+        workspace: workspace.clone(),
+    };
 
     let mut saved = test_session(&saved_id, "Saved Status", None);
     saved.workspace = workspace.clone();
@@ -1044,13 +1063,6 @@ fn gather_sessions_status_includes_saved_inactive_sessions() {
     assert!(status.contains(saved_id.as_str()));
     assert!(status.contains("Saved Status"));
     assert!(status.contains("[saved]"));
-
-    let _ = std::fs::remove_file(sessions_dir().join(format!("{saved_id}.json")));
-    let session_dir = workspace
-        .parent()
-        .map(PathBuf::from)
-        .expect("session dir should exist");
-    let _ = std::fs::remove_dir_all(session_dir);
 }
 
 #[test]
@@ -1213,6 +1225,7 @@ fn send_sessions_list_omits_in_memory_session_that_is_empty_after_sanitization()
                 show_react: false,
                 show_tools: true,
                 show_reasoning: true,
+                disabled_system_skills: HashSet::new(),
                 version: SESSION_VERSION,
                 workspace: PathBuf::new(),
             },
@@ -1446,6 +1459,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
         version: 0,
         workspace: workspace.clone(),
     };
@@ -1517,6 +1531,7 @@ fn save_session_to_disk_overwrites_existing_file() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
         version: 1,
         workspace: workspace.clone(),
     };
@@ -1821,6 +1836,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
         version: 0,
         workspace: PathBuf::new(),
     };

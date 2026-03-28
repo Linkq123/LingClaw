@@ -73,11 +73,13 @@ async fn prepare_analyze_snapshot(
     let session = sessions.get_mut(ctx.current_session_id)?;
     let model_str = session.effective_model(&ctx.state.config.model).to_string();
     let is_main_session = session.is_main();
+    let disabled = session.disabled_system_skills.clone();
     let mut fresh_system = build_system_prompt(
         &ctx.state.config,
         &session.workspace,
         &model_str,
         is_main_session,
+        &disabled,
     );
     if let Some(hint) = phase_state.last_observation_hint.take() {
         if let Some(ref mut content) = fresh_system.content {

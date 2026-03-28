@@ -487,3 +487,65 @@ fn ensure_session_workspace_creates_skills_directory() {
 
     let _ = fs::remove_dir_all(&workspace);
 }
+
+// ── is_system_skill_disabled tests ───────────────────────────────────────────────────────
+
+#[test]
+fn system_skill_disabled_exact_match() {
+    let disabled = HashSet::from(["anthropics/pdf".to_string()]);
+    assert!(is_system_skill_disabled(
+        "system://skills/anthropics/pdf/SKILL.md",
+        &disabled,
+    ));
+}
+
+#[test]
+fn system_skill_disabled_group_match() {
+    let disabled = HashSet::from(["anthropics".to_string()]);
+    assert!(is_system_skill_disabled(
+        "system://skills/anthropics/pdf/SKILL.md",
+        &disabled,
+    ));
+    assert!(is_system_skill_disabled(
+        "system://skills/anthropics/xlsx/SKILL.md",
+        &disabled,
+    ));
+}
+
+#[test]
+fn system_skill_disabled_no_match() {
+    let disabled = HashSet::from(["anthropics/pdf".to_string()]);
+    assert!(!is_system_skill_disabled(
+        "system://skills/anthropics/xlsx/SKILL.md",
+        &disabled,
+    ));
+}
+
+#[test]
+fn system_skill_disabled_empty_set() {
+    let disabled = HashSet::new();
+    assert!(!is_system_skill_disabled(
+        "system://skills/anthropics/pdf/SKILL.md",
+        &disabled,
+    ));
+}
+
+#[test]
+fn system_skill_disabled_no_partial_prefix_collision() {
+    // "anthro" should NOT match "anthropics/pdf"
+    let disabled = HashSet::from(["anthro".to_string()]);
+    assert!(!is_system_skill_disabled(
+        "system://skills/anthropics/pdf/SKILL.md",
+        &disabled,
+    ));
+}
+
+#[test]
+fn system_skill_disabled_non_system_path_passthrough() {
+    let disabled = HashSet::from(["anthropics".to_string()]);
+    // Paths without system:// prefix still work (rel_dir fallback)
+    assert!(!is_system_skill_disabled(
+        "global://skills/other/SKILL.md",
+        &disabled,
+    ));
+}

@@ -50,6 +50,7 @@ pub(crate) async fn resolve_or_create_socket_session(
             &session.workspace,
             session.effective_model(&state.config.model),
             false,
+            &session.disabled_system_skills,
         );
         session.messages.push(sys);
         let current_session_id = session.id.clone();

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use serde_json::json;
@@ -138,7 +139,7 @@ async fn reset_session_context_and_persist(
         |session| {
             let model = session.effective_model(&state.config.model).to_string();
             let is_main = session.is_main();
-            let sys = build_system_prompt(&state.config, &session.workspace, &model, is_main);
+            let sys = build_system_prompt(&state.config, &session.workspace, &model, is_main, &session.disabled_system_skills);
             session.messages = vec![sys];
             session.tool_calls_count = 0;
         },
@@ -361,7 +362,7 @@ async fn handle_session_new_command(current_session_id: &str, state: &AppState) 
 
     let mut session = Session::new();
     let model = session.effective_model(&state.config.model).to_string();
-    let sys = build_system_prompt(&state.config, &session.workspace, &model, false);
+    let sys = build_system_prompt(&state.config, &session.workspace, &model, false, &session.disabled_system_skills);
     session.messages.push(sys);
     let new_id = session.id.clone();
     if let Err(err) = save_session_to_disk(&session).await {
@@ -629,6 +630,232 @@ async fn handle_skills_command(
     }
 
     command_result(output, "system", None, false)
+}
+
+/// Handle `/skills-system [install|uninstall <pattern>]`.
+///
+/// Without arguments: list all system skills with loaded/disabled status.
+/// `uninstall <pattern>`: disable system skills matching the pattern (e.g. `anthropics`, `anthropics/pdf`).
+/// `install <pattern>`:   re-enable previously disabled system skills.
+async fn handle_skills_system_command(
+    arg: &str,
+    current_session_id: &str,
+    state: &AppState,
+) -> CommandResult {
+    let parts: Vec<&str> = arg.splitn(2, ' ').collect();
+    let sub = parts.first().map(|s| s.trim()).unwrap_or("");
+
+    match sub {
+        "" => show_system_skills_status(current_session_id, state).await,
+        "uninstall" | "disable" => {
+            let pattern = parts.get(1).map(|s| s.trim()).unwrap_or("");
+            if pattern.is_empty() {
+                return command_result(
+                    "Usage: /skills-system uninstall <pattern>\n\
+                     Examples:\n\
+                     \x20 /skills-system uninstall anthropics        — uninstall all anthropics skills\n\
+                     \x20 /skills-system uninstall anthropics/pdf    — uninstall only the pdf skill",
+                    "system",
+                    None,
+                    false,
+                );
+            }
+            toggle_system_skill(current_session_id, state, pattern, true).await
+        }
+        "install" | "enable" => {
+            let pattern = parts.get(1).map(|s| s.trim()).unwrap_or("");
+            if pattern.is_empty() {
+                return command_result(
+                    "Usage: /skills-system install <pattern>\n\
+                     Examples:\n\
+                     \x20 /skills-system install anthropics        — re-install all anthropics skills\n\
+                     \x20 /skills-system install anthropics/pdf    — re-install only the pdf skill",
+                    "system",
+                    None,
+                    false,
+                );
+            }
+            toggle_system_skill(current_session_id, state, pattern, false).await
+        }
+        _ => command_result(
+            "Unknown subcommand. Usage:\n\
+             \x20 /skills-system                         — show system skills status\n\
+             \x20 /skills-system uninstall <pattern>     — disable a skill or group\n\
+             \x20 /skills-system install <pattern>       — re-enable a skill or group",
+            "system",
+            None,
+            false,
+        ),
+    }
+}
+
+async fn show_system_skills_status(
+    current_session_id: &str,
+    state: &AppState,
+) -> CommandResult {
+    let (workspace, disabled) = {
+        let sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get(current_session_id) else {
+            return command_result("Session not found.", "error", None, false);
+        };
+        (session.workspace.clone(), session.disabled_system_skills.clone())
+    };
+
+    let skills = prompts::discover_skills_by_source(&workspace, prompts::SkillSource::System);
+
+    let mut output = String::from("System skills:");
+    if skills.is_empty() {
+        output.push_str("\n  (none)");
+    } else {
+        for skill in &skills {
+            let is_disabled = prompts::is_system_skill_disabled(&skill.path, &disabled);
+            let status = if is_disabled { "disabled" } else { "loaded" };
+            let status_icon = if is_disabled { "✗" } else { "✓" };
+            if skill.description.is_empty() {
+                output.push_str(&format!(
+                    "\n  {status_icon} [{status}] {} ({})",
+                    skill.name, skill.path
+                ));
+            } else {
+                output.push_str(&format!(
+                    "\n  {status_icon} [{status}] {} → {} ({})",
+                    skill.name, skill.description, skill.path
+                ));
+            }
+        }
+    }
+
+    if !disabled.is_empty() {
+        let mut sorted: Vec<_> = disabled.iter().cloned().collect();
+        sorted.sort();
+        output.push_str(&format!(
+            "\n\nDisabled patterns: {}",
+            sorted.join(", ")
+        ));
+    }
+
+    command_result(output, "system", None, false)
+}
+
+/// Extract the relative directory from a system skill path.
+/// `system://skills/anthropics/pdf/SKILL.md` → `anthropics/pdf`
+fn skill_relative_dir(path: &str) -> String {
+    const PREFIX: &str = "system://skills/";
+    let relative = path.strip_prefix(PREFIX).unwrap_or(path);
+    relative
+        .strip_suffix("/SKILL.md")
+        .unwrap_or(relative)
+        .to_string()
+}
+
+async fn toggle_system_skill(
+    current_session_id: &str,
+    state: &AppState,
+    pattern: &str,
+    disable: bool,
+) -> CommandResult {
+    // Normalise pattern: strip leading/trailing slashes
+    let pattern = pattern.trim_matches('/').to_string();
+
+    // Validate the pattern matches at least one discovered system skill
+    let workspace = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(current_session_id)
+            .map(|s| s.workspace.clone())
+    };
+    let ws = workspace.as_deref().unwrap_or(std::path::Path::new(""));
+    let system_skills = prompts::discover_skills_by_source(ws, prompts::SkillSource::System);
+    let matched: Vec<_> = system_skills
+        .iter()
+        .filter(|s| prompts::is_system_skill_disabled(&s.path, &HashSet::from([pattern.clone()])))
+        .collect();
+
+    if matched.is_empty() {
+        let groups = prompts::list_system_skill_groups();
+        let hint = if groups.is_empty() {
+            String::new()
+        } else {
+            format!("\nAvailable groups: {}", groups.join(", "))
+        };
+        return command_result(
+            format!("No system skills match pattern: {pattern}{hint}"),
+            "error",
+            None,
+            false,
+        );
+    }
+
+    // Pre-compute the new disabled set outside the closure so we have access to
+    // `system_skills` for the parent-pattern expansion logic (install sub-skill
+    // when a parent group is disabled → replace parent with sibling disables).
+    let compute_new_disabled = |current: &HashSet<String>| -> HashSet<String> {
+        let mut new_set = current.clone();
+        if disable {
+            new_set.insert(pattern.clone());
+        } else {
+            // Remove exact match and any sub-patterns covered by this install
+            new_set.retain(|p| p != &pattern && !p.starts_with(&format!("{}/", pattern)));
+
+            // If a parent pattern still covers the installed pattern, expand it:
+            // e.g. disabled={"anthropics"}, install "anthropics/pdf" →
+            //   remove "anthropics", add individual disables for all siblings.
+            let parents: Vec<String> = new_set
+                .iter()
+                .filter(|p| pattern.starts_with(&format!("{}/", p)))
+                .cloned()
+                .collect();
+            for parent in parents {
+                new_set.remove(&parent);
+                // Add individual disable entries for sibling skills not being installed
+                for skill in &system_skills {
+                    let rel = skill_relative_dir(&skill.path);
+                    if prompts::is_system_skill_disabled(&skill.path, &HashSet::from([parent.clone()]))
+                        && !prompts::is_system_skill_disabled(&skill.path, &HashSet::from([pattern.clone()]))
+                    {
+                        new_set.insert(rel);
+                    }
+                }
+            }
+        }
+        new_set
+    };
+
+    let pattern_for_msg = pattern.clone();
+    match persist_session_update(
+        state,
+        current_session_id,
+        |session| session.disabled_system_skills.clone(),
+        |session| {
+            session.disabled_system_skills = compute_new_disabled(&session.disabled_system_skills);
+        },
+        |session, old| {
+            session.disabled_system_skills = old;
+        },
+    )
+    .await
+    {
+        Ok(()) => {
+            let verb = if disable { "Disabled" } else { "Enabled" };
+            let names: Vec<_> = matched.iter().map(|s| s.name.as_str()).collect();
+            command_result(
+                format!(
+                    "{verb} {} skill(s) matching \"{pattern_for_msg}\": {}",
+                    matched.len(),
+                    names.join(", ")
+                ),
+                "system",
+                None,
+                true,
+            )
+        }
+        Err(err) => command_result(
+            format!("Failed to persist change: {err}"),
+            "error",
+            None,
+            false,
+        ),
+    }
 }
 
 fn format_mcp_reports(reports: &[tools::mcp::McpServerLoadReport]) -> String {
@@ -948,7 +1175,7 @@ Commands:
     /reasoning [on|off] Toggle reasoning visibility
     /stop            Stop the running agent
     /skills          List available tools and skills
-    /skills-system   List system built-in skills
+    /skills-system   List system skills with status (install/uninstall subcommands)
     /skills-global   List global skills (~/.lingclaw/skills/)
     /skills-session  List session-local skills
     /rename <name>   Rename current session
@@ -1066,12 +1293,7 @@ pub(crate) async fn handle_command(
         "/clear" => Some(handle_clear_command(current_session_id, state).await),
         "/skills" => Some(handle_skills_command(None, current_session_id, state).await),
         "/skills-system" => Some(
-            handle_skills_command(
-                Some(prompts::SkillSource::System),
-                current_session_id,
-                state,
-            )
-            .await,
+            handle_skills_system_command(arg, current_session_id, state).await,
         ),
         "/skills-global" => Some(
             handle_skills_command(

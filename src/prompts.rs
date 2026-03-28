@@ -1,4 +1,5 @@
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Local};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::config_dir_path;
@@ -75,15 +76,20 @@ fn discover_skills_in_dir(dir: &Path, source: SkillSource, path_prefix: &str) ->
         if !path.is_dir() {
             continue;
         }
+        let dir_name = entry.file_name();
+        let dir_name_str = dir_name.to_string_lossy();
         let skill_file = path.join("SKILL.md");
-        let Ok(content) = std::fs::read_to_string(&skill_file) else {
-            continue;
-        };
-        if let Some(mut meta) = parse_skill_frontmatter(&content) {
-            let dir_name = entry.file_name();
-            meta.path = format!("{path_prefix}{}/SKILL.md", dir_name.to_string_lossy());
-            meta.source = source;
-            skills.push(meta);
+        if let Ok(content) = std::fs::read_to_string(&skill_file) {
+            // This directory contains a SKILL.md — treat it as a skill.
+            if let Some(mut meta) = parse_skill_frontmatter(&content) {
+                meta.path = format!("{path_prefix}{dir_name_str}/SKILL.md");
+                meta.source = source;
+                skills.push(meta);
+            }
+        } else {
+            // No SKILL.md here — recurse into subdirectory (supports org folders like `anthropics/`).
+            let sub_prefix = format!("{path_prefix}{dir_name_str}/");
+            skills.extend(discover_skills_in_dir(&path, source, &sub_prefix));
         }
     }
     skills
@@ -224,6 +230,51 @@ pub(crate) fn render_skills_catalog(skills: &[SkillMeta]) -> Option<String> {
     }
 
     Some(lines.join("\n"))
+}
+
+/// Check whether a system skill path is disabled by any entry in the disabled set.
+///
+/// `path` looks like `system://skills/anthropics/pdf/SKILL.md`.
+/// `disabled` entries are relative segments like `anthropics` or `anthropics/pdf`.
+///
+/// A disabled entry matches if it equals the relative dir or is a prefix of it.
+pub(crate) fn is_system_skill_disabled(
+    path: &str,
+    disabled: &HashSet<String>,
+) -> bool {
+    const PREFIX: &str = "system://skills/";
+    let relative = path.strip_prefix(PREFIX).unwrap_or(path);
+    // Strip trailing `/SKILL.md` so we get e.g. `anthropics/pdf`
+    let rel_dir = relative.strip_suffix("/SKILL.md").unwrap_or(relative);
+    for pattern in disabled {
+        if rel_dir == pattern.as_str() {
+            return true;
+        }
+        let mut prefix = String::with_capacity(pattern.len() + 1);
+        prefix.push_str(pattern);
+        prefix.push('/');
+        if rel_dir.starts_with(&prefix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// List available system skill "groups" (top-level directories) for display.
+pub(crate) fn list_system_skill_groups() -> Vec<String> {
+    let Some(dir) = system_skills_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut groups: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    groups.sort();
+    groups
 }
 
 #[derive(Clone, Copy)]

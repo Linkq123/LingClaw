@@ -82,7 +82,6 @@ use session_store::{
     list_saved_session_summaries_in_dir, recoverable_session_ids_from_summaries,
     resolve_session_target, sanitize_session_messages, sessions_dir, trim_incomplete_tool_calls,
 };
-#[cfg(test)]
 use std::collections::HashSet;
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -186,6 +185,9 @@ struct Session {
     show_tools: bool,
     #[serde(default = "default_show_reasoning")]
     show_reasoning: bool,
+    /// System skill paths disabled for this session (e.g. "anthropics", "anthropics/pdf").
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    disabled_system_skills: HashSet<String>,
     #[serde(default)]
     version: u32,
     #[serde(skip)]
@@ -263,6 +265,7 @@ impl Session {
             show_react: default_show_react(),
             show_tools: default_show_tools(),
             show_reasoning: default_show_reasoning(),
+            disabled_system_skills: HashSet::new(),
             version: SESSION_VERSION,
             workspace,
         }
@@ -333,6 +336,7 @@ fn build_system_prompt(
     workspace: &Path,
     model: &str,
     is_main: bool,
+    disabled_system_skills: &HashSet<String>,
 ) -> ChatMessage {
     let os_name = if cfg!(windows) {
         "Windows"
@@ -355,6 +359,17 @@ Only read those files if the user explicitly asks to inspect them, if you need t
         .unwrap_or_default();
 
     let skills_section = prompts::discover_all_skills(workspace);
+    let skills_section: Vec<_> = if disabled_system_skills.is_empty() {
+        skills_section
+    } else {
+        skills_section
+            .into_iter()
+            .filter(|s| {
+                s.source != prompts::SkillSource::System
+                    || !prompts::is_system_skill_disabled(&s.path, disabled_system_skills)
+            })
+            .collect()
+    };
     let skills_section = prompts::render_skills_catalog(&skills_section)
         .map(|s| format!("\n\n{s}"))
         .unwrap_or_default();
@@ -1329,7 +1344,7 @@ async fn main() {
         let main_session = load_session_from_disk(MAIN_SESSION_ID).unwrap_or_else(|| {
             let mut s = Session::new_with_id(MAIN_SESSION_ID, "Main");
             let model = s.effective_model(&state.config.model).to_string();
-            let sys = build_system_prompt(&state.config, &s.workspace, &model, true);
+            let sys = build_system_prompt(&state.config, &s.workspace, &model, true, &s.disabled_system_skills);
             s.messages.push(sys);
             s
         });
