@@ -62,6 +62,11 @@ fn system_skills_dir() -> Option<PathBuf> {
     None
 }
 
+/// Diagnostic: return the resolved system skills directory path (or None).
+pub(crate) fn system_skills_resolved_path() -> Option<PathBuf> {
+    system_skills_dir()
+}
+
 /// Global skills directory: `~/.lingclaw/skills/`.
 fn global_skills_dir() -> Option<PathBuf> {
     let dir = config_dir_path()?.join(SKILLS_DIR);

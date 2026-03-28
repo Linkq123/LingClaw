@@ -706,6 +706,19 @@ async fn show_system_skills_status(
     let mut output = String::from("System skills:");
     if skills.is_empty() {
         output.push_str("\n  (none)");
+        // Diagnostic: show resolved path to help troubleshoot
+        match prompts::system_skills_resolved_path() {
+            Some(p) => output.push_str(&format!("\n  Search resolved to: {}", p.display())),
+            None => {
+                output.push_str("\n  No system skills directory found.");
+                output.push_str(
+                    "\n  Expected: ~/.lingclaw/system-skills/ or docs/reference/skills/ near the binary.",
+                );
+                output.push_str(
+                    "\n  Run `lingclaw install` from the source directory to deploy system skills.",
+                );
+            }
+        }
     } else {
         for skill in &skills {
             let is_disabled = prompts::is_system_skill_disabled(&skill.path, &disabled);
