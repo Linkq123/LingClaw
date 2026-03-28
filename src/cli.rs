@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::{config_dir_path, config_file_path, Config, DEFAULT_PORT, VERSION};
+use crate::{config_dir_path, config_file_path, prompts, Config, DEFAULT_PORT, VERSION};
 
 static MCP_PREFLIGHT_ID: AtomicU64 = AtomicU64::new(1);
 const MCP_PREFLIGHT_TIMEOUT_SECS: u64 = 5;
@@ -1240,6 +1240,81 @@ fn handle_status_command(port_override: Option<u16>) -> bool {
         }
         println!();
         println!("  (* = default model)");
+    }
+    println!();
+
+    // ── MCP Servers ──
+    if config.mcp_servers.is_empty() {
+        println!("  MCP Servers: (none configured)");
+    } else {
+        println!("  MCP Servers ({}):", config.mcp_servers.len());
+        println!();
+        println!(
+            "  {:<20} {:<8} {:<30} {:>10}",
+            "NAME", "STATUS", "COMMAND", "TIMEOUT"
+        );
+        println!("  {}", "─".repeat(72));
+        for (name, srv) in &config.mcp_servers {
+            let status = if srv.enabled { "enabled" } else { "disabled" };
+            let cmd_display = if srv.args.is_empty() {
+                srv.command.clone()
+            } else {
+                format!("{} {}", srv.command, srv.args.join(" "))
+            };
+            let cmd_display = if cmd_display.chars().count() > 30 {
+                let s: String = cmd_display.chars().take(29).collect();
+                format!("{s}…")
+            } else {
+                cmd_display
+            };
+            let timeout = srv
+                .timeout_secs
+                .map(|t| format!("{t}s"))
+                .unwrap_or_else(|| format!("{}s", config.tool_timeout.as_secs()));
+            println!(
+                "  {:<20} {:<8} {:<30} {:>10}",
+                name, status, cmd_display, timeout
+            );
+        }
+    }
+    println!();
+
+    // ── Skills ──
+    // Use a dummy workspace path — we only care about system + global layers here.
+    let dummy_workspace = std::path::Path::new("");
+    let system_skills =
+        prompts::discover_skills_by_source(dummy_workspace, prompts::SkillSource::System);
+    let global_skills =
+        prompts::discover_skills_by_source(dummy_workspace, prompts::SkillSource::Global);
+
+    let total = system_skills.len() + global_skills.len();
+    if total == 0 {
+        println!("  Skills: (none discovered)");
+    } else {
+        println!(
+            "  Skills ({} system, {} global):",
+            system_skills.len(),
+            global_skills.len()
+        );
+        println!();
+        println!("  {:<24} {:<8} DESCRIPTION", "NAME", "SOURCE");
+        println!("  {}", "─".repeat(72));
+        for skill in system_skills.iter().chain(global_skills.iter()) {
+            let desc = if skill.description.chars().count() > 38 {
+                let s: String = skill.description.chars().take(37).collect();
+                format!("{s}…")
+            } else if skill.description.is_empty() {
+                "-".into()
+            } else {
+                skill.description.clone()
+            };
+            println!(
+                "  {:<24} {:<8} {}",
+                skill.name,
+                skill.source.label(),
+                desc
+            );
+        }
     }
     println!();
 
