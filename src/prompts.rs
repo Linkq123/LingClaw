@@ -67,6 +67,34 @@ pub(crate) fn system_skills_resolved_path() -> Option<PathBuf> {
     system_skills_dir()
 }
 
+/// Resolve a virtual skill path to its real filesystem path.
+///
+/// Recognised prefixes:
+///   - `system://skills/...` → resolved via `system_skills_dir()`
+///   - `~/.lingclaw/skills/...` → resolved via `global_skills_dir()`
+///
+/// Returns `None` for session-local `skills/...` paths (handled by the normal
+/// workspace-relative resolution) or unknown prefixes.
+pub(crate) fn resolve_skill_path(virtual_path: &str) -> Option<PathBuf> {
+    const SYSTEM_PREFIX: &str = "system://skills/";
+    const GLOBAL_PREFIX: &str = "~/.lingclaw/skills/";
+
+    if let Some(relative) = virtual_path.strip_prefix(SYSTEM_PREFIX) {
+        let dir = system_skills_dir()?;
+        let full = dir.join(relative);
+        if full.exists() {
+            return Some(full);
+        }
+    } else if let Some(relative) = virtual_path.strip_prefix(GLOBAL_PREFIX) {
+        let dir = global_skills_dir()?;
+        let full = dir.join(relative);
+        if full.exists() {
+            return Some(full);
+        }
+    }
+    None
+}
+
 /// Global skills directory: `~/.lingclaw/skills/`.
 fn global_skills_dir() -> Option<PathBuf> {
     let dir = config_dir_path()?.join(SKILLS_DIR);

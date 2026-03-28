@@ -9,6 +9,20 @@ fn resolve_tool_path(path_str: &str, workspace: &Path, tool_name: &str) -> Resul
         .map_err(|message| format!("{tool_name} error: {message}"))
 }
 
+/// Like `resolve_tool_path` but also resolves virtual skill paths
+/// (`system://skills/...`, `~/.lingclaw/skills/...`) for read-only access.
+fn resolve_tool_path_readable(
+    path_str: &str,
+    workspace: &Path,
+    tool_name: &str,
+) -> Result<PathBuf, String> {
+    // Try virtual skill path first (read-only)
+    if let Some(real) = crate::prompts::resolve_skill_path(path_str) {
+        return Ok(real);
+    }
+    resolve_tool_path(path_str, workspace, tool_name)
+}
+
 // ── read_file ────────────────────────────────────────────────────────────────
 
 pub(crate) async fn tool_read_file(
@@ -20,7 +34,7 @@ pub(crate) async fn tool_read_file(
         Some(p) => p,
         None => return "Error: 'path' parameter is required".into(),
     };
-    let path = match resolve_tool_path(path_str, workspace, "read_file") {
+    let path = match resolve_tool_path_readable(path_str, workspace, "read_file") {
         Ok(path) => path,
         Err(message) => return message,
     };
@@ -169,7 +183,7 @@ pub(crate) async fn tool_list_dir(
     workspace: &Path,
 ) -> String {
     let path_str = args["path"].as_str().unwrap_or(".");
-    let path = match resolve_tool_path(path_str, workspace, "list_dir") {
+    let path = match resolve_tool_path_readable(path_str, workspace, "list_dir") {
         Ok(path) => path,
         Err(message) => return message,
     };
@@ -270,7 +284,7 @@ pub(crate) async fn tool_search_files(
         Err(e) => return format!("Invalid regex pattern: {e}"),
     };
     let dir_str = args["path"].as_str().unwrap_or(".");
-    let dir = match resolve_tool_path(dir_str, workspace, "search_files") {
+    let dir = match resolve_tool_path_readable(dir_str, workspace, "search_files") {
         Ok(path) => path,
         Err(message) => return message,
     };
