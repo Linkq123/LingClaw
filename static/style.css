@@ -301,6 +301,14 @@ header .actions button.is-active {
   color: var(--dim);
   max-width: 82ch;
 }
+.msg.assistant .katex-display {
+  margin: 12px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 4px 0;
+  max-width: 100%;
+}
+.msg.assistant .katex { font-size: 1.05em; }
 .msg.assistant pre {
   margin: 10px 0 14px;
   position: relative;

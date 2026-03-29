@@ -413,6 +413,107 @@ function findProgressiveSplitPoint(text) {
   return lastSplit;
 }
 
+// ── Math (KaTeX) integration ──
+
+function extractMath(text) {
+  const blocks = [];
+  let out = '';
+  let i = 0;
+  const len = text.length;
+
+  while (i < len) {
+    // Escaped dollar sign
+    if (text[i] === '\\' && i + 1 < len && text[i + 1] === '$') {
+      out += '\\$';
+      i += 2;
+      continue;
+    }
+
+    // Fenced code block
+    const atLineStart = i === 0 || text[i - 1] === '\n';
+    if (atLineStart && i + 2 < len && text[i] === '`' && text[i + 1] === '`' && text[i + 2] === '`') {
+      const endMarker = text.indexOf('\n```', i + 3);
+      if (endMarker === -1) {
+        out += text.substring(i);
+        i = len;
+        continue;
+      }
+      let end = endMarker + 4;
+      while (end < len && text[end] !== '\n') end++;
+      out += text.substring(i, end);
+      i = end;
+      continue;
+    }
+
+    // Inline code
+    if (text[i] === '`') {
+      let j = i + 1;
+      while (j < len && text[j] !== '`' && text[j] !== '\n') j++;
+      if (j < len && text[j] === '`') {
+        out += text.substring(i, j + 1);
+        i = j + 1;
+        continue;
+      }
+    }
+
+    // Display math $$...$$
+    if (text[i] === '$' && i + 1 < len && text[i + 1] === '$') {
+      const searchFrom = i + 2;
+      const end = text.indexOf('$$', searchFrom);
+      if (end !== -1 && end > searchFrom) {
+        const formula = text.substring(searchFrom, end);
+        const id = blocks.length;
+        blocks.push({ formula: formula.trim(), displayMode: true });
+        out += `<span data-math="${id}"></span>`;
+        i = end + 2;
+        continue;
+      }
+    }
+
+    // Inline math $...$ (no newline, no leading/trailing space)
+    if (text[i] === '$' && i + 1 < len && text[i + 1] !== '$' && text[i + 1] !== ' ' && text[i + 1] !== '\n') {
+      let j = i + 1;
+      while (j < len && text[j] !== '$' && text[j] !== '\n') j++;
+      if (j < len && text[j] === '$' && j > i + 1 && text[j - 1] !== ' ') {
+        const formula = text.substring(i + 1, j);
+        const id = blocks.length;
+        blocks.push({ formula, displayMode: false });
+        out += `<span data-math="${id}"></span>`;
+        i = j + 1;
+        continue;
+      }
+    }
+
+    out += text[i];
+    i++;
+  }
+
+  return { text: out, blocks };
+}
+
+function renderMathPlaceholders(html, mathBlocks) {
+  if (!mathBlocks.length) return html;
+  return html.replace(/<span data-math="(\d+)"><\/span>/g, (_, idStr) => {
+    const id = parseInt(idStr, 10);
+    if (id < 0 || id >= mathBlocks.length) return '';
+    const { formula, displayMode } = mathBlocks[id];
+    if (typeof katex === 'undefined') {
+      return displayMode
+        ? `<pre><code>${escHtml(formula)}</code></pre>`
+        : `<code>${escHtml(formula)}</code>`;
+    }
+    try {
+      return katex.renderToString(formula, {
+        displayMode,
+        throwOnError: false,
+        output: 'htmlAndMathml',
+      });
+    } catch {
+      return `<code>${escHtml(formula)}</code>`;
+    }
+  });
+}
+
 function decorateCodeBlocks(container) {
   container.querySelectorAll('pre').forEach(pre => {
     pre.style.position = 'relative';
@@ -445,10 +546,11 @@ function decorateCodeBlocks(container) {
 }
 
 function appendRenderedSegment(el, markdownText) {
-  const html = marked.parse(markdownText);
+  const { text: preprocessed, blocks: mathBlocks } = extractMath(markdownText);
+  const html = marked.parse(preprocessed);
   const sanitized = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : html;
   const temp = document.createElement('div');
-  temp.innerHTML = sanitized;
+  temp.innerHTML = renderMathPlaceholders(sanitized, mathBlocks);
   decorateCodeBlocks(temp);
   const codeBlocks = [...temp.querySelectorAll('pre code')];
   const tail = el._liveTail;
@@ -1285,8 +1387,10 @@ function addToolResult(name, result, id, durationMs = null) {
 
 function renderMarkdown(el) {
   const raw = el._rawText || el.textContent;
-  const html = marked.parse(raw);
-  el.innerHTML = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : html;
+  const { text: preprocessed, blocks: mathBlocks } = extractMath(raw);
+  const html = marked.parse(preprocessed);
+  const sanitized = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : html;
+  el.innerHTML = renderMathPlaceholders(sanitized, mathBlocks);
   el._markdownIdleHandle = 0;
 
   decorateCodeBlocks(el);
