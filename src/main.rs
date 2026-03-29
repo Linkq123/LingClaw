@@ -1,7 +1,7 @@
 use axum::{
     extract::{
         ws::{Message as WsMsg, WebSocket, WebSocketUpgrade},
-        Query, State,
+        State,
     },
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
@@ -53,18 +53,8 @@ use runtime_loop::{
     handle_idle_socket_input, resolve_or_create_socket_session, run_agent_session,
     IdleSocketInputAction,
 };
-use session_admin::{
-    admin_tool_definitions_anthropic, admin_tool_definitions_openai, execute_admin_tool,
-    is_admin_tool,
-};
-use session_store::{
-    list_recoverable_saved_session_ids, load_session_from_disk, refresh_session_system_prompt,
-    save_session_to_disk,
-};
-use socket_sync::{
-    send_command_refresh, send_existing_session_payloads, send_new_session_payload,
-    send_session_switched_payloads, send_sessions_list,
-};
+use session_store::{load_session_from_disk, refresh_session_system_prompt, save_session_to_disk};
+use socket_sync::{send_command_refresh, send_existing_session_payloads};
 use socket_tasks::{finalize_connection, spawn_connection_tasks, ConnectionCleanup};
 
 #[cfg(test)]
@@ -77,7 +67,7 @@ use context::{
 #[cfg(test)]
 use hooks::{build_compressed_messages, find_auto_compress_cutoff};
 #[cfg(test)]
-use session_admin::{delete_session_by_id, gather_global_today_usage, gather_sessions_status};
+use session_admin::gather_global_today_usage;
 #[cfg(test)]
 use session_store::{
     build_active_session_lines, build_global_today_usage, build_history_payload,
@@ -145,13 +135,6 @@ fn now_epoch() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn gen_session_id() -> String {
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    format!("{:x}{:04x}", t.as_secs(), t.subsec_nanos() % 0xFFFF)
 }
 
 const SESSION_VERSION: u32 = 4;
@@ -241,10 +224,6 @@ fn session_workspace_path(session_id: &str) -> PathBuf {
 }
 
 impl Session {
-    fn new() -> Self {
-        Self::new_with_id(&gen_session_id(), "New Chat")
-    }
-
     fn new_with_id(id: &str, name: &str) -> Self {
         let workspace = session_workspace_path(id);
         std::fs::create_dir_all(&workspace).ok();
@@ -274,10 +253,6 @@ impl Session {
         }
     }
 
-    fn is_main(&self) -> bool {
-        self.id == MAIN_SESSION_ID
-    }
-
     fn effective_model<'a>(&'a self, default: &'a str) -> &'a str {
         self.model_override.as_deref().unwrap_or(default)
     }
@@ -291,8 +266,10 @@ struct AppState {
     active_connections: Mutex<HashMap<String, u64>>,
     session_clients: Mutex<HashMap<String, SessionClientBinding>>,
     live_rounds: Mutex<HashMap<String, LiveRoundState>>,
-    /// Per-session active agent run cancellation tokens.
-    active_runs: Mutex<HashMap<String, CancellationToken>>,
+    /// Per-session active agent runs keyed by the owning connection.
+    active_runs: Mutex<HashMap<String, SessionRunBinding>>,
+    /// Per-session connection-level cancellation tokens (kick old connection on rebind).
+    connection_cancels: Mutex<HashMap<String, ConnectionCancelBinding>>,
     next_connection_id: AtomicU64,
     shutdown: CancellationToken,
     shutdown_token: String,
@@ -307,6 +284,18 @@ struct SessionClientBinding {
     pending_events: Vec<serde_json::Value>,
 }
 
+#[derive(Clone)]
+struct SessionRunBinding {
+    connection_id: u64,
+    cancel: CancellationToken,
+}
+
+#[derive(Clone)]
+struct ConnectionCancelBinding {
+    connection_id: u64,
+    cancel: CancellationToken,
+}
+
 #[derive(Clone, Default)]
 struct LiveToolState {
     id: String,
@@ -318,6 +307,7 @@ struct LiveToolState {
 
 #[derive(Clone, Default)]
 struct LiveRoundState {
+    connection_id: u64,
     round: usize,
     react_visible: bool,
     phase: Option<String>,
@@ -339,7 +329,6 @@ fn build_system_prompt(
     config: &Config,
     workspace: &Path,
     model: &str,
-    is_main: bool,
     disabled_system_skills: &HashSet<String>,
 ) -> ChatMessage {
     let os_name = if cfg!(windows) {
@@ -378,16 +367,6 @@ Only read those files if the user explicitly asks to inspect them, if you need t
         .map(|s| format!("\n\n{s}"))
         .unwrap_or_default();
 
-    let admin_section = if is_main {
-        "\n\n## Admin Tools (Main Session Only)\n\
-         You have access to session management tools. When users ask about sessions, \
-         session counts, or want to manage/delete sessions, use these tools directly.\n\
-         - list_sessions: List all sessions with model, context usage, and configuration\n\
-         - delete_session: Delete a session by ID (cannot delete the main session)"
-    } else {
-        ""
-    };
-
     let prompt = format!(
         r#"{persona}
 
@@ -402,13 +381,12 @@ Only read those files if the user explicitly asks to inspect them, if you need t
 {prompt_file_note}
 
 ## Available Tools
-{tool_lines}{admin_section}{mcp_note}{skills_section}"#,
+{tool_lines}{mcp_note}{skills_section}"#,
         model = model,
         local_time = local_time,
         tool_lines = tool_lines,
         persona = persona,
         prompt_file_note = prompt_file_note,
-        admin_section = admin_section,
         mcp_note = mcp_note,
         skills_section = skills_section,
     );
@@ -740,7 +718,20 @@ async fn unbind_session_connection_if_matches(
     }
 }
 
-async fn dispatch_live_event(state: &AppState, session_id: &str, event: serde_json::Value) {
+async fn dispatch_live_event(
+    state: &AppState,
+    session_id: &str,
+    connection_id: u64,
+    event: serde_json::Value,
+) {
+    let is_current_connection = {
+        let active = state.active_connections.lock().await;
+        active.get(session_id).copied() == Some(connection_id)
+    };
+    if !is_current_connection {
+        return;
+    }
+
     let event_type = event["type"].as_str().unwrap_or_default();
 
     {
@@ -750,6 +741,7 @@ async fn dispatch_live_event(state: &AppState, session_id: &str, event: serde_js
                 live_rounds.insert(
                     session_id.to_string(),
                     LiveRoundState {
+                        connection_id,
                         round: event["round"].as_u64().unwrap_or(1) as usize,
                         react_visible: event["react_visible"].as_bool().unwrap_or(false),
                         phase: event["phase"].as_str().map(str::to_string),
@@ -861,6 +853,9 @@ async fn dispatch_live_event(state: &AppState, session_id: &str, event: serde_js
     let binding = {
         let mut clients = state.session_clients.lock().await;
         if let Some(binding) = clients.get_mut(session_id) {
+            if binding.connection_id != connection_id {
+                return;
+            }
             if !binding.replay_ready {
                 binding.pending_events.push(event.clone());
                 None
@@ -955,86 +950,10 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
     }
 }
 
-// ── Session Claim ────────────────────────────────────────────────────────────
-
-enum ClaimSessionResult {
-    Claimed(String),
-    InUse,
-    NotFound,
-}
-
-/// Lock ordering: active_connections → session_clients → sessions.
-/// All callers must acquire locks in this order to prevent deadlocks.
-async fn try_claim_session(id: &str, state: &AppState, connection_id: u64) -> ClaimSessionResult {
-    if id.contains('/') || id.contains('\\') || id.contains("..") {
-        return ClaimSessionResult::NotFound;
-    }
-
-    // Phase 1: quick check — is there an active connection?
-    if state.active_connections.lock().await.contains_key(id) {
-        return ClaimSessionResult::InUse;
-    }
-    if state.session_clients.lock().await.contains_key(id) {
-        return ClaimSessionResult::InUse;
-    }
-
-    // Phase 2: try claiming from in-memory orphan (no disk I/O)
-    {
-        let mut active = state.active_connections.lock().await;
-        if active.contains_key(id) {
-            return ClaimSessionResult::InUse;
-        }
-        if state.session_clients.lock().await.contains_key(id) {
-            return ClaimSessionResult::InUse;
-        }
-        let mut sessions = state.sessions.lock().await;
-        if let Some(session) = sessions.get_mut(id) {
-            refresh_session_system_prompt(state, session);
-            active.insert(id.to_string(), connection_id);
-            return ClaimSessionResult::Claimed(id.to_string());
-        }
-    }
-
-    // Phase 3: load from disk WITHOUT holding any lock
-    let Some(mut session) = load_session_from_disk(id) else {
-        return ClaimSessionResult::NotFound;
-    };
-    refresh_session_system_prompt(state, &mut session);
-
-    // Phase 4: re-acquire locks and atomically claim
-    let mut active = state.active_connections.lock().await;
-    if active.contains_key(id) {
-        return ClaimSessionResult::InUse;
-    }
-    if state.session_clients.lock().await.contains_key(id) {
-        return ClaimSessionResult::InUse;
-    }
-    let mut sessions = state.sessions.lock().await;
-    if sessions.contains_key(id) {
-        // Someone else loaded it while we were reading disk
-        return ClaimSessionResult::InUse;
-    }
-
-    let sid = session.id.clone();
-    sessions.insert(sid.clone(), session);
-    active.insert(sid.clone(), connection_id);
-    ClaimSessionResult::Claimed(sid)
-}
-
 // ── WebSocket Handler ────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct WsQuery {
-    session: Option<String>,
-}
-
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    Query(query): Query<WsQuery>,
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
-    let requested = query.session.filter(|s| !s.is_empty());
-    ws.on_upgrade(|socket| handle_socket(socket, state, requested))
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_socket(socket, state, None))
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Option<String>) {
@@ -1060,7 +979,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
     let reader_run_active = run_active.clone();
     let reader_cancel = connection_cancel.clone();
     let reader = tokio::spawn(async move {
-        while let Some(result) = rx.next().await {
+        loop {
+            let Some(result) = (tokio::select! {
+                biased;
+                _ = reader_cancel.cancelled() => None,
+                result = rx.next() => result,
+            }) else {
+                break;
+            };
             match result {
                 Ok(WsMsg::Text(t)) => {
                     if t.trim().eq_ignore_ascii_case("/stop")
@@ -1083,10 +1009,35 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
     let mut current_session_id =
         resolve_or_create_socket_session(&state, &tx, requested_id.as_deref(), connection_id).await;
 
+    // Kick out any previous connection bound to this session.
+    {
+        let mut cancels = state.connection_cancels.lock().await;
+        if let Some(old_binding) = cancels.remove(&current_session_id) {
+            old_binding.cancel.cancel();
+        }
+        cancels.insert(
+            current_session_id.clone(),
+            ConnectionCancelBinding {
+                connection_id,
+                cancel: connection_cancel.clone(),
+            },
+        );
+    }
+    {
+        let active_run = {
+            let runs = state.active_runs.lock().await;
+            runs.get(&current_session_id).cloned()
+        };
+        if let Some(run) = active_run {
+            if run.connection_id != connection_id {
+                run.cancel.cancel();
+            }
+        }
+    }
+
     bind_session_connection(&state, &current_session_id, connection_id, &tx, false).await;
     replay_live_round(&tx, &state, &current_session_id).await;
     finish_session_replay(&state, &current_session_id, connection_id).await;
-    send_sessions_list(&tx, &state, &current_session_id).await;
 
     let cancel = state.shutdown.clone();
     let current_session_ref = Arc::new(Mutex::new(current_session_id.clone()));
@@ -1131,6 +1082,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         let outcome = run_agent_session(
             &state,
             &current_session_id,
+            connection_id,
             &cancel,
             &live_tx,
             &mut inbound_rx,
@@ -1160,37 +1112,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         },
     )
     .await;
-}
-
-/// Wait for a specific session to become available (old connection releasing it),
-/// then load from disk and claim it. Returns None if unavailable after timeout.
-async fn claim_requested_session(id: &str, state: &AppState, connection_id: u64) -> Option<String> {
-    // Validate ID format
-    if id.contains('/') || id.contains('\\') || id.contains("..") {
-        return None;
-    }
-    // Browser refresh can race the old socket disconnect: the new connection may arrive
-    // while the previous client binding still exists for the same session. Give that
-    // binding a short grace window to disappear before treating it as a different live client.
-    const REFRESH_CLIENT_GRACE_POLLS: usize = 6;
-
-    // Wait up to 30 seconds for an in-flight generation round to finish and release the session.
-    for attempt in 0..60 {
-        let active = state.active_connections.lock().await.contains_key(id);
-        let has_bound_client = state.session_clients.lock().await.contains_key(id);
-        if !active && !has_bound_client {
-            break;
-        }
-        if has_bound_client && attempt >= REFRESH_CLIENT_GRACE_POLLS {
-            // Another client is still actively bound after the refresh grace window.
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    match try_claim_session(id, state, connection_id).await {
-        ClaimSessionResult::Claimed(id) => Some(id),
-        ClaimSessionResult::InUse | ClaimSessionResult::NotFound => None,
-    }
 }
 
 // ── HTTP API ──────────────────────────────────────────────────────────────────
@@ -1227,10 +1148,10 @@ async fn api_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 async fn api_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let sessions = state.sessions.lock().await;
     let list: Vec<serde_json::Value> = sessions
-        .iter()
-        .map(|(id, s)| {
+        .get(MAIN_SESSION_ID)
+        .map(|s| {
             json!({
-                "id": id,
+                "id": MAIN_SESSION_ID,
                 "name": s.name,
                 "messages": s.messages.len(),
                 "tool_calls": s.tool_calls_count,
@@ -1239,6 +1160,7 @@ async fn api_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 "updated_at": s.updated_at,
             })
         })
+        .into_iter()
         .collect();
     Json(json!({"sessions": list}))
 }
@@ -1343,6 +1265,7 @@ async fn main() {
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
         active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
         next_connection_id: AtomicU64::new(1),
         shutdown: shutdown.clone(),
         shutdown_token,
@@ -1358,7 +1281,6 @@ async fn main() {
                 &state.config,
                 &s.workspace,
                 &model,
-                true,
                 &s.disabled_system_skills,
             );
             s.messages.push(sys);

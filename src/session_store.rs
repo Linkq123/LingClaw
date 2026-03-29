@@ -1,6 +1,8 @@
 use serde_json::json;
+#[cfg(test)]
+use std::collections::HashSet;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
 };
 
@@ -102,7 +104,6 @@ pub(crate) fn refresh_session_system_prompt(state: &AppState, session: &mut Sess
         &state.config,
         &session.workspace,
         &model,
-        session.is_main(),
         &session.disabled_system_skills,
     );
     if let Some(first) = session.messages.first_mut() {
@@ -112,6 +113,7 @@ pub(crate) fn refresh_session_system_prompt(state: &AppState, session: &mut Sess
     }
 }
 
+#[cfg(test)]
 pub(crate) fn sanitized_non_system_message_count(session: &Session) -> usize {
     let mut normalized = session.clone();
     normalize_session(&mut normalized);
@@ -122,6 +124,7 @@ pub(crate) fn sanitized_non_system_message_count(session: &Session) -> usize {
         .count()
 }
 
+#[cfg(test)]
 pub(crate) fn list_saved_session_summaries_in_dir(dir: &Path) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -159,10 +162,7 @@ pub(crate) fn list_saved_session_summaries_in_dir(dir: &Path) -> Vec<serde_json:
     out
 }
 
-pub(crate) fn list_saved_session_summaries() -> Vec<serde_json::Value> {
-    list_saved_session_summaries_in_dir(&sessions_dir())
-}
-
+#[cfg(test)]
 pub(crate) fn recoverable_session_ids_from_summaries(
     summaries: &[serde_json::Value],
 ) -> Vec<String> {
@@ -176,10 +176,7 @@ pub(crate) fn recoverable_session_ids_from_summaries(
         .collect()
 }
 
-pub(crate) fn list_recoverable_saved_session_ids() -> Vec<String> {
-    recoverable_session_ids_from_summaries(&list_saved_session_summaries())
-}
-
+#[cfg(test)]
 pub(crate) fn list_saved_session_ids_in_dir(dir: &Path) -> HashSet<String> {
     let mut ids = HashSet::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -194,10 +191,6 @@ pub(crate) fn list_saved_session_ids_in_dir(dir: &Path) -> HashSet<String> {
         }
     }
     ids
-}
-
-pub(crate) fn list_saved_session_ids() -> HashSet<String> {
-    list_saved_session_ids_in_dir(&sessions_dir())
 }
 
 pub(crate) fn build_history_payload(session: &Session) -> serde_json::Value {
@@ -248,6 +241,7 @@ pub(crate) fn build_view_state_payload(session: &Session) -> serde_json::Value {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_session_target(
     target: &str,
     known_ids: &HashSet<String>,
@@ -271,7 +265,7 @@ pub(crate) fn resolve_session_target(
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn build_active_session_lines(
     sessions: &HashMap<String, Session>,
     active_ids: &HashSet<String>,

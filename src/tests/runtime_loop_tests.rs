@@ -30,6 +30,7 @@ fn test_app_state() -> AppState {
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
         active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),

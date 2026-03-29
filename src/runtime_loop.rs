@@ -28,12 +28,12 @@ struct AgentPhaseState {
     pending_tool_calls: Vec<ToolCall>,
     collected_results: Vec<agent::ToolResultEntry>,
     cycle_workspace: PathBuf,
-    cycle_is_main: bool,
     last_observation_hint: Option<String>,
     pending_interventions: Vec<String>,
     react_ctx: agent::AgentLoopCtx,
     shutting_down: bool,
     run_stopped: bool,
+    run_detached: bool,
 }
 
 enum AgentPhaseControl {
@@ -71,15 +71,9 @@ async fn prepare_analyze_snapshot(
     let mut sessions = ctx.state.sessions.lock().await;
     let session = sessions.get_mut(ctx.current_session_id)?;
     let model_str = session.effective_model(&ctx.state.config.model).to_string();
-    let is_main_session = session.is_main();
     let disabled = session.disabled_system_skills.clone();
-    let mut fresh_system = build_system_prompt(
-        &ctx.state.config,
-        &session.workspace,
-        &model_str,
-        is_main_session,
-        &disabled,
-    );
+    let mut fresh_system =
+        build_system_prompt(&ctx.state.config, &session.workspace, &model_str, &disabled);
     if let Some(hint) = phase_state.last_observation_hint.take() {
         if let Some(ref mut content) = fresh_system.content {
             content.push_str("\n\n");
@@ -101,7 +95,6 @@ async fn prepare_analyze_snapshot(
     let pruned_count = msg_count_before - session.messages.len();
 
     phase_state.cycle_workspace = session.workspace.clone();
-    phase_state.cycle_is_main = ctx.current_session_id == MAIN_SESSION_ID;
 
     Some(AnalyzeSnapshot {
         model: model_str,
@@ -225,7 +218,6 @@ async fn build_cycle_tools(
         &ctx.state.config,
         resolved.provider,
         &phase_state.cycle_workspace,
-        phase_state.cycle_is_main,
     )
     .await
 }
@@ -234,17 +226,8 @@ pub(crate) async fn build_runtime_tools(
     config: &Config,
     provider: Provider,
     workspace: &Path,
-    is_main: bool,
 ) -> Vec<serde_json::Value> {
-    let extra_tools: Vec<serde_json::Value> = if is_main {
-        match provider {
-            Provider::Anthropic => admin_tool_definitions_anthropic(),
-            Provider::OpenAI => admin_tool_definitions_openai(),
-        }
-    } else {
-        vec![]
-    };
-    let mut extra_tools = extra_tools;
+    let mut extra_tools = Vec::new();
     let mut mcp_tools = match provider {
         Provider::Anthropic => tools::mcp::tool_definitions_anthropic(config, workspace).await,
         Provider::OpenAI => tools::mcp::tool_definitions_openai(config, workspace).await,
@@ -441,50 +424,27 @@ async fn execute_tool_call(
         return Err(AgentPhaseControl::Break);
     }
 
-    let run_state = if phase_state.cycle_is_main && is_admin_tool(&tc.function.name) {
-        run_tool_with_feedback(
-            ctx.live_tx,
-            ctx.run_cancel,
-            &tc.id,
+    let run_state = run_tool_with_feedback(
+        ctx.live_tx,
+        ctx.run_cancel,
+        &tc.id,
+        &tc.function.name,
+        tool_timeout,
+        execute_tool(
             &tc.function.name,
-            tool_timeout,
-            async {
-                let start = std::time::Instant::now();
-                let output =
-                    execute_admin_tool(&tc.function.name, &tc.function.arguments, ctx.state).await;
-                let duration_ms = start.elapsed().as_millis() as u64;
-                let is_error = tools::is_tool_error_output(&tc.function.name, &output);
-                tools::ToolOutcome {
-                    output,
-                    is_error,
-                    duration_ms,
-                }
-            },
-        )
-        .await
-    } else {
-        run_tool_with_feedback(
-            ctx.live_tx,
-            ctx.run_cancel,
-            &tc.id,
-            &tc.function.name,
-            tool_timeout,
-            execute_tool(
-                &tc.function.name,
-                &tc.function.arguments,
-                &ctx.state.config,
-                &ctx.state.http,
-                &phase_state.cycle_workspace,
-            ),
-        )
-        .await
-    };
+            &tc.function.arguments,
+            &ctx.state.config,
+            &ctx.state.http,
+            &phase_state.cycle_workspace,
+        ),
+    )
+    .await;
 
     match run_state {
         ToolRunState::Completed(result) => Ok(result),
         ToolRunState::Abort => {
             phase_state.shutting_down = ctx.cancel.is_cancelled();
-            phase_state.run_stopped = !phase_state.shutting_down;
+            phase_state.run_detached = !phase_state.shutting_down;
             Err(AgentPhaseControl::Break)
         }
     }
@@ -640,7 +600,7 @@ async fn run_analyze_phase(
         biased;
         _ = ctx.run_cancel.cancelled() => {
             phase_state.shutting_down = ctx.cancel.is_cancelled();
-            phase_state.run_stopped = !phase_state.shutting_down;
+            phase_state.run_detached = !phase_state.shutting_down;
             return AgentPhaseControl::Break;
         }
         result = providers::call_llm_stream(
@@ -682,7 +642,7 @@ async fn run_act_phase(
     for tc in &tool_calls {
         if ctx.run_cancel.is_cancelled() {
             phase_state.shutting_down = ctx.cancel.is_cancelled();
-            phase_state.run_stopped = !phase_state.shutting_down;
+            phase_state.run_detached = !phase_state.shutting_down;
             return AgentPhaseControl::Break;
         }
 
@@ -803,6 +763,7 @@ async fn run_finish_phase(
 pub(crate) async fn run_agent_session(
     state: &Arc<AppState>,
     current_session_id: &str,
+    connection_id: u64,
     cancel: &CancellationToken,
     live_tx: &LiveTx,
     inbound_rx: &mut mpsc::Receiver<String>,
@@ -819,7 +780,13 @@ pub(crate) async fn run_agent_session(
     let run_cancel = cancel.child_token();
     {
         let mut runs = state.active_runs.lock().await;
-        runs.insert(current_session_id.to_string(), run_cancel.clone());
+        runs.insert(
+            current_session_id.to_string(),
+            SessionRunBinding {
+                connection_id,
+                cancel: run_cancel.clone(),
+            },
+        );
     }
 
     let ctx = AgentRunCtx {
@@ -834,17 +801,22 @@ pub(crate) async fn run_agent_session(
         pending_tool_calls: Vec::new(),
         collected_results: Vec::new(),
         cycle_workspace: PathBuf::new(),
-        cycle_is_main: false,
         last_observation_hint: None,
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(show_react),
         shutting_down: false,
         run_stopped: false,
+        run_detached: false,
     };
 
     'agent: loop {
         if cancel.is_cancelled() {
             phase_state.shutting_down = true;
+            break;
+        }
+        if run_cancel.is_cancelled() {
+            phase_state.shutting_down = cancel.is_cancelled();
+            phase_state.run_detached = !phase_state.shutting_down;
             break;
         }
         if stop_requested.swap(false, Ordering::Relaxed) {
@@ -882,10 +854,13 @@ pub(crate) async fn run_agent_session(
 
     {
         let mut runs = state.active_runs.lock().await;
-        runs.remove(current_session_id);
+        if runs.get(current_session_id).map(|run| run.connection_id) == Some(connection_id) {
+            runs.remove(current_session_id);
+        }
     }
 
     let rerun_agent = if !phase_state.run_stopped
+        && !phase_state.run_detached
         && !phase_state.shutting_down
         && !phase_state.pending_interventions.is_empty()
     {
@@ -924,6 +899,13 @@ pub(crate) async fn run_agent_session(
             }),
         )
         .await;
+    }
+
+    if phase_state.run_detached {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(current_session_id) {
+            session_store::trim_incomplete_tool_calls(&mut session.messages);
+        }
     }
 
     if phase_state.shutting_down {

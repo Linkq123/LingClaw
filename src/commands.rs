@@ -8,13 +8,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     agent, build_system_prompt, default_show_react, default_show_reasoning, default_show_tools,
     now_epoch, prompts, providers,
-    session_admin::{
-        admin_tool_definitions_anthropic, admin_tool_definitions_openai, delete_session_by_id,
-        gather_global_today_usage, gather_sessions_status,
-    },
-    session_store::{build_session_status, build_usage_report, save_session_to_disk, sessions_dir},
-    tools, truncate, try_claim_session, ws_send, AppState, ChatMessage, ClaimSessionResult,
-    Session, WsTx, MAIN_SESSION_ID,
+    session_admin::gather_global_today_usage,
+    session_store::{build_session_status, build_usage_report, save_session_to_disk},
+    tools, truncate, ws_send, AppState, ChatMessage, Session, WsTx, MAIN_SESSION_ID,
 };
 
 // ── Chat Commands ────────────────────────────────────────────────────────────
@@ -22,7 +18,6 @@ use crate::{
 pub(crate) struct CommandResult {
     pub(crate) response: String,
     pub(crate) response_type: &'static str,
-    pub(crate) new_session_id: Option<String>,
     pub(crate) sessions_changed: bool,
     pub(crate) refresh_history: bool,
 }
@@ -30,13 +25,11 @@ pub(crate) struct CommandResult {
 pub(crate) fn command_result(
     response: impl Into<String>,
     response_type: &'static str,
-    new_session_id: Option<String>,
     sessions_changed: bool,
 ) -> CommandResult {
     CommandResult {
         response: response.into(),
         response_type,
-        new_session_id,
         sessions_changed,
         refresh_history: false,
     }
@@ -45,12 +38,11 @@ pub(crate) fn command_result(
 pub(crate) fn command_result_with_history(
     response: impl Into<String>,
     response_type: &'static str,
-    new_session_id: Option<String>,
     sessions_changed: bool,
 ) -> CommandResult {
     CommandResult {
         refresh_history: true,
-        ..command_result(response, response_type, new_session_id, sessions_changed)
+        ..command_result(response, response_type, sessions_changed)
     }
 }
 
@@ -126,14 +118,7 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
     let model = session.effective_model(&state.config.model).to_string();
     let resolved = state.config.resolve_model(&model);
     let effective_think = status_effective_think_level(session, state, &resolved).await;
-    let mut extra_tools = if session.is_main() {
-        match resolved.provider {
-            crate::Provider::Anthropic => admin_tool_definitions_anthropic(),
-            crate::Provider::OpenAI => admin_tool_definitions_openai(),
-        }
-    } else {
-        Vec::new()
-    };
+    let mut extra_tools = Vec::new();
     let mut cached_mcp_tools = match resolved.provider {
         crate::Provider::Anthropic => {
             tools::mcp::cached_tool_definitions_anthropic(&state.config, &session.workspace)
@@ -155,7 +140,6 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
         &state.config,
         &session.workspace,
         &model,
-        session.is_main(),
         &session.disabled_system_skills,
     );
     if let Some(first) = request_messages.first_mut() {
@@ -246,12 +230,10 @@ async fn reset_session_context_and_persist(
         },
         |session| {
             let model = session.effective_model(&state.config.model).to_string();
-            let is_main = session.is_main();
             let sys = build_system_prompt(
                 &state.config,
                 &session.workspace,
                 &model,
-                is_main,
                 &session.disabled_system_skills,
             );
             session.messages = vec![sys];
@@ -266,22 +248,6 @@ async fn reset_session_context_and_persist(
     .await
 }
 
-async fn delete_session_artifacts(session_id: &str) {
-    let path = sessions_dir().join(format!("{session_id}.json"));
-    if tokio::fs::try_exists(&path).await.unwrap_or(false) {
-        let _ = tokio::fs::remove_file(&path).await;
-    }
-
-    if let Some(session_dir) = crate::session_workspace_path(session_id)
-        .parent()
-        .map(Path::to_path_buf)
-    {
-        if tokio::fs::try_exists(&session_dir).await.unwrap_or(false) {
-            let _ = tokio::fs::remove_dir_all(session_dir).await;
-        }
-    }
-}
-
 async fn handle_new_command(
     current_session_id: &str,
     state: &AppState,
@@ -292,7 +258,7 @@ async fn handle_new_command(
         let sessions = state.sessions.lock().await;
         let session = match sessions.get(current_session_id) {
             Some(s) => s,
-            None => return Some(command_result("Session not found", "system", None, false)),
+            None => return Some(command_result("Session not found", "system", false)),
         };
         let mut lines = Vec::new();
         for msg in &session.messages {
@@ -325,18 +291,16 @@ async fn handle_new_command(
                 return Some(command_result_with_history(
                     "Context cleared.",
                     "system",
-                    None,
                     true,
                 ));
             }
             Err(err) if err == "Session not found" => {
-                return Some(command_result(err, "system", None, false));
+                return Some(command_result(err, "system", false));
             }
             Err(err) => {
                 return Some(command_result(
                     format!("Failed to persist cleared context: {err}"),
                     "error",
-                    None,
                     false,
                 ));
             }
@@ -378,7 +342,6 @@ async fn handle_new_command(
             return Some(command_result(
                 "Shutdown: compression skipped, context unchanged.",
                 "system",
-                None,
                 false,
             ));
         }
@@ -389,7 +352,6 @@ async fn handle_new_command(
                     return Some(command_result(
                         format!("Failed to compress conversation: {e}"),
                         "system",
-                        None,
                         false,
                     ));
                 }
@@ -422,7 +384,6 @@ async fn handle_new_command(
         return Some(command_result(
             format!("Failed to write memory: {e}"),
             "system",
-            None,
             false,
         ));
     }
@@ -430,13 +391,12 @@ async fn handle_new_command(
     match reset_session_context_and_persist(state, current_session_id).await {
         Ok(()) => {}
         Err(err) if err == "Session not found" => {
-            return Some(command_result(err, "system", None, false));
+            return Some(command_result(err, "system", false));
         }
         Err(err) => {
             return Some(command_result(
                 format!("Failed to persist cleared context: {err}"),
                 "error",
-                None,
                 false,
             ));
         }
@@ -445,124 +405,37 @@ async fn handle_new_command(
     Some(command_result_with_history(
         format!("Conversation compressed and saved to memory/{today}.md. Context cleared."),
         "success",
-        None,
         true,
     ))
 }
 
 async fn handle_session_new_command(current_session_id: &str, state: &AppState) -> CommandResult {
-    let snapshot = {
-        let sessions = state.sessions.lock().await;
-        sessions.get(current_session_id).cloned()
-    };
-    if let Some(ref s) = snapshot {
-        if s.messages.len() > 1 {
-            match save_session_to_disk(s).await {
-                Ok(()) => {
-                    state.sessions.lock().await.remove(current_session_id);
-                }
-                Err(e) => {
-                    eprintln!(
-                        "Warning: failed to save session {} before /session_new: {e}; keeping in memory",
-                        s.id
-                    );
-                }
-            }
-        } else {
-            state.sessions.lock().await.remove(current_session_id);
-            delete_session_artifacts(current_session_id).await;
-        }
+    match reset_session_context_and_persist(state, current_session_id).await {
+        Ok(()) => command_result_with_history(
+            "Single-session mode is enabled. Cleared the main session instead of creating a new one.",
+            "system",
+            false,
+        ),
+        Err(err) if err == "Session not found" => command_result(err, "system", false),
+        Err(err) => command_result(
+            format!("Failed to reset main session: {err}"),
+            "error",
+            false,
+        ),
     }
-
-    let mut session = Session::new();
-    let model = session.effective_model(&state.config.model).to_string();
-    let sys = build_system_prompt(
-        &state.config,
-        &session.workspace,
-        &model,
-        false,
-        &session.disabled_system_skills,
-    );
-    session.messages.push(sys);
-    let new_id = session.id.clone();
-    if let Err(err) = save_session_to_disk(&session).await {
-        eprintln!(
-            "Warning: failed to persist new session {} during /session_new: {err}; keeping in memory",
-            new_id
-        );
-    }
-    state.sessions.lock().await.insert(new_id.clone(), session);
-
-    command_result("A new journey begins.", "system", Some(new_id), true)
 }
 
 async fn handle_switch_command(
-    arg: &str,
-    current_session_id: &str,
-    connection_id: u64,
-    state: &AppState,
+    _arg: &str,
+    _current_session_id: &str,
+    _connection_id: u64,
+    _state: &AppState,
 ) -> CommandResult {
-    if arg.is_empty() {
-        return command_result("Usage: /switch <session_id>", "system", None, false);
-    }
-    let target = arg.to_string();
-    if target == current_session_id {
-        return command_result("Already on this session.", "system", None, false);
-    }
-
-    let snapshot = {
-        let sessions = state.sessions.lock().await;
-        sessions.get(current_session_id).cloned()
-    };
-    let should_delete_current_if_switch_succeeds = snapshot
-        .as_ref()
-        .is_some_and(|session| session.messages.len() <= 1);
-    if let Some(ref s) = snapshot {
-        if s.messages.len() > 1 {
-            if let Err(e) = save_session_to_disk(s).await {
-                eprintln!(
-                    "Warning: failed to save session {} before /switch: {e}; keeping in memory",
-                    s.id
-                );
-                return command_result(
-                    "Failed to save current session; switch cancelled to avoid data loss.",
-                    "system",
-                    None,
-                    false,
-                );
-            }
-        }
-    }
-
-    match try_claim_session(&target, state, connection_id).await {
-        ClaimSessionResult::Claimed(id) => {
-            state.sessions.lock().await.remove(current_session_id);
-            if should_delete_current_if_switch_succeeds {
-                delete_session_artifacts(current_session_id).await;
-            }
-            command_result(
-                format!("Loaded session {}", &id[..12.min(id.len())]),
-                "system",
-                Some(id),
-                true,
-            )
-        }
-        ClaimSessionResult::InUse => command_result(
-            format!(
-                "Session '{}' is in use by another connection.",
-                &target[..12.min(target.len())]
-            ),
-            "system",
-            None,
-            false,
-        ),
-        ClaimSessionResult::NotFound => command_result(
-            format!("Session '{}' not found.", &target[..12.min(target.len())]),
-            "system",
-            None,
-            false,
-        ),
-    }
+    command_result(
+        "Single-session mode is enabled. LingClaw only keeps the main session.",
+        "system",
+        false,
+    )
 }
 
 async fn handle_model_command(
@@ -596,14 +469,13 @@ async fn handle_model_command(
         return command_result(
             format!("Available models:\n{list}\n\nUse /model <name> to switch."),
             "system",
-            None,
             false,
         );
     }
 
     let canonical = match state.config.canonical_model_ref(arg) {
         Ok(value) => value,
-        Err(err) => return command_result(err, "error", None, false),
+        Err(err) => return command_result(err, "error", false),
     };
     match persist_session_update(
         state,
@@ -619,17 +491,11 @@ async fn handle_model_command(
     )
     .await
     {
-        Ok(()) => command_result(
-            format!("Model switched to: {canonical}"),
-            "system",
-            None,
-            true,
-        ),
-        Err(err) if err == "Session not found" => command_result(err, "system", None, false),
+        Ok(()) => command_result(format!("Model switched to: {canonical}"), "system", true),
+        Err(err) if err == "Session not found" => command_result(err, "system", false),
         Err(err) => command_result(
             format!("Failed to persist model switch: {err}"),
             "error",
-            None,
             false,
         ),
     }
@@ -641,13 +507,10 @@ async fn handle_status_command(current_session_id: &str, state: &AppState) -> Co
         sessions.get(current_session_id).cloned()
     };
     match session {
-        Some(session) => command_result(
-            build_runtime_status(&session, state).await,
-            "system",
-            None,
-            false,
-        ),
-        None => command_result("No active session", "system", None, false),
+        Some(session) => {
+            command_result(build_runtime_status(&session, state).await, "system", false)
+        }
+        None => command_result("No active session", "system", false),
     }
 }
 
@@ -660,26 +523,21 @@ async fn handle_usage_command(current_session_id: &str, state: &AppState) -> Com
         Some(session) => command_result(
             build_usage_report(&session, &gather_global_today_usage(state).await),
             "system",
-            None,
             false,
         ),
-        None => command_result("No active session", "system", None, false),
+        None => command_result("No active session", "system", false),
     }
 }
 
 async fn handle_clear_command(current_session_id: &str, state: &AppState) -> CommandResult {
     match reset_session_context_and_persist(state, current_session_id).await {
-        Ok(()) => command_result_with_history(
-            "Session cleared. System prompt preserved.",
-            "system",
-            None,
-            true,
-        ),
-        Err(err) if err == "Session not found" => command_result(err, "system", None, false),
+        Ok(()) => {
+            command_result_with_history("Session cleared. System prompt preserved.", "system", true)
+        }
+        Err(err) if err == "Session not found" => command_result(err, "system", false),
         Err(err) => command_result(
             format!("Failed to persist cleared session: {err}"),
             "error",
-            None,
             false,
         ),
     }
@@ -752,7 +610,7 @@ async fn handle_skills_command(
         }
     }
 
-    command_result(output, "system", None, false)
+    command_result(output, "system", false)
 }
 
 /// Handle `/skills-system [install|uninstall <pattern>]`.
@@ -779,7 +637,6 @@ async fn handle_skills_system_command(
                      \x20 /skills-system uninstall anthropics        — uninstall all anthropics skills\n\
                      \x20 /skills-system uninstall anthropics/pdf    — uninstall only the pdf skill",
                     "system",
-                    None,
                     false,
                 );
             }
@@ -794,7 +651,6 @@ async fn handle_skills_system_command(
                      \x20 /skills-system install anthropics        — re-install all anthropics skills\n\
                      \x20 /skills-system install anthropics/pdf    — re-install only the pdf skill",
                     "system",
-                    None,
                     false,
                 );
             }
@@ -806,7 +662,6 @@ async fn handle_skills_system_command(
              \x20 /skills-system uninstall <pattern>     — disable a skill or group\n\
              \x20 /skills-system install <pattern>       — re-enable a skill or group",
             "system",
-            None,
             false,
         ),
     }
@@ -816,7 +671,7 @@ async fn show_system_skills_status(current_session_id: &str, state: &AppState) -
     let (workspace, disabled) = {
         let sessions = state.sessions.lock().await;
         let Some(session) = sessions.get(current_session_id) else {
-            return command_result("Session not found.", "error", None, false);
+            return command_result("Session not found.", "error", false);
         };
         (
             session.workspace.clone(),
@@ -867,7 +722,7 @@ async fn show_system_skills_status(current_session_id: &str, state: &AppState) -
         output.push_str(&format!("\n\nDisabled patterns: {}", sorted.join(", ")));
     }
 
-    command_result(output, "system", None, false)
+    command_result(output, "system", false)
 }
 
 /// Extract the relative directory from a system skill path.
@@ -914,7 +769,6 @@ async fn toggle_system_skill(
         return command_result(
             format!("No system skills match pattern: {pattern}{hint}"),
             "error",
-            None,
             false,
         );
     }
@@ -982,16 +836,10 @@ async fn toggle_system_skill(
                     names.join(", ")
                 ),
                 "system",
-                None,
                 true,
             )
         }
-        Err(err) => command_result(
-            format!("Failed to persist change: {err}"),
-            "error",
-            None,
-            false,
-        ),
+        Err(err) => command_result(format!("Failed to persist change: {err}"), "error", false),
     }
 }
 
@@ -1033,7 +881,7 @@ async fn handle_mcp_command_with_arg(
         let sessions = state.sessions.lock().await;
         match sessions.get(current_session_id) {
             Some(session) => session.workspace.clone(),
-            None => return command_result("No active session", "system", None, false),
+            None => return command_result("No active session", "system", false),
         }
     };
 
@@ -1044,29 +892,27 @@ async fn handle_mcp_command_with_arg(
         .filter(|server| server.enabled)
         .count();
     if enabled_servers == 0 {
-        return command_result("No MCP servers enabled.", "system", None, false);
+        return command_result("No MCP servers enabled.", "system", false);
     }
 
     match arg {
         "" => {
             let reports = tools::mcp::inspect_servers(&state.config, &workspace).await;
-            command_result(format_mcp_reports(&reports), "system", None, false)
+            command_result(format_mcp_reports(&reports), "system", false)
         }
         "refresh" => match tools::mcp::refresh_servers(&state.config, &workspace).await {
             Ok(reports) => command_result(
                 format!("Refreshed MCP cache.\n\n{}", format_mcp_reports(&reports)),
                 "system",
-                None,
                 false,
             ),
             Err(error) => command_result(
                 format!("Failed to refresh MCP cache: {error}"),
                 "error",
-                None,
                 false,
             ),
         },
-        _ => command_result("Usage: /mcp [refresh]", "system", None, false),
+        _ => command_result("Usage: /mcp [refresh]", "system", false),
     }
 }
 
@@ -1086,7 +932,6 @@ async fn handle_think_command(
         return command_result(
             format!("think: {level}\nUsage: /think <auto|off|minimal|low|medium|high|xhigh>"),
             "system",
-            None,
             false,
         );
     }
@@ -1098,7 +943,6 @@ async fn handle_think_command(
                 "Invalid think level: {arg}\nValid: auto, off, minimal, low, medium, high, xhigh"
             ),
             "system",
-            None,
             false,
         );
     }
@@ -1117,12 +961,11 @@ async fn handle_think_command(
     )
     .await
     {
-        Ok(()) => command_result(format!("Think mode set to: {level}"), "system", None, true),
-        Err(err) if err == "Session not found" => command_result(err, "system", None, false),
+        Ok(()) => command_result(format!("Think mode set to: {level}"), "system", true),
+        Err(err) if err == "Session not found" => command_result(err, "system", false),
         Err(err) => command_result(
             format!("Failed to persist think level: {err}"),
             "error",
-            None,
             false,
         ),
     }
@@ -1145,14 +988,13 @@ async fn handle_react_command(
                 if on { "on" } else { "off" }
             ),
             "system",
-            None,
             false,
         );
     }
 
     let on = match parse_toggle_value(arg, "react") {
         Ok(value) => value,
-        Err(err) => return command_result(err, "system", None, false),
+        Err(err) => return command_result(err, "system", false),
     };
     match persist_session_update(
         state,
@@ -1171,14 +1013,12 @@ async fn handle_react_command(
         Ok(()) => command_result(
             format!("React visibility: {}", if on { "on" } else { "off" }),
             "system",
-            None,
             true,
         ),
-        Err(err) if err == "Session not found" => command_result(err, "system", None, false),
+        Err(err) if err == "Session not found" => command_result(err, "system", false),
         Err(err) => command_result(
             format!("Failed to persist react visibility: {err}"),
             "error",
-            None,
             false,
         ),
     }
@@ -1201,14 +1041,13 @@ async fn handle_tool_command(
                 if on { "on" } else { "off" }
             ),
             "system",
-            None,
             false,
         );
     }
 
     let on = match parse_toggle_value(arg, "tool") {
         Ok(value) => value,
-        Err(err) => return command_result(err, "system", None, false),
+        Err(err) => return command_result(err, "system", false),
     };
 
     match persist_session_update(
@@ -1228,14 +1067,12 @@ async fn handle_tool_command(
         Ok(()) => command_result_with_history(
             format!("Tool visibility: {}", if on { "on" } else { "off" }),
             "system",
-            None,
             true,
         ),
-        Err(err) if err == "Session not found" => command_result(err, "system", None, false),
+        Err(err) if err == "Session not found" => command_result(err, "system", false),
         Err(err) => command_result(
             format!("Failed to persist tool visibility: {err}"),
             "error",
-            None,
             false,
         ),
     }
@@ -1258,14 +1095,13 @@ async fn handle_reasoning_command(
                 if on { "on" } else { "off" }
             ),
             "system",
-            None,
             false,
         );
     }
 
     let on = match parse_toggle_value(arg, "reasoning") {
         Ok(value) => value,
-        Err(err) => return command_result(err, "system", None, false),
+        Err(err) => return command_result(err, "system", false),
     };
 
     match persist_session_update(
@@ -1285,14 +1121,12 @@ async fn handle_reasoning_command(
         Ok(()) => command_result(
             format!("Reasoning visibility: {}", if on { "on" } else { "off" }),
             "system",
-            None,
             true,
         ),
-        Err(err) if err == "Session not found" => command_result(err, "system", None, false),
+        Err(err) if err == "Session not found" => command_result(err, "system", false),
         Err(err) => command_result(
             format!("Failed to persist reasoning visibility: {err}"),
             "error",
-            None,
             false,
         ),
     }
@@ -1302,6 +1136,7 @@ fn handle_help_command(current_session_id: &str) -> CommandResult {
     let mut help = "\
 Commands:
     /new             Compress conversation to memory & clear context
+    /session_new     Reset session context (fresh start)
     /status          Show session status
     /mcp [refresh]   Show MCP load status or refresh cache
     /usage           Show session token usage
@@ -1320,46 +1155,29 @@ Commands:
     /help            Show this help"
         .to_string();
     if current_session_id == MAIN_SESSION_ID {
-        help.push_str(
-            "\n\nMain session commands:\n\
-        /sessions        List all active sessions\n\
-        /delete <id>     Delete a session by full ID or unique prefix",
-        );
+        help.push_str("\n\nSingle-session mode: LingClaw keeps only the main session.");
     }
-    command_result(help, "system", None, false)
+    command_result(help, "system", false)
 }
 
-async fn handle_sessions_command(current_session_id: &str, state: &AppState) -> CommandResult {
-    if current_session_id != MAIN_SESSION_ID {
-        return command_result(
-            "This command is only available in the main session.",
-            "error",
-            None,
-            false,
-        );
-    }
-    command_result(gather_sessions_status(state).await, "system", None, false)
+async fn handle_sessions_command(_current_session_id: &str, _state: &AppState) -> CommandResult {
+    command_result(
+        "Single-session mode is enabled. Only the main session is available.",
+        "system",
+        false,
+    )
 }
 
 async fn handle_delete_command(
-    arg: &str,
-    current_session_id: &str,
-    state: &AppState,
+    _arg: &str,
+    _current_session_id: &str,
+    _state: &AppState,
 ) -> CommandResult {
-    if current_session_id != MAIN_SESSION_ID {
-        return command_result(
-            "This command is only available in the main session.",
-            "error",
-            None,
-            false,
-        );
-    }
-    if arg.is_empty() {
-        return command_result("Usage: /delete <session_id>", "system", None, false);
-    }
-    let result = delete_session_by_id(arg, state).await;
-    let changed = result.starts_with("Deleted");
-    command_result(result, "system", None, changed)
+    command_result(
+        "Single-session mode is enabled. The main session cannot be deleted.",
+        "system",
+        false,
+    )
 }
 
 pub(crate) async fn handle_command(
@@ -1383,12 +1201,7 @@ pub(crate) async fn handle_command(
 
         "/rename" => {
             if arg.is_empty() {
-                return Some(command_result(
-                    "Usage: /rename <new_name>",
-                    "system",
-                    None,
-                    false,
-                ));
+                return Some(command_result("Usage: /rename <new_name>", "system", false));
             }
             let name = arg.to_string();
             match persist_session_update(
@@ -1405,19 +1218,13 @@ pub(crate) async fn handle_command(
             )
             .await
             {
-                Ok(()) => Some(command_result(
-                    format!("Renamed to: {arg}"),
-                    "system",
-                    None,
-                    true,
-                )),
+                Ok(()) => Some(command_result(format!("Renamed to: {arg}"), "system", true)),
                 Err(err) if err == "Session not found" => {
-                    Some(command_result(err, "system", None, false))
+                    Some(command_result(err, "system", false))
                 }
                 Err(err) => Some(command_result(
                     format!("Failed to persist rename: {err}"),
                     "error",
-                    None,
                     false,
                 )),
             }
@@ -1457,12 +1264,7 @@ pub(crate) async fn handle_command(
         "/delete" => Some(handle_delete_command(arg, current_session_id, state).await),
 
         // /stop when not busy — the in-flight case is handled by the agent loop drain
-        "/stop" => Some(command_result(
-            "No active run to stop.",
-            "system",
-            None,
-            false,
-        )),
+        "/stop" => Some(command_result("No active run to stop.", "system", false)),
 
         _ => None,
     }

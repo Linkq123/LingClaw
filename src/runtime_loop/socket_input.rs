@@ -11,70 +11,58 @@ pub(crate) enum IdleSocketInputAction {
 pub(crate) async fn resolve_or_create_socket_session(
     state: &Arc<AppState>,
     tx: &WsTx,
-    requested_id: Option<&str>,
-    connection_id: u64,
+    _requested_id: Option<&str>,
+    _connection_id: u64,
 ) -> String {
-    let mut claimed = if let Some(req_id) = requested_id {
-        claim_requested_session(req_id, state, connection_id).await
-    } else {
-        None
-    };
+    ensure_main_session_ready(state).await;
+    send_existing_session_payloads(tx, state, MAIN_SESSION_ID).await;
+    MAIN_SESSION_ID.to_string()
+}
 
-    if claimed.is_none() && requested_id.is_none() {
-        match try_claim_session(MAIN_SESSION_ID, state, connection_id).await {
-            ClaimSessionResult::Claimed(id) => {
-                claimed = Some(id);
-            }
-            ClaimSessionResult::InUse | ClaimSessionResult::NotFound => {
-                let saved_ids = list_recoverable_saved_session_ids();
-                for cid in &saved_ids {
-                    match try_claim_session(cid, state, connection_id).await {
-                        ClaimSessionResult::Claimed(id) => {
-                            claimed = Some(id);
-                            break;
-                        }
-                        ClaimSessionResult::InUse | ClaimSessionResult::NotFound => continue,
-                    }
-                }
-            }
+async fn ensure_main_session_ready(state: &Arc<AppState>) {
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(MAIN_SESSION_ID) {
+            refresh_session_system_prompt(state, session);
+            return;
         }
     }
 
-    if let Some(id) = claimed {
-        send_existing_session_payloads(tx, state, &id).await;
-        id
-    } else {
-        let mut session = Session::new();
-        let sys = build_system_prompt(
-            &state.config,
-            &session.workspace,
-            session.effective_model(&state.config.model),
-            false,
-            &session.disabled_system_skills,
-        );
-        session.messages.push(sys);
-        let current_session_id = session.id.clone();
+    let (mut session, created_fresh) = match load_session_from_disk(MAIN_SESSION_ID) {
+        Some(session) => (session, false),
+        None => {
+            let mut session = Session::new_with_id(MAIN_SESSION_ID, "Main");
+            let model = session.effective_model(&state.config.model).to_string();
+            let sys = build_system_prompt(
+                &state.config,
+                &session.workspace,
+                &model,
+                &session.disabled_system_skills,
+            );
+            session.messages.push(sys);
+            (session, true)
+        }
+    };
+    refresh_session_system_prompt(state, &mut session);
+
+    if created_fresh {
         if let Err(error) = save_session_to_disk(&session).await {
             eprintln!(
-                "Warning: failed to persist new session {} on creation: {error}; keeping in memory",
-                current_session_id
+                "Warning: failed to persist main session on creation: {error}; keeping in memory"
             );
         }
-        {
-            let mut active = state.active_connections.lock().await;
-            let mut sessions = state.sessions.lock().await;
-            sessions.insert(current_session_id.clone(), session);
-            active.insert(current_session_id.clone(), connection_id);
-        }
-        send_new_session_payload(tx, state, &current_session_id).await;
-        current_session_id
     }
+
+    let mut sessions = state.sessions.lock().await;
+    sessions
+        .entry(MAIN_SESSION_ID.to_string())
+        .or_insert(session);
 }
 
 pub(crate) async fn handle_idle_socket_input(
     text: String,
     current_session_id: &mut String,
-    current_session_ref: &Arc<Mutex<String>>,
+    _current_session_ref: &Arc<Mutex<String>>,
     connection_id: u64,
     state: &Arc<AppState>,
     tx: &WsTx,
@@ -107,20 +95,19 @@ pub(crate) async fn handle_idle_socket_input(
             )
             .await;
 
-            if let Some(new_id) = result.new_session_id {
-                unbind_session_connection_if_matches(state, current_session_id, connection_id)
-                    .await;
-                state.live_rounds.lock().await.remove(current_session_id);
-                *current_session_id = new_id.clone();
-                bind_session_connection(state, current_session_id, connection_id, tx, true).await;
-                {
-                    let mut active_id = current_session_ref.lock().await;
-                    *active_id = current_session_id.clone();
-                }
-                send_session_switched_payloads(tx, state, &new_id).await;
-            }
             if result.sessions_changed {
-                send_sessions_list(tx, state, current_session_id).await;
+                let name = {
+                    let sessions = state.sessions.lock().await;
+                    sessions
+                        .get(current_session_id.as_str())
+                        .map(|s| s.name.clone())
+                        .unwrap_or_else(|| "Main".to_string())
+                };
+                ws_send(
+                    tx,
+                    &json!({"type":"session","id":current_session_id,"name":name}),
+                )
+                .await;
             }
         } else {
             ws_send(

@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     session_store::{save_session_to_disk, trim_incomplete_tool_calls},
-    AppState, LiveTx, WsTx,
+    AppState, LiveTx, WsTx, MAIN_SESSION_ID,
 };
 
 pub(crate) struct SocketTaskHandles {
@@ -40,7 +40,7 @@ pub(crate) fn spawn_connection_tasks(
                 let guard = live_session_ref.lock().await;
                 guard.clone()
             };
-            super::dispatch_live_event(&live_state, &session_id, event).await;
+            super::dispatch_live_event(&live_state, &session_id, connection_id, event).await;
         }
     });
 
@@ -75,6 +75,14 @@ pub(crate) async fn finalize_connection(
 ) {
     connection_cancel.cancel();
 
+    // Clean up connection_cancels entry only if it still belongs to this connection.
+    {
+        let mut cancels = state.connection_cancels.lock().await;
+        if cancels.get(session_id).map(|binding| binding.connection_id) == Some(connection_id) {
+            cancels.remove(session_id);
+        }
+    }
+
     {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(session_id) {
@@ -97,7 +105,7 @@ pub(crate) async fn finalize_connection(
                     .lock()
                     .await
                     .contains_key(session_id);
-                if !has_active_connection {
+                if !has_active_connection && session_id != MAIN_SESSION_ID {
                     let mut sessions = state.sessions.lock().await;
                     sessions.remove(session_id);
                 }
@@ -115,13 +123,18 @@ pub(crate) async fn finalize_connection(
             .lock()
             .await
             .contains_key(session_id);
-        if !has_active_connection {
+        if !has_active_connection && session_id != MAIN_SESSION_ID {
             let mut sessions = state.sessions.lock().await;
             sessions.remove(session_id);
         }
     }
 
-    state.live_rounds.lock().await.remove(session_id);
+    {
+        let mut live_rounds = state.live_rounds.lock().await;
+        if live_rounds.get(session_id).map(|r| r.connection_id) == Some(connection_id) {
+            live_rounds.remove(session_id);
+        }
+    }
 
     drop(cleanup.tx);
     drop(cleanup.live_tx);

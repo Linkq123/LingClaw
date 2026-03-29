@@ -123,6 +123,7 @@ async fn status_command_reports_runtime_request_estimate() {
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
         active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
@@ -157,7 +158,6 @@ async fn status_command_reports_runtime_request_estimate() {
         &state.config,
         &workspace,
         &model,
-        false,
         &session.disabled_system_skills,
     ));
     session.messages.push(ChatMessage {
@@ -238,6 +238,7 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
         active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
@@ -272,7 +273,6 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
         &state.config,
         &workspace,
         &model,
-        false,
         &session.disabled_system_skills,
     ));
 
@@ -296,4 +296,161 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
     assert!(result.response.contains("think high"));
 
     let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn session_new_command_resets_main_session_in_single_session_mode() {
+    let workspace = unique_temp_workspace("lingclaw-command-single-main-reset");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let state = AppState {
+        config: crate::Config {
+            api_key: "env-key".to_string(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            provider: crate::Provider::OpenAI,
+            anthropic_prompt_caching: false,
+            providers: HashMap::new(),
+            mcp_servers: HashMap::new(),
+            port: crate::DEFAULT_PORT,
+            max_context_tokens: 32000,
+            exec_timeout: Duration::from_secs(30),
+            tool_timeout: Duration::from_secs(30),
+            max_output_bytes: 50 * 1024,
+            max_file_bytes: 200 * 1024,
+            openai_stream_include_usage: false,
+        },
+        http: reqwest::Client::new(),
+        sessions: Mutex::new(HashMap::new()),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+    };
+
+    let mut session = Session {
+        id: MAIN_SESSION_ID.to_string(),
+        name: "Main".to_string(),
+        messages: Vec::new(),
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: "estimated".to_string(),
+        output_token_source: "estimated".to_string(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        model_override: None,
+        think_level: "auto".to_string(),
+        show_react: true,
+        show_tools: true,
+        show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
+        version: 4,
+        workspace: workspace.clone(),
+    };
+    let model = session.effective_model(&state.config.model).to_string();
+    session.messages.push(build_system_prompt(
+        &state.config,
+        &workspace,
+        &model,
+        &session.disabled_system_skills,
+    ));
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("keep only main".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: Some(1),
+    });
+
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(MAIN_SESSION_ID.to_string(), session);
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+    let result = handle_command(
+        "/session_new",
+        MAIN_SESSION_ID,
+        1,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("command should resolve");
+
+    assert!(result.refresh_history);
+    assert!(result.response.contains("Single-session mode is enabled"));
+
+    let sessions = state.sessions.lock().await;
+    let main_session = sessions
+        .get(MAIN_SESSION_ID)
+        .expect("main session should still exist");
+    assert_eq!(main_session.messages.len(), 1);
+    assert_eq!(main_session.messages[0].role, "system");
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn switch_command_is_blocked_in_single_session_mode() {
+    let state = AppState {
+        config: crate::Config {
+            api_key: "env-key".to_string(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            provider: crate::Provider::OpenAI,
+            anthropic_prompt_caching: false,
+            providers: HashMap::new(),
+            mcp_servers: HashMap::new(),
+            port: crate::DEFAULT_PORT,
+            max_context_tokens: 32000,
+            exec_timeout: Duration::from_secs(30),
+            tool_timeout: Duration::from_secs(30),
+            max_output_bytes: 50 * 1024,
+            max_file_bytes: 200 * 1024,
+            openai_stream_include_usage: false,
+        },
+        http: reqwest::Client::new(),
+        sessions: Mutex::new(HashMap::new()),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+    };
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+    let result = handle_command(
+        "/switch another-session",
+        MAIN_SESSION_ID,
+        1,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("command should resolve");
+
+    assert!(result
+        .response
+        .contains("LingClaw only keeps the main session"));
 }

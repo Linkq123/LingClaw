@@ -52,6 +52,7 @@ fn test_app_state() -> AppState {
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
         active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
@@ -68,6 +69,7 @@ fn test_app_state_with_config(config: Config) -> AppState {
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
         active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
@@ -1003,10 +1005,10 @@ fn build_global_today_usage_sums_all_sessions() {
 }
 
 #[test]
-fn gather_global_today_usage_includes_saved_sessions_not_loaded_in_memory() {
+fn gather_global_today_usage_uses_main_session_only_in_single_session_mode() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = test_app_state();
-    let mut current = test_session("current", "Current", None);
+    let mut current = test_session(MAIN_SESSION_ID, "Main", None);
     current.daily_input_tokens = 2_300;
     current.daily_output_tokens = 560;
 
@@ -1033,36 +1035,9 @@ fn gather_global_today_usage_includes_saved_sessions_not_loaded_in_memory() {
     let usage = rt.block_on(gather_global_today_usage(&state));
 
     assert!(usage.contains("global_today_usage_est: # 所有会话今日 token 使用估算"));
-    assert!(usage.contains("input_tokens: 3K"));
-    assert!(usage.contains("output_tokens: 1K"));
-    assert!(usage.contains("total_tokens: 4K"));
-}
-
-#[test]
-fn gather_sessions_status_includes_saved_inactive_sessions() {
-    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let state = test_app_state();
-
-    let saved_id = format!("saved-status-{}", now_epoch());
-    let workspace = session_workspace_path(&saved_id);
-    std::fs::create_dir_all(&workspace).expect("workspace should be created");
-    let _guard = SavedSessionGuard {
-        session_id: saved_id.clone(),
-        workspace: workspace.clone(),
-    };
-
-    let mut saved = test_session(&saved_id, "Saved Status", None);
-    saved.workspace = workspace.clone();
-    saved.messages.push(make_message("user", "persisted"));
-    rt.block_on(save_session_to_disk(&saved))
-        .expect("saved session should persist");
-
-    let status = rt.block_on(gather_sessions_status(&state));
-
-    assert!(status.contains("Sessions ("));
-    assert!(status.contains(saved_id.as_str()));
-    assert!(status.contains("Saved Status"));
-    assert!(status.contains("[saved]"));
+    assert!(usage.contains("input_tokens: 2.3K"));
+    assert!(usage.contains("output_tokens: 560"));
+    assert!(usage.contains("total_tokens: 2.9K"));
 }
 
 #[test]
@@ -1181,71 +1156,30 @@ fn list_saved_session_summaries_in_dir_counts_messages_after_sanitization() {
 }
 
 #[test]
-fn send_sessions_list_omits_in_memory_session_that_is_empty_after_sanitization() {
+fn resolve_or_create_socket_session_ignores_requested_session_and_uses_main() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let state = test_app_state();
-    let session_id = format!("sidebar-sanitize-{}", now_epoch());
+    let state = Arc::new(test_app_state());
     let (tx, mut rx) = mpsc::channel::<String>(4);
 
-    {
-        let mut sessions = rt.block_on(state.sessions.lock());
-        sessions.insert(
-            session_id.clone(),
-            Session {
-                id: session_id.clone(),
-                name: "Sidebar Sanitized".into(),
-                messages: vec![
-                    ChatMessage {
-                        role: "system".into(),
-                        content: Some("system".into()),
-                        tool_calls: None,
-                        tool_call_id: None,
-                        timestamp: None,
-                    },
-                    ChatMessage {
-                        role: "assistant".into(),
-                        content: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                        timestamp: Some(1),
-                    },
-                ],
-                created_at: 0,
-                updated_at: 0,
-                tool_calls_count: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                daily_input_tokens: 0,
-                daily_output_tokens: 0,
-                input_token_source: default_token_usage_source(),
-                output_token_source: default_token_usage_source(),
-                token_usage_day: prompts::current_local_snapshot().today(),
-                model_override: None,
-                think_level: default_think_level(),
-                show_react: false,
-                show_tools: true,
-                show_reasoning: true,
-                disabled_system_skills: HashSet::new(),
-                version: SESSION_VERSION,
-                workspace: PathBuf::new(),
-            },
-        );
-    }
+    let resolved = rt.block_on(resolve_or_create_socket_session(
+        &state,
+        &tx,
+        Some("legacy-session"),
+        1,
+    ));
 
-    rt.block_on(send_sessions_list(&tx, &state, "another-session"));
+    assert_eq!(resolved, MAIN_SESSION_ID);
+    assert!(rt
+        .block_on(state.sessions.lock())
+        .contains_key(MAIN_SESSION_ID));
 
     let payload = rt
         .block_on(rx.recv())
-        .expect("sessions list payload should be sent");
+        .expect("session payload should be sent");
     let parsed: serde_json::Value =
         serde_json::from_str(&payload).expect("payload should be valid json");
-    let sessions = parsed["sessions"]
-        .as_array()
-        .expect("sessions list should be an array");
-
-    assert!(!sessions
-        .iter()
-        .any(|session| session["id"].as_str() == Some(session_id.as_str())));
+    assert_eq!(parsed["type"].as_str(), Some("session"));
+    assert_eq!(parsed["id"].as_str(), Some(MAIN_SESSION_ID));
 }
 
 #[test]
@@ -2302,15 +2236,16 @@ fn handle_command_persists_new_on_empty_context() {
 }
 
 #[test]
-fn handle_command_session_new_persists_created_session() {
+fn handle_command_session_new_resets_main_session_without_creating_a_new_one() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let session_id = format!("persist-session-new-source-{}", now_epoch());
+    let session_id = MAIN_SESSION_ID.to_string();
     let workspace = session_workspace_path(&session_id);
     std::fs::create_dir_all(&workspace).expect("workspace should be created");
 
     let mut session = test_session(&session_id, "Source Session", None);
     session.workspace = workspace.clone();
     session.version = SESSION_VERSION;
+    session.messages.push(make_message("user", "reset me"));
 
     let state = test_app_state();
     {
@@ -2332,17 +2267,13 @@ fn handle_command_session_new_persists_created_session() {
         ))
         .expect("command should return a result");
 
-    let new_id = result
-        .new_session_id
-        .clone()
-        .expect("session_new should return a new session id");
-    let persisted = load_session_from_disk(&new_id).expect("new session should be saved to disk");
-    assert_eq!(persisted.id, new_id);
+    let persisted =
+        load_session_from_disk(&session_id).expect("main session should remain saved to disk");
+    assert!(result.response.contains("Single-session mode is enabled"));
+    assert_eq!(persisted.id, session_id);
     assert_eq!(persisted.messages.len(), 1);
     assert_eq!(persisted.messages[0].role, "system");
 
-    let new_path = sessions_dir().join(format!("{new_id}.json"));
-    let _ = std::fs::remove_file(new_path);
     let path = sessions_dir().join(format!("{session_id}.json"));
     let _ = std::fs::remove_file(path);
     let source_session_dir = workspace
@@ -2350,18 +2281,12 @@ fn handle_command_session_new_persists_created_session() {
         .map(PathBuf::from)
         .expect("session dir should exist");
     let _ = std::fs::remove_dir_all(source_session_dir);
-    let new_workspace = session_workspace_path(&new_id);
-    let new_session_dir = new_workspace
-        .parent()
-        .map(PathBuf::from)
-        .expect("new session dir should exist");
-    let _ = std::fs::remove_dir_all(new_session_dir);
 }
 
 #[test]
-fn handle_command_session_new_removes_abandoned_empty_session_artifacts() {
+fn handle_command_session_new_keeps_main_session_artifacts() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let session_id = format!("abandon-empty-session-new-{}", now_epoch());
+    let session_id = MAIN_SESSION_ID.to_string();
     let workspace = session_workspace_path(&session_id);
     std::fs::create_dir_all(&workspace).expect("workspace should be created");
 
@@ -2380,7 +2305,7 @@ fn handle_command_session_new_removes_abandoned_empty_session_artifacts() {
     let (tx, _rx) = mpsc::channel(4);
     let cancel = CancellationToken::new();
 
-    let result = rt
+    let _result = rt
         .block_on(handle_command(
             "/session_new",
             &session_id,
@@ -2390,29 +2315,25 @@ fn handle_command_session_new_removes_abandoned_empty_session_artifacts() {
             &cancel,
         ))
         .expect("command should return a result");
-    let new_id = result
-        .new_session_id
-        .clone()
-        .expect("session_new should return a new session id");
 
-    assert!(!sessions_dir().join(format!("{session_id}.json")).exists());
-    assert!(!workspace
-        .parent()
-        .expect("source session dir should exist")
-        .exists());
+    let sessions = rt.block_on(state.sessions.lock());
+    let main = sessions
+        .get(&session_id)
+        .expect("main session should remain loaded");
+    assert_eq!(main.messages.len(), 1);
+    assert_eq!(main.messages[0].role, "system");
 
-    let new_path = sessions_dir().join(format!("{new_id}.json"));
-    let _ = std::fs::remove_file(new_path);
-    let new_workspace = session_workspace_path(&new_id);
-    let new_session_dir = new_workspace
-        .parent()
-        .map(PathBuf::from)
-        .expect("new session dir should exist");
-    let _ = std::fs::remove_dir_all(new_session_dir);
+    let _ = std::fs::remove_file(sessions_dir().join(format!("{session_id}.json")));
+    let _ = std::fs::remove_dir_all(
+        workspace
+            .parent()
+            .map(PathBuf::from)
+            .expect("main session dir should exist"),
+    );
 }
 
 #[test]
-fn handle_command_switch_removes_abandoned_empty_session_artifacts() {
+fn handle_command_switch_is_blocked_in_single_session_mode() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let source_id = format!("abandon-empty-switch-source-{}", now_epoch());
     let source_workspace = session_workspace_path(&source_id);
@@ -2455,9 +2376,11 @@ fn handle_command_switch_removes_abandoned_empty_session_artifacts() {
         ))
         .expect("command should return a result");
 
-    assert_eq!(result.new_session_id.as_deref(), Some(target_id.as_str()));
-    assert!(!sessions_dir().join(format!("{source_id}.json")).exists());
-    assert!(!source_workspace
+    assert!(result
+        .response
+        .contains("LingClaw only keeps the main session"));
+    assert!(sessions_dir().join(format!("{source_id}.json")).exists());
+    assert!(source_workspace
         .parent()
         .expect("source session dir should exist")
         .exists());
@@ -2494,44 +2417,6 @@ fn recoverable_session_ids_skip_empty_and_corrupt_sessions() {
     let recoverable = recoverable_session_ids_from_summaries(&summaries);
 
     assert_eq!(recoverable, vec!["real-session".to_string()]);
-}
-
-#[test]
-fn delete_session_rejects_bound_client_without_active_connection() {
-    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let session_id = format!("delete-bound-client-{}", now_epoch());
-    let state = test_app_state();
-    let (bound_tx, _bound_rx) = mpsc::channel::<String>(4);
-
-    {
-        let mut sessions = rt.block_on(state.sessions.lock());
-        sessions.insert(
-            session_id.clone(),
-            test_session(&session_id, "Delete Guard", None),
-        );
-    }
-    {
-        let mut clients = rt.block_on(state.session_clients.lock());
-        clients.insert(
-            session_id.clone(),
-            SessionClientBinding {
-                connection_id: 42,
-                tx: bound_tx,
-                replay_ready: true,
-                pending_events: Vec::new(),
-            },
-        );
-    }
-
-    let result = rt.block_on(delete_session_by_id(&session_id, &state));
-
-    assert!(result.contains("currently in use"));
-    assert!(rt.block_on(state.sessions.lock()).contains_key(&session_id));
-
-    let _ = rt
-        .block_on(state.session_clients.lock())
-        .remove(&session_id);
-    let _ = rt.block_on(state.sessions.lock()).remove(&session_id);
 }
 
 #[test]
@@ -2596,6 +2481,128 @@ fn finalize_connection_removes_unbound_session_from_memory() {
         .map(PathBuf::from)
         .expect("session dir should exist");
     let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn finalize_connection_keeps_main_session_loaded_in_memory() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = MAIN_SESSION_ID.to_string();
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.workspace = workspace.clone();
+    session.version = SESSION_VERSION;
+
+    let state = test_app_state();
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(session_id.clone(), session);
+    }
+    {
+        let mut active = rt.block_on(state.active_connections.lock());
+        active.insert(session_id.clone(), 7);
+    }
+
+    let connection_cancel = CancellationToken::new();
+    let (tx, _rx) = mpsc::channel::<String>(4);
+    let (live_tx, _live_rx) = mpsc::channel::<serde_json::Value>(4);
+    let disconnect_watcher = rt.spawn(async {});
+    let live_dispatcher = rt.spawn(async {});
+    let reader = rt.spawn(async {});
+    let writer = rt.spawn(async {});
+
+    rt.block_on(finalize_connection(
+        &state,
+        &session_id,
+        7,
+        &connection_cancel,
+        ConnectionCleanup {
+            tx,
+            live_tx,
+            tasks: socket_tasks::SocketTaskHandles {
+                live_dispatcher,
+                disconnect_watcher,
+            },
+            reader,
+            writer,
+        },
+    ));
+
+    assert!(rt
+        .block_on(state.sessions.lock())
+        .get(&session_id)
+        .is_some());
+    assert!(rt
+        .block_on(state.active_connections.lock())
+        .get(&session_id)
+        .is_none());
+
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let _ = std::fs::remove_file(path);
+    let session_dir = workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn finalize_connection_does_not_remove_newer_connection_cancel_binding() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("cancel-binding-{}", now_epoch());
+    let old_cancel = CancellationToken::new();
+    let newer_cancel = CancellationToken::new();
+
+    {
+        let mut active = rt.block_on(state.active_connections.lock());
+        active.insert(session_id.clone(), 2);
+    }
+    {
+        let mut cancels = rt.block_on(state.connection_cancels.lock());
+        cancels.insert(
+            session_id.clone(),
+            ConnectionCancelBinding {
+                connection_id: 2,
+                cancel: newer_cancel.clone(),
+            },
+        );
+    }
+
+    let (tx, _rx) = mpsc::channel::<String>(4);
+    let (live_tx, _live_rx) = mpsc::channel::<serde_json::Value>(4);
+    let disconnect_watcher = rt.spawn(async {});
+    let live_dispatcher = rt.spawn(async {});
+    let reader = rt.spawn(async {});
+    let writer = rt.spawn(async {});
+
+    rt.block_on(finalize_connection(
+        &state,
+        &session_id,
+        1,
+        &old_cancel,
+        ConnectionCleanup {
+            tx,
+            live_tx,
+            tasks: socket_tasks::SocketTaskHandles {
+                live_dispatcher,
+                disconnect_watcher,
+            },
+            reader,
+            writer,
+        },
+    ));
+
+    let active = rt.block_on(state.active_connections.lock());
+    assert_eq!(active.get(&session_id).copied(), Some(2));
+
+    let cancels = rt.block_on(state.connection_cancels.lock());
+    let binding = cancels
+        .get(&session_id)
+        .expect("newer connection cancel binding should remain");
+    assert_eq!(binding.connection_id, 2);
+    assert!(!binding.cancel.is_cancelled());
 }
 
 #[test]
@@ -2681,222 +2688,6 @@ fn handle_command_reports_mcp_load_failures() {
 }
 
 #[test]
-fn claim_requested_session_waits_for_active_connection_release() {
-    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let session_id = format!("reclaim-refresh-{}", now_epoch());
-    let state = Arc::new(test_app_state());
-    let old_connection_id = 1;
-    let new_connection_id = 2;
-
-    {
-        let mut sessions = rt.block_on(state.sessions.lock());
-        sessions.insert(
-            session_id.clone(),
-            test_session(&session_id, "Reconnect", None),
-        );
-    }
-    {
-        let mut active = rt.block_on(state.active_connections.lock());
-        active.insert(session_id.clone(), old_connection_id);
-    }
-
-    let release_state = state.clone();
-    let release_id = session_id.clone();
-    rt.spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        release_state
-            .active_connections
-            .lock()
-            .await
-            .remove(&release_id);
-    });
-
-    let claimed = rt.block_on(claim_requested_session(
-        &session_id,
-        &state,
-        new_connection_id,
-    ));
-    assert_eq!(claimed.as_deref(), Some(session_id.as_str()));
-
-    let _ = rt
-        .block_on(state.active_connections.lock())
-        .remove(&session_id);
-    let _ = rt.block_on(state.sessions.lock()).remove(&session_id);
-}
-
-#[test]
-fn claim_requested_session_waits_for_bound_client_release_during_refresh() {
-    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let session_id = format!("reclaim-bound-refresh-{}", now_epoch());
-    let state = Arc::new(test_app_state());
-    let old_connection_id = 10;
-    let new_connection_id = 11;
-    let (bound_tx, _bound_rx) = mpsc::channel::<String>(4);
-
-    {
-        let mut sessions = rt.block_on(state.sessions.lock());
-        sessions.insert(
-            session_id.clone(),
-            test_session(&session_id, "Reconnect", None),
-        );
-    }
-    {
-        let mut active = rt.block_on(state.active_connections.lock());
-        active.insert(session_id.clone(), old_connection_id);
-    }
-    {
-        let mut clients = rt.block_on(state.session_clients.lock());
-        clients.insert(
-            session_id.clone(),
-            SessionClientBinding {
-                connection_id: old_connection_id,
-                tx: bound_tx,
-                replay_ready: true,
-                pending_events: Vec::new(),
-            },
-        );
-    }
-
-    let release_state = state.clone();
-    let release_id = session_id.clone();
-    rt.spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        release_state
-            .session_clients
-            .lock()
-            .await
-            .remove(&release_id);
-        release_state
-            .active_connections
-            .lock()
-            .await
-            .remove(&release_id);
-    });
-
-    let claimed = rt.block_on(claim_requested_session(
-        &session_id,
-        &state,
-        new_connection_id,
-    ));
-    assert_eq!(claimed.as_deref(), Some(session_id.as_str()));
-
-    let _ = rt
-        .block_on(state.session_clients.lock())
-        .remove(&session_id);
-    let _ = rt
-        .block_on(state.active_connections.lock())
-        .remove(&session_id);
-    let _ = rt.block_on(state.sessions.lock()).remove(&session_id);
-}
-
-#[test]
-fn try_claim_session_rejects_orphaned_bound_client() {
-    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let session_id = format!("orphan-bound-client-{}", now_epoch());
-    let state = test_app_state();
-    let (bound_tx, _bound_rx) = mpsc::channel::<String>(4);
-
-    {
-        let mut sessions = rt.block_on(state.sessions.lock());
-        sessions.insert(
-            session_id.clone(),
-            test_session(&session_id, "Reconnect", None),
-        );
-    }
-    {
-        let mut clients = rt.block_on(state.session_clients.lock());
-        clients.insert(
-            session_id.clone(),
-            SessionClientBinding {
-                connection_id: 10,
-                tx: bound_tx,
-                replay_ready: true,
-                pending_events: Vec::new(),
-            },
-        );
-    }
-
-    let claimed = rt.block_on(try_claim_session(&session_id, &state, 11));
-    assert!(matches!(claimed, ClaimSessionResult::InUse));
-
-    let _ = rt
-        .block_on(state.session_clients.lock())
-        .remove(&session_id);
-    let _ = rt.block_on(state.sessions.lock()).remove(&session_id);
-}
-
-#[test]
-fn claim_requested_session_waits_for_bound_client_release_after_active_disconnect() {
-    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let session_id = format!("reclaim-release-order-{}", now_epoch());
-    let state = Arc::new(test_app_state());
-    let old_connection_id = 20;
-    let new_connection_id = 21;
-    let (bound_tx, _bound_rx) = mpsc::channel::<String>(4);
-
-    {
-        let mut sessions = rt.block_on(state.sessions.lock());
-        sessions.insert(
-            session_id.clone(),
-            test_session(&session_id, "Reconnect", None),
-        );
-    }
-    {
-        let mut active = rt.block_on(state.active_connections.lock());
-        active.insert(session_id.clone(), old_connection_id);
-    }
-    {
-        let mut clients = rt.block_on(state.session_clients.lock());
-        clients.insert(
-            session_id.clone(),
-            SessionClientBinding {
-                connection_id: old_connection_id,
-                tx: bound_tx,
-                replay_ready: true,
-                pending_events: Vec::new(),
-            },
-        );
-    }
-
-    let release_state = state.clone();
-    let release_id = session_id.clone();
-    rt.spawn(async move {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        release_state
-            .active_connections
-            .lock()
-            .await
-            .remove(&release_id);
-        tokio::time::sleep(Duration::from_millis(650)).await;
-        release_state
-            .session_clients
-            .lock()
-            .await
-            .remove(&release_id);
-    });
-
-    let started = std::time::Instant::now();
-    let claimed = rt.block_on(claim_requested_session(
-        &session_id,
-        &state,
-        new_connection_id,
-    ));
-    assert_eq!(claimed.as_deref(), Some(session_id.as_str()));
-    assert!(
-        started.elapsed() >= Duration::from_millis(900),
-        "claim should wait until the bound client is gone even after active_connections clears"
-    );
-
-    let _ = rt
-        .block_on(state.session_clients.lock())
-        .remove(&session_id);
-    let _ = rt
-        .block_on(state.active_connections.lock())
-        .remove(&session_id);
-    let _ = rt.block_on(state.sessions.lock()).remove(&session_id);
-}
-
-#[test]
 fn replay_live_round_rehydrates_inflight_round_state() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = test_app_state();
@@ -2913,6 +2704,7 @@ fn replay_live_round_rehydrates_inflight_round_state() {
     rt.block_on(dispatch_live_event(
         &state,
         &session_id,
+        1,
         json!({
             "type": "start",
             "round": 3,
@@ -2924,21 +2716,25 @@ fn replay_live_round_rehydrates_inflight_round_state() {
     rt.block_on(dispatch_live_event(
         &state,
         &session_id,
+        1,
         json!({"type": "thinking_start"}),
     ));
     rt.block_on(dispatch_live_event(
         &state,
         &session_id,
+        1,
         json!({"type": "thinking_delta", "content": "step-1"}),
     ));
     rt.block_on(dispatch_live_event(
         &state,
         &session_id,
+        1,
         json!({"type": "thinking_done"}),
     ));
     rt.block_on(dispatch_live_event(
         &state,
         &session_id,
+        1,
         json!({
             "type": "tool_call",
             "id": "tool-1",
@@ -2949,6 +2745,7 @@ fn replay_live_round_rehydrates_inflight_round_state() {
     rt.block_on(dispatch_live_event(
         &state,
         &session_id,
+        1,
         json!({
             "type": "tool_result",
             "id": "tool-1",
@@ -2959,6 +2756,7 @@ fn replay_live_round_rehydrates_inflight_round_state() {
     rt.block_on(dispatch_live_event(
         &state,
         &session_id,
+        1,
         json!({"type": "delta", "content": "final answer"}),
     ));
 
@@ -3004,12 +2802,71 @@ fn replay_live_round_rehydrates_inflight_round_state() {
     rt.block_on(dispatch_live_event(
         &state,
         &session_id,
+        1,
         json!({"type": "done"}),
     ));
     assert!(rt
         .block_on(state.live_rounds.lock())
         .get(&session_id)
         .is_none());
+}
+
+#[test]
+fn dispatch_live_event_ignores_stale_connection_after_rebind() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-rebind-{}", now_epoch());
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(4);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        2,
+        &bound_tx,
+        true,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 1,
+            "phase": "analyze",
+            "cycle": 1,
+            "react_visible": true,
+        }),
+    ));
+
+    assert!(rt
+        .block_on(state.live_rounds.lock())
+        .get(&session_id)
+        .is_none());
+    assert!(bound_rx.try_recv().is_err());
+
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        2,
+        json!({
+            "type": "start",
+            "round": 1,
+            "phase": "analyze",
+            "cycle": 1,
+            "react_visible": true,
+        }),
+    ));
+
+    let payload = rt
+        .block_on(bound_rx.recv())
+        .expect("current binding should receive live event");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload).expect("payload should be valid json");
+    assert_eq!(parsed["type"].as_str(), Some("start"));
+    assert!(rt
+        .block_on(state.live_rounds.lock())
+        .get(&session_id)
+        .is_some());
 }
 
 // ── Phase 4: Tool Protocol + Session Recovery ────────────────────────────────
@@ -3702,22 +3559,6 @@ fn chat_message_is_empty_assistant_message() {
         timestamp: None,
     };
     assert!(!user_msg.is_empty_assistant_message());
-}
-
-// ───── Phase 5: is_admin_tool ─────
-
-#[test]
-fn is_admin_tool_recognizes_admin_tools() {
-    assert!(is_admin_tool("list_sessions"));
-    assert!(is_admin_tool("delete_session"));
-}
-
-#[test]
-fn is_admin_tool_rejects_regular_tools() {
-    assert!(!is_admin_tool("exec"));
-    assert!(!is_admin_tool("read_file"));
-    assert!(!is_admin_tool("think"));
-    assert!(!is_admin_tool("http_fetch"));
 }
 
 // ───── Phase 5: prune_messages with tool_calls turn ─────

@@ -8,7 +8,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 
 - **Skill** — LLM 推理层：系统提示、模型路由、上下文裁剪、思维模式
 - **CLI** — 工具执行层：安全的命令/文件/网络工具、沙盒路径、SSRF 防护、安装与更新
-- **Loop** — 连接层：WebSocket 会话、多会话状态、流式输出、斜杠命令、持久化
+- **Loop** — 连接层：WebSocket 主会话、流式输出、斜杠命令、持久化
 
 整个后端约 11200 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
 
@@ -16,11 +16,11 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 
 - **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
 - **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断
-- **2 主会话管理工具**：`list_sessions`、`delete_session`
-- **21 斜杠命令**：`/new`、`/session_new`、`/switch`、`/rename`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/status`、`/mcp`、`/usage`、`/clear`、`/help`、`/sessions`、`/delete`
+- **单主会话**：运行时固定使用 `main`，不再创建、切换或删除其他会话
+- **18 斜杠命令**：`/new`、`/session_new`、`/rename`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/status`、`/mcp`、`/usage`、`/clear`、`/help`
 - **双 Provider 模型路由**：OpenAI + Anthropic，支持 `provider/model` 和纯 model ID
-- **Per-session 模型覆盖**：运行时通过 `/model` 切换
-- **持久化多会话**：每个会话有独立工作区和磁盘存档
+- **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
+- **持久化主会话**：固定保存 `main` 工作区和磁盘存档
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
 - **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端，增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
@@ -176,8 +176,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | 命令 | 说明 |
 |---|---|
 | `/new` | 压缩对话到每日记忆，清空上下文 |
-| `/session_new` | 创建新会话 |
-| `/switch <id>` | 切换到另一个会话 |
+| `/session_new` | 重置 `main` 会话上下文 |
 | `/rename <name>` | 重命名当前会话 |
 | `/model [name]` | 查看可用模型或切换当前会话模型 |
 | `/think [level]` | 设置思维模式：`auto`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh` |
@@ -191,11 +190,9 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `/skills-session` | 仅列出当前 session Skills（workspace `skills/`） |
 | `/status` | 显示模型、provider、上下文估算、最大输出 token、思维级别，token 数值按 K/M 显示 |
 | `/mcp [refresh]` | 查看当前已加载的 MCP server 状态；加上 `refresh` 时强制刷新工具缓存并重建运行时 MCP 会话 |
-| `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；同时显示内存与磁盘上所有 session 合并后的今日总 token 估算，按 K/M 显示 |
+| `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；单会话模式下同时显示主会话今日总 token 估算，按 K/M 显示 |
 | `/clear` | 清空消息但保留系统提示 |
 | `/help` | 命令帮助 |
-| `/sessions` | 仅主会话：列出活跃会话 |
-| `/delete <id>` | 仅主会话：按完整 ID 或唯一前缀删除会话 |
 
 ## Tools
 
@@ -210,8 +207,6 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `list_dir` | 列目录内容 |
 | `search_files` | 正则搜索工作区文件 |
 | `http_fetch` | HTTP GET，带 SSRF 防护和重定向阻断 |
-| `list_sessions` | 仅主会话：查看会话状态 |
-| `delete_session` | 仅主会话：删除会话 |
 
 ## Skills
 
@@ -225,7 +220,7 @@ Skills 从三个目录分层加载，后加载的同名 Skill 覆盖先前的：
 |------|------|------|
 | **System** | `docs/reference/skills/` 或 `~/.lingclaw/system-skills/` | 随程序分发的内置 Skills；安装时自动部署到 `~/.lingclaw/system-skills/` |
 | **Global** | `~/.lingclaw/skills/` | 跨 session 共享的全局 Skills |
-| **Session** | `~/.lingclaw/{sessionId}/workspace/skills/` | 当前 session 专属 Skills |
+| **Session** | `~/.lingclaw/main/workspace/skills/` | 主会话专属 Skills |
 
 ### 结构
 
@@ -299,8 +294,8 @@ SKILL.md 的 YAML frontmatter 格式兼容 [Agent Skills 规范](https://agentsk
         │                  │                   │
 ┌───────▼───────┐  ┌───────▼────────┐  ┌──────▼────────┐
 │  Agent Loop   │  │  Session Store │  │  Config       │
-│  ReAct FSM    │  │  多会话持久化    │  │  模型路由      │
-│  ≤200 rounds  │  │  隔离工作区      │  │  环境变量回退   │
+│  ReAct FSM    │  │  主会话持久化    │  │  模型路由      │
+│  ≤200 rounds  │  │  主会话工作区    │  │  环境变量回退   │
 └───┬───────┬───┘  └────────────────┘  └───────────────┘
     │       │
 ┌───▼───┐ ┌─▼──────────────────┐
@@ -419,7 +414,7 @@ src/
 ├── providers.rs       (~860 行)  — OpenAI/Anthropic 流式调用, 推理模式, prompt caching
 ├── prompts.rs         (~660 行)  — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
 ├── hooks.rs           (~340 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
-├── session_admin.rs   (~240 行)  — 管理工具 (list/delete sessions, 仅主会话)
+├── session_admin.rs   (~240 行)  — 全局用量统计 (仅主会话)
 ├── session_store.rs   (~340 行)  — 会话持久化, 迁移, 磁盘 I/O
 ├── socket_sync.rs     (~140 行)  — WebSocket 会话声明, 断线监听, 重绑定
 ├── socket_tasks.rs    (~120 行)  — WebSocket 读写任务
@@ -559,8 +554,7 @@ think_level 映射：
 ├── system-skills/          — 安装时部署的系统 Skills (从 docs/reference/skills/ 复制)
 ├── skills/                 — 全局 Skills (跨 session 共享)
 ├── sessions/
-│   ├── main.json           — 主会话存档
-│   └── {uuid}.json         — 子会话存档
+│   └── main.json           — 主会话存档
 ├── main/workspace/         — 主会话工作区
 │   ├── AGENTS.md           — 核心代理行为
 │   ├── IDENTITY.md         — 身份信息
@@ -571,7 +565,6 @@ think_level 映射：
 │   ├── skills/             — session 专属 Skills
 │   └── memory/
 │       └── 2026-03-17.md   — 每日记忆
-└── {uuid}/workspace/       — 子会话工作区 (同结构)
 ```
 
 提示加载模式：
@@ -619,29 +612,24 @@ think_level 映射：
 | `success` | 命令成功（成功样式） |
 | `system` | 中性系统消息 |
 | `error` | 错误消息 |
-| `session_created` | 新会话已创建 |
-| `session_switched` | 已切换到目标会话 |
-| `session_deleted` | 会话已删除 |
-| `session_renamed` | 会话已重命名 |
-| `sessions_list` | 会话列表 |
-| `session` / `session_switched` | 当前会话已初始化或切换 |
+| `session` | 当前主会话已初始化或刷新 |
 
 ## HTTP API
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
 | `/api/health` | GET | 健康检查 |
-| `/api/sessions` | GET | 列出已知会话 |
+| `/api/sessions` | GET | 返回主会话信息 |
 | `/api/shutdown` | POST | 认证的本地关停端点（CLI 使用） |
 | `/ws` | GET | WebSocket 升级端点 |
 
 ## Session Workspace
 
-每个会话拥有独立工作区 `~/.lingclaw/{sessionId}/workspace/`，包含以下提示文件：
+主会话拥有独立工作区 `~/.lingclaw/main/workspace/`，包含以下提示文件：
 
 | 文件 | 用途 |
 |---|---|
-| `BOOTSTRAP.md` | 新会话的初始引导指令 |
+| `BOOTSTRAP.md` | 初始引导指令 |
 | `AGENTS.md` | 核心代理行为 |
 | `IDENTITY.md` | 身份/人格信息 |
 | `SOUL.md` | 高层推理规则 |

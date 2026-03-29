@@ -9,7 +9,6 @@ const connDot = document.getElementById('conn-dot');
 const connLabel = document.getElementById('conn-label');
 const sessionNameEl = document.getElementById('session-name');
 const sessionIdEl = document.getElementById('session-id');
-const sessionList = document.getElementById('session-list');
 const toggleToolsBtn = document.getElementById('toggle-tools-btn');
 const toggleReasoningBtn = document.getElementById('toggle-reasoning-btn');
 const toolDrawer = document.getElementById('tool-drawer');
@@ -26,7 +25,6 @@ let ws = null;
 let currentMsg = null;
 let busy = false;
 let currentSessionId = '';
-let sessions = [];
 let reasoningPanel = null;
 let reactStatusRow = null;
 let reactStatusPhase = '';
@@ -708,9 +706,7 @@ marked.setOptions({
 // ── WebSocket ──
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const stored = sessionStorage.getItem('lingclaw_session');
-  const qs = stored ? `?session=${encodeURIComponent(stored)}` : '';
-  ws = new WebSocket(`${proto}://${location.host}/ws${qs}`);
+  ws = new WebSocket(`${proto}://${location.host}/ws`);
 
   ws.onopen = () => {
     reconnectDelay = 1000;
@@ -752,25 +748,9 @@ function handleMessage(data) {
   switch (data.type) {
     case 'session':
       currentSessionId = data.id;
-      sessionNameEl.textContent = data.name || 'New Chat';
+      sessionNameEl.textContent = data.name || 'Main';
       sessionIdEl.textContent = data.id.slice(0, 12);
-      sessionStorage.setItem('lingclaw_session', data.id);
       applyViewState(data);
-      break;
-
-    case 'session_switched':
-      currentSessionId = data.id;
-      sessionNameEl.textContent = data.name || 'New Chat';
-      sessionIdEl.textContent = data.id.slice(0, 12);
-      sessionStorage.setItem('lingclaw_session', data.id);
-      applyViewState(data);
-      finishAssistantStream({ discardIfEmpty: true });
-      finishReasoningStream();
-      closeToolDrawer();
-      clearReactStatus();
-      chat.innerHTML = '';
-      reasoningPanel = null;
-      setBusy(false);
       break;
 
     case 'history': {
@@ -806,11 +786,6 @@ function handleMessage(data) {
 
     case 'view_state':
       applyViewState(data);
-      break;
-
-    case 'sessions_list':
-      sessions = data.sessions || [];
-      renderSessionList();
       break;
 
     case 'start':
@@ -1125,48 +1100,6 @@ function renderMarkdown(el) {
   scheduleCodeHighlight(el.querySelectorAll('pre code'));
 }
 
-// ── Session sidebar ──
-function renderSessionList() {
-  sessionList.innerHTML = '';
-  sessions.sort((a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0));
-  for (const s of sessions) {
-    const item = document.createElement('div');
-    item.className = `session-item${s.id === currentSessionId ? ' active' : ''}`;
-    const ts = s.updated_at || s.created_at;
-    item.innerHTML = `
-      <div class="session-top">
-        <span class="name">${escHtml(s.name)}</span>
-        <span class="meta">${s.messages || 0}msg</span>
-      </div>
-      <span class="session-time">${ts ? timeAgo(ts) : ''}</span>
-    `;
-    item.onclick = () => {
-      if (s.id !== currentSessionId) {
-        sendCmd(`/switch ${s.id}`);
-      }
-    };
-    sessionList.appendChild(item);
-  }
-  const active = sessions.find(s => s.id === currentSessionId);
-  if (active) {
-    sessionNameEl.textContent = active.name;
-    sessionIdEl.textContent = active.id.slice(0, 12);
-  }
-}
-
-function newSession() {
-  if (confirm('开启新的对话？')) {
-    sendCmd('/session_new');
-  }
-}
-
-function toggleSidebar() {
-  const sidebar = document.getElementById('sidebar');
-  sidebar.classList.toggle('collapsed');
-  const btn = document.querySelector('.toggle-sidebar');
-  btn.setAttribute('aria-expanded', !sidebar.classList.contains('collapsed'));
-}
-
 // ── Helpers ──
 function fallbackCopy(text) {
   const ta = document.createElement('textarea');
@@ -1234,9 +1167,9 @@ function showWelcome() {
       输入消息开始对话，或使用 <strong>/</strong> 命令
     </div>
     <div class="welcome-shortcuts">
+      <button onclick="sendCmd('/session_new')">🔄 New Conversation</button>
       <button onclick="sendCmd('/status')">📊 Status</button>
       <button onclick="sendCmd('/help')">❓ Help</button>
-      <button onclick="newSession()">✨ New Chat</button>
     </div>
   `;
   chat.appendChild(w);

@@ -14,19 +14,9 @@
 </head>
 <body>
 
-<!-- Sidebar -->
-<aside class="sidebar" id="sidebar" aria-label="Session list">
-  <div class="sidebar-header">
-    <h2><img src="branding/logo-mark.png" alt="" aria-hidden="true"> <span>Sessions</span></h2>
-    <button onclick="newSession()" title="New session" aria-label="New session">+</button>
-  </div>
-  <div id="session-list"></div>
-</aside>
-
 <!-- Main -->
 <div class="main">
   <header>
-    <button class="toggle-sidebar" onclick="toggleSidebar()" aria-label="Toggle sidebar" aria-expanded="true">☰</button>
     <div class="conn-badge" id="conn-badge">
       <span class="conn-dot disconnected" id="conn-dot"></span>
       <span class="conn-label" id="conn-label">Offline</span>
@@ -50,9 +40,9 @@
         输入消息开始对话，或使用 <strong>/</strong> 命令
       </div>
       <div class="welcome-shortcuts">
+        <button onclick="sendCmd('/session_new')">🔄 New Conversation</button>
         <button onclick="sendCmd('/status')">📊 Status</button>
         <button onclick="sendCmd('/help')">❓ Help</button>
-        <button onclick="newSession()">✨ New Chat</button>
       </div>
     </div>
   </div>
