@@ -1329,12 +1329,7 @@ fn handle_status_command(port_override: Option<u16>) -> bool {
             } else {
                 skill.description.clone()
             };
-            println!(
-                "  {:<24} {:<8} {}",
-                skill.name,
-                skill.source.label(),
-                desc
-            );
+            println!("  {:<24} {:<8} {}", skill.name, skill.source.label(), desc);
         }
     }
     println!();

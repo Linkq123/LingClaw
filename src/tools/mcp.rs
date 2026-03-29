@@ -102,6 +102,22 @@ pub(crate) async fn tool_definitions_openai(config: &Config, workspace: &Path) -
         .collect()
 }
 
+pub(crate) fn cached_tool_definitions_openai(config: &Config, workspace: &Path) -> Vec<Value> {
+    cached_list_tools(config, workspace)
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": tool.exposed_name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                }
+            })
+        })
+        .collect()
+}
+
 pub(crate) async fn tool_definitions_anthropic(config: &Config, workspace: &Path) -> Vec<Value> {
     list_tools(config, workspace)
         .await
@@ -114,6 +130,54 @@ pub(crate) async fn tool_definitions_anthropic(config: &Config, workspace: &Path
             })
         })
         .collect()
+}
+
+pub(crate) fn cached_tool_definitions_anthropic(config: &Config, workspace: &Path) -> Vec<Value> {
+    cached_list_tools(config, workspace)
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.exposed_name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn cached_server_counts(config: &Config, workspace: &Path) -> (usize, usize) {
+    let mut enabled_servers = 0;
+    let mut cached_servers = 0;
+    let now = Instant::now();
+
+    for (server_name, server) in config
+        .mcp_servers
+        .iter()
+        .filter(|(_, server)| server.enabled)
+    {
+        enabled_servers += 1;
+        let Ok(key) = cache_key(server_name, server, workspace, config) else {
+            continue;
+        };
+        let has_cache = {
+            let Ok(mut cache) = tool_cache().lock() else {
+                continue;
+            };
+            match cache.get(&key) {
+                Some(entry) if now.duration_since(entry.loaded_at) < tool_cache_ttl() => true,
+                Some(_) => {
+                    cache.remove(&key);
+                    false
+                }
+                None => false,
+            }
+        };
+        if has_cache {
+            cached_servers += 1;
+        }
+    }
+
+    (cached_servers, enabled_servers)
 }
 
 pub(crate) async fn execute_tool(
@@ -395,6 +459,49 @@ async fn list_tools(config: &Config, workspace: &Path) -> Vec<McpToolDescriptor>
             Err(error) => eprintln!("Warning: MCP server '{server_name}' unavailable: {error}"),
         }
     }
+    tools
+}
+
+fn cached_list_tools(config: &Config, workspace: &Path) -> Vec<McpToolDescriptor> {
+    let mut server_names: Vec<&str> = config
+        .mcp_servers
+        .iter()
+        .filter(|(_, server)| server.enabled)
+        .map(|(name, _)| name.as_str())
+        .collect();
+    server_names.sort_unstable();
+
+    let mut tools = Vec::new();
+    let now = Instant::now();
+
+    for server_name in server_names {
+        let Some(server) = config.mcp_servers.get(server_name) else {
+            continue;
+        };
+        let Ok(key) = cache_key(server_name, server, workspace, config) else {
+            continue;
+        };
+        let cached = {
+            let Ok(mut cache) = tool_cache().lock() else {
+                continue;
+            };
+            match cache.get(&key) {
+                Some(entry) if now.duration_since(entry.loaded_at) < tool_cache_ttl() => {
+                    Some(entry.descriptors.clone())
+                }
+                Some(_) => {
+                    cache.remove(&key);
+                    None
+                }
+                None => None,
+            }
+        };
+
+        if let Some(mut cached) = cached {
+            tools.append(&mut cached);
+        }
+    }
+
     tools
 }
 

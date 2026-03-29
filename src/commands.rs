@@ -6,9 +6,12 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    build_system_prompt, default_show_react, default_show_reasoning, default_show_tools, now_epoch,
-    prompts, providers,
-    session_admin::{delete_session_by_id, gather_global_today_usage, gather_sessions_status},
+    agent, build_system_prompt, default_show_react, default_show_reasoning, default_show_tools,
+    now_epoch, prompts, providers,
+    session_admin::{
+        admin_tool_definitions_anthropic, admin_tool_definitions_openai, delete_session_by_id,
+        gather_global_today_usage, gather_sessions_status,
+    },
     session_store::{build_session_status, build_usage_report, save_session_to_disk, sessions_dir},
     tools, truncate, try_claim_session, ws_send, AppState, ChatMessage, ClaimSessionResult,
     Session, WsTx, MAIN_SESSION_ID,
@@ -95,6 +98,111 @@ fn parse_toggle_value(arg: &str, command_name: &str) -> Result<bool, String> {
     }
 }
 
+async fn status_effective_think_level(
+    session: &Session,
+    state: &AppState,
+    resolved: &providers::ResolvedModel,
+) -> String {
+    if session.think_level != "auto" {
+        return session.think_level.clone();
+    }
+    if !(resolved.reasoning || resolved.thinking_format.is_some()) {
+        return "off".to_string();
+    }
+
+    let live_round = { state.live_rounds.lock().await.get(&session.id).cloned() };
+    let cycles = live_round
+        .as_ref()
+        .and_then(|round| round.cycle)
+        .unwrap_or(0);
+    let has_observation = live_round
+        .as_ref()
+        .map(|round| round.has_observation)
+        .unwrap_or(false);
+    agent::auto_think_level(cycles, has_observation).to_string()
+}
+
+async fn build_runtime_status(session: &Session, state: &AppState) -> String {
+    let model = session.effective_model(&state.config.model).to_string();
+    let resolved = state.config.resolve_model(&model);
+    let effective_think = status_effective_think_level(session, state, &resolved).await;
+    let mut extra_tools = if session.is_main() {
+        match resolved.provider {
+            crate::Provider::Anthropic => admin_tool_definitions_anthropic(),
+            crate::Provider::OpenAI => admin_tool_definitions_openai(),
+        }
+    } else {
+        Vec::new()
+    };
+    let mut cached_mcp_tools = match resolved.provider {
+        crate::Provider::Anthropic => {
+            tools::mcp::cached_tool_definitions_anthropic(&state.config, &session.workspace)
+        }
+        crate::Provider::OpenAI => {
+            tools::mcp::cached_tool_definitions_openai(&state.config, &session.workspace)
+        }
+    };
+    extra_tools.append(&mut cached_mcp_tools);
+    let (cached_mcp_servers, enabled_mcp_servers) =
+        tools::mcp::cached_server_counts(&state.config, &session.workspace);
+    let request_budget =
+        crate::context::context_input_budget_for_runtime(&state.config, &model, &effective_think);
+    let tool_estimate =
+        crate::context::estimate_tool_schema_tokens_for_provider(resolved.provider, &extra_tools);
+
+    let mut request_messages = session.messages.clone();
+    let fresh_system = build_system_prompt(
+        &state.config,
+        &session.workspace,
+        &model,
+        session.is_main(),
+        &session.disabled_system_skills,
+    );
+    if let Some(first) = request_messages.first_mut() {
+        if first.role == "system" {
+            *first = fresh_system;
+        }
+    }
+
+    let request_estimate = crate::context::estimate_request_tokens_for_provider(
+        resolved.provider,
+        &request_messages,
+        &extra_tools,
+    );
+
+    let mcp_cache_line = if enabled_mcp_servers > 0 {
+        format!(
+            "\nmcp_schema_cache: {}/{} enabled server(s) cached",
+            cached_mcp_servers, enabled_mcp_servers
+        )
+    } else {
+        String::new()
+    };
+    let request_note = if enabled_mcp_servers > cached_mcp_servers {
+        format!(
+            "includes refreshed system prompt, built-in tool schemas, cached runtime tool schemas, and runtime reasoning reserve; uncached MCP servers are excluded from this estimate ({cached_mcp_servers}/{enabled_mcp_servers} cached)"
+        )
+    } else {
+        "includes refreshed system prompt, built-in/runtime tool schemas, and runtime reasoning reserve".to_string()
+    };
+
+    format!(
+        "{}\nrequest_est: {}/{} (tools {} think {})\nrequest_status: {}{}\nrequest_note: {}",
+        build_session_status(session, &state.config),
+        crate::format_token_count(request_estimate as u64),
+        crate::format_token_count(request_budget as u64),
+        crate::format_token_count(tool_estimate as u64),
+        effective_think,
+        if request_estimate > request_budget {
+            "over budget"
+        } else {
+            "ok"
+        },
+        mcp_cache_line,
+        request_note,
+    )
+}
+
 async fn append_daily_memory_entry(
     memory_path: &Path,
     today: &str,
@@ -139,7 +247,13 @@ async fn reset_session_context_and_persist(
         |session| {
             let model = session.effective_model(&state.config.model).to_string();
             let is_main = session.is_main();
-            let sys = build_system_prompt(&state.config, &session.workspace, &model, is_main, &session.disabled_system_skills);
+            let sys = build_system_prompt(
+                &state.config,
+                &session.workspace,
+                &model,
+                is_main,
+                &session.disabled_system_skills,
+            );
             session.messages = vec![sys];
             session.tool_calls_count = 0;
         },
@@ -362,7 +476,13 @@ async fn handle_session_new_command(current_session_id: &str, state: &AppState) 
 
     let mut session = Session::new();
     let model = session.effective_model(&state.config.model).to_string();
-    let sys = build_system_prompt(&state.config, &session.workspace, &model, false, &session.disabled_system_skills);
+    let sys = build_system_prompt(
+        &state.config,
+        &session.workspace,
+        &model,
+        false,
+        &session.disabled_system_skills,
+    );
     session.messages.push(sys);
     let new_id = session.id.clone();
     if let Err(err) = save_session_to_disk(&session).await {
@@ -516,10 +636,13 @@ async fn handle_model_command(
 }
 
 async fn handle_status_command(current_session_id: &str, state: &AppState) -> CommandResult {
-    let sessions = state.sessions.lock().await;
-    match sessions.get(current_session_id) {
+    let session = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(current_session_id).cloned()
+    };
+    match session {
         Some(session) => command_result(
-            build_session_status(session, &state.config),
+            build_runtime_status(&session, state).await,
             "system",
             None,
             false,
@@ -689,16 +812,16 @@ async fn handle_skills_system_command(
     }
 }
 
-async fn show_system_skills_status(
-    current_session_id: &str,
-    state: &AppState,
-) -> CommandResult {
+async fn show_system_skills_status(current_session_id: &str, state: &AppState) -> CommandResult {
     let (workspace, disabled) = {
         let sessions = state.sessions.lock().await;
         let Some(session) = sessions.get(current_session_id) else {
             return command_result("Session not found.", "error", None, false);
         };
-        (session.workspace.clone(), session.disabled_system_skills.clone())
+        (
+            session.workspace.clone(),
+            session.disabled_system_skills.clone(),
+        )
     };
 
     let skills = prompts::discover_skills_by_source(&workspace, prompts::SkillSource::System);
@@ -741,10 +864,7 @@ async fn show_system_skills_status(
     if !disabled.is_empty() {
         let mut sorted: Vec<_> = disabled.iter().cloned().collect();
         sorted.sort();
-        output.push_str(&format!(
-            "\n\nDisabled patterns: {}",
-            sorted.join(", ")
-        ));
+        output.push_str(&format!("\n\nDisabled patterns: {}", sorted.join(", ")));
     }
 
     command_result(output, "system", None, false)
@@ -823,9 +943,13 @@ async fn toggle_system_skill(
                 // Add individual disable entries for sibling skills not being installed
                 for skill in &system_skills {
                     let rel = skill_relative_dir(&skill.path);
-                    if prompts::is_system_skill_disabled(&skill.path, &HashSet::from([parent.clone()]))
-                        && !prompts::is_system_skill_disabled(&skill.path, &HashSet::from([pattern.clone()]))
-                    {
+                    if prompts::is_system_skill_disabled(
+                        &skill.path,
+                        &HashSet::from([parent.clone()]),
+                    ) && !prompts::is_system_skill_disabled(
+                        &skill.path,
+                        &HashSet::from([pattern.clone()]),
+                    ) {
                         new_set.insert(rel);
                     }
                 }
@@ -1305,9 +1429,9 @@ pub(crate) async fn handle_command(
         "/usage" => Some(handle_usage_command(current_session_id, state).await),
         "/clear" => Some(handle_clear_command(current_session_id, state).await),
         "/skills" => Some(handle_skills_command(None, current_session_id, state).await),
-        "/skills-system" => Some(
-            handle_skills_system_command(arg, current_session_id, state).await,
-        ),
+        "/skills-system" => {
+            Some(handle_skills_system_command(arg, current_session_id, state).await)
+        }
         "/skills-global" => Some(
             handle_skills_command(
                 Some(prompts::SkillSource::Global),

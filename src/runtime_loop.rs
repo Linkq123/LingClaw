@@ -42,7 +42,6 @@ enum AgentPhaseControl {
 }
 
 struct AnalyzeSnapshot {
-    msgs_snapshot: Vec<ChatMessage>,
     model: String,
     think_level: String,
     pruned_count: usize,
@@ -94,8 +93,9 @@ async fn prepare_analyze_snapshot(
     }
 
     let msg_count_before = session.messages.len();
-    prune_messages(
+    crate::context::prune_messages_for_provider(
         &mut session.messages,
+        ctx.state.config.resolve_model(&model_str).provider,
         context_input_budget_for_model(&ctx.state.config, &model_str),
     );
     let pruned_count = msg_count_before - session.messages.len();
@@ -104,20 +104,53 @@ async fn prepare_analyze_snapshot(
     phase_state.cycle_is_main = ctx.current_session_id == MAIN_SESSION_ID;
 
     Some(AnalyzeSnapshot {
-        msgs_snapshot: session.messages.clone(),
         model: model_str,
         think_level: session.think_level.clone(),
         pruned_count,
     })
 }
 
+async fn fit_messages_to_request_budget(
+    ctx: &AgentRunCtx<'_>,
+    model: &str,
+    think_level: &str,
+    extra_tools: &[serde_json::Value],
+) -> Option<(usize, usize)> {
+    let provider = ctx.state.config.resolve_model(model).provider;
+    let request_budget =
+        crate::context::context_input_budget_for_runtime(&ctx.state.config, model, think_level);
+    let message_budget = crate::context::request_message_budget_for_runtime(
+        &ctx.state.config,
+        model,
+        think_level,
+        extra_tools,
+    );
+
+    let pruned_count = {
+        let mut sessions = ctx.state.sessions.lock().await;
+        let session = sessions.get_mut(ctx.current_session_id)?;
+        let before = session.messages.len();
+        crate::context::prune_messages_for_provider(
+            &mut session.messages,
+            provider,
+            message_budget,
+        );
+        let after = session.messages.len();
+        if before != after {
+            session.updated_at = now_epoch();
+        }
+        before.saturating_sub(after)
+    };
+
+    Some((pruned_count, request_budget))
+}
+
 async fn send_before_analyze_events(
     ctx: &AgentRunCtx<'_>,
     react_ctx: &agent::AgentLoopCtx,
     model: &str,
-    msgs_snapshot: &[ChatMessage],
     pruned_count: usize,
-) -> bool {
+) -> Option<Vec<ChatMessage>> {
     let mut before_analyze_events = run_hooks(
         &ctx.state.hooks,
         agent::HookPoint::BeforeAnalyze,
@@ -129,9 +162,16 @@ async fn send_before_analyze_events(
     )
     .await;
 
+    let final_messages = {
+        let sessions = ctx.state.sessions.lock().await;
+        sessions
+            .get(ctx.current_session_id)
+            .map(|session| session.messages.clone())
+            .unwrap_or_default()
+    };
     let final_context_estimate = estimate_tokens_for_provider(
         ctx.state.config.resolve_model(model).provider,
-        msgs_snapshot,
+        &final_messages,
     );
     for event in &mut before_analyze_events {
         if event["type"] == "context_compressed" {
@@ -141,7 +181,7 @@ async fn send_before_analyze_events(
 
     for event in before_analyze_events {
         if !live_send(ctx.live_tx, event).await {
-            return false;
+            return None;
         }
     }
 
@@ -156,7 +196,7 @@ async fn send_before_analyze_events(
         .await;
     }
 
-    true
+    Some(final_messages)
 }
 
 fn effective_think_level(
@@ -181,8 +221,23 @@ async fn build_cycle_tools(
     phase_state: &AgentPhaseState,
     resolved: &providers::ResolvedModel,
 ) -> Vec<serde_json::Value> {
-    let extra_tools: Vec<serde_json::Value> = if phase_state.cycle_is_main {
-        match resolved.provider {
+    build_runtime_tools(
+        &ctx.state.config,
+        resolved.provider,
+        &phase_state.cycle_workspace,
+        phase_state.cycle_is_main,
+    )
+    .await
+}
+
+pub(crate) async fn build_runtime_tools(
+    config: &Config,
+    provider: Provider,
+    workspace: &Path,
+    is_main: bool,
+) -> Vec<serde_json::Value> {
+    let extra_tools: Vec<serde_json::Value> = if is_main {
+        match provider {
             Provider::Anthropic => admin_tool_definitions_anthropic(),
             Provider::OpenAI => admin_tool_definitions_openai(),
         }
@@ -190,15 +245,9 @@ async fn build_cycle_tools(
         vec![]
     };
     let mut extra_tools = extra_tools;
-    let mut mcp_tools = match resolved.provider {
-        Provider::Anthropic => {
-            tools::mcp::tool_definitions_anthropic(&ctx.state.config, &phase_state.cycle_workspace)
-                .await
-        }
-        Provider::OpenAI => {
-            tools::mcp::tool_definitions_openai(&ctx.state.config, &phase_state.cycle_workspace)
-                .await
-        }
+    let mut mcp_tools = match provider {
+        Provider::Anthropic => tools::mcp::tool_definitions_anthropic(config, workspace).await,
+        Provider::OpenAI => tools::mcp::tool_definitions_openai(config, workspace).await,
     };
     extra_tools.append(&mut mcp_tools);
     extra_tools
@@ -215,12 +264,10 @@ fn token_usage_source(token_count: Option<u64>) -> &'static str {
 async fn update_llm_response_usage(
     ctx: &AgentRunCtx<'_>,
     resolved_provider: Provider,
-    msgs_snapshot: &[ChatMessage],
+    request_input_estimate: u64,
     resp: &providers::LlmResponse,
 ) {
-    let input_tokens = resp
-        .input_tokens
-        .unwrap_or_else(|| estimate_tokens_for_provider(resolved_provider, msgs_snapshot) as u64);
+    let input_tokens = resp.input_tokens.unwrap_or(request_input_estimate);
     let output_tokens = resp
         .output_tokens
         .unwrap_or_else(|| message_token_len_for_provider(resolved_provider, &resp.message) as u64);
@@ -272,10 +319,10 @@ async fn apply_llm_response(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
     resolved_provider: Provider,
-    msgs_snapshot: &[ChatMessage],
+    request_input_estimate: u64,
     resp: providers::LlmResponse,
 ) {
-    update_llm_response_usage(ctx, resolved_provider, msgs_snapshot, &resp).await;
+    update_llm_response_usage(ctx, resolved_provider, request_input_estimate, &resp).await;
     persist_assistant_message(ctx, &resp.message).await;
     advance_after_llm_response(ctx.live_tx, phase_state, &resp.message).await;
 }
@@ -524,17 +571,40 @@ async fn run_analyze_phase(
         None => return AgentPhaseControl::Break,
     };
 
-    if !send_before_analyze_events(
+    let resolved = ctx.state.config.resolve_model(&snapshot.model);
+    let effective_think = effective_think_level(
+        &snapshot.think_level,
+        &resolved,
+        phase_state.react_ctx.cycles,
+        had_observation_hint,
+    );
+    let extra_tools = build_cycle_tools(ctx, phase_state, &resolved).await;
+
+    let (extra_pruned_count, request_budget) =
+        match fit_messages_to_request_budget(ctx, &snapshot.model, &effective_think, &extra_tools)
+            .await
+        {
+            Some(result) => result,
+            None => return AgentPhaseControl::Break,
+        };
+    let total_pruned_count = snapshot.pruned_count.saturating_add(extra_pruned_count);
+
+    let final_msgs_snapshot = match send_before_analyze_events(
         ctx,
         &phase_state.react_ctx,
         &snapshot.model,
-        &snapshot.msgs_snapshot,
-        snapshot.pruned_count,
+        total_pruned_count,
     )
     .await
     {
-        return AgentPhaseControl::Break;
-    }
+        Some(msgs) => msgs,
+        None => return AgentPhaseControl::Break,
+    };
+    let request_estimate = crate::context::estimate_request_tokens_for_provider(
+        resolved.provider,
+        &final_msgs_snapshot,
+        &extra_tools,
+    );
 
     if !live_send(
         ctx.live_tx,
@@ -550,14 +620,21 @@ async fn run_analyze_phase(
         return AgentPhaseControl::Break;
     }
 
-    let resolved = ctx.state.config.resolve_model(&snapshot.model);
-    let effective_think = effective_think_level(
-        &snapshot.think_level,
-        &resolved,
-        phase_state.react_ctx.cycles,
-        had_observation_hint,
-    );
-    let extra_tools = build_cycle_tools(ctx, phase_state, &resolved).await;
+    if request_estimate > request_budget {
+        let _ = live_send(
+            ctx.live_tx,
+            json!({
+                "type":"error",
+                "content": format!(
+                    "Estimated request size {} exceeds runtime input budget {} after accounting for tools and reasoning. Reduce context, disable MCP servers, lower /think, or switch to a model with a larger context window.",
+                    format_token_count(request_estimate as u64),
+                    format_token_count(request_budget as u64),
+                ),
+            }),
+        )
+        .await;
+        return AgentPhaseControl::Break;
+    }
 
     let llm_result = tokio::select! {
         biased;
@@ -569,7 +646,7 @@ async fn run_analyze_phase(
         result = providers::call_llm_stream(
             &ctx.state.http,
             &resolved,
-            &snapshot.msgs_snapshot,
+            &final_msgs_snapshot,
             ctx.live_tx,
             &effective_think,
             &extra_tools,
@@ -582,7 +659,7 @@ async fn run_analyze_phase(
                 ctx,
                 phase_state,
                 resolved.provider,
-                &snapshot.msgs_snapshot,
+                request_estimate as u64,
                 resp,
             )
             .await;

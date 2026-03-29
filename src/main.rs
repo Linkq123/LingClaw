@@ -44,7 +44,7 @@ pub(crate) use config::{config_dir_path, config_file_path, Config, Provider, DEF
 pub(crate) use context::{
     accumulate_daily_token_usage, context_input_budget_for_model, current_daily_token_usage,
     estimate_tokens_for_provider, format_token_count, format_usage_block,
-    message_token_len_for_provider, prune_messages, update_session_token_usage,
+    message_token_len_for_provider, update_session_token_usage,
 };
 pub(crate) use hooks::{run_hooks, AutoCompressContextHook, HookRegistry};
 
@@ -70,7 +70,10 @@ use socket_tasks::{finalize_connection, spawn_connection_tasks, ConnectionCleanu
 #[cfg(test)]
 use config::{JsonConfig, JsonModelEntry, JsonProviderConfig};
 #[cfg(test)]
-use context::{estimate_tokens, message_token_len, turn_len};
+use context::{
+    estimate_request_tokens_for_provider, estimate_tokens, message_token_len, prune_messages,
+    turn_len,
+};
 #[cfg(test)]
 use hooks::{build_compressed_messages, find_auto_compress_cutoff};
 #[cfg(test)]
@@ -319,6 +322,7 @@ struct LiveRoundState {
     react_visible: bool,
     phase: Option<String>,
     cycle: Option<usize>,
+    has_observation: bool,
     assistant_text: String,
     reasoning_text: String,
     reasoning_done: bool,
@@ -750,6 +754,7 @@ async fn dispatch_live_event(state: &AppState, session_id: &str, event: serde_js
                         react_visible: event["react_visible"].as_bool().unwrap_or(false),
                         phase: event["phase"].as_str().map(str::to_string),
                         cycle: event["cycle"].as_u64().map(|value| value as usize),
+                        has_observation: false,
                         assistant_text: String::new(),
                         reasoning_text: String::new(),
                         reasoning_done: false,
@@ -839,6 +844,11 @@ async fn dispatch_live_event(state: &AppState, session_id: &str, event: serde_js
                 if let Some(round) = live_rounds.get_mut(session_id) {
                     round.phase = event["phase"].as_str().map(str::to_string);
                     round.cycle = event["cycle"].as_u64().map(|value| value as usize);
+                }
+            }
+            "observation" => {
+                if let Some(round) = live_rounds.get_mut(session_id) {
+                    round.has_observation = true;
                 }
             }
             "done" | "error" => {
@@ -1344,7 +1354,13 @@ async fn main() {
         let main_session = load_session_from_disk(MAIN_SESSION_ID).unwrap_or_else(|| {
             let mut s = Session::new_with_id(MAIN_SESSION_ID, "Main");
             let model = s.effective_model(&state.config.model).to_string();
-            let sys = build_system_prompt(&state.config, &s.workspace, &model, true, &s.disabled_system_skills);
+            let sys = build_system_prompt(
+                &state.config,
+                &s.workspace,
+                &model,
+                true,
+                &s.disabled_system_skills,
+            );
             s.messages.push(sys);
             s
         });

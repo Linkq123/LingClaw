@@ -169,3 +169,55 @@ fn hard_cap_events_include_terminal_done_message() {
     assert_eq!(done_event["cycles"], 3);
     assert_eq!(done_event["tool_calls"], 7);
 }
+
+#[test]
+fn update_llm_response_usage_uses_request_estimate_when_provider_usage_missing() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = std::sync::Arc::new(test_app_state());
+    let session = test_session("usage-session", "Usage Session", None);
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+    let run_cancel = cancel.child_token();
+
+    rt.block_on(async {
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session.id.clone(), session.clone());
+
+        let ctx = AgentRunCtx {
+            state: &state,
+            current_session_id: "usage-session",
+            cancel: &cancel,
+            live_tx: &live_tx,
+            run_cancel: &run_cancel,
+        };
+        let resp = providers::LlmResponse {
+            message: ChatMessage {
+                role: "assistant".into(),
+                content: Some("done".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+            input_tokens: None,
+            output_tokens: None,
+        };
+
+        update_llm_response_usage(&ctx, Provider::OpenAI, 777, &resp).await;
+    });
+
+    let persisted = rt.block_on(async {
+        state
+            .sessions
+            .lock()
+            .await
+            .get("usage-session")
+            .cloned()
+            .expect("session should exist")
+    });
+
+    assert_eq!(persisted.input_tokens, 777);
+    assert_eq!(persisted.input_token_source, "estimated");
+}

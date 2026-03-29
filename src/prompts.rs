@@ -294,10 +294,7 @@ pub(crate) fn render_skills_catalog(skills: &[SkillMeta]) -> Option<String> {
 /// `disabled` entries are relative segments like `anthropics` or `anthropics/pdf`.
 ///
 /// A disabled entry matches if it equals the relative dir or is a prefix of it.
-pub(crate) fn is_system_skill_disabled(
-    path: &str,
-    disabled: &HashSet<String>,
-) -> bool {
+pub(crate) fn is_system_skill_disabled(path: &str, disabled: &HashSet<String>) -> bool {
     const PREFIX: &str = "system://skills/";
     let relative = path.strip_prefix(PREFIX).unwrap_or(path);
     // Strip trailing `/SKILL.md` so we get e.g. `anthropics/pdf`

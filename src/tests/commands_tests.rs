@@ -1,4 +1,11 @@
 use super::*;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::atomic::AtomicU64,
+    time::Duration,
+};
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 fn unique_temp_workspace(prefix: &str) -> std::path::PathBuf {
     let unique = std::time::SystemTime::now()
@@ -60,6 +67,233 @@ async fn append_daily_memory_entry_appends_without_overwriting_existing_content(
     assert!(content.contains("## 08:00 Local\n\nexisting summary"));
     assert!(content.contains("## 09:30 Local\n\nnext summary"));
     assert_eq!(content.matches("# 2026-03-19").count(), 1);
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn status_command_reports_runtime_request_estimate() {
+    let workspace = unique_temp_workspace("lingclaw-command-status");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        "anthropic".to_string(),
+        crate::config::JsonProviderConfig {
+            base_url: "https://api.anthropic.com".to_string(),
+            api_key: "anthropic-key".to_string(),
+            api: "anthropic".to_string(),
+            models: vec![crate::config::JsonModelEntry {
+                id: "claude-sonnet-4-20250514".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(200000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+
+    let state = AppState {
+        config: crate::Config {
+            api_key: "env-key".to_string(),
+            api_base: "https://fallback.example/v1".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            provider: crate::Provider::OpenAI,
+            anthropic_prompt_caching: false,
+            providers,
+            mcp_servers: HashMap::new(),
+            port: crate::DEFAULT_PORT,
+            max_context_tokens: 32000,
+            exec_timeout: Duration::from_secs(30),
+            tool_timeout: Duration::from_secs(30),
+            max_output_bytes: 50 * 1024,
+            max_file_bytes: 200 * 1024,
+            openai_stream_include_usage: false,
+        },
+        http: reqwest::Client::new(),
+        sessions: Mutex::new(HashMap::new()),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+    };
+
+    let mut session = Session {
+        id: "status-session".to_string(),
+        name: "Status Session".to_string(),
+        messages: Vec::new(),
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: "estimated".to_string(),
+        output_token_source: "estimated".to_string(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        model_override: Some("anthropic/claude-sonnet-4-20250514".to_string()),
+        think_level: "medium".to_string(),
+        show_react: true,
+        show_tools: true,
+        show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
+        version: 4,
+        workspace: workspace.clone(),
+    };
+    let model = session.effective_model(&state.config.model).to_string();
+    session.messages.push(build_system_prompt(
+        &state.config,
+        &workspace,
+        &model,
+        false,
+        &session.disabled_system_skills,
+    ));
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("Summarize the current backend architecture.".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.id.clone(), session);
+
+    let result = handle_status_command("status-session", &state).await;
+
+    assert_eq!(result.response_type, "system");
+    assert!(result.response.contains("request_est:"));
+    assert!(result.response.contains("request_status: ok"));
+    assert!(result
+        .response
+        .contains("request_note: includes refreshed system prompt, built-in/runtime tool schemas, and runtime reasoning reserve"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn status_command_uses_live_round_for_auto_think_estimate() {
+    let workspace = unique_temp_workspace("lingclaw-command-status-auto");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai".to_string(),
+        crate::config::JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "openai-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![crate::config::JsonModelEntry {
+                id: "gpt-4o-reasoner".to_string(),
+                name: None,
+                reasoning: Some(true),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+
+    let state = AppState {
+        config: crate::Config {
+            api_key: "env-key".to_string(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            model: "openai/gpt-4o-reasoner".to_string(),
+            provider: crate::Provider::OpenAI,
+            anthropic_prompt_caching: false,
+            providers,
+            mcp_servers: HashMap::new(),
+            port: crate::DEFAULT_PORT,
+            max_context_tokens: 32000,
+            exec_timeout: Duration::from_secs(30),
+            tool_timeout: Duration::from_secs(30),
+            max_output_bytes: 50 * 1024,
+            max_file_bytes: 200 * 1024,
+            openai_stream_include_usage: false,
+        },
+        http: reqwest::Client::new(),
+        sessions: Mutex::new(HashMap::new()),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+    };
+
+    let mut session = Session {
+        id: "status-auto".to_string(),
+        name: "Status Auto".to_string(),
+        messages: Vec::new(),
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: "estimated".to_string(),
+        output_token_source: "estimated".to_string(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        model_override: Some("openai/gpt-4o-reasoner".to_string()),
+        think_level: "auto".to_string(),
+        show_react: true,
+        show_tools: true,
+        show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
+        version: 4,
+        workspace: workspace.clone(),
+    };
+    let model = session.effective_model(&state.config.model).to_string();
+    session.messages.push(build_system_prompt(
+        &state.config,
+        &workspace,
+        &model,
+        false,
+        &session.disabled_system_skills,
+    ));
+
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.id.clone(), session);
+    state.live_rounds.lock().await.insert(
+        "status-auto".to_string(),
+        crate::LiveRoundState {
+            cycle: Some(2),
+            has_observation: true,
+            ..Default::default()
+        },
+    );
+
+    let result = handle_status_command("status-auto", &state).await;
+
+    assert_eq!(result.response_type, "system");
+    assert!(result.response.contains("think high"));
 
     let _ = tokio::fs::remove_dir_all(&workspace).await;
 }

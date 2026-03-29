@@ -192,6 +192,28 @@ fn runtime_tool_note_lists_enabled_servers() {
     assert!(note.contains("mcp__"));
 }
 
+#[tokio::test]
+async fn cached_tool_definitions_do_not_start_server_on_cache_miss() {
+    let _guard = acquire_mcp_test_guard().await;
+    clear_mcp_caches_for_test().await;
+
+    let workspace = unique_temp_workspace("lingclaw-mcp-cache-miss");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    let log_path = workspace.join("mock.log");
+    let config = test_config_with_mock_server("normal", &log_path);
+
+    let tools = cached_tool_definitions_openai(&config, &workspace);
+    let (cached_servers, enabled_servers) = cached_server_counts(&config, &workspace);
+
+    assert!(tools.is_empty());
+    assert_eq!(cached_servers, 0);
+    assert_eq!(enabled_servers, 1);
+    assert_eq!(log_line_count(&log_path, "tools/list"), 0);
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 #[test]
 fn server_timeout_defaults_to_tool_timeout_when_override_missing() {
     let mut config = test_config_with_mcp();

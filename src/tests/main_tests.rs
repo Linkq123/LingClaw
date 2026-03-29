@@ -3394,6 +3394,55 @@ fn provider_aware_estimate_adds_tool_protocol_overhead() {
 }
 
 #[test]
+fn request_estimate_includes_tool_schema_overhead() {
+    let messages = vec![ChatMessage {
+        role: "system".into(),
+        content: Some("system prompt".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let extra_tools = vec![json!({
+        "name": "mcp__very_large_tool",
+        "description": "A runtime MCP tool with a large schema payload.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "workspace path"},
+                "content": {"type": "string", "description": "large content"},
+                "flags": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            },
+            "required": ["path", "content"]
+        }
+    })];
+
+    let message_estimate = estimate_tokens_for_provider(Provider::Anthropic, &messages);
+    let request_estimate =
+        estimate_request_tokens_for_provider(Provider::Anthropic, &messages, &extra_tools);
+
+    assert!(request_estimate > message_estimate);
+}
+
+#[test]
+fn openai_request_estimate_includes_builtin_tool_schemas() {
+    let messages = vec![ChatMessage {
+        role: "system".into(),
+        content: Some("system prompt".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let message_estimate = estimate_tokens_for_provider(Provider::OpenAI, &messages);
+    let request_estimate = estimate_request_tokens_for_provider(Provider::OpenAI, &messages, &[]);
+
+    assert!(request_estimate > message_estimate);
+}
+
+#[test]
 fn context_input_budget_reserves_headroom() {
     let mut providers = HashMap::new();
     providers.insert(
