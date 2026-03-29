@@ -415,6 +415,10 @@ function findProgressiveSplitPoint(text) {
 
 // ── Math (KaTeX) integration ──
 
+function isAsciiDigit(ch) {
+  return ch >= '0' && ch <= '9';
+}
+
 function extractMath(text) {
   const blocks = [];
   let out = '';
@@ -470,11 +474,27 @@ function extractMath(text) {
       }
     }
 
-    // Inline math $...$ (no newline, no leading/trailing space)
-    if (text[i] === '$' && i + 1 < len && text[i + 1] !== '$' && text[i + 1] !== ' ' && text[i + 1] !== '\n') {
+    // Inline math $...$ with a conservative digit heuristic to avoid
+    // mis-rendering currency like "$5,$10" as a formula.
+    const prev = i > 0 ? text[i - 1] : '';
+    if (
+      text[i] === '$' &&
+      i + 1 < len &&
+      text[i + 1] !== '$' &&
+      text[i + 1] !== ' ' &&
+      text[i + 1] !== '\n' &&
+      !isAsciiDigit(prev)
+    ) {
       let j = i + 1;
       while (j < len && text[j] !== '$' && text[j] !== '\n') j++;
-      if (j < len && text[j] === '$' && j > i + 1 && text[j - 1] !== ' ') {
+      const next = j + 1 < len ? text[j + 1] : '';
+      if (
+        j < len &&
+        text[j] === '$' &&
+        j > i + 1 &&
+        text[j - 1] !== ' ' &&
+        !isAsciiDigit(next)
+      ) {
         const formula = text.substring(i + 1, j);
         const id = blocks.length;
         blocks.push({ formula, displayMode: false });
@@ -717,7 +737,7 @@ function currentMsgRow() {
 
 function beginAssistantStream() {
   cancelAssistantFlush();
-  const message = addAssistant('');
+  const message = addAssistant('', { trackUnread: false });
   const row = message.closest('.msg-row');
   if (row) {
     row.hidden = true;
@@ -1258,7 +1278,7 @@ function addMsg(cls, text, timestamp, options = {}) {
   return el;
 }
 
-function addAssistant(text) { return addMsg('assistant', text); }
+function addAssistant(text, options = {}) { return addMsg('assistant', text, undefined, options); }
 
 function addSystem(t, kind = 'info') {
   const row = document.createElement('div');
