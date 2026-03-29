@@ -2,6 +2,8 @@
 const chat = document.getElementById('chat');
 const input = document.getElementById('input');
 const inputArea = document.getElementById('input-area');
+const jumpToLatestBtn = document.getElementById('jump-to-latest');
+const jumpToLatestBadge = document.getElementById('jump-to-latest-badge');
 const stopBtn = document.getElementById('stop');
 const sendBtn = document.getElementById('send');
 const sendIcon = document.getElementById('send-icon');
@@ -20,6 +22,10 @@ const toolDrawerResult = document.getElementById('tool-drawer-result');
 const toolDrawerResultSection = document.getElementById('tool-drawer-result-section');
 const DEFAULT_BRAND_AVATAR = 'branding/avatar.png';
 const DEFAULT_WELCOME_LOGO = 'branding/logo-wordmark.png';
+const AUTO_SCROLL_THRESHOLD = 88;
+const SOFT_SPLIT_MIN_CHARS = 72;
+const SOFT_SPLIT_MAX_CHARS = 160;
+const SOFT_SPLIT_TAIL_MIN_CHARS = 18;
 
 let ws = null;
 let currentMsg = null;
@@ -50,6 +56,11 @@ const HISTORY_RENDER_LIMIT = 50;
 let activeToolPanel = null;
 let showTools = true;
 let showReasoning = true;
+let autoFollowChat = true;
+let hasBufferedChatUpdates = false;
+let unreadMessageCount = 0;
+let bulkRenderingChat = false;
+let suppressScrollTracking = false;
 const markdownRenderQueue = [];
 let markdownQueueHandle = 0;
 
@@ -201,6 +212,83 @@ function syncToolDrawerBounds() {
     : window.innerHeight;
   const bottomInset = Math.max(16, Math.ceil(viewportBottom - rect.top + 8));
   document.documentElement.style.setProperty('--tool-drawer-bottom', `${bottomInset}px`);
+  document.documentElement.style.setProperty('--jump-to-latest-bottom', `${bottomInset + 10}px`);
+}
+
+function distanceFromBottom() {
+  return chat.scrollHeight - chat.scrollTop - chat.clientHeight;
+}
+
+function isChatNearBottom(threshold = AUTO_SCROLL_THRESHOLD) {
+  return distanceFromBottom() <= threshold;
+}
+
+function updateJumpToLatestVisibility() {
+  if (!jumpToLatestBtn) return;
+  const show = !autoFollowChat && hasBufferedChatUpdates;
+  const hasCount = unreadMessageCount > 0;
+  jumpToLatestBtn.hidden = !show;
+  jumpToLatestBtn.classList.toggle('visible', show);
+  jumpToLatestBtn.classList.toggle('has-state-only', show && !hasCount);
+  if (jumpToLatestBadge) {
+    if (!show) {
+      jumpToLatestBadge.hidden = true;
+      jumpToLatestBadge.textContent = '';
+    } else if (hasCount) {
+      jumpToLatestBadge.hidden = false;
+      jumpToLatestBadge.textContent = unreadMessageCount > 99 ? '99+' : String(unreadMessageCount);
+    } else {
+      jumpToLatestBadge.hidden = false;
+      jumpToLatestBadge.textContent = '新';
+    }
+  }
+  jumpToLatestBtn.setAttribute(
+    'aria-label',
+    hasCount ? `Jump to latest messages, ${unreadMessageCount} unread items` : 'Jump to latest messages, new content available'
+  );
+  jumpToLatestBtn.title = hasCount ? `${unreadMessageCount} 条新内容` : '有新内容';
+}
+
+function clearBufferedChatUpdates() {
+  hasBufferedChatUpdates = false;
+  unreadMessageCount = 0;
+  updateJumpToLatestVisibility();
+}
+
+function setAutoFollowChat(nextFollow) {
+  autoFollowChat = nextFollow;
+  if (nextFollow) {
+    clearBufferedChatUpdates();
+  } else {
+    updateJumpToLatestVisibility();
+  }
+}
+
+function markChatUpdateOffscreen() {
+  if (bulkRenderingChat) return;
+  hasBufferedChatUpdates = true;
+  updateJumpToLatestVisibility();
+}
+
+function queueUnreadContent({ countable = false } = {}) {
+  if (bulkRenderingChat || autoFollowChat || isChatNearBottom()) {
+    return;
+  }
+  hasBufferedChatUpdates = true;
+  if (countable) {
+    unreadMessageCount += 1;
+  }
+  updateJumpToLatestVisibility();
+}
+
+function syncChatScrollState() {
+  if (suppressScrollTracking) return;
+  setAutoFollowChat(isChatNearBottom());
+}
+
+function jumpToLatest() {
+  setAutoFollowChat(true);
+  scrollDown(true);
 }
 
 function updateViewToggleButtons() {
@@ -260,9 +348,26 @@ function canSendWhileBusy(cmd) {
 
 // ── Progressive segmented markdown ──
 
+function isSentenceSplitChar(text, index) {
+  const ch = text[index];
+  if ('。！？；：'.includes(ch)) return true;
+  if ('!?;:'.includes(ch)) {
+    const next = text[index + 1] || '';
+    return !next || /\s/.test(next);
+  }
+  if (ch === '.') {
+    const prev = text[index - 1] || '';
+    const next = text[index + 1] || '';
+    return /[A-Za-z0-9\)]/.test(prev) && (!next || /\s/.test(next));
+  }
+  return false;
+}
+
 function findProgressiveSplitPoint(text) {
   let inFence = false;
   let lastSplit = -1;
+  let lastSoftSplit = -1;
+  let charsSinceBoundary = 0;
   let i = 0;
   while (i < text.length) {
     const atLineStart = (i === 0 || text[i - 1] === '\n');
@@ -275,6 +380,8 @@ function findProgressiveSplitPoint(text) {
       i = j < text.length ? j + 1 : text.length;
       if (wasFenced && !inFence && i < text.length) {
         lastSplit = i;
+        lastSoftSplit = -1;
+        charsSinceBoundary = 0;
       }
       continue;
     }
@@ -282,10 +389,26 @@ function findProgressiveSplitPoint(text) {
       let j = i + 2;
       while (j < text.length && text[j] === '\n') j++;
       lastSplit = j;
+      lastSoftSplit = -1;
+      charsSinceBoundary = 0;
       i = j;
       continue;
     }
+    if (!inFence) {
+      charsSinceBoundary += 1;
+      if (isSentenceSplitChar(text, i) && charsSinceBoundary >= SOFT_SPLIT_MIN_CHARS) {
+        lastSoftSplit = i + 1;
+      } else if (/\s/.test(text[i]) && charsSinceBoundary >= SOFT_SPLIT_MAX_CHARS) {
+        lastSoftSplit = i + 1;
+      }
+    }
     i++;
+  }
+  if (!inFence && lastSoftSplit > lastSplit) {
+    const tailLength = text.length - lastSoftSplit;
+    if (tailLength === 0 || tailLength >= SOFT_SPLIT_TAIL_MIN_CHARS) {
+      return lastSoftSplit;
+    }
   }
   return lastSplit;
 }
@@ -339,13 +462,79 @@ function appendRenderedSegment(el, markdownText) {
   scheduleCodeHighlight(codeBlocks);
 }
 
-function updateLiveTail(el, text) {
-  if (!el._liveTail) {
-    el._liveTail = document.createTextNode(text);
-    el.appendChild(el._liveTail);
-  } else {
-    el._liveTail.nodeValue = text;
+function parseOpenCodeFence(text) {
+  const normalized = text.replace(/^\n+/, '');
+  if (!normalized.startsWith('```')) return null;
+
+  const firstNewline = normalized.indexOf('\n');
+  if (firstNewline === -1) return null;
+
+  const rest = normalized.slice(firstNewline + 1);
+  if (/(^|\n)```/.test(rest)) return null;
+
+  const info = normalized.slice(3, firstNewline).trim();
+  const language = info ? info.split(/\s+/, 1)[0] : '';
+  return {
+    language,
+    code: rest
+  };
+}
+
+function ensureLiveTail(el, mode) {
+  if (el._liveTail && el._liveTail.dataset.mode === mode) {
+    return el._liveTail;
   }
+
+  removeLiveTail(el);
+
+  if (mode === 'code') {
+    const pre = document.createElement('pre');
+    pre.className = 'live-tail live-code-tail';
+    pre.dataset.mode = 'code';
+    const code = document.createElement('code');
+    pre.appendChild(code);
+    el.appendChild(pre);
+    el._liveTail = pre;
+    return pre;
+  }
+
+  const span = document.createElement('span');
+  span.className = 'live-tail';
+  span.dataset.mode = 'text';
+  el.appendChild(span);
+  el._liveTail = span;
+  return span;
+}
+
+function updateLiveTail(el, text) {
+  if (!text) {
+    removeLiveTail(el);
+    return;
+  }
+
+  const codeTail = parseOpenCodeFence(text);
+  if (codeTail) {
+    const tail = ensureLiveTail(el, 'code');
+    let label = tail.querySelector('.code-lang-label');
+    if (codeTail.language) {
+      if (!label) {
+        label = document.createElement('span');
+        label.className = 'code-lang-label';
+        tail.insertBefore(label, tail.firstChild);
+      }
+      label.textContent = codeTail.language;
+    } else if (label) {
+      label.remove();
+    }
+    const codeEl = tail.querySelector('code');
+    if (codeEl) {
+      codeEl.textContent = codeTail.code;
+    }
+    return;
+  }
+
+  const tail = ensureLiveTail(el, 'text');
+  tail.textContent = text;
 }
 
 function removeLiveTail(el) {
@@ -365,22 +554,13 @@ function flushAssistantText() {
   const splitAt = findProgressiveSplitPoint(raw);
 
   if (splitAt > offset) {
-    if (currentMsg._textNode) {
-      currentMsg._textNode.remove();
-      currentMsg._textNode = null;
-    }
     appendRenderedSegment(currentMsg, raw.substring(offset, splitAt));
     currentMsg._renderedOffset = splitAt;
     updateLiveTail(currentMsg, raw.substring(splitAt));
   } else if (offset > 0) {
     updateLiveTail(currentMsg, raw.substring(offset));
   } else {
-    if (!currentMsg._textNode) {
-      currentMsg._textNode = document.createTextNode(raw);
-      currentMsg.replaceChildren(currentMsg._textNode);
-    } else {
-      currentMsg._textNode.nodeValue = raw;
-    }
+    updateLiveTail(currentMsg, raw);
   }
   revealCurrentAssistant();
 }
@@ -400,7 +580,7 @@ function flushReasoningText() {
 
 function flushStreaming() {
   flushHandle = 0;
-  const follow = chat.scrollHeight - chat.scrollTop - chat.clientHeight < 80;
+  const follow = autoFollowChat || isChatNearBottom();
   flushAssistantText();
   flushReasoningText();
   if (follow) scrollDown();
@@ -759,6 +939,8 @@ function handleMessage(data) {
       }
       closeToolDrawer();
       clearReactStatus();
+      clearBufferedChatUpdates();
+      setAutoFollowChat(true);
       chat.innerHTML = '';
       _deferredHistory = [];
       const msgs = data.messages || [];
@@ -766,6 +948,7 @@ function handleMessage(data) {
         showWelcome();
       } else {
         chat.classList.add('no-animate');
+        bulkRenderingChat = true;
         let startIdx = 0;
         if (msgs.length > HISTORY_RENDER_LIMIT) {
           startIdx = findHistoryRenderStart(msgs, msgs.length - HISTORY_RENDER_LIMIT);
@@ -779,7 +962,11 @@ function handleMessage(data) {
         for (let i = startIdx; i < msgs.length; i++) {
           renderHistoryMessage(msgs[i]);
         }
-        requestAnimationFrame(() => chat.classList.remove('no-animate'));
+        requestAnimationFrame(() => {
+          bulkRenderingChat = false;
+          chat.classList.remove('no-animate');
+          scrollDown(true);
+        });
       }
       break;
     }
@@ -928,7 +1115,8 @@ function handleMessage(data) {
 }
 
 // ── Message rendering ──
-function addMsg(cls, text, timestamp) {
+function addMsg(cls, text, timestamp, options = {}) {
+  const { trackUnread = cls === 'assistant' } = options;
   const isChat = (cls === 'user' || cls === 'assistant');
   const hasAvatar = cls === 'assistant';
   const row = document.createElement('div');
@@ -959,6 +1147,9 @@ function addMsg(cls, text, timestamp) {
   }
 
   chat.appendChild(row);
+  if (trackUnread) {
+    queueUnreadContent({ countable: true });
+  }
   pinReactStatusToBottom();
   if (isChat) hideWelcome();
   scrollDown();
@@ -983,6 +1174,7 @@ function addSystem(t, kind = 'info') {
   }
   row.appendChild(card);
   chat.appendChild(row);
+  queueUnreadContent({ countable: true });
   pinReactStatusToBottom();
   scrollDown();
 }
@@ -995,6 +1187,7 @@ function addError(t) {
   card.innerHTML = `<span class="system-icon">⚠️</span> <span style="color:var(--accent-error)">${escHtml(t)}</span>`;
   row.appendChild(card);
   chat.appendChild(row);
+  queueUnreadContent({ countable: true });
   pinReactStatusToBottom();
   scrollDown();
 }
@@ -1112,12 +1305,31 @@ function fallbackCopy(text) {
 }
 
 function escHtml(s) {
+  s = String(s ?? '');
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
 }
 function truncateStr(s, max) {
   return s.length > max ? s.slice(0, max) + '…' : s;
 }
-function scrollDown() { chat.scrollTop = chat.scrollHeight; }
+function scrollDown(force = false) {
+  if (bulkRenderingChat) {
+    return false;
+  }
+
+  const shouldFollow = force || autoFollowChat || isChatNearBottom();
+  if (!shouldFollow) {
+    markChatUpdateOffscreen();
+    return false;
+  }
+
+  suppressScrollTracking = true;
+  chat.scrollTop = chat.scrollHeight;
+  requestAnimationFrame(() => {
+    suppressScrollTracking = false;
+    setAutoFollowChat(true);
+  });
+  return true;
+}
 
 function setAssistantAvatar(node) {
   node.replaceChildren();
@@ -1302,11 +1514,14 @@ function loadEarlierMessages() {
   const existing = [...chat.children];
   chat.replaceChildren();
   chat.classList.add('no-animate');
+  bulkRenderingChat = true;
   for (const m of msgs) renderHistoryMessage(m, { followMarkdown: false });
   for (const el of existing) chat.appendChild(el);
   requestAnimationFrame(() => {
+    bulkRenderingChat = false;
     chat.classList.remove('no-animate');
     if (anchor) anchor.scrollIntoView({ block: 'start' });
+    requestAnimationFrame(syncChatScrollState);
   });
 }
 
@@ -1330,6 +1545,7 @@ function send() {
   }
 
   addMsg('user', text);
+  scrollDown(true);
 
   if (!busy) {
     setBusy(true);
@@ -1356,6 +1572,7 @@ function sendCmd(cmd) {
 
 updateViewToggleButtons();
 syncToolDrawerBounds();
+updateJumpToLatestVisibility();
 
 input.addEventListener('keydown', (e) => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
@@ -1370,10 +1587,18 @@ input.addEventListener('input', () => {
   input.style.height = Math.min(input.scrollHeight, 120) + 'px';
   syncToolDrawerBounds();
 });
+chat.addEventListener('scroll', () => {
+  syncChatScrollState();
+});
 window.addEventListener('resize', syncToolDrawerBounds);
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', syncToolDrawerBounds);
   window.visualViewport.addEventListener('scroll', syncToolDrawerBounds);
+}
+if (jumpToLatestBtn) {
+  jumpToLatestBtn.addEventListener('click', () => {
+    jumpToLatest();
+  });
 }
 sendBtn.addEventListener('click', () => {
   send();
