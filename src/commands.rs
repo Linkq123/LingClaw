@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     agent, build_system_prompt, default_show_react, default_show_reasoning, default_show_tools,
-    now_epoch, prompts, providers,
+    memory, now_epoch, prompts, providers,
     session_admin::gather_global_today_usage,
     session_store::{build_session_status, build_usage_report, save_session_to_disk},
     tools, truncate, ws_send, AppState, ChatMessage, Session, WsTx, MAIN_SESSION_ID,
@@ -1152,6 +1152,7 @@ Commands:
     /skills-session  List session-local skills
     /rename <name>   Rename current session
     /clear           Clear messages (keep system prompt)
+    /memory          Show structured memory status
     /help            Show this help"
         .to_string();
     if current_session_id == MAIN_SESSION_ID {
@@ -1178,6 +1179,25 @@ async fn handle_delete_command(
         "system",
         false,
     )
+}
+
+async fn handle_memory_command(current_session_id: &str, state: &AppState) -> CommandResult {
+    if !state.config.structured_memory {
+        return command_result(
+            "Structured memory is disabled. Enable with `\"structuredMemory\": true` in settings or `LINGCLAW_STRUCTURED_MEMORY=true`.",
+            "system",
+            false,
+        );
+    }
+    let workspace = {
+        let sessions = state.sessions.lock().await;
+        match sessions.get(current_session_id) {
+            Some(s) => s.workspace.clone(),
+            None => return command_result("Session not found", "error", false),
+        }
+    };
+    let status = memory::memory_status(&workspace);
+    command_result(status, "system", false)
 }
 
 pub(crate) async fn handle_command(
@@ -1262,6 +1282,7 @@ pub(crate) async fn handle_command(
         "/help" => Some(handle_help_command(current_session_id)),
         "/sessions" => Some(handle_sessions_command(current_session_id, state).await),
         "/delete" => Some(handle_delete_command(arg, current_session_id, state).await),
+        "/memory" => Some(handle_memory_command(current_session_id, state).await),
 
         // /stop when not busy — the in-flight case is handled by the agent loop drain
         "/stop" => Some(command_result("No active run to stop.", "system", false)),

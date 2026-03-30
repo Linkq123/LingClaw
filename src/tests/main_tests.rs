@@ -35,6 +35,7 @@ fn test_config() -> Config {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     }
 }
 
@@ -57,6 +58,7 @@ fn test_app_state() -> AppState {
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
         hooks: HookRegistry::new(),
+        memory_queue: None,
     }
 }
 
@@ -74,6 +76,7 @@ fn test_app_state_with_config(config: Config) -> AppState {
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
         hooks: HookRegistry::new(),
+        memory_queue: None,
     }
 }
 
@@ -198,6 +201,7 @@ fn resolve_model_uses_config_for_plain_model_id() {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     };
 
     let resolved = config.resolve_model("gpt-4o-mini");
@@ -410,6 +414,7 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     };
 
     assert!(crate::cli::is_default_model_row(
@@ -483,6 +488,7 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -548,6 +554,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -595,6 +602,7 @@ fn canonical_model_ref_expands_unique_plain_id() {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     };
 
     let canonical = config
@@ -659,6 +667,7 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     };
 
     let err = config
@@ -725,6 +734,7 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     };
 
     let available = config.available_models();
@@ -771,6 +781,7 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     };
 
     let err = config
@@ -817,6 +828,7 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     };
 
     let canonical = config
@@ -843,6 +855,7 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     };
 
     let canonical = config
@@ -869,6 +882,7 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     };
 
     let resolved = config.resolve_model("anthropic/claude-sonnet-4-20250514");
@@ -915,6 +929,7 @@ fn build_session_status_reports_resolved_target() {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     };
     let mut session = test_session("abc", "Test", Some("anthropic/claude-sonnet-4-20250514"));
     session.think_level = "medium".to_string();
@@ -3336,6 +3351,7 @@ fn context_input_budget_reserves_headroom() {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     };
 
     let budget = context_input_budget_for_model(&config, "anthropic/claude-sonnet-4-20250514");

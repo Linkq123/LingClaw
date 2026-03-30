@@ -740,6 +740,12 @@ async fn run_finish_phase(
         let _ = live_send(ctx.live_tx, event).await;
     }
 
+    // Enqueue structured memory update (async, non-blocking)
+    if let (Some(queue), Some(ref session)) = (&ctx.state.memory_queue, &snapshot) {
+        let model = session.effective_model(&ctx.state.config.model).to_string();
+        queue.enqueue(session.workspace.clone(), model, session.messages.clone());
+    }
+
     let finish_label = phase_state
         .react_ctx
         .finish_reason

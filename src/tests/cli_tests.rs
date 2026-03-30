@@ -22,6 +22,7 @@ fn test_config_with_broken_mcp() -> Config {
         model: "gpt-4o-mini".to_string(),
         provider: Provider::OpenAI,
         openai_stream_include_usage: false,
+        structured_memory: false,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
         mcp_servers,

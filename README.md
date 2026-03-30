@@ -6,9 +6,9 @@
 
 LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Loop** 三层架构设计。
 
-- **Skill** — LLM 推理层：系统提示、模型路由、上下文裁剪、思维模式
+- **Skill** — LLM 推理层：系统提示、模型路由、上下文裁剪、思维模式、结构化记忆注入
 - **CLI** — 工具执行层：安全的命令/文件/网络工具、沙盒路径、SSRF 防护、安装与更新
-- **Loop** — 连接层：WebSocket 主会话、流式输出、斜杠命令、持久化
+- **Loop** — 连接层：WebSocket 主会话、流式输出、斜杠命令、持久化、异步记忆更新
 
 整个后端约 11200 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
 
@@ -17,7 +17,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
 - **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断
 - **单主会话**：运行时固定使用 `main`，不再创建、切换或删除其他会话
-- **18 斜杠命令**：`/new`、`/session_new`、`/rename`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/status`、`/mcp`、`/usage`、`/clear`、`/help`
+- **19 斜杠命令**：`/new`、`/session_new`、`/rename`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/status`、`/mcp`、`/usage`、`/clear`、`/memory`、`/help`
 - **双 Provider 模型路由**：OpenAI + Anthropic，支持 `provider/model` 和纯 model ID
 - **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
 - **持久化主会话**：固定保存 `main` 工作区和磁盘存档
@@ -25,6 +25,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端，增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
+- **Structured Memory（可选）**：启用 `structuredMemory` 后，Finish 阶段会异步抽取稳定偏好、项目上下文和长期事实，写入 workspace 下的 `structured_memory.json`，并在后续轮次按预算注入 system prompt；`/memory` 可查看当前状态
 - **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环，`evaluate_finish()` 结构化完成判定，`auto_think_level()` 按循环深度动态调整推理预算
 - **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留；错误工具标记 `[FAILED]` 并附带耗时
 - **推理可见性控制**：默认开启 ReAct 阶段转换 WS 事件（`react_phase`），可通过 `/react on|off` 手动切换；浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
@@ -88,7 +89,8 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
     "toolTimeout": 30,
     "maxContextTokens": 32000,
     "maxOutputBytes": 51200,
-    "maxFileBytes": 204800
+    "maxFileBytes": 204800,
+    "structuredMemory": false
   },
   "models": {
     "providers": {
@@ -144,6 +146,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 
 - 推荐使用 `provider/model` 格式引用模型
 - 多个 provider 暴露同一 model ID 时，必须使用显式前缀
+- `structuredMemory` 默认为 `false`；启用后会在 Finish 阶段后台更新结构化记忆，并在后续 system prompt 中注入摘要
 - 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容
 - 可选的 `mcpServers` 顶层对象可声明 MCP server，例如 `command`、`args`、`env`、`cwd`、`timeoutSecs`
 - `mcpServers.*.cwd` 必须落在当前 session workspace 内；未设置 `timeoutSecs` 时默认继承 `toolTimeout`
@@ -156,6 +159,18 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 - Agent 忙碌时，输入框中发送普通文本不会打断当前 tool/推理步骤，而是作为下一轮 Analyze 的纠偏输入
 - Agent 忙碌时，发送按钮会变为停止按钮；点击后等价于发送 `/stop`
 - Agent 忙碌时，只允许 `/stop`、`/tool`、`/reasoning` 立即执行；其他斜杠命令需等待当前运行结束
+
+### Structured Memory
+
+`structuredMemory` 是一个默认关闭的可选功能，用于维护一份**机器可读**的长期记忆，与人工编辑的 `MEMORY.md` 和 `memory/YYYY-MM-DD.md` 并存。
+
+- 启用方式：在 `settings.structuredMemory` 中设为 `true`，或设置环境变量 `LINGCLAW_STRUCTURED_MEMORY=true`
+- 存储位置：`~/.lingclaw/main/workspace/structured_memory.json`
+- 更新时机：每轮回答完成后的 Finish 阶段，异步入队并做 3 秒 debounce，不阻塞主 agent loop
+- 提取来源：仅使用 user/assistant 对话内容，不纳入 tool 结果，也会过滤自动生成的 `## Context Summary (auto-generated)` 压缩摘要
+- 合并策略：模型返回缺失字段时保留旧值；显式 `null` 会清空 `user_context`；`facts` 返回时按完整列表替换
+- 超时策略：memory 更新请求沿用 `toolTimeout` 预算，并设 30 秒下限，避免配置过小导致后台更新恒定超时
+- 查看状态：聊天中输入 `/memory`
 
 ## Environment Variables
 
@@ -170,6 +185,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `LINGCLAW_EXEC_TIMEOUT` | `30` | Shell 命令超时（秒） |
 | `LINGCLAW_TOOL_TIMEOUT` | `30` | 非 shell 的 Act 阶段工具超时（秒） |
 | `LINGCLAW_MAX_CONTEXT_TOKENS` | `32000` | 默认上下文 token 预算 |
+| `LINGCLAW_STRUCTURED_MEMORY` | `false` | 启用后台结构化记忆提取与 prompt 注入 |
 
 ## Slash Commands
 
@@ -192,6 +208,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `/mcp [refresh]` | 查看当前已加载的 MCP server 状态；加上 `refresh` 时强制刷新工具缓存并重建运行时 MCP 会话 |
 | `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；单会话模式下同时显示主会话今日总 token 估算，按 K/M 显示 |
 | `/clear` | 清空消息但保留系统提示 |
+| `/memory` | 查看当前 structured memory 摘要；若功能未启用，会提示对应配置方式 |
 | `/help` | 命令帮助 |
 
 ## Tools
@@ -289,7 +306,7 @@ SKILL.md 的 YAML frontmatter 格式兼容 [Agent Skills 规范](https://agentsk
 │                    Connection Layer (Loop)                        │
 │   handle_socket() · handle_command() · session persistence       │
 │   active_connections · session_clients · live_rounds             │
-│   replay/rebind · cooperative shutdown                           │
+│   memory queue · replay/rebind · cooperative shutdown            │
 └───────┬──────────────────┬───────────────────┬───────────────────┘
         │                  │                   │
 ┌───────▼───────┐  ┌───────▼────────┐  ┌──────▼────────┐
@@ -315,7 +332,7 @@ SKILL.md 的 YAML frontmatter 格式兼容 [Agent Skills 规范](https://agentsk
 
 | 层 | 职责 | 代码位置 |
 |---|---|---|
-| **Skill** | LLM 推理、系统提示构建、上下文裁剪、token 估算、思维模式 | `src/main.rs`（`build_system_prompt`, `prune_messages`, `estimate_tokens`）、`src/providers.rs`（流式调用）、`src/prompts.rs`（模板加载） |
+| **Skill** | LLM 推理、系统提示构建、上下文裁剪、token 估算、思维模式、结构化记忆注入 | `src/main.rs`（`build_system_prompt`, `prune_messages`, `estimate_tokens`）、`src/providers.rs`（流式调用）、`src/prompts.rs`（模板加载）、`src/memory.rs`（结构化记忆） |
 | **CLI** | 工具注册/分发/执行、路径沙盒、危险命令检测、SSRF 防护 | `src/tools/mod.rs`（注册表）、`src/tools/fs.rs`（文件工具）、`src/tools/net.rs`（网络工具）、`src/tools/exec.rs`（执行工具） |
 | **Loop** | WebSocket 处理、会话生命周期、斜杠命令、持久化、HTTP API | `src/main.rs`（`handle_socket`, `handle_command`, session 管理） |
 
@@ -391,6 +408,8 @@ handle_socket()
   │    │
   │    └─ AgentPhase::Finish
   │         ├─ 增量保存 session
+  │         ├─ 运行 OnFinish hooks
+  │         ├─ enqueue structured memory update（启用时）
   │         ├─ WS done 事件
   │         └─ break
   │    │
@@ -414,6 +433,7 @@ src/
 ├── providers.rs       (~860 行)  — OpenAI/Anthropic 流式调用, 推理模式, prompt caching
 ├── prompts.rs         (~660 行)  — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
 ├── hooks.rs           (~340 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
+├── memory.rs          (~460 行)  — structured_memory.json 读写, MemoryUpdateQueue, prompt 注入, /memory 状态
 ├── session_admin.rs   (~240 行)  — 全局用量统计 (仅主会话)
 ├── session_store.rs   (~340 行)  — 会话持久化, 迁移, 磁盘 I/O
 ├── socket_sync.rs     (~140 行)  — WebSocket 会话声明, 断线监听, 重绑定
@@ -444,8 +464,8 @@ enum Provider { OpenAI, Anthropic }
 struct Config {
     api_key, api_base, model, provider,
     providers: HashMap<String, JsonProviderConfig>,
-    port, max_context_tokens, exec_timeout,
-    max_output_bytes, max_file_bytes,
+  port, max_context_tokens, exec_timeout, tool_timeout,
+  max_output_bytes, max_file_bytes, structured_memory,
 }
 
 struct Session {
@@ -474,6 +494,12 @@ struct ResolvedModel {
     reasoning: bool,
     thinking_format: Option<String>,  // "qwen"|"openai"|"anthropic"
     max_tokens: Option<u64>,
+}
+
+struct StructuredMemory {
+  user_context: Option<String>,
+  facts: Vec<MemoryFact>,
+  updated_at: u64,
 }
 
 // Agent 状态机 (src/agent.rs)
@@ -562,6 +588,7 @@ think_level 映射：
 │   ├── USER.md             — 用户特定行为
 │   ├── TOOLS.md            — 工具使用指南
 │   ├── MEMORY.md           — 持久记忆指南
+│   ├── structured_memory.json  — 机器可读结构化记忆（启用时生成）
 │   ├── skills/             — session 专属 Skills
 │   └── memory/
 │       └── 2026-03-17.md   — 每日记忆
@@ -578,6 +605,7 @@ think_level 映射：
 - 当 `IDENTITY.md` 和 `USER.md` 中的关键字段已被有效填写后，后端会自动删除 `BOOTSTRAP.md` 并切换到 Normal 模式
 - `/new` 只压缩对话 + 写入记忆 + 清空上下文，不重建 session
 - 重连不重建 `BOOTSTRAP.md`
+- 启用 `structuredMemory` 时，system prompt 会额外注入 `structured_memory.json` 的摘要，但不会替代人工维护的 `MEMORY.md`
 - 每轮 agent loop 后增量保存 session（原子写入：write .tmp → rename）
 - 会话切换前先保存到磁盘，失败时保留内存副本供重连恢复
 - 加载时自动修剪不完整的工具调用事务（`trim_incomplete_tool_calls`）
@@ -638,6 +666,7 @@ think_level 映射：
 | `MEMORY.md` | 持久记忆指导 |
 
 每个工作区还有 `memory/` 子目录，存放 `memory/YYYY-MM-DD.md` 每日日志。
+启用 `structuredMemory` 后，还会在同目录生成 `structured_memory.json`，供后台异步记忆抽取和后续 prompt 注入使用。
 
 ## License
 

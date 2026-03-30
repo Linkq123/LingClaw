@@ -18,6 +18,7 @@ fn test_config() -> Config {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
+        structured_memory: false,
     }
 }
 
@@ -35,6 +36,7 @@ fn test_app_state() -> AppState {
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
         hooks: HookRegistry::new(),
+        memory_queue: None,
     }
 }
 

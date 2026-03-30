@@ -31,6 +31,7 @@ mod commands;
 mod config;
 mod context;
 mod hooks;
+mod memory;
 mod prompts;
 mod providers;
 mod runtime_loop;
@@ -47,6 +48,7 @@ pub(crate) use context::{
     message_token_len_for_provider, update_session_token_usage,
 };
 pub(crate) use hooks::{run_hooks, AutoCompressContextHook, HookRegistry};
+pub(crate) use memory::MemoryUpdateQueue;
 
 use commands::handle_command;
 use runtime_loop::{
@@ -274,6 +276,8 @@ struct AppState {
     shutdown: CancellationToken,
     shutdown_token: String,
     hooks: HookRegistry,
+    /// Background structured memory updater (active when config.structured_memory is true).
+    memory_queue: Option<MemoryUpdateQueue>,
 }
 
 #[derive(Clone)]
@@ -367,6 +371,15 @@ Only read those files if the user explicitly asks to inspect them, if you need t
         .map(|s| format!("\n\n{s}"))
         .unwrap_or_default();
 
+    // Structured memory injection (coexists with MEMORY.md and daily memory)
+    let structured_memory_section = if config.structured_memory {
+        memory::format_memory_for_injection(&memory::load_structured_memory(workspace))
+            .map(|s| format!("\n\n{s}"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
     let prompt = format!(
         r#"{persona}
 
@@ -381,7 +394,7 @@ Only read those files if the user explicitly asks to inspect them, if you need t
 {prompt_file_note}
 
 ## Available Tools
-{tool_lines}{mcp_note}{skills_section}"#,
+{tool_lines}{mcp_note}{skills_section}{structured_memory_section}"#,
         model = model,
         local_time = local_time,
         tool_lines = tool_lines,
@@ -389,6 +402,7 @@ Only read those files if the user explicitly asks to inspect them, if you need t
         prompt_file_note = prompt_file_note,
         mcp_note = mcp_note,
         skills_section = skills_section,
+        structured_memory_section = structured_memory_section,
     );
 
     ChatMessage {
@@ -1257,6 +1271,12 @@ async fn main() {
     let mut hooks = HookRegistry::new();
     hooks.register(Box::new(AutoCompressContextHook::new()));
 
+    let memory_queue = if config.structured_memory {
+        Some(MemoryUpdateQueue::spawn(config.clone()))
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         config,
         http: Client::new(),
@@ -1270,6 +1290,7 @@ async fn main() {
         shutdown: shutdown.clone(),
         shutdown_token,
         hooks,
+        memory_queue,
     });
 
     // Ensure main session exists (load from disk or create fresh)

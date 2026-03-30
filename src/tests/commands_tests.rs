@@ -116,6 +116,7 @@ async fn status_command_reports_runtime_request_estimate() {
             max_output_bytes: 50 * 1024,
             max_file_bytes: 200 * 1024,
             openai_stream_include_usage: false,
+            structured_memory: false,
         },
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
@@ -128,6 +129,7 @@ async fn status_command_reports_runtime_request_estimate() {
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        memory_queue: None,
     };
 
     let mut session = Session {
@@ -231,6 +233,7 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
             max_output_bytes: 50 * 1024,
             max_file_bytes: 200 * 1024,
             openai_stream_include_usage: false,
+            structured_memory: false,
         },
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
@@ -243,6 +246,7 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        memory_queue: None,
     };
 
     let mut session = Session {
@@ -323,6 +327,7 @@ async fn session_new_command_resets_main_session_in_single_session_mode() {
             max_output_bytes: 50 * 1024,
             max_file_bytes: 200 * 1024,
             openai_stream_include_usage: false,
+            structured_memory: false,
         },
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
@@ -335,6 +340,7 @@ async fn session_new_command_resets_main_session_in_single_session_mode() {
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        memory_queue: None,
     };
 
     let mut session = Session {
@@ -424,6 +430,7 @@ async fn switch_command_is_blocked_in_single_session_mode() {
             max_output_bytes: 50 * 1024,
             max_file_bytes: 200 * 1024,
             openai_stream_include_usage: false,
+            structured_memory: false,
         },
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
@@ -436,6 +443,7 @@ async fn switch_command_is_blocked_in_single_session_mode() {
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
         hooks: crate::HookRegistry::new(),
+        memory_queue: None,
     };
 
     let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);

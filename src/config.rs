@@ -78,6 +78,8 @@ pub(crate) struct Config {
     pub(crate) tool_timeout: Duration,
     pub(crate) max_output_bytes: usize,
     pub(crate) max_file_bytes: usize,
+    /// Enable structured async memory (auto-extracts facts from conversations).
+    pub(crate) structured_memory: bool,
 }
 
 impl Config {
@@ -189,6 +191,18 @@ impl Config {
             ),
             max_output_bytes: settings.max_output_bytes.unwrap_or(50 * 1024),
             max_file_bytes: settings.max_file_bytes.unwrap_or(200 * 1024),
+            structured_memory: settings
+                .structured_memory
+                .or_else(|| {
+                    std::env::var("LINGCLAW_STRUCTURED_MEMORY")
+                        .ok()
+                        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+                            "1" | "true" | "yes" | "on" => Some(true),
+                            "0" | "false" | "no" | "off" => Some(false),
+                            _ => None,
+                        })
+                })
+                .unwrap_or(false),
         }
     }
 
@@ -489,6 +503,9 @@ pub(crate) struct JsonSettings {
     pub(crate) max_output_bytes: Option<usize>,
     #[serde(rename = "maxFileBytes")]
     pub(crate) max_file_bytes: Option<usize>,
+    /// Enable structured async memory (default: false).
+    #[serde(rename = "structuredMemory")]
+    pub(crate) structured_memory: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
