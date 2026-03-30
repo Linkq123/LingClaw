@@ -84,6 +84,9 @@ pub(crate) async fn tool_http_fetch(
         return msg;
     }
     let max_bytes = args["max_bytes"].as_u64().unwrap_or(102_400) as usize;
+    if max_bytes == 0 {
+        return "http_fetch error: max_bytes must be >= 1".into();
+    }
 
     // Build a one-off client with redirects disabled to prevent redirect-based SSRF.
     let no_redirect = match Client::builder()

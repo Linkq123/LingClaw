@@ -12,6 +12,8 @@ use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+#[cfg(test)]
+use std::sync::OnceLock;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -140,6 +142,12 @@ fn now_epoch() -> u64 {
 }
 
 const SESSION_VERSION: u32 = 4;
+
+#[cfg(test)]
+pub(crate) fn saved_session_test_guard() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {
@@ -419,17 +427,26 @@ Only read those files if the user explicitly asks to inspect them, if you need t
 const DANGEROUS_PATTERNS: &[&str] = &[
     "rm -rf /",
     "rm -rf /*",
+    "rm -rf ~",
     "mkfs.",
     "dd if=/dev",
     ":(){ :|:&",
     "> /dev/sda",
+    "chmod -r 777 /",
+    "chown -r root",
     "format c:",
     "del /f /s /q c:\\",
     "rd /s /q c:\\",
+    "reg delete hk",
 ];
 
+/// Collapse repeated whitespace to a single space for robust pattern matching.
+fn normalize_command_whitespace(cmd: &str) -> String {
+    cmd.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn check_dangerous_command(cmd: &str) -> Option<&'static str> {
-    let lower = cmd.to_lowercase();
+    let lower = normalize_command_whitespace(cmd).to_lowercase();
     DANGEROUS_PATTERNS
         .iter()
         .find(|&&pattern| lower.contains(pattern))

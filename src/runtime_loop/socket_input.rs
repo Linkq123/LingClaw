@@ -161,13 +161,22 @@ pub(super) async fn persist_pending_interventions(
     }
 }
 
+/// Maximum messages to drain in a single tick to prevent starvation.
+const MAX_DRAIN_PER_TICK: usize = 64;
+
 pub(super) async fn drain_busy_socket_messages(
     inbound_rx: &mut mpsc::Receiver<String>,
     pending_interventions: &mut Vec<String>,
     live_tx: &LiveTx,
     run_cancel: &CancellationToken,
 ) -> bool {
-    while let Ok(msg) = inbound_rx.try_recv() {
+    let mut drained = 0;
+    while drained < MAX_DRAIN_PER_TICK {
+        let msg = match inbound_rx.try_recv() {
+            Ok(msg) => msg,
+            Err(_) => break,
+        };
+        drained += 1;
         let trimmed = msg.trim();
         if trimmed.eq_ignore_ascii_case("/stop") {
             run_cancel.cancel();

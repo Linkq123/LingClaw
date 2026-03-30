@@ -15,7 +15,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 ## Features
 
 - **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
-- **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断
+- **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断；server 启动连续失败会进入短暂冷却，避免请求风暴
 - **单主会话**：运行时固定使用 `main`，不再创建、切换或删除其他会话
 - **19 斜杠命令**：`/new`、`/session_new`、`/rename`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/status`、`/mcp`、`/usage`、`/clear`、`/memory`、`/help`
 - **双 Provider 模型路由**：OpenAI + Anthropic，支持 `provider/model` 和纯 model ID
@@ -25,11 +25,11 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端，增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
-- **Structured Memory（可选）**：启用 `structuredMemory` 后，Finish 阶段会异步抽取稳定偏好、项目上下文和长期事实，写入 workspace 下的 `structured_memory.json`，并在后续轮次按预算注入 system prompt；`/memory` 可查看当前状态
+- **Structured Memory（可选）**：启用 `structuredMemory` 后，Finish 阶段会异步抽取稳定偏好、项目上下文和长期事实，写入 workspace 下的 `structured_memory.json`，并记录 `structured_memory.audit.jsonl` 诊断轨迹；`/memory`、`/memory stats`、`/memory debug` 可查看状态与最近审计信息
 - **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环，`evaluate_finish()` 结构化完成判定，`auto_think_level()` 按循环深度动态调整推理预算
 - **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留；错误工具标记 `[FAILED]` 并附带耗时
 - **推理可见性控制**：默认开启 ReAct 阶段转换 WS 事件（`react_phase`），可通过 `/react on|off` 手动切换；浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
-- **结构化工具结果**：`ToolOutcome`（output + is_error + duration_ms），前缀式错误检测，必填参数预校验，`tool_result` WS 事件携带耗时和错误标记
+- **结构化工具结果**：`ToolOutcome`（output + is_error + duration_ms），前缀式错误检测，schema 约束校验（required/type/range/length），`tool_result` WS 事件携带耗时和错误标记
 - **原子持久化**：会话存档先写 `.tmp` 再 rename（Windows 兼容），加载时自动修剪不完整工具调用
 - **会话版本控制**：`SESSION_VERSION = 4`，旧存档自动迁移并补齐 `show_tools` / `show_reasoning` / `show_react` 等字段默认值
 - **上下文裁剪追踪**：Analyze 阶段裁剪后发送 `context_pruned` WS 事件，包含移除消息数
@@ -152,7 +152,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 - `mcpServers.*.cwd` 必须落在当前 session workspace 内；未设置 `timeoutSecs` 时默认继承 `toolTimeout`
 - `start` / `restart` 的 MCP 预检使用受限的一次性探测，不会把预检进程保留为运行时 MCP 会话；`mcp-check` 会按配置的运行时超时做更深诊断
 - `/mcp` 会在聊天页面列出当前已加载的 MCP servers；如果某个 server 失败，页面会显示失败原因，便于排查启动、命令解析或超时问题
-- `/mcp refresh` 会清空当前 workspace 对应的 MCP 工具缓存并丢弃空闲会话，然后重新探测已启用 servers；运行时空闲 MCP 会话也会自动回收，`notifications/tools/list_changed` 会触发下一次工具发现时自动刷新
+- `/mcp refresh` 会清空当前 workspace 对应的 MCP 工具缓存、空闲会话和最近失败冷却状态，然后重新探测已启用 servers；运行时空闲 MCP 会话也会自动回收，`notifications/tools/list_changed` 会触发下一次工具发现时自动刷新
 
 聊天页运行时交互说明：
 
@@ -166,11 +166,12 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 
 - 启用方式：在 `settings.structuredMemory` 中设为 `true`，或设置环境变量 `LINGCLAW_STRUCTURED_MEMORY=true`
 - 存储位置：`~/.lingclaw/main/workspace/structured_memory.json`
+- 审计文件：`~/.lingclaw/main/workspace/structured_memory.audit.jsonl`
 - 更新时机：每轮回答完成后的 Finish 阶段，异步入队并做 3 秒 debounce，不阻塞主 agent loop
-- 提取来源：仅使用 user/assistant 对话内容，不纳入 tool 结果，也会过滤自动生成的 `## Context Summary (auto-generated)` 压缩摘要
+- 提取来源：使用 user/assistant 对话内容，并附带 tool 调用名与 tool 结果首行摘要；会过滤自动生成的 `## Context Summary (auto-generated)` 压缩摘要
 - 合并策略：模型返回缺失字段时保留旧值；显式 `null` 会清空 `user_context`；`facts` 返回时按完整列表替换
 - 超时策略：memory 更新请求沿用 `toolTimeout` 预算，并设 30 秒下限，避免配置过小导致后台更新恒定超时
-- 查看状态：聊天中输入 `/memory`
+- 查看状态：`/memory` 显示当前摘要和 updater 运行状态，`/memory stats` 显示 updater 计数器，`/memory debug` 额外显示最近审计记录
 
 ## Environment Variables
 
@@ -208,7 +209,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `/mcp [refresh]` | 查看当前已加载的 MCP server 状态；加上 `refresh` 时强制刷新工具缓存并重建运行时 MCP 会话 |
 | `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；单会话模式下同时显示主会话今日总 token 估算，按 K/M 显示 |
 | `/clear` | 清空消息但保留系统提示 |
-| `/memory` | 查看当前 structured memory 摘要；若功能未启用，会提示对应配置方式 |
+| `/memory [stats\|debug]` | 查看当前 structured memory 摘要与 updater 状态；`stats` 仅显示运行状态，`debug` 额外显示最近审计记录 |
 | `/help` | 命令帮助 |
 
 ## Tools

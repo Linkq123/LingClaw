@@ -2252,6 +2252,7 @@ fn handle_command_persists_new_on_empty_context() {
 
 #[test]
 fn handle_command_session_new_resets_main_session_without_creating_a_new_one() {
+    let _guard = crate::saved_session_test_guard().blocking_lock();
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let session_id = MAIN_SESSION_ID.to_string();
     let workspace = session_workspace_path(&session_id);
@@ -2300,6 +2301,7 @@ fn handle_command_session_new_resets_main_session_without_creating_a_new_one() {
 
 #[test]
 fn handle_command_session_new_keeps_main_session_artifacts() {
+    let _guard = crate::saved_session_test_guard().blocking_lock();
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let session_id = MAIN_SESSION_ID.to_string();
     let workspace = session_workspace_path(&session_id);
@@ -3086,6 +3088,25 @@ fn dangerous_command_allows_safe_commands() {
     assert!(check_dangerous_command("rm temp.txt").is_none());
 }
 
+#[test]
+fn dangerous_command_normalizes_whitespace() {
+    // Extra whitespace between tokens should still match.
+    assert!(check_dangerous_command("rm  -rf  /").is_some());
+    assert!(check_dangerous_command("rm   -rf   /*").is_some());
+    assert!(check_dangerous_command("rm\t-rf\t/").is_some());
+    assert!(check_dangerous_command("del  /f  /s  /q  c:\\").is_some());
+}
+
+#[test]
+fn dangerous_command_detects_new_patterns() {
+    assert!(check_dangerous_command("rm -rf ~").is_some());
+    assert!(check_dangerous_command("chmod -R 777 /").is_some());
+    assert!(check_dangerous_command("chown -R root:root /").is_some());
+    assert!(check_dangerous_command("reg delete HKLM\\Software").is_some());
+    // Workspace-scoped chown to a non-root user should be allowed.
+    assert!(check_dangerous_command("chown -R user:group ./dir").is_none());
+}
+
 // ───── Phase 5: truncate ─────
 
 #[test]
@@ -3698,6 +3719,63 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
     let before_len = messages.len();
     trim_incomplete_tool_calls(&mut messages);
     assert_eq!(messages.len(), before_len);
+}
+
+#[test]
+fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
+    let mut messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("sys".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("do something".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![
+                ToolCall {
+                    id: "tc1".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "exec".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+                ToolCall {
+                    id: "tc2".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    },
+                },
+            ]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        // Only 1 of 2 tool results present → incomplete
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("result1".into()),
+            tool_calls: None,
+            tool_call_id: Some("tc1".into()),
+            timestamp: None,
+        },
+    ];
+    trim_incomplete_tool_calls(&mut messages);
+    // Should have removed the assistant + partial tool result, keeping system + user.
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].role, "system");
+    assert_eq!(messages[1].role, "user");
 }
 
 // ───── Phase 5: tool_think ─────

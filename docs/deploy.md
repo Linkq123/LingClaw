@@ -148,7 +148,8 @@ lingclaw --version  # 显示版本号
 
 - `start` / `restart` 会先执行受限的一次性 MCP preflight；失败只会给出警告，不会阻止服务启动
 - `mcp-check` 会按运行时超时配置做更深的 MCP 诊断，适合排查 `command`、`cwd`、协议握手或工具发现问题
-- 浏览器聊天页可用 `/mcp` 查看当前已加载的 MCP server 状态，`/mcp refresh` 会清空缓存并重新探测 tools；服务端发出的 `notifications/tools/list_changed` 也会让下一次工具发现自动刷新
+- 浏览器聊天页可用 `/mcp` 查看当前已加载的 MCP server 状态，`/mcp refresh` 会清空缓存、空闲会话和最近失败冷却状态并重新探测 tools；服务端发出的 `notifications/tools/list_changed` 也会让下一次工具发现自动刷新
+- MCP server 连续启动失败后会进入短暂冷却，避免每次请求都反复拉起失败进程；手动执行 `/mcp refresh` 可立即清除该冷却并重试
 - 运行时的 MCP 空闲会话会自动回收，因此 `mcp-check` 的一次性诊断进程和聊天页的长生命周期工具会话不会相互复用
 - `stop` 会优先走本地认证的优雅关停端点 `/api/shutdown`，超时后才回退到强制结束进程
 

@@ -23,7 +23,7 @@ If the new capability is coming from an external stdio MCP server rather than a 
 
 - [ ] Tool function name is snake_case
 - [ ] JSON schema has clear `description` for each parameter
-- [ ] Implementation validates all required parameters (return error string, don't panic)
+- [ ] Implementation validates schema constraints for parameters (required/type/range/length) and returns error strings instead of panicking
 - [ ] Output is truncated via `truncate()` if it could be large
 - [ ] User-supplied filesystem paths go through `resolve_path_checked()`; only internal sandboxed normalization should use `resolve_path()`
 - [ ] If the work touches MCP-backed tools, any configured server `cwd` also goes through `resolve_path_checked()` and stays inside the session workspace

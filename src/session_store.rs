@@ -41,9 +41,12 @@ pub(crate) async fn save_session_to_disk(session: &Session) -> Result<(), String
             .map_err(|e| e.to_string())?;
     }
 
-    tokio::fs::rename(&tmp_path, &path)
-        .await
-        .map_err(|e| e.to_string())
+    if let Err(e) = tokio::fs::rename(&tmp_path, &path).await {
+        // Best-effort cleanup of the orphaned temp file.
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(e.to_string());
+    }
+    Ok(())
 }
 
 pub(crate) fn sanitize_session_messages(messages: &mut Vec<ChatMessage>) {
@@ -68,6 +71,10 @@ pub(crate) fn trim_incomplete_tool_calls(messages: &mut Vec<ChatMessage>) {
         .filter(|m| m.role == "tool")
         .count();
     if actual < expected {
+        let removed = messages.len() - idx;
+        eprintln!(
+            "trim_incomplete_tool_calls: removed {removed} trailing messages (expected {expected} tool results, found {actual})"
+        );
         messages.truncate(idx);
     }
 

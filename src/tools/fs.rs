@@ -43,6 +43,15 @@ pub(crate) async fn tool_read_file(
         Ok(content) => {
             let start = args["start_line"].as_u64().map(|n| n as usize);
             let end = args["end_line"].as_u64().map(|n| n as usize);
+            if matches!(start, Some(0)) || matches!(end, Some(0)) {
+                return "read_file error: start_line and end_line must be >= 1".into();
+            }
+            if let (Some(start), Some(end)) = (start, end) {
+                if end < start {
+                    return "read_file error: end_line must be greater than or equal to start_line"
+                        .into();
+                }
+            }
             let lines: Vec<&str> = content.lines().collect();
             let total = lines.len();
 
@@ -290,6 +299,9 @@ pub(crate) async fn tool_search_files(
     };
     let file_glob = args["file_glob"].as_str();
     let max_results = args["max_results"].as_u64().unwrap_or(50) as usize;
+    if max_results == 0 {
+        return "search_files error: max_results must be >= 1".into();
+    }
 
     let files = collect_file_paths(&dir, file_glob, 5, 10_000).await;
     let mut results = Vec::new();

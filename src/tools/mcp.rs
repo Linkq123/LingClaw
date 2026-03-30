@@ -24,8 +24,10 @@ const MCP_DIAGNOSTIC_LINE_LIMIT: usize = 6;
 const MCP_DIAGNOSTIC_CHAR_LIMIT: usize = 400;
 const MCP_TOOL_CACHE_TTL_SECS: u64 = 30;
 const MCP_SESSION_IDLE_TTL_SECS: u64 = 300;
+const MCP_SPAWN_FAILURE_COOLDOWN_SECS: u64 = 15;
 static MCP_TOOL_CACHE: OnceLock<Mutex<HashMap<String, CachedToolDescriptors>>> = OnceLock::new();
 static MCP_SESSION_CACHE: OnceLock<Mutex<HashMap<String, CachedMcpSession>>> = OnceLock::new();
+static MCP_SPAWN_FAILURES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 struct McpToolDescriptor {
@@ -676,6 +678,34 @@ fn session_idle_ttl() -> Duration {
     Duration::from_secs(MCP_SESSION_IDLE_TTL_SECS)
 }
 
+fn spawn_failures() -> &'static Mutex<HashMap<String, Instant>> {
+    MCP_SPAWN_FAILURES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_spawn_failure(server_name: &str) {
+    if let Ok(mut map) = spawn_failures().lock() {
+        map.insert(server_name.to_string(), Instant::now());
+    }
+}
+
+fn check_spawn_cooldown(server_name: &str) -> Option<u64> {
+    let map = spawn_failures().lock().ok()?;
+    let last_failure = map.get(server_name)?;
+    let elapsed = last_failure.elapsed();
+    let cooldown = Duration::from_secs(MCP_SPAWN_FAILURE_COOLDOWN_SECS);
+    if elapsed < cooldown {
+        Some(cooldown.as_secs() - elapsed.as_secs())
+    } else {
+        None
+    }
+}
+
+fn clear_spawn_failure(server_name: &str) {
+    if let Ok(mut map) = spawn_failures().lock() {
+        map.remove(server_name);
+    }
+}
+
 fn resolve_server_command(command: &str) -> PathBuf {
     resolve_server_command_from_env(
         command,
@@ -830,6 +860,7 @@ async fn refresh_server_caches(config: &Config, workspace: &Path) -> Result<(), 
         .filter(|(_, server)| server.enabled)
     {
         cache_keys.push(cache_key(server_name, server, workspace, config)?);
+        clear_spawn_failure(server_name);
     }
 
     {
@@ -1059,6 +1090,13 @@ async fn spawn_server_session(
     config: &Config,
     workspace: &Path,
 ) -> Result<McpServerSession, String> {
+    // Backoff: reject spawn if server recently failed.
+    if let Some(remaining_secs) = check_spawn_cooldown(server_name) {
+        return Err(format!(
+            "MCP server '{server_name}' is in cooldown after recent failure ({remaining_secs}s remaining)"
+        ));
+    }
+
     let server = config
         .mcp_servers
         .get(server_name)
@@ -1112,8 +1150,10 @@ async fn spawn_server_session(
     if let Err(error) = session.initialize().await {
         let decorated = session.decorate_error(error);
         session.shutdown().await;
+        record_spawn_failure(server_name);
         return Err(decorated);
     }
+    clear_spawn_failure(server_name);
     Ok(session)
 }
 

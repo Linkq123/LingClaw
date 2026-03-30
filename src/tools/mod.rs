@@ -4,7 +4,7 @@ pub(crate) mod mcp;
 pub(crate) mod net;
 
 use reqwest::Client;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::Path;
 use std::time::Instant;
 use std::{future::Future, pin::Pin};
@@ -36,6 +36,8 @@ fn tool_parameters_think() -> serde_json::Value {
         "properties": {
             "thought": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": 20000,
                 "description": "Your step-by-step reasoning and plan"
             }
         },
@@ -49,10 +51,13 @@ fn tool_parameters_exec() -> serde_json::Value {
         "properties": {
             "command": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": 20000,
                 "description": "Shell command to execute"
             },
             "working_dir": {
                 "type": "string",
+                "maxLength": 4096,
                 "description": "Working directory (default: workspace root)"
             }
         },
@@ -66,14 +71,20 @@ fn tool_parameters_read_file() -> serde_json::Value {
         "properties": {
             "path": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
                 "description": "File path to read inside the session workspace"
             },
             "start_line": {
                 "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000,
                 "description": "Starting line number (1-based, optional)"
             },
             "end_line": {
                 "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000,
                 "description": "Ending line number (inclusive, optional)"
             }
         },
@@ -87,10 +98,13 @@ fn tool_parameters_write_file() -> serde_json::Value {
         "properties": {
             "path": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
                 "description": "File path to write inside the session workspace"
             },
             "content": {
                 "type": "string",
+                "maxLength": 1000000,
                 "description": "Content to write to the file"
             }
         },
@@ -104,14 +118,19 @@ fn tool_parameters_patch_file() -> serde_json::Value {
         "properties": {
             "path": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
                 "description": "File path to patch inside the session workspace"
             },
             "old_string": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": 1000000,
                 "description": "Exact string to find (must exist in the file)"
             },
             "new_string": {
                 "type": "string",
+                "maxLength": 1000000,
                 "description": "Replacement string"
             }
         },
@@ -125,6 +144,7 @@ fn tool_parameters_list_dir() -> serde_json::Value {
         "properties": {
             "path": {
                 "type": "string",
+                "maxLength": 4096,
                 "description": "Directory path inside the session workspace (default: workspace root)"
             }
         },
@@ -138,18 +158,24 @@ fn tool_parameters_search_files() -> serde_json::Value {
         "properties": {
             "pattern": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": 2000,
                 "description": "Regex pattern to search for"
             },
             "path": {
                 "type": "string",
+                "maxLength": 4096,
                 "description": "Directory to search in inside the session workspace (default: workspace root)"
             },
             "file_glob": {
                 "type": "string",
+                "maxLength": 256,
                 "description": "File name filter, e.g. '*.rs' (default: all files)"
             },
             "max_results": {
                 "type": "integer",
+                "minimum": 1,
+                "maximum": 200,
                 "description": "Maximum number of results (default: 50)"
             }
         },
@@ -163,10 +189,14 @@ fn tool_parameters_http_fetch() -> serde_json::Value {
         "properties": {
             "url": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
                 "description": "URL to fetch"
             },
             "max_bytes": {
                 "type": "integer",
+                "minimum": 1,
+                "maximum": 1000000,
                 "description": "Maximum response size in bytes (default: 102400)"
             }
         },
@@ -180,6 +210,8 @@ fn tool_parameters_delete_file() -> serde_json::Value {
         "properties": {
             "path": {
                 "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
                 "description": "File path to delete inside the session workspace"
             }
         },
@@ -449,7 +481,7 @@ pub(crate) async fn execute_tool(
     };
 
     // Pre-validate required parameters against JSON schema
-    if let Some(err) = validate_required_params(name, &args, &(spec.parameters)()) {
+    if let Some(err) = validate_tool_args(name, &args, &(spec.parameters)()) {
         return ToolOutcome {
             output: err,
             is_error: true,
@@ -479,11 +511,7 @@ pub(crate) fn is_tool_error_output(tool_name: &str, output: &str) -> bool {
 
 /// Validate required parameters against the tool's JSON schema.
 /// Returns `Some(error_message)` when a required param is missing.
-fn validate_required_params(
-    tool_name: &str,
-    args: &serde_json::Value,
-    schema: &serde_json::Value,
-) -> Option<String> {
+fn validate_required_params(tool_name: &str, args: &Value, schema: &Value) -> Option<String> {
     let required = schema.get("required")?.as_array()?;
     let obj = args.as_object();
     for req in required {
@@ -497,3 +525,177 @@ fn validate_required_params(
     }
     None
 }
+
+fn validate_tool_args(tool_name: &str, args: &Value, schema: &Value) -> Option<String> {
+    let Some(obj) = args.as_object() else {
+        return Some(format!(
+            "{tool_name} error: arguments must be a JSON object"
+        ));
+    };
+
+    if let Some(error) = validate_required_params(tool_name, args, schema) {
+        return Some(error);
+    }
+
+    let properties = schema.get("properties").and_then(Value::as_object)?;
+
+    for (key, property_schema) in properties {
+        let Some(value) = obj.get(key) else {
+            continue;
+        };
+
+        if value.is_null() {
+            return Some(format!(
+                "{tool_name} error: parameter '{key}' cannot be null"
+            ));
+        }
+
+        if let Some(error) = validate_property(tool_name, key, value, property_schema) {
+            return Some(error);
+        }
+    }
+
+    None
+}
+
+fn validate_property(
+    tool_name: &str,
+    key: &str,
+    value: &Value,
+    property_schema: &Value,
+) -> Option<String> {
+    match property_schema.get("type").and_then(Value::as_str) {
+        Some("string") => validate_string_property(tool_name, key, value, property_schema),
+        Some("integer") => validate_integer_property(tool_name, key, value, property_schema),
+        Some("boolean") => {
+            if value.is_boolean() {
+                None
+            } else {
+                Some(format!(
+                    "{tool_name} error: parameter '{key}' must be a boolean, got {}",
+                    json_type_name(value)
+                ))
+            }
+        }
+        Some("object") => {
+            if value.is_object() {
+                None
+            } else {
+                Some(format!(
+                    "{tool_name} error: parameter '{key}' must be an object, got {}",
+                    json_type_name(value)
+                ))
+            }
+        }
+        Some("array") => {
+            if value.is_array() {
+                None
+            } else {
+                Some(format!(
+                    "{tool_name} error: parameter '{key}' must be an array, got {}",
+                    json_type_name(value)
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn validate_string_property(
+    tool_name: &str,
+    key: &str,
+    value: &Value,
+    property_schema: &Value,
+) -> Option<String> {
+    let Some(text) = value.as_str() else {
+        return Some(format!(
+            "{tool_name} error: parameter '{key}' must be a string, got {}",
+            json_type_name(value)
+        ));
+    };
+
+    let char_len = text.chars().count() as u64;
+    if let Some(min) = property_schema.get("minLength").and_then(Value::as_u64) {
+        if char_len < min {
+            return Some(format!(
+                "{tool_name} error: parameter '{key}' must be at least {min} characters"
+            ));
+        }
+    }
+    if let Some(max) = property_schema.get("maxLength").and_then(Value::as_u64) {
+        if char_len > max {
+            return Some(format!(
+                "{tool_name} error: parameter '{key}' must be at most {max} characters"
+            ));
+        }
+    }
+
+    None
+}
+
+fn validate_integer_property(
+    tool_name: &str,
+    key: &str,
+    value: &Value,
+    property_schema: &Value,
+) -> Option<String> {
+    let int_value = if let Some(number) = value.as_i64() {
+        number
+    } else if let Some(number) = value.as_u64() {
+        match i64::try_from(number) {
+            Ok(number) => number,
+            Err(_) => return Some(format!("{tool_name} error: parameter '{key}' is too large")),
+        }
+    } else {
+        return Some(format!(
+            "{tool_name} error: parameter '{key}' must be an integer, got {}",
+            json_type_name(value)
+        ));
+    };
+
+    if let Some(min) = schema_i64(property_schema, "minimum") {
+        if int_value < min {
+            return Some(format!(
+                "{tool_name} error: parameter '{key}' must be >= {min}"
+            ));
+        }
+    }
+    if let Some(max) = schema_i64(property_schema, "maximum") {
+        if int_value > max {
+            return Some(format!(
+                "{tool_name} error: parameter '{key}' must be <= {max}"
+            ));
+        }
+    }
+
+    None
+}
+
+fn schema_i64(schema: &Value, field: &str) -> Option<i64> {
+    schema.get(field).and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_u64().and_then(|number| i64::try_from(number).ok()))
+    })
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(number) => {
+            if number.is_i64() || number.is_u64() {
+                "integer"
+            } else {
+                "number"
+            }
+        }
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests/tools_tests.rs"]
+mod tests;

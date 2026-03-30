@@ -395,7 +395,7 @@ async fn handle_new_command(
         }
         Err(err) => {
             return Some(command_result(
-                format!("Failed to persist cleared context: {err}"),
+                format!("Memory saved to memory/{today}.md but failed to clear context: {err}"),
                 "error",
                 false,
             ));
@@ -1152,7 +1152,7 @@ Commands:
     /skills-session  List session-local skills
     /rename <name>   Rename current session
     /clear           Clear messages (keep system prompt)
-    /memory          Show structured memory status
+    /memory [stats|debug] Show structured memory status or updater diagnostics
     /help            Show this help"
         .to_string();
     if current_session_id == MAIN_SESSION_ID {
@@ -1181,7 +1181,11 @@ async fn handle_delete_command(
     )
 }
 
-async fn handle_memory_command(current_session_id: &str, state: &AppState) -> CommandResult {
+async fn handle_memory_command(
+    arg: &str,
+    current_session_id: &str,
+    state: &AppState,
+) -> CommandResult {
     if !state.config.structured_memory {
         return command_result(
             "Structured memory is disabled. Enable with `\"structuredMemory\": true` in settings or `LINGCLAW_STRUCTURED_MEMORY=true`.",
@@ -1196,8 +1200,23 @@ async fn handle_memory_command(current_session_id: &str, state: &AppState) -> Co
             None => return command_result("Session not found", "error", false),
         }
     };
-    let status = memory::memory_status(&workspace);
-    command_result(status, "system", false)
+
+    let response = match arg {
+        "" => format!(
+            "{}\n\n{}",
+            memory::memory_status(&workspace),
+            memory::memory_runtime_status(state.memory_queue.as_ref())
+        ),
+        "stats" => memory::memory_runtime_status(state.memory_queue.as_ref()),
+        "debug" => format!(
+            "{}\n\n{}",
+            memory::memory_status(&workspace),
+            memory::memory_debug_status(&workspace, state.memory_queue.as_ref())
+        ),
+        _ => return command_result("Usage: /memory [stats|debug]", "system", false),
+    };
+
+    command_result(response, "system", false)
 }
 
 pub(crate) async fn handle_command(
@@ -1282,7 +1301,7 @@ pub(crate) async fn handle_command(
         "/help" => Some(handle_help_command(current_session_id)),
         "/sessions" => Some(handle_sessions_command(current_session_id, state).await),
         "/delete" => Some(handle_delete_command(arg, current_session_id, state).await),
-        "/memory" => Some(handle_memory_command(current_session_id, state).await),
+        "/memory" => Some(handle_memory_command(arg, current_session_id, state).await),
 
         // /stop when not busy — the in-flight case is handled by the agent loop drain
         "/stop" => Some(command_result("No active run to stop.", "system", false)),

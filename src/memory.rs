@@ -11,12 +11,14 @@
 
 use std::{
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
 use crate::{config::Config, providers};
 
@@ -49,10 +51,277 @@ pub(crate) struct MemoryFact {
 }
 
 const MEMORY_FILE_NAME: &str = "structured_memory.json";
+const MEMORY_AUDIT_FILE_NAME: &str = "structured_memory.audit.jsonl";
+/// Max audit file size before rotation (trim oldest entries).
+const MEMORY_AUDIT_MAX_BYTES: u64 = 256_000;
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MemoryQueueStatusSnapshot {
+    pub state: String,
+    pub enqueued: u64,
+    pub replaced_during_debounce: u64,
+    pub started: u64,
+    pub succeeded: u64,
+    pub failed: u64,
+    pub timed_out: u64,
+    pub last_model: Option<String>,
+    pub last_excerpt_chars: usize,
+    pub last_duration_ms: u64,
+    pub last_error: Option<String>,
+    pub last_enqueued_at: u64,
+    pub last_started_at: u64,
+    pub last_finished_at: u64,
+    pub last_success_at: u64,
+    pub last_failure_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MemoryAuditRecord {
+    timestamp: u64,
+    model: String,
+    status: String,
+    excerpt_chars: usize,
+    duration_ms: u64,
+    facts_before: usize,
+    facts_after: usize,
+    had_user_context_before: bool,
+    had_user_context_after: bool,
+    changed: bool,
+    error: Option<String>,
+}
+
+struct MemoryAuditBaseline {
+    excerpt_chars: usize,
+    facts_before: usize,
+    had_user_context_before: bool,
+}
+
+#[derive(Clone, Debug)]
+struct MemoryProcessStats {
+    excerpt_chars: usize,
+    facts_before: usize,
+    facts_after: usize,
+    had_user_context_before: bool,
+    had_user_context_after: bool,
+    changed: bool,
+}
+
+type SharedMemoryQueueStatus = Arc<Mutex<MemoryQueueStatusSnapshot>>;
 
 /// Storage path for a session's structured memory.
 fn memory_path(workspace: &Path) -> PathBuf {
     workspace.join(MEMORY_FILE_NAME)
+}
+
+fn memory_audit_path(workspace: &Path) -> PathBuf {
+    workspace.join(MEMORY_AUDIT_FILE_NAME)
+}
+
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn format_relative_age(age_secs: u64) -> String {
+    if age_secs < 60 {
+        "just now".to_string()
+    } else if age_secs < 3600 {
+        format!("{}m ago", age_secs / 60)
+    } else if age_secs < 86400 {
+        format!("{}h ago", age_secs / 3600)
+    } else {
+        format!("{}d ago", age_secs / 86400)
+    }
+}
+
+fn timestamp_label(ts: u64) -> Option<String> {
+    if ts == 0 {
+        return None;
+    }
+    Some(format_relative_age(now_epoch_secs().saturating_sub(ts)))
+}
+
+fn truncate_inline(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
+        return text.to_string();
+    }
+    let cut = (0..=limit)
+        .rev()
+        .find(|&idx| text.is_char_boundary(idx))
+        .unwrap_or(0);
+    format!("{}…", &text[..cut])
+}
+
+fn with_queue_status<F>(status: &SharedMemoryQueueStatus, update: F)
+where
+    F: FnOnce(&mut MemoryQueueStatusSnapshot),
+{
+    if let Ok(mut guard) = status.lock() {
+        update(&mut guard);
+    }
+}
+
+fn build_audit_baseline(req: &MemoryUpdateRequest) -> MemoryAuditBaseline {
+    let existing = load_structured_memory(&req.workspace);
+    let excerpt = build_conversation_excerpt(&req.conversation_excerpt);
+    MemoryAuditBaseline {
+        excerpt_chars: excerpt.chars().count(),
+        facts_before: existing.facts.len(),
+        had_user_context_before: existing.user_context.is_some(),
+    }
+}
+
+async fn append_memory_audit_record(workspace: &Path, record: &MemoryAuditRecord) {
+    let serialized = match serde_json::to_string(record) {
+        Ok(data) => data,
+        Err(error) => {
+            eprintln!("memory audit serialize error: {error}");
+            return;
+        }
+    };
+
+    let path = memory_audit_path(workspace);
+
+    // Rotate if oversized: keep the most recent half of lines.
+    if let Ok(meta) = tokio::fs::metadata(&path).await {
+        if meta.len() > MEMORY_AUDIT_MAX_BYTES {
+            if let Ok(data) = tokio::fs::read_to_string(&path).await {
+                let lines: Vec<&str> = data.lines().collect();
+                let keep_from = lines.len() / 2;
+                let trimmed = lines[keep_from..].join("\n") + "\n";
+                let _ = tokio::fs::write(&path, trimmed).await;
+            }
+        }
+    }
+
+    let mut file = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!("memory audit open error: {error}");
+            return;
+        }
+    };
+
+    if let Err(error) = file.write_all(format!("{serialized}\n").as_bytes()).await {
+        eprintln!("memory audit write error: {error}");
+    }
+}
+
+fn read_recent_memory_audit(workspace: &Path, limit: usize) -> Vec<MemoryAuditRecord> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let data = match std::fs::read_to_string(memory_audit_path(workspace)) {
+        Ok(data) => data,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut records = Vec::new();
+    for line in data.lines().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(record) = serde_json::from_str::<MemoryAuditRecord>(line) {
+            records.push(record);
+            if records.len() == limit {
+                break;
+            }
+        }
+    }
+    records.reverse();
+    records
+}
+
+fn format_queue_status(snapshot: &MemoryQueueStatusSnapshot) -> String {
+    let mut lines = Vec::new();
+    lines.push("**Memory Updater**".to_string());
+    lines.push(format!("State: {}", snapshot.state));
+    lines.push(format!(
+        "Attempts: enqueued {} | started {} | ok {} | failed {} | timed out {}",
+        snapshot.enqueued,
+        snapshot.started,
+        snapshot.succeeded,
+        snapshot.failed,
+        snapshot.timed_out,
+    ));
+    if snapshot.replaced_during_debounce > 0 {
+        lines.push(format!(
+            "Debounce replacements: {}",
+            snapshot.replaced_during_debounce
+        ));
+    }
+    if let Some(model) = &snapshot.last_model {
+        lines.push(format!("Last model: {model}"));
+    }
+    if snapshot.last_excerpt_chars > 0 {
+        lines.push(format!(
+            "Last excerpt: {} chars",
+            snapshot.last_excerpt_chars
+        ));
+    }
+    if snapshot.last_duration_ms > 0 {
+        lines.push(format!("Last duration: {} ms", snapshot.last_duration_ms));
+    }
+    if let Some(label) = timestamp_label(snapshot.last_enqueued_at) {
+        lines.push(format!("Last enqueued: {label}"));
+    }
+    if let Some(label) = timestamp_label(snapshot.last_started_at) {
+        lines.push(format!("Last started: {label}"));
+    }
+    if let Some(label) = timestamp_label(snapshot.last_success_at) {
+        lines.push(format!("Last success: {label}"));
+    }
+    if let Some(label) = timestamp_label(snapshot.last_failure_at) {
+        lines.push(format!("Last failure: {label}"));
+    }
+    if let Some(error) = &snapshot.last_error {
+        lines.push(format!("Last error: {}", truncate_inline(error, 160)));
+    }
+    lines.join("\n")
+}
+
+pub(crate) fn memory_runtime_status(queue: Option<&MemoryUpdateQueue>) -> String {
+    match queue {
+        Some(queue) => format_queue_status(&queue.status_snapshot()),
+        None => "**Memory Updater**\nState: unavailable in this process".to_string(),
+    }
+}
+
+pub(crate) fn memory_debug_status(workspace: &Path, queue: Option<&MemoryUpdateQueue>) -> String {
+    let mut lines = vec![memory_runtime_status(queue)];
+    let records = read_recent_memory_audit(workspace, 5);
+    if records.is_empty() {
+        lines.push("\nRecent audit entries: none".to_string());
+        return lines.join("\n");
+    }
+
+    lines.push("\nRecent audit entries:".to_string());
+    for record in records {
+        let age = format_relative_age(now_epoch_secs().saturating_sub(record.timestamp));
+        let mut line = format!(
+            "- {} | {} | model {} | excerpt {} chars | facts {} -> {} | {} ms",
+            age,
+            record.status,
+            record.model,
+            record.excerpt_chars,
+            record.facts_before,
+            record.facts_after,
+            record.duration_ms,
+        );
+        if let Some(error) = record.error {
+            line.push_str(&format!(" | {}", truncate_inline(&error, 120)));
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
 }
 
 // ── Storage ─────────────────────────────────────────────────────────────────
@@ -91,6 +360,7 @@ const MEMORY_INJECTION_CHAR_BUDGET: usize = 2_000;
 
 /// Format structured memory for injection into the system prompt.
 /// Returns `None` if the memory is empty.
+/// Facts are sorted by recency (newest first) so truncation drops stale facts.
 pub(crate) fn format_memory_for_injection(mem: &StructuredMemory) -> Option<String> {
     if mem.user_context.is_none() && mem.facts.is_empty() {
         return None;
@@ -106,8 +376,12 @@ pub(crate) fn format_memory_for_injection(mem: &StructuredMemory) -> Option<Stri
     }
 
     if !mem.facts.is_empty() {
+        // Sort by recency: newest first for priority-aware truncation.
+        let mut sorted_facts = mem.facts.clone();
+        sorted_facts.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at));
+
         lines.push("**Remembered facts:**".to_string());
-        for fact in &mem.facts {
+        for fact in &sorted_facts {
             lines.push(format!("- **{}**: {}", fact.key, fact.value));
         }
     }
@@ -133,19 +407,34 @@ struct MemoryUpdateRequest {
     conversation_excerpt: Vec<crate::ChatMessage>,
 }
 
+/// Max pending update requests. Beyond this, new requests replace the latest.
+const MEMORY_QUEUE_CAPACITY: usize = 16;
+
 /// Debounced async memory update queue.
 /// Receives update requests from the OnFinish hook and processes them
 /// in the background with debounce to avoid excessive LLM calls.
 pub(crate) struct MemoryUpdateQueue {
-    tx: mpsc::UnboundedSender<MemoryUpdateRequest>,
+    tx: mpsc::Sender<MemoryUpdateRequest>,
+    status: SharedMemoryQueueStatus,
 }
 
 impl MemoryUpdateQueue {
     /// Spawn the background updater task. Returns the queue handle.
     pub(crate) fn spawn(config: Config) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(memory_updater_loop(rx, config));
-        Self { tx }
+        let (tx, rx) = mpsc::channel(MEMORY_QUEUE_CAPACITY);
+        let status = Arc::new(Mutex::new(MemoryQueueStatusSnapshot {
+            state: "idle".to_string(),
+            ..Default::default()
+        }));
+        tokio::spawn(memory_updater_loop(rx, config, status.clone()));
+        Self { tx, status }
+    }
+
+    pub(crate) fn status_snapshot(&self) -> MemoryQueueStatusSnapshot {
+        self.status
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
     }
 
     /// Enqueue a memory update request (non-blocking).
@@ -157,10 +446,19 @@ impl MemoryUpdateQueue {
     ) {
         let req = MemoryUpdateRequest {
             workspace,
-            model,
+            model: model.clone(),
             conversation_excerpt,
         };
-        let _ = self.tx.send(req);
+        if self.tx.try_send(req).is_err() {
+            eprintln!("Warning: memory update queue is full, request dropped");
+            return;
+        }
+        with_queue_status(&self.status, |snapshot| {
+            snapshot.state = "pending".to_string();
+            snapshot.enqueued += 1;
+            snapshot.last_model = Some(model);
+            snapshot.last_enqueued_at = now_epoch_secs();
+        });
     }
 }
 
@@ -168,7 +466,11 @@ impl MemoryUpdateQueue {
 const DEBOUNCE_DURATION: Duration = Duration::from_secs(3);
 
 /// Background loop that processes memory update requests with debounce.
-async fn memory_updater_loop(mut rx: mpsc::UnboundedReceiver<MemoryUpdateRequest>, config: Config) {
+async fn memory_updater_loop(
+    mut rx: mpsc::Receiver<MemoryUpdateRequest>,
+    config: Config,
+    status: SharedMemoryQueueStatus,
+) {
     let memory_timeout = config.tool_timeout.max(Duration::from_secs(30));
     let http = Client::builder()
         .timeout(memory_timeout)
@@ -184,6 +486,12 @@ async fn memory_updater_loop(mut rx: mpsc::UnboundedReceiver<MemoryUpdateRequest
                     match next {
                         Some(newer) => {
                             // Replace with newer request, restart debounce
+                            with_queue_status(&status, |snapshot| {
+                                snapshot.state = "pending".to_string();
+                                snapshot.replaced_during_debounce += 1;
+                                snapshot.last_model = Some(newer.model.clone());
+                                snapshot.last_enqueued_at = now_epoch_secs();
+                            });
                             pending = Some(newer);
                             continue;
                         }
@@ -194,15 +502,114 @@ async fn memory_updater_loop(mut rx: mpsc::UnboundedReceiver<MemoryUpdateRequest
             };
 
             // Process the debounced request with a timeout guard
+            let audit_baseline = build_audit_baseline(&final_req);
+            let started_at = now_epoch_secs();
+            let start = std::time::Instant::now();
+            with_queue_status(&status, |snapshot| {
+                snapshot.state = "running".to_string();
+                snapshot.started += 1;
+                snapshot.last_model = Some(final_req.model.clone());
+                snapshot.last_excerpt_chars = audit_baseline.excerpt_chars;
+                snapshot.last_started_at = started_at;
+            });
+
             match tokio::time::timeout(
                 memory_timeout,
                 process_memory_update(&final_req, &config, &http),
             )
             .await
             {
-                Ok(Err(e)) => eprintln!("memory update error: {e}"),
-                Err(_) => eprintln!("memory update timed out"),
-                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let now = now_epoch_secs();
+                    with_queue_status(&status, |snapshot| {
+                        snapshot.state = "idle".to_string();
+                        snapshot.failed += 1;
+                        snapshot.last_duration_ms = duration_ms;
+                        snapshot.last_error = Some(error.clone());
+                        snapshot.last_failure_at = now;
+                        snapshot.last_finished_at = now;
+                    });
+                    append_memory_audit_record(
+                        &final_req.workspace,
+                        &MemoryAuditRecord {
+                            timestamp: now,
+                            model: final_req.model.clone(),
+                            status: "error".to_string(),
+                            excerpt_chars: audit_baseline.excerpt_chars,
+                            duration_ms,
+                            facts_before: audit_baseline.facts_before,
+                            facts_after: audit_baseline.facts_before,
+                            had_user_context_before: audit_baseline.had_user_context_before,
+                            had_user_context_after: audit_baseline.had_user_context_before,
+                            changed: false,
+                            error: Some(error.clone()),
+                        },
+                    )
+                    .await;
+                    eprintln!("memory update error: {error}");
+                }
+                Err(_) => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let now = now_epoch_secs();
+                    let error = "memory update timed out".to_string();
+                    with_queue_status(&status, |snapshot| {
+                        snapshot.state = "idle".to_string();
+                        snapshot.timed_out += 1;
+                        snapshot.last_duration_ms = duration_ms;
+                        snapshot.last_error = Some(error.clone());
+                        snapshot.last_failure_at = now;
+                        snapshot.last_finished_at = now;
+                    });
+                    append_memory_audit_record(
+                        &final_req.workspace,
+                        &MemoryAuditRecord {
+                            timestamp: now,
+                            model: final_req.model.clone(),
+                            status: "timeout".to_string(),
+                            excerpt_chars: audit_baseline.excerpt_chars,
+                            duration_ms,
+                            facts_before: audit_baseline.facts_before,
+                            facts_after: audit_baseline.facts_before,
+                            had_user_context_before: audit_baseline.had_user_context_before,
+                            had_user_context_after: audit_baseline.had_user_context_before,
+                            changed: false,
+                            error: Some(error.clone()),
+                        },
+                    )
+                    .await;
+                    eprintln!("{error}");
+                }
+                Ok(Ok(stats)) => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let now = now_epoch_secs();
+                    with_queue_status(&status, |snapshot| {
+                        snapshot.state = "idle".to_string();
+                        snapshot.succeeded += 1;
+                        snapshot.last_duration_ms = duration_ms;
+                        snapshot.last_error = None;
+                        snapshot.last_success_at = now;
+                        snapshot.last_finished_at = now;
+                        snapshot.last_excerpt_chars = stats.excerpt_chars;
+                    });
+                    append_memory_audit_record(
+                        &final_req.workspace,
+                        &MemoryAuditRecord {
+                            timestamp: now,
+                            model: final_req.model.clone(),
+                            status: "success".to_string(),
+                            excerpt_chars: stats.excerpt_chars,
+                            duration_ms,
+                            facts_before: stats.facts_before,
+                            facts_after: stats.facts_after,
+                            had_user_context_before: stats.had_user_context_before,
+                            had_user_context_after: stats.had_user_context_after,
+                            changed: stats.changed,
+                            error: None,
+                        },
+                    )
+                    .await;
+                }
             }
         } else {
             // Wait for next request
@@ -222,13 +629,23 @@ async fn process_memory_update(
     req: &MemoryUpdateRequest,
     config: &Config,
     http: &Client,
-) -> Result<(), String> {
+) -> Result<MemoryProcessStats, String> {
     let existing = load_structured_memory(&req.workspace);
+    let facts_before = existing.facts.len();
+    let had_user_context_before = existing.user_context.is_some();
 
     // Build conversation excerpt text
     let excerpt = build_conversation_excerpt(&req.conversation_excerpt);
+    let excerpt_chars = excerpt.chars().count();
     if excerpt.trim().is_empty() {
-        return Ok(());
+        return Ok(MemoryProcessStats {
+            excerpt_chars,
+            facts_before,
+            facts_after: facts_before,
+            had_user_context_before,
+            had_user_context_after: had_user_context_before,
+            changed: false,
+        });
     }
 
     // Build existing memory context
@@ -280,7 +697,14 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
 
     let response = response.trim();
     if response.is_empty() {
-        return Ok(());
+        return Ok(MemoryProcessStats {
+            excerpt_chars,
+            facts_before,
+            facts_after: facts_before,
+            had_user_context_before,
+            had_user_context_after: had_user_context_before,
+            changed: false,
+        });
     }
 
     // Strip markdown fences if present
@@ -292,12 +716,10 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
     let raw: serde_json::Value =
         serde_json::from_str(json_str).map_err(|e| format!("parse LLM response: {e}"))?;
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = now_epoch_secs();
 
     let mut merged = existing;
+    let before_json = serde_json::to_string(&merged).unwrap_or_default();
 
     // Only touch user_context when the key is actually present in the response.
     // null → clear, string → update, absent → preserve existing.
@@ -354,11 +776,27 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
         merged.facts.truncate(MAX_FACTS);
     }
 
-    save_structured_memory(&req.workspace, &merged)
+    let facts_after = merged.facts.len();
+    let had_user_context_after = merged.user_context.is_some();
+    let after_json = serde_json::to_string(&merged).unwrap_or_default();
+    save_structured_memory(&req.workspace, &merged)?;
+
+    Ok(MemoryProcessStats {
+        excerpt_chars,
+        facts_before,
+        facts_after,
+        had_user_context_before,
+        had_user_context_after,
+        changed: before_json != after_json,
+    })
 }
 
-/// Build conversation excerpt from messages, filtering to only user and
-/// final assistant content (no tool calls, no tool results).
+/// Max chars for a single tool result summary in the conversation excerpt.
+const TOOL_RESULT_EXCERPT_LIMIT: usize = 200;
+
+/// Build conversation excerpt from messages, including user, assistant, and
+/// brief tool result summaries for key findings. Filters out auto-generated
+/// compression summaries and excessive tool noise.
 fn build_conversation_excerpt(messages: &[crate::ChatMessage]) -> String {
     let mut lines = Vec::new();
     for msg in messages {
@@ -380,9 +818,32 @@ fn build_conversation_excerpt(messages: &[crate::ChatMessage]) -> String {
                         lines.push(format!("Assistant: {content}"));
                     }
                 }
-                // Skip tool_calls — we don't want tool noise in memory
+                // Include tool call names so memory captures what the agent did.
+                if let Some(tool_calls) = &msg.tool_calls {
+                    for tc in tool_calls {
+                        lines.push(format!("[tool: {}]", tc.function.name));
+                    }
+                }
             }
-            _ => {} // skip tool results, system
+            "tool" => {
+                // Include brief tool result summaries when the result indicates
+                // a notable finding (not just raw data dumps).
+                if let Some(content) = msg.content.as_deref() {
+                    if !content.is_empty() {
+                        let first_line = content.lines().next().unwrap_or("");
+                        let summary = if content.len() <= TOOL_RESULT_EXCERPT_LIMIT {
+                            content.to_string()
+                        } else {
+                            truncate_inline(first_line, TOOL_RESULT_EXCERPT_LIMIT)
+                        };
+                        // Only include non-trivial results.
+                        if !summary.trim().is_empty() {
+                            lines.push(format!("[tool result: {summary}]"));
+                        }
+                    }
+                }
+            }
+            _ => {} // skip system
         }
     }
     lines.join("\n\n")
@@ -446,21 +907,10 @@ pub(crate) fn memory_status(workspace: &Path) -> String {
     }
 
     if mem.updated_at > 0 {
-        let age_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .saturating_sub(mem.updated_at);
-        let age_label = if age_secs < 60 {
-            "just now".to_string()
-        } else if age_secs < 3600 {
-            format!("{}m ago", age_secs / 60)
-        } else if age_secs < 86400 {
-            format!("{}h ago", age_secs / 3600)
-        } else {
-            format!("{}d ago", age_secs / 86400)
-        };
-        lines.push(format!("Last updated: {age_label}"));
+        lines.push(format!(
+            "Last updated: {}",
+            format_relative_age(now_epoch_secs().saturating_sub(mem.updated_at))
+        ));
     }
 
     lines.join("\n")

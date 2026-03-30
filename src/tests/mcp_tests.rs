@@ -749,3 +749,24 @@ fn path_to_file_uri_encodes_spaces_and_non_ascii() {
         "non-ASCII bytes must be percent-encoded"
     );
 }
+
+#[test]
+fn spawn_cooldown_blocks_rapid_retry() {
+    let server = "test_cooldown_server";
+    // Clear any existing state.
+    clear_spawn_failure(server);
+    assert!(check_spawn_cooldown(server).is_none());
+
+    // Record failure and verify cooldown is active.
+    record_spawn_failure(server);
+    let remaining = check_spawn_cooldown(server);
+    assert!(
+        remaining.is_some(),
+        "cooldown should be active after failure"
+    );
+    assert!(remaining.unwrap() > 0);
+
+    // Clear and verify cooldown is gone.
+    clear_spawn_failure(server);
+    assert!(check_spawn_cooldown(server).is_none());
+}

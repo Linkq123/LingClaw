@@ -690,7 +690,9 @@ async fn run_observe_phase(
         sessions.get(ctx.current_session_id).cloned()
     };
     if let Some(ref session) = snapshot {
-        let _ = save_session_to_disk(session).await;
+        if let Err(e) = save_session_to_disk(session).await {
+            eprintln!("Warning: failed to save session after observe phase: {e}");
+        }
     }
 
     let after_observe_events = run_hooks(
@@ -722,7 +724,9 @@ async fn run_finish_phase(
         sessions.get(ctx.current_session_id).cloned()
     };
     if let Some(ref session) = snapshot {
-        let _ = save_session_to_disk(session).await;
+        if let Err(e) = save_session_to_disk(session).await {
+            eprintln!("Warning: failed to save session at finish phase: {e}");
+        }
     }
 
     let on_finish_events = run_hooks(
