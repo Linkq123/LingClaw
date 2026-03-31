@@ -755,18 +755,26 @@ async fn dispatch_live_event(
     connection_id: u64,
     event: serde_json::Value,
 ) {
-    let is_current_connection = {
-        let active = state.active_connections.lock().await;
-        active.get(session_id).copied() == Some(connection_id)
-    };
-    if !is_current_connection {
-        return;
-    }
-
     let event_type = event["type"].as_str().unwrap_or_default();
 
+    // Validate connection ownership and update live replay state under a single
+    // critical section. We hold session_clients for the entire block to prevent
+    // unbind/rebind from racing between validation and live_rounds mutation.
     {
+        let clients_guard = state.session_clients.lock().await;
+        let is_current = clients_guard
+            .get(session_id)
+            .map(|b| b.connection_id == connection_id)
+            .unwrap_or(false);
+        if !is_current {
+            return;
+        }
+
         let mut live_rounds = state.live_rounds.lock().await;
+        // Drop the clients guard now — we've entered the live_rounds critical
+        // section and no longer need the binding check to stay valid.
+        drop(clients_guard);
+
         match event_type {
             "start" => {
                 live_rounds.insert(
@@ -787,95 +795,115 @@ async fn dispatch_live_event(
             }
             "delta" => {
                 if let Some(round) = live_rounds.get_mut(session_id) {
-                    if let Some(content) = event["content"].as_str() {
-                        if round.assistant_text.len() < LIVE_REPLAY_CAP {
-                            round.assistant_text.push_str(content);
-                            round.assistant_text.truncate(LIVE_REPLAY_CAP);
+                    if round.connection_id == connection_id {
+                        if let Some(content) = event["content"].as_str() {
+                            if round.assistant_text.len() < LIVE_REPLAY_CAP {
+                                round.assistant_text.push_str(content);
+                                round.assistant_text.truncate(LIVE_REPLAY_CAP);
+                            }
                         }
                     }
                 }
             }
             "thinking_start" => {
                 if let Some(round) = live_rounds.get_mut(session_id) {
-                    round.reasoning_text.clear();
-                    round.reasoning_done = false;
+                    if round.connection_id == connection_id {
+                        round.reasoning_text.clear();
+                        round.reasoning_done = false;
+                    }
                 }
             }
             "thinking_delta" => {
                 if let Some(round) = live_rounds.get_mut(session_id) {
-                    if let Some(content) = event["content"].as_str() {
-                        if round.reasoning_text.len() < LIVE_REPLAY_CAP {
-                            round.reasoning_text.push_str(content);
-                            round.reasoning_text.truncate(LIVE_REPLAY_CAP);
+                    if round.connection_id == connection_id {
+                        if let Some(content) = event["content"].as_str() {
+                            if round.reasoning_text.len() < LIVE_REPLAY_CAP {
+                                round.reasoning_text.push_str(content);
+                                round.reasoning_text.truncate(LIVE_REPLAY_CAP);
+                            }
                         }
                     }
                 }
             }
             "thinking_done" => {
                 if let Some(round) = live_rounds.get_mut(session_id) {
-                    round.reasoning_done = true;
+                    if round.connection_id == connection_id {
+                        round.reasoning_done = true;
+                    }
                 }
             }
             "tool_call" => {
                 if let Some(round) = live_rounds.get_mut(session_id) {
-                    round.tools.push(LiveToolState {
-                        id: event["id"].as_str().unwrap_or_default().to_string(),
-                        name: event["name"].as_str().unwrap_or_default().to_string(),
-                        arguments: event["arguments"].as_str().unwrap_or_default().to_string(),
-                        result: None,
-                        elapsed_ms: 0,
-                    });
+                    if round.connection_id == connection_id {
+                        round.tools.push(LiveToolState {
+                            id: event["id"].as_str().unwrap_or_default().to_string(),
+                            name: event["name"].as_str().unwrap_or_default().to_string(),
+                            arguments: event["arguments"].as_str().unwrap_or_default().to_string(),
+                            result: None,
+                            elapsed_ms: 0,
+                        });
+                    }
                 }
             }
             "tool_progress" => {
                 if let Some(round) = live_rounds.get_mut(session_id) {
-                    let tool_id = event["id"].as_str().unwrap_or_default();
-                    let elapsed_ms = event["elapsed_ms"].as_u64().unwrap_or(0);
-                    if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
-                        tool.elapsed_ms = elapsed_ms;
-                    } else {
-                        round.tools.push(LiveToolState {
-                            id: tool_id.to_string(),
-                            name: event["name"].as_str().unwrap_or_default().to_string(),
-                            arguments: String::new(),
-                            result: None,
-                            elapsed_ms,
-                        });
+                    if round.connection_id == connection_id {
+                        let tool_id = event["id"].as_str().unwrap_or_default();
+                        let elapsed_ms = event["elapsed_ms"].as_u64().unwrap_or(0);
+                        if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
+                            tool.elapsed_ms = elapsed_ms;
+                        } else {
+                            round.tools.push(LiveToolState {
+                                id: tool_id.to_string(),
+                                name: event["name"].as_str().unwrap_or_default().to_string(),
+                                arguments: String::new(),
+                                result: None,
+                                elapsed_ms,
+                            });
+                        }
                     }
                 }
             }
             "tool_result" => {
                 if let Some(round) = live_rounds.get_mut(session_id) {
-                    let tool_id = event["id"].as_str().unwrap_or_default();
-                    let mut result = event["result"].as_str().unwrap_or_default().to_string();
-                    result.truncate(LIVE_REPLAY_CAP);
-                    if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
-                        tool.result = Some(result);
-                        tool.elapsed_ms = event["duration_ms"].as_u64().unwrap_or(tool.elapsed_ms);
-                    } else {
-                        round.tools.push(LiveToolState {
-                            id: tool_id.to_string(),
-                            name: event["name"].as_str().unwrap_or_default().to_string(),
-                            arguments: String::new(),
-                            result: Some(result),
-                            elapsed_ms: event["duration_ms"].as_u64().unwrap_or(0),
-                        });
+                    if round.connection_id == connection_id {
+                        let tool_id = event["id"].as_str().unwrap_or_default();
+                        let mut result = event["result"].as_str().unwrap_or_default().to_string();
+                        result.truncate(LIVE_REPLAY_CAP);
+                        if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
+                            tool.result = Some(result);
+                            tool.elapsed_ms = event["duration_ms"].as_u64().unwrap_or(tool.elapsed_ms);
+                        } else {
+                            round.tools.push(LiveToolState {
+                                id: tool_id.to_string(),
+                                name: event["name"].as_str().unwrap_or_default().to_string(),
+                                arguments: String::new(),
+                                result: Some(result),
+                                elapsed_ms: event["duration_ms"].as_u64().unwrap_or(0),
+                            });
+                        }
                     }
                 }
             }
             "react_phase" => {
                 if let Some(round) = live_rounds.get_mut(session_id) {
-                    round.phase = event["phase"].as_str().map(str::to_string);
-                    round.cycle = event["cycle"].as_u64().map(|value| value as usize);
+                    if round.connection_id == connection_id {
+                        round.phase = event["phase"].as_str().map(str::to_string);
+                        round.cycle = event["cycle"].as_u64().map(|value| value as usize);
+                    }
                 }
             }
             "observation" => {
                 if let Some(round) = live_rounds.get_mut(session_id) {
-                    round.has_observation = true;
+                    if round.connection_id == connection_id {
+                        round.has_observation = true;
+                    }
                 }
             }
             "done" | "error" => {
-                live_rounds.remove(session_id);
+                if live_rounds.get(session_id).map(|r| r.connection_id) == Some(connection_id) {
+                    live_rounds.remove(session_id);
+                }
             }
             _ => {}
         }

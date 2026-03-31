@@ -98,7 +98,42 @@ pub(crate) fn load_session_from_disk(id: &str) -> Option<Session> {
         return None;
     }
     let path = sessions_dir().join(format!("{id}.json"));
-    let mut session = load_session_snapshot_from_path(&path)?;
+    let tmp_path = sessions_dir().join(format!("{id}.json.tmp"));
+    // Load from primary, fall back to .tmp, or pick the newer of the two.
+    // Crash scenarios: (a) primary missing, tmp exists → use tmp;
+    // (b) both exist, tmp is newer → use tmp (crash after tmp write, before rename);
+    // (c) both exist, primary is newer → use primary (normal case).
+    let primary = load_session_snapshot_from_path(&path);
+    let tmp_available = tmp_path.exists();
+    let mut session = match (primary, tmp_available) {
+        (Some(p), false) => p,
+        (None, true) => {
+            eprintln!(
+                "Warning: recovering session '{id}' from .tmp file (primary missing after crash)"
+            );
+            load_session_snapshot_from_path(&tmp_path)?
+        }
+        (Some(p), true) => {
+            // Both exist — pick the one with the later mtime.
+            let primary_mtime = std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok();
+            let tmp_mtime = std::fs::metadata(&tmp_path)
+                .and_then(|m| m.modified())
+                .ok();
+            if tmp_mtime >= primary_mtime {
+                eprintln!(
+                    "Warning: recovering session '{id}' from newer .tmp file (crash during save)"
+                );
+                load_session_snapshot_from_path(&tmp_path).unwrap_or(p)
+            } else {
+                // tmp is stale leftover — clean it up.
+                let _ = std::fs::remove_file(&tmp_path);
+                p
+            }
+        }
+        (None, false) => return None,
+    };
     session.workspace = super::session_workspace_path(&session.id);
     std::fs::create_dir_all(&session.workspace).ok();
     prompts::ensure_session_workspace(&session.workspace);

@@ -34,7 +34,11 @@ struct AgentPhaseState {
     shutting_down: bool,
     run_stopped: bool,
     run_detached: bool,
+    last_save_instant: Option<std::time::Instant>,
 }
+
+/// Minimum interval between observe-phase incremental saves.
+const OBSERVE_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 
 enum AgentPhaseControl {
     Continue,
@@ -685,13 +689,22 @@ async fn run_observe_phase(
     phase_state.last_observation_hint = agent::build_observation_context_hint(&summaries);
     phase_state.collected_results.clear();
 
-    let snapshot = {
-        let sessions = ctx.state.sessions.lock().await;
-        sessions.get(ctx.current_session_id).cloned()
-    };
-    if let Some(ref session) = snapshot {
-        if let Err(e) = save_session_to_disk(session).await {
-            eprintln!("Warning: failed to save session after observe phase: {e}");
+    // Debounced incremental save: skip if saved recently, finish phase always saves.
+    let should_save = phase_state
+        .last_save_instant
+        .map(|t| t.elapsed() >= OBSERVE_SAVE_DEBOUNCE)
+        .unwrap_or(true);
+    if should_save {
+        let snapshot = {
+            let sessions = ctx.state.sessions.lock().await;
+            sessions.get(ctx.current_session_id).cloned()
+        };
+        if let Some(ref session) = snapshot {
+            if let Err(e) = save_session_to_disk(session).await {
+                eprintln!("Warning: failed to save session after observe phase: {e}");
+            } else {
+                phase_state.last_save_instant = Some(std::time::Instant::now());
+            }
         }
     }
 
@@ -744,10 +757,12 @@ async fn run_finish_phase(
         let _ = live_send(ctx.live_tx, event).await;
     }
 
-    // Enqueue structured memory update (async, non-blocking)
+    // Enqueue structured memory update (async, non-blocking).
+    // Pre-filter messages to avoid cloning the full session history.
     if let (Some(queue), Some(ref session)) = (&ctx.state.memory_queue, &snapshot) {
         let model = session.effective_model(&ctx.state.config.model).to_string();
-        queue.enqueue(session.workspace.clone(), model, session.messages.clone());
+        let excerpt = crate::memory::prefilter_for_memory(&session.messages);
+        queue.enqueue(session.workspace.clone(), model, excerpt);
     }
 
     let finish_label = phase_state
@@ -817,6 +832,7 @@ pub(crate) async fn run_agent_session(
         shutting_down: false,
         run_stopped: false,
         run_detached: false,
+        last_save_instant: None,
     };
 
     'agent: loop {

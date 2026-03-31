@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use futures::{Stream, StreamExt};
@@ -770,6 +770,56 @@ where
     Ok(())
 }
 
+/// Maximum number of retries for transient LLM API errors (429, 5xx, connect/timeout).
+const MAX_LLM_RETRIES: usize = 2;
+
+/// Send an HTTP request with automatic retry for transient failures.
+/// Retries on 429 (rate limit), 5xx (server error), and connection/timeout errors.
+/// Uses exponential backoff: 1s, 2s.
+async fn send_with_retry(
+    _http: &Client,
+    mut build: impl FnMut() -> reqwest::RequestBuilder,
+) -> Result<reqwest::Response, String> {
+    for attempt in 0..=MAX_LLM_RETRIES {
+        if attempt > 0 {
+            let delay_ms = 1000 * (1u64 << (attempt - 1));
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        match build().send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+                    if attempt < MAX_LLM_RETRIES {
+                        eprintln!(
+                            "LLM API {status}, retrying ({}/{})",
+                            attempt + 1,
+                            MAX_LLM_RETRIES
+                        );
+                        continue;
+                    }
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(format!("API {status} (after {} attempts): {text}", attempt + 1));
+                }
+                if !status.is_success() {
+                    let text = resp.text().await.unwrap_or_default();
+                    return Err(format!("API {status}: {text}"));
+                }
+                return Ok(resp);
+            }
+            Err(e) if attempt < MAX_LLM_RETRIES && (e.is_connect() || e.is_timeout()) => {
+                eprintln!(
+                    "LLM request error: {e}, retrying ({}/{})",
+                    attempt + 1,
+                    MAX_LLM_RETRIES
+                );
+                continue;
+            }
+            Err(e) => return Err(format!("HTTP error: {e}")),
+        }
+    }
+    Err("LLM request failed after all retries".into())
+}
+
 async fn call_llm_stream_openai(
     http: &Client,
     resolved: &ResolvedModel,
@@ -781,19 +831,10 @@ async fn call_llm_stream_openai(
     let url = format!("{}/chat/completions", resolved.api_base);
     let body = build_openai_stream_body(resolved, messages, think_level, extra_tools);
 
-    let resp = http
-        .post(&url)
-        .bearer_auth(&resolved.api_key)
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP error: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("API {status}: {text}"));
-    }
+    let resp = send_with_retry(http, || {
+        http.post(&url).bearer_auth(&resolved.api_key).json(&body)
+    })
+    .await?;
 
     let mut stream = resp.bytes_stream();
     let mut stream_state = OpenAiStreamState {
@@ -832,21 +873,14 @@ async fn call_llm_stream_anthropic(
     let url = format!("{}/v1/messages", resolved.api_base);
     let body = build_anthropic_stream_body(resolved, messages, think_level, extra_tools);
 
-    let resp = http
-        .post(&url)
-        .header("x-api-key", &resolved.api_key)
-        .header("anthropic-version", "2023-06-01")
-        .header("content-type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP error: {e}"))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        return Err(format!("API {status}: {text}"));
-    }
+    let resp = send_with_retry(http, || {
+        http.post(&url)
+            .header("x-api-key", &resolved.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&body)
+    })
+    .await?;
 
     let mut stream = resp.bytes_stream();
     let mut stream_state = AnthropicStreamState {

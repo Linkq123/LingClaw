@@ -1,4 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
+
+use futures::stream::{self, StreamExt};
 
 use regex::Regex;
 
@@ -304,24 +310,41 @@ pub(crate) async fn tool_search_files(
     }
 
     let files = collect_file_paths(&dir, file_glob, 5, 10_000).await;
-    let mut results = Vec::new();
+    let re = Arc::new(re);
+    let max_results_limit = max_results;
+    let found_count = Arc::new(AtomicUsize::new(0));
 
-    for file_path in &files {
-        if results.len() >= max_results {
-            break;
-        }
-        let Ok(content) = tokio::fs::read_to_string(file_path).await else {
-            continue; // skip binary / unreadable files
-        };
-        for (i, line) in content.lines().enumerate() {
-            if results.len() >= max_results {
-                break;
+    // Concurrent file reads with bounded parallelism, early termination,
+    // and stable file order (buffered, not buffer_unordered).
+    let batched_results: Vec<Vec<String>> = stream::iter(files.into_iter())
+        .map(|file_path| {
+            let re = Arc::clone(&re);
+            let found_count = Arc::clone(&found_count);
+            async move {
+                if found_count.load(Ordering::Relaxed) >= max_results_limit {
+                    return Vec::new();
+                }
+                let Ok(content) = tokio::fs::read_to_string(&file_path).await else {
+                    return Vec::new();
+                };
+                let matches: Vec<String> = content
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| re.is_match(line))
+                    .map(|(i, line)| {
+                        format!("{}:{}:{}", file_path.display(), i + 1, line.trim())
+                    })
+                    .collect();
+                found_count.fetch_add(matches.len(), Ordering::Relaxed);
+                matches
             }
-            if re.is_match(line) {
-                results.push(format!("{}:{}:{}", file_path.display(), i + 1, line.trim()));
-            }
-        }
-    }
+        })
+        .buffered(32)
+        .collect()
+        .await;
+
+    let mut results: Vec<String> = batched_results.into_iter().flatten().collect();
+    results.truncate(max_results_limit);
 
     if results.is_empty() {
         format!("No matches for '{}' in {}", pattern_str, dir.display())

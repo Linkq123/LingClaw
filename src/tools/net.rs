@@ -29,7 +29,8 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 
 /// Check if a URL targets a private/loopback/link-local address or a disallowed scheme.
 /// Returns an error message if blocked, None if the URL is allowed.
-fn check_ssrf(url: &str) -> Option<String> {
+/// DNS resolution runs on a blocking thread to avoid stalling tokio workers.
+async fn check_ssrf(url: &str) -> Option<String> {
     // Only allow http and https schemes
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Some(format!(
@@ -55,15 +56,21 @@ fn check_ssrf(url: &str) -> Option<String> {
             ));
         }
     } else {
-        // DNS resolution
+        // DNS resolution on a blocking thread to avoid stalling async workers
         let port = parsed.port().unwrap_or(80);
         let to_resolve = format!("{bare_host}:{port}");
-        if let Ok(addrs) = to_resolve.to_socket_addrs() {
-            for addr in addrs {
-                if is_private_ip(&addr.ip()) {
-                    return Some(format!("BLOCKED: URL resolves to private/reserved address ({}). Refusing to fetch.", addr.ip()));
-                }
-            }
+        let dns_result = tokio::task::spawn_blocking(move || {
+            to_resolve
+                .to_socket_addrs()
+                .ok()
+                .and_then(|addrs| addrs.into_iter().find(|addr| is_private_ip(&addr.ip())))
+        })
+        .await;
+        if let Ok(Some(private_addr)) = dns_result {
+            return Some(format!(
+                "BLOCKED: URL resolves to private/reserved address ({}). Refusing to fetch.",
+                private_addr.ip()
+            ));
         }
     }
     None
@@ -80,7 +87,7 @@ pub(crate) async fn tool_http_fetch(
         Some(u) => u,
         None => return "Error: 'url' parameter is required".into(),
     };
-    if let Some(msg) = check_ssrf(url) {
+    if let Some(msg) = check_ssrf(url).await {
         return msg;
     }
     let max_bytes = args["max_bytes"].as_u64().unwrap_or(102_400) as usize;

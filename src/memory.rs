@@ -183,15 +183,32 @@ async fn append_memory_audit_record(workspace: &Path, record: &MemoryAuditRecord
     };
 
     let path = memory_audit_path(workspace);
+    let tmp_path = workspace.join("structured_memory.audit.jsonl.tmp");
 
-    // Rotate if oversized: keep the most recent half of lines.
+    // Recover .tmp left behind by a previous crash during rotation (Windows).
+    if !tokio::fs::try_exists(&path).await.unwrap_or(true)
+        && tokio::fs::try_exists(&tmp_path).await.unwrap_or(false)
+    {
+        let _ = tokio::fs::rename(&tmp_path, &path).await;
+    }
+
+    // Rotate if oversized: keep the most recent half of lines via tmp+rename.
+    // On Windows, rename requires removing the destination first, leaving a
+    // brief crash window; the recovery above handles that on the next call.
     if let Ok(meta) = tokio::fs::metadata(&path).await {
         if meta.len() > MEMORY_AUDIT_MAX_BYTES {
             if let Ok(data) = tokio::fs::read_to_string(&path).await {
                 let lines: Vec<&str> = data.lines().collect();
                 let keep_from = lines.len() / 2;
                 let trimmed = lines[keep_from..].join("\n") + "\n";
-                let _ = tokio::fs::write(&path, trimmed).await;
+                if tokio::fs::write(&tmp_path, &trimmed).await.is_ok() {
+                    #[cfg(windows)]
+                    let _ = tokio::fs::remove_file(&path).await;
+                    if tokio::fs::rename(&tmp_path, &path).await.is_err() {
+                        let _ = tokio::fs::write(&path, &trimmed).await;
+                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                    }
+                }
             }
         }
     }
@@ -793,6 +810,35 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
 
 /// Max chars for a single tool result summary in the conversation excerpt.
 const TOOL_RESULT_EXCERPT_LIMIT: usize = 200;
+
+/// Maximum number of recent messages to keep for memory extraction.
+/// Only the tail of the conversation is relevant — older context is already captured.
+const MEMORY_EXCERPT_MAX_MESSAGES: usize = 40;
+
+/// Pre-filter messages for memory extraction. Returns a lightweight clone
+/// containing only the recent non-system messages needed for memory extraction,
+/// avoiding a full clone of the entire session history.
+pub(crate) fn prefilter_for_memory(messages: &[crate::ChatMessage]) -> Vec<crate::ChatMessage> {
+    let start = if messages.len() > MEMORY_EXCERPT_MAX_MESSAGES {
+        let tentative = messages.len() - MEMORY_EXCERPT_MAX_MESSAGES;
+        // Scan backward from (and including) tentative to find the nearest
+        // "user" message, ensuring we start at a complete turn boundary
+        // rather than mid-turn (e.g. orphaned tool results without their
+        // triggering question).
+        // If no user message exists at or before tentative, fall back to tentative.
+        messages[..=tentative]
+            .iter()
+            .rposition(|m| m.role == "user")
+            .unwrap_or(tentative)
+    } else {
+        0
+    };
+    messages[start..]
+        .iter()
+        .filter(|m| m.role != "system")
+        .cloned()
+        .collect()
+}
 
 /// Build conversation excerpt from messages, including user, assistant, and
 /// brief tool result summaries for key findings. Filters out auto-generated

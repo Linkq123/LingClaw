@@ -44,35 +44,35 @@ fn is_private_ip_public_addresses() {
     assert!(!is_private_ip(&IpAddr::V6(public_v6)));
 }
 
-#[test]
-fn check_ssrf_blocks_unsupported_schemes() {
-    assert!(check_ssrf("ftp://example.com").is_some());
-    assert!(check_ssrf("file:///etc/passwd").is_some());
-    assert!(check_ssrf("gopher://evil.com").is_some());
+#[tokio::test]
+async fn check_ssrf_blocks_unsupported_schemes() {
+    assert!(check_ssrf("ftp://example.com").await.is_some());
+    assert!(check_ssrf("file:///etc/passwd").await.is_some());
+    assert!(check_ssrf("gopher://evil.com").await.is_some());
 }
 
-#[test]
-fn check_ssrf_blocks_private_ip_literals() {
-    assert!(check_ssrf("http://127.0.0.1/admin").is_some());
-    assert!(check_ssrf("http://10.0.0.1/internal").is_some());
-    assert!(check_ssrf("http://192.168.1.1/").is_some());
-    assert!(check_ssrf("http://[::1]/").is_some());
+#[tokio::test]
+async fn check_ssrf_blocks_private_ip_literals() {
+    assert!(check_ssrf("http://127.0.0.1/admin").await.is_some());
+    assert!(check_ssrf("http://10.0.0.1/internal").await.is_some());
+    assert!(check_ssrf("http://192.168.1.1/").await.is_some());
+    assert!(check_ssrf("http://[::1]/").await.is_some());
 }
 
-#[test]
-fn check_ssrf_allows_public_ip() {
-    assert!(check_ssrf("http://8.8.8.8/dns").is_none());
-    assert!(check_ssrf("https://1.1.1.1/").is_none());
+#[tokio::test]
+async fn check_ssrf_allows_public_ip() {
+    assert!(check_ssrf("http://8.8.8.8/dns").await.is_none());
+    assert!(check_ssrf("https://1.1.1.1/").await.is_none());
 }
 
-#[test]
-fn check_ssrf_blocks_invalid_url() {
-    assert!(check_ssrf("http://").is_some());
-    assert!(check_ssrf("not-a-url").is_some());
+#[tokio::test]
+async fn check_ssrf_blocks_invalid_url() {
+    assert!(check_ssrf("http://").await.is_some());
+    assert!(check_ssrf("not-a-url").await.is_some());
 }
 
-#[test]
-fn check_ssrf_allows_https_public_domain() {
+#[tokio::test]
+async fn check_ssrf_allows_https_public_domain() {
     // Public domains should pass (DNS resolves to public IPs)
-    assert!(check_ssrf("https://example.com").is_none());
+    assert!(check_ssrf("https://example.com").await.is_none());
 }
