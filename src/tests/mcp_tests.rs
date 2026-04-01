@@ -33,6 +33,7 @@ fn test_config_with_mcp() -> Config {
         api_key: "env-key".to_string(),
         api_base: "https://api.openai.com/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         openai_stream_include_usage: false,
         structured_memory: false,

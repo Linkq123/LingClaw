@@ -47,7 +47,7 @@ fn test_load_missing_returns_default() {
 #[test]
 fn test_format_memory_for_injection_empty() {
     let mem = StructuredMemory::default();
-    assert!(format_memory_for_injection(&mem).is_none());
+    assert!(format_memory_for_injection(&mem, None).is_none());
 }
 
 #[test]
@@ -69,7 +69,7 @@ fn test_format_memory_for_injection_with_facts() {
         updated_at: 100,
     };
 
-    let result = format_memory_for_injection(&mem).unwrap();
+    let result = format_memory_for_injection(&mem, None).unwrap();
     assert!(result.contains("Structured Memory"));
     assert!(result.contains("Likes concise code"));
     assert!(result.contains("preferred_language"));
@@ -361,7 +361,7 @@ fn test_format_memory_for_injection_sorts_by_recency() {
         updated_at: 2000,
     };
 
-    let injected = format_memory_for_injection(&mem).unwrap();
+    let injected = format_memory_for_injection(&mem, None).unwrap();
     let old_pos = injected.find("old value").unwrap();
     let new_pos = injected.find("new value").unwrap();
     // Newer fact should appear before older fact.
@@ -383,4 +383,273 @@ fn test_build_conversation_excerpt_truncates_long_tool_results() {
     assert!(excerpt.contains("[tool result:"));
     // Should be truncated, not include all 500 chars.
     assert!(excerpt.len() < 400);
+}
+
+// ── Incremental memory merge tests ──────────────────────────────────────────
+
+#[test]
+fn test_merge_incremental_update_adds_new_fact() {
+    let mut mem = StructuredMemory {
+        user_context: Some("existing".into()),
+        facts: vec![MemoryFact {
+            key: "lang".into(),
+            value: "Rust".into(),
+            recorded_at: 100,
+        }],
+        updated_at: 100,
+    };
+    let raw: serde_json::Value = serde_json::from_str(
+        r#"{"update_facts": [{"key": "editor", "value": "VS Code"}], "delete_facts": []}"#,
+    )
+    .unwrap();
+    merge_llm_response_into_memory(&mut mem, &raw, 200);
+    assert_eq!(mem.facts.len(), 2);
+    assert_eq!(mem.facts[0].key, "lang");
+    assert_eq!(mem.facts[0].recorded_at, 100); // unchanged
+    assert_eq!(mem.facts[1].key, "editor");
+    assert_eq!(mem.facts[1].value, "VS Code");
+    assert_eq!(mem.facts[1].recorded_at, 200);
+    // user_context unchanged (absent in response)
+    assert_eq!(mem.user_context.as_deref(), Some("existing"));
+}
+
+#[test]
+fn test_merge_incremental_update_modifies_existing() {
+    let mut mem = StructuredMemory {
+        user_context: None,
+        facts: vec![MemoryFact {
+            key: "lang".into(),
+            value: "Python".into(),
+            recorded_at: 100,
+        }],
+        updated_at: 100,
+    };
+    let raw: serde_json::Value = serde_json::from_str(
+        r#"{"update_facts": [{"key": "lang", "value": "Rust"}], "delete_facts": []}"#,
+    )
+    .unwrap();
+    merge_llm_response_into_memory(&mut mem, &raw, 200);
+    assert_eq!(mem.facts.len(), 1);
+    assert_eq!(mem.facts[0].value, "Rust");
+    assert_eq!(mem.facts[0].recorded_at, 200); // updated timestamp
+}
+
+#[test]
+fn test_merge_incremental_delete_removes_fact() {
+    let mut mem = StructuredMemory {
+        user_context: None,
+        facts: vec![
+            MemoryFact {
+                key: "old".into(),
+                value: "stale".into(),
+                recorded_at: 50,
+            },
+            MemoryFact {
+                key: "keep".into(),
+                value: "important".into(),
+                recorded_at: 100,
+            },
+        ],
+        updated_at: 100,
+    };
+    let raw: serde_json::Value =
+        serde_json::from_str(r#"{"update_facts": [], "delete_facts": ["old"]}"#).unwrap();
+    merge_llm_response_into_memory(&mut mem, &raw, 200);
+    assert_eq!(mem.facts.len(), 1);
+    assert_eq!(mem.facts[0].key, "keep");
+}
+
+#[test]
+fn test_merge_incremental_preserves_untouched_facts() {
+    let mut mem = StructuredMemory {
+        user_context: Some("ctx".into()),
+        facts: vec![
+            MemoryFact {
+                key: "a".into(),
+                value: "1".into(),
+                recorded_at: 10,
+            },
+            MemoryFact {
+                key: "b".into(),
+                value: "2".into(),
+                recorded_at: 20,
+            },
+            MemoryFact {
+                key: "c".into(),
+                value: "3".into(),
+                recorded_at: 30,
+            },
+        ],
+        updated_at: 30,
+    };
+    // Only update "b", leave "a" and "c" alone
+    let raw: serde_json::Value = serde_json::from_str(
+        r#"{"update_facts": [{"key": "b", "value": "updated"}], "delete_facts": []}"#,
+    )
+    .unwrap();
+    merge_llm_response_into_memory(&mut mem, &raw, 200);
+    assert_eq!(mem.facts.len(), 3);
+    assert_eq!(mem.facts[0].value, "1"); // a unchanged
+    assert_eq!(mem.facts[1].value, "updated"); // b updated
+    assert_eq!(mem.facts[2].value, "3"); // c unchanged
+}
+
+#[test]
+fn test_merge_legacy_full_replacement_still_works() {
+    let mut mem = StructuredMemory {
+        user_context: None,
+        facts: vec![
+            MemoryFact {
+                key: "old".into(),
+                value: "gone".into(),
+                recorded_at: 50,
+            },
+            MemoryFact {
+                key: "keep".into(),
+                value: "same".into(),
+                recorded_at: 100,
+            },
+        ],
+        updated_at: 100,
+    };
+    // Legacy format: just "facts" key
+    let raw: serde_json::Value = serde_json::from_str(
+        r#"{"facts": [{"key": "keep", "value": "same"}, {"key": "new", "value": "added"}]}"#,
+    )
+    .unwrap();
+    merge_llm_response_into_memory(&mut mem, &raw, 200);
+    assert_eq!(mem.facts.len(), 2);
+    assert_eq!(mem.facts[0].key, "keep");
+    assert_eq!(mem.facts[0].recorded_at, 100); // preserved timestamp for same value
+    assert_eq!(mem.facts[1].key, "new");
+    assert_eq!(mem.facts[1].recorded_at, 200);
+}
+
+#[test]
+fn test_merge_empty_response_preserves_memory() {
+    let mut mem = StructuredMemory {
+        user_context: Some("ctx".into()),
+        facts: vec![MemoryFact {
+            key: "lang".into(),
+            value: "Rust".into(),
+            recorded_at: 100,
+        }],
+        updated_at: 100,
+    };
+    let raw: serde_json::Value =
+        serde_json::from_str(r#"{"update_facts": [], "delete_facts": []}"#).unwrap();
+    merge_llm_response_into_memory(&mut mem, &raw, 200);
+    assert_eq!(mem.facts.len(), 1);
+    assert_eq!(mem.user_context.as_deref(), Some("ctx"));
+}
+
+#[test]
+fn test_merge_same_value_is_noop() {
+    let mut mem = StructuredMemory {
+        user_context: None,
+        facts: vec![MemoryFact {
+            key: "lang".into(),
+            value: "Rust".into(),
+            recorded_at: 100,
+        }],
+        updated_at: 100,
+    };
+    let raw: serde_json::Value = serde_json::from_str(
+        r#"{"update_facts": [{"key": "lang", "value": "Rust"}], "delete_facts": []}"#,
+    )
+    .unwrap();
+    merge_llm_response_into_memory(&mut mem, &raw, 200);
+    assert_eq!(mem.facts.len(), 1);
+    assert_eq!(mem.facts[0].value, "Rust");
+    assert_eq!(mem.facts[0].recorded_at, 100); // timestamp unchanged
+}
+
+#[test]
+fn test_format_memory_query_aware_sorting() {
+    let mem = StructuredMemory {
+        user_context: None,
+        facts: vec![
+            MemoryFact {
+                key: "food".into(),
+                value: "likes sushi".into(),
+                recorded_at: 200, // newer but irrelevant
+            },
+            MemoryFact {
+                key: "language".into(),
+                value: "uses Rust primarily".into(),
+                recorded_at: 100, // older but relevant
+            },
+        ],
+        updated_at: 200,
+    };
+    // With query about Rust, the "language" fact should come first
+    let result = format_memory_for_injection(&mem, Some("How do I compile Rust?")).unwrap();
+    let lang_pos = result.find("language").unwrap();
+    let food_pos = result.find("food").unwrap();
+    assert!(
+        lang_pos < food_pos,
+        "relevant fact should be listed before irrelevant one"
+    );
+
+    // Without query, sorted by recency (food=200 first)
+    let result_no_query = format_memory_for_injection(&mem, None).unwrap();
+    let lang_pos2 = result_no_query.find("language").unwrap();
+    let food_pos2 = result_no_query.find("food").unwrap();
+    assert!(
+        food_pos2 < lang_pos2,
+        "without query, newer fact should be listed first"
+    );
+}
+
+#[test]
+fn test_tokenize_for_matching_handles_cjk() {
+    // Pure CJK: each character becomes a separate token
+    let tokens = crate::tokenize_for_matching("编程语言");
+    assert_eq!(tokens, vec!["编", "程", "语", "言"]);
+
+    // Mixed CJK + ASCII: ASCII words and CJK chars both emitted
+    let tokens = crate::tokenize_for_matching("喜欢Rust语言");
+    assert!(tokens.contains(&"rust".to_string()));
+    assert!(tokens.contains(&"语".to_string()));
+    assert!(tokens.contains(&"言".to_string()));
+    assert!(tokens.contains(&"喜".to_string()));
+
+    // Pure ASCII still works as before
+    let tokens = crate::tokenize_for_matching("hello world");
+    assert_eq!(tokens, vec!["hello", "world"]);
+
+    // Short ASCII words (< 2 chars) are filtered
+    let tokens = crate::tokenize_for_matching("I am OK");
+    assert_eq!(tokens, vec!["am", "ok"]);
+
+    // CJK punctuation should NOT become tokens
+    let tokens = crate::tokenize_for_matching("你好。世界？");
+    assert_eq!(tokens, vec!["你", "好", "世", "界"]);
+}
+
+#[test]
+fn test_query_aware_sorting_with_cjk_query() {
+    let mem = StructuredMemory {
+        user_context: None,
+        facts: vec![
+            MemoryFact {
+                key: "food".into(),
+                value: "likes sushi".into(),
+                recorded_at: 200,
+            },
+            MemoryFact {
+                key: "language".into(),
+                value: "使用Rust编程".into(),
+                recorded_at: 100,
+            },
+        ],
+        updated_at: 200,
+    };
+    let result = format_memory_for_injection(&mem, Some("Rust编程")).unwrap();
+    let lang_pos = result.find("language").unwrap();
+    let food_pos = result.find("food").unwrap();
+    assert!(
+        lang_pos < food_pos,
+        "CJK query should rank matching fact higher"
+    );
 }

@@ -111,7 +111,15 @@ async fn status_effective_think_level(
         .as_ref()
         .map(|round| round.has_observation)
         .unwrap_or(false);
-    agent::auto_think_level(cycles, has_observation).to_string()
+    let user_msg_chars = session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.as_ref())
+        .map(|c| c.chars().count())
+        .unwrap_or(0);
+    agent::auto_think_level(cycles, has_observation, user_msg_chars, 0).to_string()
 }
 
 async fn build_runtime_status(session: &Session, state: &AppState) -> String {

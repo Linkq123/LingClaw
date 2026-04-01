@@ -253,7 +253,14 @@ fn unquote_yaml_value(val: &str) -> String {
 
 /// Render a skill catalog section for injection into the system prompt.
 /// Returns `None` if no skills are discovered.
-pub(crate) fn render_skills_catalog(skills: &[SkillMeta]) -> Option<String> {
+///
+/// When `current_query` is provided and there are more than `SKILL_FULL_DISPLAY_THRESHOLD`
+/// skills, skills are ranked by keyword relevance to the query. The top matches
+/// get full descriptions; the rest are listed by name only to save tokens.
+pub(crate) fn render_skills_catalog(
+    skills: &[SkillMeta],
+    current_query: Option<&str>,
+) -> Option<String> {
     if skills.is_empty() {
         return None;
     }
@@ -270,6 +277,49 @@ pub(crate) fn render_skills_catalog(skills: &[SkillMeta]) -> Option<String> {
     );
     lines.push(String::new());
 
+    const SKILL_FULL_DISPLAY_THRESHOLD: usize = 5;
+    const SKILL_TOP_N: usize = 3;
+
+    if skills.len() > SKILL_FULL_DISPLAY_THRESHOLD {
+        if let Some(query) = current_query {
+            let query_tokens = crate::tokenize_for_matching(query);
+            let mut ranked: Vec<(usize, &SkillMeta)> = skills
+                .iter()
+                .map(|s| (skill_relevance(s, &query_tokens), s))
+                .collect();
+            ranked.sort_by(|a, b| b.0.cmp(&a.0));
+
+            // Only compress when at least one skill actually matches the query.
+            // Zero-hit queries fall through to full display for discoverability.
+            let max_score = ranked.first().map(|(s, _)| *s).unwrap_or(0);
+            if max_score > 0 {
+                for (i, (_score, skill)) in ranked.iter().enumerate() {
+                    let source_tag = skill.source.label();
+                    if i < SKILL_TOP_N {
+                        if skill.description.is_empty() {
+                            lines.push(format!(
+                                "- **{}** [`{}`] (`{}`)",
+                                skill.name, source_tag, skill.path
+                            ));
+                        } else {
+                            lines.push(format!(
+                                "- **{}** [`{}`] — {} (`{}`)",
+                                skill.name, source_tag, skill.description, skill.path
+                            ));
+                        }
+                    } else {
+                        lines.push(format!(
+                            "- **{}** [`{}`] (`{}`)",
+                            skill.name, source_tag, skill.path
+                        ));
+                    }
+                }
+                return Some(lines.join("\n"));
+            }
+        }
+    }
+
+    // Default: all skills with full descriptions
     for skill in skills {
         let source_tag = skill.source.label();
         if skill.description.is_empty() {
@@ -286,6 +336,18 @@ pub(crate) fn render_skills_catalog(skills: &[SkillMeta]) -> Option<String> {
     }
 
     Some(lines.join("\n"))
+}
+
+/// Score a skill's relevance to the query tokens.
+fn skill_relevance(skill: &SkillMeta, query_tokens: &[String]) -> usize {
+    if query_tokens.is_empty() {
+        return 0;
+    }
+    let text = format!("{} {}", skill.name, skill.description).to_lowercase();
+    query_tokens
+        .iter()
+        .filter(|t| text.contains(t.as_str()))
+        .count()
 }
 
 /// Check whether a system skill path is disabled by any entry in the disabled set.
@@ -689,11 +751,16 @@ pub(crate) fn load_session_prompt_files_with_snapshot(
         parts.push(format!("<!-- MEMORY.md -->\n{content}"));
     }
 
+    // Daily memory budget: cap each day file to avoid unbounded prompt growth
+    // (reflection entries accumulate over a busy day).
+    const DAILY_MEMORY_CHAR_BUDGET: usize = 4000;
+
     let today = snapshot.today();
     let yesterday = snapshot.yesterday();
     for date_str in &[today, yesterday] {
         let path = workspace.join("memory").join(format!("{date_str}.md"));
         if let Some(content) = read_nonempty(&path) {
+            let content = crate::truncate(&content, DAILY_MEMORY_CHAR_BUDGET);
             parts.push(format!("<!-- memory/{date_str}.md -->\n{content}"));
         }
     }

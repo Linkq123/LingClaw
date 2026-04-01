@@ -287,7 +287,10 @@ volumes:
   },
   "agents": {
     "defaults": {
-      "model": { "primary": "anthropic/claude-sonnet-4-20250514" }
+      "model": {
+        "primary": "anthropic/claude-sonnet-4-20250514",
+        "fast": "anthropic/claude-haiku-3-20250306"
+      }
     }
   }
 }

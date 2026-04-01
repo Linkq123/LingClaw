@@ -67,6 +67,8 @@ pub(crate) struct Config {
     pub(crate) api_key: String,
     pub(crate) api_base: String,
     pub(crate) model: String,
+    /// Optional lighter model for simple first-cycle queries.
+    pub(crate) fast_model: Option<String>,
     pub(crate) provider: Provider,
     pub(crate) openai_stream_include_usage: bool,
     pub(crate) anthropic_prompt_caching: bool,
@@ -94,11 +96,15 @@ impl Config {
             json_cfg.mcp_servers.unwrap_or_default();
 
         // Default model: JSON agents.defaults.model.primary → env LINGCLAW_MODEL → "gpt-4o-mini"
-        let default_from_json = json_cfg
+        let model_config = json_cfg
             .agents
             .and_then(|a| a.defaults)
-            .and_then(|d| d.model)
-            .and_then(|m| m.primary);
+            .and_then(|d| d.model);
+        let default_from_json = model_config.as_ref().and_then(|m| m.primary.clone());
+        let fast_model = model_config
+            .as_ref()
+            .and_then(|m| m.fast.clone())
+            .or_else(|| std::env::var("LINGCLAW_FAST_MODEL").ok());
 
         let model = default_from_json
             .or_else(|| std::env::var("LINGCLAW_MODEL").ok())
@@ -137,6 +143,7 @@ impl Config {
             api_key,
             api_base,
             model,
+            fast_model,
             provider,
             openai_stream_include_usage: settings
                 .openai_stream_include_usage
@@ -580,6 +587,8 @@ pub(crate) struct JsonAgentDefaults {
 #[derive(Deserialize, Default)]
 pub(crate) struct JsonDefaultModel {
     pub(crate) primary: Option<String>,
+    /// Optional lighter/cheaper model for simple queries (cycle 0, short input).
+    pub(crate) fast: Option<String>,
 }
 
 pub(crate) fn config_dir_path() -> Option<PathBuf> {

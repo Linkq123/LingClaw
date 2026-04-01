@@ -131,7 +131,8 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
   "agents": {
     "defaults": {
       "model": {
-        "primary": "openai/gpt-4o-mini"
+        "primary": "openai/gpt-4o-mini",
+        "fast": "openai/gpt-4o-mini"
       },
       "models": {
         "openai/gpt-4o-mini": {},
@@ -186,6 +187,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `LINGCLAW_EXEC_TIMEOUT` | `30` | Shell 命令超时（秒） |
 | `LINGCLAW_TOOL_TIMEOUT` | `30` | 非 shell 的 Act 阶段工具超时（秒） |
 | `LINGCLAW_MAX_CONTEXT_TOKENS` | `32000` | 默认上下文 token 预算 |
+| `LINGCLAW_FAST_MODEL` | 无 | 简单首轮查询使用的轻量模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_STRUCTURED_MEMORY` | `false` | 启用后台结构化记忆提取与 prompt 注入 |
 
 ## Slash Commands

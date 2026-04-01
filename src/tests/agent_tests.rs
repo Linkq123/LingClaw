@@ -105,19 +105,32 @@ fn evaluate_finish_returns_correct_reasons() {
 
 #[test]
 fn auto_think_level_adapts_by_cycle() {
-    // First round: medium
-    assert_eq!(auto_think_level(0, false), "medium");
-    assert_eq!(auto_think_level(0, true), "medium");
+    // First round: medium (short message, no errors)
+    assert_eq!(auto_think_level(0, false, 100, 0), "medium");
+    assert_eq!(auto_think_level(0, true, 100, 0), "medium");
+    // First round with complex message (>200 chars): high
+    assert_eq!(auto_think_level(0, false, 250, 0), "high");
     // Mid rounds with observation: high
-    assert_eq!(auto_think_level(1, true), "high");
-    assert_eq!(auto_think_level(5, true), "high");
+    assert_eq!(auto_think_level(1, true, 100, 0), "high");
+    assert_eq!(auto_think_level(5, true, 100, 0), "high");
     // Mid rounds without observation: medium
-    assert_eq!(auto_think_level(1, false), "medium");
-    assert_eq!(auto_think_level(5, false), "medium");
+    assert_eq!(auto_think_level(1, false, 100, 0), "medium");
+    assert_eq!(auto_think_level(5, false, 100, 0), "medium");
     // Late rounds: low regardless
-    assert_eq!(auto_think_level(6, false), "low");
-    assert_eq!(auto_think_level(6, true), "low");
-    assert_eq!(auto_think_level(100, true), "low");
+    assert_eq!(auto_think_level(6, false, 100, 0), "low");
+    assert_eq!(auto_think_level(6, true, 100, 0), "low");
+    assert_eq!(auto_think_level(100, true, 100, 0), "low");
+    // Exactly at boundary: still medium
+    assert_eq!(auto_think_level(0, false, 200, 0), "medium");
+}
+
+#[test]
+fn auto_think_level_escalates_on_errors() {
+    // Consecutive errors bump to high regardless of cycle
+    assert_eq!(auto_think_level(3, false, 100, 2), "high");
+    assert_eq!(auto_think_level(10, false, 100, 3), "high");
+    // Single error doesn't escalate
+    assert_eq!(auto_think_level(6, false, 100, 1), "low");
 }
 
 #[test]
@@ -160,7 +173,7 @@ fn summarize_observations_produces_summary_for_large() {
 
 #[test]
 fn observation_context_hint_none_when_empty() {
-    assert!(build_observation_context_hint(&[]).is_none());
+    assert!(build_observation_context_hint(&[], 0).is_none());
 }
 
 #[test]
@@ -172,8 +185,71 @@ fn observation_context_hint_builds_markdown() {
         line_count: 100,
         hint: "read_file returned 100 lines / 5000 bytes — focus on key findings".into(),
     }];
-    let hint = build_observation_context_hint(&summaries).unwrap();
+    let hint = build_observation_context_hint(&summaries, 0).unwrap();
     assert!(hint.starts_with("## Recent Observation Notes"));
     assert!(hint.contains("**read_file**"));
     assert!(hint.contains("c1"));
+}
+
+#[test]
+fn observation_hint_degradation_at_2_errors() {
+    let hint = build_observation_context_hint(&[], 2).unwrap();
+    assert!(hint.contains("2 consecutive tool errors"));
+    assert!(hint.contains("alternative approach"));
+}
+
+#[test]
+fn observation_hint_degradation_at_3_errors() {
+    let hint = build_observation_context_hint(&[], 3).unwrap();
+    assert!(hint.contains("3 consecutive tool errors"));
+    assert!(hint.contains("not working"));
+    assert!(hint.contains("different tool"));
+}
+
+#[test]
+fn observation_hint_no_degradation_below_2() {
+    assert!(build_observation_context_hint(&[], 0).is_none());
+    assert!(build_observation_context_hint(&[], 1).is_none());
+}
+
+#[test]
+fn finish_nudge_none_for_short_runs() {
+    assert!(build_finish_nudge(0).is_none());
+    assert!(build_finish_nudge(5).is_none());
+    assert!(build_finish_nudge(14).is_none());
+}
+
+#[test]
+fn finish_nudge_gentle_at_15() {
+    let nudge = build_finish_nudge(15).unwrap();
+    assert!(nudge.contains("Guidance"));
+    assert!(nudge.contains("wrap up"));
+}
+
+#[test]
+fn finish_nudge_strong_at_30() {
+    let nudge = build_finish_nudge(30).unwrap();
+    assert!(nudge.contains("Wrap Up Now"));
+    assert!(nudge.contains("Do not start new tool calls"));
+}
+
+#[test]
+fn simple_query_short_greetings() {
+    assert!(is_simple_query("hello"));
+    assert!(is_simple_query("hi there"));
+    assert!(is_simple_query("what time is it?"));
+    assert!(is_simple_query("who are you?"));
+}
+
+#[test]
+fn simple_query_rejects_complex() {
+    assert!(!is_simple_query("write a function to sort an array"));
+    assert!(!is_simple_query("debug this error message"));
+    assert!(!is_simple_query("implement a binary search tree"));
+    assert!(!is_simple_query("explain how async/await works in Rust"));
+    assert!(!is_simple_query(&"a".repeat(200)));
+    // Chinese complex keywords
+    assert!(!is_simple_query("帮我实现一个排序算法"));
+    assert!(!is_simple_query("分析这段代码"));
+    assert!(!is_simple_query("编写一个函数"));
 }

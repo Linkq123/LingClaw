@@ -198,17 +198,38 @@ pub(crate) fn summarize_observations(results: &[ToolResultEntry]) -> Vec<Observa
 /// Build a compact context hint from observation summaries.
 /// Injected into the system prompt's trailing section before the next
 /// Analyze round so the model knows which tool outputs were large.
-/// Returns `None` if no summaries exist.
-pub(crate) fn build_observation_context_hint(summaries: &[ObservationSummary]) -> Option<String> {
-    if summaries.is_empty() {
+/// When `consecutive_errors` >= 2, appends a degradation hint nudging
+/// the model to try alternative approaches instead of retrying the same tool.
+/// Returns `None` if no summaries exist and no degradation hint is needed.
+pub(crate) fn build_observation_context_hint(
+    summaries: &[ObservationSummary],
+    consecutive_errors: usize,
+) -> Option<String> {
+    if summaries.is_empty() && consecutive_errors < 2 {
         return None;
     }
-    let mut lines = Vec::with_capacity(summaries.len() + 1);
+    let mut lines = Vec::with_capacity(summaries.len() + 3);
     lines.push("## Recent Observation Notes".to_owned());
     for s in summaries {
         lines.push(format!(
             "- **{}** (id: {}): {}",
             s.tool_name, s.tool_call_id, s.hint
+        ));
+    }
+    if consecutive_errors >= 3 {
+        lines.push(String::new());
+        lines.push(format!(
+            "⚠ **{consecutive_errors} consecutive tool errors detected.** \
+             The current approach is not working. Stop retrying the same tool/arguments. \
+             Consider: (1) a completely different tool, (2) different parameters, \
+             (3) breaking the task into smaller steps, or (4) asking the user for clarification."
+        ));
+    } else if consecutive_errors >= 2 {
+        lines.push(String::new());
+        lines.push(format!(
+            "⚠ **{consecutive_errors} consecutive tool errors.** \
+             Consider trying an alternative approach or different parameters \
+             before retrying."
         ));
     }
     Some(lines.join("\n"))
@@ -308,15 +329,80 @@ pub(crate) enum HookResult {
 }
 
 /// Compute effective think level when session mode is "auto".
-/// Adapts reasoning budget based on cycle depth and observation context.
+/// Adapts reasoning budget based on cycle depth, observation context,
+/// user message complexity, and consecutive tool errors.
 /// Called only for auto-mode sessions with reasoning-capable models.
-pub(crate) fn auto_think_level(cycles: usize, has_observation: bool) -> &'static str {
+///
+/// `user_msg_chars` is the **character** count (not byte length) of the
+/// latest user message, so CJK text is not unfairly penalised.
+pub(crate) fn auto_think_level(
+    cycles: usize,
+    has_observation: bool,
+    user_msg_chars: usize,
+    consecutive_errors: usize,
+) -> &'static str {
+    // Consecutive tool failures: escalate to deeper thinking
+    if consecutive_errors >= 2 {
+        return "high";
+    }
+
+    // Complex user request on first cycle: start with higher budget
+    if cycles == 0 && user_msg_chars > 200 {
+        return "high";
+    }
+
     match (cycles, has_observation) {
         (0, _) => "medium",
         (_, true) if cycles <= 5 => "high",
         (1..=5, false) => "medium",
+        // Efficiency mode for deep loops
         _ => "low",
     }
+}
+
+/// Build a soft finish nudge when the agent has been looping for many cycles.
+/// Returns `None` for short runs. The nudge is injected into the system prompt
+/// to gently guide the model toward wrapping up, preventing runaway loops.
+pub(crate) fn build_finish_nudge(cycles: usize) -> Option<&'static str> {
+    match cycles {
+        0..=14 => None,
+        15..=29 => Some(
+            "## Guidance\n\
+             You have been working for many cycles. Consider whether you have enough \
+             information to provide a comprehensive answer. If so, wrap up your response.",
+        ),
+        _ => Some(
+            "## Priority: Wrap Up Now\n\
+             You have been working for an extended number of cycles. Provide your best \
+             answer with the information gathered so far. Do not start new tool calls \
+             unless absolutely critical to answering the user's question.",
+        ),
+    }
+}
+
+/// Heuristic: returns `true` when the query is simple enough to use
+/// a cheaper/faster model (when configured). Only relevant on cycle 0.
+///
+/// A query is considered "simple" when it is short and does not contain
+/// keywords suggesting code generation, analysis, or multi-step reasoning.
+pub(crate) fn is_simple_query(query: &str) -> bool {
+    // Use char count (not byte length) so CJK text isn't unfairly penalised.
+    const MAX_SIMPLE_CHARS: usize = 120;
+    if query.chars().count() > MAX_SIMPLE_CHARS {
+        return false;
+    }
+    let lower = query.to_ascii_lowercase();
+    const COMPLEX_KEYWORDS: &[&str] = &[
+        "code", "implement", "refactor", "debug", "fix", "error", "bug",
+        "function", "class", "struct", "async", "trait", "module",
+        "explain", "analyze", "compare", "design", "architect",
+        "write", "create", "build", "generate", "convert",
+        "```", "fn ", "def ", "import ", "use ",
+        // Chinese equivalents for common complex-task keywords
+        "代码", "实现", "重构", "调试", "修复", "错误", "函数",
+        "分析", "解释", "设计", "编写", "创建", "生成",
+    ];
+    !COMPLEX_KEYWORDS.iter().any(|kw| lower.contains(kw))
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

@@ -24,6 +24,7 @@ fn test_config() -> Config {
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -190,6 +191,7 @@ fn resolve_model_uses_config_for_plain_model_id() {
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -403,6 +405,7 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         api_key: "key-a".to_string(),
         api_base: "https://api-a.example/v1".to_string(),
         model: "shared-model".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -477,6 +480,7 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "shared-model".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -543,6 +547,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         api_key: "key-b".to_string(),
         api_base: "https://api-b.example/v1".to_string(),
         model: "shared-model".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -591,6 +596,7 @@ fn canonical_model_ref_expands_unique_plain_id() {
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -656,6 +662,7 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         api_key: "key-a".to_string(),
         api_base: "https://api-a.example/v1".to_string(),
         model: "shared-model".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -723,6 +730,7 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         api_key: "key-a".to_string(),
         api_base: "https://api-a.example/v1".to_string(),
         model: "shared-model".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -770,6 +778,7 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -817,6 +826,7 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -844,6 +854,7 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         api_key: "env-key".to_string(),
         api_base: "https://api.openai.com/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -871,6 +882,7 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         api_key: "env-key".to_string(),
         api_base: "https://api.openai.com/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -918,6 +930,7 @@ fn build_session_status_reports_resolved_target() {
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1824,7 +1837,7 @@ fn observation_summaries_are_independent_of_session_messages() {
     assert_eq!(summaries.len(), 1);
     assert_eq!(summaries[0].tool_call_id, "c2");
 
-    let hint = agent::build_observation_context_hint(&summaries);
+    let hint = agent::build_observation_context_hint(&summaries, 0);
     assert!(hint.is_some());
     let hint_text = hint.unwrap();
     assert!(hint_text.contains("read_file"));
@@ -1849,7 +1862,7 @@ fn system_prompt_with_observation_hint_preserves_original_content() {
         line_count: 200,
         hint: "exec returned 200 lines / 8000 bytes — focus on key findings".into(),
     }];
-    if let Some(hint) = agent::build_observation_context_hint(&summaries) {
+    if let Some(hint) = agent::build_observation_context_hint(&summaries, 0) {
         if let Some(ref mut content) = msg.content {
             content.push_str("\n\n");
             content.push_str(&hint);
@@ -1872,13 +1885,13 @@ fn finish_reason_label_appears_in_done_event_shape() {
 #[test]
 fn auto_think_adapts_in_agent_loop_context() {
     // Simulate the pattern used in the Analyze arm:
-    // auto mode + reasoning model → phase-adapted level
+    // auto mode + reasoning model — phase-adapted level
     let think_level = "auto";
     let model_supports_reasoning = true;
 
     // Cycle 0, no observation
     let effective = if think_level == "auto" && model_supports_reasoning {
-        agent::auto_think_level(0, false).to_owned()
+        agent::auto_think_level(0, false, 0, 0).to_owned()
     } else {
         think_level.to_owned()
     };
@@ -1886,7 +1899,7 @@ fn auto_think_adapts_in_agent_loop_context() {
 
     // Cycle 2, has observation
     let effective = if think_level == "auto" && model_supports_reasoning {
-        agent::auto_think_level(2, true).to_owned()
+        agent::auto_think_level(2, true, 0, 0).to_owned()
     } else {
         think_level.to_owned()
     };
@@ -1894,16 +1907,16 @@ fn auto_think_adapts_in_agent_loop_context() {
 
     // Cycle 10, late round
     let effective = if think_level == "auto" && model_supports_reasoning {
-        agent::auto_think_level(10, false).to_owned()
+        agent::auto_think_level(10, false, 0, 0).to_owned()
     } else {
         think_level.to_owned()
     };
     assert_eq!(effective, "low");
 
-    // Explicit level → no adaptation
+    // Explicit level — no adaptation
     let think_level = "high";
     let effective = if think_level == "auto" && model_supports_reasoning {
-        agent::auto_think_level(5, true).to_owned()
+        agent::auto_think_level(5, true, 0, 0).to_owned()
     } else {
         think_level.to_owned()
     };
@@ -2923,7 +2936,7 @@ fn session_version_is_preserved_in_serialization() {
 fn tool_outcome_error_detection_by_convention() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // Unknown tool → is_error
+    // Unknown tool — is_error
     let outcome = rt.block_on(tools::execute_tool(
         "nonexistent",
         "{}",
@@ -3043,7 +3056,7 @@ fn prune_messages_tracks_removal_count() {
         },
     ];
     let before = messages.len();
-    prune_messages(&mut messages, 1000); // very small limit → must prune
+    prune_messages(&mut messages, 1000); // very small limit — must prune
     let pruned = before - messages.len();
     assert!(pruned > 0, "should have removed at least one turn");
     // System + latest user should remain
@@ -3361,6 +3374,7 @@ fn context_input_budget_reserves_headroom() {
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -3762,7 +3776,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
             tool_call_id: None,
             timestamp: None,
         },
-        // Only 1 of 2 tool results present → incomplete
+        // Only 1 of 2 tool results present — incomplete
         ChatMessage {
             role: "tool".into(),
             content: Some("result1".into()),

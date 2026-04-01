@@ -452,6 +452,12 @@ pub(crate) fn tool_definitions_anthropic() -> serde_json::Value {
     json!(tools)
 }
 
+/// Returns true if the named tool performs no side effects (no writes, no exec).
+/// Used to gate parallel execution — only read-only tool batches are safe to parallelize.
+pub(crate) fn is_read_only_tool(name: &str) -> bool {
+    matches!(name, "think" | "read_file" | "list_dir" | "search_files" | "http_fetch")
+}
+
 pub(crate) async fn execute_tool(
     name: &str,
     args_str: &str,

@@ -377,8 +377,14 @@ const MEMORY_INJECTION_CHAR_BUDGET: usize = 2_000;
 
 /// Format structured memory for injection into the system prompt.
 /// Returns `None` if the memory is empty.
-/// Facts are sorted by recency (newest first) so truncation drops stale facts.
-pub(crate) fn format_memory_for_injection(mem: &StructuredMemory) -> Option<String> {
+///
+/// When `current_query` is provided, facts are sorted by keyword relevance
+/// to the current query (most relevant first), with recency as tiebreaker.
+/// Without a query, facts are sorted by recency (newest first).
+pub(crate) fn format_memory_for_injection(
+    mem: &StructuredMemory,
+    current_query: Option<&str>,
+) -> Option<String> {
     if mem.user_context.is_none() && mem.facts.is_empty() {
         return None;
     }
@@ -393,9 +399,21 @@ pub(crate) fn format_memory_for_injection(mem: &StructuredMemory) -> Option<Stri
     }
 
     if !mem.facts.is_empty() {
-        // Sort by recency: newest first for priority-aware truncation.
         let mut sorted_facts = mem.facts.clone();
-        sorted_facts.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at));
+
+        if let Some(query) = current_query {
+            // Keyword-overlap scoring: tokenize query and score each fact.
+            let query_tokens = crate::tokenize_for_matching(query);
+            sorted_facts.sort_by(|a, b| {
+                let score_a = fact_relevance_score(a, &query_tokens);
+                let score_b = fact_relevance_score(b, &query_tokens);
+                score_b
+                    .cmp(&score_a)
+                    .then(b.recorded_at.cmp(&a.recorded_at))
+            });
+        } else {
+            sorted_facts.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at));
+        }
 
         lines.push("**Remembered facts:**".to_string());
         for fact in &sorted_facts {
@@ -405,12 +423,24 @@ pub(crate) fn format_memory_for_injection(mem: &StructuredMemory) -> Option<Stri
 
     let result = lines.join("\n");
     if result.len() > MEMORY_INJECTION_CHAR_BUDGET {
-        // Truncate at a safe boundary
         let truncated = crate::truncate(&result, MEMORY_INJECTION_CHAR_BUDGET);
         Some(format!("{truncated}\n*(memory truncated)*"))
     } else {
         Some(result)
     }
+}
+
+/// Score a memory fact's relevance to the query tokens.
+/// Higher score = more relevant.
+fn fact_relevance_score(fact: &MemoryFact, query_tokens: &[String]) -> usize {
+    if query_tokens.is_empty() {
+        return 0;
+    }
+    let fact_text = format!("{} {}", fact.key, fact.value).to_lowercase();
+    query_tokens
+        .iter()
+        .filter(|token| fact_text.contains(token.as_str()))
+        .count()
 }
 
 // ── Async update queue ──────────────────────────────────────────────────────
@@ -640,6 +670,104 @@ async fn memory_updater_loop(
     }
 }
 
+/// Merge a parsed LLM extraction response into the existing memory.
+///
+/// Supports two formats:
+/// - **Incremental** (`update_facts` + `delete_facts`): only touches mentioned facts.
+/// - **Legacy full-replacement** (`facts`): replaces all facts (backward compat).
+///
+/// `user_context` is only updated when the key is explicitly present in `raw`.
+pub(crate) fn merge_llm_response_into_memory(
+    memory: &mut StructuredMemory,
+    raw: &serde_json::Value,
+    now: u64,
+) {
+    // Only touch user_context when the key is actually present in the response.
+    // null → clear, string → update, absent → preserve existing.
+    if raw.get("user_context").is_some() {
+        memory.user_context = raw["user_context"].as_str().map(|s| s.to_string());
+    }
+
+    let used_incremental = raw.get("update_facts").is_some() || raw.get("delete_facts").is_some();
+
+    if used_incremental {
+        // Apply deletions first
+        if let Some(delete_arr) = raw.get("delete_facts").and_then(|v| v.as_array()) {
+            let delete_keys: Vec<&str> = delete_arr.iter().filter_map(|v| v.as_str()).collect();
+            memory
+                .facts
+                .retain(|f| !delete_keys.contains(&f.key.as_str()));
+        }
+
+        // Apply updates/inserts
+        if let Some(update_arr) = raw.get("update_facts").and_then(|v| v.as_array()) {
+            for fv in update_arr {
+                let key = fv
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let value = fv
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if key.is_empty() || value.is_empty() {
+                    continue;
+                }
+                if let Some(existing_fact) = memory.facts.iter_mut().find(|f| f.key == key) {
+                    if existing_fact.value != value {
+                        existing_fact.value = value;
+                        existing_fact.recorded_at = now;
+                    }
+                } else {
+                    memory.facts.push(MemoryFact {
+                        key,
+                        value,
+                        recorded_at: now,
+                    });
+                }
+            }
+        }
+    } else if let Some(facts_val) = raw.get("facts") {
+        // Legacy full-replacement path
+        if let Some(facts_arr) = facts_val.as_array() {
+            let mut new_facts = Vec::new();
+            for fv in facts_arr {
+                let key = fv
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let value = fv
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if key.is_empty() || value.is_empty() {
+                    continue;
+                }
+                let recorded_at = memory
+                    .facts
+                    .iter()
+                    .find(|f| f.key == key && f.value == value)
+                    .map(|f| f.recorded_at)
+                    .unwrap_or(now);
+                new_facts.push(MemoryFact {
+                    key,
+                    value,
+                    recorded_at,
+                });
+            }
+            memory.facts = new_facts;
+        }
+    }
+}
+
 /// Core memory update: call LLM to extract memory from conversation,
 /// merge with existing memory, and persist.
 async fn process_memory_update(
@@ -679,14 +807,15 @@ Current memory state:
 
 Instructions:
 1. Extract any new user preferences, key decisions, project context, or important facts from the conversation.
-2. Return the COMPLETE updated memory — include all facts that should be kept. Omit any facts that are clearly outdated or contradicted by the conversation.
-3. Update user_context if the user reveals preferences, background, or working style. Set to null to clear it.
+2. Return ONLY the changes needed — do not repeat unchanged facts.
+3. Update user_context if the user reveals preferences, background, or working style. Omit user_context from your response if it hasn't changed. Set to null to clear it.
 4. Return ONLY valid JSON matching this schema (no markdown fences, no explanation):
 
-{{"user_context": "string or null", "facts": [{{"key": "short_label", "value": "content"}}]}}
+{{"user_context": "string or null (omit if unchanged)", "update_facts": [{{"key": "short_label", "value": "content"}}], "delete_facts": ["key_to_remove"]}}
 
-IMPORTANT: The returned facts list REPLACES the existing facts entirely. Include ALL facts that should persist, not just new ones.
-If there is nothing meaningful to extract, return the existing memory unchanged.
+- `update_facts`: New facts to add, or existing facts to update (matched by key). Only include facts that are new or whose value changed.
+- `delete_facts`: Keys of facts that are clearly outdated or contradicted by the conversation. Only delete when you are certain.
+- If there is nothing meaningful to extract, return: {{"update_facts": [], "delete_facts": []}}
 Keep facts concise. Do not store ephemeral task details — only persistent knowledge."#
     );
 
@@ -738,50 +867,7 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
     let mut merged = existing;
     let before_json = serde_json::to_string(&merged).unwrap_or_default();
 
-    // Only touch user_context when the key is actually present in the response.
-    // null → clear, string → update, absent → preserve existing.
-    if raw.get("user_context").is_some() {
-        merged.user_context = raw["user_context"].as_str().map(|s| s.to_string());
-    }
-
-    // Only replace facts when the key is actually present in the response.
-    // Absent → preserve existing facts unchanged.
-    if let Some(facts_val) = raw.get("facts") {
-        if let Some(facts_arr) = facts_val.as_array() {
-            let mut new_facts = Vec::new();
-            for fv in facts_arr {
-                let key = fv
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                let value = fv
-                    .get("value")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if key.is_empty() || value.is_empty() {
-                    continue;
-                }
-                let recorded_at = merged
-                    .facts
-                    .iter()
-                    .find(|f| f.key == key && f.value == value)
-                    .map(|f| f.recorded_at)
-                    .unwrap_or(now);
-                new_facts.push(MemoryFact {
-                    key,
-                    value,
-                    recorded_at,
-                });
-            }
-            merged.facts = new_facts;
-        }
-    }
-
-    merged.updated_at = now;
+    merge_llm_response_into_memory(&mut merged, &raw, now);
 
     // Cap total facts to prevent unbounded growth
     const MAX_FACTS: usize = 50;
@@ -795,8 +881,13 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
 
     let facts_after = merged.facts.len();
     let had_user_context_after = merged.user_context.is_some();
+    // Only update timestamp and persist when actual content changed.
     let after_json = serde_json::to_string(&merged).unwrap_or_default();
-    save_structured_memory(&req.workspace, &merged)?;
+    let changed = before_json != after_json;
+    if changed {
+        merged.updated_at = now;
+        save_structured_memory(&req.workspace, &merged)?;
+    }
 
     Ok(MemoryProcessStats {
         excerpt_chars,
@@ -804,7 +895,7 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
         facts_after,
         had_user_context_before,
         had_user_context_after,
-        changed: before_json != after_json,
+        changed,
     })
 }
 
@@ -843,7 +934,7 @@ pub(crate) fn prefilter_for_memory(messages: &[crate::ChatMessage]) -> Vec<crate
 /// Build conversation excerpt from messages, including user, assistant, and
 /// brief tool result summaries for key findings. Filters out auto-generated
 /// compression summaries and excessive tool noise.
-fn build_conversation_excerpt(messages: &[crate::ChatMessage]) -> String {
+pub(crate) fn build_conversation_excerpt(messages: &[crate::ChatMessage]) -> String {
     let mut lines = Vec::new();
     for msg in messages {
         match msg.role.as_str() {

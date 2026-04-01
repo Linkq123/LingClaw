@@ -349,7 +349,7 @@ fn render_skills_catalog_formats_correctly() {
             source: SkillSource::System,
         },
     ];
-    let catalog = render_skills_catalog(&skills).expect("catalog should render");
+    let catalog = render_skills_catalog(&skills, None).expect("catalog should render");
     assert!(catalog.contains("## Skills"));
     assert!(catalog.contains("**coding** [`session`] — Help with code (`skills/coding/SKILL.md`)"));
     assert!(catalog.contains("**minimal** [`system`] (`skills/minimal/SKILL.md`)"));
@@ -357,7 +357,7 @@ fn render_skills_catalog_formats_correctly() {
 
 #[test]
 fn render_skills_catalog_returns_none_for_empty_list() {
-    assert!(render_skills_catalog(&[]).is_none());
+    assert!(render_skills_catalog(&[], None).is_none());
 }
 
 #[test]
@@ -469,6 +469,75 @@ fn discover_all_skills_deduplicates_by_name_later_wins() {
 }
 
 #[test]
+fn test_skill_tokenize_handles_cjk() {
+    let tokens = crate::tokenize_for_matching("PDF解析工具");
+    assert_eq!(tokens, vec!["pdf", "解", "析", "工", "具"]);
+
+    let tokens = crate::tokenize_for_matching("hello world");
+    assert_eq!(tokens, vec!["hello", "world"]);
+
+    let tokens = crate::tokenize_for_matching("代码审查");
+    assert_eq!(tokens, vec!["代", "码", "审", "查"]);
+}
+
+#[test]
+fn test_skill_tokenize_excludes_cjk_punctuation() {
+    // CJK punctuation (。？「」) should NOT become tokens
+    let tokens = crate::tokenize_for_matching("你好。世界？");
+    assert_eq!(tokens, vec!["你", "好", "世", "界"]);
+}
+
+#[test]
+fn test_render_skills_catalog_query_aware_compression() {
+    // Build 6 skills (above SKILL_FULL_DISPLAY_THRESHOLD=5) with one matching query
+    let skills: Vec<SkillMeta> = (0..6)
+        .map(|i| SkillMeta {
+            name: format!("skill-{i}"),
+            description: if i == 2 {
+                "Help with Rust code".to_string()
+            } else {
+                format!("Generic skill {i}")
+            },
+            path: format!("skills/skill-{i}/SKILL.md"),
+            source: SkillSource::Session,
+        })
+        .collect();
+
+    // With a relevant query, top-N get full descriptions, rest abbreviated
+    let catalog = render_skills_catalog(&skills, Some("Rust")).unwrap();
+    // skill-2 has "Rust" overlap, should get full description
+    assert!(catalog.contains("Help with Rust code"));
+    // At least one skill should be abbreviated (no description shown)
+    let abbreviated_count = catalog.lines().filter(|l| {
+        l.starts_with("- **skill-") && !l.contains(" — ")
+    }).count();
+    assert!(abbreviated_count > 0, "some skills should be abbreviated");
+}
+
+#[test]
+fn test_render_skills_catalog_zero_hit_shows_all_descriptions() {
+    // 6 skills, none matching the query — should fall back to full display
+    let skills: Vec<SkillMeta> = (0..6)
+        .map(|i| SkillMeta {
+            name: format!("skill-{i}"),
+            description: format!("Description for {i}"),
+            path: format!("skills/skill-{i}/SKILL.md"),
+            source: SkillSource::Session,
+        })
+        .collect();
+
+    // Query has zero overlap with any skill
+    let catalog = render_skills_catalog(&skills, Some("quantum physics")).unwrap();
+    // All 6 descriptions should be present (full display fallback)
+    for i in 0..6 {
+        assert!(
+            catalog.contains(&format!("Description for {i}")),
+            "skill-{i} description should be shown on zero-hit fallback"
+        );
+    }
+}
+
+#[test]
 fn skill_source_label_returns_correct_strings() {
     assert_eq!(SkillSource::System.label(), "system");
     assert_eq!(SkillSource::Global.label(), "global");
@@ -548,4 +617,41 @@ fn system_skill_disabled_non_system_path_passthrough() {
         "global://skills/other/SKILL.md",
         &disabled,
     ));
+}
+
+#[test]
+fn load_session_prompt_files_truncates_large_daily_memory() {
+    let workspace = std::env::temp_dir().join("lingclaw-prompt-daily-trunc-test");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(workspace.join("memory")).expect("memory dir");
+    fs::write(workspace.join("AGENTS.md"), "agent").unwrap();
+    fs::write(workspace.join("IDENTITY.md"), "identity").unwrap();
+    fs::write(workspace.join("USER.md"), "user").unwrap();
+
+    // Write a daily memory file that exceeds the 4000-char budget.
+    let big_content = "x".repeat(6000);
+    fs::write(workspace.join("memory/2026-03-16.md"), &big_content).unwrap();
+
+    let snapshot = LocalTimeSnapshot::from_datetime(
+        DateTime::parse_from_rfc3339("2026-03-16T12:00:00+08:00").unwrap(),
+    );
+    let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
+
+    // The injected daily memory must not exceed the budget + truncation marker.
+    let daily_marker = "<!-- memory/2026-03-16.md -->";
+    let daily_start = loaded.find(daily_marker).expect("daily memory should be present");
+    let daily_section = &loaded[daily_start..];
+    // Budget is 4000 chars; with truncation marker overhead, the section should
+    // be well under 4200 chars and certainly below the original 6000.
+    assert!(
+        daily_section.len() < 4200,
+        "daily memory section should be truncated, got {} chars",
+        daily_section.len()
+    );
+    assert!(
+        daily_section.contains("truncated"),
+        "truncated daily memory should contain truncation marker"
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
 }

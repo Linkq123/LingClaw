@@ -343,6 +343,16 @@ fn build_system_prompt(
     model: &str,
     disabled_system_skills: &HashSet<String>,
 ) -> ChatMessage {
+    build_system_prompt_with_query(config, workspace, model, disabled_system_skills, None)
+}
+
+fn build_system_prompt_with_query(
+    config: &Config,
+    workspace: &Path,
+    model: &str,
+    disabled_system_skills: &HashSet<String>,
+    current_query: Option<&str>,
+) -> ChatMessage {
     let os_name = if cfg!(windows) {
         "Windows"
     } else if cfg!(target_os = "macos") {
@@ -375,21 +385,24 @@ Only read those files if the user explicitly asks to inspect them, if you need t
             })
             .collect()
     };
-    let skills_section = prompts::render_skills_catalog(&skills_section)
+    let skills_section = prompts::render_skills_catalog(&skills_section, current_query)
         .map(|s| format!("\n\n{s}"))
         .unwrap_or_default();
 
     // Structured memory injection (coexists with MEMORY.md and daily memory)
     let structured_memory_section = if config.structured_memory {
-        memory::format_memory_for_injection(&memory::load_structured_memory(workspace))
-            .map(|s| format!("\n\n{s}"))
-            .unwrap_or_default()
+        memory::format_memory_for_injection(
+            &memory::load_structured_memory(workspace),
+            current_query,
+        )
+        .map(|s| format!("\n\n{s}"))
+        .unwrap_or_default()
     } else {
         String::new()
     };
 
     let prompt = format!(
-        r#"{persona}
+        r#"{persona}{structured_memory_section}
 
 ---
 
@@ -402,7 +415,7 @@ Only read those files if the user explicitly asks to inspect them, if you need t
 {prompt_file_note}
 
 ## Available Tools
-{tool_lines}{mcp_note}{skills_section}{structured_memory_section}"#,
+{tool_lines}{mcp_note}{skills_section}"#,
         model = model,
         local_time = local_time,
         tool_lines = tool_lines,
@@ -650,6 +663,48 @@ fn truncate(s: &str, max: usize) -> String {
             s.len()
         )
     }
+}
+
+/// Tokenize a string into lowercase words for keyword matching.
+/// CJK characters are emitted as individual tokens so that per-character
+/// overlap scoring works with `text.contains(token)`.
+fn tokenize_for_matching(s: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            current.push(c);
+        } else if is_cjk_char(c) {
+            if current.len() >= 2 {
+                tokens.push(current.to_lowercase());
+            }
+            current.clear();
+            tokens.push(c.to_string());
+        } else {
+            if current.len() >= 2 {
+                tokens.push(current.to_lowercase());
+            }
+            current.clear();
+        }
+    }
+    if current.len() >= 2 {
+        tokens.push(current.to_lowercase());
+    }
+    tokens
+}
+
+/// Returns `true` for CJK Unified, Extension A, Compatibility,
+/// Hiragana, Katakana, and Hangul Syllables.
+fn is_cjk_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{4E00}'..='\u{9FFF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{3040}'..='\u{309F}'
+            | '\u{30A0}'..='\u{30FF}'
+            | '\u{AC00}'..='\u{D7AF}'
+    )
 }
 
 fn format_size(bytes: u64) -> String {

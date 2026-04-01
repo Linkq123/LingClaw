@@ -7,6 +7,7 @@ fn test_config() -> Config {
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
+        fast_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),

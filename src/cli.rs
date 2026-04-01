@@ -1798,7 +1798,23 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
         }
     }
 
+    // Derive a sensible fast model from the chosen provider.
+    let fast_model: Option<String> = match provider_choice {
+        0 => Some("openai/gpt-4o-mini".to_string()),
+        1 => Some("anthropic/claude-haiku-3-20250306".to_string()),
+        _ => None,
+    };
+
     // Build config JSON
+    let mut model_block = serde_json::Map::new();
+    model_block.insert(
+        "primary".to_string(),
+        json!(default_model.unwrap_or_else(|| "gpt-4o-mini".to_string())),
+    );
+    if let Some(ref fast) = fast_model {
+        model_block.insert("fast".to_string(), json!(fast));
+    }
+
     let mut config = json!({
         "settings": {
             "port": DEFAULT_PORT,
@@ -1811,9 +1827,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
         },
         "agents": {
             "defaults": {
-                "model": {
-                    "primary": default_model.unwrap_or_else(|| "gpt-4o-mini".to_string()),
-                },
+                "model": model_block,
                 "models": agent_models,
             }
         }
@@ -1850,6 +1864,9 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     }
 
     println!("   ✅ Configuration saved to {}", config_path.display());
+    if fast_model.is_some() {
+        println!("   💡 Fast model configured for simple first-cycle queries.");
+    }
     #[cfg(not(target_os = "windows"))]
     if add_systemd {
         println!();

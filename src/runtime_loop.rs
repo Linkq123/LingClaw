@@ -49,6 +49,8 @@ struct AnalyzeSnapshot {
     model: String,
     think_level: String,
     pruned_count: usize,
+    /// Character count of latest user message, for complexity-aware think level.
+    user_msg_chars: usize,
 }
 
 enum ToolRunState {
@@ -57,6 +59,94 @@ enum ToolRunState {
 }
 
 const AGENT_HARD_CAP_ROUNDS: usize = 200;
+
+/// Post-execution reflection: analyze what went well/poorly in a multi-step task.
+/// Writes a brief reflection to the session's daily memory file.
+/// Runs as a non-blocking background task — failures are non-critical.
+async fn run_post_execution_reflection(
+    config: &Config,
+    http: &reqwest::Client,
+    workspace: &std::path::Path,
+    model: &str,
+    messages: &[ChatMessage],
+    cycles: usize,
+    tool_calls: usize,
+) -> Result<(), String> {
+    // Build a compact excerpt of the conversation for reflection.
+    let excerpt = crate::memory::build_conversation_excerpt(messages);
+    if excerpt.trim().is_empty() {
+        return Ok(());
+    }
+    // Cap excerpt to avoid excessive token use for reflection.
+    let excerpt = crate::truncate(&excerpt, 8_000);
+
+    let system_prompt = format!(
+        "You are reflecting on a completed task. The task took {cycles} reasoning cycles \
+         and {tool_calls} tool calls.\n\n\
+         Analyze the conversation and produce 1-3 concise bullet points covering:\n\
+         - What went well (efficient approaches, good decisions)\n\
+         - What could be improved (wasted cycles, wrong tools, missed approaches)\n\
+         - Key takeaway for future similar tasks\n\n\
+         Be specific and actionable. Keep the same language as the conversation. \
+         Return ONLY the bullet points, no preamble."
+    );
+
+    let prompt_messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some(system_prompt),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some(excerpt),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    ];
+
+    let resolved = config.resolve_model(model);
+    let reflection = providers::call_llm_simple(http, &resolved, &prompt_messages)
+        .await
+        .map_err(|e| format!("Reflection LLM call failed: {e}"))?;
+
+    let reflection = reflection.trim();
+    if reflection.is_empty() {
+        return Ok(());
+    }
+
+    // Write reflection to daily memory file.
+    let local = prompts::current_local_snapshot();
+    let today = local.today();
+    let time = local.hhmm();
+    let memory_dir = workspace.join("memory");
+    let _ = tokio::fs::create_dir_all(&memory_dir).await;
+    let memory_path = memory_dir.join(format!("{today}.md"));
+
+    let entry = format!(
+        "\n\n---\n\n## {time} Local — Reflection ({cycles} cycles, {tool_calls} tools)\n\n{reflection}"
+    );
+
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&memory_path)
+        .await
+    {
+        Ok(mut file) => {
+            use tokio::io::AsyncWriteExt;
+            file.write_all(entry.as_bytes())
+                .await
+                .map_err(|e| format!("Write reflection: {e}"))?;
+        }
+        Err(e) => return Err(format!("Open memory file: {e}")),
+    }
+
+    Ok(())
+}
 
 async fn send_react_phase_event(live_tx: &LiveTx, react_ctx: &agent::AgentLoopCtx, phase: &str) {
     if react_ctx.show_react {
@@ -74,16 +164,72 @@ async fn prepare_analyze_snapshot(
 ) -> Option<AnalyzeSnapshot> {
     let mut sessions = ctx.state.sessions.lock().await;
     let session = sessions.get_mut(ctx.current_session_id)?;
-    let model_str = session.effective_model(&ctx.state.config.model).to_string();
+    let base_model = session.effective_model(&ctx.state.config.model).to_string();
     let disabled = session.disabled_system_skills.clone();
-    let mut fresh_system =
-        build_system_prompt(&ctx.state.config, &session.workspace, &model_str, &disabled);
-    if let Some(hint) = phase_state.last_observation_hint.take() {
-        if let Some(ref mut content) = fresh_system.content {
+
+    // Extract latest user message for query-aware memory retrieval and complexity sensing.
+    let latest_query: Option<String> = session
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "user")
+        .and_then(|m| m.content.clone());
+    let user_msg_chars = latest_query
+        .as_ref()
+        .map(|q| q.chars().count())
+        .unwrap_or(0);
+
+    // On the first cycle, downgrade to fast model for simple queries when configured.
+    let model_str = if phase_state.react_ctx.cycles == 0
+        && session.model_override.is_none()
+    {
+        if let Some(ref fast) = ctx.state.config.fast_model {
+            if latest_query
+                .as_deref()
+                .map(agent::is_simple_query)
+                .unwrap_or(false)
+            {
+                fast.clone()
+            } else {
+                base_model
+            }
+        } else {
+            base_model
+        }
+    } else {
+        base_model
+    };
+
+    let mut fresh_system = build_system_prompt_with_query(
+        &ctx.state.config,
+        &session.workspace,
+        &model_str,
+        &disabled,
+        latest_query.as_deref(),
+    );
+
+    // Dynamic context injections into the system prompt:
+    // - Observation hint from previous cycle
+    // - Planning nudge on first cycle for multi-step tasks
+    // - Finish nudge for deep loops
+    if let Some(ref mut content) = fresh_system.content {
+        if let Some(hint) = phase_state.last_observation_hint.take() {
             content.push_str("\n\n");
             content.push_str(&hint);
         }
+        if phase_state.react_ctx.cycles == 0 {
+            content.push_str(
+                "\n\n## Working Method\n\
+                 For complex multi-step tasks, use the `think` tool first to outline your plan \
+                 before executing other tools. For simple questions or single-step tasks, respond directly.",
+            );
+        }
+        if let Some(nudge) = agent::build_finish_nudge(phase_state.react_ctx.cycles) {
+            content.push_str("\n\n");
+            content.push_str(nudge);
+        }
     }
+
     if let Some(first) = session.messages.first_mut() {
         if first.role == "system" {
             *first = fresh_system;
@@ -104,6 +250,7 @@ async fn prepare_analyze_snapshot(
         model: model_str,
         think_level: session.think_level.clone(),
         pruned_count,
+        user_msg_chars,
     })
 }
 
@@ -201,10 +348,13 @@ fn effective_think_level(
     resolved: &providers::ResolvedModel,
     cycles: usize,
     had_observation_hint: bool,
+    user_msg_chars: usize,
+    consecutive_errors: usize,
 ) -> String {
     if think_level == "auto" {
         if resolved.reasoning || resolved.thinking_format.is_some() {
-            agent::auto_think_level(cycles, had_observation_hint).to_owned()
+            agent::auto_think_level(cycles, had_observation_hint, user_msg_chars, consecutive_errors)
+                .to_owned()
         } else {
             "off".to_owned()
         }
@@ -536,11 +686,22 @@ async fn run_analyze_phase(
     };
 
     let resolved = ctx.state.config.resolve_model(&snapshot.model);
+
+    // Complexity signals for adaptive think level.
+    let consecutive_errors = phase_state
+        .collected_results
+        .iter()
+        .rev()
+        .take_while(|r| r.is_error)
+        .count();
+
     let effective_think = effective_think_level(
         &snapshot.think_level,
         &resolved,
         phase_state.react_ctx.cycles,
         had_observation_hint,
+        snapshot.user_msg_chars,
+        consecutive_errors,
     );
     let extra_tools = build_cycle_tools(ctx, phase_state, &resolved).await;
 
@@ -643,22 +804,102 @@ async fn run_act_phase(
     phase_state.collected_results.clear();
     let tool_calls = std::mem::take(&mut phase_state.pending_tool_calls);
 
-    for tc in &tool_calls {
-        if ctx.run_cancel.is_cancelled() {
-            phase_state.shutting_down = ctx.cancel.is_cancelled();
-            phase_state.run_detached = !phase_state.shutting_down;
-            return AgentPhaseControl::Break;
+    let all_read_only = tool_calls.len() > 1
+        && tool_calls
+            .iter()
+            .all(|tc| tools::is_read_only_tool(&tc.function.name));
+
+    if !all_read_only {
+        // Sequential path: single tool call or any mutating tool in the batch.
+        for tc in &tool_calls {
+            if ctx.run_cancel.is_cancelled() {
+                phase_state.shutting_down = ctx.cancel.is_cancelled();
+                phase_state.run_detached = !phase_state.shutting_down;
+                return AgentPhaseControl::Break;
+            }
+
+            let result = match execute_tool_call(ctx, phase_state, tc).await {
+                Ok(result) => result,
+                Err(control) => return control,
+            };
+
+            if matches!(
+                record_tool_result(ctx, phase_state, tc, result).await,
+                AgentPhaseControl::Break
+            ) {
+                return AgentPhaseControl::Break;
+            }
+        }
+    } else {
+        // Multiple read-only tool calls: parallel execution with ordered result recording.
+        // 1. Send all tool_call WS events up front so the UI shows them immediately.
+        for tc in &tool_calls {
+            if ctx.run_cancel.is_cancelled() {
+                phase_state.shutting_down = ctx.cancel.is_cancelled();
+                phase_state.run_detached = !phase_state.shutting_down;
+                return AgentPhaseControl::Break;
+            }
+            if !live_send(
+                ctx.live_tx,
+                json!({
+                    "type":"tool_call",
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                }),
+            )
+            .await
+            {
+                return AgentPhaseControl::Break;
+            }
         }
 
-        let result = match execute_tool_call(ctx, phase_state, tc).await {
-            Ok(result) => result,
-            Err(control) => return control,
-        };
+        // 2. Launch all tool futures concurrently.
+        let tool_timeout = ctx.state.config.tool_timeout;
+        let futures: Vec<_> = tool_calls
+            .iter()
+            .map(|tc| {
+                run_tool_with_feedback(
+                    ctx.live_tx,
+                    ctx.run_cancel,
+                    &tc.id,
+                    &tc.function.name,
+                    tool_timeout,
+                    execute_tool(
+                        &tc.function.name,
+                        &tc.function.arguments,
+                        &ctx.state.config,
+                        &ctx.state.http,
+                        &phase_state.cycle_workspace,
+                    ),
+                )
+            })
+            .collect();
 
-        if matches!(
-            record_tool_result(ctx, phase_state, tc, result).await,
-            AgentPhaseControl::Break
-        ) {
+        let results = futures::future::join_all(futures).await;
+
+        // 3. Record results in order, preserving stable tool IDs.
+        //    On abort, still record any already-completed results so the LLM
+        //    sees side effects (e.g. files written) that already happened.
+        let mut should_break = false;
+        for (tc, run_state) in tool_calls.iter().zip(results) {
+            match run_state {
+                ToolRunState::Completed(result) => {
+                    if matches!(
+                        record_tool_result(ctx, phase_state, tc, result).await,
+                        AgentPhaseControl::Break
+                    ) {
+                        should_break = true;
+                    }
+                }
+                ToolRunState::Abort => {
+                    phase_state.shutting_down = ctx.cancel.is_cancelled();
+                    phase_state.run_detached = !phase_state.shutting_down;
+                    should_break = true;
+                }
+            }
+        }
+        if should_break {
             return AgentPhaseControl::Break;
         }
     }
@@ -686,7 +927,14 @@ async fn run_observe_phase(
         )
         .await;
     }
-    phase_state.last_observation_hint = agent::build_observation_context_hint(&summaries);
+    let consecutive_errors = phase_state
+        .collected_results
+        .iter()
+        .rev()
+        .take_while(|r| r.is_error)
+        .count();
+    phase_state.last_observation_hint =
+        agent::build_observation_context_hint(&summaries, consecutive_errors);
     phase_state.collected_results.clear();
 
     // Debounced incremental save: skip if saved recently, finish phase always saves.
@@ -763,6 +1011,45 @@ async fn run_finish_phase(
         let model = session.effective_model(&ctx.state.config.model).to_string();
         let excerpt = crate::memory::prefilter_for_memory(&session.messages);
         queue.enqueue(session.workspace.clone(), model, excerpt);
+    }
+
+    // Post-execution reflection for multi-step tasks.
+    // Spawned as a background task to avoid delaying the "done" event.
+    if phase_state.react_ctx.cycles > 0 && phase_state.react_ctx.tool_calls > 0 {
+        if let Some(ref session) = snapshot {
+            let config = ctx.state.config.clone();
+            let http = ctx.state.http.clone();
+            let workspace = session.workspace.clone();
+            let model = session.effective_model(&config.model).to_string();
+            let messages = crate::memory::prefilter_for_memory(&session.messages);
+            let cycles = phase_state.react_ctx.cycles;
+            let tool_calls = phase_state.react_ctx.tool_calls;
+            let reflection_timeout = config.tool_timeout;
+            tokio::spawn(async move {
+                match tokio::time::timeout(
+                    reflection_timeout,
+                    run_post_execution_reflection(
+                        &config,
+                        &http,
+                        &workspace,
+                        &model,
+                        &messages,
+                        cycles,
+                        tool_calls,
+                    ),
+                )
+                .await
+                {
+                    Ok(Err(e)) => {
+                        eprintln!("Reflection failed (non-critical): {e}");
+                    }
+                    Err(_elapsed) => {
+                        eprintln!("Reflection timed out (non-critical)");
+                    }
+                    Ok(Ok(())) => {}
+                }
+            });
+        }
     }
 
     let finish_label = phase_state
