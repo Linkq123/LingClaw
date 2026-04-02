@@ -1548,8 +1548,10 @@ fn handle_doctor_command() -> bool {
             if let Some(ref src_ver) = source_ver {
                 let src_parts: Vec<u32> =
                     src_ver.split('.').filter_map(|s| s.parse().ok()).collect();
-                let remote_parts: Vec<u32> =
-                    remote_ver.split('.').filter_map(|s| s.parse().ok()).collect();
+                let remote_parts: Vec<u32> = remote_ver
+                    .split('.')
+                    .filter_map(|s| s.parse().ok())
+                    .collect();
                 match src_parts.cmp(&remote_parts) {
                     std::cmp::Ordering::Equal => {
                         println!("✅ v{src_ver} (up to date)");
@@ -1627,10 +1629,7 @@ fn handle_doctor_command() -> bool {
     fixes.dedup_by_key(|f| f.1);
 
     let fix_summary: Vec<&str> = fixes.iter().map(|f| f.1).collect();
-    println!(
-        "Fix automatically? Commands: {}",
-        fix_summary.join(" && ")
-    );
+    println!("Fix automatically? Commands: {}", fix_summary.join(" && "));
     print!("[y/N] ");
     let _ = io::stdout().flush();
     let mut answer = String::new();

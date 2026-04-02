@@ -40,7 +40,7 @@ Architecture (single process, single binary):
 - **Session store**: `HashMap<String, Session>` plus live connection state in `active_connections: Mutex<HashMap<String, u64>>`, `session_clients`, and `live_rounds` — supports exclusive ownership, disconnect/rebind, and in-flight replay when a browser reconnects; disk persistence still flows through `try_claim_session()` / `claim_requested_session()`
 - **Main session**: Designated session (`MAIN_SESSION_ID = "main"`) with admin privileges — can list/delete other sessions via AI tools and slash commands; admin tools injected via `extra_tools` parameter; prefix-based session target resolution with atomic delete
 - **Graceful shutdown**: `CancellationToken` (tokio-util), `/api/shutdown` with per-port Bearer token auth, auto-save on exit
-- **Frontend**: static `index.html` + `app.js` + `style.css` — WebChat UI with incremental text node streaming (`TextNode.nodeValue +=`), unified `requestAnimationFrame` flush scheduler, pre-mutation scroll-follow detection, history lazy-load (last 50 messages rendered initially, tool_call/tool_result pairs kept intact via `findHistoryRenderStart()`), markdown-only-on-finish rendering
+- **Frontend**: static `index.html` + `app.js` + `style.css` — WebChat UI with incremental text node streaming (`TextNode.nodeValue +=`), unified `requestAnimationFrame` flush scheduler, pre-mutation scroll-follow detection, history lazy-load (last 50 messages rendered initially, tool_call/tool_result pairs kept intact via `findHistoryRenderStart()`), markdown-only-on-finish rendering, version badge (header + welcome, fetched from `/api/health`), input history navigation (up/down arrow keys, max 10 entries)
 
 Key files:
 - `Cargo.toml` — dependency manifest (axum, tokio, serde, serde_json, reqwest, futures, regex, tower-http, tokio-util, chrono, base64, getrandom)
@@ -64,7 +64,7 @@ Key files:
 - `src/tools/mcp.rs` — stdio MCP tool discovery/execution bridge with workspace-safe cwd handling
 - `src/tests/` — module-scoped test files, including MCP/config/runtime coverage
 - `docs/reference/templates/` — 7 prompt template files copied into session workspaces
-- `static/index.html`, `static/app.js`, `static/style.css` — WebChat UI with ReAct/tool status rendering
+- `static/index.html`, `static/app.js`, `static/style.css` — WebChat UI with ReAct/tool status rendering, version badge, input history navigation
 - `~/.lingclaw/.lingclaw.json` — user config file, including `settings`, `models.providers`, and optional top-level `mcpServers`
 
 ## Current Module Ownership

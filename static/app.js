@@ -11,6 +11,7 @@ const connDot = document.getElementById('conn-dot');
 const connLabel = document.getElementById('conn-label');
 const sessionNameEl = document.getElementById('session-name');
 const sessionIdEl = document.getElementById('session-id');
+const headerVersionEl = document.getElementById('app-version-header');
 const toggleToolsBtn = document.getElementById('toggle-tools-btn');
 const toggleReasoningBtn = document.getElementById('toggle-reasoning-btn');
 const toolDrawer = document.getElementById('tool-drawer');
@@ -61,8 +62,50 @@ let hasBufferedChatUpdates = false;
 let unreadMessageCount = 0;
 let bulkRenderingChat = false;
 let suppressScrollTracking = false;
+let currentAppVersion = '';
+const inputHistory = [];
+const INPUT_HISTORY_MAX = 10;
+let inputHistoryIndex = -1;
+let inputHistoryDraft = '';
 const markdownRenderQueue = [];
 let markdownQueueHandle = 0;
+
+function versionBadgeMarkup(id, extraClass = '') {
+  const className = ['app-version-badge', extraClass].filter(Boolean).join(' ');
+  if (!currentAppVersion) {
+    return `<div class="${className}" id="${id}" hidden></div>`;
+  }
+  return `<div class="${className}" id="${id}">v${currentAppVersion}</div>`;
+}
+
+function setVersionBadge(el, version) {
+  if (!el) return;
+  if (!version) {
+    el.hidden = true;
+    el.textContent = '';
+    return;
+  }
+  el.textContent = `v${version}`;
+  el.hidden = false;
+}
+
+function syncVersionBadges() {
+  setVersionBadge(headerVersionEl, currentAppVersion);
+  setVersionBadge(document.getElementById('app-version-welcome'), currentAppVersion);
+}
+
+async function loadAppVersion() {
+  try {
+    const response = await fetch('/api/health');
+    if (!response.ok) return;
+    const data = await response.json();
+    if (typeof data.version !== 'string' || !data.version) return;
+    currentAppVersion = data.version;
+    syncVersionBadges();
+  } catch {
+    // Version is optional UI metadata; ignore fetch failures.
+  }
+}
 
 function afterNextPaint(callback) {
   requestAnimationFrame(() => requestAnimationFrame(callback));
@@ -1498,6 +1541,7 @@ function showWelcome() {
   w.innerHTML = `
     <div class="welcome-logo"><img src="${DEFAULT_WELCOME_LOGO}" alt="LingClaw"></div>
     <div class="welcome-title">LingClaw</div>
+    ${versionBadgeMarkup('app-version-welcome', 'welcome-version')}
     <div class="welcome-hint">
       你的私人 AI 助手已就绪<br>
       输入消息开始对话，或使用 <strong>/</strong> 命令
@@ -1509,6 +1553,7 @@ function showWelcome() {
     </div>
   `;
   chat.appendChild(w);
+  syncVersionBadges();
 }
 
 function setBusy(b) {
@@ -1662,6 +1707,7 @@ function send() {
       return;
     }
     sendCmd(text);
+    pushInputHistory(text);
     input.value = '';
     input.style.height = 'auto';
     syncToolDrawerBounds();
@@ -1678,9 +1724,22 @@ function send() {
   }
 
   ws.send(text);
+  pushInputHistory(text);
   input.value = '';
   input.style.height = 'auto';
   syncToolDrawerBounds();
+}
+
+function pushInputHistory(text) {
+  if (!text) return;
+  // Avoid consecutive duplicates
+  if (inputHistory.length > 0 && inputHistory[inputHistory.length - 1] === text) {
+    inputHistoryIndex = -1;
+    return;
+  }
+  inputHistory.push(text);
+  if (inputHistory.length > INPUT_HISTORY_MAX) inputHistory.shift();
+  inputHistoryIndex = -1;
 }
 
 function stopAgent() {
@@ -1699,7 +1758,40 @@ syncToolDrawerBounds();
 updateJumpToLatestVisibility();
 
 input.addEventListener('keydown', (e) => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); return; }
+  if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && !e.shiftKey && inputHistory.length > 0) {
+    // Only intercept when cursor is on the first/last line
+    const val = input.value;
+    const pos = input.selectionStart;
+    if (e.key === 'ArrowUp') {
+      const textBefore = val.slice(0, pos);
+      if (textBefore.includes('\n')) return; // not on first line
+      e.preventDefault();
+      if (inputHistoryIndex === -1) {
+        inputHistoryDraft = val;
+        inputHistoryIndex = inputHistory.length - 1;
+      } else if (inputHistoryIndex > 0) {
+        inputHistoryIndex--;
+      }
+      input.value = inputHistory[inputHistoryIndex];
+      input.setSelectionRange(input.value.length, input.value.length);
+    } else {
+      const textAfter = val.slice(pos);
+      if (textAfter.includes('\n')) return; // not on last line
+      e.preventDefault();
+      if (inputHistoryIndex === -1) return;
+      if (inputHistoryIndex < inputHistory.length - 1) {
+        inputHistoryIndex++;
+        input.value = inputHistory[inputHistoryIndex];
+      } else {
+        inputHistoryIndex = -1;
+        input.value = inputHistoryDraft;
+      }
+      input.setSelectionRange(input.value.length, input.value.length);
+    }
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+  }
 });
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
@@ -1731,4 +1823,5 @@ stopBtn.addEventListener('click', () => {
   stopAgent();
 });
 
+void loadAppVersion();
 connect();

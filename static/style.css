@@ -58,15 +58,41 @@ header {
   z-index: 2;
   position: relative;
 }
+.brand-block {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
 header .session-name {
   font-size: 14px;
   font-weight: 700;
   flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 header .session-id { font-size: 11px; color: var(--dim); font-family: var(--font-mono); }
+.app-version-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent2) 22%, var(--border));
+  background: linear-gradient(135deg, rgba(214,86,110,.08), rgba(45,139,207,.10));
+  color: var(--dim);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+.header-version {
+  flex-shrink: 0;
+}
 header .actions { display: flex; gap: 6px; }
 header .actions button {
   background: none;
@@ -144,6 +170,10 @@ header .actions button.is-active {
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
+}
+.welcome-version {
+  font-size: 12px;
+  padding: 4px 10px;
 }
 .welcome-hint { font-size: 13px; line-height: 1.8; max-width: 320px; }
 .welcome-shortcuts { display: flex; gap: 10px; margin-top: 8px; }
@@ -924,6 +954,20 @@ pre:hover .copy-btn { opacity: 1; }
 
 /* ── Mobile ── */
 @media (max-width: 768px) {
+  header {
+    flex-wrap: wrap;
+  }
+  .brand-block {
+    min-width: 0;
+  }
+  header .session-id {
+    width: 100%;
+    order: 4;
+  }
+  header .actions {
+    width: 100%;
+    flex-wrap: wrap;
+  }
   .msg-row { max-width: 95%; }
   .msg-row.assistant { width: 95%; min-width: 0; }
   .reasoning-panel,

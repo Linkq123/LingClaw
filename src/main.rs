@@ -1250,6 +1250,7 @@ async fn api_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let sessions = state.sessions.lock().await;
     Json(json!({
         "status": "ok",
+        "version": VERSION,
         "model": state.config.model,
         "sessions": sessions.len(),
     }))

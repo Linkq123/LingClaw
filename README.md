@@ -22,7 +22,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
 - **持久化主会话**：固定保存 `main` 工作区和磁盘存档
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
-- **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端，增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）
+- **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端，增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、输入框上下键历史导航（最多 10 条）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
 - **Structured Memory（可选）**：启用 `structuredMemory` 后，Finish 阶段会异步抽取稳定偏好、项目上下文和长期事实，写入 workspace 下的 `structured_memory.json`，并记录 `structured_memory.audit.jsonl` 诊断轨迹；`/memory`、`/memory stats`、`/memory debug` 可查看状态与最近审计信息
@@ -451,7 +451,7 @@ src/
 
 static/
 ├── index.html                  — 主页面
-├── app.js                      — 前端逻辑（流式渲染、懒加载历史、智能滚动）
+├── app.js                      — 前端逻辑（流式渲染、懒加载历史、智能滚动、版本 badge、输入历史导航）
 └── style.css                   — 样式
 
 docs/reference/templates/       — 7 个提示模板文件 (BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/TOOLS/MEMORY.md)
@@ -650,7 +650,7 @@ think_level 映射：
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
-| `/api/health` | GET | 健康检查 |
+| `/api/health` | GET | 健康检查（返回 `version`、`model`、`sessions`） |
 | `/api/sessions` | GET | 返回主会话信息 |
 | `/api/shutdown` | POST | 认证的本地关停端点（CLI 使用） |
 | `/ws` | GET | WebSocket 升级端点 |
