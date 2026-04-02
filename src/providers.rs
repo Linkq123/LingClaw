@@ -8,7 +8,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{live_send, tools, ChatMessage, FunctionCall, LiveTx, Provider, ToolCall};
+use crate::{ChatMessage, FunctionCall, LiveTx, Provider, ToolCall, live_send, tools};
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  Provider Types
@@ -200,10 +200,10 @@ fn convert_messages_to_anthropic(messages: &[ChatMessage]) -> (String, Vec<serde
             }
             "assistant" => {
                 let mut content_blocks: Vec<serde_json::Value> = Vec::new();
-                if let Some(text) = &msg.content {
-                    if !text.is_empty() {
-                        content_blocks.push(json!({"type": "text", "text": text}));
-                    }
+                if let Some(text) = &msg.content
+                    && !text.is_empty()
+                {
+                    content_blocks.push(json!({"type": "text", "text": text}));
                 }
                 if let Some(tool_calls) = &msg.tool_calls {
                     for tc in tool_calls {
@@ -420,20 +420,18 @@ async fn process_openai_data_line(data: &str, tx: &LiveTx, state: &mut OpenAiStr
         }
         if let Some(choices) = chunk.choices {
             for choice in choices {
-                if let Some(think_text) = &choice.delta.reasoning_content {
-                    if !think_text.is_empty() && !state.client_gone {
-                        if !state.reasoning_started {
-                            state.reasoning_started = true;
-                            state.client_gone =
-                                !live_send(tx, json!({"type":"thinking_start"})).await;
-                        }
-                        if !state.client_gone {
-                            state.client_gone = !live_send(
-                                tx,
-                                json!({"type":"thinking_delta","content":think_text}),
-                            )
-                            .await;
-                        }
+                if let Some(think_text) = &choice.delta.reasoning_content
+                    && !think_text.is_empty()
+                    && !state.client_gone
+                {
+                    if !state.reasoning_started {
+                        state.reasoning_started = true;
+                        state.client_gone = !live_send(tx, json!({"type":"thinking_start"})).await;
+                    }
+                    if !state.client_gone {
+                        state.client_gone =
+                            !live_send(tx, json!({"type":"thinking_delta","content":think_text}))
+                                .await;
                     }
                 }
                 if let Some(text) = &choice.delta.content {
@@ -497,111 +495,105 @@ async fn process_anthropic_sse_line(line: &str, tx: &LiveTx, state: &mut Anthrop
         let data = data.trim();
         match state.current_event_type.as_str() {
             "message_start" => {
-                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
-                    if let Some(message) = evt.message.as_ref() {
-                        if let Some(usage) = message.usage.as_ref() {
-                            state.input_tokens = Some(total_anthropic_input_tokens(usage));
-                            state.output_tokens = usage.output_tokens;
-                        }
-                    }
+                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data)
+                    && let Some(message) = evt.message.as_ref()
+                    && let Some(usage) = message.usage.as_ref()
+                {
+                    state.input_tokens = Some(total_anthropic_input_tokens(usage));
+                    state.output_tokens = usage.output_tokens;
                 }
             }
             "message_delta" => {
-                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
-                    if let Some(usage) = evt.usage.as_ref() {
-                        state.input_tokens = Some(total_anthropic_input_tokens(usage));
-                        if let Some(value) = usage.output_tokens {
-                            state.output_tokens = Some(value);
-                        }
+                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data)
+                    && let Some(usage) = evt.usage.as_ref()
+                {
+                    state.input_tokens = Some(total_anthropic_input_tokens(usage));
+                    if let Some(value) = usage.output_tokens {
+                        state.output_tokens = Some(value);
                     }
                 }
             }
             "content_block_start" => {
-                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
-                    if let Some(block) = &evt.content_block {
-                        match block.block_type.as_str() {
-                            "thinking" => {
-                                state.thinking_block_idx = evt.index;
-                                if !state.client_gone {
-                                    state.reasoning_started = true;
-                                    state.client_gone =
-                                        !live_send(tx, json!({"type":"thinking_start"})).await;
-                                }
+                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data)
+                    && let Some(block) = &evt.content_block
+                {
+                    match block.block_type.as_str() {
+                        "thinking" => {
+                            state.thinking_block_idx = evt.index;
+                            if !state.client_gone {
+                                state.reasoning_started = true;
+                                state.client_gone =
+                                    !live_send(tx, json!({"type":"thinking_start"})).await;
                             }
-                            "tool_use" => {
-                                let idx = state.tool_calls.len();
-                                state.tool_calls.push(ToolCall {
-                                    id: block.id.clone().unwrap_or_default(),
-                                    call_type: "function".into(),
-                                    function: FunctionCall {
-                                        name: block.name.clone().unwrap_or_default(),
-                                        arguments: String::new(),
-                                    },
-                                });
-                                if let Some(block_idx) = evt.index {
-                                    state.block_tool_idx.insert(block_idx, idx);
-                                }
-                            }
-                            _ => {}
                         }
+                        "tool_use" => {
+                            let idx = state.tool_calls.len();
+                            state.tool_calls.push(ToolCall {
+                                id: block.id.clone().unwrap_or_default(),
+                                call_type: "function".into(),
+                                function: FunctionCall {
+                                    name: block.name.clone().unwrap_or_default(),
+                                    arguments: String::new(),
+                                },
+                            });
+                            if let Some(block_idx) = evt.index {
+                                state.block_tool_idx.insert(block_idx, idx);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
             "content_block_delta" => {
-                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
-                    if let Some(delta) = &evt.delta {
-                        match delta.delta_type.as_deref() {
-                            Some("thinking_delta") => {
-                                if let Some(text) = &delta.thinking {
-                                    if !text.is_empty() && !state.client_gone {
-                                        state.client_gone = !live_send(
-                                            tx,
-                                            json!({"type":"thinking_delta","content":text}),
-                                        )
+                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data)
+                    && let Some(delta) = &evt.delta
+                {
+                    match delta.delta_type.as_deref() {
+                        Some("thinking_delta") => {
+                            if let Some(text) = &delta.thinking
+                                && !text.is_empty()
+                                && !state.client_gone
+                            {
+                                state.client_gone =
+                                    !live_send(tx, json!({"type":"thinking_delta","content":text}))
                                         .await;
-                                    }
-                                }
                             }
-                            Some("text_delta") => {
-                                if let Some(text) = &delta.text {
-                                    state.content_buf.push_str(text);
-                                    if !state.client_gone
-                                        && !live_send(tx, json!({"type":"delta","content":text}))
-                                            .await
-                                    {
-                                        state.client_gone = true;
-                                    }
-                                }
-                            }
-                            Some("input_json_delta") => {
-                                if let Some(json_str) = &delta.partial_json {
-                                    if let Some(block_idx) = evt.index {
-                                        if let Some(&tc_idx) = state.block_tool_idx.get(&block_idx)
-                                        {
-                                            if tc_idx < state.tool_calls.len() {
-                                                state.tool_calls[tc_idx]
-                                                    .function
-                                                    .arguments
-                                                    .push_str(json_str);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
+                        Some("text_delta") => {
+                            if let Some(text) = &delta.text {
+                                state.content_buf.push_str(text);
+                                if !state.client_gone
+                                    && !live_send(tx, json!({"type":"delta","content":text})).await
+                                {
+                                    state.client_gone = true;
+                                }
+                            }
+                        }
+                        Some("input_json_delta") => {
+                            if let Some(json_str) = &delta.partial_json
+                                && let Some(block_idx) = evt.index
+                                && let Some(&tc_idx) = state.block_tool_idx.get(&block_idx)
+                                && tc_idx < state.tool_calls.len()
+                            {
+                                state.tool_calls[tc_idx]
+                                    .function
+                                    .arguments
+                                    .push_str(json_str);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
             "content_block_stop" => {
-                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data) {
-                    if state.thinking_block_idx.is_some() && evt.index == state.thinking_block_idx {
-                        state.thinking_block_idx = None;
-                        state.reasoning_started = false;
-                        if !state.client_gone {
-                            state.client_gone =
-                                !live_send(tx, json!({"type":"thinking_done"})).await;
-                        }
+                if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data)
+                    && state.thinking_block_idx.is_some()
+                    && evt.index == state.thinking_block_idx
+                {
+                    state.thinking_block_idx = None;
+                    state.reasoning_started = false;
+                    if !state.client_gone {
+                        state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
                     }
                 }
             }
@@ -682,11 +674,11 @@ where
             if line.is_empty() || line.starts_with(':') {
                 continue;
             }
-            if let Some(data) = line.strip_prefix("data: ") {
-                if process_openai_data_line(data.trim(), tx, state).await {
-                    stream_done = true;
-                    break;
-                }
+            if let Some(data) = line.strip_prefix("data: ")
+                && process_openai_data_line(data.trim(), tx, state).await
+            {
+                stream_done = true;
+                break;
             }
         }
 
@@ -785,7 +777,8 @@ async fn send_with_retry(
             let delay_ms = 1000 * (1u64 << (attempt - 1));
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
-        match build().send().await {
+        let response = build().send().await;
+        match response {
             Ok(resp) => {
                 let status = resp.status();
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
@@ -798,7 +791,10 @@ async fn send_with_retry(
                         continue;
                     }
                     let text = resp.text().await.unwrap_or_default();
-                    return Err(format!("API {status} (after {} attempts): {text}", attempt + 1));
+                    return Err(format!(
+                        "API {status} (after {} attempts): {text}",
+                        attempt + 1
+                    ));
                 }
                 if !status.is_success() {
                     let text = resp.text().await.unwrap_or_default();

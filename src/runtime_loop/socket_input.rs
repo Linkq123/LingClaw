@@ -45,12 +45,10 @@ async fn ensure_main_session_ready(state: &Arc<AppState>) {
     };
     refresh_session_system_prompt(state, &mut session);
 
-    if created_fresh {
-        if let Err(error) = save_session_to_disk(&session).await {
-            eprintln!(
-                "Warning: failed to persist main session on creation: {error}; keeping in memory"
-            );
-        }
+    if created_fresh && let Err(error) = save_session_to_disk(&session).await {
+        eprintln!(
+            "Warning: failed to persist main session on creation: {error}; keeping in memory"
+        );
     }
 
     let mut sessions = state.sessions.lock().await;

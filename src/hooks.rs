@@ -5,10 +5,10 @@ use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::{
-    agent,
+    ChatMessage, Session, agent,
     config::{Config, Provider},
     context::{context_input_budget_for_model, estimate_tokens_for_provider, turn_len},
-    providers, truncate, ChatMessage, Session,
+    providers, truncate,
 };
 
 // ── Hook Infrastructure ──────────────────────────────────────────────────────
@@ -123,17 +123,17 @@ pub(crate) fn build_compression_source_text(messages: &[ChatMessage]) -> String 
     for msg in messages {
         match msg.role.as_str() {
             "user" => {
-                if let Some(content) = msg.content.as_deref() {
-                    if !content.is_empty() {
-                        lines.push(format!("User: {content}"));
-                    }
+                if let Some(content) = msg.content.as_deref()
+                    && !content.is_empty()
+                {
+                    lines.push(format!("User: {content}"));
                 }
             }
             "assistant" => {
-                if let Some(content) = msg.content.as_deref() {
-                    if !content.is_empty() {
-                        lines.push(format!("Assistant: {content}"));
-                    }
+                if let Some(content) = msg.content.as_deref()
+                    && !content.is_empty()
+                {
+                    lines.push(format!("Assistant: {content}"));
                 }
                 if let Some(tool_calls) = msg.tool_calls.as_ref() {
                     for tc in tool_calls {

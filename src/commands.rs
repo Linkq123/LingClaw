@@ -6,11 +6,12 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    agent, build_system_prompt, default_show_react, default_show_reasoning, default_show_tools,
-    memory, now_epoch, prompts, providers,
+    AppState, ChatMessage, MAIN_SESSION_ID, Session, WsTx, agent, build_system_prompt,
+    default_show_react, default_show_reasoning, default_show_tools, memory, now_epoch, prompts,
+    providers,
     session_admin::gather_global_today_usage,
     session_store::{build_session_status, build_usage_report, save_session_to_disk},
-    tools, truncate, ws_send, AppState, ChatMessage, Session, WsTx, MAIN_SESSION_ID,
+    tools, truncate, ws_send,
 };
 
 // ── Chat Commands ────────────────────────────────────────────────────────────
@@ -150,10 +151,10 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
         &model,
         &session.disabled_system_skills,
     );
-    if let Some(first) = request_messages.first_mut() {
-        if first.role == "system" {
-            *first = fresh_system;
-        }
+    if let Some(first) = request_messages.first_mut()
+        && first.role == "system"
+    {
+        *first = fresh_system;
     }
 
     let request_estimate = crate::context::estimate_request_tokens_for_provider(
@@ -277,10 +278,10 @@ async fn handle_new_command(
                     }
                 }
                 "assistant" => {
-                    if let Some(c) = &msg.content {
-                        if !c.is_empty() {
-                            lines.push(format!("Assistant: {c}"));
-                        }
+                    if let Some(c) = &msg.content
+                        && !c.is_empty()
+                    {
+                        lines.push(format!("Assistant: {c}"));
                     }
                 }
                 _ => {}

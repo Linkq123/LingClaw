@@ -72,9 +72,11 @@ async fn execute_tool_rejects_descending_read_file_range() {
     .await;
 
     assert!(outcome.is_error);
-    assert!(outcome
-        .output
-        .contains("end_line must be greater than or equal to start_line"));
+    assert!(
+        outcome
+            .output
+            .contains("end_line must be greater than or equal to start_line")
+    );
 
     let _ = tokio::fs::remove_dir_all(&workspace).await;
 }
@@ -97,9 +99,11 @@ async fn execute_tool_rejects_zero_search_results_limit() {
     .await;
 
     assert!(outcome.is_error);
-    assert!(outcome
-        .output
-        .contains("parameter 'max_results' must be >= 1"));
+    assert!(
+        outcome
+            .output
+            .contains("parameter 'max_results' must be >= 1")
+    );
 
     let _ = tokio::fs::remove_dir_all(&workspace).await;
 }

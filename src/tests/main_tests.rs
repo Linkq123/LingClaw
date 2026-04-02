@@ -157,10 +157,12 @@ fn build_compressed_messages_inserts_summary_and_keeps_recent_tail() {
     assert_eq!(compressed.len(), 4);
     assert_eq!(compressed[0].role, "system");
     assert_eq!(compressed[1].role, "assistant");
-    assert!(compressed[1]
-        .content
-        .as_deref()
-        .is_some_and(|text| text.starts_with("## Context Summary (auto-generated)")));
+    assert!(
+        compressed[1]
+            .content
+            .as_deref()
+            .is_some_and(|text| text.starts_with("## Context Summary (auto-generated)"))
+    );
     assert_eq!(compressed[2].content.as_deref(), Some("recent-user"));
     assert_eq!(compressed[3].content.as_deref(), Some("recent-assistant"));
 }
@@ -1197,9 +1199,10 @@ fn resolve_or_create_socket_session_ignores_requested_session_and_uses_main() {
     ));
 
     assert_eq!(resolved, MAIN_SESSION_ID);
-    assert!(rt
-        .block_on(state.sessions.lock())
-        .contains_key(MAIN_SESSION_ID));
+    assert!(
+        rt.block_on(state.sessions.lock())
+            .contains_key(MAIN_SESSION_ID)
+    );
 
     let payload = rt
         .block_on(rx.recv())
@@ -1862,11 +1865,11 @@ fn system_prompt_with_observation_hint_preserves_original_content() {
         line_count: 200,
         hint: "exec returned 200 lines / 8000 bytes — focus on key findings".into(),
     }];
-    if let Some(hint) = agent::build_observation_context_hint(&summaries, 0) {
-        if let Some(ref mut content) = msg.content {
-            content.push_str("\n\n");
-            content.push_str(&hint);
-        }
+    if let Some(hint) = agent::build_observation_context_hint(&summaries, 0)
+        && let Some(ref mut content) = msg.content
+    {
+        content.push_str("\n\n");
+        content.push_str(&hint);
     }
 
     let content = msg.content.as_deref().unwrap();
@@ -2406,14 +2409,18 @@ fn handle_command_switch_is_blocked_in_single_session_mode() {
         ))
         .expect("command should return a result");
 
-    assert!(result
-        .response
-        .contains("LingClaw only keeps the main session"));
+    assert!(
+        result
+            .response
+            .contains("LingClaw only keeps the main session")
+    );
     assert!(sessions_dir().join(format!("{source_id}.json")).exists());
-    assert!(source_workspace
-        .parent()
-        .expect("source session dir should exist")
-        .exists());
+    assert!(
+        source_workspace
+            .parent()
+            .expect("source session dir should exist")
+            .exists()
+    );
 
     let target_path = sessions_dir().join(format!("{target_id}.json"));
     let _ = std::fs::remove_file(target_path);
@@ -2495,14 +2502,16 @@ fn finalize_connection_removes_unbound_session_from_memory() {
         },
     ));
 
-    assert!(rt
-        .block_on(state.sessions.lock())
-        .get(&session_id)
-        .is_none());
-    assert!(rt
-        .block_on(state.active_connections.lock())
-        .get(&session_id)
-        .is_none());
+    assert!(
+        rt.block_on(state.sessions.lock())
+            .get(&session_id)
+            .is_none()
+    );
+    assert!(
+        rt.block_on(state.active_connections.lock())
+            .get(&session_id)
+            .is_none()
+    );
 
     let path = sessions_dir().join(format!("{session_id}.json"));
     let _ = std::fs::remove_file(path);
@@ -2559,14 +2568,16 @@ fn finalize_connection_keeps_main_session_loaded_in_memory() {
         },
     ));
 
-    assert!(rt
-        .block_on(state.sessions.lock())
-        .get(&session_id)
-        .is_some());
-    assert!(rt
-        .block_on(state.active_connections.lock())
-        .get(&session_id)
-        .is_none());
+    assert!(
+        rt.block_on(state.sessions.lock())
+            .get(&session_id)
+            .is_some()
+    );
+    assert!(
+        rt.block_on(state.active_connections.lock())
+            .get(&session_id)
+            .is_none()
+    );
 
     let path = sessions_dir().join(format!("{session_id}.json"));
     let _ = std::fs::remove_file(path);
@@ -2653,15 +2664,21 @@ fn help_command_lists_usage_without_extra_indent() {
         ))
         .expect("command should return a result");
 
-    assert!(result
-        .response
-        .contains("  /status          Show session status"));
-    assert!(result
-        .response
-        .contains("/mcp [refresh]   Show MCP load status or refresh cache"));
-    assert!(result
-        .response
-        .contains("/usage           Show session token usage"));
+    assert!(
+        result
+            .response
+            .contains("  /status          Show session status")
+    );
+    assert!(
+        result
+            .response
+            .contains("/mcp [refresh]   Show MCP load status or refresh cache")
+    );
+    assert!(
+        result
+            .response
+            .contains("/usage           Show session token usage")
+    );
 }
 
 #[test]
@@ -2704,9 +2721,11 @@ fn handle_command_reports_mcp_load_failures() {
     assert_eq!(result.response_type, "system");
     assert!(result.response.contains("MCP servers:"));
     assert!(result.response.contains("- broken: failed to load"));
-    assert!(result
-        .response
-        .contains("failed to spawn 'definitely-not-a-real-command'"));
+    assert!(
+        result
+            .response
+            .contains("failed to spawn 'definitely-not-a-real-command'")
+    );
 
     let path = sessions_dir().join(format!("{session_id}.json"));
     let _ = std::fs::remove_file(path);
@@ -2835,10 +2854,11 @@ fn replay_live_round_rehydrates_inflight_round_state() {
         1,
         json!({"type": "done"}),
     ));
-    assert!(rt
-        .block_on(state.live_rounds.lock())
-        .get(&session_id)
-        .is_none());
+    assert!(
+        rt.block_on(state.live_rounds.lock())
+            .get(&session_id)
+            .is_none()
+    );
 }
 
 #[test]
@@ -2868,10 +2888,11 @@ fn dispatch_live_event_ignores_stale_connection_after_rebind() {
         }),
     ));
 
-    assert!(rt
-        .block_on(state.live_rounds.lock())
-        .get(&session_id)
-        .is_none());
+    assert!(
+        rt.block_on(state.live_rounds.lock())
+            .get(&session_id)
+            .is_none()
+    );
     assert!(bound_rx.try_recv().is_err());
 
     rt.block_on(dispatch_live_event(
@@ -2893,10 +2914,11 @@ fn dispatch_live_event_ignores_stale_connection_after_rebind() {
     let parsed: serde_json::Value =
         serde_json::from_str(&payload).expect("payload should be valid json");
     assert_eq!(parsed["type"].as_str(), Some("start"));
-    assert!(rt
-        .block_on(state.live_rounds.lock())
-        .get(&session_id)
-        .is_some());
+    assert!(
+        rt.block_on(state.live_rounds.lock())
+            .get(&session_id)
+            .is_some()
+    );
 }
 
 // ── Phase 4: Tool Protocol + Session Recovery ────────────────────────────────
@@ -3140,7 +3162,7 @@ fn truncate_ascii_at_boundary() {
 fn truncate_utf8_multibyte_boundary() {
     let s = "\u{4f60}\u{597d}\u{4e16}\u{754c}"; // 12 bytes (3 per char)
     let result = truncate(s, 7); // mid-char boundary
-                                 // Should cut at char boundary <= 7, which is 6 (after first 2 chars)
+    // Should cut at char boundary <= 7, which is 6 (after first 2 chars)
     assert!(result.starts_with("\u{4f60}\u{597d}"));
     assert!(result.contains("[truncated at 6 bytes"));
 }

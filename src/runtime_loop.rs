@@ -5,10 +5,10 @@ use tokio::time::MissedTickBehavior;
 
 mod socket_input;
 
-use socket_input::{drain_busy_socket_messages, persist_pending_interventions};
 pub(crate) use socket_input::{
-    handle_idle_socket_input, resolve_or_create_socket_session, IdleSocketInputAction,
+    IdleSocketInputAction, handle_idle_socket_input, resolve_or_create_socket_session,
 };
+use socket_input::{drain_busy_socket_messages, persist_pending_interventions};
 
 pub(crate) struct AgentRunOutcome {
     pub(crate) rerun_agent: bool,
@@ -180,9 +180,7 @@ async fn prepare_analyze_snapshot(
         .unwrap_or(0);
 
     // On the first cycle, downgrade to fast model for simple queries when configured.
-    let model_str = if phase_state.react_ctx.cycles == 0
-        && session.model_override.is_none()
-    {
+    let model_str = if phase_state.react_ctx.cycles == 0 && session.model_override.is_none() {
         if let Some(ref fast) = ctx.state.config.fast_model {
             if latest_query
                 .as_deref()
@@ -230,10 +228,10 @@ async fn prepare_analyze_snapshot(
         }
     }
 
-    if let Some(first) = session.messages.first_mut() {
-        if first.role == "system" {
-            *first = fresh_system;
-        }
+    if let Some(first) = session.messages.first_mut()
+        && first.role == "system"
+    {
+        *first = fresh_system;
     }
 
     let msg_count_before = session.messages.len();
@@ -353,8 +351,13 @@ fn effective_think_level(
 ) -> String {
     if think_level == "auto" {
         if resolved.reasoning || resolved.thinking_format.is_some() {
-            agent::auto_think_level(cycles, had_observation_hint, user_msg_chars, consecutive_errors)
-                .to_owned()
+            agent::auto_think_level(
+                cycles,
+                had_observation_hint,
+                user_msg_chars,
+                consecutive_errors,
+            )
+            .to_owned()
         } else {
             "off".to_owned()
         }
@@ -984,10 +987,10 @@ async fn run_finish_phase(
         let sessions = ctx.state.sessions.lock().await;
         sessions.get(ctx.current_session_id).cloned()
     };
-    if let Some(ref session) = snapshot {
-        if let Err(e) = save_session_to_disk(session).await {
-            eprintln!("Warning: failed to save session at finish phase: {e}");
-        }
+    if let Some(ref session) = snapshot
+        && let Err(e) = save_session_to_disk(session).await
+    {
+        eprintln!("Warning: failed to save session at finish phase: {e}");
     }
 
     let on_finish_events = run_hooks(
@@ -1007,7 +1010,7 @@ async fn run_finish_phase(
 
     // Enqueue structured memory update (async, non-blocking).
     // Pre-filter messages to avoid cloning the full session history.
-    if let (Some(queue), Some(ref session)) = (&ctx.state.memory_queue, &snapshot) {
+    if let (Some(queue), Some(session)) = (&ctx.state.memory_queue, &snapshot) {
         let model = session.effective_model(&ctx.state.config.model).to_string();
         let excerpt = crate::memory::prefilter_for_memory(&session.messages);
         queue.enqueue(session.workspace.clone(), model, excerpt);
@@ -1015,41 +1018,36 @@ async fn run_finish_phase(
 
     // Post-execution reflection for multi-step tasks.
     // Spawned as a background task to avoid delaying the "done" event.
-    if phase_state.react_ctx.cycles > 0 && phase_state.react_ctx.tool_calls > 0 {
-        if let Some(ref session) = snapshot {
-            let config = ctx.state.config.clone();
-            let http = ctx.state.http.clone();
-            let workspace = session.workspace.clone();
-            let model = session.effective_model(&config.model).to_string();
-            let messages = crate::memory::prefilter_for_memory(&session.messages);
-            let cycles = phase_state.react_ctx.cycles;
-            let tool_calls = phase_state.react_ctx.tool_calls;
-            let reflection_timeout = config.tool_timeout;
-            tokio::spawn(async move {
-                match tokio::time::timeout(
-                    reflection_timeout,
-                    run_post_execution_reflection(
-                        &config,
-                        &http,
-                        &workspace,
-                        &model,
-                        &messages,
-                        cycles,
-                        tool_calls,
-                    ),
-                )
-                .await
-                {
-                    Ok(Err(e)) => {
-                        eprintln!("Reflection failed (non-critical): {e}");
-                    }
-                    Err(_elapsed) => {
-                        eprintln!("Reflection timed out (non-critical)");
-                    }
-                    Ok(Ok(())) => {}
+    if phase_state.react_ctx.cycles > 0
+        && phase_state.react_ctx.tool_calls > 0
+        && let Some(ref session) = snapshot
+    {
+        let config = ctx.state.config.clone();
+        let http = ctx.state.http.clone();
+        let workspace = session.workspace.clone();
+        let model = session.effective_model(&config.model).to_string();
+        let messages = crate::memory::prefilter_for_memory(&session.messages);
+        let cycles = phase_state.react_ctx.cycles;
+        let tool_calls = phase_state.react_ctx.tool_calls;
+        let reflection_timeout = config.tool_timeout;
+        tokio::spawn(async move {
+            match tokio::time::timeout(
+                reflection_timeout,
+                run_post_execution_reflection(
+                    &config, &http, &workspace, &model, &messages, cycles, tool_calls,
+                ),
+            )
+            .await
+            {
+                Ok(Err(e)) => {
+                    eprintln!("Reflection failed (non-critical): {e}");
                 }
-            });
-        }
+                Err(_elapsed) => {
+                    eprintln!("Reflection timed out (non-critical)");
+                }
+                Ok(Ok(())) => {}
+            }
+        });
     }
 
     let finish_label = phase_state

@@ -390,9 +390,11 @@ fn discover_all_skills_merges_session_skills() {
 
     let skills = discover_all_skills(&workspace);
     // At minimum, the session skill should be present
-    assert!(skills
-        .iter()
-        .any(|s| s.name == "alpha" && s.source == SkillSource::Session));
+    assert!(
+        skills
+            .iter()
+            .any(|s| s.name == "alpha" && s.source == SkillSource::Session)
+    );
 
     let _ = fs::remove_dir_all(&workspace);
 }
@@ -508,9 +510,10 @@ fn test_render_skills_catalog_query_aware_compression() {
     // skill-2 has "Rust" overlap, should get full description
     assert!(catalog.contains("Help with Rust code"));
     // At least one skill should be abbreviated (no description shown)
-    let abbreviated_count = catalog.lines().filter(|l| {
-        l.starts_with("- **skill-") && !l.contains(" — ")
-    }).count();
+    let abbreviated_count = catalog
+        .lines()
+        .filter(|l| l.starts_with("- **skill-") && !l.contains(" — "))
+        .count();
     assert!(abbreviated_count > 0, "some skills should be abbreviated");
 }
 
@@ -639,7 +642,9 @@ fn load_session_prompt_files_truncates_large_daily_memory() {
 
     // The injected daily memory must not exceed the budget + truncation marker.
     let daily_marker = "<!-- memory/2026-03-16.md -->";
-    let daily_start = loaded.find(daily_marker).expect("daily memory should be present");
+    let daily_start = loaded
+        .find(daily_marker)
+        .expect("daily memory should be present");
     let daily_section = &loaded[daily_start..];
     // Budget is 4000 chars; with truncation marker overhead, the section should
     // be well under 4200 chars and certainly below the original 6000.

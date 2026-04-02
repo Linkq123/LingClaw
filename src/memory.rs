@@ -195,20 +195,19 @@ async fn append_memory_audit_record(workspace: &Path, record: &MemoryAuditRecord
     // Rotate if oversized: keep the most recent half of lines via tmp+rename.
     // On Windows, rename requires removing the destination first, leaving a
     // brief crash window; the recovery above handles that on the next call.
-    if let Ok(meta) = tokio::fs::metadata(&path).await {
-        if meta.len() > MEMORY_AUDIT_MAX_BYTES {
-            if let Ok(data) = tokio::fs::read_to_string(&path).await {
-                let lines: Vec<&str> = data.lines().collect();
-                let keep_from = lines.len() / 2;
-                let trimmed = lines[keep_from..].join("\n") + "\n";
-                if tokio::fs::write(&tmp_path, &trimmed).await.is_ok() {
-                    #[cfg(windows)]
-                    let _ = tokio::fs::remove_file(&path).await;
-                    if tokio::fs::rename(&tmp_path, &path).await.is_err() {
-                        let _ = tokio::fs::write(&path, &trimmed).await;
-                        let _ = tokio::fs::remove_file(&tmp_path).await;
-                    }
-                }
+    if let Ok(meta) = tokio::fs::metadata(&path).await
+        && meta.len() > MEMORY_AUDIT_MAX_BYTES
+        && let Ok(data) = tokio::fs::read_to_string(&path).await
+    {
+        let lines: Vec<&str> = data.lines().collect();
+        let keep_from = lines.len() / 2;
+        let trimmed = lines[keep_from..].join("\n") + "\n";
+        if tokio::fs::write(&tmp_path, &trimmed).await.is_ok() {
+            #[cfg(windows)]
+            let _ = tokio::fs::remove_file(&path).await;
+            if tokio::fs::rename(&tmp_path, &path).await.is_err() {
+                let _ = tokio::fs::write(&path, &trimmed).await;
+                let _ = tokio::fs::remove_file(&tmp_path).await;
             }
         }
     }
@@ -392,10 +391,10 @@ pub(crate) fn format_memory_for_injection(
     let mut lines = Vec::new();
     lines.push("## Structured Memory (auto-maintained)".to_string());
 
-    if let Some(ref ctx) = mem.user_context {
-        if !ctx.trim().is_empty() {
-            lines.push(format!("**User context:** {}", ctx.trim()));
-        }
+    if let Some(ref ctx) = mem.user_context
+        && !ctx.trim().is_empty()
+    {
+        lines.push(format!("**User context:** {}", ctx.trim()));
     }
 
     if !mem.facts.is_empty() {
@@ -939,10 +938,10 @@ pub(crate) fn build_conversation_excerpt(messages: &[crate::ChatMessage]) -> Str
     for msg in messages {
         match msg.role.as_str() {
             "user" => {
-                if let Some(content) = msg.content.as_deref() {
-                    if !content.is_empty() {
-                        lines.push(format!("User: {content}"));
-                    }
+                if let Some(content) = msg.content.as_deref()
+                    && !content.is_empty()
+                {
+                    lines.push(format!("User: {content}"));
                 }
             }
             "assistant" => {
@@ -965,18 +964,18 @@ pub(crate) fn build_conversation_excerpt(messages: &[crate::ChatMessage]) -> Str
             "tool" => {
                 // Include brief tool result summaries when the result indicates
                 // a notable finding (not just raw data dumps).
-                if let Some(content) = msg.content.as_deref() {
-                    if !content.is_empty() {
-                        let first_line = content.lines().next().unwrap_or("");
-                        let summary = if content.len() <= TOOL_RESULT_EXCERPT_LIMIT {
-                            content.to_string()
-                        } else {
-                            truncate_inline(first_line, TOOL_RESULT_EXCERPT_LIMIT)
-                        };
-                        // Only include non-trivial results.
-                        if !summary.trim().is_empty() {
-                            lines.push(format!("[tool result: {summary}]"));
-                        }
+                if let Some(content) = msg.content.as_deref()
+                    && !content.is_empty()
+                {
+                    let first_line = content.lines().next().unwrap_or("");
+                    let summary = if content.len() <= TOOL_RESULT_EXCERPT_LIMIT {
+                        content.to_string()
+                    } else {
+                        truncate_inline(first_line, TOOL_RESULT_EXCERPT_LIMIT)
+                    };
+                    // Only include non-trivial results.
+                    if !summary.trim().is_empty() {
+                        lines.push(format!("[tool result: {summary}]"));
                     }
                 }
             }
@@ -989,15 +988,15 @@ pub(crate) fn build_conversation_excerpt(messages: &[crate::ChatMessage]) -> Str
 /// Strip ```json ... ``` fences from LLM output.
 fn strip_json_fences(s: &str) -> &str {
     let s = s.trim();
-    if let Some(rest) = s.strip_prefix("```json") {
-        if let Some(inner) = rest.strip_suffix("```") {
-            return inner.trim();
-        }
+    if let Some(rest) = s.strip_prefix("```json")
+        && let Some(inner) = rest.strip_suffix("```")
+    {
+        return inner.trim();
     }
-    if let Some(rest) = s.strip_prefix("```") {
-        if let Some(inner) = rest.strip_suffix("```") {
-            return inner.trim();
-        }
+    if let Some(rest) = s.strip_prefix("```")
+        && let Some(inner) = rest.strip_suffix("```")
+    {
+        return inner.trim();
     }
     s
 }

@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use tokio::{
-    sync::{mpsc, Mutex},
+    sync::{Mutex, mpsc},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    AppState, LiveTx, MAIN_SESSION_ID, WsTx,
     session_store::{save_session_to_disk, trim_incomplete_tool_calls},
-    AppState, LiveTx, WsTx, MAIN_SESSION_ID,
 };
 
 pub(crate) struct SocketTaskHandles {

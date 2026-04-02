@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use reqwest::Client;
 
-use crate::{truncate, Config};
+use crate::{Config, truncate};
 
 /// Return true if an IP address is private/loopback/link-local/unspecified.
 fn is_private_ip(ip: &IpAddr) -> bool {

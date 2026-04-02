@@ -1,4 +1,4 @@
-use crate::{check_dangerous_command, resolve_path_checked, truncate, Config};
+use crate::{Config, check_dangerous_command, resolve_path_checked, truncate};
 use std::path::Path;
 
 // ── think ────────────────────────────────────────────────────────────────────

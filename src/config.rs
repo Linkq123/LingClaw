@@ -339,10 +339,10 @@ impl Config {
         }
         if models.is_empty() {
             models.push(self.model.clone());
-        } else if let Ok(canonical) = self.canonical_model_ref(&self.model) {
-            if !models.iter().any(|m| m == &canonical) {
-                models.push(canonical);
-            }
+        } else if let Ok(canonical) = self.canonical_model_ref(&self.model)
+            && !models.iter().any(|m| m == &canonical)
+        {
+            models.push(canonical);
         }
         models
     }
@@ -451,10 +451,10 @@ impl Config {
 
     /// Look up the JsonModelEntry for a given model reference ("provider/model" or plain id).
     pub(crate) fn find_model_entry(&self, model_ref: &str) -> Option<&JsonModelEntry> {
-        if let Some((prov_name, model_id)) = model_ref.split_once('/') {
-            if let Some(pc) = self.providers.get(prov_name) {
-                return pc.models.iter().find(|m| m.id == model_id);
-            }
+        if let Some((prov_name, model_id)) = model_ref.split_once('/')
+            && let Some(pc) = self.providers.get(prov_name)
+        {
+            return pc.models.iter().find(|m| m.id == model_id);
         }
         // Fallback: search all providers by plain id
         for pc in self.providers.values() {
@@ -468,10 +468,10 @@ impl Config {
     /// Return the effective context token limit for the given model.
     /// Priority: model's contextWindow → settings.maxContextTokens → 32000.
     pub(crate) fn context_limit_for_model(&self, model_ref: &str) -> usize {
-        if let Some(entry) = self.find_model_entry(model_ref) {
-            if let Some(cw) = entry.context_window {
-                return cw as usize;
-            }
+        if let Some(entry) = self.find_model_entry(model_ref)
+            && let Some(cw) = entry.context_window
+        {
+            return cw as usize;
         }
         self.max_context_tokens
     }

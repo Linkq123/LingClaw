@@ -108,9 +108,11 @@ fn drain_busy_socket_messages_collects_interventions_and_stops_run() {
         .try_recv()
         .expect("progress event should be emitted");
     assert_eq!(progress_event["type"], "progress");
-    assert!(progress_event["content"]
-        .as_str()
-        .is_some_and(|value| value.contains("Intervention received")));
+    assert!(
+        progress_event["content"]
+            .as_str()
+            .is_some_and(|value| value.contains("Intervention received"))
+    );
     assert!(live_rx.try_recv().is_err());
 }
 

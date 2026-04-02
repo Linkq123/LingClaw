@@ -1,12 +1,12 @@
 use axum::{
+    Json, Router,
     extract::{
-        ws::{Message as WsMsg, WebSocket, WebSocketUpgrade},
         State,
+        ws::{Message as WsMsg, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
-    Json, Router,
 };
 use futures::{SinkExt, StreamExt};
 use reqwest::Client;
@@ -18,12 +18,12 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 
@@ -43,23 +43,23 @@ mod socket_sync;
 mod socket_tasks;
 mod tools;
 
-pub(crate) use config::{config_dir_path, config_file_path, Config, Provider, DEFAULT_PORT};
+pub(crate) use config::{Config, DEFAULT_PORT, Provider, config_dir_path, config_file_path};
 pub(crate) use context::{
     accumulate_daily_token_usage, context_input_budget_for_model, current_daily_token_usage,
     estimate_tokens_for_provider, format_token_count, format_usage_block,
     message_token_len_for_provider, update_session_token_usage,
 };
-pub(crate) use hooks::{run_hooks, AutoCompressContextHook, HookRegistry};
+pub(crate) use hooks::{AutoCompressContextHook, HookRegistry, run_hooks};
 pub(crate) use memory::MemoryUpdateQueue;
 
 use commands::handle_command;
 use runtime_loop::{
-    handle_idle_socket_input, resolve_or_create_socket_session, run_agent_session,
-    IdleSocketInputAction,
+    IdleSocketInputAction, handle_idle_socket_input, resolve_or_create_socket_session,
+    run_agent_session,
 };
 use session_store::{load_session_from_disk, refresh_session_system_prompt, save_session_to_disk};
 use socket_sync::{send_command_refresh, send_existing_session_payloads};
-use socket_tasks::{finalize_connection, spawn_connection_tasks, ConnectionCleanup};
+use socket_tasks::{ConnectionCleanup, finalize_connection, spawn_connection_tasks};
 
 #[cfg(test)]
 use config::{JsonConfig, JsonModelEntry, JsonProviderConfig};
@@ -497,15 +497,15 @@ fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
             }
             std::path::Component::Normal(part) => {
                 resolved.push(part);
-                if let Ok(meta) = std::fs::symlink_metadata(&resolved) {
-                    if meta.file_type().is_symlink() {
-                        eprintln!(
-                            "SECURITY: path '{}' traverses symlink '{}', clamped",
-                            path_str,
-                            resolved.display()
-                        );
-                        return ws_canonical;
-                    }
+                if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+                    && meta.file_type().is_symlink()
+                {
+                    eprintln!(
+                        "SECURITY: path '{}' traverses symlink '{}', clamped",
+                        path_str,
+                        resolved.display()
+                    );
+                    return ws_canonical;
                 }
             }
             std::path::Component::Prefix(_) | std::path::Component::RootDir => {
@@ -578,15 +578,15 @@ fn resolve_path_checked(path_str: &str, workspace: &Path) -> Result<PathBuf, Str
             }
             std::path::Component::Normal(part) => {
                 resolved.push(part);
-                if let Ok(meta) = std::fs::symlink_metadata(&resolved) {
-                    if meta.file_type().is_symlink() {
-                        return Err(format!(
-                            "path '{}' traverses symlink '{}' outside the session workspace '{}'",
-                            path_str,
-                            resolved.display(),
-                            workspace_root.display()
-                        ));
-                    }
+                if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+                    && meta.file_type().is_symlink()
+                {
+                    return Err(format!(
+                        "path '{}' traverses symlink '{}' outside the session workspace '{}'",
+                        path_str,
+                        resolved.display(),
+                        workspace_root.display()
+                    ));
                 }
             }
             std::path::Component::Prefix(_) | std::path::Component::RootDir => {
@@ -849,110 +849,106 @@ async fn dispatch_live_event(
                 );
             }
             "delta" => {
-                if let Some(round) = live_rounds.get_mut(session_id) {
-                    if round.connection_id == connection_id {
-                        if let Some(content) = event["content"].as_str() {
-                            if round.assistant_text.len() < LIVE_REPLAY_CAP {
-                                round.assistant_text.push_str(content);
-                                round.assistant_text.truncate(LIVE_REPLAY_CAP);
-                            }
-                        }
-                    }
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && let Some(content) = event["content"].as_str()
+                    && round.assistant_text.len() < LIVE_REPLAY_CAP
+                {
+                    round.assistant_text.push_str(content);
+                    round.assistant_text.truncate(LIVE_REPLAY_CAP);
                 }
             }
             "thinking_start" => {
-                if let Some(round) = live_rounds.get_mut(session_id) {
-                    if round.connection_id == connection_id {
-                        round.reasoning_text.clear();
-                        round.reasoning_done = false;
-                    }
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                {
+                    round.reasoning_text.clear();
+                    round.reasoning_done = false;
                 }
             }
             "thinking_delta" => {
-                if let Some(round) = live_rounds.get_mut(session_id) {
-                    if round.connection_id == connection_id {
-                        if let Some(content) = event["content"].as_str() {
-                            if round.reasoning_text.len() < LIVE_REPLAY_CAP {
-                                round.reasoning_text.push_str(content);
-                                round.reasoning_text.truncate(LIVE_REPLAY_CAP);
-                            }
-                        }
-                    }
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && let Some(content) = event["content"].as_str()
+                    && round.reasoning_text.len() < LIVE_REPLAY_CAP
+                {
+                    round.reasoning_text.push_str(content);
+                    round.reasoning_text.truncate(LIVE_REPLAY_CAP);
                 }
             }
             "thinking_done" => {
-                if let Some(round) = live_rounds.get_mut(session_id) {
-                    if round.connection_id == connection_id {
-                        round.reasoning_done = true;
-                    }
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                {
+                    round.reasoning_done = true;
                 }
             }
             "tool_call" => {
-                if let Some(round) = live_rounds.get_mut(session_id) {
-                    if round.connection_id == connection_id {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                {
+                    round.tools.push(LiveToolState {
+                        id: event["id"].as_str().unwrap_or_default().to_string(),
+                        name: event["name"].as_str().unwrap_or_default().to_string(),
+                        arguments: event["arguments"].as_str().unwrap_or_default().to_string(),
+                        result: None,
+                        elapsed_ms: 0,
+                    });
+                }
+            }
+            "tool_progress" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                {
+                    let tool_id = event["id"].as_str().unwrap_or_default();
+                    let elapsed_ms = event["elapsed_ms"].as_u64().unwrap_or(0);
+                    if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
+                        tool.elapsed_ms = elapsed_ms;
+                    } else {
                         round.tools.push(LiveToolState {
-                            id: event["id"].as_str().unwrap_or_default().to_string(),
+                            id: tool_id.to_string(),
                             name: event["name"].as_str().unwrap_or_default().to_string(),
-                            arguments: event["arguments"].as_str().unwrap_or_default().to_string(),
+                            arguments: String::new(),
                             result: None,
-                            elapsed_ms: 0,
+                            elapsed_ms,
                         });
                     }
                 }
             }
-            "tool_progress" => {
-                if let Some(round) = live_rounds.get_mut(session_id) {
-                    if round.connection_id == connection_id {
-                        let tool_id = event["id"].as_str().unwrap_or_default();
-                        let elapsed_ms = event["elapsed_ms"].as_u64().unwrap_or(0);
-                        if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
-                            tool.elapsed_ms = elapsed_ms;
-                        } else {
-                            round.tools.push(LiveToolState {
-                                id: tool_id.to_string(),
-                                name: event["name"].as_str().unwrap_or_default().to_string(),
-                                arguments: String::new(),
-                                result: None,
-                                elapsed_ms,
-                            });
-                        }
-                    }
-                }
-            }
             "tool_result" => {
-                if let Some(round) = live_rounds.get_mut(session_id) {
-                    if round.connection_id == connection_id {
-                        let tool_id = event["id"].as_str().unwrap_or_default();
-                        let mut result = event["result"].as_str().unwrap_or_default().to_string();
-                        result.truncate(LIVE_REPLAY_CAP);
-                        if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
-                            tool.result = Some(result);
-                            tool.elapsed_ms = event["duration_ms"].as_u64().unwrap_or(tool.elapsed_ms);
-                        } else {
-                            round.tools.push(LiveToolState {
-                                id: tool_id.to_string(),
-                                name: event["name"].as_str().unwrap_or_default().to_string(),
-                                arguments: String::new(),
-                                result: Some(result),
-                                elapsed_ms: event["duration_ms"].as_u64().unwrap_or(0),
-                            });
-                        }
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                {
+                    let tool_id = event["id"].as_str().unwrap_or_default();
+                    let mut result = event["result"].as_str().unwrap_or_default().to_string();
+                    result.truncate(LIVE_REPLAY_CAP);
+                    if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
+                        tool.result = Some(result);
+                        tool.elapsed_ms = event["duration_ms"].as_u64().unwrap_or(tool.elapsed_ms);
+                    } else {
+                        round.tools.push(LiveToolState {
+                            id: tool_id.to_string(),
+                            name: event["name"].as_str().unwrap_or_default().to_string(),
+                            arguments: String::new(),
+                            result: Some(result),
+                            elapsed_ms: event["duration_ms"].as_u64().unwrap_or(0),
+                        });
                     }
                 }
             }
             "react_phase" => {
-                if let Some(round) = live_rounds.get_mut(session_id) {
-                    if round.connection_id == connection_id {
-                        round.phase = event["phase"].as_str().map(str::to_string);
-                        round.cycle = event["cycle"].as_u64().map(|value| value as usize);
-                    }
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                {
+                    round.phase = event["phase"].as_str().map(str::to_string);
+                    round.cycle = event["cycle"].as_u64().map(|value| value as usize);
                 }
             }
             "observation" => {
-                if let Some(round) = live_rounds.get_mut(session_id) {
-                    if round.connection_id == connection_id {
-                        round.has_observation = true;
-                    }
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                {
+                    round.has_observation = true;
                 }
             }
             "done" | "error" => {
@@ -980,10 +976,10 @@ async fn dispatch_live_event(
             None
         }
     };
-    if let Some(binding) = binding {
-        if !ws_send(&binding.tx, &event).await {
-            unbind_session_connection_if_matches(state, session_id, binding.connection_id).await;
-        }
+    if let Some(binding) = binding
+        && !ws_send(&binding.tx, &event).await
+    {
+        unbind_session_connection_if_matches(state, session_id, binding.connection_id).await;
     }
 }
 
@@ -1142,10 +1138,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             let runs = state.active_runs.lock().await;
             runs.get(&current_session_id).cloned()
         };
-        if let Some(run) = active_run {
-            if run.connection_id != connection_id {
-                run.cancel.cancel();
-            }
+        if let Some(run) = active_run
+            && run.connection_id != connection_id
+        {
+            run.cancel.cancel();
         }
     }
 
@@ -1428,7 +1424,9 @@ async fn main() {
 
     let addr = format!("127.0.0.1:{port}");
     println!("🦀 LingClaw v2 listening on http://{addr}");
-    println!("   Tools: think, exec, read_file, write_file, patch_file, list_dir, search_files, http_fetch");
+    println!(
+        "   Tools: think, exec, read_file, write_file, patch_file, list_dir, search_files, http_fetch"
+    );
 
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => listener,

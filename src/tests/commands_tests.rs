@@ -463,9 +463,11 @@ async fn switch_command_is_blocked_in_single_session_mode() {
     .await
     .expect("command should resolve");
 
-    assert!(result
-        .response
-        .contains("LingClaw only keeps the main session"));
+    assert!(
+        result
+            .response
+            .contains("LingClaw only keeps the main session")
+    );
 }
 
 #[tokio::test]

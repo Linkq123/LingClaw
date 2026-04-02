@@ -7,8 +7,8 @@ use std::{
 };
 
 use crate::{
-    config_dir_path, context_input_budget_for_model, estimate_tokens_for_provider,
-    format_token_count, format_usage_block, prompts, Config, Session,
+    Config, Session, config_dir_path, context_input_budget_for_model, estimate_tokens_for_provider,
+    format_token_count, format_usage_block, prompts,
 };
 
 use super::{AppState, ChatMessage};
@@ -115,12 +115,8 @@ pub(crate) fn load_session_from_disk(id: &str) -> Option<Session> {
         }
         (Some(p), true) => {
             // Both exist — pick the one with the later mtime.
-            let primary_mtime = std::fs::metadata(&path)
-                .and_then(|m| m.modified())
-                .ok();
-            let tmp_mtime = std::fs::metadata(&tmp_path)
-                .and_then(|m| m.modified())
-                .ok();
+            let primary_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+            let tmp_mtime = std::fs::metadata(&tmp_path).and_then(|m| m.modified()).ok();
             if tmp_mtime >= primary_mtime {
                 eprintln!(
                     "Warning: recovering session '{id}' from newer .tmp file (crash during save)"
@@ -148,10 +144,10 @@ pub(crate) fn refresh_session_system_prompt(state: &AppState, session: &mut Sess
         &model,
         &session.disabled_system_skills,
     );
-    if let Some(first) = session.messages.first_mut() {
-        if first.role == "system" {
-            *first = sys;
-        }
+    if let Some(first) = session.messages.first_mut()
+        && first.role == "system"
+    {
+        *first = sys;
     }
 }
 
@@ -246,26 +242,24 @@ pub(crate) fn build_history_payload(session: &Session) -> serde_json::Value {
                 }
             }
             "assistant" => {
-                if let Some(c) = &msg.content {
-                    if !c.is_empty() {
-                        msgs.push(
-                            json!({"role":"assistant","content":c,"timestamp":msg.timestamp}),
-                        );
-                    }
+                if let Some(c) = &msg.content
+                    && !c.is_empty()
+                {
+                    msgs.push(json!({"role":"assistant","content":c,"timestamp":msg.timestamp}));
                 }
-                if let Some(tcs) = &msg.tool_calls {
-                    if session.show_tools {
-                        for tc in tcs {
-                            msgs.push(json!({"role":"tool_call","name":tc.function.name,"arguments":tc.function.arguments,"id":tc.id}));
-                        }
+                if let Some(tcs) = &msg.tool_calls
+                    && session.show_tools
+                {
+                    for tc in tcs {
+                        msgs.push(json!({"role":"tool_call","name":tc.function.name,"arguments":tc.function.arguments,"id":tc.id}));
                     }
                 }
             }
             "tool" => {
-                if session.show_tools {
-                    if let Some(c) = &msg.content {
-                        msgs.push(json!({"role":"tool_result","result":c,"id":msg.tool_call_id.as_deref().unwrap_or("")}));
-                    }
+                if session.show_tools
+                    && let Some(c) = &msg.content
+                {
+                    msgs.push(json!({"role":"tool_result","result":c,"id":msg.tool_call_id.as_deref().unwrap_or("")}));
                 }
             }
             _ => {}

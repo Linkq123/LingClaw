@@ -1,5 +1,5 @@
 use futures::future::join_all;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
@@ -14,7 +14,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{config::JsonMcpServerConfig, resolve_path_checked, Config, VERSION};
+use crate::{Config, VERSION, config::JsonMcpServerConfig, resolve_path_checked};
 
 use super::ToolOutcome;
 
@@ -406,11 +406,11 @@ fn render_call_result(result: &Value) -> String {
 
     if let Some(content) = result.get("content").and_then(Value::as_array) {
         for item in content {
-            if let Some(text) = item.get("text").and_then(Value::as_str) {
-                if !text.is_empty() {
-                    parts.push(text.to_string());
-                    continue;
-                }
+            if let Some(text) = item.get("text").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                parts.push(text.to_string());
+                continue;
             }
             let item_type = item
                 .get("type")
@@ -839,7 +839,8 @@ async fn remove_cached_sessions(cache_keys: &[String]) {
         };
         let mut removed = Vec::new();
         for cache_key in cache_keys {
-            if let Some(entry) = cache.remove(cache_key) {
+            let removed_entry = cache.remove(cache_key);
+            if let Some(entry) = removed_entry {
                 removed.push(entry.session);
             }
         }
@@ -1234,7 +1235,8 @@ async fn reap_idle_server_sessions(now: Instant) -> Result<(), String> {
             .collect();
         let mut stale = Vec::with_capacity(stale_keys.len());
         for cache_key in stale_keys {
-            if let Some(entry) = cache.remove(&cache_key) {
+            let removed_entry = cache.remove(&cache_key);
+            if let Some(entry) = removed_entry {
                 stale.push(entry.session);
             }
         }
@@ -1250,12 +1252,11 @@ async fn reap_idle_server_sessions(now: Instant) -> Result<(), String> {
 }
 
 fn remove_cached_server_session(cache_key: &str, session: &Arc<AsyncMutex<McpServerSession>>) {
-    if let Ok(mut cache) = session_cache().lock() {
-        if let Some(existing) = cache.get(cache_key) {
-            if Arc::ptr_eq(&existing.session, session) {
-                cache.remove(cache_key);
-            }
-        }
+    if let Ok(mut cache) = session_cache().lock()
+        && let Some(existing) = cache.get(cache_key)
+        && Arc::ptr_eq(&existing.session, session)
+    {
+        cache.remove(cache_key);
     }
 }
 
@@ -1304,7 +1305,8 @@ async fn call_server(
     for attempt in 0..2 {
         let request_result = {
             let mut guard = session.lock().await;
-            match guard.request(method, params.clone()).await {
+            let req_result = guard.request(method, params.clone()).await;
+            match req_result {
                 Ok(result) => return Ok(result),
                 Err(error) => {
                     let decorated = guard.decorate_error(error);

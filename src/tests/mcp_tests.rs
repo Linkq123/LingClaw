@@ -1,5 +1,5 @@
 use super::*;
-use crate::{Provider, DEFAULT_PORT};
+use crate::{DEFAULT_PORT, Provider};
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -454,10 +454,12 @@ fn read_response_handles_ping_requests_while_waiting_for_expected_id() {
     assert_eq!(result.0.get("id").and_then(Value::as_u64), Some(2));
     assert!(result.1.contains("\"id\":\"ping-1\""));
     assert!(result.1.contains("\"result\":{}"));
-    assert!(result
-        .2
-        .iter()
-        .any(|line| line.contains("\"method\":\"ping\"")));
+    assert!(
+        result
+            .2
+            .iter()
+            .any(|line| line.contains("\"method\":\"ping\""))
+    );
 }
 
 #[test]

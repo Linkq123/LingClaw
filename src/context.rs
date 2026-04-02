@@ -1,4 +1,4 @@
-use crate::{config::Config, config::Provider, prompts, ChatMessage, Session};
+use crate::{ChatMessage, Session, config::Config, config::Provider, prompts};
 
 // ── Context Management ──────────────────────────────────────────────────────
 
@@ -275,30 +275,29 @@ pub(crate) fn turn_len(messages: &[ChatMessage], start: usize) -> usize {
         if start + 1 < messages.len() {
             let next = &messages[start + 1];
             if next.role == "assistant" {
-                if let Some(tcs) = &next.tool_calls {
-                    if !tcs.is_empty() {
-                        let tool_results = messages[start + 2..]
-                            .iter()
-                            .take_while(|m| m.role == "tool")
-                            .count();
-                        return 2 + tool_results; // user + assistant + tool results
-                    }
+                if let Some(tcs) = &next.tool_calls
+                    && !tcs.is_empty()
+                {
+                    let tool_results = messages[start + 2..]
+                        .iter()
+                        .take_while(|m| m.role == "tool")
+                        .count();
+                    return 2 + tool_results; // user + assistant + tool results
                 }
                 return 2; // user + assistant text reply
             }
         }
         return 1; // standalone user
     }
-    if msg.role == "assistant" {
-        if let Some(tcs) = &msg.tool_calls {
-            if !tcs.is_empty() {
-                let tool_results = messages[start + 1..]
-                    .iter()
-                    .take_while(|m| m.role == "tool")
-                    .count();
-                return 1 + tool_results; // assistant + tool results
-            }
-        }
+    if msg.role == "assistant"
+        && let Some(tcs) = &msg.tool_calls
+        && !tcs.is_empty()
+    {
+        let tool_results = messages[start + 1..]
+            .iter()
+            .take_while(|m| m.role == "tool")
+            .count();
+        return 1 + tool_results; // assistant + tool results
     }
     1 // standalone assistant or tool message
 }

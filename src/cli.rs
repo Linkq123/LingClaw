@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::{config_dir_path, config_file_path, prompts, Config, DEFAULT_PORT, VERSION};
+use crate::{Config, DEFAULT_PORT, VERSION, config_dir_path, config_file_path, prompts};
 
 static MCP_PREFLIGHT_ID: AtomicU64 = AtomicU64::new(1);
 const MCP_PREFLIGHT_TIMEOUT_SECS: u64 = 5;
@@ -32,10 +32,11 @@ fn prompt_choice(options: &[&str]) -> usize {
             println!("  {}. {opt}", i + 1);
         }
         let input = prompt_line("> ");
-        if let Ok(n) = input.parse::<usize>() {
-            if n >= 1 && n <= options.len() {
-                return n - 1;
-            }
+        if let Ok(n) = input.parse::<usize>()
+            && n >= 1
+            && n <= options.len()
+        {
+            return n - 1;
         }
         println!(
             "Invalid choice. Please enter a number between 1 and {}.",
@@ -468,9 +469,7 @@ fn build_systemd_service_unit(exe: &Path, working_dir: &Path, user: &str, home: 
     );
     format!(
         "[Unit]\nDescription=LingClaw AI Assistant\nAfter=network.target\n\n[Service]\nType=simple\nUser={user}\nWorkingDirectory={}\nEnvironment={}\nExecStart={}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n",
-        working_dir,
-        home,
-        exec_start
+        working_dir, home, exec_start
     )
 }
 
@@ -608,10 +607,6 @@ fn install_global_path() {
                 match res {
                     Ok(s) if s.success() => {
                         println!("   ✅ Added to User PATH: {dir}");
-                        // Also update the current process so child commands work immediately
-                        if let Ok(machine) = std::env::var("Path") {
-                            std::env::set_var("Path", format!("{new_path};{machine}"));
-                        }
                     }
                     _ => eprintln!("   ❌ Failed to update PATH"),
                 }
@@ -639,16 +634,6 @@ fn install_global_path() {
                     eprintln!("   ❌ Failed to update {}: {e}", rc_path.display());
                 }
             }
-        }
-        let current_path = std::env::var("PATH").unwrap_or_default();
-        let already_in_current = current_path.split(':').any(|entry| entry == dir);
-        if !already_in_current {
-            let next_path = if current_path.is_empty() {
-                dir.clone()
-            } else {
-                format!("{dir}:{current_path}")
-            };
-            std::env::set_var("PATH", next_path);
         }
         if added {
             println!("   ✅ Added to PATH for current shell and future login shells.");
@@ -796,12 +781,12 @@ fn handle_start_command(port_override: Option<u16>) -> bool {
     #[cfg(target_os = "windows")]
     let managed_by_systemd = false;
     let effective_port = if managed_by_systemd {
-        if let Some(port) = port_override {
-            if port != config.port {
-                eprintln!(
-                    "Warning: --port is ignored when LingClaw is managed by systemd. Update config and restart the service instead."
-                );
-            }
+        if let Some(port) = port_override
+            && port != config.port
+        {
+            eprintln!(
+                "Warning: --port is ignored when LingClaw is managed by systemd. Update config and restart the service instead."
+            );
         }
         config.port
     } else {
@@ -1339,12 +1324,12 @@ fn handle_status_command(port_override: Option<u16>) -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    if let Some(remote_ver) = read_remote_version() {
-        if remote_ver != VERSION {
-            println!("  💡 New version available: v{VERSION} → v{remote_ver}");
-            println!("     Run `lingclaw update` to upgrade.");
-            println!();
-        }
+    if let Some(remote_ver) = read_remote_version()
+        && remote_ver != VERSION
+    {
+        println!("  💡 New version available: v{VERSION} → v{remote_ver}");
+        println!("     Run `lingclaw update` to upgrade.");
+        println!();
     }
 
     true
@@ -1428,7 +1413,9 @@ fn handle_install_command(port_override: Option<u16>) -> bool {
 
     match cmp {
         std::cmp::Ordering::Less => {
-            eprintln!("❌ Source version v{source_version} is older than installed v{VERSION}. Cannot install.");
+            eprintln!(
+                "❌ Source version v{source_version} is older than installed v{VERSION}. Cannot install."
+            );
             return true;
         }
         std::cmp::Ordering::Equal => {
@@ -1463,10 +1450,10 @@ fn handle_install_command(port_override: Option<u16>) -> bool {
         handle_stop_command(port_override);
         let exe = std::env::current_exe().ok();
         for _ in 0..10 {
-            if let Some(ref path) = exe {
-                if std::fs::OpenOptions::new().write(true).open(path).is_ok() {
-                    break;
-                }
+            if let Some(ref path) = exe
+                && std::fs::OpenOptions::new().write(true).open(path).is_ok()
+            {
+                break;
             }
             std::thread::sleep(Duration::from_millis(500));
         }
@@ -1839,14 +1826,14 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     }
 
     // Ensure ~/.lingclaw directory exists
-    if let Some(dir) = config_dir_path() {
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            eprintln!(
-                "ERROR: Failed to create config directory {}: {e}",
-                dir.display()
-            );
-            return false;
-        }
+    if let Some(dir) = config_dir_path()
+        && let Err(e) = std::fs::create_dir_all(&dir)
+    {
+        eprintln!(
+            "ERROR: Failed to create config directory {}: {e}",
+            dir.display()
+        );
+        return false;
     }
 
     // Write config file

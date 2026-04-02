@@ -1,5 +1,5 @@
 use super::*;
-use crate::{config::JsonMcpServerConfig, Provider};
+use crate::{Provider, config::JsonMcpServerConfig};
 use std::{collections::HashMap, time::Duration};
 
 fn test_config_with_broken_mcp() -> Config {
@@ -46,11 +46,13 @@ fn inspect_mcp_preflight_is_nonfatal_inside_runtime() {
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].server_name, "broken");
     assert!(reports[0].tool_names.is_empty());
-    assert!(reports[0]
-        .error
-        .as_deref()
-        .unwrap_or_default()
-        .contains("failed to spawn 'definitely-not-a-real-command'"));
+    assert!(
+        reports[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("failed to spawn 'definitely-not-a-real-command'")
+    );
 }
 
 #[test]
@@ -135,11 +137,13 @@ fn run_mcp_inspection_without_timeout_returns_reports() {
 
     assert_eq!(reports.len(), 1);
     assert_eq!(reports[0].server_name, "broken");
-    assert!(reports[0]
-        .error
-        .as_deref()
-        .unwrap_or_default()
-        .contains("failed to spawn"));
+    assert!(
+        reports[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("failed to spawn")
+    );
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -152,11 +156,13 @@ fn inspect_mcp_check_is_nonfatal_inside_runtime() {
         .expect("mcp-check should return reports even when a server fails");
 
     assert_eq!(reports.len(), 1);
-    assert!(reports[0]
-        .error
-        .as_deref()
-        .unwrap_or_default()
-        .contains("failed to spawn"));
+    assert!(
+        reports[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("failed to spawn")
+    );
 }
 
 #[test]

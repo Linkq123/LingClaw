@@ -111,11 +111,7 @@ pub(crate) fn resolve_skill_path(virtual_path: &str) -> Option<PathBuf> {
 /// Global skills directory: `~/.lingclaw/skills/`.
 fn global_skills_dir() -> Option<PathBuf> {
     let dir = config_dir_path()?.join(SKILLS_DIR);
-    if dir.is_dir() {
-        Some(dir)
-    } else {
-        None
-    }
+    if dir.is_dir() { Some(dir) } else { None }
 }
 
 /// Scan a single directory for skill subdirectories containing valid `SKILL.md`.
@@ -280,42 +276,42 @@ pub(crate) fn render_skills_catalog(
     const SKILL_FULL_DISPLAY_THRESHOLD: usize = 5;
     const SKILL_TOP_N: usize = 3;
 
-    if skills.len() > SKILL_FULL_DISPLAY_THRESHOLD {
-        if let Some(query) = current_query {
-            let query_tokens = crate::tokenize_for_matching(query);
-            let mut ranked: Vec<(usize, &SkillMeta)> = skills
-                .iter()
-                .map(|s| (skill_relevance(s, &query_tokens), s))
-                .collect();
-            ranked.sort_by(|a, b| b.0.cmp(&a.0));
+    if skills.len() > SKILL_FULL_DISPLAY_THRESHOLD
+        && let Some(query) = current_query
+    {
+        let query_tokens = crate::tokenize_for_matching(query);
+        let mut ranked: Vec<(usize, &SkillMeta)> = skills
+            .iter()
+            .map(|s| (skill_relevance(s, &query_tokens), s))
+            .collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0));
 
-            // Only compress when at least one skill actually matches the query.
-            // Zero-hit queries fall through to full display for discoverability.
-            let max_score = ranked.first().map(|(s, _)| *s).unwrap_or(0);
-            if max_score > 0 {
-                for (i, (_score, skill)) in ranked.iter().enumerate() {
-                    let source_tag = skill.source.label();
-                    if i < SKILL_TOP_N {
-                        if skill.description.is_empty() {
-                            lines.push(format!(
-                                "- **{}** [`{}`] (`{}`)",
-                                skill.name, source_tag, skill.path
-                            ));
-                        } else {
-                            lines.push(format!(
-                                "- **{}** [`{}`] — {} (`{}`)",
-                                skill.name, source_tag, skill.description, skill.path
-                            ));
-                        }
-                    } else {
+        // Only compress when at least one skill actually matches the query.
+        // Zero-hit queries fall through to full display for discoverability.
+        let max_score = ranked.first().map(|(s, _)| *s).unwrap_or(0);
+        if max_score > 0 {
+            for (i, (_score, skill)) in ranked.iter().enumerate() {
+                let source_tag = skill.source.label();
+                if i < SKILL_TOP_N {
+                    if skill.description.is_empty() {
                         lines.push(format!(
                             "- **{}** [`{}`] (`{}`)",
                             skill.name, source_tag, skill.path
                         ));
+                    } else {
+                        lines.push(format!(
+                            "- **{}** [`{}`] — {} (`{}`)",
+                            skill.name, source_tag, skill.description, skill.path
+                        ));
                     }
+                } else {
+                    lines.push(format!(
+                        "- **{}** [`{}`] (`{}`)",
+                        skill.name, source_tag, skill.path
+                    ));
                 }
-                return Some(lines.join("\n"));
             }
+            return Some(lines.join("\n"));
         }
     }
 

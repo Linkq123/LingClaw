@@ -4,7 +4,7 @@ pub(crate) mod mcp;
 pub(crate) mod net;
 
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 use std::time::Instant;
 use std::{future::Future, pin::Pin};
@@ -455,7 +455,10 @@ pub(crate) fn tool_definitions_anthropic() -> serde_json::Value {
 /// Returns true if the named tool performs no side effects (no writes, no exec).
 /// Used to gate parallel execution — only read-only tool batches are safe to parallelize.
 pub(crate) fn is_read_only_tool(name: &str) -> bool {
-    matches!(name, "think" | "read_file" | "list_dir" | "search_files" | "http_fetch")
+    matches!(
+        name,
+        "think" | "read_file" | "list_dir" | "search_files" | "http_fetch"
+    )
 }
 
 pub(crate) async fn execute_tool(
@@ -621,19 +624,19 @@ fn validate_string_property(
     };
 
     let char_len = text.chars().count() as u64;
-    if let Some(min) = property_schema.get("minLength").and_then(Value::as_u64) {
-        if char_len < min {
-            return Some(format!(
-                "{tool_name} error: parameter '{key}' must be at least {min} characters"
-            ));
-        }
+    if let Some(min) = property_schema.get("minLength").and_then(Value::as_u64)
+        && char_len < min
+    {
+        return Some(format!(
+            "{tool_name} error: parameter '{key}' must be at least {min} characters"
+        ));
     }
-    if let Some(max) = property_schema.get("maxLength").and_then(Value::as_u64) {
-        if char_len > max {
-            return Some(format!(
-                "{tool_name} error: parameter '{key}' must be at most {max} characters"
-            ));
-        }
+    if let Some(max) = property_schema.get("maxLength").and_then(Value::as_u64)
+        && char_len > max
+    {
+        return Some(format!(
+            "{tool_name} error: parameter '{key}' must be at most {max} characters"
+        ));
     }
 
     None
@@ -659,19 +662,19 @@ fn validate_integer_property(
         ));
     };
 
-    if let Some(min) = schema_i64(property_schema, "minimum") {
-        if int_value < min {
-            return Some(format!(
-                "{tool_name} error: parameter '{key}' must be >= {min}"
-            ));
-        }
+    if let Some(min) = schema_i64(property_schema, "minimum")
+        && int_value < min
+    {
+        return Some(format!(
+            "{tool_name} error: parameter '{key}' must be >= {min}"
+        ));
     }
-    if let Some(max) = schema_i64(property_schema, "maximum") {
-        if int_value > max {
-            return Some(format!(
-                "{tool_name} error: parameter '{key}' must be <= {max}"
-            ));
-        }
+    if let Some(max) = schema_i64(property_schema, "maximum")
+        && int_value > max
+    {
+        return Some(format!(
+            "{tool_name} error: parameter '{key}' must be <= {max}"
+        ));
     }
 
     None

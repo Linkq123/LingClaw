@@ -1,14 +1,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc,
+    atomic::{AtomicUsize, Ordering},
 };
 
 use futures::stream::{self, StreamExt};
 
 use regex::Regex;
 
-use crate::{format_size, matches_glob, resolve_path_checked, truncate, Config};
+use crate::{Config, format_size, matches_glob, resolve_path_checked, truncate};
 
 fn resolve_tool_path(path_str: &str, workspace: &Path, tool_name: &str) -> Result<PathBuf, String> {
     resolve_path_checked(path_str, workspace)
@@ -52,11 +52,11 @@ pub(crate) async fn tool_read_file(
             if matches!(start, Some(0)) || matches!(end, Some(0)) {
                 return "read_file error: start_line and end_line must be >= 1".into();
             }
-            if let (Some(start), Some(end)) = (start, end) {
-                if end < start {
-                    return "read_file error: end_line must be greater than or equal to start_line"
-                        .into();
-                }
+            if let (Some(start), Some(end)) = (start, end)
+                && end < start
+            {
+                return "read_file error: end_line must be greater than or equal to start_line"
+                    .into();
             }
             let lines: Vec<&str> = content.lines().collect();
             let total = lines.len();
@@ -131,10 +131,10 @@ pub(crate) async fn tool_write_file(
         Err(message) => return message,
     };
 
-    if let Some(parent) = path.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
-            return format!("write_file error: could not create directories: {e}");
-        }
+    if let Some(parent) = path.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await
+    {
+        return format!("write_file error: could not create directories: {e}");
     }
 
     match tokio::fs::write(&path, content).await {
@@ -331,9 +331,7 @@ pub(crate) async fn tool_search_files(
                     .lines()
                     .enumerate()
                     .filter(|(_, line)| re.is_match(line))
-                    .map(|(i, line)| {
-                        format!("{}:{}:{}", file_path.display(), i + 1, line.trim())
-                    })
+                    .map(|(i, line)| format!("{}:{}:{}", file_path.display(), i + 1, line.trim()))
                     .collect();
                 found_count.fetch_add(matches.len(), Ordering::Relaxed);
                 matches

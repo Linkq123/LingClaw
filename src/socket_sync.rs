@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use crate::{session_store::*, ws_send, AppState, WsTx};
+use crate::{AppState, WsTx, session_store::*, ws_send};
 
 fn default_history_payload() -> serde_json::Value {
     json!({"type":"history","messages":[]})
