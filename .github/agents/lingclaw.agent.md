@@ -50,7 +50,7 @@ Key files:
 - `src/config.rs` — runtime config, provider/MCP config structs, model resolution, timeout loading
 - `src/context.rs` — token estimation, context budgets, pruning, usage formatting
 - `src/commands.rs` — slash command handlers and session-facing command mutations
-- `src/cli.rs` — CLI subcommands, setup wizard, install/update/service helpers
+- `src/cli.rs` — CLI subcommands, setup wizard, install/update/service helpers, `doctor` readiness checks
 - `src/providers.rs` — OpenAI/Anthropic streaming, reasoning modes, prompt caching, provider compatibility gates
 - `src/prompts.rs` — session prompt bootstrap/normal flow, baselines, local prompt composition
 - `src/hooks.rs` — hook registry and auto-compress context hook
@@ -75,7 +75,7 @@ Key files:
 - `src/config.rs` — `Config` (incl. `fast_model: Option<String>`), `JsonConfig`, `JsonSettings`, `JsonMcpServerConfig`, model resolution, timeout/env loading
 - `src/context.rs` — token estimation, context input budget, turn-based pruning, usage formatting
 - `src/commands.rs` — slash commands, per-session view toggles, command persistence helpers
-- `src/cli.rs` — setup wizard, daemon/service helpers, CLI status/update/install commands
+- `src/cli.rs` — setup wizard, daemon/service helpers, CLI status/update/install commands, `doctor` readiness checks (`handle_doctor_command()`, version detection helpers)
 - `src/providers.rs` — provider request/stream handling, reasoning/thinking blocks, compatibility gates, extra tool injection
 - `src/prompts.rs` — prompt template initialization, bootstrap baselines, normal-mode prompt loading, daily memory composition (with 4000-char budget), query-aware skill catalog compression
 - `src/hooks.rs` — hook registry and auto-compress lifecycle behavior

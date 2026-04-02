@@ -55,6 +55,7 @@ lingclaw restart
 lingclaw status
 lingclaw mcp-check
 lingclaw update
+lingclaw doctor
 lingclaw install
 lingclaw install -d /path/to/source
 lingclaw systemd-install        # Linux: 安装并启用 lingclaw.service
@@ -430,7 +431,7 @@ src/
 │   └── socket_input.rs (~185 行) — socket 空闲/忙碌输入辅助
 ├── agent.rs           (~290 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
 ├── commands.rs        (~1260 行) — 斜杠命令处理器 (handle_command, /skills-system install/uninstall 等)
-├── cli.rs             (~1730 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署
+├── cli.rs             (~2020 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
 ├── config.rs          (~550 行)  — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
 ├── context.rs         (~210 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
 ├── providers.rs       (~860 行)  — OpenAI/Anthropic 流式调用, 推理模式, prompt caching

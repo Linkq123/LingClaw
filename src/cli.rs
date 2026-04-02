@@ -1335,6 +1335,330 @@ fn handle_status_command(port_override: Option<u16>) -> bool {
     true
 }
 
+// ── Doctor ───────────────────────────────────────────────────────────────────
+
+/// Minimum Rust version required for edition 2024.
+const MIN_RUSTC_VERSION: (u32, u32, u32) = (1, 85, 0);
+
+fn parse_version_triple(s: &str) -> Option<(u32, u32, u32)> {
+    let mut parts = s.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+fn detect_rustc_version() -> Option<String> {
+    let output = std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // "rustc 1.85.0 (..." → "1.85.0"
+    text.split_whitespace().nth(1).map(|v| v.to_string())
+}
+
+fn detect_cargo_version() -> Option<String> {
+    let output = std::process::Command::new("cargo")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.split_whitespace().nth(1).map(|v| v.to_string())
+}
+
+fn detect_git_version() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // "git version 2.45.0" → "2.45.0"  (also handles "git version 2.45.0.windows.1")
+    text.split_whitespace().nth(2).map(|v| v.to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn command_exists(name: &str) -> bool {
+    std::process::Command::new(name)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn read_local_source_version() -> Option<String> {
+    let cargo_toml = std::env::current_dir().ok()?.join("Cargo.toml");
+    let content = std::fs::read_to_string(cargo_toml).ok()?;
+    if !content.contains("name = \"lingclaw\"") {
+        return None;
+    }
+    content.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with("version") {
+            line.split('"').nth(1).map(|v| v.to_string())
+        } else {
+            None
+        }
+    })
+}
+
+fn handle_doctor_command() -> bool {
+    println!("🩺 LingClaw Doctor — Install Readiness Check");
+    println!();
+
+    let mut all_ok = true;
+
+    // ── 1. Rust toolchain ────────────────────────────────────────────────
+    print!("  Rust toolchain ............. ");
+    let rustc_ok = if let Some(ver_str) = detect_rustc_version() {
+        if let Some(triple) = parse_version_triple(&ver_str) {
+            if triple >= MIN_RUSTC_VERSION {
+                println!("✅ rustc {ver_str}");
+                true
+            } else {
+                println!(
+                    "❌ rustc {ver_str} (need >= {}.{}.{})",
+                    MIN_RUSTC_VERSION.0, MIN_RUSTC_VERSION.1, MIN_RUSTC_VERSION.2
+                );
+                false
+            }
+        } else {
+            println!("⚠ rustc {ver_str} (cannot parse version)");
+            false
+        }
+    } else {
+        println!("❌ not found");
+        false
+    };
+    if !rustc_ok {
+        all_ok = false;
+    }
+
+    // ── 2. Cargo ─────────────────────────────────────────────────────────
+    print!("  Cargo ...................... ");
+    let cargo_ok = if let Some(ver_str) = detect_cargo_version() {
+        println!("✅ cargo {ver_str}");
+        true
+    } else {
+        println!("❌ not found");
+        false
+    };
+    if !cargo_ok {
+        all_ok = false;
+    }
+
+    // ── 3. Git ───────────────────────────────────────────────────────────
+    print!("  Git ........................ ");
+    let git_ok = if let Some(ver_str) = detect_git_version() {
+        println!("✅ git {ver_str}");
+        true
+    } else {
+        println!("❌ not found (needed for update/remote checks)");
+        false
+    };
+    if !git_ok {
+        all_ok = false;
+    }
+
+    // ── 4. Platform tooling ──────────────────────────────────────────────
+    #[cfg(target_os = "windows")]
+    {
+        print!("  PowerShell ................. ");
+        let ps_ok = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", "exit 0"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if ps_ok {
+            println!("✅ available");
+        } else {
+            println!("⚠ not found (needed for PATH registration)");
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let has_systemd;
+    #[cfg(not(target_os = "windows"))]
+    {
+        print!("  systemd .................... ");
+        has_systemd = command_exists("systemctl");
+        if has_systemd {
+            println!("✅ available");
+        } else {
+            println!("⚠ not found (lingclaw will use nohup instead)");
+        }
+
+        print!("  nohup ...................... ");
+        if command_exists("nohup") {
+            println!("✅ available");
+        } else if has_systemd {
+            println!("⚠ not found (systemd is available, so this is fine)");
+        } else {
+            println!("❌ neither systemd nor nohup found for background execution");
+            all_ok = false;
+        }
+    }
+
+    // ── 5. Source vs installed ────────────────────────────────────────────
+    print!("  Source vs installed ......... ");
+    let (source_ok, source_ver) = if let Some(src_ver) = read_local_source_version() {
+        let src_parts: Vec<u32> = src_ver.split('.').filter_map(|s| s.parse().ok()).collect();
+        let cur_parts: Vec<u32> = VERSION.split('.').filter_map(|s| s.parse().ok()).collect();
+        match src_parts.cmp(&cur_parts) {
+            std::cmp::Ordering::Greater => {
+                println!("💡 v{} → v{src_ver} (upgrade available)", VERSION);
+                (true, Some(src_ver))
+            }
+            std::cmp::Ordering::Equal => {
+                println!("✅ v{VERSION} (same)");
+                (true, Some(src_ver))
+            }
+            std::cmp::Ordering::Less => {
+                println!("❌ source v{src_ver} < installed v{VERSION}");
+                all_ok = false;
+                (false, Some(src_ver))
+            }
+        }
+    } else {
+        println!("⚠ not in a LingClaw source directory");
+        (true, None) // not a blocker when run outside source tree
+    };
+
+    // ── 6. Source vs remote ──────────────────────────────────────────────
+    print!("  Source vs remote ........... ");
+    let remote_ok = {
+        // Try git fetch first so remote refs are fresh.
+        let _ = std::process::Command::new("git")
+            .args(["fetch", "--quiet"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Some(remote_ver) = read_remote_version() {
+            if let Some(ref src_ver) = source_ver {
+                let src_parts: Vec<u32> =
+                    src_ver.split('.').filter_map(|s| s.parse().ok()).collect();
+                let remote_parts: Vec<u32> =
+                    remote_ver.split('.').filter_map(|s| s.parse().ok()).collect();
+                match src_parts.cmp(&remote_parts) {
+                    std::cmp::Ordering::Equal => {
+                        println!("✅ v{src_ver} (up to date)");
+                        true
+                    }
+                    std::cmp::Ordering::Greater => {
+                        println!("✅ v{src_ver} (ahead of remote v{remote_ver})");
+                        true
+                    }
+                    std::cmp::Ordering::Less => {
+                        println!("💡 v{src_ver} → v{remote_ver} (behind remote)");
+                        all_ok = false;
+                        false
+                    }
+                }
+            } else {
+                println!("⚠ skipped (no local source)");
+                true
+            }
+        } else {
+            println!("⚠ cannot read remote (no git remote?)");
+            true // not fatal
+        }
+    };
+
+    println!();
+
+    if all_ok {
+        println!("✅ All checks passed. Ready to install.");
+        if source_ver.is_some() {
+            println!("   Run `lingclaw install` to proceed.");
+        }
+        return true;
+    }
+
+    // ── Offer to fix ─────────────────────────────────────────────────────
+    println!("Some checks need attention:");
+    println!();
+    let mut fixes: Vec<(&str, &str)> = Vec::new();
+    if !rustc_ok {
+        println!(
+            "  • Rust toolchain needs >= {}.{}.{}",
+            MIN_RUSTC_VERSION.0, MIN_RUSTC_VERSION.1, MIN_RUSTC_VERSION.2
+        );
+        fixes.push(("rust", "rustup update stable"));
+    }
+    if !cargo_ok && rustc_ok {
+        println!("  • Cargo not found — usually installed with rustup");
+        fixes.push(("cargo", "rustup update stable"));
+    }
+    if !git_ok {
+        println!("  • Git not found — install git from https://git-scm.com");
+        // Cannot auto-fix git installation portably.
+    }
+    #[cfg(not(target_os = "windows"))]
+    if !has_systemd && !command_exists("nohup") {
+        println!("  • No background execution tool (systemd or nohup)");
+        println!("    → Install nohup (coreutils) or enable systemd.");
+    }
+    if !remote_ok {
+        println!("  • Local source is behind remote");
+        fixes.push(("source", "git pull"));
+    }
+    if !source_ok {
+        println!("  • Source version is older than installed binary");
+        println!("    → Pull the latest source or check out a newer branch.");
+    }
+    println!();
+
+    if fixes.is_empty() {
+        return true;
+    }
+
+    // Deduplicate (rust + cargo may both suggest `rustup update stable`)
+    fixes.dedup_by_key(|f| f.1);
+
+    let fix_summary: Vec<&str> = fixes.iter().map(|f| f.1).collect();
+    println!(
+        "Fix automatically? Commands: {}",
+        fix_summary.join(" && ")
+    );
+    print!("[y/N] ");
+    let _ = io::stdout().flush();
+    let mut answer = String::new();
+    let _ = io::stdin().read_line(&mut answer);
+    if !answer.trim().eq_ignore_ascii_case("y") {
+        println!("Skipped. You can run these commands manually.");
+        return true;
+    }
+
+    println!();
+    for (label, cmd) in &fixes {
+        println!("Running: {cmd}  ({label})");
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        let status = std::process::Command::new(parts[0])
+            .args(&parts[1..])
+            .status();
+        match status {
+            Ok(s) if s.success() => println!("  ✅ {label} updated"),
+            Ok(s) => println!("  ❌ {label} failed (exit {})", s.code().unwrap_or(-1)),
+            Err(e) => println!("  ❌ {label} failed: {e}"),
+        }
+        println!();
+    }
+
+    println!("Re-run `lingclaw doctor` to verify.");
+    true
+}
+
 fn handle_help_command() -> bool {
     println!("🦀 LingClaw v{VERSION} — Personal AI Assistant");
     println!();
@@ -1348,6 +1672,7 @@ fn handle_help_command() -> bool {
     println!("  health             Health check (exit 0 = ok)");
     println!("  status             Show detailed service status");
     println!("  update             Check for updates, rebuild if newer");
+    println!("  doctor             Check install readiness (Rust, versions)");
     println!("  install [-d DIR]   Install from local source directory");
     #[cfg(not(target_os = "windows"))]
     println!("  systemd-install    Install and enable lingclaw.service");
@@ -1546,6 +1871,7 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
         "mcp-check" => handle_mcp_check_command(),
         "health" => handle_health_command(port_override),
         "update" => handle_update_command(port_override),
+        "doctor" => handle_doctor_command(),
         "status" => handle_status_command(port_override),
         "help" | "--help" | "-h" => handle_help_command(),
         "--version" | "-V" => {
