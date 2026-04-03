@@ -2079,7 +2079,7 @@ fn handle_command_persists_tool_and_reasoning_visibility_changes() {
 }
 
 #[test]
-fn handle_command_persists_model_think_react_and_rename_changes() {
+fn handle_command_persists_model_think_and_react_changes() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let session_id = format!("persist-command-{}", now_epoch());
     let workspace = session_workspace_path(&session_id);
@@ -2137,19 +2137,6 @@ fn handle_command_persists_model_think_react_and_rename_changes() {
     assert_eq!(react_result.response_type, "system");
     assert!(react_result.sessions_changed);
 
-    let rename_result = rt
-        .block_on(handle_command(
-            "/rename After Rename",
-            &session_id,
-            1,
-            &state,
-            &tx,
-            &cancel,
-        ))
-        .expect("command should return a result");
-    assert_eq!(rename_result.response_type, "system");
-    assert!(rename_result.sessions_changed);
-
     let persisted = load_session_from_disk(&session_id).expect("session should load from disk");
     assert_eq!(
         persisted.model_override.as_deref(),
@@ -2157,7 +2144,7 @@ fn handle_command_persists_model_think_react_and_rename_changes() {
     );
     assert_eq!(persisted.think_level, "high");
     assert!(!persisted.show_react);
-    assert_eq!(persisted.name, "After Rename");
+    assert_eq!(persisted.name, "Before Rename");
     assert!(persisted.updated_at > 0);
 
     let path = sessions_dir().join(format!("{session_id}.json"));

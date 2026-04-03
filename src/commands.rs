@@ -1159,7 +1159,6 @@ Commands:
     /skills-system   List system skills with status (install/uninstall subcommands)
     /skills-global   List global skills (~/.lingclaw/skills/)
     /skills-session  List session-local skills
-    /rename <name>   Rename current session
     /clear           Clear messages (keep system prompt)
     /memory [stats|debug] Show structured memory status or updater diagnostics
     /help            Show this help"
@@ -1245,37 +1244,6 @@ pub(crate) async fn handle_command(
         "/session_new" => Some(handle_session_new_command(current_session_id, state).await),
         "/switch" => {
             Some(handle_switch_command(arg, current_session_id, connection_id, state).await)
-        }
-
-        "/rename" => {
-            if arg.is_empty() {
-                return Some(command_result("Usage: /rename <new_name>", "system", false));
-            }
-            let name = arg.to_string();
-            match persist_session_update(
-                state,
-                current_session_id,
-                |session| (session.name.clone(), session.updated_at),
-                |session| {
-                    session.name = name;
-                },
-                |session, (session_name, updated_at)| {
-                    session.name = session_name;
-                    session.updated_at = updated_at;
-                },
-            )
-            .await
-            {
-                Ok(()) => Some(command_result(format!("Renamed to: {arg}"), "system", true)),
-                Err(err) if err == "Session not found" => {
-                    Some(command_result(err, "system", false))
-                }
-                Err(err) => Some(command_result(
-                    format!("Failed to persist rename: {err}"),
-                    "error",
-                    false,
-                )),
-            }
         }
 
         "/model" => Some(handle_model_command(arg, current_session_id, state).await),
