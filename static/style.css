@@ -544,6 +544,10 @@ header .actions button.is-active {
   min-width: 320px;
   position: relative;
   padding-left: 28px;
+  --_tl-color: color-mix(in srgb, var(--accent2) 30%, var(--border));
+}
+.timeline-node:has(+ .timeline-node) {
+  background: linear-gradient(var(--_tl-color), var(--_tl-color)) no-repeat 7px 18px / 2px calc(100% - 18px);
 }
 .timeline-node::before {
   content: '';
@@ -573,12 +577,18 @@ header .actions button.is-active {
   background: var(--accent-warn);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-warn) 18%, transparent);
 }
+.timeline-node--reasoning {
+  --_tl-color: color-mix(in srgb, var(--accent-warn) 30%, var(--border));
+}
 .timeline-node--reasoning + .timeline-node::after {
   background: color-mix(in srgb, var(--accent-warn) 30%, var(--border));
 }
 .timeline-node--result::before {
   background: var(--accent-success);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-success) 18%, transparent);
+}
+.timeline-node--result {
+  --_tl-color: color-mix(in srgb, var(--accent-success) 30%, var(--border));
 }
 .timeline-node--result + .timeline-node::after {
   background: color-mix(in srgb, var(--accent-success) 30%, var(--border));
@@ -1173,6 +1183,9 @@ pre:hover .copy-btn { opacity: 1; }
     left: 4px;
     top: -10px;
     height: 24px;
+  }
+  .timeline-node:has(+ .timeline-node) {
+    background-position: 4px 18px;
   }
   .copy-btn {
     opacity: .7;

@@ -1394,7 +1394,12 @@ function addToolCall(name, args, id) {
     </div>
   `;
   const wrapper = wrapInTimeline(panel, 'tool');
-  chat.appendChild(wrapper);
+  const currentRow = currentMsg ? currentMsg.closest('.msg-row') : null;
+  if (currentRow) {
+    chat.insertBefore(wrapper, currentRow);
+  } else {
+    chat.appendChild(wrapper);
+  }
   pinReactStatusToBottom();
   animatePanelIn(panel);
   hideWelcome();
@@ -1459,7 +1464,12 @@ function addToolResult(name, result, id, durationMs = null) {
   `;
   el.classList.add('tool-panel-ready');
   const wrapper = wrapInTimeline(el, 'result');
-  chat.appendChild(wrapper);
+  const currentRow = currentMsg ? currentMsg.closest('.msg-row') : null;
+  if (currentRow) {
+    chat.insertBefore(wrapper, currentRow);
+  } else {
+    chat.appendChild(wrapper);
+  }
   pinReactStatusToBottom();
   animatePanelIn(el);
   scrollDown();
