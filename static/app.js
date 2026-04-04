@@ -120,6 +120,19 @@ function animatePanelIn(panel) {
   });
 }
 
+function wrapInTimeline(panel, variant) {
+  const node = document.createElement('div');
+  node.className = 'timeline-node' + (variant ? ` timeline-node--${variant}` : '');
+  node.appendChild(panel);
+  return node;
+}
+
+function removeTimelinePanel(panel) {
+  if (!panel) return;
+  const wrapper = panel.closest('.timeline-node');
+  if (wrapper) wrapper.remove(); else panel.remove();
+}
+
 function cancelScheduledMarkdownRender(el) {
   if (!el) return;
   if (el._markdownIdleHandle) {
@@ -238,7 +251,8 @@ function animateCollapsibleSection(body, expand) {
   body.classList.toggle('is-open', expand);
   body.style.height = `${targetHeight}px`;
 
-  const finalize = () => {
+  const finalize = (e) => {
+    if (e.propertyName !== 'height') return;
     body.style.height = expand ? 'auto' : '0px';
     body.removeEventListener('transitionend', finalize);
   };
@@ -354,7 +368,7 @@ function applyViewState(viewState) {
       closeToolDrawer();
       activeToolPanel = null;
       for (const panel of chat.querySelectorAll('.tool-panel')) {
-        panel.remove();
+        removeTimelinePanel(panel);
       }
     }
   }
@@ -363,7 +377,7 @@ function applyViewState(viewState) {
     showReasoning = viewState.show_reasoning;
     if (!showReasoning) {
       finishReasoningStream();
-      if (reasoningPanel) reasoningPanel.remove();
+      if (reasoningPanel) removeTimelinePanel(reasoningPanel);
       reasoningPanel = null;
     }
   }
@@ -592,7 +606,7 @@ function decorateCodeBlocks(container) {
     }
     const btn = document.createElement('button');
     btn.className = 'copy-btn';
-    btn.textContent = 'Copy';
+    btn.textContent = '复制';
     btn.onclick = () => {
       const code = pre.querySelector('code');
       const text = code?.textContent || pre.textContent;
@@ -601,8 +615,8 @@ function decorateCodeBlocks(container) {
       } else {
         fallbackCopy(text);
       }
-      btn.textContent = 'Copied!';
-      setTimeout(() => btn.textContent = 'Copy', 1500);
+      btn.textContent = '已复制';
+      setTimeout(() => btn.textContent = '复制', 1500);
     };
     pre.appendChild(btn);
   });
@@ -611,7 +625,7 @@ function decorateCodeBlocks(container) {
 function appendRenderedSegment(el, markdownText) {
   const { text: preprocessed, blocks: mathBlocks } = extractMath(markdownText);
   const html = marked.parse(preprocessed);
-  const sanitized = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : html;
+  const sanitized = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : escHtml(html);
   const temp = document.createElement('div');
   temp.innerHTML = renderMathPlaceholders(sanitized, mathBlocks);
   decorateCodeBlocks(temp);
@@ -1183,10 +1197,11 @@ function handleMessage(data) {
         <div class="reasoning-body show"></div>
       `;
       const currentRow = currentMsg ? currentMsg.closest('.msg-row') : null;
+      const wrapper = wrapInTimeline(panel, 'reasoning');
       if (currentRow) {
-        chat.insertBefore(panel, currentRow);
+        chat.insertBefore(wrapper, currentRow);
       } else {
-        chat.appendChild(panel);
+        chat.appendChild(wrapper);
       }
       pinReactStatusToBottom();
       animatePanelIn(panel);
@@ -1374,11 +1389,12 @@ function addToolCall(name, args, id) {
     <div class="tool-header" onclick="openToolDrawerFromHeader(this)">
       <span class="tool-icon">⚡</span>
       <span class="tool-name">${escHtml(name)}</span>
+      <span class="tool-args-preview">${escHtml(truncateStr(args, 80))}</span>
       <span class="tool-status">执行中</span>
-      <span style="color:var(--dim);font-size:12px">${escHtml(truncateStr(args, 80))}</span>
     </div>
   `;
-  chat.appendChild(panel);
+  const wrapper = wrapInTimeline(panel, 'tool');
+  chat.appendChild(wrapper);
   pinReactStatusToBottom();
   animatePanelIn(panel);
   hideWelcome();
@@ -1442,7 +1458,8 @@ function addToolResult(name, result, id, durationMs = null) {
     </div>
   `;
   el.classList.add('tool-panel-ready');
-  chat.appendChild(el);
+  const wrapper = wrapInTimeline(el, 'result');
+  chat.appendChild(wrapper);
   pinReactStatusToBottom();
   animatePanelIn(el);
   scrollDown();
@@ -1452,7 +1469,7 @@ function renderMarkdown(el) {
   const raw = el._rawText || el.textContent;
   const { text: preprocessed, blocks: mathBlocks } = extractMath(raw);
   const html = marked.parse(preprocessed);
-  const sanitized = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : html;
+  const sanitized = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : escHtml(html);
   el.innerHTML = renderMathPlaceholders(sanitized, mathBlocks);
   el._markdownIdleHandle = 0;
 
@@ -1830,7 +1847,7 @@ input.addEventListener('input', () => {
 });
 chat.addEventListener('scroll', () => {
   syncChatScrollState();
-});
+}, { passive: true });
 window.addEventListener('resize', syncToolDrawerBounds);
 window.addEventListener('resize', () => {
   if (window.innerWidth > 768) closeMobileMenu();
