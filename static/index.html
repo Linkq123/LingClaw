@@ -24,6 +24,7 @@
       <span class="conn-label" id="conn-label">Offline</span>
     </div>
     <div class="brand-block">
+      <img class="brand-logo" src="branding/logo-mark.png" alt="" width="28" height="28">
       <span class="session-name" id="session-name">LingClaw</span>
       <span class="app-version-badge header-version" id="app-version-header" hidden></span>
     </div>
@@ -31,24 +32,29 @@
     <div class="actions">
       <button id="toggle-tools-btn" onclick="toggleToolsVisibility()" aria-label="Toggle tools visibility">Tools: On</button>
       <button id="toggle-reasoning-btn" onclick="toggleReasoningVisibility()" aria-label="Toggle reasoning visibility">Reasoning: On</button>
-      <button onclick="sendCmd('/status')" aria-label="Show status">Status</button>
-      <button onclick="sendCmd('/clear')" aria-label="Clear chat">Clear</button>
-      <button onclick="sendCmd('/help')" aria-label="Show help">Help</button>
+      <button class="mobile-hide" onclick="sendCmd('/status')" aria-label="Show status">Status</button>
+      <button class="mobile-hide" onclick="sendCmd('/clear')" aria-label="Clear chat">Clear</button>
+      <button class="mobile-hide" onclick="sendCmd('/help')" aria-label="Show help">Help</button>
+      <button class="mobile-menu-toggle" id="mobile-menu-toggle" onclick="toggleMobileMenu()" aria-label="More actions" aria-expanded="false" aria-controls="mobile-menu">⋯</button>
+      <div class="mobile-menu" id="mobile-menu" role="menu">
+        <button onclick="sendCmd('/status'); closeMobileMenu()">Status</button>
+        <button onclick="sendCmd('/clear'); closeMobileMenu()">Clear</button>
+        <button onclick="sendCmd('/help'); closeMobileMenu()">Help</button>
+      </div>
     </div>
   </header>
   <div id="chat" role="log" aria-live="polite">
     <div class="welcome" id="welcome">
       <div class="welcome-logo"><img src="branding/logo-wordmark.png" alt="LingClaw"></div>
-      <div class="welcome-title">LingClaw</div>
       <div class="app-version-badge welcome-version" id="app-version-welcome" hidden></div>
       <div class="welcome-hint">
         你的私人 AI 助手已就绪<br>
         输入消息开始对话，或使用 <strong>/</strong> 命令
       </div>
       <div class="welcome-shortcuts">
-        <button onclick="sendCmd('/clear')">🔄 New Conversation</button>
-        <button onclick="sendCmd('/status')">📊 Status</button>
-        <button onclick="sendCmd('/help')">❓ Help</button>
+        <button onclick="sendCmd('/clear')">New Conversation</button>
+        <button onclick="sendCmd('/status')">Status</button>
+        <button onclick="sendCmd('/help')">Help</button>
       </div>
     </div>
   </div>
@@ -57,9 +63,11 @@
     <span class="jump-to-latest-badge" id="jump-to-latest-badge" hidden></span>
   </button>
   <div id="input-area">
-    <textarea id="input" placeholder="Message LingClaw... (/ for commands)" rows="1" aria-label="Message input"></textarea>
-    <button id="stop" aria-label="Stop agent" title="Stop" style="display:none"><span id="stop-icon">■</span></button>
-    <button id="send" aria-label="Send message"><span id="send-icon">↑</span></button>
+    <div class="input-composer">
+      <textarea id="input" placeholder="Message LingClaw... (/ for commands)" rows="1" aria-label="Message input"></textarea>
+      <button id="stop" aria-label="Stop agent" title="Stop" style="display:none"><span id="stop-icon">■</span></button>
+      <button id="send" aria-label="Send message"><span id="send-icon">↑</span></button>
+    </div>
   </div>
 </div>
 

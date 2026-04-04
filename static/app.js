@@ -1540,16 +1540,15 @@ function showWelcome() {
   w.id = 'welcome';
   w.innerHTML = `
     <div class="welcome-logo"><img src="${DEFAULT_WELCOME_LOGO}" alt="LingClaw"></div>
-    <div class="welcome-title">LingClaw</div>
     ${versionBadgeMarkup('app-version-welcome', 'welcome-version')}
     <div class="welcome-hint">
       你的私人 AI 助手已就绪<br>
       输入消息开始对话，或使用 <strong>/</strong> 命令
     </div>
     <div class="welcome-shortcuts">
-      <button onclick="sendCmd('/clear')">🔄 New Conversation</button>
-      <button onclick="sendCmd('/status')">📊 Status</button>
-      <button onclick="sendCmd('/help')">❓ Help</button>
+      <button onclick="sendCmd('/clear')">New Conversation</button>
+      <button onclick="sendCmd('/status')">Status</button>
+      <button onclick="sendCmd('/help')">Help</button>
     </div>
   `;
   chat.appendChild(w);
@@ -1622,6 +1621,31 @@ function toggleTool(header) {
   if (chevron) chevron.classList.toggle('open', nextOpen);
   animateCollapsibleSection(body, nextOpen);
 }
+
+// ── Mobile menu ──
+function syncMobileMenuAria(open) {
+  const toggle = document.getElementById('mobile-menu-toggle');
+  if (toggle) toggle.setAttribute('aria-expanded', String(open));
+}
+function toggleMobileMenu() {
+  const menu = document.getElementById('mobile-menu');
+  if (!menu) return;
+  const willOpen = !menu.classList.contains('open');
+  menu.classList.toggle('open', willOpen);
+  syncMobileMenuAria(willOpen);
+}
+function closeMobileMenu() {
+  const menu = document.getElementById('mobile-menu');
+  if (menu) menu.classList.remove('open');
+  syncMobileMenuAria(false);
+}
+document.addEventListener('click', (e) => {
+  const toggle = document.getElementById('mobile-menu-toggle');
+  const menu = document.getElementById('mobile-menu');
+  if (menu && toggle && !toggle.contains(e.target) && !menu.contains(e.target)) {
+    closeMobileMenu();
+  }
+});
 
 // ── History lazy-load ──
 function findHistoryRenderStart(messages, preferredStart) {
@@ -1796,6 +1820,7 @@ input.addEventListener('keydown', (e) => {
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     closeToolDrawer();
+    closeMobileMenu();
   }
 });
 input.addEventListener('input', () => {
@@ -1807,6 +1832,9 @@ chat.addEventListener('scroll', () => {
   syncChatScrollState();
 });
 window.addEventListener('resize', syncToolDrawerBounds);
+window.addEventListener('resize', () => {
+  if (window.innerWidth > 768) closeMobileMenu();
+});
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', syncToolDrawerBounds);
   window.visualViewport.addEventListener('scroll', syncToolDrawerBounds);
