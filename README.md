@@ -17,7 +17,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
 - **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断；server 启动连续失败会进入短暂冷却，避免请求风暴
 - **单主会话**：运行时固定使用 `main`，不再创建、切换或删除其他会话
-- **18 斜杠命令**：`/new`、`/session_new`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/status`、`/mcp`、`/usage`、`/clear`、`/memory`、`/help`
+- **文档化斜杠命令**：`/new`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/status`、`/mcp`、`/usage`、`/clear`、`/memory`、`/help`
 - **双 Provider 模型路由**：OpenAI + Anthropic，支持 `provider/model` 和纯 model ID
 - **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
 - **持久化主会话**：固定保存 `main` 工作区和磁盘存档
@@ -196,7 +196,6 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | 命令 | 说明 |
 |---|---|
 | `/new` | 压缩对话到每日记忆，清空上下文 |
-| `/session_new` | 重置 `main` 会话上下文 |
 | `/model [name]` | 查看可用模型或切换当前会话模型 |
 | `/think [level]` | 设置思维模式：`auto`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh` |
 | `/react [on\|off]` | 切换 ReAct 阶段可见性（默认开启；启用后每次阶段转换发送 `react_phase` WS 事件） |

@@ -1547,7 +1547,7 @@ function showWelcome() {
       输入消息开始对话，或使用 <strong>/</strong> 命令
     </div>
     <div class="welcome-shortcuts">
-      <button onclick="sendCmd('/session_new')">🔄 New Conversation</button>
+      <button onclick="sendCmd('/clear')">🔄 New Conversation</button>
       <button onclick="sendCmd('/status')">📊 Status</button>
       <button onclick="sendCmd('/help')">❓ Help</button>
     </div>

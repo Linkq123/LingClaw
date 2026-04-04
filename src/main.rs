@@ -12,8 +12,6 @@ use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -145,12 +143,6 @@ fn now_epoch() -> u64 {
 }
 
 const SESSION_VERSION: u32 = 4;
-
-#[cfg(test)]
-pub(crate) fn saved_session_test_guard() -> &'static tokio::sync::Mutex<()> {
-    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
-}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {

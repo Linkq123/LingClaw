@@ -418,22 +418,6 @@ async fn handle_new_command(
     ))
 }
 
-async fn handle_session_new_command(current_session_id: &str, state: &AppState) -> CommandResult {
-    match reset_session_context_and_persist(state, current_session_id).await {
-        Ok(()) => command_result_with_history(
-            "Single-session mode is enabled. Cleared the main session instead of creating a new one.",
-            "system",
-            false,
-        ),
-        Err(err) if err == "Session not found" => command_result(err, "system", false),
-        Err(err) => command_result(
-            format!("Failed to reset main session: {err}"),
-            "error",
-            false,
-        ),
-    }
-}
-
 async fn handle_switch_command(
     _arg: &str,
     _current_session_id: &str,
@@ -1145,7 +1129,6 @@ fn handle_help_command(current_session_id: &str) -> CommandResult {
     let mut help = "\
 Commands:
     /new             Compress conversation to memory & clear context
-    /session_new     Reset session context (fresh start)
     /status          Show session status
     /mcp [refresh]   Show MCP load status or refresh cache
     /usage           Show session token usage
@@ -1241,7 +1224,6 @@ pub(crate) async fn handle_command(
 
     match cmd {
         "/new" => handle_new_command(current_session_id, state, tx, cancel).await,
-        "/session_new" => Some(handle_session_new_command(current_session_id, state).await),
         "/switch" => {
             Some(handle_switch_command(arg, current_session_id, connection_id, state).await)
         }
