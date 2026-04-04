@@ -560,20 +560,76 @@ where
     }
 }
 
+/// Returns `(outcome, effective_args)` where `effective_args` is `None` when
+/// the tool was rejected by a BeforeToolExec hook (signals record_tool_result
+/// to skip AfterToolExec), or `Some(args_json)` with the actually-executed args.
 async fn execute_tool_call(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
     tc: &ToolCall,
-) -> Result<tools::ToolOutcome, AgentPhaseControl> {
+) -> Result<(tools::ToolOutcome, Option<String>), AgentPhaseControl> {
     let tool_timeout = ctx.state.config.tool_timeout;
 
+    // ── BeforeToolExec hook (evaluated before the WS event so the frontend
+    //    always sees the arguments that will actually be executed) ─────────
+    let tool_hook_input = ToolHookInput {
+        tool_name: tc.function.name.clone(),
+        tool_args: serde_json::from_str(&tc.function.arguments)
+            .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone())),
+        tool_id: tc.id.clone(),
+        cycle: phase_state.react_ctx.cycles,
+        workspace: phase_state.cycle_workspace.clone(),
+        outcome_output: None,
+        outcome_is_error: None,
+        outcome_duration_ms: None,
+    };
+    let hook_output = run_tool_hooks(
+        &ctx.state.hooks,
+        agent::HookPoint::BeforeToolExec,
+        tool_hook_input,
+        &ctx.state.config,
+    )
+    .await;
+
+    let effective_args = match hook_output {
+        hooks::HookOutput::Reject { reason, events } => {
+            // Still send the tool_call event so the frontend sees the attempted call.
+            let _ = live_send(
+                ctx.live_tx,
+                json!({
+                    "type":"tool_call",
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                }),
+            )
+            .await;
+            for ev in events {
+                let _ = live_send(ctx.live_tx, ev).await;
+            }
+            return Ok((
+                tools::ToolOutcome {
+                    output: format!("[rejected by hook] {reason}"),
+                    is_error: true,
+                    duration_ms: 0,
+                },
+                None, // rejected — skip AfterToolExec
+            ));
+        }
+        hooks::HookOutput::ModifyToolArgs { args } => {
+            serde_json::to_string(&args).unwrap_or_else(|_| tc.function.arguments.clone())
+        }
+        _ => tc.function.arguments.clone(),
+    };
+
+    // Send tool_call event with the effective (possibly hook-modified) arguments.
     if !live_send(
         ctx.live_tx,
         json!({
             "type":"tool_call",
             "id": tc.id,
             "name": tc.function.name,
-            "arguments": tc.function.arguments,
+            "arguments": effective_args,
         }),
     )
     .await
@@ -589,7 +645,7 @@ async fn execute_tool_call(
         tool_timeout,
         execute_tool(
             &tc.function.name,
-            &tc.function.arguments,
+            &effective_args,
             &ctx.state.config,
             &ctx.state.http,
             &phase_state.cycle_workspace,
@@ -598,7 +654,7 @@ async fn execute_tool_call(
     .await;
 
     match run_state {
-        ToolRunState::Completed(result) => Ok(result),
+        ToolRunState::Completed(result) => Ok((result, Some(effective_args))),
         ToolRunState::Abort => {
             phase_state.shutting_down = ctx.cancel.is_cancelled();
             phase_state.run_detached = !phase_state.shutting_down;
@@ -607,12 +663,41 @@ async fn execute_tool_call(
     }
 }
 
+/// `effective_args`: `Some(args_json)` = the args actually executed (used for
+/// AfterToolExec hook input); `None` = tool was rejected by BeforeToolExec —
+/// AfterToolExec hooks are skipped entirely.
 async fn record_tool_result(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
     tc: &ToolCall,
-    result: tools::ToolOutcome,
+    mut result: tools::ToolOutcome,
+    effective_args: Option<&str>,
 ) -> AgentPhaseControl {
+    // ── AfterToolExec hook (skipped when tool was rejected) ──────────────
+    if let Some(eff_args) = effective_args {
+        let after_input = ToolHookInput {
+            tool_name: tc.function.name.clone(),
+            tool_args: serde_json::from_str(eff_args)
+                .unwrap_or_else(|_| serde_json::Value::String(eff_args.to_string())),
+            tool_id: tc.id.clone(),
+            cycle: phase_state.react_ctx.cycles,
+            workspace: phase_state.cycle_workspace.clone(),
+            outcome_output: Some(result.output.clone()),
+            outcome_is_error: Some(result.is_error),
+            outcome_duration_ms: Some(result.duration_ms),
+        };
+        let hook_output = run_tool_hooks(
+            &ctx.state.hooks,
+            agent::HookPoint::AfterToolExec,
+            after_input,
+            &ctx.state.config,
+        )
+        .await;
+        if let hooks::HookOutput::ModifyToolResult { result: new_output } = hook_output {
+            result.output = new_output;
+        }
+    }
+
     if !live_send(
         ctx.live_tx,
         json!({
@@ -728,11 +813,79 @@ async fn run_analyze_phase(
         Some(msgs) => msgs,
         None => return AgentPhaseControl::Break,
     };
-    let request_estimate = crate::context::estimate_request_tokens_for_provider(
+    // ── BeforeLlmCall hook (before budget check so estimate includes hook changes) ──
+    let llm_hook_input = LlmHookInput {
+        messages: final_msgs_snapshot.clone(),
+        model: snapshot.model.clone(),
+        think_level: effective_think.clone(),
+        cycle: phase_state.react_ctx.cycles,
+        tool_count: extra_tools.len(),
+    };
+    let llm_hook_output = run_llm_hooks(&ctx.state.hooks, &llm_hook_input, &ctx.state.config).await;
+
+    let (effective_think, mut final_msgs_snapshot, request_budget) = match llm_hook_output {
+        hooks::HookOutput::ModifyLlmParams {
+            extra_system,
+            think_override,
+        } => {
+            let has_think_override = think_override.is_some();
+            let think = think_override.unwrap_or(effective_think);
+            // Recalculate budget when think_level changed so the reserve matches.
+            let budget = if has_think_override {
+                crate::context::context_input_budget_for_runtime(
+                    &ctx.state.config,
+                    &snapshot.model,
+                    &think,
+                )
+            } else {
+                request_budget
+            };
+            let msgs = if let Some(extra) = extra_system {
+                let mut m = final_msgs_snapshot;
+                if let Some(first) = m.first_mut()
+                    && first.role == "system"
+                    && let Some(content) = first.content.as_mut()
+                {
+                    content.push('\n');
+                    content.push_str(&extra);
+                }
+                m
+            } else {
+                final_msgs_snapshot
+            };
+            (think, msgs, budget)
+        }
+        _ => (effective_think, final_msgs_snapshot, request_budget),
+    };
+
+    // Budget check uses the post-hook snapshot so hook-injected content is accounted for.
+    let mut request_estimate = crate::context::estimate_request_tokens_for_provider(
         resolved.provider,
         &final_msgs_snapshot,
         &extra_tools,
     );
+
+    // If hook-modified conditions (think_override / extra_system) made the
+    // estimate exceed the (possibly recalculated) budget, re-prune the local
+    // snapshot before erroring — the messages may still fit after trimming.
+    if request_estimate > request_budget {
+        let message_budget = crate::context::request_message_budget_for_runtime(
+            &ctx.state.config,
+            &snapshot.model,
+            &effective_think,
+            &extra_tools,
+        );
+        crate::context::prune_messages_for_provider(
+            &mut final_msgs_snapshot,
+            resolved.provider,
+            message_budget,
+        );
+        request_estimate = crate::context::estimate_request_tokens_for_provider(
+            resolved.provider,
+            &final_msgs_snapshot,
+            &extra_tools,
+        );
+    }
 
     if !live_send(
         ctx.live_tx,
@@ -821,13 +974,13 @@ async fn run_act_phase(
                 return AgentPhaseControl::Break;
             }
 
-            let result = match execute_tool_call(ctx, phase_state, tc).await {
-                Ok(result) => result,
+            let (result, eff_args) = match execute_tool_call(ctx, phase_state, tc).await {
+                Ok(pair) => pair,
                 Err(control) => return control,
             };
 
             if matches!(
-                record_tool_result(ctx, phase_state, tc, result).await,
+                record_tool_result(ctx, phase_state, tc, result, eff_args.as_deref()).await,
                 AgentPhaseControl::Break
             ) {
                 return AgentPhaseControl::Break;
@@ -835,34 +988,109 @@ async fn run_act_phase(
         }
     } else {
         // Multiple read-only tool calls: parallel execution with ordered result recording.
-        // 1. Send all tool_call WS events up front so the UI shows them immediately.
+        // 1. Run BeforeToolExec hooks sequentially (may reject or modify args).
+        struct HookEvalResult {
+            effective_args: Option<String>,
+            rejected: Option<tools::ToolOutcome>,
+            reject_events: Vec<serde_json::Value>,
+        }
+        let mut hook_results: Vec<HookEvalResult> = Vec::with_capacity(tool_calls.len());
         for tc in &tool_calls {
+            let hook_input = ToolHookInput {
+                tool_name: tc.function.name.clone(),
+                tool_args: serde_json::from_str(&tc.function.arguments)
+                    .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone())),
+                tool_id: tc.id.clone(),
+                cycle: phase_state.react_ctx.cycles,
+                workspace: phase_state.cycle_workspace.clone(),
+                outcome_output: None,
+                outcome_is_error: None,
+                outcome_duration_ms: None,
+            };
+            let hook_output = run_tool_hooks(
+                &ctx.state.hooks,
+                agent::HookPoint::BeforeToolExec,
+                hook_input,
+                &ctx.state.config,
+            )
+            .await;
+            hook_results.push(match hook_output {
+                hooks::HookOutput::Reject { reason, events } => HookEvalResult {
+                    effective_args: None,
+                    rejected: Some(tools::ToolOutcome {
+                        output: format!("[rejected by hook] {reason}"),
+                        is_error: true,
+                        duration_ms: 0,
+                    }),
+                    reject_events: events,
+                },
+                hooks::HookOutput::ModifyToolArgs { args } => HookEvalResult {
+                    effective_args: Some(
+                        serde_json::to_string(&args)
+                            .unwrap_or_else(|_| tc.function.arguments.clone()),
+                    ),
+                    rejected: None,
+                    reject_events: Vec::new(),
+                },
+                _ => HookEvalResult {
+                    effective_args: Some(tc.function.arguments.clone()),
+                    rejected: None,
+                    reject_events: Vec::new(),
+                },
+            });
+        }
+
+        // 2. Send tool_call WS events with effective (possibly hook-modified) args,
+        //    then send any reject hook events (matching sequential path: tool_call → hook events).
+        for (tc, hr) in tool_calls.iter().zip(hook_results.iter()) {
             if ctx.run_cancel.is_cancelled() {
                 phase_state.shutting_down = ctx.cancel.is_cancelled();
                 phase_state.run_detached = !phase_state.shutting_down;
                 return AgentPhaseControl::Break;
             }
+            // For rejected tools, show original args; for others, show effective args.
+            let display_args = if hr.rejected.is_some() {
+                &tc.function.arguments
+            } else {
+                hr.effective_args.as_deref().unwrap_or(&tc.function.arguments)
+            };
             if !live_send(
                 ctx.live_tx,
                 json!({
                     "type":"tool_call",
                     "id": tc.id,
                     "name": tc.function.name,
-                    "arguments": tc.function.arguments,
+                    "arguments": display_args,
                 }),
             )
             .await
             {
                 return AgentPhaseControl::Break;
             }
+            // Send reject hook events after tool_call (matches sequential path order).
+            for ev in &hr.reject_events {
+                let _ = live_send(ctx.live_tx, ev.clone()).await;
+            }
         }
 
-        // 2. Launch all tool futures concurrently.
+        // 3. Launch non-rejected tool futures concurrently.
         let tool_timeout = ctx.state.config.tool_timeout;
         let futures: Vec<_> = tool_calls
             .iter()
-            .map(|tc| {
-                run_tool_with_feedback(
+            .zip(hook_results.iter())
+            .map(|(tc, hr)| {
+                if hr.rejected.is_some() {
+                    // Rejected by hook — return a no-op future.
+                    return futures::future::Either::Left(async {
+                        ToolRunState::Completed(tools::ToolOutcome {
+                            output: String::new(), // placeholder, replaced below
+                            is_error: true,
+                            duration_ms: 0,
+                        })
+                    });
+                }
+                let args = hr.effective_args.as_deref().unwrap_or(&tc.function.arguments);
+                futures::future::Either::Right(run_tool_with_feedback(
                     ctx.live_tx,
                     ctx.run_cancel,
                     &tc.id,
@@ -870,26 +1098,36 @@ async fn run_act_phase(
                     tool_timeout,
                     execute_tool(
                         &tc.function.name,
-                        &tc.function.arguments,
+                        args,
                         &ctx.state.config,
                         &ctx.state.http,
                         &phase_state.cycle_workspace,
                     ),
-                )
+                ))
             })
             .collect();
 
         let results = futures::future::join_all(futures).await;
 
-        // 3. Record results in order, preserving stable tool IDs.
+        // 4. Record results in order, preserving stable tool IDs.
         //    On abort, still record any already-completed results so the LLM
         //    sees side effects (e.g. files written) that already happened.
         let mut should_break = false;
-        for (tc, run_state) in tool_calls.iter().zip(results) {
-            match run_state {
+        for (tc, (run_state, hr)) in tool_calls
+            .iter()
+            .zip(results.into_iter().zip(hook_results.into_iter()))
+        {
+            // Use the pre-rejected outcome if the hook rejected this tool.
+            // For rejected tools, effective_args is None → AfterToolExec hooks are skipped.
+            let (effective_run_state, after_args) = if let Some(outcome) = hr.rejected {
+                (ToolRunState::Completed(outcome), None)
+            } else {
+                (run_state, hr.effective_args)
+            };
+            match effective_run_state {
                 ToolRunState::Completed(result) => {
                     if matches!(
-                        record_tool_result(ctx, phase_state, tc, result).await,
+                        record_tool_result(ctx, phase_state, tc, result, after_args.as_deref()).await,
                         AgentPhaseControl::Break
                     ) {
                         should_break = true;
@@ -1070,6 +1308,26 @@ async fn run_finish_phase(
     AgentPhaseControl::Break
 }
 
+/// Fire `/stop` OnCommand hook in a background task so a slow hook cannot
+/// block the stop path.  Best-effort: errors are silently dropped.
+fn fire_stop_command_hook(state: &Arc<AppState>, session_id: &str, live_tx: &LiveTx) {
+    let state = Arc::clone(state);
+    let live_tx = live_tx.clone();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        let hook_input = CommandHookInput {
+            command: "/stop".to_string(),
+            args: String::new(),
+            result_type: "system".to_string(),
+            session_id,
+        };
+        let hook_events = run_command_hooks(&state.hooks, &hook_input, &state.config).await;
+        for ev in hook_events {
+            let _ = live_send(&live_tx, ev).await;
+        }
+    });
+}
+
 pub(crate) async fn run_agent_session(
     state: &Arc<AppState>,
     current_session_id: &str,
@@ -1131,11 +1389,13 @@ pub(crate) async fn run_agent_session(
             break;
         }
         if stop_requested.swap(false, Ordering::Relaxed) {
+            // Cancel first so running tools/LLM see cancellation immediately.
             run_cancel.cancel();
+            // Fire OnCommand hook in background — must not block the stop path.
+            fire_stop_command_hook(state, current_session_id, live_tx);
             phase_state.run_stopped = true;
             break;
-        }
-        if drain_busy_socket_messages(
+        } else if drain_busy_socket_messages(
             inbound_rx,
             &mut phase_state.pending_interventions,
             live_tx,
@@ -1143,6 +1403,8 @@ pub(crate) async fn run_agent_session(
         )
         .await
         {
+            // /stop during busy — fire OnCommand hook in background.
+            fire_stop_command_hook(state, current_session_id, live_tx);
             phase_state.run_stopped = true;
             break;
         }

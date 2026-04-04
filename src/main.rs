@@ -49,7 +49,10 @@ pub(crate) use context::{
     estimate_tokens_for_provider, format_token_count, format_usage_block,
     message_token_len_for_provider, update_session_token_usage,
 };
-pub(crate) use hooks::{AutoCompressContextHook, HookRegistry, run_hooks};
+pub(crate) use hooks::{
+    AutoCompressContextHook, CommandHookInput, HookRegistry, LlmHookInput, ToolHookInput,
+    run_command_hooks, run_hooks, run_llm_hooks, run_tool_hooks,
+};
 pub(crate) use memory::MemoryUpdateQueue;
 
 use commands::handle_command;

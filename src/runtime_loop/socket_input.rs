@@ -84,6 +84,26 @@ pub(crate) async fn handle_idle_socket_input(
         if cancel.is_cancelled() {
             return IdleSocketInputAction::Break;
         }
+
+        // ── OnCommand hook (post-execution, observational) ───────────────
+        let (cmd_name, cmd_args) = trimmed
+            .split_once(char::is_whitespace)
+            .unwrap_or((trimmed, ""));
+        let result_type = cmd_result
+            .as_ref()
+            .map(|r| r.response_type.to_string())
+            .unwrap_or_else(|| "unknown_command".to_string());
+        let hook_input = CommandHookInput {
+            command: cmd_name.to_string(),
+            args: cmd_args.to_string(),
+            result_type,
+            session_id: current_session_id.clone(),
+        };
+        let hook_events = run_command_hooks(&state.hooks, &hook_input, &state.config).await;
+        for ev in hook_events {
+            ws_send(tx, &ev).await;
+        }
+
         if let Some(result) = cmd_result {
             send_command_refresh(tx, state, current_session_id, result.refresh_history).await;
 

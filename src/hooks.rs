@@ -34,6 +34,54 @@ pub(crate) enum HookOutput {
         messages: Vec<ChatMessage>,
         events: Vec<serde_json::Value>,
     },
+    /// Modify tool arguments before execution (BeforeToolExec only).
+    ModifyToolArgs { args: serde_json::Value },
+    /// Modify the tool result string after execution (AfterToolExec only).
+    ModifyToolResult { result: String },
+    /// Reject tool execution entirely (BeforeToolExec only).
+    Reject {
+        reason: String,
+        events: Vec<serde_json::Value>,
+    },
+    /// Modify LLM call parameters (BeforeLlmCall only).
+    ModifyLlmParams {
+        /// Extra text appended to the system prompt.
+        extra_system: Option<String>,
+        /// Override the effective think level.
+        think_override: Option<String>,
+    },
+}
+
+/// Owned snapshot for tool-level hook execution (lock-free).
+pub(crate) struct ToolHookInput {
+    pub(crate) tool_name: String,
+    pub(crate) tool_args: serde_json::Value,
+    pub(crate) tool_id: String,
+    pub(crate) cycle: usize,
+    pub(crate) workspace: PathBuf,
+    /// Present only for `AfterToolExec`.
+    pub(crate) outcome_output: Option<String>,
+    /// Present only for `AfterToolExec`.
+    pub(crate) outcome_is_error: Option<bool>,
+    /// Present only for `AfterToolExec`.
+    pub(crate) outcome_duration_ms: Option<u64>,
+}
+
+/// Owned snapshot for LLM-call-level hook execution (lock-free).
+pub(crate) struct LlmHookInput {
+    pub(crate) messages: Vec<ChatMessage>,
+    pub(crate) model: String,
+    pub(crate) think_level: String,
+    pub(crate) cycle: usize,
+    pub(crate) tool_count: usize,
+}
+
+/// Owned snapshot for command hook execution.
+pub(crate) struct CommandHookInput {
+    pub(crate) command: String,
+    pub(crate) args: String,
+    pub(crate) result_type: String,
+    pub(crate) session_id: String,
 }
 
 /// Agent lifecycle hook.
@@ -65,6 +113,55 @@ pub(crate) trait AgentHook: Send + Sync {
         config: &'a Config,
         http: &'a Client,
     ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>>;
+
+    // ── Tool-level hooks (opt-in) ────────────────────────────────────────
+
+    /// Fast eligibility check for tool hooks (`BeforeToolExec` / `AfterToolExec`).
+    /// Default: not interested in tool events.
+    fn should_run_tool(&self, _tool_name: &str, _point: agent::HookPoint) -> bool {
+        false
+    }
+
+    /// Execute a tool-level hook. Called **without** session lock.
+    fn run_tool<'a>(
+        &'a self,
+        _input: ToolHookInput,
+        _config: &'a Config,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async { HookOutput::NoOp })
+    }
+
+    // ── LLM-level hooks (opt-in) ─────────────────────────────────────────
+
+    /// Fast eligibility check for `BeforeLlmCall`.
+    fn should_run_llm(&self, _cycle: usize) -> bool {
+        false
+    }
+
+    /// Execute an LLM-level hook. Called **without** session lock.
+    fn run_llm<'a>(
+        &'a self,
+        _input: LlmHookInput,
+        _config: &'a Config,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async { HookOutput::NoOp })
+    }
+
+    // ── Command hooks (opt-in) ───────────────────────────────────────────
+
+    /// Fast eligibility check for `OnCommand`.
+    fn should_run_command(&self, _command: &str) -> bool {
+        false
+    }
+
+    /// Execute a command hook. Purely observational (post-execution).
+    fn run_command<'a>(
+        &'a self,
+        _input: CommandHookInput,
+        _config: &'a Config,
+    ) -> Pin<Box<dyn Future<Output = Vec<serde_json::Value>> + Send + 'a>> {
+        Box::pin(async { Vec::new() })
+    }
 }
 
 /// Registry of agent lifecycle hooks, populated at startup.
@@ -376,8 +473,240 @@ pub(crate) async fn run_hooks(
                 }
                 events.extend(hook_events);
             }
-            HookOutput::NoOp => {}
+            HookOutput::NoOp
+            | HookOutput::ModifyToolArgs { .. }
+            | HookOutput::ModifyToolResult { .. }
+            | HookOutput::Reject { .. }
+            | HookOutput::ModifyLlmParams { .. } => {}
         }
     }
     events
 }
+
+// ── Tool-level hook dispatch ─────────────────────────────────────────────────
+
+/// Run tool-level hooks (`BeforeToolExec` / `AfterToolExec`) across the registry.
+///
+/// Short-circuits on `Reject`. Folds `ModifyToolArgs` sequentially for
+/// `BeforeToolExec`, or `ModifyToolResult` for `AfterToolExec`.
+/// Returns the final `HookOutput` after all eligible hooks have run.
+pub(crate) async fn run_tool_hooks(
+    registry: &HookRegistry,
+    point: agent::HookPoint,
+    mut input: ToolHookInput,
+    config: &Config,
+) -> HookOutput {
+    let mut modified = false;
+    for index in 0..registry.len() {
+        let hook = match registry.hook(index) {
+            Some(h) => h,
+            None => continue,
+        };
+        if hook.point() != point {
+            continue;
+        }
+        if !hook.should_run_tool(&input.tool_name, point) {
+            continue;
+        }
+
+        // Snapshot invariant fields before consuming input.
+        let tool_name = input.tool_name.clone();
+        let tool_id = input.tool_id.clone();
+        let cycle = input.cycle;
+        let workspace = input.workspace.clone();
+        let outcome_output = input.outcome_output.clone();
+        let outcome_is_error = input.outcome_is_error;
+        let outcome_duration_ms = input.outcome_duration_ms;
+        let tool_args = input.tool_args.clone();
+
+        let output = hook.run_tool(input, config).await;
+        match output {
+            HookOutput::Reject { .. } if point == agent::HookPoint::BeforeToolExec => {
+                return output;
+            }
+            HookOutput::ModifyToolArgs { args } if point == agent::HookPoint::BeforeToolExec => {
+                modified = true;
+                input = ToolHookInput {
+                    tool_name,
+                    tool_args: args,
+                    tool_id,
+                    cycle,
+                    workspace,
+                    outcome_output,
+                    outcome_is_error,
+                    outcome_duration_ms,
+                };
+            }
+            HookOutput::ModifyToolResult { result }
+                if point == agent::HookPoint::AfterToolExec =>
+            {
+                modified = true;
+                input = ToolHookInput {
+                    tool_name,
+                    tool_args,
+                    tool_id,
+                    cycle,
+                    workspace,
+                    outcome_output: Some(result),
+                    outcome_is_error,
+                    outcome_duration_ms,
+                };
+            }
+            HookOutput::NoOp => {
+                input = ToolHookInput {
+                    tool_name,
+                    tool_args,
+                    tool_id,
+                    cycle,
+                    workspace,
+                    outcome_output,
+                    outcome_is_error,
+                    outcome_duration_ms,
+                };
+            }
+            _invalid => {
+                eprintln!(
+                    "[hooks] warning: hook {} returned output type invalid for {:?}, treating as NoOp",
+                    hook.name(),
+                    point
+                );
+                input = ToolHookInput {
+                    tool_name,
+                    tool_args,
+                    tool_id,
+                    cycle,
+                    workspace,
+                    outcome_output,
+                    outcome_is_error,
+                    outcome_duration_ms,
+                };
+            }
+        }
+    }
+    if !modified {
+        return HookOutput::NoOp;
+    }
+    if point == agent::HookPoint::BeforeToolExec {
+        HookOutput::ModifyToolArgs {
+            args: input.tool_args,
+        }
+    } else if let Some(result) = input.outcome_output {
+        HookOutput::ModifyToolResult { result }
+    } else {
+        HookOutput::NoOp
+    }
+}
+
+// ── LLM-call-level hook dispatch ─────────────────────────────────────────────
+
+/// Run LLM-call-level hooks (`BeforeLlmCall`) across the registry.
+///
+/// Folds `ModifyLlmParams` sequentially: `extra_system` strings are appended,
+/// the last `think_override` wins.
+/// Returns the accumulated `HookOutput`.
+pub(crate) async fn run_llm_hooks(
+    registry: &HookRegistry,
+    input: &LlmHookInput,
+    config: &Config,
+) -> HookOutput {
+    let mut extra_system: Option<String> = None;
+    let mut think_override: Option<String> = None;
+    let mut any_modified = false;
+    let mut running_messages = input.messages.clone();
+
+    for index in 0..registry.len() {
+        let hook = match registry.hook(index) {
+            Some(h) => h,
+            None => continue,
+        };
+        if hook.point() != agent::HookPoint::BeforeLlmCall {
+            continue;
+        }
+        if !hook.should_run_llm(input.cycle) {
+            continue;
+        }
+
+        let snapshot = LlmHookInput {
+            messages: running_messages.clone(),
+            model: input.model.clone(),
+            think_level: think_override
+                .as_deref()
+                .unwrap_or(&input.think_level)
+                .to_string(),
+            cycle: input.cycle,
+            tool_count: input.tool_count,
+        };
+        let output = hook.run_llm(snapshot, config).await;
+        if let HookOutput::ModifyLlmParams {
+            extra_system: es,
+            think_override: to,
+        } = output
+        {
+            if let Some(s) = es {
+                // Update running messages so subsequent hooks see the injection.
+                if let Some(first) = running_messages.first_mut()
+                    && first.role == "system"
+                    && let Some(content) = first.content.as_mut()
+                {
+                    content.push('\n');
+                    content.push_str(&s);
+                }
+                extra_system = Some(match extra_system {
+                    Some(existing) => format!("{existing}\n{s}"),
+                    None => s,
+                });
+                any_modified = true;
+            }
+            if let Some(t) = to {
+                think_override = Some(t);
+                any_modified = true;
+            }
+        }
+    }
+    if any_modified {
+        HookOutput::ModifyLlmParams {
+            extra_system,
+            think_override,
+        }
+    } else {
+        HookOutput::NoOp
+    }
+}
+
+// ── Command hook dispatch ────────────────────────────────────────────────────
+
+/// Run post-command observation hooks (`OnCommand`) across the registry.
+///
+/// Returns accumulated frontend events from all hooks (purely observational).
+pub(crate) async fn run_command_hooks(
+    registry: &HookRegistry,
+    input: &CommandHookInput,
+    config: &Config,
+) -> Vec<serde_json::Value> {
+    let mut events = Vec::new();
+    for index in 0..registry.len() {
+        let hook = match registry.hook(index) {
+            Some(h) => h,
+            None => continue,
+        };
+        if hook.point() != agent::HookPoint::OnCommand {
+            continue;
+        }
+        if !hook.should_run_command(&input.command) {
+            continue;
+        }
+        let snapshot = CommandHookInput {
+            command: input.command.clone(),
+            args: input.args.clone(),
+            result_type: input.result_type.clone(),
+            session_id: input.session_id.clone(),
+        };
+        let hook_events = hook.run_command(snapshot, config).await;
+        events.extend(hook_events);
+    }
+    events
+}
+
+#[cfg(test)]
+#[path = "tests/hooks_tests.rs"]
+mod hooks_tests;

@@ -295,6 +295,7 @@ pub(crate) fn evaluate_finish(has_content: bool, has_tool_calls: bool) -> Option
 /// (trait + registry) live in `src/main.rs` where they have access to session
 /// types, config, and the HTTP client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[allow(dead_code)] // Variants used by hook implementors, not always constructed in core.
 pub(crate) enum HookPoint {
     /// Before each Analyze phase — context compression, prompt injection.
     BeforeAnalyze,
@@ -302,6 +303,14 @@ pub(crate) enum HookPoint {
     AfterObserve,
     /// Agent loop finished — cleanup, final logging.
     OnFinish,
+    /// Before a tool is executed — can modify args or reject execution.
+    BeforeToolExec,
+    /// After a tool completes — can modify the result.
+    AfterToolExec,
+    /// Before the LLM call — can inject system prompt or override think level.
+    BeforeLlmCall,
+    /// After a chat command completes — post-execution observation.
+    OnCommand,
 }
 
 impl HookPoint {
@@ -310,6 +319,10 @@ impl HookPoint {
             Self::BeforeAnalyze => "before_analyze",
             Self::AfterObserve => "after_observe",
             Self::OnFinish => "on_finish",
+            Self::BeforeToolExec => "before_tool_exec",
+            Self::AfterToolExec => "after_tool_exec",
+            Self::BeforeLlmCall => "before_llm_call",
+            Self::OnCommand => "on_command",
         }
     }
 }
