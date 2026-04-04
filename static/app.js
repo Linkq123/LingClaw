@@ -1229,9 +1229,15 @@ function handleMessage(data) {
         finishReasoningStream();
         reasoningPanel.classList.remove('reasoning-active');
         const status = reasoningPanel.querySelector('.reasoning-status');
-        if (status) status.textContent = '完成';
         const body = reasoningPanel.querySelector('.reasoning-body');
         const chevron = reasoningPanel.querySelector('.chevron');
+        const rawText = body?._textNode?.nodeValue || body?.textContent || '';
+        const summaryText = rawText.trim().replace(/\n+/g, ' ');
+        const preview = summaryText.substring(0, 60);
+        if (status) {
+          status.textContent = preview ? preview + (summaryText.length > 60 ? '…' : '') : '完成';
+          status.title = summaryText || '完成';
+        }
         setTimeout(() => {
           if (body) animateCollapsibleSection(body, false);
           if (chevron) chevron.classList.remove('open');
