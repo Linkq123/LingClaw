@@ -32,7 +32,7 @@ cargo build --release
 .\target\release\lingclaw.exe --install-daemon
 ```
 
-配置文件位于 `%USERPROFILE%\.lingclaw\.lingclaw.json`，支持手动编辑。参见项目根目录 `lingclaw.json.example` 获取完整配置示例。
+配置文件位于 `%USERPROFILE%\.lingclaw\.lingclaw.json`，支持手动编辑。参见项目根目录 `.lingclaw.json.example` 获取完整配置示例。
 
 LingClaw 默认以后台守护进程运行，通过 CLI 命令管理：
 
@@ -96,8 +96,11 @@ cargo build --release
 cargo install --path .
 mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin/static"
 cp -R static/. "${CARGO_HOME:-$HOME/.cargo}/bin/static/"
+mkdir -p "$HOME/.lingclaw/system-skills" "$HOME/.lingclaw/system-agents"
+cp -R docs/reference/skills/. "$HOME/.lingclaw/system-skills/"
+cp -R docs/reference/agents/. "$HOME/.lingclaw/system-agents/"
 ```
-如果只执行 `cargo install --path .` 而没有同步 `static/` 到安装目录旁边，`/api/health` 仍可能正常，但访问首页 `http://127.0.0.1:18989/` 会返回 404。
+如果只执行 `cargo install --path .` 而没有同步部署 `static/`、`docs/reference/skills/`、`docs/reference/agents/`，`/api/health` 仍可能正常，但访问首页 `http://127.0.0.1:18989/` 会返回 404，且内置 Skills / Sub-Agents 不可用。
 
 如果安装报错 `error: failed to run custom build command for openssl-sys`：
 - Ubuntu / Debian / Kali Linux
@@ -216,6 +219,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /build/target/release/lingclaw /usr/local/bin/
 COPY static/ /app/static/
+COPY docs/reference/skills/ /app/docs/reference/skills/
+COPY docs/reference/agents/ /app/docs/reference/agents/
 
 WORKDIR /app
 EXPOSE 18989
@@ -224,7 +229,7 @@ ENV LINGCLAW_PORT=18989
 ENTRYPOINT ["lingclaw", "--serve"]
 ```
 
-> Docker 场景下可通过挂载 `~/.lingclaw/.lingclaw.json` 配置文件，也可通过 `-e` 传入环境变量作为覆盖。Prompt 模板已在编译期内嵌，运行时不要求容器内存在 `docs/reference/templates/`；只有你想覆盖内嵌模板时才需要额外挂载该目录。
+> Docker 场景下可通过挂载 `~/.lingclaw/.lingclaw.json` 配置文件，也可通过 `-e` 传入环境变量作为覆盖。Prompt 模板已在编译期内嵌，运行时不要求容器内存在 `docs/reference/templates/`；但内置 Skills / Sub-Agents 依赖运行时磁盘目录发现，因此镜像中需要保留 `docs/reference/skills/` 和 `docs/reference/agents/`，否则它们不会被加载。
 
 ### 3.2 构建镜像
 
@@ -267,7 +272,7 @@ volumes:
   lingclaw-data:
 ```
 
-> 将 `lingclaw.json.example` 复制为 `lingclaw.json` 并编辑后挂载即可。
+> 将 `.lingclaw.json.example` 复制为 `lingclaw.json` 并编辑后挂载即可。
 
 ### 3.5 使用 Anthropic
 
@@ -300,7 +305,7 @@ volumes:
 
 ## 配置参考
 
-所有配置通过 `~/.lingclaw/.lingclaw.json` 管理（首次运行 Setup Wizard 自动创建）。参见 `lingclaw.json.example` 获取完整示例。
+所有配置通过 `~/.lingclaw/.lingclaw.json` 管理（首次运行 Setup Wizard 自动创建）。参见 `.lingclaw.json.example` 获取完整示例。
 
 ### settings 字段
 
@@ -324,6 +329,8 @@ lingclaw                        # 二进制
 static/
   index.html                    # WebChat 前端
 docs/reference/templates/       # 7 个 Prompt 模板（BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/TOOLS/MEMORY.md）
+docs/reference/skills/          # 内置 system skills（运行时磁盘发现）
+docs/reference/agents/          # 内置 system sub-agents（运行时磁盘发现）
 ~/.lingclaw/
   .lingclaw.json                # 配置文件（Setup Wizard 自动创建）
   sessions/                     # 磁盘持久化的会话 JSON

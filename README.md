@@ -45,6 +45,9 @@ cargo build --release
 cargo install --path .
 mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin/static"
 cp -R static/. "${CARGO_HOME:-$HOME/.cargo}/bin/static/"
+mkdir -p "$HOME/.lingclaw/system-skills" "$HOME/.lingclaw/system-agents"
+cp -R docs/reference/skills/. "$HOME/.lingclaw/system-skills/"
+cp -R docs/reference/agents/. "$HOME/.lingclaw/system-agents/"
 
 # 首次运行打开设置向导
 lingclaw
@@ -65,7 +68,7 @@ lingclaw help
 lingclaw --version
 ```
 
-手动执行 `cargo install --path .` 时，必须把 `static/` 一并复制到安装目录旁边，否则 `http://127.0.0.1:18989/` 会返回 404。优先推荐直接使用 `bash scripts/install-linux.sh`。
+手动执行 `cargo install --path .` 时，必须同步部署 `static/`、`docs/reference/skills/` 和 `docs/reference/agents/`；否则首页可能返回 404，且内置 Skills / Sub-Agents 不可用。优先推荐直接使用 `bash scripts/install-linux.sh`。
 
 服务启动后访问 http://127.0.0.1:18989 。
 
@@ -308,7 +311,7 @@ description: 描述这个 Skill 做什么以及何时触发
   - `/skills-system uninstall <pattern>` — 禁用 Skill（支持组级如 `anthropics` 或单个如 `anthropics/pdf`）
   - `/skills-global` — 仅列出全局 Skills
   - `/skills-session` — 仅列出当前 session Skills
-- **部署**：`lingclaw install` 和 `lingclaw update` 会自动将 `docs/reference/skills/` 复制到 `~/.lingclaw/system-skills/`，确保系统 Skills 在安装后可用
+- **部署**：`lingclaw install` 和 `lingclaw update` 会自动将 `docs/reference/skills/` 复制到 `~/.lingclaw/system-skills/`，并将 `docs/reference/agents/` 复制到 `~/.lingclaw/system-agents/`，确保系统 Skills / Sub-Agents 在安装后可用
 
 ### 兼容性
 
@@ -678,6 +681,7 @@ think_level 映射：
 ~/.lingclaw/
 ├── .lingclaw.json          — 全局配置
 ├── system-skills/          — 安装时部署的系统 Skills (从 docs/reference/skills/ 复制)
+├── system-agents/          — 安装时部署的系统子代理 (从 docs/reference/agents/ 复制)
 ├── skills/                 — 全局 Skills (跨 session 共享)
 ├── sessions/
 │   └── main.json           — 主会话存档
@@ -774,6 +778,14 @@ think_level 映射：
 每个工作区还有 `memory/` 子目录，存放 `memory/YYYY-MM-DD.md` 每日日志。
 启用 `structuredMemory` 后，还会在同目录生成 `structured_memory.json`，供后台异步记忆抽取和后续 prompt 注入使用。
 
+## 鸣谢
+
+- 感谢开源项目 openclaw、claude code、deer-flow、opencode
+- 感谢 vide-coding 伙伴：GPT-5.4、Claude Opus 4.6
+- 感谢 GitHub Copilot、VS Code
+- 感谢时间
+
 ## License
 
-MIT
+本项目采用 Apache License 2.0。
+完整条款见 [LICENSE](LICENSE)。
