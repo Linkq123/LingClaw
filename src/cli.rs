@@ -2039,7 +2039,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
                     "models": []
                 }),
             );
-            default_model = Some("ollama/llama3.2".to_string());
+            default_model = Some("ollama/qwen3".to_string());
         }
         _ => {
             // Skip

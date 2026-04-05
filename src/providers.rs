@@ -279,6 +279,7 @@ fn convert_messages_to_anthropic(messages: &[ChatMessage]) -> (String, Vec<serde
 
 fn convert_messages_to_ollama(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
+    let mut tool_names_by_id: HashMap<String, String> = HashMap::new();
 
     for msg in messages {
         match msg.role.as_str() {
@@ -296,13 +297,20 @@ fn convert_messages_to_ollama(messages: &[ChatMessage]) -> Vec<serde_json::Value
                 if let Some(tool_calls) = &msg.tool_calls {
                     let calls = tool_calls
                         .iter()
-                        .map(|tool_call| {
+                        .enumerate()
+                        .map(|(idx, tool_call)| {
+                            if !tool_call.id.is_empty() {
+                                tool_names_by_id
+                                    .insert(tool_call.id.clone(), tool_call.function.name.clone());
+                            }
                             let arguments =
                                 serde_json::from_str::<Value>(&tool_call.function.arguments)
                                     .unwrap_or_else(|_| json!(tool_call.function.arguments));
                             json!({
+                                "type": "function",
                                 "id": tool_call.id,
                                 "function": {
+                                    "index": idx,
                                     "name": tool_call.function.name,
                                     "arguments": arguments,
                                 }
@@ -314,11 +322,18 @@ fn convert_messages_to_ollama(messages: &[ChatMessage]) -> Vec<serde_json::Value
                 out.push(item);
             }
             "tool" => {
-                out.push(json!({
+                let mut item = json!({
                     "role": "tool",
                     "content": msg.content.as_deref().unwrap_or(""),
-                    "tool_call_id": msg.tool_call_id.as_deref().unwrap_or(""),
-                }));
+                });
+                if let Some(tool_name) = msg
+                    .tool_call_id
+                    .as_ref()
+                    .and_then(|tool_call_id| tool_names_by_id.get(tool_call_id))
+                {
+                    item["tool_name"] = json!(tool_name);
+                }
+                out.push(item);
             }
             _ => {}
         }
@@ -461,12 +476,40 @@ fn think_level_to_budget(level: &str) -> u64 {
     }
 }
 
-fn think_level_to_ollama(level: &str) -> serde_json::Value {
+fn think_level_to_ollama_level(level: &str) -> &'static str {
     match level {
-        "minimal" | "low" => json!("low"),
-        "medium" => json!("medium"),
-        "high" | "xhigh" => json!("high"),
-        _ => json!(true),
+        "minimal" | "low" => "low",
+        "medium" => "medium",
+        "high" | "xhigh" => "high",
+        _ => "medium",
+    }
+}
+
+fn ollama_uses_think_levels(resolved: &ResolvedModel) -> bool {
+    resolved
+        .thinking_format
+        .as_deref()
+        .is_some_and(|fmt| matches!(fmt, "gpt-oss" | "ollama-gpt-oss"))
+        || resolved
+            .model_id
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with("gpt-oss")
+}
+
+fn ollama_think_value(resolved: &ResolvedModel, think_level: &str) -> Option<serde_json::Value> {
+    if think_level == "off" {
+        return if ollama_uses_think_levels(resolved) {
+            None
+        } else {
+            Some(json!(false))
+        };
+    }
+
+    if ollama_uses_think_levels(resolved) {
+        Some(json!(think_level_to_ollama_level(think_level)))
+    } else {
+        Some(json!(true))
     }
 }
 
@@ -871,8 +914,8 @@ fn build_ollama_stream_body(
         "tools": all_tools,
         "stream": true,
     });
-    if think_level != "off" {
-        body["think"] = think_level_to_ollama(think_level);
+    if let Some(think) = ollama_think_value(resolved, think_level) {
+        body["think"] = think;
     }
     if let Some(max_tokens) = resolved.max_tokens {
         body["options"] = json!({"num_predict": max_tokens});

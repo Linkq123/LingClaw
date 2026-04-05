@@ -342,14 +342,16 @@ fn convert_messages_to_ollama_all_roles() {
     assert_eq!(out.len(), 4);
     assert_eq!(out[0]["role"], "system");
     assert_eq!(out[1]["role"], "user");
+    assert_eq!(out[2]["tool_calls"][0]["type"], "function");
     assert_eq!(out[2]["tool_calls"][0]["id"], "tc1");
+    assert_eq!(out[2]["tool_calls"][0]["function"]["index"], 0);
     assert_eq!(out[2]["tool_calls"][0]["function"]["name"], "read_file");
     assert_eq!(
         out[2]["tool_calls"][0]["function"]["arguments"]["path"],
         "README.md"
     );
     assert_eq!(out[3]["role"], "tool");
-    assert_eq!(out[3]["tool_call_id"], "tc1");
+    assert_eq!(out[3]["tool_name"], "read_file");
 }
 
 #[test]
@@ -496,7 +498,7 @@ fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
         provider: Provider::Ollama,
         api_base: "http://127.0.0.1:11434".into(),
         api_key: String::new(),
-        model_id: "llama3.2".into(),
+        model_id: "qwen3".into(),
         reasoning: true,
         thinking_format: Some("ollama".into()),
         max_tokens: Some(256),
@@ -513,11 +515,30 @@ fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
 
     let body = build_ollama_stream_body(&resolved, &messages, "high", &[]);
 
-    assert_eq!(body["model"], "llama3.2");
+    assert_eq!(body["model"], "qwen3");
     assert_eq!(body["stream"], true);
-    assert_eq!(body["think"], "high");
+    assert_eq!(body["think"], true);
     assert_eq!(body["options"]["num_predict"], 256);
     assert!(body["tools"].is_array());
+}
+
+#[test]
+fn build_ollama_stream_body_uses_levels_for_gpt_oss() {
+    let resolved = ResolvedModel {
+        provider: Provider::Ollama,
+        api_base: "http://127.0.0.1:11434".into(),
+        api_key: String::new(),
+        model_id: "gpt-oss:20b".into(),
+        reasoning: true,
+        thinking_format: Some("gpt-oss".into()),
+        max_tokens: None,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+
+    let body = build_ollama_stream_body(&resolved, &[], "high", &[]);
+
+    assert_eq!(body["think"], "high");
 }
 
 #[test]
@@ -559,7 +580,7 @@ fn call_llm_simple_ollama_sends_auth_and_expected_body() {
         provider: Provider::Ollama,
         api_base,
         api_key: "secret-key".into(),
-        model_id: "llama3.2".into(),
+        model_id: "qwen3".into(),
         reasoning: true,
         thinking_format: Some("ollama".into()),
         max_tokens: Some(64),
@@ -590,7 +611,7 @@ fn call_llm_simple_ollama_sends_auth_and_expected_body() {
 
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be valid json");
-    assert_eq!(body["model"], "llama3.2");
+    assert_eq!(body["model"], "qwen3");
     assert_eq!(body["stream"], false);
     assert_eq!(body["options"]["num_predict"], 64);
     assert_eq!(body["messages"][0]["role"], "user");
@@ -614,7 +635,7 @@ fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
         provider: Provider::Ollama,
         api_base,
         api_key: "stream-key".into(),
-        model_id: "llama3.2".into(),
+        model_id: "qwen3".into(),
         reasoning: true,
         thinking_format: Some("ollama".into()),
         max_tokens: Some(128),
@@ -648,7 +669,7 @@ fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be valid json");
     assert_eq!(body["stream"], true);
-    assert_eq!(body["think"], "high");
+    assert_eq!(body["think"], true);
     assert_eq!(body["options"]["num_predict"], 128);
 
     assert_eq!(response.message.content.as_deref(), Some("final answer"));

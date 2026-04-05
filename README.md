@@ -79,7 +79,7 @@ OPENAI_API_KEY=sk-xxx lingclaw
 ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 
 # Ollama
-LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=llama3.2 OLLAMA_API_BASE=http://127.0.0.1:11434 lingclaw
+LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:11434 lingclaw
 ```
 
 ## Configuration
@@ -137,8 +137,8 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=llama3.2 OLLAMA_API_BASE=http://127.0.0.
         "api": "ollama",
         "models": [
           {
-            "id": "llama3.2",
-            "name": "llama3.2",
+            "id": "qwen3",
+            "name": "qwen3",
             "reasoning": true,
             "input": ["text"],
             "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
@@ -169,6 +169,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=llama3.2 OLLAMA_API_BASE=http://127.0.0.
 - `structuredMemory` 默认为 `false`；启用后会在 Finish 阶段后台更新结构化记忆，并在后续 system prompt 中注入摘要
 - 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容
 - `models.providers.*.api` 目前支持 `openai-completions`、`anthropic`、`ollama`
+- Ollama 的 thinking / tool calling 依赖模型能力，推荐优先使用 `qwen3`、`gpt-oss`、`deepseek-r1` 等官方支持模型，而不是把任意本地模型都视为支持深度思考和工具调用
 - 可选的 `mcpServers` 顶层对象可声明 MCP server，例如 `command`、`args`、`env`、`cwd`、`timeoutSecs`
 - `mcpServers.*.cwd` 必须落在当前 session workspace 内；未设置 `timeoutSecs` 时默认继承 `toolTimeout`
 - `start` / `restart` 的 MCP 预检使用受限的一次性探测，不会把预检进程保留为运行时 MCP 会话；`mcp-check` 会按配置的运行时超时做更深诊断
@@ -633,13 +634,13 @@ think_level 映射：
 
 | level | OpenAI reasoning_effort | Anthropic budget_tokens | Ollama think |
 |---|---|---|---|
-| off | — | — | — |
-| minimal | low | 1024 | low |
-| low | low | 4096 | low |
-| medium | medium | 10240 | medium |
-| high | high | 16384 | high |
-| xhigh | high | 32768 | high |
-| auto | model 支持 reasoning? medium : off | 同左 | model 支持 reasoning? true : off |
+| off | — | — | `false`（GPT-OSS 例外，无法完全关闭） |
+| minimal | low | 1024 | `true`；GPT-OSS 映射到 `low` |
+| low | low | 4096 | `true`；GPT-OSS 映射到 `low` |
+| medium | medium | 10240 | `true`；GPT-OSS 映射到 `medium` |
+| high | high | 16384 | `true`；GPT-OSS 映射到 `high` |
+| xhigh | high | 32768 | `true`；GPT-OSS 映射到 `high` |
+| auto | model 支持 reasoning? medium : off | 同左 | model 支持 reasoning? `true` : off |
 
 ### 安全架构
 
