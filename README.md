@@ -780,12 +780,12 @@ think_level 映射：
 
 ## 鸣谢
 
-- 感谢开源项目 openclaw、claude code、deer-flow、opencode
+- 感谢 openclaw、claude code、deer-flow、opencode
 - 感谢 vide-coding 伙伴：GPT-5.4、Claude Opus 4.6
 - 感谢 GitHub Copilot、VS Code
 - 感谢时间
 
 ## License
 
-本项目采用 Apache License 2.0。
+本项目采用 MIT License。
 完整条款见 [LICENSE](LICENSE)。
