@@ -2153,6 +2153,8 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     };
     // Sub-agent model defaults to the same as fast model (cheaper for delegated tasks).
     let sub_agent_model: Option<String> = fast_model.clone();
+    // Structured memory extraction also defaults to the lighter model when available.
+    let memory_model: Option<String> = fast_model.clone();
 
     // Build config JSON
     let mut model_block = serde_json::Map::new();
@@ -2165,6 +2167,9 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     }
     if let Some(ref sub_agent) = sub_agent_model {
         model_block.insert("sub-agent".to_string(), json!(sub_agent));
+    }
+    if let Some(ref memory) = memory_model {
+        model_block.insert("memory".to_string(), json!(memory));
     }
 
     let mut config = json!({
@@ -2220,6 +2225,9 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     }
     if sub_agent_model.is_some() {
         println!("   💡 Sub-agent model configured for delegated task execution.");
+    }
+    if memory_model.is_some() {
+        println!("   💡 Memory model configured for structured memory extraction.");
     }
     #[cfg(not(target_os = "windows"))]
     if add_systemd {

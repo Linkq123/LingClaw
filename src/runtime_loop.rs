@@ -1459,7 +1459,8 @@ async fn run_finish_phase(
     // Enqueue structured memory update (async, non-blocking).
     // Pre-filter messages to avoid cloning the full session history.
     if let (Some(queue), Some(session)) = (&ctx.state.memory_queue, &snapshot) {
-        let model = session.effective_model(&ctx.state.config.model).to_string();
+        let fallback_model = session.effective_model(&ctx.state.config.model);
+        let model = ctx.state.config.memory_model_or(fallback_model).to_string();
         let excerpt = crate::memory::prefilter_for_memory(&session.messages);
         queue.enqueue(session.workspace.clone(), model, excerpt);
     }

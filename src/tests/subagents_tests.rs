@@ -211,6 +211,7 @@ fn base_config() -> Config {
         model: "openai/gpt-4o".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         openai_stream_include_usage: false,

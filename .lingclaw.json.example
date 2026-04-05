@@ -73,7 +73,8 @@
     "defaults": {
       "model": {
         "primary": "openai/gpt-4o-mini",
-        "sub-agent": "openai/gpt-4o-mini"
+        "sub-agent": "openai/gpt-4o-mini",
+        "memory": "openai/gpt-4o-mini"
       }
     }
   },

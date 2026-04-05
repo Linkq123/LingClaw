@@ -35,6 +35,7 @@ fn test_config_with_mcp() -> Config {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         openai_stream_include_usage: false,
         structured_memory: false,

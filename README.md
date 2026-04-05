@@ -155,7 +155,8 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
       "model": {
         "primary": "openai/gpt-4o-mini",
         "fast": "openai/gpt-4o-mini",
-        "sub-agent": "openai/gpt-4o-mini"
+        "sub-agent": "openai/gpt-4o-mini",
+        "memory": "openai/gpt-4o-mini"
       }
     }
   }
@@ -166,7 +167,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 
 - 推荐使用 `provider/model` 格式引用模型
 - 多个 provider 暴露同一 model ID 时，必须使用显式前缀
-- `structuredMemory` 默认为 `false`；启用后会在 Finish 阶段后台更新结构化记忆，并在后续 system prompt 中注入摘要
+- `structuredMemory` 默认为 `false`；启用后会在 Finish 阶段后台更新结构化记忆，并在后续 system prompt 中注入摘要；若配置了 `agents.defaults.model.memory` 或 `LINGCLAW_MEMORY_MODEL`，后台抽取优先使用该模型，否则回退到当前会话有效模型
 - 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容
 - `models.providers.*.api` 目前支持 `openai-completions`、`anthropic`、`ollama`
 - Ollama 的 thinking / tool calling 依赖模型能力，推荐优先使用 `qwen3`、`gpt-oss`、`deepseek-r1` 等官方支持模型，而不是把任意本地模型都视为支持深度思考和工具调用
@@ -190,6 +191,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 - 存储位置：`~/.lingclaw/main/workspace/structured_memory.json`
 - 审计文件：`~/.lingclaw/main/workspace/structured_memory.audit.jsonl`
 - 更新时机：每轮回答完成后的 Finish 阶段，异步入队并做 3 秒 debounce，不阻塞主 agent loop
+- 模型选择：优先使用 `agents.defaults.model.memory` 或环境变量 `LINGCLAW_MEMORY_MODEL`；未设置时回退到当前会话有效模型
 - 提取来源：使用 user/assistant 对话内容，并附带 tool 调用名与 tool 结果首行摘要；会过滤自动生成的 `## Context Summary (auto-generated)` 压缩摘要
 - 合并策略：模型返回缺失字段时保留旧值；显式 `null` 会清空 `user_context`；`facts` 返回时按完整列表替换
 - 超时策略：memory 更新请求沿用 `toolTimeout` 预算，并设 30 秒下限，避免配置过小导致后台更新恒定超时
@@ -212,6 +214,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 | `LINGCLAW_MAX_CONTEXT_TOKENS` | `32000` | 默认上下文 token 预算 |
 | `LINGCLAW_FAST_MODEL` | 无 | 简单首轮查询使用的轻量模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_SUB_AGENT_MODEL` | 无 | 子代理委托任务使用的模型（如 `openai/gpt-4o-mini`） |
+| `LINGCLAW_MEMORY_MODEL` | 无 | structured memory 后台抽取优先使用的模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_STRUCTURED_MEMORY` | `false` | 启用后台结构化记忆提取与 prompt 注入 |
 
 ## Slash Commands

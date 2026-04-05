@@ -26,6 +26,7 @@ fn test_config() -> Config {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -44,6 +45,29 @@ fn test_config() -> Config {
 #[test]
 fn default_port_constant_is_18989() {
     assert_eq!(DEFAULT_PORT, 18989);
+}
+
+#[test]
+fn memory_model_prefers_dedicated_config() {
+    let config = Config {
+        memory_model: Some("openai/gpt-4o-mini".to_string()),
+        ..test_config()
+    };
+
+    assert_eq!(
+        config.memory_model_or("openai/gpt-4o"),
+        "openai/gpt-4o-mini"
+    );
+}
+
+#[test]
+fn memory_model_falls_back_when_unset() {
+    let config = test_config();
+
+    assert_eq!(
+        config.memory_model_or("ollama/gemma4:e4b"),
+        "ollama/gemma4:e4b"
+    );
 }
 
 fn test_app_state() -> AppState {
@@ -196,6 +220,7 @@ fn resolve_model_uses_config_for_plain_model_id() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -402,6 +427,7 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
         model: "llama3.2".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::Ollama,
         anthropic_prompt_caching: false,
         providers,
@@ -472,6 +498,7 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -548,6 +575,7 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -616,6 +644,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -666,6 +695,7 @@ fn canonical_model_ref_expands_unique_plain_id() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -733,6 +763,7 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -802,6 +833,7 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -851,6 +883,7 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -900,6 +933,7 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -929,6 +963,7 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -958,6 +993,7 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -987,6 +1023,7 @@ fn resolve_model_accepts_ollama_prefix_without_provider_config() {
         model: "llama3.2".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::Ollama,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -1036,6 +1073,7 @@ fn build_session_status_reports_resolved_target() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -3389,6 +3427,7 @@ fn context_input_budget_reserves_headroom() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        memory_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
