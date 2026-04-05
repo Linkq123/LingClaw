@@ -7,6 +7,7 @@ fn test_config() -> Config {
         api_base: "https://api.openai.com/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
+        sub_agent_model: None,
         provider: crate::Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),

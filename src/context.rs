@@ -168,6 +168,21 @@ pub(crate) fn request_message_budget_for_runtime(
     )
 }
 
+/// Compute message budget for a caller that already has the complete set of
+/// tool definition JSON values it will send (e.g. sub-agents with a filtered
+/// tool subset). Unlike `request_message_budget_for_runtime` this does NOT
+/// re-derive builtin tools — it uses the provided `tool_defs` directly.
+pub(crate) fn message_budget_for_tool_defs(
+    config: &Config,
+    model_ref: &str,
+    think_level: &str,
+    tool_defs: &[serde_json::Value],
+) -> usize {
+    context_input_budget_for_runtime(config, model_ref, think_level).saturating_sub(
+        estimate_extra_tools_tokens(tool_defs).saturating_add(REQUEST_STRUCTURAL_OVERHEAD_TOKENS),
+    )
+}
+
 pub(crate) fn format_token_count(value: u64) -> String {
     fn format_scaled(value: u64, divisor: u64, unit: &str) -> String {
         let scaled_tenths = (value * 10 + divisor / 2) / divisor;

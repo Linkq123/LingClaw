@@ -537,9 +537,7 @@ pub(crate) async fn run_tool_hooks(
                     outcome_duration_ms,
                 };
             }
-            HookOutput::ModifyToolResult { result }
-                if point == agent::HookPoint::AfterToolExec =>
-            {
+            HookOutput::ModifyToolResult { result } if point == agent::HookPoint::AfterToolExec => {
                 modified = true;
                 input = ToolHookInput {
                     tool_name,

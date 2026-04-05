@@ -17,7 +17,8 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
 - **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断；server 启动连续失败会进入短暂冷却，避免请求风暴
 - **单主会话**：运行时固定使用 `main`，不再创建、切换或删除其他会话
-- **文档化斜杠命令**：`/new`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/status`、`/mcp`、`/usage`、`/clear`、`/memory`、`/help`
+- **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、coder）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤
+- **文档化斜杠命令**：`/new`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/mcp`、`/usage`、`/clear`、`/memory`、`/help`
 - **双 Provider 模型路由**：OpenAI + Anthropic，支持 `provider/model` 和纯 model ID
 - **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
 - **持久化主会话**：固定保存 `main` 工作区和磁盘存档
@@ -133,11 +134,8 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
     "defaults": {
       "model": {
         "primary": "openai/gpt-4o-mini",
-        "fast": "openai/gpt-4o-mini"
-      },
-      "models": {
-        "openai/gpt-4o-mini": {},
-        "anthropic/claude-sonnet-4-20250514": {}
+        "fast": "openai/gpt-4o-mini",
+        "sub-agent": "openai/gpt-4o-mini"
       }
     }
   }
@@ -189,6 +187,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `LINGCLAW_TOOL_TIMEOUT` | `30` | 非 shell 的 Act 阶段工具超时（秒） |
 | `LINGCLAW_MAX_CONTEXT_TOKENS` | `32000` | 默认上下文 token 预算 |
 | `LINGCLAW_FAST_MODEL` | 无 | 简单首轮查询使用的轻量模型（如 `openai/gpt-4o-mini`） |
+| `LINGCLAW_SUB_AGENT_MODEL` | 无 | 子代理委托任务使用的模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_STRUCTURED_MEMORY` | `false` | 启用后台结构化记忆提取与 prompt 注入 |
 
 ## Slash Commands
@@ -206,6 +205,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `/skills-system [install\|uninstall <pattern>]` | 列出系统内置 Skills 状态；`install`/`uninstall` 子命令可运行时启用/禁用 Skill 或 Skill 组（如 `anthropics`、`anthropics/pdf`） |
 | `/skills-global` | 仅列出全局 Skills（`~/.lingclaw/skills/`） |
 | `/skills-session` | 仅列出当前 session Skills（workspace `skills/`） |
+| `/agents` | 列出已发现的子代理（含来源标签：system / global / session） |
 | `/status` | 显示模型、provider、上下文估算、最大输出 token、思维级别，token 数值按 K/M 显示 |
 | `/mcp [refresh]` | 查看当前已加载的 MCP server 状态；加上 `refresh` 时强制刷新工具缓存并重建运行时 MCP 会话 |
 | `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；单会话模式下同时显示主会话今日总 token 估算，按 K/M 显示 |
@@ -226,6 +226,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 | `list_dir` | 列目录内容 |
 | `search_files` | 正则搜索工作区文件 |
 | `http_fetch` | HTTP GET，带 SSRF 防护和重定向阻断 |
+| `task` | 委托任务给子代理（当发现代理时动态注册）|
 
 ## Skills
 
@@ -285,6 +286,64 @@ description: 描述这个 Skill 做什么以及何时触发
 ### 兼容性
 
 SKILL.md 的 YAML frontmatter 格式兼容 [Agent Skills 规范](https://agentskills.io)。你可以从 [anthropics/skills](https://github.com/anthropics/skills) 仓库获取社区 Skill 并放入任意层级的 `skills/` 目录。
+
+## Sub-Agents
+
+子代理是可委托的专用任务执行器。主 Agent 通过 `task` 工具将子任务分派给子代理，子代理在独立的 ReAct 循环中执行，完成后将结果返回给主 Agent。
+
+### 三层来源
+
+子代理从三个目录分层加载，后加载的同名代理覆盖先前的：
+
+| 层级 | 目录 | 说明 |
+|------|------|------|
+| **System** | `docs/reference/agents/` | 随程序分发的内置子代理 |
+| **Global** | `~/.lingclaw/agents/` | 跨 session 共享的全局子代理 |
+| **Session** | `~/.lingclaw/main/workspace/agents/` | 主会话专属子代理 |
+
+### 内置子代理
+
+| 名称 | 用途 |
+|------|------|
+| **explore** | 快速只读代码库探索和问答 |
+| **researcher** | 深度研究，综合多源信息 |
+| **coder** | 代码实现与修改 |
+
+### AGENT.md 格式
+
+```markdown
+---
+name: my-agent
+description: 描述这个子代理做什么
+model: openai/gpt-4o-mini   # 可选：覆盖默认模型
+max_turns: 15               # 可选：最大 ReAct 轮数（默认 15）
+tools:
+  allow: ["read_file", "list_dir", "search_files"]   # 白名单模式
+  # deny: ["exec", "write_file"]                      # 或黑名单模式
+---
+
+# 系统提示正文
+
+详细的行为指令...
+```
+
+### 模型优先级
+
+子代理使用的模型按以下优先级解析：
+
+1. **AGENT.md `model` 字段** — 子代理定义中指定的模型（最高优先级）
+2. **`agents.defaults.model.sub-agent`** — 全局子代理模型配置（JSON 配置或 `LINGCLAW_SUB_AGENT_MODEL` 环境变量）
+3. **`agents.defaults.model.primary`** — 主模型（兜底）
+
+### 工作原理
+
+- **发现**：系统自动扫描三层目录下的 `agents/*/AGENT.md`，解析 YAML frontmatter
+- **动态注册**：当发现至少一个子代理时，`task` 工具会被动态添加到模型工具列表
+- **隔离执行**：子代理拥有独立的消息历史、过滤后的工具集、独立的 ReAct 循环
+- **Hook 集成**：子代理的工具执行经过 BeforeToolExec / AfterToolExec Hook 链，Reject 事件会转发给父 Agent
+- **递归阻断**：`task` 工具始终被排除在子代理的工具集之外，防止无限委托
+- **事件流**：`task_started`、`task_progress`、`task_tool`、`task_completed`、`task_failed` 事件实时流向前端
+- **查看代理**：`/agents` 列出所有已发现的子代理及其来源
 
 ---
 
@@ -397,7 +456,7 @@ handle_socket()
   │    │
   │    ├─ AgentPhase::Act
   │    │    ├─ 安全检查
-  │    │    ├─ execute_tool() × N
+  │    │    ├─ execute_tool() × N (含 task 工具 → 子代理委托)
   │    │    ├─ 收集 ToolResultEntry
   │    │    ├─ 持久化 tool result 到 session
   │    │    └─ transition_to_observe()
@@ -446,6 +505,10 @@ src/
     ├── net.rs         (~120 行)  — http_fetch, check_ssrf, is_private_ip
     ├── exec.rs        (~60 行)   — exec (shell), think (scratchpad)
     └── mcp.rs         (~1250 行) — stdio MCP 工具发现/执行桥接, 会话缓存, preflight
+├── subagents/
+│   ├── mod.rs         (~220 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, 工具过滤
+│   ├── executor.rs    (~400 行)  — 隔离 mini-ReAct 执行循环, Hook 集成, 父级事件流
+│   └── discovery.rs   (~200 行)  — 三层发现 (system/global/session), YAML frontmatter 解析
 
 static/
 ├── index.html                  — 主页面
@@ -454,6 +517,7 @@ static/
 
 docs/reference/templates/       — 7 个提示模板文件 (BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/TOOLS/MEMORY.md)
 docs/reference/skills/          — 17 个系统内置 Skills (安装时部署到 ~/.lingclaw/system-skills/)
+docs/reference/agents/          — 3 个内置子代理 (explore, researcher, coder)
 
 src/tests/                      — 模块测试文件 (~5470 行)
 ```
@@ -592,6 +656,7 @@ think_level 映射：
 │   ├── MEMORY.md           — 持久记忆指南
 │   ├── structured_memory.json  — 机器可读结构化记忆（启用时生成）
 │   ├── skills/             — session 专属 Skills
+│   ├── agents/             — session 专属子代理
 │   └── memory/
 │       └── 2026-03-17.md   — 每日记忆
 ```
@@ -636,6 +701,11 @@ think_level 映射：
 | `tool_result` | 工具执行结果（含 `duration_ms`、`is_error`） |
 | `done` | 响应完成 |
 | `react_phase` | ReAct 阶段转换（默认启用，可通过 `/react off` 关闭） |
+| `task_started` | 子代理开始执行 |
+| `task_progress` | 子代理 ReAct 周期进度 |
+| `task_tool` | 子代理工具调用（含 `agent`、`tool`、`id`） |
+| `task_completed` | 子代理完成（含 `cycles`、`tool_calls`、`duration_ms`） |
+| `task_failed` | 子代理失败（含 `error`、`cycles`、`tool_calls`、`duration_ms`） |
 | `observation` | 非破坏性工具结果摘要 |
 | `context_pruned` | 上下文裁剪通知（含 `removed_count`） |
 | `progress` | 命令处理中（不清除忙碌状态） |

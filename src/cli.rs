@@ -726,6 +726,23 @@ fn install_system_skills(source_dir: &Path) -> io::Result<()> {
     copy_dir_recursive(&source_skills, &target)
 }
 
+/// Copy system agents from source `docs/reference/agents/` to `~/.lingclaw/system-agents/`.
+fn install_system_agents(source_dir: &Path) -> io::Result<()> {
+    let source_agents = source_dir.join("docs").join("reference").join("agents");
+    if !source_agents.is_dir() {
+        return Ok(());
+    }
+    let target = match config_dir_path() {
+        Some(d) => d.join("system-agents"),
+        None => return Ok(()),
+    };
+    // Remove stale target so we get a clean copy
+    if target.is_dir() {
+        std::fs::remove_dir_all(&target)?;
+    }
+    copy_dir_recursive(&source_agents, &target)
+}
+
 fn install_built_binary(built_exe: &Path, current_exe: &Path) -> io::Result<()> {
     #[cfg(target_os = "windows")]
     {
@@ -1089,6 +1106,10 @@ fn handle_update_command(port_override: Option<u16>) -> bool {
             match install_system_skills(&workspace) {
                 Ok(()) => println!("   ✅ System skills updated"),
                 Err(e) => eprintln!("   ⚠ Failed to update system skills: {e}"),
+            }
+            match install_system_agents(&workspace) {
+                Ok(()) => println!("   ✅ System agents updated"),
+                Err(e) => eprintln!("   ⚠ Failed to update system agents: {e}"),
             }
             println!("Starting...");
             handle_start_command(port_override);
@@ -1842,6 +1863,10 @@ fn handle_install_command(port_override: Option<u16>) -> bool {
                 Ok(()) => println!("   ✅ System skills installed"),
                 Err(e) => eprintln!("   ⚠ Failed to install system skills: {e}"),
             }
+            match install_system_agents(&source_dir) {
+                Ok(()) => println!("   ✅ System agents installed"),
+                Err(e) => eprintln!("   ⚠ Failed to install system agents: {e}"),
+            }
             if was_running {
                 println!("Starting service...");
                 handle_start_command(port_override);
@@ -2098,24 +2123,14 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     prompt_line("   Press Enter to continue...");
     println!();
 
-    // Build agents.defaults.models map from provider models
-    let mut agent_models = serde_json::Map::new();
-    for (prov_name, prov) in &providers {
-        if let Some(models) = prov.get("models").and_then(|m| m.as_array()) {
-            for m in models {
-                if let Some(id) = m.get("id").and_then(|v| v.as_str()) {
-                    agent_models.insert(format!("{prov_name}/{id}"), json!({}));
-                }
-            }
-        }
-    }
-
     // Derive a sensible fast model from the chosen provider.
     let fast_model: Option<String> = match provider_choice {
         0 => Some("openai/gpt-4o-mini".to_string()),
         1 => Some("anthropic/claude-haiku-3-20250306".to_string()),
         _ => None,
     };
+    // Sub-agent model defaults to the same as fast model (cheaper for delegated tasks).
+    let sub_agent_model: Option<String> = fast_model.clone();
 
     // Build config JSON
     let mut model_block = serde_json::Map::new();
@@ -2125,6 +2140,9 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     );
     if let Some(ref fast) = fast_model {
         model_block.insert("fast".to_string(), json!(fast));
+    }
+    if let Some(ref sub_agent) = sub_agent_model {
+        model_block.insert("sub-agent".to_string(), json!(sub_agent));
     }
 
     let mut config = json!({
@@ -2140,7 +2158,6 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
         "agents": {
             "defaults": {
                 "model": model_block,
-                "models": agent_models,
             }
         }
     });
@@ -2178,6 +2195,9 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     println!("   ✅ Configuration saved to {}", config_path.display());
     if fast_model.is_some() {
         println!("   💡 Fast model configured for simple first-cycle queries.");
+    }
+    if sub_agent_model.is_some() {
+        println!("   💡 Sub-agent model configured for delegated task execution.");
     }
     #[cfg(not(target_os = "windows"))]
     if add_systemd {

@@ -1267,6 +1267,23 @@ function handleMessage(data) {
       addToolResult(data.name, data.result, data.id, data.duration_ms ?? null);
       break;
 
+    // ── Sub-agent task events ──
+    case 'task_started':
+      if (showTools) addSystem(`🤖 Sub-agent **${data.agent}** started`);
+      break;
+    case 'task_progress':
+      // Cycle progress — silently consumed (visible via tool_progress on parent)
+      break;
+    case 'task_tool':
+      if (showTools) addSystem(`🔧 **${data.agent}** → \`${data.tool}\``);
+      break;
+    case 'task_completed':
+      if (showTools) addSystem(`✅ Sub-agent **${data.agent}** completed (${data.cycles} cycles, ${data.tool_calls} tools, ${formatToolDuration(data.duration_ms)})`);
+      break;
+    case 'task_failed':
+      if (showTools) addSystem(`❌ Sub-agent **${data.agent}** failed${data.error ? ': ' + data.error : ''} (${data.cycles ?? 0} cycles, ${data.tool_calls ?? 0} tools${data.duration_ms ? ', ' + formatToolDuration(data.duration_ms) : ''})`);
+      break;
+
     case 'context_compressed':
       addSystem(
         `Context auto-compressed: removed ${data.messages_removed || 0} messages, token estimate ${data.before_estimate || 0} -> ${data.after_estimate || 0}`

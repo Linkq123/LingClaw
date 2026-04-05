@@ -58,6 +58,45 @@ enum ToolRunState {
     Abort,
 }
 
+/// Drop guard that sends a `task_failed` event when a `task` tool future is
+/// dropped after `task_started` was emitted but before the terminal event fired
+/// (e.g. on timeout or cancellation). Uses `try_send` (non-async, best-effort).
+struct TaskEventGuard<'a> {
+    live_tx: &'a LiveTx,
+    agent_name: String,
+    finished: bool,
+}
+
+impl<'a> TaskEventGuard<'a> {
+    fn new(live_tx: &'a LiveTx, agent_name: &str) -> Self {
+        Self {
+            live_tx,
+            agent_name: agent_name.to_string(),
+            finished: false,
+        }
+    }
+
+    fn mark_finished(&mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for TaskEventGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            eprintln!(
+                "[task-guard] sub-agent '{}' dropped before terminal event — sending task_failed",
+                self.agent_name
+            );
+            let _ = self.live_tx.try_send(json!({
+                "type": "task_failed",
+                "agent": self.agent_name,
+                "error": "task aborted (timeout or cancellation)",
+            }));
+        }
+    }
+}
+
 const AGENT_HARD_CAP_ROUNDS: usize = 200;
 
 /// Post-execution reflection: analyze what went well/poorly in a multi-step task.
@@ -385,6 +424,18 @@ pub(crate) async fn build_runtime_tools(
     workspace: &Path,
 ) -> Vec<serde_json::Value> {
     let mut extra_tools = Vec::new();
+
+    // Sub-agent task tool (only added when agents are discovered)
+    let agents = crate::subagents::discovery::discover_all_agents(workspace);
+    if !agents.is_empty() {
+        let agent_names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
+        let task_def = match provider {
+            Provider::Anthropic => tools::task_tool_definition_anthropic(&agent_names),
+            Provider::OpenAI => tools::task_tool_definition_openai(&agent_names),
+        };
+        extra_tools.push(task_def);
+    }
+
     let mut mcp_tools = match provider {
         Provider::Anthropic => tools::mcp::tool_definitions_anthropic(config, workspace).await,
         Provider::OpenAI => tools::mcp::tool_definitions_openai(config, workspace).await,
@@ -478,6 +529,134 @@ async fn execute_tool(
         result
     } else {
         tools::execute_tool(name, args_str, config, http, workspace).await
+    }
+}
+
+/// Execute a `task` tool call by delegating to a sub-agent.
+/// Returns the outcome as a standard ToolOutcome so it integrates with the
+/// existing record_tool_result flow.
+async fn execute_task_tool(
+    args_str: &str,
+    config: &Config,
+    http: &Client,
+    workspace: &Path,
+    live_tx: &LiveTx,
+    cancel: CancellationToken,
+    hooks: &HookRegistry,
+) -> tools::ToolOutcome {
+    let start = std::time::Instant::now();
+
+    let args: serde_json::Value = match serde_json::from_str(args_str) {
+        Ok(v) => v,
+        Err(e) => {
+            return tools::ToolOutcome {
+                output: format!("task error: invalid arguments JSON: {e}"),
+                is_error: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    // Validate task tool parameters against schema
+    if let Some(err) = tools::validate_tool_args("task", &args, &tools::task_tool_parameters()) {
+        return tools::ToolOutcome {
+            output: err,
+            is_error: true,
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
+    }
+
+    let agent_name = match args.get("agent").and_then(|v| v.as_str()) {
+        Some(name) => name,
+        None => {
+            return tools::ToolOutcome {
+                output: "task error: missing required parameter 'agent'".to_string(),
+                is_error: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    let prompt = match args.get("prompt").and_then(|v| v.as_str()) {
+        Some(p) => p,
+        None => {
+            return tools::ToolOutcome {
+                output: "task error: missing required parameter 'prompt'".to_string(),
+                is_error: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    let spec = match crate::subagents::discovery::find_agent(workspace, agent_name) {
+        Some(s) => s,
+        None => {
+            let available = crate::subagents::discovery::discover_all_agents(workspace);
+            let names: Vec<&str> = available.iter().map(|a| a.name.as_str()).collect();
+            return tools::ToolOutcome {
+                output: format!(
+                    "task error: sub-agent '{}' not found. Available agents: {}",
+                    agent_name,
+                    if names.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        names.join(", ")
+                    }
+                ),
+                is_error: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    // Send task_started event
+    let _ = live_send(
+        live_tx,
+        json!({
+            "type": "task_started",
+            "agent": agent_name,
+            "prompt": crate::truncate(prompt, 500),
+        }),
+    )
+    .await;
+
+    // Guard ensures task_failed is sent if we're dropped after task_started
+    // (e.g. timeout or cancellation in run_tool_with_feedback).
+    let mut guard = TaskEventGuard::new(live_tx, agent_name);
+
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec, prompt, config, http, workspace, live_tx, cancel, hooks,
+    )
+    .await;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+
+    // Send task_completed / task_failed event
+    let terminal_event = if outcome.aborted {
+        json!({
+            "type": "task_failed",
+            "agent": agent_name,
+            "error": outcome.result,
+            "cycles": outcome.cycles,
+            "tool_calls": outcome.tool_calls,
+            "duration_ms": duration_ms,
+        })
+    } else {
+        json!({
+            "type": "task_completed",
+            "agent": agent_name,
+            "cycles": outcome.cycles,
+            "tool_calls": outcome.tool_calls,
+            "duration_ms": duration_ms,
+        })
+    };
+    let _ = live_send(live_tx, terminal_event).await;
+    guard.mark_finished();
+
+    tools::ToolOutcome {
+        output: outcome.result,
+        is_error: outcome.aborted,
+        duration_ms,
     }
 }
 
@@ -637,21 +816,44 @@ async fn execute_tool_call(
         return Err(AgentPhaseControl::Break);
     }
 
-    let run_state = run_tool_with_feedback(
-        ctx.live_tx,
-        ctx.run_cancel,
-        &tc.id,
-        &tc.function.name,
-        tool_timeout,
-        execute_tool(
+    let run_state = if tools::is_task_tool(&tc.function.name) {
+        // Sub-agent task: use dedicated executor with LiveTx for streaming events.
+        // Task tool gets its own child cancel token for isolation.
+        let task_cancel = ctx.run_cancel.child_token();
+        run_tool_with_feedback(
+            ctx.live_tx,
+            ctx.run_cancel,
+            &tc.id,
             &tc.function.name,
-            &effective_args,
-            &ctx.state.config,
-            &ctx.state.http,
-            &phase_state.cycle_workspace,
-        ),
-    )
-    .await;
+            tool_timeout,
+            execute_task_tool(
+                &effective_args,
+                &ctx.state.config,
+                &ctx.state.http,
+                &phase_state.cycle_workspace,
+                ctx.live_tx,
+                task_cancel,
+                &ctx.state.hooks,
+            ),
+        )
+        .await
+    } else {
+        run_tool_with_feedback(
+            ctx.live_tx,
+            ctx.run_cancel,
+            &tc.id,
+            &tc.function.name,
+            tool_timeout,
+            execute_tool(
+                &tc.function.name,
+                &effective_args,
+                &ctx.state.config,
+                &ctx.state.http,
+                &phase_state.cycle_workspace,
+            ),
+        )
+        .await
+    };
 
     match run_state {
         ToolRunState::Completed(result) => Ok((result, Some(effective_args))),
@@ -1052,7 +1254,9 @@ async fn run_act_phase(
             let display_args = if hr.rejected.is_some() {
                 &tc.function.arguments
             } else {
-                hr.effective_args.as_deref().unwrap_or(&tc.function.arguments)
+                hr.effective_args
+                    .as_deref()
+                    .unwrap_or(&tc.function.arguments)
             };
             if !live_send(
                 ctx.live_tx,
@@ -1089,7 +1293,10 @@ async fn run_act_phase(
                         })
                     });
                 }
-                let args = hr.effective_args.as_deref().unwrap_or(&tc.function.arguments);
+                let args = hr
+                    .effective_args
+                    .as_deref()
+                    .unwrap_or(&tc.function.arguments);
                 futures::future::Either::Right(run_tool_with_feedback(
                     ctx.live_tx,
                     ctx.run_cancel,
@@ -1127,7 +1334,8 @@ async fn run_act_phase(
             match effective_run_state {
                 ToolRunState::Completed(result) => {
                     if matches!(
-                        record_tool_result(ctx, phase_state, tc, result, after_args.as_deref()).await,
+                        record_tool_result(ctx, phase_state, tc, result, after_args.as_deref())
+                            .await,
                         AgentPhaseControl::Break
                     ) {
                         should_break = true;

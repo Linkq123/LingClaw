@@ -93,6 +93,15 @@ install_release() {
     cp -R "$system_skills_src/." "$system_skills_dst/"
     info "Installed system skills to $system_skills_dst"
   fi
+  # Install system agents to ~/.lingclaw/system-agents/
+  local system_agents_src="$ROOT_DIR/docs/reference/agents"
+  local system_agents_dst="$HOME/.lingclaw/system-agents"
+  if [[ -d "$system_agents_src" ]]; then
+    rm -rf "$system_agents_dst"
+    mkdir -p "$system_agents_dst"
+    cp -R "$system_agents_src/." "$system_agents_dst/"
+    info "Installed system agents to $system_agents_dst"
+  fi
   export PATH="$cargo_bin:$PATH"
 }
 

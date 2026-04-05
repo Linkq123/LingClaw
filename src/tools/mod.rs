@@ -26,7 +26,7 @@ pub(crate) struct ToolSpec {
     pub(crate) name: &'static str,
     pub(crate) description: &'static str,
     prompt_line: fn(&Config) -> String,
-    parameters: fn() -> serde_json::Value,
+    pub(crate) parameters: fn() -> serde_json::Value,
     handler: ToolHandler,
 }
 
@@ -461,6 +461,73 @@ pub(crate) fn is_read_only_tool(name: &str) -> bool {
     )
 }
 
+/// Returns true if the named tool is the sub-agent `task` tool.
+/// This tool is handled specially by the runtime loop, not the standard execute path.
+pub(crate) fn is_task_tool(name: &str) -> bool {
+    name == "task"
+}
+
+/// Generate the `task` tool definition for OpenAI format.
+/// The description is dynamically enriched with discovered sub-agent names.
+pub(crate) fn task_tool_definition_openai(agent_names: &[String]) -> serde_json::Value {
+    let catalog = if agent_names.is_empty() {
+        "No sub-agents currently available.".to_string()
+    } else {
+        format!("Available sub-agents: {}", agent_names.join(", "))
+    };
+    json!({
+        "type": "function",
+        "function": {
+            "name": "task",
+            "description": format!(
+                "Delegate a sub-task to a specialized sub-agent that runs in an isolated context \
+                 with its own tool set and message history. Use this for research, code review, \
+                 exploration, or any task that benefits from focused attention. {catalog}"
+            ),
+            "parameters": task_tool_parameters(),
+        }
+    })
+}
+
+/// Generate the `task` tool definition for Anthropic format.
+pub(crate) fn task_tool_definition_anthropic(agent_names: &[String]) -> serde_json::Value {
+    let catalog = if agent_names.is_empty() {
+        "No sub-agents currently available.".to_string()
+    } else {
+        format!("Available sub-agents: {}", agent_names.join(", "))
+    };
+    json!({
+        "name": "task",
+        "description": format!(
+            "Delegate a sub-task to a specialized sub-agent that runs in an isolated context \
+             with its own tool set and message history. Use this for research, code review, \
+             exploration, or any task that benefits from focused attention. {catalog}"
+        ),
+        "input_schema": task_tool_parameters(),
+    })
+}
+
+pub(crate) fn task_tool_parameters() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "agent": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100,
+                "description": "The name of the sub-agent to delegate the task to"
+            },
+            "prompt": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 50000,
+                "description": "Detailed task description for the sub-agent"
+            }
+        },
+        "required": ["agent", "prompt"]
+    })
+}
+
 pub(crate) async fn execute_tool(
     name: &str,
     args_str: &str,
@@ -535,7 +602,7 @@ fn validate_required_params(tool_name: &str, args: &Value, schema: &Value) -> Op
     None
 }
 
-fn validate_tool_args(tool_name: &str, args: &Value, schema: &Value) -> Option<String> {
+pub(crate) fn validate_tool_args(tool_name: &str, args: &Value, schema: &Value) -> Option<String> {
     let Some(obj) = args.as_object() else {
         return Some(format!(
             "{tool_name} error: arguments must be a JSON object"

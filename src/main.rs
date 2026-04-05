@@ -39,6 +39,7 @@ mod session_admin;
 mod session_store;
 mod socket_sync;
 mod socket_tasks;
+mod subagents;
 mod tools;
 
 pub(crate) use config::{Config, DEFAULT_PORT, Provider, config_dir_path, config_file_path};
@@ -324,6 +325,25 @@ struct LiveRoundState {
     reasoning_text: String,
     reasoning_done: bool,
     tools: Vec<LiveToolState>,
+    /// Currently active sub-agent task (set on `task_started`, cleared on terminal).
+    active_task: Option<LiveTaskState>,
+}
+
+#[derive(Clone)]
+struct LiveTaskState {
+    agent: String,
+    prompt: String,
+    /// Latest cycle/phase from `task_progress` events.
+    current_cycle: Option<usize>,
+    current_phase: Option<String>,
+    /// Tool calls reported via `task_tool` events (for replay on reconnect).
+    tools: Vec<LiveTaskToolState>,
+}
+
+#[derive(Clone)]
+struct LiveTaskToolState {
+    tool: String,
+    id: String,
 }
 
 /// Cap for replay buffer strings (128 KB). Keeps memory bounded for long outputs.
@@ -396,6 +416,14 @@ Only read those files if the user explicitly asks to inspect them, if you need t
         String::new()
     };
 
+    // Sub-agent catalog (discovered from system/global/session layers)
+    let agents_section = {
+        let agents = subagents::discovery::discover_all_agents(workspace);
+        subagents::render_agents_catalog(&agents)
+            .map(|s| format!("\n\n{s}"))
+            .unwrap_or_default()
+    };
+
     let prompt = format!(
         r#"{persona}{structured_memory_section}
 
@@ -410,7 +438,7 @@ Only read those files if the user explicitly asks to inspect them, if you need t
 {prompt_file_note}
 
 ## Available Tools
-{tool_lines}{mcp_note}{skills_section}"#,
+{tool_lines}{mcp_note}{skills_section}{agents_section}"#,
         model = model,
         local_time = local_time,
         tool_lines = tool_lines,
@@ -419,6 +447,7 @@ Only read those files if the user explicitly asks to inspect them, if you need t
         mcp_note = mcp_note,
         skills_section = skills_section,
         structured_memory_section = structured_memory_section,
+        agents_section = agents_section,
     );
 
     ChatMessage {
@@ -840,6 +869,7 @@ async fn dispatch_live_event(
                         reasoning_text: String::new(),
                         reasoning_done: false,
                         tools: Vec::new(),
+                        active_task: None,
                     },
                 );
             }
@@ -944,6 +974,46 @@ async fn dispatch_live_event(
                     && round.connection_id == connection_id
                 {
                     round.has_observation = true;
+                }
+            }
+            "task_started" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                {
+                    round.active_task = Some(LiveTaskState {
+                        agent: event["agent"].as_str().unwrap_or_default().to_string(),
+                        prompt: event["prompt"].as_str().unwrap_or_default().to_string(),
+                        current_cycle: None,
+                        current_phase: None,
+                        tools: Vec::new(),
+                    });
+                }
+            }
+            "task_progress" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && let Some(task) = round.active_task.as_mut()
+                {
+                    task.current_cycle = event["cycle"].as_u64().map(|v| v as usize);
+                    task.current_phase = event["phase"].as_str().map(str::to_string);
+                }
+            }
+            "task_tool" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && let Some(task) = round.active_task.as_mut()
+                {
+                    task.tools.push(LiveTaskToolState {
+                        tool: event["tool"].as_str().unwrap_or_default().to_string(),
+                        id: event["id"].as_str().unwrap_or_default().to_string(),
+                    });
+                }
+            }
+            "task_completed" | "task_failed" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                {
+                    round.active_task = None;
                 }
             }
             "done" | "error" => {
@@ -1052,6 +1122,47 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
             &json!({"type":"delta","content": live_round.assistant_text}),
         )
         .await;
+    }
+
+    // Replay active sub-agent task if one is running.
+    if let Some(task) = &live_round.active_task {
+        ws_send(
+            tx,
+            &json!({
+                "type": "task_started",
+                "agent": task.agent,
+                "prompt": task.prompt,
+            }),
+        )
+        .await;
+
+        // Replay latest progress (cycle/phase).
+        if let Some(cycle) = task.current_cycle {
+            ws_send(
+                tx,
+                &json!({
+                    "type": "task_progress",
+                    "agent": task.agent,
+                    "cycle": cycle,
+                    "phase": task.current_phase.as_deref().unwrap_or("analyze"),
+                }),
+            )
+            .await;
+        }
+
+        // Replay tool calls reported by the sub-agent.
+        for tool in &task.tools {
+            ws_send(
+                tx,
+                &json!({
+                    "type": "task_tool",
+                    "agent": task.agent,
+                    "tool": tool.tool,
+                    "id": tool.id,
+                }),
+            )
+            .await;
+        }
     }
 }
 

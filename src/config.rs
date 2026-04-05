@@ -69,6 +69,8 @@ pub(crate) struct Config {
     pub(crate) model: String,
     /// Optional lighter model for simple first-cycle queries.
     pub(crate) fast_model: Option<String>,
+    /// Optional model for sub-agent task delegation.
+    pub(crate) sub_agent_model: Option<String>,
     pub(crate) provider: Provider,
     pub(crate) openai_stream_include_usage: bool,
     pub(crate) anthropic_prompt_caching: bool,
@@ -105,6 +107,10 @@ impl Config {
             .as_ref()
             .and_then(|m| m.fast.clone())
             .or_else(|| std::env::var("LINGCLAW_FAST_MODEL").ok());
+        let sub_agent_model = model_config
+            .as_ref()
+            .and_then(|m| m.sub_agent.clone())
+            .or_else(|| std::env::var("LINGCLAW_SUB_AGENT_MODEL").ok());
 
         let model = default_from_json
             .or_else(|| std::env::var("LINGCLAW_MODEL").ok())
@@ -144,6 +150,7 @@ impl Config {
             api_base,
             model,
             fast_model,
+            sub_agent_model,
             provider,
             openai_stream_include_usage: settings
                 .openai_stream_include_usage
@@ -589,6 +596,9 @@ pub(crate) struct JsonDefaultModel {
     pub(crate) primary: Option<String>,
     /// Optional lighter/cheaper model for simple queries (cycle 0, short input).
     pub(crate) fast: Option<String>,
+    /// Optional model for sub-agent task delegation.
+    #[serde(rename = "sub-agent")]
+    pub(crate) sub_agent: Option<String>,
 }
 
 pub(crate) fn config_dir_path() -> Option<PathBuf> {

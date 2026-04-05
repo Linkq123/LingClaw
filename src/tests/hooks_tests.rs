@@ -16,6 +16,7 @@ fn test_config() -> Config {
         api_base: "https://test.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
+        sub_agent_model: None,
         provider: crate::config::Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -367,9 +368,7 @@ impl AgentHook for WrongPointCommandHook {
         _input: CommandHookInput,
         _config: &'a Config,
     ) -> Pin<Box<dyn Future<Output = Vec<serde_json::Value>> + Send + 'a>> {
-        Box::pin(async {
-            vec![serde_json::json!({"type": "should_never_fire"})]
-        })
+        Box::pin(async { vec![serde_json::json!({"type": "should_never_fire"})] })
     }
 }
 
@@ -515,12 +514,39 @@ async fn run_tool_hooks_after_sees_effective_args() {
         // Use a wrapper to share Arc
         struct ArcCaptureHook(std::sync::Arc<CaptureArgsAfterHook>);
         impl AgentHook for ArcCaptureHook {
-            fn name(&self) -> &'static str { self.0.name() }
-            fn point(&self) -> agent::HookPoint { self.0.point() }
-            fn should_run(&self, a: &[ChatMessage], b: config::Provider, c: usize, d: usize) -> bool { self.0.should_run(a, b, c, d) }
-            fn run<'a>(&'a self, i: HookInput, c: &'a Config, h: &'a reqwest::Client) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> { self.0.run(i, c, h) }
-            fn should_run_tool(&self, n: &str, p: agent::HookPoint) -> bool { self.0.should_run_tool(n, p) }
-            fn run_tool<'a>(&'a self, i: ToolHookInput, c: &'a Config) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> { self.0.run_tool(i, c) }
+            fn name(&self) -> &'static str {
+                self.0.name()
+            }
+            fn point(&self) -> agent::HookPoint {
+                self.0.point()
+            }
+            fn should_run(
+                &self,
+                a: &[ChatMessage],
+                b: config::Provider,
+                c: usize,
+                d: usize,
+            ) -> bool {
+                self.0.should_run(a, b, c, d)
+            }
+            fn run<'a>(
+                &'a self,
+                i: HookInput,
+                c: &'a Config,
+                h: &'a reqwest::Client,
+            ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+                self.0.run(i, c, h)
+            }
+            fn should_run_tool(&self, n: &str, p: agent::HookPoint) -> bool {
+                self.0.should_run_tool(n, p)
+            }
+            fn run_tool<'a>(
+                &'a self,
+                i: ToolHookInput,
+                c: &'a Config,
+            ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+                self.0.run_tool(i, c)
+            }
         }
         r.register(Box::new(ArcCaptureHook(capture.clone())));
         r
@@ -539,9 +565,20 @@ async fn run_tool_hooks_after_sees_effective_args() {
         outcome_is_error: Some(false),
         outcome_duration_ms: Some(10),
     };
-    let _ = run_tool_hooks(&after_registry, agent::HookPoint::AfterToolExec, after_input, &config).await;
-    let captured = capture.captured().expect("AfterToolExec hook should have fired");
-    assert_eq!(captured["injected"], true, "AfterToolExec should see effective args");
+    let _ = run_tool_hooks(
+        &after_registry,
+        agent::HookPoint::AfterToolExec,
+        after_input,
+        &config,
+    )
+    .await;
+    let captured = capture
+        .captured()
+        .expect("AfterToolExec hook should have fired");
+    assert_eq!(
+        captured["injected"], true,
+        "AfterToolExec should see effective args"
+    );
     assert_eq!(captured["key"], "val");
 }
 
@@ -755,12 +792,33 @@ async fn run_llm_hooks_chained_think_override_visible_to_next_hook() {
     let capture = std::sync::Arc::new(CaptureThinkLevelHook::new());
     struct ArcCaptureThinkHook(std::sync::Arc<CaptureThinkLevelHook>);
     impl AgentHook for ArcCaptureThinkHook {
-        fn name(&self) -> &'static str { self.0.name() }
-        fn point(&self) -> agent::HookPoint { self.0.point() }
-        fn should_run(&self, a: &[ChatMessage], b: config::Provider, c: usize, d: usize) -> bool { self.0.should_run(a, b, c, d) }
-        fn run<'a>(&'a self, i: HookInput, c: &'a Config, h: &'a reqwest::Client) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> { self.0.run(i, c, h) }
-        fn should_run_llm(&self, cycle: usize) -> bool { self.0.should_run_llm(cycle) }
-        fn run_llm<'a>(&'a self, i: LlmHookInput, c: &'a Config) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> { self.0.run_llm(i, c) }
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+        fn point(&self) -> agent::HookPoint {
+            self.0.point()
+        }
+        fn should_run(&self, a: &[ChatMessage], b: config::Provider, c: usize, d: usize) -> bool {
+            self.0.should_run(a, b, c, d)
+        }
+        fn run<'a>(
+            &'a self,
+            i: HookInput,
+            c: &'a Config,
+            h: &'a reqwest::Client,
+        ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+            self.0.run(i, c, h)
+        }
+        fn should_run_llm(&self, cycle: usize) -> bool {
+            self.0.should_run_llm(cycle)
+        }
+        fn run_llm<'a>(
+            &'a self,
+            i: LlmHookInput,
+            c: &'a Config,
+        ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+            self.0.run_llm(i, c)
+        }
     }
     registry.register(Box::new(ArcCaptureThinkHook(capture.clone())));
 
@@ -784,7 +842,10 @@ async fn run_llm_hooks_chained_think_override_visible_to_next_hook() {
 
     // Hook B should have seen "high" (from hook A), not "off" (original).
     let seen = capture.captured().expect("hook B should have fired");
-    assert_eq!(seen, "high", "subsequent hook must see accumulated think_override");
+    assert_eq!(
+        seen, "high",
+        "subsequent hook must see accumulated think_override"
+    );
 }
 
 /// An LLM hook that captures the messages it receives (for asserting
@@ -849,12 +910,33 @@ async fn run_llm_hooks_chained_extra_system_visible_to_next_hook() {
     let capture = std::sync::Arc::new(CaptureMessagesLlmHook::new());
     struct ArcCaptureMsgsHook(std::sync::Arc<CaptureMessagesLlmHook>);
     impl AgentHook for ArcCaptureMsgsHook {
-        fn name(&self) -> &'static str { self.0.name() }
-        fn point(&self) -> agent::HookPoint { self.0.point() }
-        fn should_run(&self, a: &[ChatMessage], b: config::Provider, c: usize, d: usize) -> bool { self.0.should_run(a, b, c, d) }
-        fn run<'a>(&'a self, i: HookInput, c: &'a Config, h: &'a reqwest::Client) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> { self.0.run(i, c, h) }
-        fn should_run_llm(&self, cycle: usize) -> bool { self.0.should_run_llm(cycle) }
-        fn run_llm<'a>(&'a self, i: LlmHookInput, c: &'a Config) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> { self.0.run_llm(i, c) }
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+        fn point(&self) -> agent::HookPoint {
+            self.0.point()
+        }
+        fn should_run(&self, a: &[ChatMessage], b: config::Provider, c: usize, d: usize) -> bool {
+            self.0.should_run(a, b, c, d)
+        }
+        fn run<'a>(
+            &'a self,
+            i: HookInput,
+            c: &'a Config,
+            h: &'a reqwest::Client,
+        ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+            self.0.run(i, c, h)
+        }
+        fn should_run_llm(&self, cycle: usize) -> bool {
+            self.0.should_run_llm(cycle)
+        }
+        fn run_llm<'a>(
+            &'a self,
+            i: LlmHookInput,
+            c: &'a Config,
+        ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+            self.0.run_llm(i, c)
+        }
     }
     registry.register(Box::new(ArcCaptureMsgsHook(capture.clone())));
 
@@ -899,8 +981,8 @@ async fn run_llm_hooks_chained_extra_system_visible_to_next_hook() {
 async fn prune_messages_trims_local_snapshot_to_fit_budget() {
     // Simulate the runtime re-prune path: after a hook injects extra_system,
     // the estimate may exceed the budget, so we re-prune a local Vec.
-    use crate::context::{estimate_tokens_for_provider, prune_messages_for_provider};
     use crate::config::Provider;
+    use crate::context::{estimate_tokens_for_provider, prune_messages_for_provider};
 
     let mut messages = vec![
         ChatMessage {
@@ -955,7 +1037,10 @@ async fn prune_messages_trims_local_snapshot_to_fit_budget() {
     );
     // System message must always survive.
     assert_eq!(messages[0].role, "system");
-    assert!(messages.len() >= 2, "at least system + one message must survive");
+    assert!(
+        messages.len() >= 2,
+        "at least system + one message must survive"
+    );
 }
 
 // ── Tests: run_command_hooks ─────────────────────────────────────────────────
@@ -1183,14 +1268,31 @@ async fn run_command_hooks_fires_for_unknown_command_result_type() {
     // hooks with result_type="unknown_command".
     struct AllCommandAuditHook;
     impl AgentHook for AllCommandAuditHook {
-        fn name(&self) -> &'static str { "all_command_audit" }
-        fn point(&self) -> agent::HookPoint { agent::HookPoint::OnCommand }
-        fn should_run(&self, _: &[ChatMessage], _: config::Provider, _: usize, _: usize) -> bool { false }
-        fn run<'a>(&'a self, _: HookInput, _: &'a Config, _: &'a reqwest::Client) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        fn name(&self) -> &'static str {
+            "all_command_audit"
+        }
+        fn point(&self) -> agent::HookPoint {
+            agent::HookPoint::OnCommand
+        }
+        fn should_run(&self, _: &[ChatMessage], _: config::Provider, _: usize, _: usize) -> bool {
+            false
+        }
+        fn run<'a>(
+            &'a self,
+            _: HookInput,
+            _: &'a Config,
+            _: &'a reqwest::Client,
+        ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
             Box::pin(async { HookOutput::NoOp })
         }
-        fn should_run_command(&self, _command: &str) -> bool { true }
-        fn run_command<'a>(&'a self, input: CommandHookInput, _config: &'a Config) -> Pin<Box<dyn Future<Output = Vec<serde_json::Value>> + Send + 'a>> {
+        fn should_run_command(&self, _command: &str) -> bool {
+            true
+        }
+        fn run_command<'a>(
+            &'a self,
+            input: CommandHookInput,
+            _config: &'a Config,
+        ) -> Pin<Box<dyn Future<Output = Vec<serde_json::Value>> + Send + 'a>> {
             Box::pin(async move {
                 vec![serde_json::json!({
                     "type": "audit",
@@ -1283,12 +1385,33 @@ async fn run_tool_hooks_before_chaining_second_hook_sees_modified_args() {
     let capture = std::sync::Arc::new(CaptureArgsBeforeHook::new());
     struct ArcCaptureBefore(std::sync::Arc<CaptureArgsBeforeHook>);
     impl AgentHook for ArcCaptureBefore {
-        fn name(&self) -> &'static str { self.0.name() }
-        fn point(&self) -> agent::HookPoint { self.0.point() }
-        fn should_run(&self, a: &[ChatMessage], b: config::Provider, c: usize, d: usize) -> bool { self.0.should_run(a, b, c, d) }
-        fn run<'a>(&'a self, i: HookInput, c: &'a Config, h: &'a reqwest::Client) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> { self.0.run(i, c, h) }
-        fn should_run_tool(&self, n: &str, p: agent::HookPoint) -> bool { self.0.should_run_tool(n, p) }
-        fn run_tool<'a>(&'a self, i: ToolHookInput, c: &'a Config) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> { self.0.run_tool(i, c) }
+        fn name(&self) -> &'static str {
+            self.0.name()
+        }
+        fn point(&self) -> agent::HookPoint {
+            self.0.point()
+        }
+        fn should_run(&self, a: &[ChatMessage], b: config::Provider, c: usize, d: usize) -> bool {
+            self.0.should_run(a, b, c, d)
+        }
+        fn run<'a>(
+            &'a self,
+            i: HookInput,
+            c: &'a Config,
+            h: &'a reqwest::Client,
+        ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+            self.0.run(i, c, h)
+        }
+        fn should_run_tool(&self, n: &str, p: agent::HookPoint) -> bool {
+            self.0.should_run_tool(n, p)
+        }
+        fn run_tool<'a>(
+            &'a self,
+            i: ToolHookInput,
+            c: &'a Config,
+        ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+            self.0.run_tool(i, c)
+        }
     }
     registry.register(Box::new(ArcCaptureBefore(capture.clone())));
 
@@ -1308,7 +1431,10 @@ async fn run_tool_hooks_before_chaining_second_hook_sees_modified_args() {
 
     // Hook B should have seen hook A's modification.
     let seen = capture.captured().expect("hook B should have fired");
-    assert_eq!(seen["injected"], true, "hook B must see hook A's modification");
+    assert_eq!(
+        seen["injected"], true,
+        "hook B must see hook A's modification"
+    );
     assert_eq!(seen["key"], "val");
 }
 

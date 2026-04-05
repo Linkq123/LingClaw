@@ -1142,6 +1142,7 @@ Commands:
     /skills-system   List system skills with status (install/uninstall subcommands)
     /skills-global   List global skills (~/.lingclaw/skills/)
     /skills-session  List session-local skills
+    /agents          List discovered sub-agents
     /clear           Clear messages (keep system prompt)
     /memory [stats|debug] Show structured memory status or updater diagnostics
     /help            Show this help"
@@ -1210,6 +1211,66 @@ async fn handle_memory_command(
     command_result(response, "system", false)
 }
 
+async fn handle_agents_command(current_session_id: &str, state: &AppState) -> CommandResult {
+    let config = &state.config;
+    let workspace = {
+        let sessions = state.sessions.lock().await;
+        match sessions.get(current_session_id) {
+            Some(s) => s.workspace.clone(),
+            None => return command_result("Session not found", "error", false),
+        }
+    };
+
+    let agents = crate::subagents::discovery::discover_all_agents(&workspace);
+    if agents.is_empty() {
+        return command_result(
+            "No sub-agents found.\n\n\
+             Place AGENT.md files in:\n\
+             - `docs/reference/agents/<name>/AGENT.md` (system)\n\
+             - `~/.lingclaw/agents/<name>/AGENT.md` (global)\n\
+             - `agents/<name>/AGENT.md` (session workspace)",
+            "system",
+            false,
+        );
+    }
+
+    let mut lines = Vec::with_capacity(agents.len() + 2);
+    lines.push(format!("**{} sub-agent(s) available:**\n", agents.len()));
+    for agent in &agents {
+        let tools = crate::subagents::filter_tools_for_agent(agent);
+        let tool_list = if tools.is_empty() {
+            "(no tools)".to_string()
+        } else {
+            tools.join(", ")
+        };
+        let model_info = match agent.model.as_deref() {
+            Some(m) => m.to_string(),
+            None => {
+                let effective = config
+                    .sub_agent_model
+                    .as_deref()
+                    .unwrap_or(&config.model);
+                format!("(inherit: {effective})")
+            }
+        };
+        lines.push(format!(
+            "- **{}** [`{}`] — {}\n  model: {} | max_turns: {} | tools: {}",
+            agent.name,
+            agent.source.label(),
+            if agent.description.is_empty() {
+                "(no description)"
+            } else {
+                &agent.description
+            },
+            model_info,
+            agent.max_turns,
+            tool_list,
+        ));
+    }
+
+    command_result(lines.join("\n"), "system", false)
+}
+
 pub(crate) async fn handle_command(
     input: &str,
     current_session_id: &str,
@@ -1261,6 +1322,7 @@ pub(crate) async fn handle_command(
         "/sessions" => Some(handle_sessions_command(current_session_id, state).await),
         "/delete" => Some(handle_delete_command(arg, current_session_id, state).await),
         "/memory" => Some(handle_memory_command(arg, current_session_id, state).await),
+        "/agents" => Some(handle_agents_command(current_session_id, state).await),
 
         // /stop when not busy — the in-flight case is handled by the agent loop drain
         "/stop" => Some(command_result("No active run to stop.", "system", false)),
