@@ -135,6 +135,9 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
         crate::Provider::OpenAI => {
             tools::mcp::cached_tool_definitions_openai(&state.config, &session.workspace)
         }
+        crate::Provider::Ollama => {
+            tools::mcp::cached_tool_definitions_ollama(&state.config, &session.workspace)
+        }
     };
     extra_tools.append(&mut cached_mcp_tools);
     let (cached_mcp_servers, enabled_mcp_servers) =

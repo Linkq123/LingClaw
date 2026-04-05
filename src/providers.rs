@@ -4,9 +4,9 @@ use std::{
 };
 
 use futures::{Stream, StreamExt};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::{ChatMessage, FunctionCall, LiveTx, Provider, ToolCall, live_send, tools};
 
@@ -20,7 +20,7 @@ pub(crate) struct ResolvedModel {
     pub(crate) api_key: String,
     pub(crate) model_id: String,
     pub(crate) reasoning: bool,
-    /// From model config `compat.thinkingFormat`: "qwen", "openai", "anthropic", etc.
+    /// From model config `compat.thinkingFormat`: "qwen", "openai", "anthropic", "ollama", etc.
     pub(crate) thinking_format: Option<String>,
     /// From model config `maxTokens`.
     pub(crate) max_tokens: Option<u64>,
@@ -53,6 +53,33 @@ struct AnthropicStreamState {
     client_gone: bool,
     reasoning_started: bool,
     thinking_block_idx: Option<usize>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OllamaStreamChunk {
+    message: Option<OllamaMessage>,
+    done: Option<bool>,
+    prompt_eval_count: Option<u64>,
+    eval_count: Option<u64>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OllamaMessage {
+    content: Option<String>,
+    thinking: Option<String>,
+    tool_calls: Option<Vec<OllamaToolCall>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OllamaToolCall {
+    id: Option<String>,
+    function: Option<OllamaFunction>,
+}
+
+#[derive(Deserialize, Debug)]
+struct OllamaFunction {
+    name: Option<String>,
+    arguments: Option<Value>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -250,6 +277,64 @@ fn convert_messages_to_anthropic(messages: &[ChatMessage]) -> (String, Vec<serde
     (system, out)
 }
 
+fn convert_messages_to_ollama(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+
+    for msg in messages {
+        match msg.role.as_str() {
+            "system" | "user" => {
+                out.push(json!({
+                    "role": msg.role,
+                    "content": msg.content.as_deref().unwrap_or(""),
+                }));
+            }
+            "assistant" => {
+                let mut item = json!({
+                    "role": "assistant",
+                    "content": msg.content.as_deref().unwrap_or(""),
+                });
+                if let Some(tool_calls) = &msg.tool_calls {
+                    let calls = tool_calls
+                        .iter()
+                        .map(|tool_call| {
+                            let arguments =
+                                serde_json::from_str::<Value>(&tool_call.function.arguments)
+                                    .unwrap_or_else(|_| json!(tool_call.function.arguments));
+                            json!({
+                                "id": tool_call.id,
+                                "function": {
+                                    "name": tool_call.function.name,
+                                    "arguments": arguments,
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    item["tool_calls"] = json!(calls);
+                }
+                out.push(item);
+            }
+            "tool" => {
+                out.push(json!({
+                    "role": "tool",
+                    "content": msg.content.as_deref().unwrap_or(""),
+                    "tool_call_id": msg.tool_call_id.as_deref().unwrap_or(""),
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
+fn with_optional_bearer_auth(request: RequestBuilder, api_key: &str) -> RequestBuilder {
+    if api_key.is_empty() {
+        request
+    } else {
+        request.bearer_auth(api_key)
+    }
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  LLM Streaming Client
 // ══════════════════════════════════════════════════════════════════════════════
@@ -324,6 +409,33 @@ pub(crate) async fn call_llm_simple(
                 .to_string();
             Ok(content)
         }
+        Provider::Ollama => {
+            let url = format!("{}/api/chat", resolved.api_base);
+            let api_messages = convert_messages_to_ollama(messages);
+            let mut body = json!({
+                "model": resolved.model_id,
+                "messages": api_messages,
+                "stream": false,
+            });
+            if let Some(mt) = resolved.max_tokens {
+                body["options"] = json!({"num_predict": mt});
+            }
+            let resp = with_optional_bearer_auth(http.post(&url), &resolved.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("HTTP error: {e}"))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(format!("API {status}: {text}"));
+            }
+            let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            Ok(data["message"]["content"]
+                .as_str()
+                .unwrap_or("")
+                .to_string())
+        }
     }
 }
 
@@ -346,6 +458,15 @@ fn think_level_to_budget(level: &str) -> u64 {
         "high" => 16384,
         "xhigh" => 32768,
         _ => 10240,
+    }
+}
+
+fn think_level_to_ollama(level: &str) -> serde_json::Value {
+    match level {
+        "minimal" | "low" => json!("low"),
+        "medium" => json!("medium"),
+        "high" | "xhigh" => json!("high"),
+        _ => json!(true),
     }
 }
 
@@ -400,6 +521,9 @@ pub(crate) async fn call_llm_stream(
         Provider::Anthropic => {
             call_llm_stream_anthropic(http, resolved, messages, tx, effective_level, extra_tools)
                 .await
+        }
+        Provider::Ollama => {
+            call_llm_stream_ollama(http, resolved, messages, tx, effective_level, extra_tools).await
         }
     }
 }
@@ -604,6 +728,84 @@ async fn process_anthropic_sse_line(line: &str, tx: &LiveTx, state: &mut Anthrop
     }
 }
 
+async fn process_ollama_json_line(data: &str, tx: &LiveTx, state: &mut OpenAiStreamState) -> bool {
+    let Ok(chunk) = serde_json::from_str::<OllamaStreamChunk>(data) else {
+        return false;
+    };
+
+    if let Some(value) = chunk.prompt_eval_count {
+        state.input_tokens = Some(value);
+    }
+    if let Some(value) = chunk.eval_count {
+        state.output_tokens = Some(value);
+    }
+
+    let message = chunk.message.as_ref();
+    if let Some(thinking) = message.and_then(|msg| msg.thinking.as_deref())
+        && !thinking.is_empty()
+        && !state.client_gone
+    {
+        if !state.reasoning_started {
+            state.reasoning_started = true;
+            state.client_gone = !live_send(tx, json!({"type":"thinking_start"})).await;
+        }
+        if !state.client_gone {
+            state.client_gone =
+                !live_send(tx, json!({"type":"thinking_delta","content":thinking})).await;
+        }
+    }
+
+    let has_tool_calls = message
+        .and_then(|msg| msg.tool_calls.as_ref())
+        .is_some_and(|calls| !calls.is_empty());
+    let has_content = message
+        .and_then(|msg| msg.content.as_deref())
+        .is_some_and(|content| !content.is_empty());
+
+    if (has_content || has_tool_calls) && state.reasoning_started && !state.client_gone {
+        state.reasoning_started = false;
+        state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+    }
+
+    if let Some(text) = message.and_then(|msg| msg.content.as_deref())
+        && !text.is_empty()
+    {
+        state.content_buf.push_str(text);
+        if !state.client_gone && !live_send(tx, json!({"type":"delta","content":text})).await {
+            state.client_gone = true;
+        }
+    }
+
+    if let Some(tool_calls) = message.and_then(|msg| msg.tool_calls.as_ref()) {
+        for (idx, tool_call) in tool_calls.iter().enumerate() {
+            while state.tool_calls.len() <= idx {
+                state.tool_calls.push(ToolCall {
+                    id: format!("ollama_call_{}", idx + 1),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: String::new(),
+                        arguments: "{}".into(),
+                    },
+                });
+            }
+            if let Some(id) = &tool_call.id {
+                state.tool_calls[idx].id.clone_from(id);
+            }
+            if let Some(function) = &tool_call.function {
+                if let Some(name) = &function.name {
+                    state.tool_calls[idx].function.name.clone_from(name);
+                }
+                if let Some(arguments) = &function.arguments {
+                    state.tool_calls[idx].function.arguments =
+                        serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string());
+                }
+            }
+        }
+    }
+
+    chunk.done.unwrap_or(false)
+}
+
 fn drain_sse_lines(partial_buf: &mut String, chunk: &str) -> Vec<String> {
     partial_buf.push_str(chunk);
     let mut lines: Vec<String> = partial_buf
@@ -649,6 +851,31 @@ fn build_openai_stream_body(
     }
     if let Some(max_tokens) = resolved.max_tokens {
         body["max_tokens"] = json!(max_tokens);
+    }
+    body
+}
+
+fn build_ollama_stream_body(
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+    think_level: &str,
+    extra_tools: &[serde_json::Value],
+) -> serde_json::Value {
+    let api_messages = convert_messages_to_ollama(messages);
+    let mut all_tools: Vec<serde_json::Value> =
+        serde_json::from_value(tools::tool_definitions_ollama()).unwrap_or_default();
+    all_tools.extend_from_slice(extra_tools);
+    let mut body = json!({
+        "model": resolved.model_id,
+        "messages": api_messages,
+        "tools": all_tools,
+        "stream": true,
+    });
+    if think_level != "off" {
+        body["think"] = think_level_to_ollama(think_level);
+    }
+    if let Some(max_tokens) = resolved.max_tokens {
+        body["options"] = json!({"num_predict": max_tokens});
     }
     body
 }
@@ -757,6 +984,45 @@ where
 
     if !partial_buf.trim().is_empty() {
         process_anthropic_sse_line(partial_buf.trim(), tx, state).await;
+    }
+
+    Ok(())
+}
+
+async fn consume_ollama_stream<S, B>(
+    stream: &mut S,
+    tx: &LiveTx,
+    state: &mut OpenAiStreamState,
+) -> Result<(), String>
+where
+    S: Stream<Item = Result<B, reqwest::Error>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    let mut partial_buf = String::new();
+    let mut stream_done = false;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("stream error: {error}"))?;
+        let lines = drain_sse_lines(&mut partial_buf, &String::from_utf8_lossy(chunk.as_ref()));
+
+        for line in lines {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if process_ollama_json_line(line, tx, state).await {
+                stream_done = true;
+                break;
+            }
+        }
+
+        if stream_done {
+            break;
+        }
+    }
+
+    if !stream_done && !partial_buf.trim().is_empty() {
+        let _ = process_ollama_json_line(partial_buf.trim(), tx, state).await;
     }
 
     Ok(())
@@ -891,6 +1157,48 @@ async fn call_llm_stream_anthropic(
         thinking_block_idx: None,
     };
     consume_anthropic_stream(&mut stream, tx, &mut stream_state).await?;
+
+    if stream_state.reasoning_started && !stream_state.client_gone {
+        stream_state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+    }
+    if stream_state.client_gone {
+        return Err("Client disconnected".into());
+    }
+
+    build_llm_response(
+        stream_state.content_buf,
+        stream_state.tool_calls,
+        stream_state.input_tokens,
+        stream_state.output_tokens,
+    )
+}
+
+async fn call_llm_stream_ollama(
+    http: &Client,
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+    tx: &LiveTx,
+    think_level: &str,
+    extra_tools: &[serde_json::Value],
+) -> Result<LlmResponse, String> {
+    let url = format!("{}/api/chat", resolved.api_base);
+    let body = build_ollama_stream_body(resolved, messages, think_level, extra_tools);
+
+    let resp = send_with_retry(http, || {
+        with_optional_bearer_auth(http.post(&url), &resolved.api_key).json(&body)
+    })
+    .await?;
+
+    let mut stream = resp.bytes_stream();
+    let mut stream_state = OpenAiStreamState {
+        content_buf: String::new(),
+        tool_calls: Vec::new(),
+        input_tokens: None,
+        output_tokens: None,
+        client_gone: false,
+        reasoning_started: false,
+    };
+    consume_ollama_stream(&mut stream, tx, &mut stream_state).await?;
 
     if stream_state.reasoning_started && !stream_state.client_gone {
         stream_state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;

@@ -384,7 +384,7 @@ fn build_filtered_tool_defs(
         .iter()
         .filter(|ts| allowed_tools.iter().any(|a| a == ts.name))
         .map(|spec| match provider {
-            crate::config::Provider::OpenAI => {
+            crate::config::Provider::OpenAI | crate::config::Provider::Ollama => {
                 json!({
                     "type": "function",
                     "function": {

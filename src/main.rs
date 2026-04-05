@@ -1425,13 +1425,13 @@ async fn main() {
     let config = Config::load();
     let port = port_override.unwrap_or(config.port);
 
-    if config.api_key.is_empty() && config.providers.is_empty() {
+    if config.api_key.is_empty()
+        && config.providers.is_empty()
+        && config.provider.api_key_env_var().is_some()
+    {
         eprintln!(
             "WARNING: {} is not set and no config file providers found. LLM calls will fail.",
-            match config.provider {
-                Provider::Anthropic => "ANTHROPIC_API_KEY",
-                Provider::OpenAI => "OPENAI_API_KEY",
-            }
+            config.provider.api_key_env_var().unwrap_or("API key")
         );
     }
 

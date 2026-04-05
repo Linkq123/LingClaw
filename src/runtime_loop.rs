@@ -432,6 +432,7 @@ pub(crate) async fn build_runtime_tools(
         let task_def = match provider {
             Provider::Anthropic => tools::task_tool_definition_anthropic(&agent_names),
             Provider::OpenAI => tools::task_tool_definition_openai(&agent_names),
+            Provider::Ollama => tools::task_tool_definition_ollama(&agent_names),
         };
         extra_tools.push(task_def);
     }
@@ -439,6 +440,7 @@ pub(crate) async fn build_runtime_tools(
     let mut mcp_tools = match provider {
         Provider::Anthropic => tools::mcp::tool_definitions_anthropic(config, workspace).await,
         Provider::OpenAI => tools::mcp::tool_definitions_openai(config, workspace).await,
+        Provider::Ollama => tools::mcp::tool_definitions_ollama(config, workspace).await,
     };
     extra_tools.append(&mut mcp_tools);
     extra_tools

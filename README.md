@@ -19,7 +19,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **单主会话**：运行时固定使用 `main`，不再创建、切换或删除其他会话
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、coder）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤
 - **文档化斜杠命令**：`/new`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/mcp`、`/usage`、`/clear`、`/memory`、`/help`
-- **双 Provider 模型路由**：OpenAI + Anthropic，支持 `provider/model` 和纯 model ID
+- **三 Provider 模型路由**：OpenAI + Anthropic + Ollama，支持 `provider/model` 和纯 model ID
 - **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
 - **持久化主会话**：固定保存 `main` 工作区和磁盘存档
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
@@ -77,6 +77,9 @@ OPENAI_API_KEY=sk-xxx lingclaw
 
 # Anthropic
 ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
+
+# Ollama
+LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=llama3.2 OLLAMA_API_BASE=http://127.0.0.1:11434 lingclaw
 ```
 
 ## Configuration
@@ -127,6 +130,23 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
             "maxTokens": 8192
           }
         ]
+      },
+      "ollama": {
+        "baseUrl": "http://127.0.0.1:11434",
+        "apiKey": "",
+        "api": "ollama",
+        "models": [
+          {
+            "id": "llama3.2",
+            "name": "llama3.2",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 128000,
+            "maxTokens": 8192,
+            "compat": { "thinkingFormat": "ollama" }
+          }
+        ]
       }
     }
   },
@@ -148,6 +168,7 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 - 多个 provider 暴露同一 model ID 时，必须使用显式前缀
 - `structuredMemory` 默认为 `false`；启用后会在 Finish 阶段后台更新结构化记忆，并在后续 system prompt 中注入摘要
 - 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容
+- `models.providers.*.api` 目前支持 `openai-completions`、`anthropic`、`ollama`
 - 可选的 `mcpServers` 顶层对象可声明 MCP server，例如 `command`、`args`、`env`、`cwd`、`timeoutSecs`
 - `mcpServers.*.cwd` 必须落在当前 session workspace 内；未设置 `timeoutSecs` 时默认继承 `toolTimeout`
 - `start` / `restart` 的 MCP 预检使用受限的一次性探测，不会把预检进程保留为运行时 MCP 会话；`mcp-check` 会按配置的运行时超时做更深诊断
@@ -179,8 +200,10 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 |---|---|---|
 | `OPENAI_API_KEY` | provider 配置或空 | OpenAI API Key |
 | `ANTHROPIC_API_KEY` | provider 配置或 `OPENAI_API_KEY` | Anthropic API Key |
-| `LINGCLAW_PROVIDER` | 自动检测 | 强制指定 `openai` 或 `anthropic` |
+| `OLLAMA_API_KEY` | provider 配置或空 | Ollama API Key，可留空用于本地实例 |
+| `LINGCLAW_PROVIDER` | 自动检测 | 强制指定 `openai`、`anthropic` 或 `ollama` |
 | `OPENAI_API_BASE` | `https://api.openai.com/v1` | 备用 API Base |
+| `OLLAMA_API_BASE` | `http://127.0.0.1:11434` | Ollama API Base |
 | `LINGCLAW_MODEL` | `gpt-4o-mini` | 默认模型 |
 | `LINGCLAW_PORT` | `18989` | HTTP 端口 |
 | `LINGCLAW_EXEC_TIMEOUT` | `30` | Shell 命令超时（秒） |
@@ -383,9 +406,9 @@ tools:
     │         │
 ┌───▼─────────▼────────────────────────────────────────────────────┐
 │                      Provider Layer                               │
-│   call_llm_stream() → OpenAI SSE / Anthropic SSE                 │
+│   call_llm_stream() → OpenAI SSE / Anthropic SSE / Ollama NDJSON │
 │   ResolvedModel · thinking/reasoning 参数映射                      │
-│   tool_definitions() · tool_definitions_anthropic()               │
+│   tool_definitions() · tool_definitions_anthropic() · tool_definitions_ollama() │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -429,7 +452,7 @@ Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的
 
 **关键设计决策：**
 
-- **不回退到文本协议**：保留 OpenAI/Anthropic 原生结构化 tool calling，不使用文本版 `Action: tool_name\nAction Input: {...}` 解析
+- **不回退到文本协议**：保留 OpenAI/Anthropic/Ollama 原生结构化 tool calling，不使用文本版 `Action: tool_name\nAction Input: {...}` 解析
 - **不污染对话历史**：完整思维链仅在 `think` 工具内部或 provider reasoning stream 中存在，不写入主消息序列
 - **推理可见性已实现**：默认启用 `react_phase` WS 事件，前端会显示阶段切换；可通过 `/react off` 关闭；`done` 事件始终包含结构化 `reason` 字段
 - **provider 层感知状态**：`auto` 模式下 `auto_think_level()` 根据循环深度动态调整推理预算（首轮 medium / 有 observation 时 high / 深轮 low）
@@ -491,7 +514,7 @@ src/
 ├── cli.rs             (~2020 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
 ├── config.rs          (~550 行)  — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
 ├── context.rs         (~210 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
-├── providers.rs       (~860 行)  — OpenAI/Anthropic 流式调用, 推理模式, prompt caching
+├── providers.rs       (~1200 行) — OpenAI/Anthropic/Ollama 调用, 流式解析, 推理模式, prompt caching
 ├── prompts.rs         (~660 行)  — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
 ├── hooks.rs           (~340 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
 ├── memory.rs          (~460 行)  — structured_memory.json 读写, MemoryUpdateQueue, prompt 注入, /memory 状态
@@ -525,7 +548,7 @@ src/tests/                      — 模块测试文件 (~5470 行)
 ### 核心数据结构
 
 ```rust
-enum Provider { OpenAI, Anthropic }
+enum Provider { OpenAI, Anthropic, Ollama }
 
 struct Config {
     api_key, api_base, model, provider,
@@ -558,7 +581,7 @@ struct ChatMessage {
 struct ResolvedModel {
     provider, api_base, api_key, model_id,
     reasoning: bool,
-    thinking_format: Option<String>,  // "qwen"|"openai"|"anthropic"
+  thinking_format: Option<String>,  // "qwen"|"openai"|"anthropic"|"ollama"
     max_tokens: Option<u64>,
 }
 
@@ -579,7 +602,7 @@ enum AgentPhase {
 
 ### Provider 层
 
-双 Provider 支持，统一的调用接口：
+三 Provider 支持，统一的调用接口：
 
 ```text
 call_llm_stream(http, resolved, messages, tx, think_level, extra_tools)
@@ -591,25 +614,32 @@ call_llm_stream(http, resolved, messages, tx, think_level, extra_tools)
     │         ├─ think_level → reasoning_effort 映射
     │         └─ SSE 流解析 → WebSocket 转发
     │
-    └─ resolved.provider == Anthropic
-         └─ call_llm_stream_anthropic()
-              ├─ convert_messages_to_anthropic()
-              ├─ tool_definitions_anthropic()
-              ├─ think_level → budget_tokens 映射
-              └─ SSE 流解析 → WebSocket 转发
+        ├─ resolved.provider == Anthropic
+        │    └─ call_llm_stream_anthropic()
+        │         ├─ convert_messages_to_anthropic()
+        │         ├─ tool_definitions_anthropic()
+        │         ├─ think_level → budget_tokens 映射
+        │         └─ SSE 流解析 → WebSocket 转发
+        │
+        └─ resolved.provider == Ollama
+          └─ call_llm_stream_ollama()
+            ├─ convert_messages_to_ollama()
+            ├─ tool_definitions_ollama()
+            ├─ think_level → think 映射
+            └─ NDJSON 流解析 → WebSocket 转发
 ```
 
 think_level 映射：
 
-| level | OpenAI reasoning_effort | Anthropic budget_tokens |
-|---|---|---|
-| off | — | — |
-| minimal | low | 1024 |
-| low | low | 4096 |
-| medium | medium | 10240 |
-| high | high | 16384 |
-| xhigh | high | 32768 |
-| auto | model 支持 reasoning? medium : off | 同左 |
+| level | OpenAI reasoning_effort | Anthropic budget_tokens | Ollama think |
+|---|---|---|---|
+| off | — | — | — |
+| minimal | low | 1024 | low |
+| low | low | 4096 | low |
+| medium | medium | 10240 | medium |
+| high | high | 16384 | high |
+| xhigh | high | 32768 | high |
+| auto | model 支持 reasoning? medium : off | 同左 | model 支持 reasoning? true : off |
 
 ### 安全架构
 

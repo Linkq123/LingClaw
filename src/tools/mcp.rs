@@ -120,6 +120,14 @@ pub(crate) fn cached_tool_definitions_openai(config: &Config, workspace: &Path) 
         .collect()
 }
 
+pub(crate) async fn tool_definitions_ollama(config: &Config, workspace: &Path) -> Vec<Value> {
+    tool_definitions_openai(config, workspace).await
+}
+
+pub(crate) fn cached_tool_definitions_ollama(config: &Config, workspace: &Path) -> Vec<Value> {
+    cached_tool_definitions_openai(config, workspace)
+}
+
 pub(crate) async fn tool_definitions_anthropic(config: &Config, workspace: &Path) -> Vec<Value> {
     list_tools(config, workspace)
         .await

@@ -438,6 +438,10 @@ pub(crate) fn tool_definitions_openai() -> serde_json::Value {
     json!(tools)
 }
 
+pub(crate) fn tool_definitions_ollama() -> serde_json::Value {
+    tool_definitions_openai()
+}
+
 pub(crate) fn tool_definitions_anthropic() -> serde_json::Value {
     let tools = tool_specs()
         .iter()
@@ -450,6 +454,10 @@ pub(crate) fn tool_definitions_anthropic() -> serde_json::Value {
         })
         .collect::<Vec<_>>();
     json!(tools)
+}
+
+pub(crate) fn task_tool_definition_ollama(agent_names: &[String]) -> serde_json::Value {
+    task_tool_definition_openai(agent_names)
 }
 
 /// Returns true if the named tool performs no side effects (no writes, no exec).

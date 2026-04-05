@@ -363,6 +363,65 @@ fn provider_detect_accepts_provider_prefixed_model_refs() {
         Provider::detect("openai/gpt-4o-mini", "https://api.anthropic.com", None),
         Provider::OpenAI
     );
+    assert_eq!(
+        Provider::detect("ollama/llama3.2", "https://api.openai.com/v1", None),
+        Provider::Ollama
+    );
+    assert_eq!(
+        Provider::detect("llama3.2", "http://127.0.0.1:11434", None),
+        Provider::Ollama
+    );
+}
+
+#[test]
+fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "ollama".to_string(),
+        JsonProviderConfig {
+            base_url: "http://127.0.0.1:11434".to_string(),
+            api_key: String::new(),
+            api: "ollama".to_string(),
+            models: vec![JsonModelEntry {
+                id: "llama3.2".to_string(),
+                name: None,
+                reasoning: Some(true),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(8192),
+                compat: Some(json!({"thinkingFormat": "ollama"})),
+            }],
+        },
+    );
+
+    let config = Config {
+        api_key: String::new(),
+        api_base: "https://api.openai.com/v1".to_string(),
+        model: "llama3.2".to_string(),
+        fast_model: None,
+        sub_agent_model: None,
+        provider: Provider::Ollama,
+        anthropic_prompt_caching: false,
+        providers,
+        mcp_servers: HashMap::new(),
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        tool_timeout: Duration::from_secs(30),
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
+        structured_memory: false,
+    };
+
+    let resolved = config.resolve_model("llama3.2");
+
+    assert_eq!(resolved.provider, Provider::Ollama);
+    assert_eq!(resolved.api_base, "http://127.0.0.1:11434");
+    assert_eq!(resolved.model_id, "llama3.2");
+    assert_eq!(resolved.max_tokens, Some(8192));
+    assert_eq!(resolved.thinking_format.as_deref(), Some("ollama"));
 }
 
 #[test]
@@ -916,6 +975,35 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
     assert_eq!(resolved.provider, Provider::Anthropic);
     assert_eq!(resolved.api_base, "https://api.anthropic.com");
     assert_eq!(resolved.model_id, "claude-sonnet-4-20250514");
+}
+
+#[test]
+fn resolve_model_accepts_ollama_prefix_without_provider_config() {
+    let config = Config {
+        api_key: String::new(),
+        api_base: "https://api.openai.com/v1".to_string(),
+        model: "llama3.2".to_string(),
+        fast_model: None,
+        sub_agent_model: None,
+        provider: Provider::Ollama,
+        anthropic_prompt_caching: false,
+        providers: HashMap::new(),
+        mcp_servers: HashMap::new(),
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        tool_timeout: Duration::from_secs(30),
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
+        structured_memory: false,
+    };
+
+    let resolved = config.resolve_model("ollama/llama3.2");
+
+    assert_eq!(resolved.provider, Provider::Ollama);
+    assert_eq!(resolved.api_base, "http://127.0.0.1:11434");
+    assert_eq!(resolved.model_id, "llama3.2");
 }
 
 #[test]

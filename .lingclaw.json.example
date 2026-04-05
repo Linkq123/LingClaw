@@ -49,6 +49,23 @@
             "maxTokens": 8192
           }
         ]
+      },
+      "ollama": {
+        "baseUrl": "http://127.0.0.1:11434",
+        "apiKey": "",
+        "api": "ollama",
+        "models": [
+          {
+            "id": "llama3.2",
+            "name": "llama3.2",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 128000,
+            "maxTokens": 8192,
+            "compat": { "thinkingFormat": "ollama" }
+          }
+        ]
       }
     }
   },

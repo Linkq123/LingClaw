@@ -1972,7 +1972,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     // ── Step 2: Model/Auth Provider ──────────────────────────────────────
     println!("2. Model/auth provider");
     println!();
-    let provider_choice = prompt_choice(&["OpenAI", "Anthropic", "Skip for now"]);
+    let provider_choice = prompt_choice(&["OpenAI", "Anthropic", "Ollama", "Skip for now"]);
 
     let mut providers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     let mut default_model: Option<String> = None;
@@ -2019,6 +2019,27 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
                 }),
             );
             default_model = Some("anthropic/claude-sonnet-4-20250514".to_string());
+        }
+        2 => {
+            // Ollama
+            println!();
+            let base_url = prompt_line("  Base URL [http://127.0.0.1:11434]: ");
+            let base_url = if base_url.is_empty() {
+                "http://127.0.0.1:11434".to_string()
+            } else {
+                base_url
+            };
+            let api_key = prompt_line("  API Key (optional, leave empty for local Ollama): ");
+            providers.insert(
+                "ollama".to_string(),
+                json!({
+                    "baseUrl": base_url,
+                    "apiKey": api_key,
+                    "api": "ollama",
+                    "models": []
+                }),
+            );
+            default_model = Some("ollama/llama3.2".to_string());
         }
         _ => {
             // Skip
@@ -2127,6 +2148,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     let fast_model: Option<String> = match provider_choice {
         0 => Some("openai/gpt-4o-mini".to_string()),
         1 => Some("anthropic/claude-haiku-3-20250306".to_string()),
+        2 => default_model.clone(),
         _ => None,
     };
     // Sub-agent model defaults to the same as fast model (cheaper for delegated tasks).

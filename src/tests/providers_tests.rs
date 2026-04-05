@@ -1,4 +1,113 @@
 use super::*;
+use std::{
+    io::{Read, Write},
+    net::{TcpListener, TcpStream},
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
+
+struct CapturedHttpRequest {
+    request_line: String,
+    headers: std::collections::HashMap<String, String>,
+    body: String,
+}
+
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn parse_content_length(header_text: &str) -> usize {
+    header_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
+fn read_http_request(stream: &mut TcpStream) -> CapturedHttpRequest {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout should be set");
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+
+    loop {
+        let read = stream.read(&mut chunk).expect("request should be readable");
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+
+        if let Some(headers_end) = find_headers_end(&buffer) {
+            let header_text = String::from_utf8_lossy(&buffer[..headers_end + 4]);
+            let content_length = parse_content_length(&header_text);
+            let total_len = headers_end + 4 + content_length;
+            if buffer.len() >= total_len {
+                break;
+            }
+        }
+    }
+
+    let headers_end = find_headers_end(&buffer).expect("request should contain headers");
+    let header_text = String::from_utf8_lossy(&buffer[..headers_end]).to_string();
+    let mut lines = header_text.lines();
+    let request_line = lines.next().expect("request line should exist").to_string();
+    let headers = lines
+        .filter_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            Some((name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+    let body = String::from_utf8_lossy(&buffer[headers_end + 4..]).to_string();
+
+    CapturedHttpRequest {
+        request_line,
+        headers,
+        body,
+    }
+}
+
+fn spawn_one_shot_http_server(
+    response_content_type: &'static str,
+    response_body: String,
+) -> (
+    String,
+    mpsc::Receiver<CapturedHttpRequest>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose address");
+    let (request_tx, request_rx) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request should connect");
+        let request = read_http_request(&mut stream);
+        request_tx
+            .send(request)
+            .expect("captured request should be sent");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {response_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("response should be written");
+        stream.flush().expect("response should flush");
+    });
+
+    (format!("http://{}", address), request_rx, handle)
+}
 
 #[test]
 fn think_level_to_reasoning_effort_all_levels() {
@@ -189,6 +298,61 @@ fn convert_messages_to_anthropic_empty_assistant_gets_placeholder() {
 }
 
 #[test]
+fn convert_messages_to_ollama_all_roles() {
+    let messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("system prompt".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("hello".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("checking".into()),
+            tool_calls: Some(vec![ToolCall {
+                id: "tc1".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("done".into()),
+            tool_calls: None,
+            tool_call_id: Some("tc1".into()),
+            timestamp: None,
+        },
+    ];
+
+    let out = convert_messages_to_ollama(&messages);
+
+    assert_eq!(out.len(), 4);
+    assert_eq!(out[0]["role"], "system");
+    assert_eq!(out[1]["role"], "user");
+    assert_eq!(out[2]["tool_calls"][0]["id"], "tc1");
+    assert_eq!(out[2]["tool_calls"][0]["function"]["name"], "read_file");
+    assert_eq!(
+        out[2]["tool_calls"][0]["function"]["arguments"]["path"],
+        "README.md"
+    );
+    assert_eq!(out[3]["role"], "tool");
+    assert_eq!(out[3]["tool_call_id"], "tc1");
+}
+
+#[test]
 fn build_llm_response_empty_content_and_no_tools() {
     let resp = build_llm_response(String::new(), vec![], None, None).unwrap();
     assert!(resp.message.content.is_none());
@@ -323,6 +487,237 @@ fn process_anthropic_sse_line_keeps_event_type_between_lines() {
     });
 
     assert_eq!(content, "tail");
+    assert!(rx.try_recv().is_ok());
+}
+
+#[test]
+fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
+    let resolved = ResolvedModel {
+        provider: Provider::Ollama,
+        api_base: "http://127.0.0.1:11434".into(),
+        api_key: String::new(),
+        model_id: "llama3.2".into(),
+        reasoning: true,
+        thinking_format: Some("ollama".into()),
+        max_tokens: Some(256),
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hello".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let body = build_ollama_stream_body(&resolved, &messages, "high", &[]);
+
+    assert_eq!(body["model"], "llama3.2");
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["think"], "high");
+    assert_eq!(body["options"]["num_predict"], 256);
+    assert!(body["tools"].is_array());
+}
+
+#[test]
+fn with_optional_bearer_auth_skips_header_for_empty_key() {
+    let client = reqwest::Client::new();
+    let request = with_optional_bearer_auth(client.post("http://localhost/test"), "")
+        .build()
+        .expect("request should build");
+
+    assert!(
+        request
+            .headers()
+            .get(reqwest::header::AUTHORIZATION)
+            .is_none()
+    );
+}
+
+#[test]
+fn with_optional_bearer_auth_sets_header_for_non_empty_key() {
+    let client = reqwest::Client::new();
+    let request = with_optional_bearer_auth(client.post("http://localhost/test"), "secret")
+        .build()
+        .expect("request should build");
+
+    assert_eq!(
+        request.headers().get(reqwest::header::AUTHORIZATION),
+        Some(&reqwest::header::HeaderValue::from_static("Bearer secret"))
+    );
+}
+
+#[test]
+fn call_llm_simple_ollama_sends_auth_and_expected_body() {
+    let response_body = r#"{"message":{"content":"hello from ollama"}}"#.to_string();
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server("application/json", response_body);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::Ollama,
+        api_base,
+        api_key: "secret-key".into(),
+        model_id: "llama3.2".into(),
+        reasoning: true,
+        thinking_format: Some("ollama".into()),
+        max_tokens: Some(64),
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hi".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let content = runtime
+        .block_on(async { call_llm_simple(&http, &resolved, &messages).await })
+        .expect("ollama simple call should succeed");
+
+    let request = request_rx.recv().expect("captured request should exist");
+    handle.join().expect("server thread should join");
+
+    assert_eq!(content, "hello from ollama");
+    assert_eq!(request.request_line, "POST /api/chat HTTP/1.1");
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer secret-key")
+    );
+
+    let body: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid json");
+    assert_eq!(body["model"], "llama3.2");
+    assert_eq!(body["stream"], false);
+    assert_eq!(body["options"]["num_predict"], 64);
+    assert_eq!(body["messages"][0]["role"], "user");
+    assert_eq!(body["messages"][0]["content"], "hi");
+}
+
+#[test]
+fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
+    let response_body = concat!(
+        r#"{"message":{"thinking":"step 1"},"done":false}"#,
+        "\n",
+        r#"{"message":{"content":"final answer","tool_calls":[{"id":"call_1","function":{"name":"read_file","arguments":{"path":"README.md"}}}]},"prompt_eval_count":17,"eval_count":5,"done":true}"#,
+        "\n"
+    )
+    .to_string();
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server("application/x-ndjson", response_body);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::Ollama,
+        api_base,
+        api_key: "stream-key".into(),
+        model_id: "llama3.2".into(),
+        reasoning: true,
+        thinking_format: Some("ollama".into()),
+        max_tokens: Some(128),
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("inspect readme".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let live_tx: LiveTx = tx;
+
+    let response = runtime
+        .block_on(async {
+            call_llm_stream_ollama(&http, &resolved, &messages, &live_tx, "high", &[]).await
+        })
+        .expect("ollama stream call should succeed");
+
+    let request = request_rx.recv().expect("captured request should exist");
+    handle.join().expect("server thread should join");
+
+    assert_eq!(request.request_line, "POST /api/chat HTTP/1.1");
+    assert_eq!(
+        request.headers.get("authorization").map(String::as_str),
+        Some("Bearer stream-key")
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid json");
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["think"], "high");
+    assert_eq!(body["options"]["num_predict"], 128);
+
+    assert_eq!(response.message.content.as_deref(), Some("final answer"));
+    assert_eq!(response.input_tokens, Some(17));
+    assert_eq!(response.output_tokens, Some(5));
+    let tool_calls = response
+        .message
+        .tool_calls
+        .expect("stream response should keep tool calls");
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0].id, "call_1");
+    assert_eq!(tool_calls[0].function.name, "read_file");
+    assert_eq!(tool_calls[0].function.arguments, r#"{"path":"README.md"}"#);
+
+    let mut event_types = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        let event_type = event["type"]
+            .as_str()
+            .expect("event type should be present")
+            .to_string();
+        event_types.push(event_type);
+    }
+    assert!(event_types.iter().any(|event| event == "thinking_start"));
+    assert!(event_types.iter().any(|event| event == "thinking_delta"));
+    assert!(event_types.iter().any(|event| event == "thinking_done"));
+    assert!(event_types.iter().any(|event| event == "delta"));
+}
+
+#[test]
+fn process_ollama_json_line_streams_thinking_content_and_tool_calls() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let live_tx: LiveTx = tx;
+
+    let done = rt.block_on(async {
+        let mut state = OpenAiStreamState {
+            content_buf: String::new(),
+            tool_calls: Vec::new(),
+            input_tokens: None,
+            output_tokens: None,
+            client_gone: false,
+            reasoning_started: false,
+        };
+
+        let _ = process_ollama_json_line(
+            r#"{"message":{"thinking":"step 1"},"done":false}"#,
+            &live_tx,
+            &mut state,
+        )
+        .await;
+
+        let done = process_ollama_json_line(
+            r#"{"message":{"content":"answer","tool_calls":[{"function":{"name":"read_file","arguments":{"path":"README.md"}}}]},"prompt_eval_count":12,"eval_count":3,"done":true}"#,
+            &live_tx,
+            &mut state,
+        )
+        .await;
+
+        assert_eq!(state.content_buf, "answer");
+        assert_eq!(state.input_tokens, Some(12));
+        assert_eq!(state.output_tokens, Some(3));
+        assert_eq!(state.tool_calls.len(), 1);
+        assert_eq!(state.tool_calls[0].function.name, "read_file");
+        assert_eq!(state.tool_calls[0].function.arguments, r#"{"path":"README.md"}"#);
+
+        done
+    });
+
+    assert!(done);
     assert!(rx.try_recv().is_ok());
 }
 

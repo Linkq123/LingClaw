@@ -15,9 +15,34 @@ pub(crate) const DEFAULT_PORT: u16 = 18989;
 pub(crate) enum Provider {
     OpenAI,
     Anthropic,
+    Ollama,
 }
 
 impl Provider {
+    pub(crate) fn from_api_kind(api: &str) -> Self {
+        match api.trim().to_ascii_lowercase().as_str() {
+            "anthropic" => Self::Anthropic,
+            "ollama" => Self::Ollama,
+            _ => Self::OpenAI,
+        }
+    }
+
+    pub(crate) fn default_api_base(self) -> &'static str {
+        match self {
+            Self::OpenAI => "https://api.openai.com/v1",
+            Self::Anthropic => "https://api.anthropic.com",
+            Self::Ollama => "http://127.0.0.1:11434",
+        }
+    }
+
+    pub(crate) fn api_key_env_var(self) -> Option<&'static str> {
+        match self {
+            Self::OpenAI => Some("OPENAI_API_KEY"),
+            Self::Anthropic => Some("ANTHROPIC_API_KEY"),
+            Self::Ollama => None,
+        }
+    }
+
     pub(crate) fn detect(model: &str, api_base: &str, json_provider: Option<&str>) -> Self {
         // Explicit override: env var > JSON settings > auto-detect
         let env_explicit = std::env::var("LINGCLAW_PROVIDER")
@@ -31,6 +56,9 @@ impl Provider {
         if explicit == "anthropic" {
             return Self::Anthropic;
         }
+        if explicit == "ollama" {
+            return Self::Ollama;
+        }
         if explicit == "openai" {
             return Self::OpenAI;
         }
@@ -38,6 +66,9 @@ impl Provider {
             let provider_name = provider_name.to_lowercase();
             if provider_name == "anthropic" {
                 return Self::Anthropic;
+            }
+            if provider_name == "ollama" {
+                return Self::Ollama;
             }
             if provider_name == "openai" {
                 return Self::OpenAI;
@@ -49,6 +80,8 @@ impl Provider {
         // Auto-detect from model name or API base
         if model.starts_with("claude") || api_base.contains("anthropic.com") {
             Self::Anthropic
+        } else if api_base.contains("11434") || api_base.contains("ollama") {
+            Self::Ollama
         } else {
             Self::OpenAI
         }
@@ -58,6 +91,7 @@ impl Provider {
         match self {
             Self::OpenAI => "openai",
             Self::Anthropic => "anthropic",
+            Self::Ollama => "ollama",
         }
     }
 }
@@ -117,13 +151,16 @@ impl Config {
             .unwrap_or_else(|| "gpt-4o-mini".to_string());
 
         // API base: legacy settings.apiBase → env OPENAI_API_BASE → default
-        let api_base = settings
-            .api_base
+        let settings_api_base = settings.api_base.clone();
+        let openai_api_base_env = std::env::var("OPENAI_API_BASE").ok();
+        let ollama_api_base_env = std::env::var("OLLAMA_API_BASE").ok();
+        let api_base_hint = settings_api_base
             .clone()
-            .or_else(|| std::env::var("OPENAI_API_BASE").ok())
-            .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            .or_else(|| openai_api_base_env.clone())
+            .or_else(|| ollama_api_base_env.clone())
+            .unwrap_or_else(|| Provider::OpenAI.default_api_base().to_string());
 
-        let provider = Provider::detect(&model, &api_base, settings.provider.as_deref());
+        let provider = Provider::detect(&model, &api_base_hint, settings.provider.as_deref());
 
         // API key: legacy settings.apiKey → env vars → ""
         let api_key = settings.api_key.clone().unwrap_or_else(|| match provider {
@@ -131,18 +168,24 @@ impl Config {
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .unwrap_or_default(),
             Provider::OpenAI => std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+            Provider::Ollama => std::env::var("OLLAMA_API_KEY")
+                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                .unwrap_or_default(),
         });
 
-        // Adjust api_base for Anthropic when still on default OpenAI URL
-        let api_base = match provider {
-            Provider::Anthropic => {
-                if api_base == "https://api.openai.com/v1" {
-                    "https://api.anthropic.com".to_string()
-                } else {
-                    api_base
-                }
+        let api_base = if let Some(explicit) = settings_api_base {
+            explicit
+        } else {
+            match provider {
+                Provider::OpenAI => openai_api_base_env
+                    .unwrap_or_else(|| Provider::OpenAI.default_api_base().to_string()),
+                Provider::Anthropic => match openai_api_base_env {
+                    Some(base) if base != Provider::OpenAI.default_api_base() => base,
+                    _ => Provider::Anthropic.default_api_base().to_string(),
+                },
+                Provider::Ollama => ollama_api_base_env
+                    .unwrap_or_else(|| Provider::Ollama.default_api_base().to_string()),
             }
-            Provider::OpenAI => api_base,
         };
 
         Self {
@@ -226,8 +269,22 @@ impl Config {
         let fallback_resolved = |provider: Provider, model_id: &str| providers::ResolvedModel {
             provider,
             api_base: match provider {
-                Provider::Anthropic if self.api_base == "https://api.openai.com/v1" => {
-                    "https://api.anthropic.com".to_string()
+                Provider::Anthropic
+                    if self.provider != Provider::Anthropic
+                        || self.api_base == Provider::OpenAI.default_api_base() =>
+                {
+                    if self.api_base == Provider::OpenAI.default_api_base() {
+                        Provider::Anthropic.default_api_base().to_string()
+                    } else {
+                        self.api_base.clone()
+                    }
+                }
+                Provider::Ollama
+                    if self.provider != Provider::Ollama
+                        || self.api_base == Provider::OpenAI.default_api_base() =>
+                {
+                    std::env::var("OLLAMA_API_BASE")
+                        .unwrap_or_else(|_| Provider::Ollama.default_api_base().to_string())
                 }
                 _ => self.api_base.clone(),
             },
@@ -239,6 +296,11 @@ impl Config {
                 }
                 Provider::OpenAI if self.provider != Provider::OpenAI => {
                     std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| self.api_key.clone())
+                }
+                Provider::Ollama if self.provider != Provider::Ollama => {
+                    std::env::var("OLLAMA_API_KEY")
+                        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                        .unwrap_or_else(|_| self.api_key.clone())
                 }
                 _ => self.api_key.clone(),
             },
@@ -260,10 +322,7 @@ impl Config {
                     .map(|s| s.to_string());
                 let max_tokens = entry.and_then(|e| e.max_tokens);
                 providers::ResolvedModel {
-                    provider: match pc.api.as_str() {
-                        "anthropic" => Provider::Anthropic,
-                        _ => Provider::OpenAI,
-                    },
+                    provider: Provider::from_api_kind(&pc.api),
                     api_base: pc.base_url.clone(),
                     api_key: pc.api_key.clone(),
                     model_id: model_id.to_string(),
@@ -285,6 +344,7 @@ impl Config {
                 let provider = match prov_name.to_ascii_lowercase().as_str() {
                     "anthropic" => Some(Provider::Anthropic),
                     "openai" => Some(Provider::OpenAI),
+                    "ollama" => Some(Provider::Ollama),
                     _ => None,
                 };
                 if let Some(provider) = provider {
@@ -302,10 +362,7 @@ impl Config {
                 let Some(pc) = self.providers.get(name) else {
                     return 3_u8;
                 };
-                let pc_provider = match pc.api.as_str() {
-                    "anthropic" => Provider::Anthropic,
-                    _ => Provider::OpenAI,
-                };
+                let pc_provider = Provider::from_api_kind(&pc.api);
                 if pc_provider == self.provider
                     && pc.base_url == self.api_base
                     && pc.api_key == self.api_key
@@ -361,7 +418,7 @@ impl Config {
             }
             if self.providers.is_empty() {
                 let provider = prov_name.to_ascii_lowercase();
-                if provider == "openai" || provider == "anthropic" {
+                if provider == "openai" || provider == "anthropic" || provider == "ollama" {
                     return format!("{provider}/{model_id}");
                 }
             }
@@ -374,10 +431,7 @@ impl Config {
                 let Some(pc) = self.providers.get(name) else {
                     return 3_u8;
                 };
-                let pc_provider = match pc.api.as_str() {
-                    "anthropic" => Provider::Anthropic,
-                    _ => Provider::OpenAI,
-                };
+                let pc_provider = Provider::from_api_kind(&pc.api);
                 if pc_provider == self.provider
                     && pc.base_url == self.api_base
                     && pc.api_key == self.api_key
@@ -416,11 +470,11 @@ impl Config {
         if let Some((prov_name, model_id)) = trimmed.split_once('/') {
             if self.providers.is_empty() {
                 let provider = prov_name.to_ascii_lowercase();
-                if provider == "openai" || provider == "anthropic" {
+                if provider == "openai" || provider == "anthropic" || provider == "ollama" {
                     return Ok(format!("{provider}/{model_id}"));
                 }
                 return Err(format!(
-                    "Unknown provider '{prov_name}'. Use 'openai' or 'anthropic'."
+                    "Unknown provider '{prov_name}'. Use 'openai', 'anthropic', or 'ollama'."
                 ));
             }
             let Some(pc) = self.providers.get(prov_name) else {
