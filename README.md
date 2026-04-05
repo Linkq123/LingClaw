@@ -781,8 +781,9 @@ think_level 映射：
 ## 鸣谢
 
 - 感谢 openclaw、claude code、deer-flow、opencode
-- 感谢 vide-coding 伙伴：GPT-5.4、Claude Opus 4.6
+- 感谢 vide-coding 伙伴：GPT-5.4、Claude Opus 4.6、Doubao-Seedream-4.5
 - 感谢 GitHub Copilot、VS Code
+- 感谢 豆包、千问
 - 感谢时间
 
 ## License
