@@ -40,15 +40,10 @@ pub(crate) struct SubAgentOutcome {
 }
 
 /// Resolve which model a sub-agent should use.
-/// Priority: spec.model > config.sub_agent_model > config.model.
-pub(crate) fn resolve_subagent_model<'a>(
-    spec: &'a SubAgentSpec,
-    config: &'a Config,
-) -> &'a str {
-    spec.model
-        .as_deref()
-        .or(config.sub_agent_model.as_deref())
-        .unwrap_or(&config.model)
+/// Sub-agents always use the runtime config: `sub_agent_model` when set,
+/// otherwise the primary model.
+pub(crate) fn resolve_subagent_model(config: &Config) -> &str {
+    config.sub_agent_model.as_deref().unwrap_or(&config.model)
 }
 
 /// Run a sub-agent with full isolation.
@@ -69,7 +64,7 @@ pub(crate) async fn run_subagent(
     cancel: CancellationToken,
     hooks: &HookRegistry,
 ) -> SubAgentOutcome {
-    let model_id = resolve_subagent_model(spec, config).to_string();
+    let model_id = resolve_subagent_model(config).to_string();
     let resolved = config.resolve_model(&model_id);
 
     // Build filtered tool definitions for this sub-agent.

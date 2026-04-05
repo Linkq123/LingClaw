@@ -136,7 +136,6 @@ pub(crate) fn find_agent(workspace: &Path, name: &str) -> Option<SubAgentSpec> {
 /// ---
 /// name: agent-name
 /// description: "What this agent does"
-/// model: null
 /// max_turns: 15
 /// tools:
 ///   allow: [read_file, search_files, list_dir]
@@ -157,7 +156,6 @@ fn parse_agent_frontmatter(content: &str) -> Option<SubAgentSpec> {
 
     let mut name = None;
     let mut description = None;
-    let mut model = None;
     let mut max_turns = None;
     let mut allow_tools = Vec::new();
     let mut deny_tools = Vec::new();
@@ -185,14 +183,6 @@ fn parse_agent_frontmatter(content: &str) -> Option<SubAgentSpec> {
                 in_tools = false;
             } else if let Some(val) = trimmed_line.strip_prefix("description:") {
                 description = Some(unquote_yaml_value(val));
-                in_tools = false;
-            } else if let Some(val) = trimmed_line.strip_prefix("model:") {
-                let v = unquote_yaml_value(val);
-                model = if v == "null" || v.is_empty() {
-                    None
-                } else {
-                    Some(v)
-                };
                 in_tools = false;
             } else if let Some(val) = trimmed_line.strip_prefix("max_turns:") {
                 max_turns = val.trim().parse().ok();
@@ -240,7 +230,6 @@ fn parse_agent_frontmatter(content: &str) -> Option<SubAgentSpec> {
         name: name.filter(|s| !s.is_empty())?,
         description: description.unwrap_or_default(),
         system_prompt: body,
-        model,
         max_turns: max_turns.unwrap_or(15),
         tools: ToolPermissions {
             allow: allow_tools,

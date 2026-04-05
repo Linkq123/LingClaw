@@ -315,7 +315,6 @@ SKILL.md 的 YAML frontmatter 格式兼容 [Agent Skills 规范](https://agentsk
 ---
 name: my-agent
 description: 描述这个子代理做什么
-model: openai/gpt-4o-mini   # 可选：覆盖默认模型
 max_turns: 15               # 可选：最大 ReAct 轮数（默认 15）
 tools:
   allow: ["read_file", "list_dir", "search_files"]   # 白名单模式
@@ -327,13 +326,14 @@ tools:
 详细的行为指令...
 ```
 
-### 模型优先级
+### 模型选择
 
-子代理使用的模型按以下优先级解析：
+所有子代理统一使用配置文件中的模型设置：
 
-1. **AGENT.md `model` 字段** — 子代理定义中指定的模型（最高优先级）
-2. **`agents.defaults.model.sub-agent`** — 全局子代理模型配置（JSON 配置或 `LINGCLAW_SUB_AGENT_MODEL` 环境变量）
-3. **`agents.defaults.model.primary`** — 主模型（兜底）
+1. **`agents.defaults.model.sub-agent`** — 全局子代理模型配置（JSON 配置或 `LINGCLAW_SUB_AGENT_MODEL` 环境变量）
+2. **`agents.defaults.model.primary`** — 主模型（兜底）
+
+`AGENT.md` 中即使存在遗留的 `model` 字段，当前版本也会忽略，不参与运行时模型选择。
 
 ### 工作原理
 

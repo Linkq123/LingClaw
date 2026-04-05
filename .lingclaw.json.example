@@ -55,12 +55,8 @@
   "agents": {
     "defaults": {
       "model": {
-        "primary": "openai/gpt-4o-mini"
-      },
-      "models": {
-        "openai/gpt-4o-mini": {},
-        "openai/gpt-4o": {},
-        "anthropic/claude-sonnet-4-20250514": {}
+        "primary": "openai/gpt-4o-mini",
+        "sub-agent": "openai/gpt-4o-mini"
       }
     }
   },

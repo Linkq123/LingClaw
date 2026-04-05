@@ -61,7 +61,6 @@ fn test_render_agents_catalog_with_agents() {
             name: "explore".into(),
             description: "Code exploration".into(),
             system_prompt: String::new(),
-            model: None,
             max_turns: 10,
             tools: ToolPermissions::default(),
             source: AgentSource::System,
@@ -71,7 +70,6 @@ fn test_render_agents_catalog_with_agents() {
             name: "coder".into(),
             description: String::new(),
             system_prompt: String::new(),
-            model: Some("gpt-4o".into()),
             max_turns: 15,
             tools: ToolPermissions::default(),
             source: AgentSource::Global,
@@ -92,6 +90,7 @@ fn test_parse_agent_frontmatter() {
     let content = r#"---
 name: test-agent
 description: "A test agent"
+model: openai/gpt-4o-mini
 max_turns: 5
 tools:
   allow: [read_file, list_dir]
@@ -109,6 +108,23 @@ You are a test agent.
     assert_eq!(spec.tools.allow, vec!["read_file", "list_dir"]);
     assert_eq!(spec.tools.deny, vec!["exec"]);
     assert!(spec.system_prompt.contains("You are a test agent."));
+}
+
+#[test]
+fn test_parse_agent_frontmatter_ignores_legacy_model_field() {
+    let content = r#"---
+name: legacy-agent
+model: anthropic/claude-sonnet-4-20250514
+max_turns: 7
+---
+
+Legacy agent.
+"#;
+    let spec = crate::subagents::discovery::parse_agent_frontmatter_for_test(content)
+        .expect("legacy AGENT.md should still parse");
+    assert_eq!(spec.name, "legacy-agent");
+    assert_eq!(spec.max_turns, 7);
+    assert!(spec.system_prompt.contains("Legacy agent."));
 }
 
 #[test]
@@ -164,7 +180,6 @@ fn test_filter_tools_for_agent() {
         name: "test".into(),
         description: String::new(),
         system_prompt: String::new(),
-        model: None,
         max_turns: 10,
         tools: ToolPermissions {
             allow: vec!["read_file".into(), "list_dir".into()],
@@ -180,12 +195,12 @@ fn test_filter_tools_for_agent() {
     assert!(!tools.contains(&"task".to_string()));
 }
 
-// --- Sub-agent model resolution priority tests ---
+// --- Sub-agent model resolution tests ---
 // These tests call the production `resolve_subagent_model()` function.
 
-use crate::subagents::executor::resolve_subagent_model;
-use crate::config::Provider;
 use crate::Config;
+use crate::config::Provider;
+use crate::subagents::executor::resolve_subagent_model;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -211,59 +226,19 @@ fn base_config() -> Config {
     }
 }
 
-/// Spec.model takes highest priority.
+/// Sub-agents use the configured delegated model when set.
 #[test]
-fn test_model_priority_spec_overrides_all() {
+fn test_model_resolution_prefers_sub_agent_config() {
     let config = Config {
         sub_agent_model: Some("openai/gpt-4o-mini".to_string()),
         ..base_config()
     };
-    let spec = SubAgentSpec {
-        name: "test".into(),
-        description: String::new(),
-        system_prompt: String::new(),
-        model: Some("anthropic/claude-3-opus".to_string()),
-        max_turns: 10,
-        tools: ToolPermissions::default(),
-        source: AgentSource::System,
-        path: String::new(),
-    };
-    assert_eq!(resolve_subagent_model(&spec, &config), "anthropic/claude-3-opus");
+    assert_eq!(resolve_subagent_model(&config), "openai/gpt-4o-mini");
 }
 
-/// config.sub_agent_model is used when spec.model is None.
+/// Falls back to config.model when no dedicated sub-agent model is configured.
 #[test]
-fn test_model_priority_sub_agent_config() {
-    let config = Config {
-        sub_agent_model: Some("openai/gpt-4o-mini".to_string()),
-        ..base_config()
-    };
-    let spec = SubAgentSpec {
-        name: "test".into(),
-        description: String::new(),
-        system_prompt: String::new(),
-        model: None,
-        max_turns: 10,
-        tools: ToolPermissions::default(),
-        source: AgentSource::System,
-        path: String::new(),
-    };
-    assert_eq!(resolve_subagent_model(&spec, &config), "openai/gpt-4o-mini");
-}
-
-/// Falls back to config.model when both spec.model and sub_agent_model are None.
-#[test]
-fn test_model_priority_fallback_to_primary() {
+fn test_model_resolution_falls_back_to_primary() {
     let config = base_config(); // sub_agent_model = None
-    let spec = SubAgentSpec {
-        name: "test".into(),
-        description: String::new(),
-        system_prompt: String::new(),
-        model: None,
-        max_turns: 10,
-        tools: ToolPermissions::default(),
-        source: AgentSource::System,
-        path: String::new(),
-    };
-    assert_eq!(resolve_subagent_model(&spec, &config), "openai/gpt-4o");
+    assert_eq!(resolve_subagent_model(&config), "openai/gpt-4o");
 }

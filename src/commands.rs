@@ -1243,16 +1243,7 @@ async fn handle_agents_command(current_session_id: &str, state: &AppState) -> Co
         } else {
             tools.join(", ")
         };
-        let model_info = match agent.model.as_deref() {
-            Some(m) => m.to_string(),
-            None => {
-                let effective = config
-                    .sub_agent_model
-                    .as_deref()
-                    .unwrap_or(&config.model);
-                format!("(inherit: {effective})")
-            }
-        };
+        let model_info = config.sub_agent_model.as_deref().unwrap_or(&config.model);
         lines.push(format!(
             "- **{}** [`{}`] — {}\n  model: {} | max_turns: {} | tools: {}",
             agent.name,

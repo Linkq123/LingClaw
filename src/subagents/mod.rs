@@ -33,9 +33,6 @@ pub(crate) struct SubAgentSpec {
     pub description: String,
     /// System prompt body (Markdown content after frontmatter).
     pub system_prompt: String,
-    /// Optional model override (null = inherit from parent).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
     /// Maximum ReAct cycles before forced finish.
     #[serde(default = "default_max_turns")]
     pub max_turns: usize,
