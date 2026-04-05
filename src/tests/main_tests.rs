@@ -216,6 +216,7 @@ fn resolve_model_uses_config_for_plain_model_id() {
     assert_eq!(resolved.api_base, "https://api.openai.com/v1");
     assert_eq!(resolved.api_key, "test-key");
     assert_eq!(resolved.max_tokens, Some(16384));
+    assert_eq!(resolved.context_window, 128000);
 }
 
 #[test]
@@ -421,6 +422,7 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
     assert_eq!(resolved.api_base, "http://127.0.0.1:11434");
     assert_eq!(resolved.model_id, "llama3.2");
     assert_eq!(resolved.max_tokens, Some(8192));
+    assert_eq!(resolved.context_window, 128000);
     assert_eq!(resolved.thinking_format.as_deref(), Some("ollama"));
 }
 

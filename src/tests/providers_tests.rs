@@ -502,6 +502,7 @@ fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
         reasoning: true,
         thinking_format: Some("ollama".into()),
         max_tokens: Some(256),
+        context_window: 128000,
         stream_include_usage: false,
         anthropic_prompt_caching: false,
     };
@@ -519,6 +520,7 @@ fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
     assert_eq!(body["stream"], true);
     assert_eq!(body["think"], true);
     assert_eq!(body["options"]["num_predict"], 256);
+    assert_eq!(body["options"]["num_ctx"], 128000);
     assert!(body["tools"].is_array());
 }
 
@@ -532,6 +534,7 @@ fn build_ollama_stream_body_uses_levels_for_gpt_oss() {
         reasoning: true,
         thinking_format: Some("gpt-oss".into()),
         max_tokens: None,
+        context_window: 128000,
         stream_include_usage: false,
         anthropic_prompt_caching: false,
     };
@@ -584,6 +587,7 @@ fn call_llm_simple_ollama_sends_auth_and_expected_body() {
         reasoning: true,
         thinking_format: Some("ollama".into()),
         max_tokens: Some(64),
+        context_window: 128000,
         stream_include_usage: false,
         anthropic_prompt_caching: false,
     };
@@ -614,6 +618,7 @@ fn call_llm_simple_ollama_sends_auth_and_expected_body() {
     assert_eq!(body["model"], "qwen3");
     assert_eq!(body["stream"], false);
     assert_eq!(body["options"]["num_predict"], 64);
+    assert_eq!(body["options"]["num_ctx"], 128000);
     assert_eq!(body["messages"][0]["role"], "user");
     assert_eq!(body["messages"][0]["content"], "hi");
 }
@@ -639,6 +644,7 @@ fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
         reasoning: true,
         thinking_format: Some("ollama".into()),
         max_tokens: Some(128),
+        context_window: 128000,
         stream_include_usage: false,
         anthropic_prompt_caching: false,
     };
@@ -671,6 +677,7 @@ fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
     assert_eq!(body["stream"], true);
     assert_eq!(body["think"], true);
     assert_eq!(body["options"]["num_predict"], 128);
+    assert_eq!(body["options"]["num_ctx"], 128000);
 
     assert_eq!(response.message.content.as_deref(), Some("final answer"));
     assert_eq!(response.input_tokens, Some(17));
@@ -752,6 +759,7 @@ fn anthropic_prompt_caching_is_enabled_for_official_api() {
         reasoning: false,
         thinking_format: None,
         max_tokens: None,
+        context_window: 128000,
         stream_include_usage: false,
         anthropic_prompt_caching: false,
     };
@@ -769,6 +777,7 @@ fn anthropic_prompt_caching_is_disabled_for_compatible_api_by_default() {
         reasoning: false,
         thinking_format: None,
         max_tokens: None,
+        context_window: 128000,
         stream_include_usage: false,
         anthropic_prompt_caching: false,
     };
@@ -786,6 +795,7 @@ fn anthropic_prompt_caching_can_be_forced_for_compatible_api() {
         reasoning: false,
         thinking_format: None,
         max_tokens: None,
+        context_window: 128000,
         stream_include_usage: false,
         anthropic_prompt_caching: true,
     };

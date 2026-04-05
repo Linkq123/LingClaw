@@ -24,6 +24,8 @@ pub(crate) struct ResolvedModel {
     pub(crate) thinking_format: Option<String>,
     /// From model config `maxTokens`.
     pub(crate) max_tokens: Option<u64>,
+    /// Effective context window for the resolved model.
+    pub(crate) context_window: u64,
     pub(crate) stream_include_usage: bool,
     pub(crate) anthropic_prompt_caching: bool,
 }
@@ -350,6 +352,15 @@ fn with_optional_bearer_auth(request: RequestBuilder, api_key: &str) -> RequestB
     }
 }
 
+fn ollama_request_options(resolved: &ResolvedModel) -> serde_json::Value {
+    let mut options = serde_json::Map::new();
+    options.insert("num_ctx".to_string(), json!(resolved.context_window));
+    if let Some(max_tokens) = resolved.max_tokens {
+        options.insert("num_predict".to_string(), json!(max_tokens));
+    }
+    serde_json::Value::Object(options)
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  LLM Streaming Client
 // ══════════════════════════════════════════════════════════════════════════════
@@ -432,9 +443,7 @@ pub(crate) async fn call_llm_simple(
                 "messages": api_messages,
                 "stream": false,
             });
-            if let Some(mt) = resolved.max_tokens {
-                body["options"] = json!({"num_predict": mt});
-            }
+            body["options"] = ollama_request_options(resolved);
             let resp = with_optional_bearer_auth(http.post(&url), &resolved.api_key)
                 .json(&body)
                 .send()
@@ -926,9 +935,7 @@ fn build_ollama_stream_body(
     if let Some(think) = ollama_think_value(resolved, think_level) {
         body["think"] = think;
     }
-    if let Some(max_tokens) = resolved.max_tokens {
-        body["options"] = json!({"num_predict": max_tokens});
-    }
+    body["options"] = ollama_request_options(resolved);
     body
 }
 
@@ -1236,7 +1243,7 @@ async fn call_llm_stream_ollama(
     let url = format!("{}/api/chat", resolved.api_base);
     let body = build_ollama_stream_body(resolved, messages, think_level, extra_tools);
     eprintln!(
-        "[ollama] POST {} model={} think_level={} reasoning={} thinking_format={:?} think_body={} tools={} messages={}",
+        "[ollama] POST {} model={} think_level={} reasoning={} thinking_format={:?} think_body={} num_ctx={} tools={} messages={}",
         url,
         resolved.model_id,
         think_level,
@@ -1245,6 +1252,7 @@ async fn call_llm_stream_ollama(
         body.get("think")
             .map(|v| v.to_string())
             .unwrap_or_else(|| "<absent>".into()),
+        resolved.context_window,
         body.get("tools")
             .and_then(|v| v.as_array())
             .map(|a| a.len())

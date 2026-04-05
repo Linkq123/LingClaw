@@ -308,6 +308,7 @@ impl Config {
             reasoning: false,
             thinking_format: None,
             max_tokens: None,
+            context_window: self.max_context_tokens as u64,
             stream_include_usage: self.openai_stream_include_usage,
             anthropic_prompt_caching: self.anthropic_prompt_caching,
         };
@@ -321,6 +322,9 @@ impl Config {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
                 let max_tokens = entry.and_then(|e| e.max_tokens);
+                let context_window = entry
+                    .and_then(|e| e.context_window)
+                    .unwrap_or(self.max_context_tokens as u64);
                 providers::ResolvedModel {
                     provider: Provider::from_api_kind(&pc.api),
                     api_base: pc.base_url.clone(),
@@ -329,6 +333,7 @@ impl Config {
                     reasoning,
                     thinking_format,
                     max_tokens,
+                    context_window,
                     stream_include_usage: self.openai_stream_include_usage,
                     anthropic_prompt_caching: self.anthropic_prompt_caching,
                 }
