@@ -557,6 +557,15 @@ pub(crate) async fn call_llm_stream(
     } else {
         think_level
     };
+    eprintln!(
+        "[llm] provider={:?} model={} think_level={} -> effective={} reasoning={} thinking_format={:?}",
+        resolved.provider,
+        resolved.model_id,
+        think_level,
+        effective_level,
+        resolved.reasoning,
+        resolved.thinking_format,
+    );
     match resolved.provider {
         Provider::OpenAI => {
             call_llm_stream_openai(http, resolved, messages, tx, effective_level, extra_tools).await
@@ -1226,6 +1235,25 @@ async fn call_llm_stream_ollama(
 ) -> Result<LlmResponse, String> {
     let url = format!("{}/api/chat", resolved.api_base);
     let body = build_ollama_stream_body(resolved, messages, think_level, extra_tools);
+    eprintln!(
+        "[ollama] POST {} model={} think_level={} reasoning={} thinking_format={:?} think_body={} tools={} messages={}",
+        url,
+        resolved.model_id,
+        think_level,
+        resolved.reasoning,
+        resolved.thinking_format,
+        body.get("think")
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<absent>".into()),
+        body.get("tools")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0),
+        body.get("messages")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0),
+    );
 
     let resp = send_with_retry(http, || {
         with_optional_bearer_auth(http.post(&url), &resolved.api_key).json(&body)
@@ -1242,6 +1270,21 @@ async fn call_llm_stream_ollama(
         reasoning_started: false,
     };
     consume_ollama_stream(&mut stream, tx, &mut stream_state).await?;
+
+    eprintln!(
+        "[ollama] response: content_len={} tool_calls={} input_tokens={:?} output_tokens={:?} reasoning_started={}",
+        stream_state.content_buf.len(),
+        stream_state.tool_calls.len(),
+        stream_state.input_tokens,
+        stream_state.output_tokens,
+        stream_state.reasoning_started,
+    );
+    for (i, tc) in stream_state.tool_calls.iter().enumerate() {
+        eprintln!(
+            "[ollama]   tool_call[{}]: id={} name={}",
+            i, tc.id, tc.function.name
+        );
+    }
 
     if stream_state.reasoning_started && !stream_state.client_gone {
         stream_state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
