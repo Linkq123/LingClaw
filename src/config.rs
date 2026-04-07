@@ -116,10 +116,22 @@ pub(crate) struct Config {
     pub(crate) max_context_tokens: usize,
     pub(crate) exec_timeout: Duration,
     pub(crate) tool_timeout: Duration,
+    /// Total timeout for sub-agent execution (0 = unlimited, default: 300s).
+    pub(crate) sub_agent_timeout: Duration,
+    /// Maximum HTTP-level retries for transient LLM API errors (429, 5xx, connect/timeout).
+    pub(crate) max_llm_retries: usize,
     pub(crate) max_output_bytes: usize,
     pub(crate) max_file_bytes: usize,
     /// Enable structured async memory (auto-extracts facts from conversations).
     pub(crate) structured_memory: bool,
+}
+
+pub(crate) fn format_sub_agent_timeout(timeout: Duration) -> String {
+    if timeout.is_zero() {
+        "unlimited".to_string()
+    } else {
+        format!("{}s", timeout.as_secs())
+    }
 }
 
 impl Config {
@@ -253,6 +265,22 @@ impl Config {
                     .or_else(|| std::env::var("LINGCLAW_TOOL_TIMEOUT").ok()?.parse().ok())
                     .unwrap_or(30),
             ),
+            sub_agent_timeout: Duration::from_secs(
+                settings
+                    .sub_agent_timeout
+                    .or_else(|| {
+                        std::env::var("LINGCLAW_SUB_AGENT_TIMEOUT")
+                            .ok()?
+                            .parse()
+                            .ok()
+                    })
+                    .unwrap_or(300),
+            ),
+            max_llm_retries: settings
+                .max_llm_retries
+                .or_else(|| std::env::var("LINGCLAW_MAX_LLM_RETRIES").ok()?.parse().ok())
+                .unwrap_or(2)
+                .min(10),
             max_output_bytes: settings.max_output_bytes.unwrap_or(50 * 1024),
             max_file_bytes: settings.max_file_bytes.unwrap_or(200 * 1024),
             structured_memory: settings
@@ -581,6 +609,12 @@ pub(crate) struct JsonSettings {
     pub(crate) exec_timeout: Option<u64>,
     #[serde(rename = "toolTimeout")]
     pub(crate) tool_timeout: Option<u64>,
+    /// Total timeout for sub-agent execution in seconds (0 = unlimited, default: 300).
+    #[serde(rename = "subAgentTimeout")]
+    pub(crate) sub_agent_timeout: Option<u64>,
+    /// Maximum HTTP-level retries for transient LLM API errors (default: 2).
+    #[serde(rename = "maxLlmRetries")]
+    pub(crate) max_llm_retries: Option<usize>,
     #[serde(rename = "maxContextTokens")]
     pub(crate) max_context_tokens: Option<usize>,
     #[serde(rename = "maxOutputBytes")]

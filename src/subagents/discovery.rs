@@ -230,7 +230,7 @@ fn parse_agent_frontmatter(content: &str) -> Option<SubAgentSpec> {
         name: name.filter(|s| !s.is_empty())?,
         description: description.unwrap_or_default(),
         system_prompt: body,
-        max_turns: max_turns.unwrap_or(15),
+        max_turns: max_turns.unwrap_or(15).min(super::MAX_AGENT_TURNS),
         tools: ToolPermissions {
             allow: allow_tools,
             deny: deny_tools,

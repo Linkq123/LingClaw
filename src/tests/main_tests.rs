@@ -35,6 +35,8 @@ fn test_config() -> Config {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -229,6 +231,8 @@ fn resolve_model_uses_config_for_plain_model_id() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -301,6 +305,76 @@ fn settings_tool_timeout_deserializes() {
 
     let settings = cfg.settings.expect("settings should deserialize");
     assert_eq!(settings.tool_timeout, Some(45));
+}
+
+#[test]
+fn settings_sub_agent_timeout_deserializes() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "settings": {
+                "subAgentTimeout": 600
+            }
+        }"#,
+    )
+    .expect("subAgentTimeout should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.sub_agent_timeout, Some(600));
+}
+
+#[test]
+fn settings_sub_agent_timeout_zero_means_unlimited() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "settings": {
+                "subAgentTimeout": 0
+            }
+        }"#,
+    )
+    .expect("subAgentTimeout=0 should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.sub_agent_timeout, Some(0));
+}
+
+#[test]
+fn format_sub_agent_timeout_renders_unlimited_for_zero() {
+    assert_eq!(
+        crate::config::format_sub_agent_timeout(Duration::ZERO),
+        "unlimited"
+    );
+}
+
+#[test]
+fn format_sub_agent_timeout_renders_seconds_when_nonzero() {
+    assert_eq!(
+        crate::config::format_sub_agent_timeout(Duration::from_secs(7)),
+        "7s"
+    );
+}
+
+#[test]
+fn settings_max_llm_retries_deserializes() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "settings": {
+                "maxLlmRetries": 5
+            }
+        }"#,
+    )
+    .expect("maxLlmRetries should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.max_llm_retries, Some(5));
+}
+
+#[test]
+fn settings_max_llm_retries_defaults_to_none() {
+    let cfg: JsonConfig =
+        serde_json::from_str(r#"{"settings": {}}"#).expect("empty settings should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.max_llm_retries, None);
 }
 
 #[test]
@@ -436,6 +510,8 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -507,6 +583,8 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -584,6 +662,8 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -653,6 +733,8 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -704,6 +786,8 @@ fn canonical_model_ref_expands_unique_plain_id() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -772,6 +856,8 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -842,6 +928,8 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -892,6 +980,8 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -942,6 +1032,8 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -972,6 +1064,8 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -1002,6 +1096,8 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -1032,6 +1128,8 @@ fn resolve_model_accepts_ollama_prefix_without_provider_config() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -1082,6 +1180,8 @@ fn build_session_status_reports_resolved_target() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
@@ -3436,6 +3536,8 @@ fn context_input_budget_reserves_headroom() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,

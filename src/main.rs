@@ -1459,6 +1459,11 @@ async fn main() {
     eprintln!("  Exec timeout:  {}s", config.exec_timeout.as_secs());
     eprintln!("  Tool timeout:  {}s", config.tool_timeout.as_secs());
     eprintln!(
+        "  Agent timeout: {}",
+        crate::config::format_sub_agent_timeout(config.sub_agent_timeout)
+    );
+    eprintln!("  LLM retries:  {}", config.max_llm_retries);
+    eprintln!(
         "  Context limit: {} tokens",
         config.context_limit_for_model(&config.model)
     );

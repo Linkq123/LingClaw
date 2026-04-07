@@ -33,6 +33,8 @@ fn test_config_with_broken_mcp() -> Config {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
     }

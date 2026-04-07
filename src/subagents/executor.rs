@@ -27,6 +27,37 @@ use crate::{
 /// Maximum characters in the sub-agent's final result returned to the parent.
 const MAX_RESULT_CHARS: usize = 30_000;
 
+/// Apply the sub-agent AfterToolExec hook to a real or synthetic tool outcome.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_after_tool_exec_hook(
+    hooks: &HookRegistry,
+    config: &Config,
+    workspace: &Path,
+    cycle: usize,
+    tool_name: &str,
+    effective_args: &str,
+    tool_id: &str,
+    mut outcome: tools::ToolOutcome,
+) -> tools::ToolOutcome {
+    let after_input = ToolHookInput {
+        tool_name: tool_name.to_string(),
+        tool_args: serde_json::from_str(effective_args)
+            .unwrap_or_else(|_| serde_json::Value::String(effective_args.to_string())),
+        tool_id: tool_id.to_string(),
+        cycle,
+        workspace: workspace.to_path_buf(),
+        outcome_output: Some(outcome.output.clone()),
+        outcome_is_error: Some(outcome.is_error),
+        outcome_duration_ms: Some(outcome.duration_ms),
+    };
+    let after_output =
+        run_tool_hooks(hooks, agent::HookPoint::AfterToolExec, after_input, config).await;
+    if let hooks::HookOutput::ModifyToolResult { result } = after_output {
+        outcome.output = result;
+    }
+    outcome
+}
+
 /// Sub-agent execution outcome.
 pub(crate) struct SubAgentOutcome {
     /// Final text result to inject into parent context.
@@ -93,11 +124,24 @@ pub(crate) async fn run_subagent(
     let mut cycles: usize = 0;
     let mut total_tool_calls: usize = 0;
     let mut aborted = false;
+    let mut timed_out = false;
+
+    // Sub-agent deadline: 0 = unlimited.
+    let sa_timeout = config.sub_agent_timeout;
+    let unlimited = sa_timeout.is_zero();
+    let deadline = tokio::time::Instant::now() + sa_timeout;
 
     // Mini ReAct loop
     'react: for _cycle in 0..spec.max_turns {
         if cancel.is_cancelled() {
             aborted = true;
+            break;
+        }
+
+        // Check sub-agent deadline.
+        if !unlimited && tokio::time::Instant::now() >= deadline {
+            aborted = true;
+            timed_out = true;
             break;
         }
 
@@ -115,20 +159,6 @@ pub(crate) async fn run_subagent(
         )
         .await;
 
-        // Create a per-cycle channel for LLM streaming events.
-        // The forwarder task tags events with the sub-agent name and relays them.
-        let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
-        let parent_tx = parent_live_tx.clone();
-        let agent_name = spec.name.clone();
-        let forward_handle = tokio::spawn(async move {
-            while let Some(mut event) = sub_rx.recv().await {
-                if let Some(obj) = event.as_object_mut() {
-                    obj.insert("subagent".into(), json!(agent_name));
-                }
-                let _ = live_send(&parent_tx, event).await;
-            }
-        });
-
         // Prune context before each LLM call to stay within budget.
         // Use message_budget_for_tool_defs which accounts for thinking budget,
         // tool schema tokens, and structural overhead — matching the main loop's
@@ -139,26 +169,72 @@ pub(crate) async fn run_subagent(
             context::message_budget_for_tool_defs(config, &model_id, think_level, &tool_defs);
         context::prune_messages_for_provider(&mut messages, resolved.provider, budget);
 
-        // Call LLM with the sub-agent's isolated context
-        let llm_result = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                aborted = true;
-                drop(sub_tx);
-                let _ = forward_handle.await;
-                break 'react;
-            }
-            result = providers::call_llm_stream(
-                http,
-                &resolved,
-                &messages,
-                &sub_tx,
-                think_level,
-                &tool_defs,
-            ) => {
-                drop(sub_tx);
-                let _ = forward_handle.await;
-                result
+        // Call LLM with the sub-agent's isolated context.
+        // Agent-level retry: on transient HTTP errors, retry once before aborting.
+        let llm_result = 'llm_call: {
+            let mut llm_attempt = 0u8;
+            loop {
+                let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
+                let parent_tx = parent_live_tx.clone();
+                let agent_name = spec.name.clone();
+                let forward_handle = tokio::spawn(async move {
+                    while let Some(mut event) = sub_rx.recv().await {
+                        if let Some(obj) = event.as_object_mut() {
+                            obj.insert("subagent".into(), json!(agent_name));
+                        }
+                        let _ = live_send(&parent_tx, event).await;
+                    }
+                });
+
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        aborted = true;
+                        drop(sub_tx);
+                        let _ = forward_handle.await;
+                        break 'react;
+                    }
+                    _ = tokio::time::sleep_until(deadline), if !unlimited => {
+                        aborted = true;
+                        timed_out = true;
+                        drop(sub_tx);
+                        let _ = forward_handle.await;
+                        break 'react;
+                    }
+                    result = providers::call_llm_stream(
+                        http,
+                        &resolved,
+                        &messages,
+                        &sub_tx,
+                        think_level,
+                        &tool_defs,
+                        config.max_llm_retries,
+                    ) => {
+                        drop(sub_tx);
+                        let _ = forward_handle.await;
+                        result
+                    }
+                };
+
+                match &result {
+                    Err(e) if llm_attempt == 0 && providers::is_transient_llm_error(e) => {
+                        llm_attempt += 1;
+                        eprintln!("Sub-agent '{}' LLM error, retrying: {e}", spec.name);
+                        // Backoff before retry, respecting cancel/deadline.
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => { aborted = true; break 'react; }
+                            _ = tokio::time::sleep_until(deadline), if !unlimited => {
+                                aborted = true;
+                                timed_out = true;
+                                break 'react;
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+                        }
+                        continue;
+                    }
+                    _ => break 'llm_call result,
+                }
             }
         };
 
@@ -178,6 +254,12 @@ pub(crate) async fn run_subagent(
                     for tc in tool_calls {
                         if cancel.is_cancelled() {
                             aborted = true;
+                            break 'react;
+                        }
+                        // Check sub-agent deadline between tool calls.
+                        if !unlimited && tokio::time::Instant::now() >= deadline {
+                            aborted = true;
+                            timed_out = true;
                             break 'react;
                         }
 
@@ -253,41 +335,60 @@ pub(crate) async fn run_subagent(
                         )
                         .await;
 
-                        // Execute the tool
-                        let mut outcome = execute_subagent_tool(
-                            &tc.function.name,
-                            &effective_args,
-                            config,
-                            http,
-                            workspace,
-                        )
-                        .await;
+                        // Execute the tool, bounded by sub-agent deadline.
+                        let tool_started = tokio::time::Instant::now();
+                        let (outcome, hit_deadline) = if unlimited {
+                            (
+                                execute_subagent_tool(
+                                    &tc.function.name,
+                                    &effective_args,
+                                    config,
+                                    http,
+                                    workspace,
+                                )
+                                .await,
+                                false,
+                            )
+                        } else {
+                            tokio::select! {
+                                res = execute_subagent_tool(
+                                    &tc.function.name,
+                                    &effective_args,
+                                    config,
+                                    http,
+                                    workspace,
+                                ) => (res, false),
+                                _ = tokio::time::sleep_until(deadline) => {
+                                    timed_out = true;
+                                    aborted = true;
+                                    (
+                                        tools::ToolOutcome {
+                                            output: format!(
+                                                "Tool '{}' aborted: sub-agent deadline exceeded",
+                                                tc.function.name
+                                            ),
+                                            is_error: true,
+                                            duration_ms: tool_started.elapsed().as_millis() as u64,
+                                        },
+                                        true,
+                                    )
+                                }
+                            }
+                        };
 
                         total_tool_calls += 1;
 
-                        // ── AfterToolExec hook ──
-                        let after_input = ToolHookInput {
-                            tool_name: tc.function.name.clone(),
-                            tool_args: serde_json::from_str(&effective_args).unwrap_or_else(|_| {
-                                serde_json::Value::String(effective_args.clone())
-                            }),
-                            tool_id: tc.id.clone(),
-                            cycle: cycles,
-                            workspace: workspace.to_path_buf(),
-                            outcome_output: Some(outcome.output.clone()),
-                            outcome_is_error: Some(outcome.is_error),
-                            outcome_duration_ms: Some(outcome.duration_ms),
-                        };
-                        let after_output = run_tool_hooks(
+                        let outcome = apply_after_tool_exec_hook(
                             hooks,
-                            agent::HookPoint::AfterToolExec,
-                            after_input,
                             config,
+                            workspace,
+                            cycles,
+                            &tc.function.name,
+                            &effective_args,
+                            &tc.id,
+                            outcome,
                         )
                         .await;
-                        if let hooks::HookOutput::ModifyToolResult { result } = after_output {
-                            outcome.output = result;
-                        }
 
                         messages.push(ChatMessage {
                             role: "tool".into(),
@@ -296,6 +397,10 @@ pub(crate) async fn run_subagent(
                             tool_call_id: Some(tc.id.clone()),
                             timestamp: None,
                         });
+
+                        if hit_deadline {
+                            break 'react;
+                        }
                     }
                 }
             }
@@ -319,14 +424,36 @@ pub(crate) async fn run_subagent(
         .rev()
         .find(|m| m.role == "assistant" && m.has_nonempty_content())
         .and_then(|m| m.content.clone())
-        .unwrap_or_else(|| {
-            format!(
-                "Sub-agent '{}' completed {} cycles with {} tool calls but produced no final output.",
-                spec.name, cycles, total_tool_calls
-            )
-        });
+        .unwrap_or_default();
 
-    let result = truncate(&final_content, MAX_RESULT_CHARS).to_string();
+    let result = if timed_out {
+        let partial = truncate(&final_content, MAX_RESULT_CHARS.saturating_sub(200));
+        if partial.is_empty() {
+            format!(
+                "Sub-agent '{}' timed out after {}s ({} cycles, {} tool calls) with no output.",
+                spec.name,
+                sa_timeout.as_secs(),
+                cycles,
+                total_tool_calls
+            )
+        } else {
+            format!(
+                "Sub-agent '{}' timed out after {}s ({} cycles, {} tool calls). Partial result:\n\n{}",
+                spec.name,
+                sa_timeout.as_secs(),
+                cycles,
+                total_tool_calls,
+                partial
+            )
+        }
+    } else if final_content.is_empty() {
+        format!(
+            "Sub-agent '{}' completed {} cycles with {} tool calls but produced no final output.",
+            spec.name, cycles, total_tool_calls
+        )
+    } else {
+        truncate(&final_content, MAX_RESULT_CHARS).to_string()
+    };
 
     SubAgentOutcome {
         result,

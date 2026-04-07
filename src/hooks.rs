@@ -376,10 +376,13 @@ impl AgentHook for AutoCompressContextHook {
             ];
 
             let resolved = config.resolve_model(&input.model);
-            let summary = match providers::call_llm_simple(http, &resolved, &prompt).await {
-                Ok(summary) if !summary.trim().is_empty() => summary,
-                _ => return HookOutput::NoOp,
-            };
+            let summary =
+                match providers::call_llm_simple(http, &resolved, &prompt, config.max_llm_retries)
+                    .await
+                {
+                    Ok(summary) if !summary.trim().is_empty() => summary,
+                    _ => return HookOutput::NoOp,
+                };
 
             let messages = build_compressed_messages(&input.messages, compress_end, &summary);
             let after_estimate = estimate_tokens_for_provider(input.provider, &messages);

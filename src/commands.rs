@@ -357,7 +357,7 @@ async fn handle_new_command(
                 false,
             ));
         }
-        result = providers::call_llm_simple(&state.http, &resolved, &compress_prompt) => {
+        result = providers::call_llm_simple(&state.http, &resolved, &compress_prompt, state.config.max_llm_retries) => {
             match result {
                 Ok(s) => s,
                 Err(e) => {

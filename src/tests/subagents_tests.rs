@@ -1,5 +1,6 @@
 use crate::subagents::discovery::discover_all_agents;
 use crate::subagents::{AgentSource, SubAgentSpec, ToolPermissions, render_agents_catalog};
+use crate::{ChatMessage, agent};
 
 #[test]
 fn test_tool_permissions_basic() {
@@ -200,8 +201,18 @@ fn test_filter_tools_for_agent() {
 
 use crate::Config;
 use crate::config::Provider;
+use crate::hooks::{AgentHook, HookInput, HookOutput, HookRegistry, ToolHookInput};
 use crate::subagents::executor::resolve_subagent_model;
 use std::collections::HashMap;
+use std::future::Future;
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
+use std::pin::Pin;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
 use std::time::Duration;
 
 fn base_config() -> Config {
@@ -221,9 +232,109 @@ fn base_config() -> Config {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         structured_memory: false,
+    }
+}
+
+fn find_headers_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn parse_content_length(header_text: &str) -> usize {
+    header_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                value.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0)
+}
+
+fn read_http_request(stream: &mut TcpStream) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout should be set");
+
+    let mut buffer = Vec::new();
+    let mut chunk = [0_u8; 1024];
+
+    loop {
+        let read = stream.read(&mut chunk).expect("request should be readable");
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+
+        if let Some(headers_end) = find_headers_end(&buffer) {
+            let header_text = String::from_utf8_lossy(&buffer[..headers_end + 4]);
+            let content_length = parse_content_length(&header_text);
+            let total_len = headers_end + 4 + content_length;
+            if buffer.len() >= total_len {
+                break;
+            }
+        }
+    }
+}
+
+fn spawn_one_shot_http_server(
+    response_content_type: &'static str,
+    response_body: String,
+) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose address");
+
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request should connect");
+        read_http_request(&mut stream);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {response_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("response should be written");
+        stream.flush().expect("response should flush");
+    });
+
+    (format!("http://{}", address), handle)
+}
+
+fn build_openai_tool_call_stream(tool_name: &str, args: serde_json::Value) -> String {
+    let args_json = serde_json::to_string(&args).expect("tool args should serialize");
+    let chunk = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": args_json
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    format!("data: {}\n\ndata: [DONE]\n\n", chunk)
+}
+
+fn slow_tool_command() -> String {
+    if cfg!(windows) {
+        "timeout /T 2 /NOBREAK > NUL".to_string()
+    } else {
+        "while :; do :; done".to_string()
     }
 }
 
@@ -242,4 +353,225 @@ fn test_model_resolution_prefers_sub_agent_config() {
 fn test_model_resolution_falls_back_to_primary() {
     let config = base_config(); // sub_agent_model = None
     assert_eq!(resolve_subagent_model(&config), "openai/gpt-4o");
+}
+
+/// max_turns is clamped to MAX_AGENT_TURNS even when AGENT.md specifies a higher value.
+#[test]
+fn test_max_turns_clamped_to_hard_limit() {
+    let content = r#"---
+name: excessive
+max_turns: 999
+---
+
+Runaway agent.
+"#;
+    let spec = crate::subagents::discovery::parse_agent_frontmatter_for_test(content)
+        .expect("should parse");
+    assert_eq!(spec.max_turns, crate::subagents::MAX_AGENT_TURNS);
+}
+
+/// max_turns below the cap is preserved.
+#[test]
+fn test_max_turns_within_cap_preserved() {
+    let content = r#"---
+name: normal
+max_turns: 20
+---
+
+Normal agent.
+"#;
+    let spec = crate::subagents::discovery::parse_agent_frontmatter_for_test(content)
+        .expect("should parse");
+    assert_eq!(spec.max_turns, 20);
+}
+
+struct TimeoutMarkerHook;
+
+struct ObservedTimeoutHook {
+    expected_command: String,
+    called: Arc<AtomicBool>,
+}
+
+impl AgentHook for TimeoutMarkerHook {
+    fn name(&self) -> &'static str {
+        "timeout_marker"
+    }
+
+    fn point(&self) -> agent::HookPoint {
+        agent::HookPoint::AfterToolExec
+    }
+
+    fn should_run(&self, _: &[ChatMessage], _: Provider, _: usize, _: usize) -> bool {
+        false
+    }
+
+    fn run<'a>(
+        &'a self,
+        _: HookInput,
+        _: &'a Config,
+        _: &'a reqwest::Client,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async { HookOutput::NoOp })
+    }
+
+    fn should_run_tool(&self, tool_name: &str, point: agent::HookPoint) -> bool {
+        point == agent::HookPoint::AfterToolExec && tool_name == "exec"
+    }
+
+    fn run_tool<'a>(
+        &'a self,
+        input: ToolHookInput,
+        _: &'a Config,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async move {
+            assert_eq!(input.outcome_is_error, Some(true));
+            assert_eq!(input.outcome_duration_ms, Some(12));
+            assert_eq!(input.tool_args["command"], "sleep 5");
+            HookOutput::ModifyToolResult {
+                result: format!(
+                    "{} [after-hook]",
+                    input
+                        .outcome_output
+                        .expect("timeout output should be present")
+                ),
+            }
+        })
+    }
+}
+
+impl AgentHook for ObservedTimeoutHook {
+    fn name(&self) -> &'static str {
+        "observed_timeout"
+    }
+
+    fn point(&self) -> agent::HookPoint {
+        agent::HookPoint::AfterToolExec
+    }
+
+    fn should_run(&self, _: &[ChatMessage], _: Provider, _: usize, _: usize) -> bool {
+        false
+    }
+
+    fn run<'a>(
+        &'a self,
+        _: HookInput,
+        _: &'a Config,
+        _: &'a reqwest::Client,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async { HookOutput::NoOp })
+    }
+
+    fn should_run_tool(&self, tool_name: &str, point: agent::HookPoint) -> bool {
+        point == agent::HookPoint::AfterToolExec && tool_name == "exec"
+    }
+
+    fn run_tool<'a>(
+        &'a self,
+        input: ToolHookInput,
+        _: &'a Config,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async move {
+            self.called.store(true, Ordering::SeqCst);
+            assert_eq!(input.outcome_is_error, Some(true));
+            assert_eq!(
+                input.tool_args["command"].as_str(),
+                Some(self.expected_command.as_str())
+            );
+            assert!(input.outcome_duration_ms.is_some());
+            assert!(
+                input
+                    .outcome_output
+                    .as_deref()
+                    .is_some_and(|text| text.contains("deadline exceeded"))
+            );
+            HookOutput::NoOp
+        })
+    }
+}
+
+#[tokio::test]
+async fn timeout_outcome_still_runs_after_tool_exec_hook() {
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(TimeoutMarkerHook));
+
+    let workspace = std::env::temp_dir();
+    let outcome = crate::subagents::executor::apply_after_tool_exec_hook(
+        &registry,
+        &base_config(),
+        &workspace,
+        1,
+        "exec",
+        r#"{"command":"sleep 5"}"#,
+        "tc-timeout",
+        crate::tools::ToolOutcome {
+            output: "Tool 'exec' aborted: sub-agent deadline exceeded".to_string(),
+            is_error: true,
+            duration_ms: 12,
+        },
+    )
+    .await;
+
+    assert!(outcome.is_error);
+    assert_eq!(outcome.duration_ms, 12);
+    assert_eq!(
+        outcome.output,
+        "Tool 'exec' aborted: sub-agent deadline exceeded [after-hook]"
+    );
+}
+
+#[tokio::test]
+async fn run_subagent_timeout_during_tool_exec_still_runs_after_tool_exec_hook() {
+    let command = slow_tool_command();
+    let response_body =
+        build_openai_tool_call_stream("exec", serde_json::json!({ "command": command.clone() }));
+    let (api_base, handle) = spawn_one_shot_http_server("text/event-stream", response_body);
+
+    let mut config = base_config();
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+    config.exec_timeout = Duration::from_secs(5);
+    config.sub_agent_timeout = Duration::from_secs(1);
+
+    let spec = SubAgentSpec {
+        name: "timeout-agent".into(),
+        description: String::new(),
+        system_prompt: "Run the delegated command.".into(),
+        max_turns: 1,
+        tools: ToolPermissions {
+            allow: vec!["exec".into()],
+            deny: vec![],
+        },
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(16);
+    let called = Arc::new(AtomicBool::new(false));
+    let mut hooks = HookRegistry::new();
+    hooks.register(Box::new(ObservedTimeoutHook {
+        expected_command: command,
+        called: called.clone(),
+    }));
+
+    let http = reqwest::Client::new();
+    let workspace = std::env::temp_dir();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Run the slow command.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &hooks,
+    )
+    .await;
+
+    handle.join().expect("server thread should join");
+
+    assert!(called.load(Ordering::SeqCst));
+    assert!(outcome.aborted);
+    assert_eq!(outcome.cycles, 1);
+    assert_eq!(outcome.tool_calls, 1);
+    assert!(outcome.result.contains("timed out after"));
 }

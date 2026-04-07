@@ -1182,6 +1182,11 @@ fn handle_status_command(port_override: Option<u16>) -> bool {
     println!("  API base:      {}", config.api_base);
     println!("  Exec timeout:  {}s", config.exec_timeout.as_secs());
     println!("  Tool timeout:  {}s", config.tool_timeout.as_secs());
+    println!(
+        "  Agent timeout: {}",
+        crate::config::format_sub_agent_timeout(config.sub_agent_timeout)
+    );
+    println!("  LLM retries:  {}", config.max_llm_retries);
     println!("  Context limit: {} tokens", config.max_context_tokens);
     println!();
 
@@ -2177,6 +2182,8 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
             "port": DEFAULT_PORT,
             "execTimeout": 30,
             "toolTimeout": 30,
+            "subAgentTimeout": 300,
+            "maxLlmRetries": 2,
             "maxContextTokens": 32000,
         },
         "models": {

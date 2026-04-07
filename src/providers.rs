@@ -370,6 +370,7 @@ pub(crate) async fn call_llm_simple(
     http: &Client,
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
+    max_retries: usize,
 ) -> Result<String, String> {
     match resolved.provider {
         Provider::OpenAI => {
@@ -382,18 +383,10 @@ pub(crate) async fn call_llm_simple(
             if let Some(mt) = resolved.max_tokens {
                 body["max_tokens"] = json!(mt);
             }
-            let resp = http
-                .post(&url)
-                .bearer_auth(&resolved.api_key)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| format!("HTTP error: {e}"))?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(format!("API {status}: {text}"));
-            }
+            let resp = send_with_retry(http, max_retries, || {
+                http.post(&url).bearer_auth(&resolved.api_key).json(&body)
+            })
+            .await?;
             let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
             Ok(data["choices"][0]["message"]["content"]
                 .as_str()
@@ -413,19 +406,13 @@ pub(crate) async fn call_llm_simple(
             if !system.is_empty() {
                 body["system"] = anthropic_system_payload(&system, cache_enabled);
             }
-            let resp = http
-                .post(&url)
-                .header("x-api-key", &resolved.api_key)
-                .header("anthropic-version", "2023-06-01")
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| format!("HTTP error: {e}"))?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(format!("API {status}: {text}"));
-            }
+            let resp = send_with_retry(http, max_retries, || {
+                http.post(&url)
+                    .header("x-api-key", &resolved.api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&body)
+            })
+            .await?;
             let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
             let content = data["content"]
                 .as_array()
@@ -444,16 +431,10 @@ pub(crate) async fn call_llm_simple(
                 "stream": false,
             });
             body["options"] = ollama_request_options(resolved);
-            let resp = with_optional_bearer_auth(http.post(&url), &resolved.api_key)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|e| format!("HTTP error: {e}"))?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(format!("API {status}: {text}"));
-            }
+            let resp = send_with_retry(http, max_retries, || {
+                with_optional_bearer_auth(http.post(&url), &resolved.api_key).json(&body)
+            })
+            .await?;
             let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
             Ok(data["message"]["content"]
                 .as_str()
@@ -555,6 +536,7 @@ pub(crate) async fn call_llm_stream(
     tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
+    max_retries: usize,
 ) -> Result<LlmResponse, String> {
     // Resolve "auto": enable thinking at medium level if model supports it, else off
     let effective_level = if think_level == "auto" {
@@ -568,14 +550,40 @@ pub(crate) async fn call_llm_stream(
     };
     match resolved.provider {
         Provider::OpenAI => {
-            call_llm_stream_openai(http, resolved, messages, tx, effective_level, extra_tools).await
+            call_llm_stream_openai(
+                http,
+                resolved,
+                messages,
+                tx,
+                effective_level,
+                extra_tools,
+                max_retries,
+            )
+            .await
         }
         Provider::Anthropic => {
-            call_llm_stream_anthropic(http, resolved, messages, tx, effective_level, extra_tools)
-                .await
+            call_llm_stream_anthropic(
+                http,
+                resolved,
+                messages,
+                tx,
+                effective_level,
+                extra_tools,
+                max_retries,
+            )
+            .await
         }
         Provider::Ollama => {
-            call_llm_stream_ollama(http, resolved, messages, tx, effective_level, extra_tools).await
+            call_llm_stream_ollama(
+                http,
+                resolved,
+                messages,
+                tx,
+                effective_level,
+                extra_tools,
+                max_retries,
+            )
+            .await
         }
     }
 }
@@ -1078,32 +1086,41 @@ where
     Ok(())
 }
 
-/// Maximum number of retries for transient LLM API errors (429, 5xx, connect/timeout).
-const MAX_LLM_RETRIES: usize = 2;
-
 /// Send an HTTP request with automatic retry for transient failures.
 /// Retries on 429 (rate limit), 5xx (server error), and connection/timeout errors.
-/// Uses exponential backoff: 1s, 2s.
+/// Uses exponential backoff (1s, 2s, 4s, …) but respects `Retry-After` header for 429.
 async fn send_with_retry(
     _http: &Client,
+    max_retries: usize,
     mut build: impl FnMut() -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, String> {
-    for attempt in 0..=MAX_LLM_RETRIES {
-        if attempt > 0 {
-            let delay_ms = 1000 * (1u64 << (attempt - 1));
-            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        }
+    for attempt in 0..=max_retries {
         let response = build().send().await;
         match response {
             Ok(resp) => {
                 let status = resp.status();
                 if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
-                    if attempt < MAX_LLM_RETRIES {
+                    if attempt < max_retries {
+                        // Respect Retry-After header on 429, cap at 30s.
+                        let retry_after_secs = resp
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .map(|s| s.min(30));
+                        let delay = if let Some(secs) = retry_after_secs {
+                            Duration::from_secs(secs)
+                        } else {
+                            Duration::from_millis(1000 * (1u64 << attempt.min(6)))
+                        };
                         eprintln!(
-                            "LLM API {status}, retrying ({}/{})",
+                            "LLM API {status}, retrying ({}/{max_retries}){}",
                             attempt + 1,
-                            MAX_LLM_RETRIES
+                            retry_after_secs
+                                .map(|s| format!(" [Retry-After: {s}s]"))
+                                .unwrap_or_default(),
                         );
+                        tokio::time::sleep(delay).await;
                         continue;
                     }
                     let text = resp.text().await.unwrap_or_default();
@@ -1118,18 +1135,48 @@ async fn send_with_retry(
                 }
                 return Ok(resp);
             }
-            Err(e) if attempt < MAX_LLM_RETRIES && (e.is_connect() || e.is_timeout()) => {
+            Err(e) if attempt < max_retries && (e.is_connect() || e.is_timeout()) => {
+                let delay = Duration::from_millis(1000 * (1u64 << attempt.min(6)));
                 eprintln!(
-                    "LLM request error: {e}, retrying ({}/{})",
+                    "LLM request error: {e}, retrying ({}/{max_retries})",
                     attempt + 1,
-                    MAX_LLM_RETRIES
                 );
+                tokio::time::sleep(delay).await;
                 continue;
             }
             Err(e) => return Err(format!("HTTP error: {e}")),
         }
     }
     Err("LLM request failed after all retries".into())
+}
+
+/// Returns `true` if an LLM error string represents a transient failure where
+/// no partial streaming content was sent to the client – safe to retry at the
+/// agent level.
+pub(crate) fn is_transient_llm_error(error: &str) -> bool {
+    // Stream-phase errors: partial content may have been sent to the client.
+    if error.starts_with("stream error:") {
+        return false;
+    }
+    // Client disconnected: no point retrying.
+    if error == "Client disconnected" {
+        return false;
+    }
+    // HTTP-level transient errors produced by send_with_retry():
+    //   "API 429 …" / "API 500 …" / "API 502 …" / "API 503 …" / "API 504 …"
+    //   "HTTP error: …" (connection / timeout)
+    //   "LLM request failed after all retries"
+    if error.starts_with("HTTP error:") || error.starts_with("LLM request failed") {
+        return true;
+    }
+    if let Some(rest) = error.strip_prefix("API ") {
+        return rest.starts_with("429")
+            || rest.starts_with("500")
+            || rest.starts_with("502")
+            || rest.starts_with("503")
+            || rest.starts_with("504");
+    }
+    false
 }
 
 async fn call_llm_stream_openai(
@@ -1139,11 +1186,12 @@ async fn call_llm_stream_openai(
     tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
+    max_retries: usize,
 ) -> Result<LlmResponse, String> {
     let url = format!("{}/chat/completions", resolved.api_base);
     let body = build_openai_stream_body(resolved, messages, think_level, extra_tools);
 
-    let resp = send_with_retry(http, || {
+    let resp = send_with_retry(http, max_retries, || {
         http.post(&url).bearer_auth(&resolved.api_key).json(&body)
     })
     .await?;
@@ -1181,11 +1229,12 @@ async fn call_llm_stream_anthropic(
     tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
+    max_retries: usize,
 ) -> Result<LlmResponse, String> {
     let url = format!("{}/v1/messages", resolved.api_base);
     let body = build_anthropic_stream_body(resolved, messages, think_level, extra_tools);
 
-    let resp = send_with_retry(http, || {
+    let resp = send_with_retry(http, max_retries, || {
         http.post(&url)
             .header("x-api-key", &resolved.api_key)
             .header("anthropic-version", "2023-06-01")
@@ -1230,11 +1279,12 @@ async fn call_llm_stream_ollama(
     tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
+    max_retries: usize,
 ) -> Result<LlmResponse, String> {
     let url = format!("{}/api/chat", resolved.api_base);
     let body = build_ollama_stream_body(resolved, messages, think_level, extra_tools);
 
-    let resp = send_with_retry(http, || {
+    let resp = send_with_retry(http, max_retries, || {
         with_optional_bearer_auth(http.post(&url), &resolved.api_key).json(&body)
     })
     .await?;

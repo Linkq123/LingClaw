@@ -148,9 +148,10 @@ async fn run_post_execution_reflection(
     ];
 
     let resolved = config.resolve_model(model);
-    let reflection = providers::call_llm_simple(http, &resolved, &prompt_messages)
-        .await
-        .map_err(|e| format!("Reflection LLM call failed: {e}"))?;
+    let reflection =
+        providers::call_llm_simple(http, &resolved, &prompt_messages, config.max_llm_retries)
+            .await
+            .map_err(|e| format!("Reflection LLM call failed: {e}"))?;
 
     let reflection = reflection.trim();
     if reflection.is_empty() {
@@ -690,7 +691,7 @@ async fn run_tool_with_feedback<F>(
     cancel: &CancellationToken,
     tool_id: &str,
     tool_name: &str,
-    timeout: Duration,
+    timeout: Option<Duration>,
     future: F,
 ) -> ToolRunState
 where
@@ -701,8 +702,9 @@ where
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     heartbeat.tick().await;
 
-    let timeout_secs = timeout.as_secs();
-    let sleep = tokio::time::sleep(timeout);
+    let has_timeout = timeout.is_some();
+    let timeout_secs = timeout.map(|t| t.as_secs()).unwrap_or(0);
+    let sleep = tokio::time::sleep(timeout.unwrap_or(Duration::ZERO));
     tokio::pin!(sleep);
     tokio::pin!(future);
 
@@ -712,7 +714,7 @@ where
             _ = cancel.cancelled() => {
                 return ToolRunState::Abort;
             }
-            _ = &mut sleep => {
+            _ = &mut sleep, if has_timeout => {
                 return ToolRunState::Completed(tools::ToolOutcome {
                     output: format!("{tool_name} error: tool execution timed out ({}s)", timeout_secs),
                     is_error: true,
@@ -819,15 +821,15 @@ async fn execute_tool_call(
     }
 
     let run_state = if tools::is_task_tool(&tc.function.name) {
-        // Sub-agent task: use dedicated executor with LiveTx for streaming events.
-        // Task tool gets its own child cancel token for isolation.
+        // Sub-agent task: no outer timeout — the sub-agent enforces its own
+        // deadline via config.sub_agent_timeout inside run_subagent().
         let task_cancel = ctx.run_cancel.child_token();
         run_tool_with_feedback(
             ctx.live_tx,
             ctx.run_cancel,
             &tc.id,
             &tc.function.name,
-            tool_timeout,
+            None,
             execute_task_tool(
                 &effective_args,
                 &ctx.state.config,
@@ -845,7 +847,7 @@ async fn execute_tool_call(
             ctx.run_cancel,
             &tc.id,
             &tc.function.name,
-            tool_timeout,
+            Some(tool_timeout),
             execute_tool(
                 &tc.function.name,
                 &effective_args,
@@ -1121,21 +1123,55 @@ async fn run_analyze_phase(
         return AgentPhaseControl::Break;
     }
 
-    let llm_result = tokio::select! {
-        biased;
-        _ = ctx.run_cancel.cancelled() => {
-            phase_state.shutting_down = ctx.cancel.is_cancelled();
-            phase_state.run_detached = !phase_state.shutting_down;
-            return AgentPhaseControl::Break;
+    // Agent-level retry: retry the entire LLM call once for transient HTTP-level
+    // errors (429/5xx/connect/timeout that already exhausted provider-level retries).
+    // Stream-phase errors are NOT retried because partial tokens were already sent.
+    // NOTE: BeforeLlmCall hooks are intentionally NOT re-run on retry — the retry
+    // reuses the same snapshot produced by the single hook pass above, since hooks
+    // modify system prompt / think level which shouldn't change between retries of
+    // the same logical request.
+    let mut agent_llm_attempt = 0u8;
+    let llm_result = loop {
+        let result = tokio::select! {
+            biased;
+            _ = ctx.run_cancel.cancelled() => {
+                phase_state.shutting_down = ctx.cancel.is_cancelled();
+                phase_state.run_detached = !phase_state.shutting_down;
+                return AgentPhaseControl::Break;
+            }
+            result = providers::call_llm_stream(
+                &ctx.state.http,
+                &resolved,
+                &final_msgs_snapshot,
+                ctx.live_tx,
+                &effective_think,
+                &extra_tools,
+                ctx.state.config.max_llm_retries,
+            ) => result,
+        };
+
+        match &result {
+            Err(e) if agent_llm_attempt == 0 && providers::is_transient_llm_error(e) => {
+                agent_llm_attempt += 1;
+                let _ = live_send(
+                    ctx.live_tx,
+                    json!({"type":"system","content":format!("LLM request failed ({e}), retrying...")}),
+                )
+                .await;
+                // Backoff before agent-level retry, respecting cancellation.
+                tokio::select! {
+                    biased;
+                    _ = ctx.run_cancel.cancelled() => {
+                        phase_state.shutting_down = ctx.cancel.is_cancelled();
+                        phase_state.run_detached = !phase_state.shutting_down;
+                        return AgentPhaseControl::Break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                }
+                continue;
+            }
+            _ => break result,
         }
-        result = providers::call_llm_stream(
-            &ctx.state.http,
-            &resolved,
-            &final_msgs_snapshot,
-            ctx.live_tx,
-            &effective_think,
-            &extra_tools,
-        ) => result,
     };
 
     match llm_result {
@@ -1304,7 +1340,7 @@ async fn run_act_phase(
                     ctx.run_cancel,
                     &tc.id,
                     &tc.function.name,
-                    tool_timeout,
+                    Some(tool_timeout),
                     execute_tool(
                         &tc.function.name,
                         args,

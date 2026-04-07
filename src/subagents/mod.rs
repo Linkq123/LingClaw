@@ -24,6 +24,9 @@ use serde::{Deserialize, Serialize};
 #[allow(dead_code)] // Reserved for future parallel task execution
 pub(crate) const MAX_CONCURRENT_SUBAGENTS: usize = 3;
 
+/// Hard upper limit on sub-agent max_turns (prevents runaway custom agents).
+pub(crate) const MAX_AGENT_TURNS: usize = 50;
+
 /// Sub-agent definition parsed from an AGENT.md file.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SubAgentSpec {

@@ -95,6 +95,8 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
     "port": 18989,
     "execTimeout": 30,
     "toolTimeout": 30,
+    "subAgentTimeout": 300,
+    "maxLlmRetries": 2,
     "maxContextTokens": 32000,
     "maxOutputBytes": 51200,
     "maxFileBytes": 204800,
@@ -213,7 +215,9 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 | `LINGCLAW_MODEL` | `gpt-4o-mini` | 默认模型 |
 | `LINGCLAW_PORT` | `18989` | HTTP 端口 |
 | `LINGCLAW_EXEC_TIMEOUT` | `30` | Shell 命令超时（秒） |
-| `LINGCLAW_TOOL_TIMEOUT` | `30` | 非 shell 的 Act 阶段工具超时（秒） |
+| `LINGCLAW_TOOL_TIMEOUT` | `30` | 非 shell 的 Act 阶段工具超时（秒），不适用于子代理 |
+| `LINGCLAW_SUB_AGENT_TIMEOUT` | `300` | 子代理总执行超时（秒，0=无限，仅 max_turns 和 /stop 限制） |
+| `LINGCLAW_MAX_LLM_RETRIES` | `2` | LLM API 瞬态错误（429/5xx/连接/超时）的 HTTP 级重试次数 |
 | `LINGCLAW_MAX_CONTEXT_TOKENS` | `32000` | 默认上下文 token 预算 |
 | `LINGCLAW_FAST_MODEL` | 无 | 简单首轮查询使用的轻量模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_SUB_AGENT_MODEL` | 无 | 子代理委托任务使用的模型（如 `openai/gpt-4o-mini`） |
@@ -370,6 +374,7 @@ tools:
 - **发现**：系统自动扫描三层目录下的 `agents/*/AGENT.md`，解析 YAML frontmatter
 - **动态注册**：当发现至少一个子代理时，`task` 工具会被动态添加到模型工具列表
 - **隔离执行**：子代理拥有独立的消息历史、过滤后的工具集、独立的 ReAct 循环
+- **超时与安全**：子代理总执行时间受 `subAgentTimeout`（默认 300s）限制，内部各工具保留各自超时；`max_turns` 有 50 轮硬上限；`/stop` 和断开连接可随时取消
 - **Hook 集成**：子代理的工具执行经过 BeforeToolExec / AfterToolExec Hook 链，Reject 事件会转发给父 Agent
 - **递归阻断**：`task` 工具始终被排除在子代理的工具集之外，防止无限委托
 - **事件流**：`task_started`、`task_progress`、`task_tool`、`task_completed`、`task_failed` 事件实时流向前端

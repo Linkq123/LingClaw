@@ -3,6 +3,8 @@
     "port": 18989,
     "execTimeout": 30,
     "toolTimeout": 30,
+    "subAgentTimeout": 300,
+    "maxLlmRetries": 2,
     "maxContextTokens": 32000,
     "maxOutputBytes": 51200,
     "maxFileBytes": 204800

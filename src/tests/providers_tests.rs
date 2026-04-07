@@ -600,7 +600,7 @@ fn call_llm_simple_ollama_sends_auth_and_expected_body() {
     }];
 
     let content = runtime
-        .block_on(async { call_llm_simple(&http, &resolved, &messages).await })
+        .block_on(async { call_llm_simple(&http, &resolved, &messages, 2).await })
         .expect("ollama simple call should succeed");
 
     let request = request_rx.recv().expect("captured request should exist");
@@ -660,7 +660,7 @@ fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
 
     let response = runtime
         .block_on(async {
-            call_llm_stream_ollama(&http, &resolved, &messages, &live_tx, "high", &[]).await
+            call_llm_stream_ollama(&http, &resolved, &messages, &live_tx, "high", &[], 2).await
         })
         .expect("ollama stream call should succeed");
 
@@ -801,4 +801,71 @@ fn anthropic_prompt_caching_can_be_forced_for_compatible_api() {
     };
 
     assert!(anthropic_prompt_caching_enabled(&resolved));
+}
+
+// ── is_transient_llm_error ──────────────────────────────────────────────
+
+#[test]
+fn transient_error_detects_429() {
+    assert!(is_transient_llm_error(
+        "API 429 (after 3 attempts): rate limited"
+    ));
+}
+
+#[test]
+fn transient_error_detects_5xx() {
+    assert!(is_transient_llm_error(
+        "API 502 (after 3 attempts): bad gateway"
+    ));
+    assert!(is_transient_llm_error(
+        "API 500 (after 3 attempts): internal"
+    ));
+    assert!(is_transient_llm_error(
+        "API 503 (after 3 attempts): unavailable"
+    ));
+    assert!(is_transient_llm_error(
+        "API 504 (after 3 attempts): timeout"
+    ));
+}
+
+#[test]
+fn transient_error_detects_http_error() {
+    assert!(is_transient_llm_error("HTTP error: connection reset"));
+    assert!(is_transient_llm_error("HTTP error: request timed out"));
+}
+
+#[test]
+fn transient_error_detects_exhausted_retries() {
+    assert!(is_transient_llm_error(
+        "LLM request failed after all retries"
+    ));
+}
+
+#[test]
+fn transient_error_rejects_stream_errors() {
+    assert!(!is_transient_llm_error(
+        "stream error: connection reset by peer"
+    ));
+}
+
+#[test]
+fn transient_error_rejects_client_disconnected() {
+    assert!(!is_transient_llm_error("Client disconnected"));
+}
+
+#[test]
+fn transient_error_rejects_auth_errors() {
+    assert!(!is_transient_llm_error("API 401: Unauthorized"));
+    assert!(!is_transient_llm_error("API 403: Forbidden"));
+}
+
+#[test]
+fn transient_error_rejects_bad_request() {
+    assert!(!is_transient_llm_error("API 400: Bad Request"));
+}
+
+#[test]
+fn transient_error_rejects_unrecognized() {
+    assert!(!is_transient_llm_error("some random error"));
+    assert!(!is_transient_llm_error(""));
 }
