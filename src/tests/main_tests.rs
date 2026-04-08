@@ -2801,6 +2801,11 @@ fn help_command_lists_usage_without_extra_indent() {
     assert!(
         result
             .response
+            .contains("/system-prompt   Show current system prompt and estimated tokens")
+    );
+    assert!(
+        result
+            .response
             .contains("/mcp [refresh]   Show MCP load status or refresh cache")
     );
     assert!(

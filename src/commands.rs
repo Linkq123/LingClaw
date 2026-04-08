@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     AppState, ChatMessage, MAIN_SESSION_ID, Session, WsTx, agent, build_system_prompt,
-    default_show_react, default_show_reasoning, default_show_tools, memory, now_epoch, prompts,
-    providers,
+    build_system_prompt_with_query, default_show_react, default_show_reasoning, default_show_tools,
+    memory, now_epoch, prompts, providers,
     session_admin::gather_global_today_usage,
     session_store::{build_session_status, build_usage_report, save_session_to_disk},
     tools, truncate, ws_send,
@@ -505,6 +505,51 @@ async fn handle_status_command(current_session_id: &str, state: &AppState) -> Co
     match session {
         Some(session) => {
             command_result(build_runtime_status(&session, state).await, "system", false)
+        }
+        None => command_result("No active session", "system", false),
+    }
+}
+
+async fn handle_system_prompt_command(current_session_id: &str, state: &AppState) -> CommandResult {
+    let session = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(current_session_id).cloned()
+    };
+
+    match session {
+        Some(session) => {
+            let model = session.effective_model(&state.config.model).to_string();
+            let resolved = state.config.resolve_model(&model);
+            let latest_query = session
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .and_then(|message| message.content.as_deref());
+            let system_prompt = build_system_prompt_with_query(
+                &state.config,
+                &session.workspace,
+                &model,
+                &session.disabled_system_skills,
+                latest_query,
+            );
+            let prompt_tokens =
+                crate::context::message_token_len_for_provider(resolved.provider, &system_prompt);
+            let prompt_text = system_prompt.content.unwrap_or_default();
+
+            command_result(
+                format!(
+                    "Current system prompt\nmodel: {}\nprovider: {}\nestimated_tokens: {} ({})\nnote: base system prompt only; excludes per-cycle observation hints and planning/finish nudges.\n{}\n{}",
+                    model,
+                    resolved.provider.label(),
+                    crate::format_token_count(prompt_tokens as u64),
+                    prompt_tokens,
+                    "─".repeat(40),
+                    prompt_text,
+                ),
+                "system",
+                false,
+            )
         }
         None => command_result("No active session", "system", false),
     }
@@ -1133,6 +1178,7 @@ fn handle_help_command(current_session_id: &str) -> CommandResult {
 Commands:
     /new             Compress conversation to memory & clear context
     /status          Show session status
+    /system-prompt   Show current system prompt and estimated tokens
     /mcp [refresh]   Show MCP load status or refresh cache
     /usage           Show session token usage
     /model [name]    Show or switch model
@@ -1288,6 +1334,7 @@ pub(crate) async fn handle_command(
 
         "/model" => Some(handle_model_command(arg, current_session_id, state).await),
         "/status" => Some(handle_status_command(current_session_id, state).await),
+        "/system-prompt" => Some(handle_system_prompt_command(current_session_id, state).await),
         "/mcp" => Some(handle_mcp_command_with_arg(arg, current_session_id, state).await),
         "/usage" => Some(handle_usage_command(current_session_id, state).await),
         "/clear" => Some(handle_clear_command(current_session_id, state).await),

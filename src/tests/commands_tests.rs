@@ -313,6 +313,118 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
 }
 
 #[tokio::test]
+async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
+    let workspace = unique_temp_workspace("lingclaw-command-system-prompt");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let state = AppState {
+        config: crate::Config {
+            api_key: "env-key".to_string(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            fast_model: None,
+            sub_agent_model: None,
+            memory_model: None,
+            provider: crate::Provider::OpenAI,
+            anthropic_prompt_caching: false,
+            providers: HashMap::new(),
+            mcp_servers: HashMap::new(),
+            port: crate::DEFAULT_PORT,
+            max_context_tokens: 32000,
+            exec_timeout: Duration::from_secs(30),
+            tool_timeout: Duration::from_secs(30),
+            sub_agent_timeout: Duration::from_secs(300),
+            max_llm_retries: 2,
+            max_output_bytes: 50 * 1024,
+            max_file_bytes: 200 * 1024,
+            openai_stream_include_usage: false,
+            structured_memory: false,
+        },
+        http: reqwest::Client::new(),
+        sessions: Mutex::new(HashMap::new()),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+        memory_queue: None,
+    };
+
+    let mut session = Session {
+        id: MAIN_SESSION_ID.to_string(),
+        name: "Main".to_string(),
+        messages: Vec::new(),
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: "estimated".to_string(),
+        output_token_source: "estimated".to_string(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        model_override: None,
+        think_level: "auto".to_string(),
+        show_react: true,
+        show_tools: true,
+        show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
+        version: 4,
+        workspace: workspace.clone(),
+    };
+    let model = session.effective_model(&state.config.model).to_string();
+    session.messages.push(build_system_prompt(
+        &state.config,
+        &workspace,
+        &model,
+        &session.disabled_system_skills,
+    ));
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("Explain the current runtime architecture.".into()),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(MAIN_SESSION_ID.to_string(), session);
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+    let result = handle_command(
+        "/system-prompt",
+        MAIN_SESSION_ID,
+        1,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("command should resolve");
+
+    assert_eq!(result.response_type, "system");
+    assert!(result.response.contains("Current system prompt"));
+    assert!(result.response.contains("estimated_tokens:"));
+    assert!(result.response.contains("provider: openai"));
+    assert!(result.response.contains("## Environment"));
+    assert!(result.response.contains("─"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
 async fn switch_command_is_blocked_in_single_session_mode() {
     let state = AppState {
         config: crate::Config {
