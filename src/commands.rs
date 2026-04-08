@@ -1224,6 +1224,9 @@ async fn handle_agents_command(current_session_id: &str, state: &AppState) -> Co
         }
     };
 
+    // Ensure MCP tool cache is warm so the tool listing includes MCP tools.
+    crate::tools::mcp::ensure_tools_cached(config, &workspace).await;
+
     let agents = crate::subagents::discovery::discover_all_agents(&workspace);
     if agents.is_empty() {
         return command_result(
@@ -1240,7 +1243,7 @@ async fn handle_agents_command(current_session_id: &str, state: &AppState) -> Co
     let mut lines = Vec::with_capacity(agents.len() + 2);
     lines.push(format!("**{} sub-agent(s) available:**\n", agents.len()));
     for agent in &agents {
-        let tools = crate::subagents::filter_tools_for_agent(agent);
+        let tools = crate::subagents::filter_tools_for_agent_with_mcp(agent, config, &workspace);
         let tool_list = if tools.is_empty() {
             "(no tools)".to_string()
         } else {

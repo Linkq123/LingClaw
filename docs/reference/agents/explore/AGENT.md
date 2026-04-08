@@ -2,9 +2,10 @@
 name: explore
 description: "Fast read-only codebase exploration and analysis. Use for searching code, reading files, understanding project structure."
 max_turns: 10
+mcp_policy: read_only
 tools:
   allow: [think, read_file, list_dir, search_files]
-  deny: [exec, write_file, patch_file, delete_file, http_fetch]
+  deny: []
 ---
 
 You are a fast, focused codebase exploration agent. Your job is to:

@@ -15,9 +15,9 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 ## Features
 
 - **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
-- **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断；server 启动连续失败会进入短暂冷却，避免请求风暴
+- **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；主 Agent 与子代理都会按需发现并使用这些 MCP tools；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断；server 启动连续失败会进入短暂冷却，避免请求风暴
 - **单主会话**：运行时固定使用 `main`，不再创建、切换或删除其他会话
-- **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、coder）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤
+- **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、coder）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
 - **文档化斜杠命令**：`/new`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/mcp`、`/usage`、`/clear`、`/memory`、`/help`
 - **三 Provider 模型路由**：OpenAI + Anthropic + Ollama，支持 `provider/model` 和纯 model ID
 - **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
@@ -181,6 +181,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 - `start` / `restart` 的 MCP 预检使用受限的一次性探测，不会把预检进程保留为运行时 MCP 会话；`mcp-check` 会按配置的运行时超时做更深诊断
 - `/mcp` 会在聊天页面列出当前已加载的 MCP servers；如果某个 server 失败，页面会显示失败原因，便于排查启动、命令解析或超时问题
 - `/mcp refresh` 会清空当前 workspace 对应的 MCP 工具缓存、空闲会话和最近失败冷却状态，然后重新探测已启用 servers；运行时空闲 MCP 会话也会自动回收，`notifications/tools/list_changed` 会触发下一次工具发现时自动刷新
+- 子代理执行和 `/agents` 展示都会在使用前按需预热 MCP 工具缓存，因此首次使用也能拿到最新的 MCP 工具列表
 
 聊天页运行时交互说明：
 
@@ -239,7 +240,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 | `/skills-system [install\|uninstall <pattern>]` | 列出系统内置 Skills 状态；`install`/`uninstall` 子命令可运行时启用/禁用 Skill 或 Skill 组（如 `anthropics`、`anthropics/pdf`） |
 | `/skills-global` | 仅列出全局 Skills（`~/.lingclaw/skills/`） |
 | `/skills-session` | 仅列出当前 session Skills（workspace `skills/`） |
-| `/agents` | 列出已发现的子代理（含来源标签：system / global / session） |
+| `/agents` | 列出已发现的子代理（含来源标签）以及每个子代理当前可用的有效工具列表（含 MCP 工具） |
 | `/status` | 显示模型、provider、上下文估算、最大输出 token、思维级别，token 数值按 K/M 显示 |
 | `/mcp [refresh]` | 查看当前已加载的 MCP server 状态；加上 `refresh` 时强制刷新工具缓存并重建运行时 MCP 会话 |
 | `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；单会话模式下同时显示主会话今日总 token 估算，按 K/M 显示 |
@@ -360,6 +361,8 @@ tools:
 详细的行为指令...
 ```
 
+`tools.allow` / `tools.deny` 同时作用于内置工具和 `mcp__...` 形式暴露出的 MCP 工具名。若启用了 MCP server，可先用 `/agents` 查看当前子代理的有效工具列表，再决定是否在 `AGENT.md` 中做精确白名单或黑名单控制。
+
 ### 模型选择
 
 所有子代理统一使用配置文件中的模型设置：
@@ -373,12 +376,12 @@ tools:
 
 - **发现**：系统自动扫描三层目录下的 `agents/*/AGENT.md`，解析 YAML frontmatter
 - **动态注册**：当发现至少一个子代理时，`task` 工具会被动态添加到模型工具列表
-- **隔离执行**：子代理拥有独立的消息历史、过滤后的工具集、独立的 ReAct 循环
+- **隔离执行**：子代理拥有独立的消息历史、过滤后的工具集、独立的 ReAct 循环；工具集同时可包含内置工具和 MCP 工具
 - **超时与安全**：子代理总执行时间受 `subAgentTimeout`（默认 300s）限制，内部各工具保留各自超时；`max_turns` 有 50 轮硬上限；`/stop` 和断开连接可随时取消
 - **Hook 集成**：子代理的工具执行经过 BeforeToolExec / AfterToolExec Hook 链，Reject 事件会转发给父 Agent
 - **递归阻断**：`task` 工具始终被排除在子代理的工具集之外，防止无限委托
 - **事件流**：`task_started`、`task_progress`、`task_tool`、`task_completed`、`task_failed` 事件实时流向前端
-- **查看代理**：`/agents` 列出所有已发现的子代理及其来源
+- **查看代理**：`/agents` 列出所有已发现的子代理、来源以及当前过滤后的有效工具列表
 
 ---
 
@@ -541,8 +544,8 @@ src/
     ├── exec.rs        (~60 行)   — exec (shell), think (scratchpad)
     └── mcp.rs         (~1250 行) — stdio MCP 工具发现/执行桥接, 会话缓存, preflight
 ├── subagents/
-│   ├── mod.rs         (~220 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, 工具过滤
-│   ├── executor.rs    (~400 行)  — 隔离 mini-ReAct 执行循环, Hook 集成, 父级事件流
+│   ├── mod.rs         (~220 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, 工具过滤（含 MCP）
+│   ├── executor.rs    (~400 行)  — 隔离 mini-ReAct 执行循环, Hook 集成, MCP 工具调度, 父级事件流
 │   └── discovery.rs   (~200 行)  — 三层发现 (system/global/session), YAML frontmatter 解析
 
 static/

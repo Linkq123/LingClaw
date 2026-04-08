@@ -64,6 +64,7 @@ fn test_render_agents_catalog_with_agents() {
             system_prompt: String::new(),
             max_turns: 10,
             tools: ToolPermissions::default(),
+            mcp_policy: None,
             source: AgentSource::System,
             path: String::new(),
         },
@@ -73,6 +74,7 @@ fn test_render_agents_catalog_with_agents() {
             system_prompt: String::new(),
             max_turns: 15,
             tools: ToolPermissions::default(),
+            mcp_policy: None,
             source: AgentSource::Global,
             path: String::new(),
         },
@@ -186,6 +188,7 @@ fn test_filter_tools_for_agent() {
             allow: vec!["read_file".into(), "list_dir".into()],
             deny: vec![],
         },
+        mcp_policy: None,
         source: AgentSource::System,
         path: String::new(),
     };
@@ -196,24 +199,213 @@ fn test_filter_tools_for_agent() {
     assert!(!tools.contains(&"task".to_string()));
 }
 
+#[test]
+fn test_filter_tools_for_agent_with_mcp_no_servers() {
+    // When no MCP servers are configured, with_mcp yields the same result as the built-in filter.
+    let spec = SubAgentSpec {
+        name: "test".into(),
+        description: String::new(),
+        system_prompt: String::new(),
+        max_turns: 10,
+        tools: ToolPermissions {
+            allow: vec!["read_file".into(), "list_dir".into()],
+            deny: vec![],
+        },
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+    let config = base_config();
+    let workspace = std::env::temp_dir();
+    let tools = crate::subagents::filter_tools_for_agent_with_mcp(&spec, &config, &workspace);
+    assert!(tools.contains(&"read_file".to_string()));
+    assert!(tools.contains(&"list_dir".to_string()));
+    assert!(!tools.contains(&"exec".to_string()));
+    assert!(!tools.contains(&"task".to_string()));
+
+    // Should match built-in-only filter when no MCP tools exist.
+    let builtin_only = crate::subagents::filter_tools_for_agent(&spec);
+    assert_eq!(tools, builtin_only);
+}
+
+// --- MCP policy and tool classification tests ---
+
+use crate::subagents::{McpPolicy, is_mcp_tool_read_only};
+use crate::tools::mcp::McpToolDescriptor;
+
+fn make_mcp_descriptor(raw_name: &str, description: &str) -> McpToolDescriptor {
+    McpToolDescriptor {
+        server_name: "test-server".into(),
+        raw_name: raw_name.into(),
+        exposed_name: format!("mcp__test_server__{raw_name}"),
+        description: description.into(),
+        input_schema: serde_json::json!({}),
+    }
+}
+
+#[test]
+fn test_mcp_tool_classification_read_only() {
+    // Tools with read-only names should be classified as read-only.
+    assert!(is_mcp_tool_read_only(&make_mcp_descriptor(
+        "get_file_contents",
+        "Retrieve the contents of a file"
+    )));
+    assert!(is_mcp_tool_read_only(&make_mcp_descriptor(
+        "list_repos",
+        "List available repositories"
+    )));
+    assert!(is_mcp_tool_read_only(&make_mcp_descriptor(
+        "search_code",
+        "Search for code patterns"
+    )));
+    assert!(is_mcp_tool_read_only(&make_mcp_descriptor(
+        "describe_table",
+        "Show table schema information"
+    )));
+}
+
+#[test]
+fn test_mcp_tool_classification_mutating() {
+    // Tools with mutation keywords in name should NOT be classified as read-only.
+    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
+        "create_issue",
+        "Create a new GitHub issue"
+    )));
+    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
+        "delete_branch",
+        "Delete a git branch"
+    )));
+    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
+        "update_pull_request",
+        "Update a pull request"
+    )));
+    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
+        "execute_query",
+        "Execute a SQL query"
+    )));
+    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
+        "send_message",
+        "Send a chat message"
+    )));
+}
+
+#[test]
+fn test_mcp_tool_classification_description_only_mutation() {
+    // Tool with innocent name but mutation keyword in description.
+    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
+        "query",
+        "Execute and modify database records"
+    )));
+    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
+        "manage_workflow",
+        "Start or stop CI workflows"
+    )));
+}
+
+#[test]
+fn test_mcp_tool_classification_no_false_positives_from_substrings() {
+    // Words like "offset", "settings", "address" contain short keywords
+    // but should NOT trigger a mutation classification.
+    assert!(is_mcp_tool_read_only(&make_mcp_descriptor(
+        "get_offset",
+        "Retrieve the current offset"
+    )));
+    assert!(is_mcp_tool_read_only(&make_mcp_descriptor(
+        "read_settings",
+        "Load settings from configuration"
+    )));
+    assert!(is_mcp_tool_read_only(&make_mcp_descriptor(
+        "lookup_address",
+        "Look up an address record"
+    )));
+}
+
+#[test]
+fn test_parse_agent_frontmatter_with_mcp_policy() {
+    let content = r#"---
+name: smart-reader
+description: "A smart reader agent"
+mcp_policy: read_only
+tools:
+  allow: [read_file, list_dir]
+  deny: []
+---
+
+Smart reader.
+"#;
+    let spec = crate::subagents::discovery::parse_agent_frontmatter_for_test(content)
+        .expect("should parse");
+    assert_eq!(spec.name, "smart-reader");
+    assert_eq!(spec.mcp_policy, Some(McpPolicy::ReadOnly));
+}
+
+#[test]
+fn test_parse_agent_frontmatter_mcp_policy_all() {
+    let content = r#"---
+name: power-agent
+mcp_policy: all
+---
+
+Power agent.
+"#;
+    let spec = crate::subagents::discovery::parse_agent_frontmatter_for_test(content)
+        .expect("should parse");
+    assert_eq!(spec.mcp_policy, Some(McpPolicy::All));
+}
+
+#[test]
+fn test_parse_agent_frontmatter_no_mcp_policy() {
+    let content = r#"---
+name: classic-agent
+tools:
+  allow: [read_file]
+  deny: []
+---
+
+Classic agent.
+"#;
+    let spec = crate::subagents::discovery::parse_agent_frontmatter_for_test(content)
+        .expect("should parse");
+    assert_eq!(spec.mcp_policy, None);
+}
+
+#[test]
+fn test_parse_agent_frontmatter_invalid_mcp_policy() {
+    let content = r#"---
+name: bad-policy
+mcp_policy: something_invalid
+---
+
+Bad policy.
+"#;
+    let spec = crate::subagents::discovery::parse_agent_frontmatter_for_test(content)
+        .expect("should parse");
+    assert_eq!(spec.mcp_policy, None); // unknown values are ignored
+}
+
 // --- Sub-agent model resolution tests ---
 // These tests call the production `resolve_subagent_model()` function.
 
 use crate::Config;
-use crate::config::Provider;
+use crate::config::{JsonMcpServerConfig, Provider};
 use crate::hooks::{AgentHook, HookInput, HookOutput, HookRegistry, ToolHookInput};
 use crate::subagents::executor::resolve_subagent_model;
 use std::collections::HashMap;
+use std::fs;
 use std::future::Future;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::process::Command as StdCommand;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 use std::time::Duration;
+
+const MOCK_MCP_SERVER_SOURCE: &str = include_str!("fixtures/mock_mcp_server.rs");
 
 fn base_config() -> Config {
     Config {
@@ -238,6 +430,71 @@ fn base_config() -> Config {
         max_file_bytes: 200 * 1024,
         structured_memory: false,
     }
+}
+
+fn unique_temp_workspace(prefix: &str) -> PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{unique}"))
+}
+
+fn mock_server_binary() -> &'static PathBuf {
+    static BINARY: OnceLock<PathBuf> = OnceLock::new();
+    BINARY.get_or_init(|| {
+        let helper_dir = std::env::temp_dir().join("lingclaw-subagent-mcp-test-helper");
+        fs::create_dir_all(&helper_dir).expect("helper dir should exist");
+
+        let source_path = helper_dir.join("mock_mcp_server.rs");
+        let binary_path = helper_dir.join(if cfg!(windows) {
+            "mock_mcp_server.exe"
+        } else {
+            "mock_mcp_server"
+        });
+
+        fs::write(&source_path, MOCK_MCP_SERVER_SOURCE).expect("helper source should write");
+        let status = StdCommand::new("rustc")
+            .arg("--edition=2021")
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&binary_path)
+            .status()
+            .expect("rustc should run");
+        assert!(status.success(), "mock MCP server should compile");
+
+        binary_path
+    })
+}
+
+fn base_config_with_mock_mcp_server(mode: &str, log_path: &Path) -> Config {
+    let mut config = base_config();
+    config.mcp_servers.insert(
+        "mock".to_string(),
+        JsonMcpServerConfig {
+            command: mock_server_binary().display().to_string(),
+            args: Vec::new(),
+            env: HashMap::from([
+                ("LINGCLAW_MCP_MODE".to_string(), mode.to_string()),
+                (
+                    "LINGCLAW_MCP_LOG".to_string(),
+                    log_path.display().to_string(),
+                ),
+            ]),
+            cwd: None,
+            enabled: true,
+            timeout_secs: Some(5),
+        },
+    );
+    config
+}
+
+fn log_line_count(log_path: &Path, needle: &str) -> usize {
+    fs::read_to_string(log_path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| line.contains(needle))
+        .count()
 }
 
 fn find_headers_end(buf: &[u8]) -> Option<usize> {
@@ -541,6 +798,7 @@ async fn run_subagent_timeout_during_tool_exec_still_runs_after_tool_exec_hook()
             allow: vec!["exec".into()],
             deny: vec![],
         },
+        mcp_policy: None,
         source: AgentSource::System,
         path: String::new(),
     };
@@ -574,4 +832,72 @@ async fn run_subagent_timeout_during_tool_exec_still_runs_after_tool_exec_hook()
     assert_eq!(outcome.cycles, 1);
     assert_eq!(outcome.tool_calls, 1);
     assert!(outcome.result.contains("timed out after"));
+}
+
+#[tokio::test]
+async fn run_subagent_executes_mcp_tool_allowed_by_policy() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-mcp-policy");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    let log_path = workspace.join("mock.log");
+
+    let mut config = base_config_with_mock_mcp_server("normal", &log_path);
+    let reports = crate::tools::mcp::inspect_servers(&config, &workspace).await;
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].error.is_none(), "{:?}", reports[0].error);
+    let tool_name = reports[0]
+        .tool_names
+        .first()
+        .cloned()
+        .expect("mock MCP server should expose a tool");
+
+    let response_body = build_openai_tool_call_stream(
+        &tool_name,
+        serde_json::json!({
+            "value": "left"
+        }),
+    );
+    let (api_base, handle) = spawn_one_shot_http_server("text/event-stream", response_body);
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+
+    let spec = SubAgentSpec {
+        name: "mcp-reader".into(),
+        description: String::new(),
+        system_prompt: "Use the delegated MCP tool when needed.".into(),
+        max_turns: 1,
+        tools: ToolPermissions {
+            allow: vec!["think".into(), "read_file".into()],
+            deny: vec![],
+        },
+        mcp_policy: Some(McpPolicy::ReadOnly),
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(16);
+    let http = reqwest::Client::new();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Call the available read-only MCP tool.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &HookRegistry::new(),
+    )
+    .await;
+
+    handle.join().expect("server thread should join");
+
+    let tools_call_count = log_line_count(&log_path, "tools/call");
+
+    let _ = crate::tools::mcp::refresh_servers(&config, &workspace).await;
+    let _ = fs::remove_dir_all(&workspace);
+
+    assert_eq!(outcome.cycles, 1);
+    assert_eq!(outcome.tool_calls, 1);
+    assert!(!outcome.aborted);
+    assert_eq!(tools_call_count, 1);
 }

@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use super::{AgentSource, SubAgentSpec, ToolPermissions};
+use super::{AgentSource, McpPolicy, SubAgentSpec, ToolPermissions};
 
 const AGENTS_DIR: &str = "agents";
 const AGENT_FILE: &str = "AGENT.md";
@@ -157,6 +157,7 @@ fn parse_agent_frontmatter(content: &str) -> Option<SubAgentSpec> {
     let mut name = None;
     let mut description = None;
     let mut max_turns = None;
+    let mut mcp_policy = None;
     let mut allow_tools = Vec::new();
     let mut deny_tools = Vec::new();
 
@@ -186,6 +187,14 @@ fn parse_agent_frontmatter(content: &str) -> Option<SubAgentSpec> {
                 in_tools = false;
             } else if let Some(val) = trimmed_line.strip_prefix("max_turns:") {
                 max_turns = val.trim().parse().ok();
+                in_tools = false;
+            } else if let Some(val) = trimmed_line.strip_prefix("mcp_policy:") {
+                let policy_str = unquote_yaml_value(val);
+                mcp_policy = match policy_str.as_str() {
+                    "read_only" => Some(McpPolicy::ReadOnly),
+                    "all" => Some(McpPolicy::All),
+                    _ => None,
+                };
                 in_tools = false;
             } else if trimmed_line.starts_with("tools:") {
                 in_tools = true;
@@ -235,6 +244,7 @@ fn parse_agent_frontmatter(content: &str) -> Option<SubAgentSpec> {
             allow: allow_tools,
             deny: deny_tools,
         },
+        mcp_policy,
         source: AgentSource::System, // placeholder — caller overrides
         path: String::new(),
     })

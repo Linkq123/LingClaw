@@ -30,12 +30,12 @@ static MCP_SESSION_CACHE: OnceLock<Mutex<HashMap<String, CachedMcpSession>>> = O
 static MCP_SPAWN_FAILURES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
-struct McpToolDescriptor {
-    server_name: String,
-    raw_name: String,
-    exposed_name: String,
-    description: String,
-    input_schema: Value,
+pub(crate) struct McpToolDescriptor {
+    pub(crate) server_name: String,
+    pub(crate) raw_name: String,
+    pub(crate) exposed_name: String,
+    pub(crate) description: String,
+    pub(crate) input_schema: Value,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +85,13 @@ pub(crate) fn runtime_tool_note(config: &Config) -> Option<String> {
         "Additional MCP tools may be injected at runtime from configured MCP servers: {}. MCP tool names are prefixed with 'mcp__'.",
         names.join(", ")
     ))
+}
+
+/// Ensure MCP tool descriptors are cached for all enabled servers.
+/// Triggers async discovery for any server whose cache entry is missing or expired.
+/// Safe to call multiple times — hits cache on subsequent calls within the TTL window.
+pub(crate) async fn ensure_tools_cached(config: &Config, workspace: &Path) {
+    let _ = list_tools(config, workspace).await;
 }
 
 pub(crate) async fn tool_definitions_openai(config: &Config, workspace: &Path) -> Vec<Value> {
@@ -472,7 +479,7 @@ async fn list_tools(config: &Config, workspace: &Path) -> Vec<McpToolDescriptor>
     tools
 }
 
-fn cached_list_tools(config: &Config, workspace: &Path) -> Vec<McpToolDescriptor> {
+pub(crate) fn cached_list_tools(config: &Config, workspace: &Path) -> Vec<McpToolDescriptor> {
     let mut server_names: Vec<&str> = config
         .mcp_servers
         .iter()

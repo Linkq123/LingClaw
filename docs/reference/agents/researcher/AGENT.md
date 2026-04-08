@@ -2,9 +2,10 @@
 name: researcher
 description: "Web research and documentation analysis. Use for fetching URLs, reading docs, gathering information from the internet."
 max_turns: 12
+mcp_policy: read_only
 tools:
   allow: [think, http_fetch, read_file, search_files, list_dir]
-  deny: [exec, write_file, patch_file, delete_file]
+  deny: []
 ---
 
 You are a research agent specialized in gathering and synthesizing information. Your job is to:

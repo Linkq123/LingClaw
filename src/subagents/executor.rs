@@ -98,12 +98,17 @@ pub(crate) async fn run_subagent(
     let model_id = resolve_subagent_model(config).to_string();
     let resolved = config.resolve_model(&model_id);
 
-    // Build filtered tool definitions for this sub-agent.
-    let allowed_tools = super::filter_tools_for_agent(spec);
-    let tool_defs = build_filtered_tool_defs(&allowed_tools, resolved.provider);
+    // Ensure MCP tool cache is warm before building the sub-agent tool set.
+    // The main loop's Analyze phase usually warms it, but cache may have expired
+    // (TTL=30s) if LLM inference was slow, or if this is a re-invocation.
+    tools::mcp::ensure_tools_cached(config, workspace).await;
+
+    // Build filtered tool definitions for this sub-agent (includes MCP tools).
+    let allowed_tools = super::filter_tools_for_agent_with_mcp(spec, config, workspace);
+    let tool_defs = build_filtered_tool_defs(&allowed_tools, config, workspace, resolved.provider);
 
     // Build isolated message history.
-    let system_prompt = build_subagent_system_prompt(spec, &allowed_tools, config);
+    let system_prompt = build_subagent_system_prompt(spec, &allowed_tools, config, workspace);
     let mut messages: Vec<ChatMessage> = vec![
         ChatMessage {
             role: "system".into(),
@@ -263,8 +268,9 @@ pub(crate) async fn run_subagent(
                             break 'react;
                         }
 
-                        // Check tool permission
-                        if !spec.tools.is_allowed(&tc.function.name) {
+                        // Check tool permission against the pre-computed
+                        // allowed list (accounts for mcp_policy + deny overrides).
+                        if !allowed_tools.iter().any(|t| t == &tc.function.name) {
                             let result_msg = format!(
                                 "Tool '{}' is not allowed for sub-agent '{}'",
                                 tc.function.name, spec.name
@@ -466,19 +472,29 @@ pub(crate) async fn run_subagent(
 fn build_subagent_system_prompt(
     spec: &SubAgentSpec,
     allowed_tools: &[String],
-    _config: &Config,
+    config: &Config,
+    workspace: &Path,
 ) -> String {
     let tool_list = if allowed_tools.is_empty() {
         "(no tools available)".to_string()
     } else {
+        // Build a lookup of MCP tool descriptions from cache.
+        let mcp_descriptors = tools::mcp::cached_list_tools(config, workspace);
+        let mcp_desc_map: std::collections::HashMap<&str, &str> = mcp_descriptors
+            .iter()
+            .map(|d| (d.exposed_name.as_str(), d.description.as_str()))
+            .collect();
+
         allowed_tools
             .iter()
             .enumerate()
             .map(|(i, name)| {
+                // Try built-in description first, then MCP description.
                 let desc = crate::tools::tool_specs()
                     .iter()
                     .find(|ts| ts.name == name)
                     .map(|ts| ts.description)
+                    .or_else(|| mcp_desc_map.get(name.as_str()).copied())
                     .unwrap_or("");
                 format!("{}. **{}** — {}", i + 1, name, desc)
             })
@@ -504,10 +520,12 @@ fn build_subagent_system_prompt(
 
 fn build_filtered_tool_defs(
     allowed_tools: &[String],
+    config: &Config,
+    workspace: &Path,
     provider: crate::config::Provider,
 ) -> Vec<serde_json::Value> {
     let all_specs = crate::tools::tool_specs();
-    all_specs
+    let mut defs: Vec<serde_json::Value> = all_specs
         .iter()
         .filter(|ts| allowed_tools.iter().any(|a| a == ts.name))
         .map(|spec| match provider {
@@ -529,12 +547,42 @@ fn build_filtered_tool_defs(
                 })
             }
         })
-        .collect()
+        .collect();
+
+    // Append MCP tool definitions from cache.
+    let mcp_descriptors = tools::mcp::cached_list_tools(config, workspace);
+    for descriptor in mcp_descriptors {
+        if !allowed_tools.iter().any(|a| a == &descriptor.exposed_name) {
+            continue;
+        }
+        let def = match provider {
+            crate::config::Provider::OpenAI | crate::config::Provider::Ollama => {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": descriptor.exposed_name,
+                        "description": descriptor.description,
+                        "parameters": descriptor.input_schema,
+                    }
+                })
+            }
+            crate::config::Provider::Anthropic => {
+                json!({
+                    "name": descriptor.exposed_name,
+                    "description": descriptor.description,
+                    "input_schema": descriptor.input_schema,
+                })
+            }
+        };
+        defs.push(def);
+    }
+
+    defs
 }
 
 /// Execute a tool within the sub-agent context.
-/// Uses the same tool registry as the parent, but goes through the built-in
-/// execute path only (no MCP tools for sub-agents to keep isolation simple).
+/// Tries MCP tools first (matching the main loop pattern), then falls back
+/// to the built-in tool registry.
 async fn execute_subagent_tool(
     name: &str,
     args_str: &str,
@@ -542,5 +590,9 @@ async fn execute_subagent_tool(
     http: &Client,
     workspace: &Path,
 ) -> tools::ToolOutcome {
-    tools::execute_tool(name, args_str, config, http, workspace).await
+    if let Some(result) = tools::mcp::execute_tool(name, args_str, config, workspace).await {
+        result
+    } else {
+        tools::execute_tool(name, args_str, config, http, workspace).await
+    }
 }
