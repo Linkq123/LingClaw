@@ -580,6 +580,13 @@ impl Config {
         }
         self.max_context_tokens
     }
+
+    /// Check if a model supports image input based on its config `input` array.
+    pub(crate) fn model_supports_image(&self, model_ref: &str) -> bool {
+        self.find_model_entry(model_ref)
+            .and_then(|e| e.input.as_ref())
+            .is_some_and(|inputs| inputs.iter().any(|i| i == "image"))
+    }
 }
 
 // ── Config File (lingclaw.json) ──────────────────────────────────────────────

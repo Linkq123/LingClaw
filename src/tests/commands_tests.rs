@@ -170,6 +170,7 @@ async fn status_command_reports_runtime_request_estimate() {
     session.messages.push(ChatMessage {
         role: "user".into(),
         content: Some("Summarize the current backend architecture.".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -391,6 +392,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
     session.messages.push(ChatMessage {
         role: "user".into(),
         content: Some("Explain the current runtime architecture.".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,

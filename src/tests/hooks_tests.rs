@@ -948,6 +948,7 @@ async fn run_llm_hooks_chained_extra_system_visible_to_next_hook() {
         messages: vec![ChatMessage {
             role: "system".to_string(),
             content: Some("Base system prompt.".to_string()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -991,6 +992,7 @@ async fn prune_messages_trims_local_snapshot_to_fit_budget() {
         ChatMessage {
             role: "system".to_string(),
             content: Some("System prompt.".to_string()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -998,6 +1000,7 @@ async fn prune_messages_trims_local_snapshot_to_fit_budget() {
         ChatMessage {
             role: "user".to_string(),
             content: Some("First question with some context padding text.".to_string()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1005,6 +1008,7 @@ async fn prune_messages_trims_local_snapshot_to_fit_budget() {
         ChatMessage {
             role: "assistant".to_string(),
             content: Some("First answer with extra padding to push tokens.".to_string()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1012,6 +1016,7 @@ async fn prune_messages_trims_local_snapshot_to_fit_budget() {
         ChatMessage {
             role: "user".to_string(),
             content: Some("Second question.".to_string()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1019,6 +1024,7 @@ async fn prune_messages_trims_local_snapshot_to_fit_budget() {
         ChatMessage {
             role: "assistant".to_string(),
             content: Some("Second answer.".to_string()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1469,6 +1475,7 @@ async fn reprune_integration_hook_extra_system_triggers_prune_and_fits_budget() 
     let mut messages = vec![ChatMessage {
         role: "system".to_string(),
         content: Some("You are a helpful assistant.".to_string()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1479,6 +1486,7 @@ async fn reprune_integration_hook_extra_system_triggers_prune_and_fits_budget() 
         messages.push(ChatMessage {
             role: "user".to_string(),
             content: Some(format!("Q{i}: {padding}")),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1486,6 +1494,7 @@ async fn reprune_integration_hook_extra_system_triggers_prune_and_fits_budget() 
         messages.push(ChatMessage {
             role: "assistant".to_string(),
             content: Some(format!("A{i}: {padding}")),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,

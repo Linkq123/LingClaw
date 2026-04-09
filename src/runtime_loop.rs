@@ -134,6 +134,7 @@ async fn run_post_execution_reflection(
         ChatMessage {
             role: "system".into(),
             content: Some(system_prompt),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -141,6 +142,7 @@ async fn run_post_execution_reflection(
         ChatMessage {
             role: "user".into(),
             content: Some(excerpt),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -148,10 +150,15 @@ async fn run_post_execution_reflection(
     ];
 
     let resolved = config.resolve_model(model);
-    let reflection =
-        providers::call_llm_simple(http, &resolved, &prompt_messages, config.max_llm_retries)
-            .await
-            .map_err(|e| format!("Reflection LLM call failed: {e}"))?;
+    let reflection = providers::call_llm_simple(
+        http,
+        &resolved,
+        &prompt_messages,
+        workspace,
+        config.max_llm_retries,
+    )
+    .await
+    .map_err(|e| format!("Reflection LLM call failed: {e}"))?;
 
     let reflection = reflection.trim();
     if reflection.is_empty() {
@@ -934,6 +941,7 @@ async fn record_tool_result(
             session.messages.push(ChatMessage {
                 role: "tool".into(),
                 content: Some(result.output),
+                images: None,
                 tool_calls: None,
                 tool_call_id: Some(tc.id.clone()),
                 timestamp: Some(now_epoch()),
@@ -1143,6 +1151,7 @@ async fn run_analyze_phase(
                 &ctx.state.http,
                 &resolved,
                 &final_msgs_snapshot,
+                &phase_state.cycle_workspace,
                 ctx.live_tx,
                 &effective_think,
                 &extra_tools,

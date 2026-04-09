@@ -60,7 +60,9 @@ use runtime_loop::{
     run_agent_session,
 };
 use session_store::{load_session_from_disk, refresh_session_system_prompt, save_session_to_disk};
-use socket_sync::{send_command_refresh, send_existing_session_payloads};
+use socket_sync::{
+    build_session_info_payload, send_command_refresh, send_existing_session_payloads,
+};
 use socket_tasks::{ConnectionCleanup, finalize_connection, spawn_connection_tasks};
 
 #[cfg(test)]
@@ -90,10 +92,29 @@ const INBOUND_BUFFER_CAPACITY: usize = 128;
 // ── Data Models ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
+struct ImageAttachment {
+    url: String,
+    /// Persisted path to a cached base64 file inside the session workspace.
+    /// This keeps historical Ollama images available across restarts without
+    /// bloating the session JSON itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_path: Option<String>,
+    /// Cached base64-encoded image data.  Populated at intake so Ollama
+    /// requests never re-fetch historical URLs.  Not persisted to disk
+    /// (`skip_serializing`) to avoid bloating session files; after a reload
+    /// the disk cache or legacy network fallback in `fetch_images_base64`
+    /// handles it.
+    #[serde(skip_serializing, default)]
+    data: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct ChatMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<ImageAttachment>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -453,6 +474,7 @@ Only read those files if the user explicitly asks to inspect them, if you need t
     ChatMessage {
         role: "system".into(),
         content: Some(prompt),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,

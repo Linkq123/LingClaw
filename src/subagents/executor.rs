@@ -113,6 +113,7 @@ pub(crate) async fn run_subagent(
         ChatMessage {
             role: "system".into(),
             content: Some(system_prompt),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -120,6 +121,7 @@ pub(crate) async fn run_subagent(
         ChatMessage {
             role: "user".into(),
             content: Some(prompt.to_string()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -210,6 +212,7 @@ pub(crate) async fn run_subagent(
                         http,
                         &resolved,
                         &messages,
+                        workspace,
                         &sub_tx,
                         think_level,
                         &tool_defs,
@@ -278,6 +281,7 @@ pub(crate) async fn run_subagent(
                             messages.push(ChatMessage {
                                 role: "tool".into(),
                                 content: Some(result_msg),
+                                images: None,
                                 tool_calls: None,
                                 tool_call_id: Some(tc.id.clone()),
                                 timestamp: None,
@@ -316,6 +320,7 @@ pub(crate) async fn run_subagent(
                                 messages.push(ChatMessage {
                                     role: "tool".into(),
                                     content: Some(format!("[rejected by hook] {reason}")),
+                                    images: None,
                                     tool_calls: None,
                                     tool_call_id: Some(tc.id.clone()),
                                     timestamp: None,
@@ -399,6 +404,7 @@ pub(crate) async fn run_subagent(
                         messages.push(ChatMessage {
                             role: "tool".into(),
                             content: Some(outcome.output),
+                            images: None,
                             tool_calls: None,
                             tool_call_id: Some(tc.id.clone()),
                             timestamp: None,

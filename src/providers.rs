@@ -1,5 +1,8 @@
 use std::{
     collections::HashMap,
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -8,7 +11,13 @@ use reqwest::{Client, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use base64::Engine;
+
 use crate::{ChatMessage, FunctionCall, LiveTx, Provider, ToolCall, live_send, tools};
+
+/// Maximum size for a single image fetched for Ollama base64 encoding (10 MB).
+const MAX_IMAGE_FETCH_BYTES: usize = 10 * 1024 * 1024;
+const IMAGE_CACHE_DIR_NAME: &str = ".image-cache";
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  Provider Types
@@ -180,11 +189,33 @@ fn convert_messages_to_openai(messages: &[ChatMessage]) -> Vec<serde_json::Value
 
     for msg in messages {
         match msg.role.as_str() {
-            "system" | "user" => {
+            "system" => {
                 out.push(json!({
-                    "role": msg.role,
+                    "role": "system",
                     "content": msg.content.as_deref().unwrap_or(""),
                 }));
+            }
+            "user" => {
+                if let Some(images) = &msg.images
+                    && !images.is_empty()
+                {
+                    let mut parts: Vec<Value> = vec![json!({
+                        "type": "text",
+                        "text": msg.content.as_deref().unwrap_or("")
+                    })];
+                    for img in images {
+                        parts.push(json!({
+                            "type": "image_url",
+                            "image_url": {"url": &img.url}
+                        }));
+                    }
+                    out.push(json!({"role": "user", "content": parts}));
+                } else {
+                    out.push(json!({
+                        "role": "user",
+                        "content": msg.content.as_deref().unwrap_or(""),
+                    }));
+                }
             }
             "assistant" => {
                 let mut item = json!({
@@ -222,10 +253,26 @@ fn convert_messages_to_anthropic(messages: &[ChatMessage]) -> (String, Vec<serde
                 system = msg.content.clone().unwrap_or_default();
             }
             "user" => {
-                out.push(json!({
-                    "role": "user",
-                    "content": msg.content.as_deref().unwrap_or(""),
-                }));
+                if let Some(images) = &msg.images
+                    && !images.is_empty()
+                {
+                    let mut parts: Vec<Value> = vec![json!({
+                        "type": "text",
+                        "text": msg.content.as_deref().unwrap_or("")
+                    })];
+                    for img in images {
+                        parts.push(json!({
+                            "type": "image",
+                            "source": {"type": "url", "url": &img.url}
+                        }));
+                    }
+                    out.push(json!({"role": "user", "content": parts}));
+                } else {
+                    out.push(json!({
+                        "role": "user",
+                        "content": msg.content.as_deref().unwrap_or(""),
+                    }));
+                }
             }
             "assistant" => {
                 let mut content_blocks: Vec<serde_json::Value> = Vec::new();
@@ -279,17 +326,281 @@ fn convert_messages_to_anthropic(messages: &[ChatMessage]) -> (String, Vec<serde
     (system, out)
 }
 
-fn convert_messages_to_ollama(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+/// Pre-fetch all image URLs in the message list and return a URL→base64 map.
+/// Ollama requires base64-encoded image data rather than URLs.
+/// Uses cached `data` from `ImageAttachment` when available (intake pre-fetch).
+/// Falls back to a network fetch for legacy messages that lack cached data.
+/// Individual image fetch failures are logged as warnings and skipped;
+/// only client construction failure returns `Err`.
+async fn fetch_images_base64(
+    messages: &[ChatMessage],
+    workspace: &Path,
+) -> Result<HashMap<String, String>, String> {
+    let mut map = HashMap::new();
+    // Build the safe HTTP client once for the entire batch (legacy fallback path).
+    let mut safe_http: Option<Client> = None;
+    for msg in messages {
+        if msg.role != "user" {
+            continue;
+        }
+        if let Some(images) = &msg.images {
+            for img in images {
+                if map.contains_key(&img.url) {
+                    continue;
+                }
+                let b64 = if let Some(cached) = &img.data {
+                    Some(cached.clone())
+                } else if let Some(cache_path) = &img.cache_path {
+                    let cached = match resolve_image_cache_path(cache_path, workspace) {
+                        Ok(valid_path) => tokio::fs::read_to_string(&valid_path).await.ok(),
+                        Err(err) => {
+                            eprintln!(
+                                "Warning: ignoring suspicious image cache path {}: {}",
+                                cache_path, err
+                            );
+                            None
+                        }
+                    };
+                    if let Some(cached) = cached {
+                        Some(cached)
+                    } else {
+                        let http = match &safe_http {
+                            Some(c) => c,
+                            None => {
+                                safe_http = Some(build_image_fetch_client()?);
+                                safe_http.as_ref().ok_or_else(|| {
+                                    "Failed to initialize image fetch client".to_string()
+                                })?
+                            }
+                        };
+                        match fetch_single_image_base64(&img.url, http).await {
+                            Ok(cached) => Some(cached),
+                            Err(err) => {
+                                eprintln!(
+                                    "Warning: skipping uncached historical image {}: {}",
+                                    img.url, err
+                                );
+                                None
+                            }
+                        }
+                    }
+                } else {
+                    // Legacy fallback: image was stored before intake pre-fetch existed.
+                    let http = match &safe_http {
+                        Some(c) => c,
+                        None => {
+                            safe_http = Some(build_image_fetch_client()?);
+                            safe_http.as_ref().ok_or_else(|| {
+                                "Failed to initialize image fetch client".to_string()
+                            })?
+                        }
+                    };
+                    match fetch_single_image_base64(&img.url, http).await {
+                        Ok(cached) => Some(cached),
+                        Err(err) => {
+                            eprintln!(
+                                "Warning: skipping uncached historical image {}: {}",
+                                img.url, err
+                            );
+                            None
+                        }
+                    }
+                };
+                if let Some(b64) = b64 {
+                    map.insert(img.url.clone(), b64);
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Build a one-off HTTP client suitable for image fetching:
+/// redirects disabled (SSRF defense), 15 s timeout.
+pub(crate) fn build_image_fetch_client() -> Result<Client, String> {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Failed to create safe HTTP client for image fetch: {e}"))
+}
+
+fn image_cache_dir(workspace: &Path) -> PathBuf {
+    workspace.join(IMAGE_CACHE_DIR_NAME)
+}
+
+fn next_image_cache_path(workspace: &Path, url: &str) -> Result<PathBuf, String> {
+    let mut hasher = DefaultHasher::new();
+    url.hash(&mut hasher);
+    let hash = hasher.finish();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("Failed to compute cache timestamp: {e}"))?
+        .as_nanos();
+    Ok(image_cache_dir(workspace).join(format!("{nanos:032x}-{hash:016x}.b64")))
+}
+
+pub(crate) async fn persist_image_base64_cache(
+    workspace: &Path,
+    url: &str,
+    b64: &str,
+) -> Result<String, String> {
+    let dir = image_cache_dir(workspace);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("Failed to create image cache directory: {e}"))?;
+    let path = next_image_cache_path(workspace, url)?;
+    tokio::fs::write(&path, b64)
+        .await
+        .map_err(|e| format!("Failed to write image cache file: {e}"))?;
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Validate that a deserialized `cache_path` is a plausible `.b64` file
+/// inside an `.image-cache` directory.  Prevents tampered session JSON from
+/// tricking the server into reading arbitrary files.
+fn resolve_image_cache_path(cache_path: &str, workspace: &Path) -> Result<PathBuf, String> {
+    let workspace_root = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let cache_root = workspace_root.join(IMAGE_CACHE_DIR_NAME);
+    let raw = Path::new(cache_path);
+    let candidate = if raw.is_absolute() {
+        raw.to_path_buf()
+    } else {
+        workspace_root.join(raw)
+    };
+    if candidate.extension().and_then(|e| e.to_str()) != Some("b64") {
+        return Err("cache file must use .b64 extension".into());
+    }
+    let canonical_candidate = candidate
+        .canonicalize()
+        .map_err(|e| format!("cache file is not readable: {e}"))?;
+    if !canonical_candidate.starts_with(&cache_root) {
+        return Err(format!(
+            "cache file is outside session image cache '{}'",
+            cache_root.display()
+        ));
+    }
+    Ok(canonical_candidate)
+}
+
+fn is_supported_image_content_type(content_type: &str) -> bool {
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        mime.as_str(),
+        "image/jpeg" | "image/jpg" | "image/png" | "image/gif" | "image/webp"
+    )
+}
+
+/// Fetch a single image URL and return its base64-encoded content.
+///
+/// Performs SSRF check, checks Content-Length before downloading, and
+/// enforces a streaming size cap to prevent memory exhaustion from
+/// attacker-controlled URLs.  The caller supplies a no-redirect `Client`
+/// (via [`build_image_fetch_client`]) so that batches of images reuse one
+/// connection pool.
+pub(crate) async fn fetch_single_image_base64(
+    url: &str,
+    safe_http: &Client,
+) -> Result<String, String> {
+    // SSRF gate — same check used for user-supplied image URLs on input.
+    if let Some(ssrf_msg) = tools::net::check_ssrf(url).await {
+        return Err(format!("Image fetch blocked ({url}): {ssrf_msg}"));
+    }
+
+    let resp = safe_http
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to fetch image {url}: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Failed to fetch image {url} (HTTP {})",
+            resp.status()
+        ));
+    }
+
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !is_supported_image_content_type(content_type) {
+        return Err(format!(
+            "Image fetch returned unsupported content type '{}' for {}",
+            if content_type.is_empty() {
+                "unknown"
+            } else {
+                content_type
+            },
+            url
+        ));
+    }
+
+    // Pre-check Content-Length header when available to reject obviously
+    // oversized bodies without reading any data.
+    if let Some(cl) = resp.content_length()
+        && cl as usize > MAX_IMAGE_FETCH_BYTES
+    {
+        return Err(format!(
+            "Image too large ({cl} bytes, max {MAX_IMAGE_FETCH_BYTES}): {url}"
+        ));
+    }
+
+    // Streaming accumulation with a running size cap.
+    let mut buf = Vec::new();
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|e| format!("Failed to read image body {url}: {e}"))?;
+        if buf.len() + chunk.len() > MAX_IMAGE_FETCH_BYTES {
+            return Err(format!(
+                "Image too large (exceeded {MAX_IMAGE_FETCH_BYTES} bytes): {url}"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
+}
+
+fn convert_messages_to_ollama(
+    messages: &[ChatMessage],
+    images_b64: &HashMap<String, String>,
+) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
     let mut tool_names_by_id: HashMap<String, String> = HashMap::new();
 
     for msg in messages {
         match msg.role.as_str() {
-            "system" | "user" => {
+            "system" => {
                 out.push(json!({
-                    "role": msg.role,
+                    "role": "system",
                     "content": msg.content.as_deref().unwrap_or(""),
                 }));
+            }
+            "user" => {
+                let mut item = json!({
+                    "role": "user",
+                    "content": msg.content.as_deref().unwrap_or(""),
+                });
+                if let Some(images) = &msg.images
+                    && !images.is_empty()
+                {
+                    let b64_list: Vec<&str> = images
+                        .iter()
+                        .filter_map(|i| images_b64.get(&i.url).map(|s| s.as_str()))
+                        .collect();
+                    if !b64_list.is_empty() {
+                        item["images"] = json!(b64_list);
+                    }
+                }
+                out.push(item);
             }
             "assistant" => {
                 let mut item = json!({
@@ -370,6 +681,7 @@ pub(crate) async fn call_llm_simple(
     http: &Client,
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
+    workspace: &Path,
     max_retries: usize,
 ) -> Result<String, String> {
     match resolved.provider {
@@ -424,7 +736,8 @@ pub(crate) async fn call_llm_simple(
         }
         Provider::Ollama => {
             let url = format!("{}/api/chat", resolved.api_base);
-            let api_messages = convert_messages_to_ollama(messages);
+            let images_b64 = fetch_images_base64(messages, workspace).await?;
+            let api_messages = convert_messages_to_ollama(messages, &images_b64);
             let mut body = json!({
                 "model": resolved.model_id,
                 "messages": api_messages,
@@ -529,10 +842,12 @@ fn maybe_apply_anthropic_tool_cache_control(tools: &mut [serde_json::Value], cac
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn call_llm_stream(
     http: &Client,
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
+    workspace: &Path,
     tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
@@ -578,6 +893,7 @@ pub(crate) async fn call_llm_stream(
                 http,
                 resolved,
                 messages,
+                workspace,
                 tx,
                 effective_level,
                 extra_tools,
@@ -915,13 +1231,15 @@ fn build_openai_stream_body(
     body
 }
 
-fn build_ollama_stream_body(
+async fn build_ollama_stream_body(
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
+    workspace: &Path,
     think_level: &str,
     extra_tools: &[serde_json::Value],
-) -> serde_json::Value {
-    let api_messages = convert_messages_to_ollama(messages);
+) -> Result<serde_json::Value, String> {
+    let images_b64 = fetch_images_base64(messages, workspace).await?;
+    let api_messages = convert_messages_to_ollama(messages, &images_b64);
     let mut all_tools: Vec<serde_json::Value> =
         serde_json::from_value(tools::tool_definitions_ollama()).unwrap_or_default();
     all_tools.extend_from_slice(extra_tools);
@@ -935,7 +1253,7 @@ fn build_ollama_stream_body(
         body["think"] = think;
     }
     body["options"] = ollama_request_options(resolved);
-    body
+    Ok(body)
 }
 
 async fn consume_openai_stream<S, B>(
@@ -1272,17 +1590,20 @@ async fn call_llm_stream_anthropic(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn call_llm_stream_ollama(
     http: &Client,
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
+    workspace: &Path,
     tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
     max_retries: usize,
 ) -> Result<LlmResponse, String> {
     let url = format!("{}/api/chat", resolved.api_base);
-    let body = build_ollama_stream_body(resolved, messages, think_level, extra_tools);
+    let body =
+        build_ollama_stream_body(resolved, messages, workspace, think_level, extra_tools).await?;
 
     let resp = send_with_retry(http, max_retries, || {
         with_optional_bearer_auth(http.post(&url), &resolved.api_key).json(&body)
@@ -1336,6 +1657,7 @@ fn build_llm_response(
         message: ChatMessage {
             role: "assistant".into(),
             content,
+            images: None,
             tool_calls: tc,
             tool_call_id: None,
             timestamp: Some(

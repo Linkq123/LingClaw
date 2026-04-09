@@ -30,7 +30,7 @@ fn is_private_ip(ip: &IpAddr) -> bool {
 /// Check if a URL targets a private/loopback/link-local address or a disallowed scheme.
 /// Returns an error message if blocked, None if the URL is allowed.
 /// DNS resolution runs on a blocking thread to avoid stalling tokio workers.
-async fn check_ssrf(url: &str) -> Option<String> {
+pub(crate) async fn check_ssrf(url: &str) -> Option<String> {
     // Only allow http and https schemes
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return Some(format!(
@@ -74,6 +74,34 @@ async fn check_ssrf(url: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Allowed image URL extensions (lowercase) — limited to formats supported by all major providers.
+const IMAGE_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".gif", ".webp"];
+
+/// Explicitly blocked non-image extensions.
+const BLOCKED_EXTENSIONS: &[&str] = &[
+    ".html", ".htm", ".js", ".css", ".json", ".xml", ".txt", ".pdf", ".zip", ".tar", ".gz", ".exe",
+    ".sh", ".bat", ".msi", ".dll", ".so", ".py", ".rs", ".md",
+];
+
+/// Validate that a URL is a safe, reachable image URL.
+/// Performs SSRF check and validates that the URL looks like an image resource.
+pub(crate) async fn validate_image_url(url: &str) -> Result<(), String> {
+    if let Some(msg) = check_ssrf(url).await {
+        return Err(msg);
+    }
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
+    let path = parsed.path().to_lowercase();
+    let has_image_ext = IMAGE_EXTENSIONS.iter().any(|ext| path.ends_with(ext));
+    if !has_image_ext {
+        // Block URLs with known non-image extensions
+        if BLOCKED_EXTENSIONS.iter().any(|ext| path.ends_with(ext)) {
+            return Err(format!("URL does not appear to be an image: {url}"));
+        }
+        // Allow URLs without a recognized extension (dynamic image services)
+    }
+    Ok(())
 }
 
 // ── http_fetch ───────────────────────────────────────────────────────────────

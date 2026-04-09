@@ -52,6 +52,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         messages: vec![ChatMessage {
             role: "system".into(),
             content: Some("system".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -207,6 +208,7 @@ fn update_llm_response_usage_uses_request_estimate_when_provider_usage_missing()
             message: ChatMessage {
                 role: "assistant".into(),
                 content: Some("done".into()),
+                images: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,

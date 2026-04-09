@@ -115,6 +115,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         messages: vec![ChatMessage {
             role: "system".into(),
             content: Some("system".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -144,6 +145,7 @@ fn make_message(role: &str, content: &str) -> ChatMessage {
     ChatMessage {
         role: role.to_string(),
         content: Some(content.to_string()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -402,6 +404,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
             ChatMessage {
                 role: "system".into(),
                 content: Some("system".into()),
+                images: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -409,6 +412,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
             ChatMessage {
                 role: "tool".into(),
                 content: Some(long_raw_result.clone()),
+                images: None,
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
                 timestamp: Some(123),
@@ -447,6 +451,53 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         tool_result["result"].as_str(),
         Some(long_raw_result.as_str())
     );
+}
+
+#[test]
+fn build_history_payload_hides_internal_image_cache_metadata() {
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: Some("look".into()),
+            images: Some(vec![ImageAttachment {
+                url: "https://example.com/photo.png".into(),
+                cache_path: Some("C:/internal/cache/file.b64".into()),
+                data: Some("aW1hZ2U=".into()),
+            }]),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(123),
+        }],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let payload = build_history_payload(&session);
+    let images = payload["messages"][0]["images"]
+        .as_array()
+        .expect("images should be present");
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0]["url"], "https://example.com/photo.png");
+    assert!(images[0].get("cache_path").is_none());
+    assert!(images[0].get("data").is_none());
 }
 
 #[test]
@@ -1493,6 +1544,7 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
         ChatMessage {
             role: "system".into(),
             content: Some("system".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1500,6 +1552,7 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
         ChatMessage {
             role: "user".into(),
             content: Some("a".repeat(500)),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1507,6 +1560,7 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
         ChatMessage {
             role: "assistant".into(),
             content: Some("b".repeat(500)),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1514,6 +1568,7 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
         ChatMessage {
             role: "user".into(),
             content: Some("keep".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1533,6 +1588,7 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
         ChatMessage {
             role: "system".into(),
             content: Some("system".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1540,6 +1596,7 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
         ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: Some(1),
@@ -1547,6 +1604,7 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
         ChatMessage {
             role: "assistant".into(),
             content: Some(String::new()),
+            images: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call-1".into(),
                 call_type: "function".into(),
@@ -1631,6 +1689,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
             ChatMessage {
                 role: "system".into(),
                 content: Some("system".into()),
+                images: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -1638,6 +1697,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
             ChatMessage {
                 role: "assistant".into(),
                 content: None,
+                images: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: Some(1773669433),
@@ -1645,6 +1705,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
             ChatMessage {
                 role: "user".into(),
                 content: Some("next".into()),
+                images: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -1718,6 +1779,7 @@ fn save_session_to_disk_overwrites_existing_file() {
         messages: vec![ChatMessage {
             role: "system".into(),
             content: Some("first".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -2001,6 +2063,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
             ChatMessage {
                 role: "system".into(),
                 content: Some("system".into()),
+                images: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -2008,6 +2071,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
             ChatMessage {
                 role: "assistant".into(),
                 content: Some(String::new()),
+                images: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_obs".into(),
                     call_type: "function".into(),
@@ -2022,6 +2086,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
             ChatMessage {
                 role: "tool".into(),
                 content: Some(big_result.clone()),
+                images: None,
                 tool_calls: None,
                 tool_call_id: Some("call_obs".into()),
                 timestamp: Some(101),
@@ -2094,6 +2159,7 @@ fn system_prompt_with_observation_hint_preserves_original_content() {
     let mut msg = ChatMessage {
         role: "system".into(),
         content: Some("You are an assistant.".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3185,6 +3251,7 @@ fn prune_messages_tracks_removal_count() {
         ChatMessage {
             role: "system".into(),
             content: Some("sys".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3192,6 +3259,7 @@ fn prune_messages_tracks_removal_count() {
         ChatMessage {
             role: "user".into(),
             content: Some("a".repeat(200_000)),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3199,6 +3267,7 @@ fn prune_messages_tracks_removal_count() {
         ChatMessage {
             role: "assistant".into(),
             content: Some("b".repeat(200_000)),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3206,6 +3275,7 @@ fn prune_messages_tracks_removal_count() {
         ChatMessage {
             role: "user".into(),
             content: Some("latest".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3358,6 +3428,7 @@ fn message_token_len_empty_message() {
     let msg = ChatMessage {
         role: "user".into(),
         content: None,
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3371,6 +3442,7 @@ fn message_token_len_content_only() {
     let msg = ChatMessage {
         role: "user".into(),
         content: Some("hello world".into()), // 11 chars
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3384,6 +3456,7 @@ fn message_token_len_with_tool_calls() {
     let msg = ChatMessage {
         role: "assistant".into(),
         content: None,
+        images: None,
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
@@ -3405,6 +3478,7 @@ fn estimate_tokens_sums_messages() {
         ChatMessage {
             role: "system".into(),
             content: Some("sys".into()), // 3
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3412,6 +3486,7 @@ fn estimate_tokens_sums_messages() {
         ChatMessage {
             role: "user".into(),
             content: Some("hello".into()), // 5
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3427,6 +3502,7 @@ fn provider_aware_estimate_adds_tool_protocol_overhead() {
         ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -3441,6 +3517,7 @@ fn provider_aware_estimate_adds_tool_protocol_overhead() {
         ChatMessage {
             role: "tool".into(),
             content: Some("file-a\nfile-b".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -3460,6 +3537,7 @@ fn request_estimate_includes_tool_schema_overhead() {
     let messages = vec![ChatMessage {
         role: "system".into(),
         content: Some("system prompt".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3493,6 +3571,7 @@ fn openai_request_estimate_includes_builtin_tool_schemas() {
     let messages = vec![ChatMessage {
         role: "system".into(),
         content: Some("system prompt".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3561,6 +3640,7 @@ fn turn_len_standalone_user() {
     let messages = vec![ChatMessage {
         role: "user".into(),
         content: Some("hi".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3574,6 +3654,7 @@ fn turn_len_user_plus_assistant() {
         ChatMessage {
             role: "user".into(),
             content: Some("hi".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3581,6 +3662,7 @@ fn turn_len_user_plus_assistant() {
         ChatMessage {
             role: "assistant".into(),
             content: Some("hello".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3595,6 +3677,7 @@ fn turn_len_user_assistant_with_tool_calls_and_results() {
         ChatMessage {
             role: "user".into(),
             content: Some("list files".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3602,6 +3685,7 @@ fn turn_len_user_assistant_with_tool_calls_and_results() {
         ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -3616,6 +3700,7 @@ fn turn_len_user_assistant_with_tool_calls_and_results() {
         ChatMessage {
             role: "tool".into(),
             content: Some("file1.txt\nfile2.txt".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -3631,6 +3716,7 @@ fn turn_len_orphan_assistant_with_tool_results() {
         ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -3645,6 +3731,7 @@ fn turn_len_orphan_assistant_with_tool_results() {
         ChatMessage {
             role: "tool".into(),
             content: Some("ok".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -3652,6 +3739,7 @@ fn turn_len_orphan_assistant_with_tool_results() {
         ChatMessage {
             role: "tool".into(),
             content: Some("ok2".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc2".into()),
             timestamp: None,
@@ -3666,6 +3754,7 @@ fn turn_len_standalone_assistant_text() {
     let messages = vec![ChatMessage {
         role: "assistant".into(),
         content: Some("just text".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3680,6 +3769,7 @@ fn chat_message_has_nonempty_content() {
     let none_content = ChatMessage {
         role: "user".into(),
         content: None,
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3689,6 +3779,7 @@ fn chat_message_has_nonempty_content() {
     let empty_content = ChatMessage {
         role: "user".into(),
         content: Some(String::new()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3698,6 +3789,7 @@ fn chat_message_has_nonempty_content() {
     let with_content = ChatMessage {
         role: "user".into(),
         content: Some("hello".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3710,6 +3802,7 @@ fn chat_message_has_tool_calls() {
     let none_tc = ChatMessage {
         role: "assistant".into(),
         content: None,
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3719,6 +3812,7 @@ fn chat_message_has_tool_calls() {
     let empty_tc = ChatMessage {
         role: "assistant".into(),
         content: None,
+        images: None,
         tool_calls: Some(vec![]),
         tool_call_id: None,
         timestamp: None,
@@ -3728,6 +3822,7 @@ fn chat_message_has_tool_calls() {
     let with_tc = ChatMessage {
         role: "assistant".into(),
         content: None,
+        images: None,
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
@@ -3747,6 +3842,7 @@ fn chat_message_is_empty_assistant_message() {
     let empty_asst = ChatMessage {
         role: "assistant".into(),
         content: None,
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3756,6 +3852,7 @@ fn chat_message_is_empty_assistant_message() {
     let with_content = ChatMessage {
         role: "assistant".into(),
         content: Some("reply".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3765,6 +3862,7 @@ fn chat_message_is_empty_assistant_message() {
     let user_msg = ChatMessage {
         role: "user".into(),
         content: None,
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3781,6 +3879,7 @@ fn prune_messages_removes_complete_tool_turn() {
         ChatMessage {
             role: "system".into(),
             content: Some("sys".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3788,6 +3887,7 @@ fn prune_messages_removes_complete_tool_turn() {
         ChatMessage {
             role: "user".into(),
             content: Some(big.clone()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3795,6 +3895,7 @@ fn prune_messages_removes_complete_tool_turn() {
         ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -3809,6 +3910,7 @@ fn prune_messages_removes_complete_tool_turn() {
         ChatMessage {
             role: "tool".into(),
             content: Some(big.clone()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -3816,6 +3918,7 @@ fn prune_messages_removes_complete_tool_turn() {
         ChatMessage {
             role: "user".into(),
             content: Some("latest".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3840,6 +3943,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
         ChatMessage {
             role: "system".into(),
             content: Some("sys".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3847,6 +3951,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
         ChatMessage {
             role: "user".into(),
             content: Some("do something".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3854,6 +3959,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
         ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: Some(vec![
                 ToolCall {
                     id: "tc1".into(),
@@ -3878,6 +3984,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
         ChatMessage {
             role: "tool".into(),
             content: Some("result1".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -3885,6 +3992,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
         ChatMessage {
             role: "tool".into(),
             content: Some("result2".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc2".into()),
             timestamp: None,
@@ -3901,6 +4009,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
         ChatMessage {
             role: "system".into(),
             content: Some("sys".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3908,6 +4017,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
         ChatMessage {
             role: "user".into(),
             content: Some("do something".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3915,6 +4025,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
         ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: Some(vec![
                 ToolCall {
                     id: "tc1".into(),
@@ -3940,6 +4051,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
         ChatMessage {
             role: "tool".into(),
             content: Some("result1".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,

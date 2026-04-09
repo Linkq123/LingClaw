@@ -335,6 +335,7 @@ async fn handle_new_command(
         ChatMessage {
             role: "system".into(),
             content: Some("You are a conversation summarizer. Compress the following conversation into a concise markdown summary. Keep key decisions, code changes, problems solved, and important context. Use bullet points. Write in the same language as the conversation. Do NOT wrap in code blocks.".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -342,6 +343,7 @@ async fn handle_new_command(
         ChatMessage {
             role: "user".into(),
             content: Some(truncate(&conversation_text, 60_000)),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: Some(now_epoch()),
@@ -357,7 +359,7 @@ async fn handle_new_command(
                 false,
             ));
         }
-        result = providers::call_llm_simple(&state.http, &resolved, &compress_prompt, state.config.max_llm_retries) => {
+        result = providers::call_llm_simple(&state.http, &resolved, &compress_prompt, &workspace, state.config.max_llm_retries) => {
             match result {
                 Ok(s) => s,
                 Err(e) => {

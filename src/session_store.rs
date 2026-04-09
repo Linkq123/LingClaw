@@ -238,7 +238,16 @@ pub(crate) fn build_history_payload(session: &Session) -> serde_json::Value {
             "system" => {}
             "user" => {
                 if let Some(c) = &msg.content {
-                    msgs.push(json!({"role":"user","content":c,"timestamp":msg.timestamp}));
+                    let mut entry = json!({"role":"user","content":c,"timestamp":msg.timestamp});
+                    if let Some(images) = &msg.images {
+                        entry["images"] = json!(
+                            images
+                                .iter()
+                                .map(|image| json!({"url": image.url.clone()}))
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    msgs.push(entry);
                 }
             }
             "assistant" => {

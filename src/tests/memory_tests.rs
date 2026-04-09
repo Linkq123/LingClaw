@@ -90,6 +90,7 @@ fn test_build_conversation_excerpt() {
         crate::ChatMessage {
             role: "system".into(),
             content: Some("system prompt".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -97,6 +98,7 @@ fn test_build_conversation_excerpt() {
         crate::ChatMessage {
             role: "user".into(),
             content: Some("Hello".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -104,6 +106,7 @@ fn test_build_conversation_excerpt() {
         crate::ChatMessage {
             role: "assistant".into(),
             content: Some("Hi there".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -111,6 +114,7 @@ fn test_build_conversation_excerpt() {
         crate::ChatMessage {
             role: "tool".into(),
             content: Some("tool output".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -193,6 +197,7 @@ fn test_build_conversation_excerpt_skips_auto_compress_summary() {
             content: Some(
                 "## Context Summary (auto-generated)\nPrevious conversation summary...".to_string(),
             ),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -200,6 +205,7 @@ fn test_build_conversation_excerpt_skips_auto_compress_summary() {
         crate::ChatMessage {
             role: "user".into(),
             content: Some("Hello".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -207,6 +213,7 @@ fn test_build_conversation_excerpt_skips_auto_compress_summary() {
         crate::ChatMessage {
             role: "assistant".into(),
             content: Some("Real reply".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -293,6 +300,7 @@ fn test_build_conversation_excerpt_includes_tool_calls_and_results() {
         crate::ChatMessage {
             role: "system".into(),
             content: Some("system prompt".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -300,6 +308,7 @@ fn test_build_conversation_excerpt_includes_tool_calls_and_results() {
         crate::ChatMessage {
             role: "user".into(),
             content: Some("Search for files".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -307,6 +316,7 @@ fn test_build_conversation_excerpt_includes_tool_calls_and_results() {
         crate::ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: Some(vec![crate::ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -321,6 +331,7 @@ fn test_build_conversation_excerpt_includes_tool_calls_and_results() {
         crate::ChatMessage {
             role: "tool".into(),
             content: Some("Found 3 matches in src/".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -328,6 +339,7 @@ fn test_build_conversation_excerpt_includes_tool_calls_and_results() {
         crate::ChatMessage {
             role: "assistant".into(),
             content: Some("I found 3 files.".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -374,6 +386,7 @@ fn test_build_conversation_excerpt_truncates_long_tool_results() {
     let messages = vec![crate::ChatMessage {
         role: "tool".into(),
         content: Some(long_content),
+        images: None,
         tool_calls: None,
         tool_call_id: Some("tc1".into()),
         timestamp: None,

@@ -28,6 +28,9 @@ const SOFT_SPLIT_MIN_CHARS = 72;
 const SOFT_SPLIT_MAX_CHARS = 160;
 const SOFT_SPLIT_TAIL_MIN_CHARS = 18;
 
+const attachBtn = document.getElementById('attach-btn');
+const imagePreviewBar = document.getElementById('image-preview-bar');
+
 let ws = null;
 let currentMsg = null;
 let busy = false;
@@ -63,6 +66,8 @@ let unreadMessageCount = 0;
 let bulkRenderingChat = false;
 let suppressScrollTracking = false;
 let currentAppVersion = '';
+let imageCapable = false;
+let pendingImages = [];
 const inputHistory = [];
 const INPUT_HISTORY_MAX = 10;
 let inputHistoryIndex = -1;
@@ -384,6 +389,63 @@ function applyViewState(viewState) {
 
   updateViewToggleButtons();
 }
+
+// ── Image Attachment ──
+
+function updateAttachButton() {
+  if (attachBtn) attachBtn.style.display = imageCapable ? '' : 'none';
+  // Clear pending images when capability is lost
+  if (!imageCapable && pendingImages.length > 0) {
+    pendingImages = [];
+    renderImagePreviews();
+  }
+}
+
+function promptImageUrl() {
+  const url = prompt('Enter image URL (jpg, png, gif, webp, etc.):');
+  if (!url || !url.trim()) return;
+  const trimmed = url.trim();
+  // Basic client-side validation
+  try { new URL(trimmed); } catch { addSystem('Invalid URL format.'); return; }
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+    addSystem('Only http:// and https:// URLs are allowed.');
+    return;
+  }
+  pendingImages.push({ url: trimmed });
+  renderImagePreviews();
+}
+
+function removeImage(index) {
+  pendingImages.splice(index, 1);
+  renderImagePreviews();
+}
+
+function renderImagePreviews() {
+  if (!imagePreviewBar) return;
+  imagePreviewBar.innerHTML = '';
+  if (pendingImages.length === 0) {
+    imagePreviewBar.style.display = 'none';
+    return;
+  }
+  imagePreviewBar.style.display = 'flex';
+  pendingImages.forEach((img, idx) => {
+    const item = document.createElement('div');
+    item.className = 'image-preview-item';
+    const imgEl = document.createElement('img');
+    imgEl.src = img.url;
+    imgEl.alt = 'Attached image';
+    imgEl.onerror = () => { imgEl.style.display = 'none'; };
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'remove-btn';
+    removeBtn.textContent = '×';
+    removeBtn.onclick = (e) => { e.stopPropagation(); removeImage(idx); };
+    item.appendChild(imgEl);
+    item.appendChild(removeBtn);
+    imagePreviewBar.appendChild(item);
+  });
+}
+
+if (attachBtn) attachBtn.addEventListener('click', promptImageUrl);
 
 function toggleToolsVisibility() {
   if (!ws || ws.readyState !== 1) return;
@@ -1109,6 +1171,10 @@ function handleMessage(data) {
       currentSessionId = data.id;
       sessionNameEl.textContent = data.name || 'Main';
       sessionIdEl.textContent = data.id.slice(0, 12);
+      if (data.capabilities && typeof data.capabilities.image === 'boolean') {
+        imageCapable = data.capabilities.image;
+        updateAttachButton();
+      }
       applyViewState(data);
       break;
 
@@ -1360,6 +1426,29 @@ function addMsg(cls, text, timestamp, options = {}) {
 }
 
 function addAssistant(text, options = {}) { return addMsg('assistant', text, undefined, options); }
+
+function renderUserImageThumbnails(msgEl, images) {
+  if (!images || images.length === 0) return;
+  const container = document.createElement('div');
+  container.className = 'user-images';
+  for (const img of images) {
+    const imgEl = document.createElement('img');
+    imgEl.src = img.url;
+    imgEl.alt = 'Attached image';
+    imgEl.title = img.url;
+    imgEl.onerror = () => { imgEl.style.display = 'none'; };
+    imgEl.onclick = () => window.open(img.url, '_blank', 'noopener');
+    container.appendChild(imgEl);
+  }
+  // Insert the thumbnails after the message text bubble
+  const row = msgEl.closest('.msg-row');
+  if (row) {
+    const content = row.querySelector('.msg-content');
+    if (content) {
+      content.insertBefore(container, content.querySelector('.msg-time'));
+    }
+  }
+}
 
 function addSystem(t, kind = 'info') {
   const row = document.createElement('div');
@@ -1735,7 +1824,11 @@ function findHistoryRenderStart(messages, preferredStart) {
 function renderHistoryMessage(m, options = {}) {
   const { followMarkdown = true } = options;
   switch (m.role) {
-    case 'user': addMsg('user', m.content, m.timestamp); break;
+    case 'user': {
+      const el = addMsg('user', m.content, m.timestamp);
+      if (m.images && m.images.length > 0) renderUserImageThumbnails(el, m.images);
+      break;
+    }
     case 'assistant': {
       const el = addMsg('assistant', m.content, m.timestamp);
       el._rawText = m.content;
@@ -1773,9 +1866,9 @@ function send() {
   if (!ws || ws.readyState !== 1) return;
 
   const text = input.value.trim();
-  if (!text) return;
+  if (!text && pendingImages.length === 0) return;
 
-  if (text.startsWith('/')) {
+  if (text.startsWith('/') && pendingImages.length === 0) {
     if (busy && !canSendWhileBusy(text)) {
       addSystem('Agent 运行中时，只允许 /stop、/tool 和 /reasoning。');
       return;
@@ -1788,16 +1881,34 @@ function send() {
     return;
   }
 
-  addMsg('user', text);
+  const hasImages = pendingImages.length > 0;
+
+  // When agent is busy, images are dropped server-side; don't render them
+  // optimistically — the user would see thumbnails followed by a contradicting
+  // "text only" server notice.
+  const effectiveImages = busy ? [] : pendingImages.slice();
+
+  // Render user message with images
+  const el = addMsg('user', text || '(image)');
+  if (effectiveImages.length > 0) {
+    renderUserImageThumbnails(el, effectiveImages);
+  }
   scrollDown(true);
 
   if (!busy) {
     setBusy(true);
-  } else {
-    addSystem('📝 干预消息已发送，将在下一个推理周期应用');
   }
+  // When busy, the server sends its own progress event confirming receipt
+  // (with/without "images dropped" context), so no local addSystem here.
 
-  ws.send(text);
+  // Send structured JSON when images are attached, plain text otherwise
+  if (hasImages) {
+    ws.send(JSON.stringify({ text: text || '', images: pendingImages }));
+    pendingImages = [];
+    renderImagePreviews();
+  } else {
+    ws.send(text);
+  }
   pushInputHistory(text);
   input.value = '';
   input.style.height = 'auto';
