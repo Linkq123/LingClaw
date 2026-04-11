@@ -124,6 +124,21 @@ pub(crate) struct Config {
     pub(crate) max_file_bytes: usize,
     /// Enable structured async memory (auto-extracts facts from conversations).
     pub(crate) structured_memory: bool,
+    /// Optional S3-compatible storage for image uploads.
+    pub(crate) s3: Option<S3Config>,
+}
+
+#[derive(Clone)]
+pub(crate) struct S3Config {
+    pub(crate) endpoint: String,
+    pub(crate) region: String,
+    pub(crate) bucket: String,
+    pub(crate) access_key: String,
+    pub(crate) secret_key: String,
+    pub(crate) prefix: String,
+    pub(crate) url_expiry_secs: u64,
+    /// Bucket lifecycle retention in days for uploaded temp images (0 disables auto-management).
+    pub(crate) lifecycle_days: u32,
 }
 
 pub(crate) fn format_sub_agent_timeout(timeout: Duration) -> String {
@@ -131,6 +146,67 @@ pub(crate) fn format_sub_agent_timeout(timeout: Duration) -> String {
         "unlimited".to_string()
     } else {
         format!("{}s", timeout.as_secs())
+    }
+}
+
+fn trimmed_nonempty(value: Option<String>) -> Option<String> {
+    let value = value?.trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+pub(crate) fn normalized_s3_region(region: &str) -> String {
+    let region = region.trim().to_ascii_lowercase();
+    if region.is_empty() {
+        "us-east-1".to_string()
+    } else {
+        region
+    }
+}
+
+fn aws_s3_host_for_region(region: &str) -> String {
+    let region = normalized_s3_region(region);
+    let domain_suffix = if region.starts_with("cn-") {
+        "amazonaws.com.cn"
+    } else {
+        "amazonaws.com"
+    };
+    format!("s3.{region}.{domain_suffix}")
+}
+
+fn is_official_aws_s3_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host == "s3.amazonaws.com"
+        || (host.starts_with("s3.")
+            && (host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn")))
+}
+
+pub(crate) fn default_s3_endpoint(region: &str) -> String {
+    format!("https://{}", aws_s3_host_for_region(region))
+}
+
+pub(crate) fn normalized_s3_endpoint(endpoint: Option<String>, region: &str) -> String {
+    let endpoint = trimmed_nonempty(endpoint).unwrap_or_else(|| default_s3_endpoint(region));
+    let trimmed = endpoint.trim_end_matches('/').to_string();
+
+    if let Ok(mut parsed) = reqwest::Url::parse(&trimmed)
+        && parsed.host_str().is_some_and(is_official_aws_s3_host)
+    {
+        let regional_host = aws_s3_host_for_region(region);
+        if parsed.set_host(Some(&regional_host)).is_ok() {
+            return parsed.to_string().trim_end_matches('/').to_string();
+        }
+    }
+
+    trimmed
+}
+
+pub(crate) fn normalized_s3_prefix(prefix: Option<String>) -> String {
+    let raw = prefix.unwrap_or_else(|| "lingclaw/images/".to_string());
+    let normalized = raw.trim().trim_matches('/');
+    if normalized.is_empty() {
+        "lingclaw/images/".to_string()
+    } else {
+        format!("{normalized}/")
     }
 }
 
@@ -144,6 +220,24 @@ impl Config {
             .unwrap_or_default();
         let mcp_servers: HashMap<String, JsonMcpServerConfig> =
             json_cfg.mcp_servers.unwrap_or_default();
+
+        // S3 config: require region/bucket/access key/secret key; default endpoint when omitted.
+        let s3 = json_cfg.s3.and_then(|j| {
+            let region = normalized_s3_region(&trimmed_nonempty(j.region)?);
+            let bucket = trimmed_nonempty(j.bucket)?;
+            let access_key = trimmed_nonempty(j.access_key)?;
+            let secret_key = trimmed_nonempty(j.secret_key)?;
+            Some(S3Config {
+                endpoint: normalized_s3_endpoint(j.endpoint, &region),
+                region,
+                bucket,
+                access_key,
+                secret_key,
+                prefix: normalized_s3_prefix(j.prefix),
+                url_expiry_secs: j.url_expiry_secs.unwrap_or(604_800), // 7 days (AWS-compatible default)
+                lifecycle_days: j.lifecycle_days.unwrap_or(14),
+            })
+        });
 
         // Default model: JSON agents.defaults.model.primary → env LINGCLAW_MODEL → "gpt-4o-mini"
         let model_config = json_cfg
@@ -295,6 +389,7 @@ impl Config {
                         })
                 })
                 .unwrap_or(false),
+            s3,
         }
     }
 
@@ -598,6 +693,7 @@ pub(crate) struct JsonConfig {
     pub(crate) agents: Option<JsonAgentsConfig>,
     #[serde(rename = "mcpServers")]
     pub(crate) mcp_servers: Option<HashMap<String, JsonMcpServerConfig>>,
+    pub(crate) s3: Option<JsonS3Config>,
 }
 
 #[derive(Deserialize, Default)]
@@ -690,6 +786,24 @@ pub(crate) struct JsonModelEntry {
     pub(crate) max_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) compat: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Clone)]
+pub(crate) struct JsonS3Config {
+    pub(crate) endpoint: Option<String>,
+    pub(crate) region: Option<String>,
+    pub(crate) bucket: Option<String>,
+    #[serde(rename = "accessKey")]
+    pub(crate) access_key: Option<String>,
+    #[serde(rename = "secretKey")]
+    pub(crate) secret_key: Option<String>,
+    pub(crate) prefix: Option<String>,
+    /// Presigned URL expiry in seconds (default: 604800 = 7 days for AWS compatibility).
+    #[serde(rename = "urlExpirySecs")]
+    pub(crate) url_expiry_secs: Option<u64>,
+    /// Temp image lifecycle retention in days (default: 14, 0 disables auto-management).
+    #[serde(rename = "lifecycleDays")]
+    pub(crate) lifecycle_days: Option<u32>,
 }
 
 #[derive(Deserialize, Default)]

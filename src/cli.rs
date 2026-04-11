@@ -26,6 +26,18 @@ fn prompt_line(msg: &str) -> String {
     buf.trim().to_string()
 }
 
+fn prompt_secret(msg: &str) -> String {
+    print!("{msg}");
+    io::stdout().flush().ok();
+    match rpassword::read_password() {
+        Ok(value) => value.trim().to_string(),
+        Err(_) => {
+            eprintln!("\n  Warning: secure input unavailable, input will be visible.");
+            prompt_line("  ")
+        }
+    }
+}
+
 fn prompt_choice(options: &[&str]) -> usize {
     loop {
         for (i, opt) in options.iter().enumerate() {
@@ -1992,7 +2004,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
             } else {
                 base_url
             };
-            let api_key = prompt_line("  API Key: ");
+            let api_key = prompt_secret("  API Key: ");
             providers.insert(
                 "openai".to_string(),
                 json!({
@@ -2013,7 +2025,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
             } else {
                 base_url
             };
-            let api_key = prompt_line("  API Key: ");
+            let api_key = prompt_secret("  API Key: ");
             providers.insert(
                 "anthropic".to_string(),
                 json!({
@@ -2034,7 +2046,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
             } else {
                 base_url
             };
-            let api_key = prompt_line("  API Key (optional, leave empty for local Ollama): ");
+            let api_key = prompt_secret("  API Key (optional, leave empty for local Ollama): ");
             providers.insert(
                 "ollama".to_string(),
                 json!({
@@ -2115,14 +2127,72 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     }
     println!();
 
-    // ── Step 3: Select Channel ───────────────────────────────────────────
-    println!("3. Select channel (QuickStart)");
+    // ── Step 3: Optional local image uploads ────────────────────────────
+    println!("3. Optional local image uploads (S3-compatible)");
+    println!("   OpenAI/Anthropic must be able to fetch the presigned URL directly.");
+    println!("   Private or localhost S3 gateways are only guaranteed with Ollama.");
+    println!();
+    let mut s3_config = None;
+    let configure_s3 = prompt_choice(&["Configure now", "Skip for now"]);
+    if configure_s3 == 0 {
+        println!();
+        let region = prompt_line("  Region [us-east-1]: ");
+        let region = if region.is_empty() {
+            "us-east-1".to_string()
+        } else {
+            region
+        };
+        let endpoint_default = crate::config::default_s3_endpoint(&region);
+        let endpoint = prompt_line(&format!("  Endpoint [{endpoint_default}]: "));
+        let endpoint = crate::config::normalized_s3_endpoint(
+            if endpoint.is_empty() {
+                None
+            } else {
+                Some(endpoint)
+            },
+            &region,
+        );
+        let bucket = prompt_line("  Bucket: ");
+        let access_key = prompt_line("  Access key: ");
+        let secret_key = prompt_secret("  Secret key: ");
+        let prefix = prompt_line("  Prefix [lingclaw/images/]: ");
+        let prefix = crate::config::normalized_s3_prefix(if prefix.is_empty() {
+            None
+        } else {
+            Some(prefix)
+        });
+        let expiry = prompt_line("  Presigned URL expiry secs [604800]: ");
+        let url_expiry_secs = expiry.parse::<u64>().unwrap_or(604_800);
+        let lifecycle = prompt_line("  Lifecycle retention days [14, 0 disables]: ");
+        let lifecycle_days = lifecycle.parse::<u32>().unwrap_or(14);
+
+        if bucket.is_empty() || access_key.is_empty() || secret_key.is_empty() {
+            println!(
+                "   ⚠ Skipping S3 setup because bucket/access key/secret key were incomplete."
+            );
+        } else {
+            s3_config = Some(json!({
+                "endpoint": endpoint,
+                "region": region,
+                "bucket": bucket,
+                "accessKey": access_key,
+                "secretKey": secret_key,
+                "prefix": prefix,
+                "urlExpirySecs": url_expiry_secs,
+                "lifecycleDays": lifecycle_days,
+            }));
+        }
+    }
+    println!();
+
+    // ── Step 4: Select Channel ───────────────────────────────────────────
+    println!("4. Select channel (QuickStart)");
     println!();
     let _channel = prompt_choice(&["WebChat", "Skip for now"]);
     println!();
 
-    // ── Step 4: Global PATH ────────────────────────────────────────────
-    println!("4. Do you want to add LingClaw to the global PATH?");
+    // ── Step 5: Global PATH ────────────────────────────────────────────
+    println!("5. Do you want to add LingClaw to the global PATH?");
     println!("   This enables CLI commands: lingclaw start/stop/restart/health/update");
     println!();
     let add_path = prompt_choice(&["YES", "NO"]);
@@ -2133,7 +2203,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
 
     #[cfg(not(target_os = "windows"))]
     let add_systemd = {
-        println!("5. Add systemd service?");
+        println!("6. Add systemd service?");
         println!("   If enabled, LingClaw will be managed by lingclaw.service.");
         println!();
         let choice = prompt_choice(&["YES", "NO"]);
@@ -2143,9 +2213,9 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
 
     // ── Step 5: Install ──────────────────────────────────────────────────
     #[cfg(target_os = "windows")]
-    println!("5. Start installation");
-    #[cfg(not(target_os = "windows"))]
     println!("6. Start installation");
+    #[cfg(not(target_os = "windows"))]
+    println!("7. Start installation");
     prompt_line("   Press Enter to continue...");
     println!();
 
@@ -2196,6 +2266,10 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
         }
     });
 
+    if let Some(s3_config) = s3_config {
+        config["s3"] = s3_config;
+    }
+
     // Add channel info if WebChat selected
     if _channel == 0 {
         config["channel"] = json!("webchat");
@@ -2235,6 +2309,12 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     }
     if memory_model.is_some() {
         println!("   💡 Memory model configured for structured memory extraction.");
+    }
+    if config.get("s3").is_some() {
+        println!("   💡 Local JPEG/PNG uploads configured via S3-compatible storage.");
+        println!(
+            "      OpenAI/Anthropic require provider-reachable URLs; private or localhost gateways are Ollama-only."
+        );
     }
     #[cfg(not(target_os = "windows"))]
     if add_systemd {

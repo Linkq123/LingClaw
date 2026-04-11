@@ -13,7 +13,9 @@ use serde_json::{Value, json};
 
 use base64::Engine;
 
-use crate::{ChatMessage, FunctionCall, LiveTx, Provider, ToolCall, live_send, tools};
+use crate::{
+    ChatMessage, FunctionCall, LiveTx, Provider, ToolCall, image_uploads, live_send, tools,
+};
 
 /// Maximum size for a single image fetched for Ollama base64 encoding (10 MB).
 const MAX_IMAGE_FETCH_BYTES: usize = 10 * 1024 * 1024;
@@ -326,15 +328,60 @@ fn convert_messages_to_anthropic(messages: &[ChatMessage]) -> (String, Vec<serde
     (system, out)
 }
 
+fn materialize_image_urls(
+    messages: &[ChatMessage],
+    s3_cfg: Option<&crate::config::S3Config>,
+) -> Result<Vec<ChatMessage>, String> {
+    let mut hydrated = messages.to_vec();
+    for msg in &mut hydrated {
+        if let Some(images) = msg.images.as_mut() {
+            for image in images {
+                image.url = image_uploads::resolve_image_url(
+                    &image.url,
+                    image.s3_object_key.as_deref(),
+                    s3_cfg,
+                )?;
+            }
+        }
+    }
+    Ok(hydrated)
+}
+
+fn is_trusted_uploaded_image(
+    image: &crate::ImageAttachment,
+    s3_cfg: Option<&crate::config::S3Config>,
+) -> bool {
+    s3_cfg.is_some()
+        && image
+            .s3_object_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+}
+
+async fn fetch_image_base64_for_message(
+    image: &crate::ImageAttachment,
+    safe_http: &Client,
+    s3_cfg: Option<&crate::config::S3Config>,
+) -> Result<String, String> {
+    if is_trusted_uploaded_image(image, s3_cfg) {
+        fetch_single_image_base64_trusted(&image.url, safe_http).await
+    } else {
+        fetch_single_image_base64(&image.url, safe_http).await
+    }
+}
+
 /// Pre-fetch all image URLs in the message list and return a URL→base64 map.
 /// Ollama requires base64-encoded image data rather than URLs.
 /// Uses cached `data` from `ImageAttachment` when available (intake pre-fetch).
 /// Falls back to a network fetch for legacy messages that lack cached data.
+/// Trusted local uploads identified by `s3_object_key` bypass SSRF checks after
+/// `materialize_image_urls()` regenerates their presigned URL from the object key.
 /// Individual image fetch failures are logged as warnings and skipped;
 /// only client construction failure returns `Err`.
 async fn fetch_images_base64(
     messages: &[ChatMessage],
     workspace: &Path,
+    s3_cfg: Option<&crate::config::S3Config>,
 ) -> Result<HashMap<String, String>, String> {
     let mut map = HashMap::new();
     // Build the safe HTTP client once for the entire batch (legacy fallback path).
@@ -373,7 +420,7 @@ async fn fetch_images_base64(
                                 })?
                             }
                         };
-                        match fetch_single_image_base64(&img.url, http).await {
+                        match fetch_image_base64_for_message(img, http, s3_cfg).await {
                             Ok(cached) => Some(cached),
                             Err(err) => {
                                 eprintln!(
@@ -395,7 +442,7 @@ async fn fetch_images_base64(
                             })?
                         }
                     };
-                    match fetch_single_image_base64(&img.url, http).await {
+                    match fetch_image_base64_for_message(img, http, s3_cfg).await {
                         Ok(cached) => Some(cached),
                         Err(err) => {
                             eprintln!(
@@ -485,32 +532,12 @@ fn resolve_image_cache_path(cache_path: &str, workspace: &Path) -> Result<PathBu
     Ok(canonical_candidate)
 }
 
-fn is_supported_image_content_type(content_type: &str) -> bool {
-    let mime = content_type
-        .split(';')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_ascii_lowercase();
-    matches!(
-        mime.as_str(),
-        "image/jpeg" | "image/jpg" | "image/png" | "image/gif" | "image/webp"
-    )
-}
-
-/// Fetch a single image URL and return its base64-encoded content.
-///
-/// Performs SSRF check, checks Content-Length before downloading, and
-/// enforces a streaming size cap to prevent memory exhaustion from
-/// attacker-controlled URLs.  The caller supplies a no-redirect `Client`
-/// (via [`build_image_fetch_client`]) so that batches of images reuse one
-/// connection pool.
-pub(crate) async fn fetch_single_image_base64(
+async fn fetch_single_image_base64_with_policy(
     url: &str,
     safe_http: &Client,
+    enforce_ssrf: bool,
 ) -> Result<String, String> {
-    // SSRF gate — same check used for user-supplied image URLs on input.
-    if let Some(ssrf_msg) = tools::net::check_ssrf(url).await {
+    if enforce_ssrf && let Some(ssrf_msg) = tools::net::check_ssrf(url).await {
         return Err(format!("Image fetch blocked ({url}): {ssrf_msg}"));
     }
 
@@ -531,7 +558,7 @@ pub(crate) async fn fetch_single_image_base64(
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if !is_supported_image_content_type(content_type) {
+    if !image_uploads::is_supported_image_content_type(content_type) {
         return Err(format!(
             "Image fetch returned unsupported content type '{}' for {}",
             if content_type.is_empty() {
@@ -567,6 +594,27 @@ pub(crate) async fn fetch_single_image_base64(
     }
 
     Ok(base64::engine::general_purpose::STANDARD.encode(&buf))
+}
+
+/// Fetch a single image URL and return its base64-encoded content.
+///
+/// Performs SSRF check, checks Content-Length before downloading, and
+/// enforces a streaming size cap to prevent memory exhaustion from
+/// attacker-controlled URLs.  The caller supplies a no-redirect `Client`
+/// (via [`build_image_fetch_client`]) so that batches of images reuse one
+/// connection pool.
+pub(crate) async fn fetch_single_image_base64(
+    url: &str,
+    safe_http: &Client,
+) -> Result<String, String> {
+    fetch_single_image_base64_with_policy(url, safe_http, true).await
+}
+
+pub(crate) async fn fetch_single_image_base64_trusted(
+    url: &str,
+    safe_http: &Client,
+) -> Result<String, String> {
+    fetch_single_image_base64_with_policy(url, safe_http, false).await
 }
 
 fn convert_messages_to_ollama(
@@ -682,12 +730,14 @@ pub(crate) async fn call_llm_simple(
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
     workspace: &Path,
+    s3_cfg: Option<&crate::config::S3Config>,
     max_retries: usize,
 ) -> Result<String, String> {
     match resolved.provider {
         Provider::OpenAI => {
             let url = format!("{}/chat/completions", resolved.api_base);
-            let api_messages = convert_messages_to_openai(messages);
+            let messages = materialize_image_urls(messages, s3_cfg)?;
+            let api_messages = convert_messages_to_openai(&messages);
             let mut body = json!({
                 "model": resolved.model_id,
                 "messages": api_messages,
@@ -707,7 +757,8 @@ pub(crate) async fn call_llm_simple(
         }
         Provider::Anthropic => {
             let url = format!("{}/v1/messages", resolved.api_base);
-            let (system, msgs) = convert_messages_to_anthropic(messages);
+            let messages = materialize_image_urls(messages, s3_cfg)?;
+            let (system, msgs) = convert_messages_to_anthropic(&messages);
             let max_tokens = resolved.max_tokens.unwrap_or(4096);
             let cache_enabled = anthropic_prompt_caching_enabled(resolved);
             let mut body = json!({
@@ -736,8 +787,9 @@ pub(crate) async fn call_llm_simple(
         }
         Provider::Ollama => {
             let url = format!("{}/api/chat", resolved.api_base);
-            let images_b64 = fetch_images_base64(messages, workspace).await?;
-            let api_messages = convert_messages_to_ollama(messages, &images_b64);
+            let messages = materialize_image_urls(messages, s3_cfg)?;
+            let images_b64 = fetch_images_base64(&messages, workspace, s3_cfg).await?;
+            let api_messages = convert_messages_to_ollama(&messages, &images_b64);
             let mut body = json!({
                 "model": resolved.model_id,
                 "messages": api_messages,
@@ -848,6 +900,7 @@ pub(crate) async fn call_llm_stream(
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
     workspace: &Path,
+    s3_cfg: Option<&crate::config::S3Config>,
     tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
@@ -869,6 +922,7 @@ pub(crate) async fn call_llm_stream(
                 http,
                 resolved,
                 messages,
+                s3_cfg,
                 tx,
                 effective_level,
                 extra_tools,
@@ -881,6 +935,7 @@ pub(crate) async fn call_llm_stream(
                 http,
                 resolved,
                 messages,
+                s3_cfg,
                 tx,
                 effective_level,
                 extra_tools,
@@ -894,6 +949,7 @@ pub(crate) async fn call_llm_stream(
                 resolved,
                 messages,
                 workspace,
+                s3_cfg,
                 tx,
                 effective_level,
                 extra_tools,
@@ -1196,11 +1252,13 @@ fn drain_sse_lines(partial_buf: &mut String, chunk: &str) -> Vec<String> {
 fn build_openai_stream_body(
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
+    s3_cfg: Option<&crate::config::S3Config>,
     think_level: &str,
     extra_tools: &[serde_json::Value],
-) -> serde_json::Value {
+) -> Result<serde_json::Value, String> {
     let thinking_on = think_level != "off";
-    let api_messages = convert_messages_to_openai(messages);
+    let messages = materialize_image_urls(messages, s3_cfg)?;
+    let api_messages = convert_messages_to_openai(&messages);
     let mut all_tools: Vec<serde_json::Value> =
         serde_json::from_value(tools::tool_definitions()).unwrap_or_default();
     all_tools.extend_from_slice(extra_tools);
@@ -1228,18 +1286,20 @@ fn build_openai_stream_body(
     if let Some(max_tokens) = resolved.max_tokens {
         body["max_tokens"] = json!(max_tokens);
     }
-    body
+    Ok(body)
 }
 
 async fn build_ollama_stream_body(
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
     workspace: &Path,
+    s3_cfg: Option<&crate::config::S3Config>,
     think_level: &str,
     extra_tools: &[serde_json::Value],
 ) -> Result<serde_json::Value, String> {
-    let images_b64 = fetch_images_base64(messages, workspace).await?;
-    let api_messages = convert_messages_to_ollama(messages, &images_b64);
+    let messages = materialize_image_urls(messages, s3_cfg)?;
+    let images_b64 = fetch_images_base64(&messages, workspace, s3_cfg).await?;
+    let api_messages = convert_messages_to_ollama(&messages, &images_b64);
     let mut all_tools: Vec<serde_json::Value> =
         serde_json::from_value(tools::tool_definitions_ollama()).unwrap_or_default();
     all_tools.extend_from_slice(extra_tools);
@@ -1303,11 +1363,13 @@ where
 fn build_anthropic_stream_body(
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
+    s3_cfg: Option<&crate::config::S3Config>,
     think_level: &str,
     extra_tools: &[serde_json::Value],
-) -> serde_json::Value {
+) -> Result<serde_json::Value, String> {
     let thinking_on = think_level != "off";
-    let (system_prompt, anthropic_msgs) = convert_messages_to_anthropic(messages);
+    let messages = materialize_image_urls(messages, s3_cfg)?;
+    let (system_prompt, anthropic_msgs) = convert_messages_to_anthropic(&messages);
     let base_max = resolved.max_tokens.unwrap_or(8192);
     let effective_max = if thinking_on {
         base_max.saturating_add(think_level_to_budget(think_level))
@@ -1335,7 +1397,7 @@ fn build_anthropic_stream_body(
     if !system_prompt.is_empty() {
         body["system"] = anthropic_system_payload(&system_prompt, cache_enabled);
     }
-    body
+    Ok(body)
 }
 
 async fn consume_anthropic_stream<S, B>(
@@ -1497,17 +1559,19 @@ pub(crate) fn is_transient_llm_error(error: &str) -> bool {
     false
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn call_llm_stream_openai(
     http: &Client,
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
+    s3_cfg: Option<&crate::config::S3Config>,
     tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
     max_retries: usize,
 ) -> Result<LlmResponse, String> {
     let url = format!("{}/chat/completions", resolved.api_base);
-    let body = build_openai_stream_body(resolved, messages, think_level, extra_tools);
+    let body = build_openai_stream_body(resolved, messages, s3_cfg, think_level, extra_tools)?;
 
     let resp = send_with_retry(http, max_retries, || {
         http.post(&url).bearer_auth(&resolved.api_key).json(&body)
@@ -1540,17 +1604,19 @@ async fn call_llm_stream_openai(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn call_llm_stream_anthropic(
     http: &Client,
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
+    s3_cfg: Option<&crate::config::S3Config>,
     tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
     max_retries: usize,
 ) -> Result<LlmResponse, String> {
     let url = format!("{}/v1/messages", resolved.api_base);
-    let body = build_anthropic_stream_body(resolved, messages, think_level, extra_tools);
+    let body = build_anthropic_stream_body(resolved, messages, s3_cfg, think_level, extra_tools)?;
 
     let resp = send_with_retry(http, max_retries, || {
         http.post(&url)
@@ -1596,14 +1662,22 @@ async fn call_llm_stream_ollama(
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
     workspace: &Path,
+    s3_cfg: Option<&crate::config::S3Config>,
     tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
     max_retries: usize,
 ) -> Result<LlmResponse, String> {
     let url = format!("{}/api/chat", resolved.api_base);
-    let body =
-        build_ollama_stream_body(resolved, messages, workspace, think_level, extra_tools).await?;
+    let body = build_ollama_stream_body(
+        resolved,
+        messages,
+        workspace,
+        s3_cfg,
+        think_level,
+        extra_tools,
+    )
+    .await?;
 
     let resp = send_with_retry(http, max_retries, || {
         with_optional_bearer_auth(http.post(&url), &resolved.api_key).json(&body)

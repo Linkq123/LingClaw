@@ -1129,6 +1129,10 @@ pre:hover .copy-btn { opacity: 1; }
 }
 .image-preview-item .remove-btn:hover { opacity: 1; }
 /* Attach button */
+.attach-wrapper {
+  position: relative;
+  flex-shrink: 0;
+}
 .attach-btn {
   background: none;
   border: none;
@@ -1141,6 +1145,96 @@ pre:hover .copy-btn { opacity: 1; }
   flex-shrink: 0;
 }
 .attach-btn:hover { color: var(--accent2); }
+
+/* Attach popup */
+.attach-popup {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  min-width: 220px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+  z-index: 100;
+  overflow: hidden;
+  animation: popup-in .12s ease-out;
+}
+@keyframes popup-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.attach-menu {
+  display: flex;
+  flex-direction: column;
+}
+.attach-menu-item {
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 14px;
+  padding: 10px 14px;
+  text-align: left;
+  cursor: pointer;
+  transition: background .1s;
+  white-space: nowrap;
+}
+.attach-menu-item:hover {
+  background: var(--hover);
+}
+.attach-url-input {
+  display: flex;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+}
+.attach-url-input input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 13px;
+  padding: 6px 8px;
+  outline: none;
+}
+.attach-url-input input:focus {
+  border-color: var(--accent2);
+}
+.attach-url-add-btn {
+  background: var(--accent2);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.attach-url-add-btn:hover {
+  filter: brightness(1.1);
+}
+.attach-upload-status {
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+}
+.upload-spinner {
+  width: 14px;
+  height: 14px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent2);
+  border-radius: 50%;
+  animation: spin .6s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
 /* User message image thumbnails */
 .user-images {
   display: flex;

@@ -1,5 +1,6 @@
 use super::*;
 use crate::ImageAttachment;
+use crate::config::S3Config;
 use std::{
     fs,
     io::{Read, Write},
@@ -542,7 +543,7 @@ async fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
     }];
 
     let workspace = unique_temp_dir("lingclaw-ollama-body");
-    let body = build_ollama_stream_body(&resolved, &messages, &workspace, "high", &[])
+    let body = build_ollama_stream_body(&resolved, &messages, &workspace, None, "high", &[])
         .await
         .unwrap();
 
@@ -570,7 +571,7 @@ async fn build_ollama_stream_body_uses_levels_for_gpt_oss() {
     };
 
     let workspace = unique_temp_dir("lingclaw-ollama-levels");
-    let body = build_ollama_stream_body(&resolved, &[], &workspace, "high", &[])
+    let body = build_ollama_stream_body(&resolved, &[], &workspace, None, "high", &[])
         .await
         .unwrap();
 
@@ -635,7 +636,7 @@ fn call_llm_simple_ollama_sends_auth_and_expected_body() {
 
     let workspace = unique_temp_dir("lingclaw-call-simple");
     let content = runtime
-        .block_on(async { call_llm_simple(&http, &resolved, &messages, &workspace, 2).await })
+        .block_on(async { call_llm_simple(&http, &resolved, &messages, &workspace, None, 2).await })
         .expect("ollama simple call should succeed");
 
     let request = request_rx.recv().expect("captured request should exist");
@@ -702,6 +703,7 @@ fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
                 &resolved,
                 &messages,
                 &workspace,
+                None,
                 &live_tx,
                 "high",
                 &[],
@@ -927,11 +929,13 @@ fn convert_messages_to_openai_user_with_images() {
         images: Some(vec![
             ImageAttachment {
                 url: "https://example.com/a.png".into(),
+                s3_object_key: None,
                 cache_path: None,
                 data: None,
             },
             ImageAttachment {
                 url: "https://example.com/b.jpg".into(),
+                s3_object_key: None,
                 cache_path: None,
                 data: None,
             },
@@ -961,6 +965,7 @@ fn convert_messages_to_anthropic_user_with_images() {
         content: Some("what is this?".into()),
         images: Some(vec![ImageAttachment {
             url: "https://example.com/photo.png".into(),
+            s3_object_key: None,
             cache_path: None,
             data: None,
         }]),
@@ -989,11 +994,13 @@ fn convert_messages_to_ollama_user_with_images() {
         images: Some(vec![
             ImageAttachment {
                 url: "https://example.com/x.png".into(),
+                s3_object_key: None,
                 cache_path: Some("C:/tmp/x.b64".into()),
                 data: Some("aW1hZ2VfZGF0YV94".into()),
             },
             ImageAttachment {
                 url: "https://example.com/y.jpg".into(),
+                s3_object_key: None,
                 cache_path: Some("C:/tmp/y.b64".into()),
                 data: Some("aW1hZ2VfZGF0YV95".into()),
             },
@@ -1030,6 +1037,7 @@ fn convert_messages_to_ollama_user_with_images_missing_b64() {
         content: Some("describe".into()),
         images: Some(vec![ImageAttachment {
             url: "https://example.com/x.png".into(),
+            s3_object_key: None,
             cache_path: None,
             data: None,
         }]),
@@ -1058,6 +1066,7 @@ async fn fetch_images_base64_reads_persisted_cache_without_refetch() {
         content: Some("describe".into()),
         images: Some(vec![ImageAttachment {
             url: "https://example.com/cached.png".into(),
+            s3_object_key: None,
             cache_path: Some(cache_path),
             data: None,
         }]),
@@ -1066,7 +1075,7 @@ async fn fetch_images_base64_reads_persisted_cache_without_refetch() {
         timestamp: None,
     }];
 
-    let images_b64 = fetch_images_base64(&messages, &workspace)
+    let images_b64 = fetch_images_base64(&messages, &workspace, None)
         .await
         .expect("cached image should load");
     assert_eq!(
@@ -1086,6 +1095,7 @@ async fn fetch_images_base64_skips_uncached_historical_fetch_failures() {
         content: Some("describe".into()),
         images: Some(vec![ImageAttachment {
             url: "http://127.0.0.1/stale.png".into(),
+            s3_object_key: None,
             cache_path: None,
             data: None,
         }]),
@@ -1095,20 +1105,112 @@ async fn fetch_images_base64_skips_uncached_historical_fetch_failures() {
     }];
 
     let workspace = unique_temp_dir("lingclaw-stale-image-cache");
-    let images_b64 = fetch_images_base64(&messages, &workspace)
+    let images_b64 = fetch_images_base64(&messages, &workspace, None)
         .await
         .expect("stale historical images should be skipped, not fail the request");
     assert!(images_b64.is_empty());
 }
 
+#[tokio::test]
+async fn fetch_images_base64_trusted_uploaded_urls_bypass_ssrf_on_cache_miss() {
+    let (base_url, request_rx, handle) =
+        spawn_one_shot_http_server("image/png", "historical-image-body".to_string());
+    let cfg = S3Config {
+        endpoint: format!("{base_url}/storage"),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("describe".into()),
+        images: Some(vec![ImageAttachment {
+            url: "https://expired.example.test/old.png".into(),
+            s3_object_key: Some("images/2026/demo.png".into()),
+            cache_path: None,
+            data: None,
+        }]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let hydrated =
+        materialize_image_urls(&messages, Some(&cfg)).expect("uploaded image should presign");
+    let workspace = unique_temp_dir("lingclaw-trusted-history-image");
+    let images_b64 = fetch_images_base64(&hydrated, &workspace, Some(&cfg))
+        .await
+        .expect("trusted uploaded image should load on cache miss");
+
+    assert_eq!(
+        images_b64.get(hydrated[0].images.as_ref().unwrap()[0].url.as_str()),
+        Some(&"aGlzdG9yaWNhbC1pbWFnZS1ib2R5".to_string())
+    );
+
+    let request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("trusted request should reach local gateway");
+    assert!(
+        request
+            .request_line
+            .starts_with("GET /storage/bucket/images/2026/demo.png?")
+    );
+    handle.join().expect("server thread should exit cleanly");
+}
+
 #[test]
-fn supported_image_content_type_matches_provider_allowlist() {
-    assert!(is_supported_image_content_type("image/jpeg"));
-    assert!(is_supported_image_content_type("image/png; charset=binary"));
-    assert!(is_supported_image_content_type("image/webp"));
-    assert!(!is_supported_image_content_type("text/html"));
-    assert!(!is_supported_image_content_type("image/svg+xml"));
-    assert!(!is_supported_image_content_type(""));
+fn fetch_single_image_base64_trusted_allows_localhost_s3_gateways() {
+    let (base_url, _request_rx, handle) =
+        spawn_one_shot_http_server("image/png", "trusted-image-body".to_string());
+    let safe_http = build_image_fetch_client().expect("safe image client should build");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should build");
+
+    let result = runtime
+        .block_on(async {
+            fetch_single_image_base64_trusted(&format!("{base_url}/photo.png"), &safe_http).await
+        })
+        .expect("trusted localhost image fetch should bypass SSRF checks");
+
+    assert_eq!(result, "dHJ1c3RlZC1pbWFnZS1ib2R5");
+    handle.join().expect("server thread should exit cleanly");
+}
+
+#[test]
+fn materialize_image_urls_refreshes_uploaded_s3_urls() {
+    let cfg = S3Config {
+        endpoint: "https://minio.example.test/storage".into(),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("describe".into()),
+        images: Some(vec![ImageAttachment {
+            url: "https://expired.example.test/old.png".into(),
+            s3_object_key: Some("images/2026/demo.png".into()),
+            cache_path: None,
+            data: None,
+        }]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let hydrated =
+        materialize_image_urls(&messages, Some(&cfg)).expect("s3 object key should presign");
+    let url = hydrated[0].images.as_ref().unwrap()[0].url.as_str();
+
+    assert!(url.starts_with("https://minio.example.test/storage/bucket/images/2026/demo.png?"));
+    assert!(url.contains("X-Amz-Signature="));
 }
 
 #[test]

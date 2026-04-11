@@ -2,6 +2,8 @@ use super::*;
 
 use std::{collections::HashMap, sync::atomic::AtomicU64};
 
+use crate::config::S3Config;
+
 fn test_config() -> Config {
     Config {
         api_key: "env-key".to_string(),
@@ -24,6 +26,7 @@ fn test_config() -> Config {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     }
 }
 
@@ -40,6 +43,7 @@ fn test_app_state() -> AppState {
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
         memory_queue: None,
     }
@@ -75,6 +79,19 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         disabled_system_skills: HashSet::new(),
         version: 0,
         workspace: PathBuf::new(),
+    }
+}
+
+fn test_s3_config() -> S3Config {
+    S3Config {
+        endpoint: "https://minio.example.test/storage".to_string(),
+        region: "us-east-1".to_string(),
+        bucket: "bucket".to_string(),
+        access_key: "access-key".to_string(),
+        secret_key: "secret-key".to_string(),
+        prefix: "images/".to_string(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
     }
 }
 
@@ -232,4 +249,39 @@ fn update_llm_response_usage_uses_request_estimate_when_provider_usage_missing()
 
     assert_eq!(persisted.input_tokens, 777);
     assert_eq!(persisted.input_token_source, "estimated");
+}
+
+#[test]
+fn resolve_input_image_url_prefers_verified_s3_object_url() {
+    let s3_cfg = test_s3_config();
+    let object_key = "images/2026/demo.png";
+    let token = crate::image_uploads::sign_attachment_object_key(&s3_cfg, object_key);
+
+    let (url, trusted_object_key) = socket_input::resolve_input_image_url(
+        "https://example.com/decoy.png",
+        Some(object_key),
+        Some(&token),
+        Some(&s3_cfg),
+    )
+    .expect("verified uploads should resolve to a trusted S3 URL");
+
+    assert_eq!(trusted_object_key.as_deref(), Some(object_key));
+    assert!(url.starts_with("https://minio.example.test/storage/bucket/images/2026/demo.png?"));
+    assert!(url.contains("X-Amz-Signature="));
+}
+
+#[test]
+fn resolve_input_image_url_rejects_incomplete_uploaded_metadata() {
+    let err = socket_input::resolve_input_image_url(
+        "https://example.com/photo.png",
+        Some("images/2026/demo.png"),
+        None,
+        Some(&test_s3_config()),
+    )
+    .expect_err("partial upload metadata should be rejected");
+
+    assert_eq!(
+        err,
+        "Incomplete uploaded image metadata. Please re-attach the image."
+    );
 }

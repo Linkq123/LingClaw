@@ -8,6 +8,10 @@ use serde_json::json;
 #[serde(deny_unknown_fields)]
 struct InputImageAttachment {
     url: String,
+    #[serde(default)]
+    object_key: Option<String>,
+    #[serde(default)]
+    attachment_token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -15,6 +19,32 @@ struct UserMessagePayload {
     text: String,
     #[serde(default)]
     images: Vec<InputImageAttachment>,
+}
+
+pub(super) fn resolve_input_image_url(
+    url: &str,
+    object_key: Option<&str>,
+    attachment_token: Option<&str>,
+    s3_cfg: Option<&crate::config::S3Config>,
+) -> Result<(String, Option<String>), String> {
+    match (object_key, attachment_token) {
+        (Some(object_key), Some(token)) => {
+            let cfg = s3_cfg.ok_or_else(|| {
+                "S3 uploads are no longer configured. Please re-attach the image.".to_string()
+            })?;
+            if !crate::image_uploads::verify_attachment_object_key(cfg, object_key, token) {
+                return Err("Invalid uploaded image token. Please re-attach the image.".to_string());
+            }
+
+            let trusted_url =
+                crate::image_uploads::resolve_image_url("", Some(object_key), Some(cfg))?;
+            Ok((trusted_url, Some(object_key.to_string())))
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            Err("Incomplete uploaded image metadata. Please re-attach the image.".to_string())
+        }
+        (None, None) => Ok((url.to_string(), None)),
+    }
 }
 
 pub(crate) enum IdleSocketInputAction {
@@ -206,24 +236,52 @@ pub(crate) async fn handle_idle_socket_input(
                         None
                     };
                     for img in payload.images {
-                        match crate::tools::net::validate_image_url(&img.url).await {
+                        let (image_url, trusted_object_key) = match resolve_input_image_url(
+                            &img.url,
+                            img.object_key.as_deref(),
+                            img.attachment_token.as_deref(),
+                            state.config.s3.as_ref(),
+                        ) {
+                            Ok(resolved) => resolved,
+                            Err(message) => {
+                                ws_send(tx, &json!({"type":"system","content":message})).await;
+                                return IdleSocketInputAction::Continue;
+                            }
+                        };
+                        let is_trusted_upload = trusted_object_key.is_some();
+
+                        let validation = if is_trusted_upload {
+                            Ok(())
+                        } else {
+                            crate::tools::net::validate_image_url(&image_url).await
+                        };
+
+                        match validation {
                             Ok(()) => {
                                 if let Some(http) = safe_http.as_ref() {
                                     // Only Ollama needs local base64 data; persist it to the
                                     // session workspace so historical images survive restarts.
-                                    match crate::providers::fetch_single_image_base64(
-                                        &img.url, http,
-                                    )
-                                    .await
-                                    {
+                                    let fetch_result = if is_trusted_upload {
+                                        crate::providers::fetch_single_image_base64_trusted(
+                                            &image_url, http,
+                                        )
+                                        .await
+                                    } else {
+                                        crate::providers::fetch_single_image_base64(
+                                            &image_url, http,
+                                        )
+                                        .await
+                                    };
+                                    match fetch_result {
                                         Ok(b64) => {
                                             match crate::providers::persist_image_base64_cache(
-                                                &workspace, &img.url, &b64,
+                                                &workspace, &image_url, &b64,
                                             )
                                             .await
                                             {
                                                 Ok(cache_path) => validated.push(ImageAttachment {
-                                                    url: img.url,
+                                                    url: image_url,
+                                                    s3_object_key: trusted_object_key,
                                                     cache_path: Some(cache_path),
                                                     data: Some(b64),
                                                 }),
@@ -245,7 +303,8 @@ pub(crate) async fn handle_idle_socket_input(
                                     }
                                 } else {
                                     validated.push(ImageAttachment {
-                                        url: img.url,
+                                        url: image_url,
+                                        s3_object_key: trusted_object_key,
                                         cache_path: None,
                                         data: None,
                                     });

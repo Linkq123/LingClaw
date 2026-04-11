@@ -359,7 +359,7 @@ async fn handle_new_command(
                 false,
             ));
         }
-        result = providers::call_llm_simple(&state.http, &resolved, &compress_prompt, &workspace, state.config.max_llm_retries) => {
+        result = providers::call_llm_simple(&state.http, &resolved, &compress_prompt, &workspace, state.config.s3.as_ref(), state.config.max_llm_retries) => {
             match result {
                 Ok(s) => s,
                 Err(e) => {

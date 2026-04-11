@@ -155,6 +155,7 @@ async fn run_post_execution_reflection(
         &resolved,
         &prompt_messages,
         workspace,
+        config.s3.as_ref(),
         config.max_llm_retries,
     )
     .await
@@ -1152,6 +1153,7 @@ async fn run_analyze_phase(
                 &resolved,
                 &final_msgs_snapshot,
                 &phase_state.cycle_workspace,
+                ctx.state.config.s3.as_ref(),
                 ctx.live_tx,
                 &effective_think,
                 &extra_tools,

@@ -213,6 +213,7 @@ pub(crate) async fn run_subagent(
                         &resolved,
                         &messages,
                         workspace,
+                        config.s3.as_ref(),
                         &sub_tx,
                         think_level,
                         &tool_defs,

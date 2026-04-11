@@ -32,6 +32,7 @@ fn test_config() -> Config {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     }
 }
 

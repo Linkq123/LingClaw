@@ -96,16 +96,6 @@ async fn validate_image_url_accepts_common_image_extensions() {
             .await
             .is_ok()
     );
-    assert!(
-        validate_image_url("https://example.com/photo.gif")
-            .await
-            .is_ok()
-    );
-    assert!(
-        validate_image_url("https://example.com/photo.webp")
-            .await
-            .is_ok()
-    );
 }
 
 #[tokio::test]
@@ -138,8 +128,67 @@ async fn validate_image_url_blocks_non_image_extensions() {
 }
 
 #[tokio::test]
-async fn validate_image_url_allows_extensionless_dynamic_urls() {
-    // Many image services (e.g. Unsplash, imgur) serve images without extensions
+async fn validate_image_url_blocks_unsupported_image_extensions() {
+    assert!(
+        validate_image_url("https://example.com/photo.gif")
+            .await
+            .is_err()
+    );
+    assert!(
+        validate_image_url("https://example.com/photo.webp")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_url_blocks_other_explicit_non_image_extensions() {
+    assert!(
+        validate_image_url("https://example.com/video.mp4")
+            .await
+            .is_err()
+    );
+    assert!(
+        validate_image_url("https://example.com/report.csv")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_url_blocks_encoded_non_image_extensions() {
+    assert!(
+        validate_image_url("https://example.com/video%2Emp4")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_url_blocks_dotfile_non_image_extensions() {
+    assert!(
+        validate_image_url("https://example.com/.gif")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_url_blocks_trailing_dot_bypass() {
+    assert!(
+        validate_image_url("https://example.com/video.mp4.")
+            .await
+            .is_err()
+    );
+    assert!(
+        validate_image_url("https://example.com/script.js..")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_url_allows_dynamic_urls_without_extensions() {
     assert!(
         validate_image_url("https://images.unsplash.com/photo-123456")
             .await

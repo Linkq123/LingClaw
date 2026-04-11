@@ -843,6 +843,7 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
         &resolved,
         &messages,
         &req.workspace,
+        config.s3.as_ref(),
         config.max_llm_retries,
     )
     .await

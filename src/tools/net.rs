@@ -76,32 +76,71 @@ pub(crate) async fn check_ssrf(url: &str) -> Option<String> {
     None
 }
 
-/// Allowed image URL extensions (lowercase) — limited to formats supported by all major providers.
-const IMAGE_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png", ".gif", ".webp"];
+/// Allowed image URL extensions (lowercase) — restricted to the formats LingClaw accepts.
+const IMAGE_EXTENSIONS: &[&str] = &[".jpg", ".jpeg", ".png"];
 
-/// Explicitly blocked non-image extensions.
-const BLOCKED_EXTENSIONS: &[&str] = &[
-    ".html", ".htm", ".js", ".css", ".json", ".xml", ".txt", ".pdf", ".zip", ".tar", ".gz", ".exe",
-    ".sh", ".bat", ".msi", ".dll", ".so", ".py", ".rs", ".md",
+/// Common image extensions that LingClaw intentionally rejects.
+const UNSUPPORTED_IMAGE_EXTENSIONS: &[&str] = &[
+    ".gif", ".webp", ".svg", ".bmp", ".ico", ".tif", ".tiff", ".avif",
 ];
 
+fn decode_url_path_segment(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            let hi = (bytes[index + 1] as char).to_digit(16);
+            let lo = (bytes[index + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                decoded.push(((hi << 4) | lo) as u8);
+                index += 3;
+                continue;
+            }
+        }
+        decoded.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn last_path_segment(url: &reqwest::Url) -> Option<String> {
+    let segment = url
+        .path_segments()
+        .and_then(|mut segments| segments.rfind(|segment| !segment.is_empty()))?;
+    Some(decode_url_path_segment(segment).to_ascii_lowercase())
+}
+
+fn explicit_path_extension(path: &str) -> Option<&str> {
+    let segment = path.trim().trim_end_matches('.');
+    let dot_index = segment.rfind('.')?;
+    if dot_index + 1 >= segment.len() {
+        return None;
+    }
+    Some(&segment[dot_index..])
+}
+
 /// Validate that a URL is a safe, reachable image URL.
-/// Performs SSRF check and validates that the URL looks like an image resource.
+/// Performs SSRF check, allows extensionless dynamic image URLs, and rejects
+/// explicit non-PNG/JPEG suffixes early so obvious bad inputs fail before model calls.
 pub(crate) async fn validate_image_url(url: &str) -> Result<(), String> {
     if let Some(msg) = check_ssrf(url).await {
         return Err(msg);
     }
     let parsed = reqwest::Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
-    let path = parsed.path().to_lowercase();
-    let has_image_ext = IMAGE_EXTENSIONS.iter().any(|ext| path.ends_with(ext));
-    if !has_image_ext {
-        // Block URLs with known non-image extensions
-        if BLOCKED_EXTENSIONS.iter().any(|ext| path.ends_with(ext)) {
-            return Err(format!("URL does not appear to be an image: {url}"));
-        }
-        // Allow URLs without a recognized extension (dynamic image services)
+    let Some(last_segment) = last_path_segment(&parsed) else {
+        return Ok(());
+    };
+    let Some(extension) = explicit_path_extension(&last_segment) else {
+        return Ok(());
+    };
+    if IMAGE_EXTENSIONS.contains(&extension) {
+        return Ok(());
     }
-    Ok(())
+    if UNSUPPORTED_IMAGE_EXTENSIONS.contains(&extension) {
+        return Err(format!("Only PNG and JPEG image URLs are supported: {url}"));
+    }
+    Err(format!("URL does not appear to be an image: {url}"))
 }
 
 // ── http_fetch ───────────────────────────────────────────────────────────────

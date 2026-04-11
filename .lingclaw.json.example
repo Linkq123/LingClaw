@@ -103,5 +103,15 @@
         "GITHUB_PERSONAL_ACCESS_TOKEN": ""
       }
     }
+  },
+  "s3": {
+    "endpoint": "https://s3.us-east-1.amazonaws.com",
+    "region": "us-east-1",
+    "bucket": "my-bucket",
+    "accessKey": "AKIA...",
+    "secretKey": "your-secret-key",
+    "prefix": "lingclaw/images/",
+    "urlExpirySecs": 604800,
+    "lifecycleDays": 14
   }
 }

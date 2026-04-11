@@ -37,6 +37,7 @@ fn test_config_with_broken_mcp() -> Config {
         max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        s3: None,
     }
 }
 

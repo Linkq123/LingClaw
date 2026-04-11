@@ -429,6 +429,7 @@ fn base_config() -> Config {
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         structured_memory: false,
+        s3: None,
     }
 }
 

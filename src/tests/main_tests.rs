@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::JsonMcpServerConfig;
+use axum::http::{HeaderMap, HeaderValue};
 use serde_json::json;
 use std::{collections::HashMap, sync::atomic::AtomicU64};
 
@@ -41,12 +42,95 @@ fn test_config() -> Config {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     }
 }
 
 #[test]
 fn default_port_constant_is_18989() {
     assert_eq!(DEFAULT_PORT, 18989);
+}
+
+#[test]
+fn normalized_s3_prefix_defaults_when_empty() {
+    assert_eq!(
+        crate::config::normalized_s3_prefix(Some("  /  ".to_string())),
+        "lingclaw/images/"
+    );
+}
+
+#[test]
+fn normalized_s3_region_defaults_and_lowercases() {
+    assert_eq!(crate::config::normalized_s3_region("  "), "us-east-1");
+    assert_eq!(
+        crate::config::normalized_s3_region(" CN-NORTH-1 "),
+        "cn-north-1"
+    );
+}
+
+#[test]
+fn normalized_s3_prefix_trims_and_enforces_trailing_slash() {
+    assert_eq!(
+        crate::config::normalized_s3_prefix(Some(" /tmp/uploads// ".to_string())),
+        "tmp/uploads/"
+    );
+}
+
+#[test]
+fn normalized_s3_endpoint_defaults_to_regional_aws_host() {
+    assert_eq!(
+        crate::config::normalized_s3_endpoint(None, "eu-west-1"),
+        "https://s3.eu-west-1.amazonaws.com"
+    );
+}
+
+#[test]
+fn normalized_s3_endpoint_rewrites_legacy_aws_global_host() {
+    assert_eq!(
+        crate::config::normalized_s3_endpoint(
+            Some("https://s3.amazonaws.com".to_string()),
+            "ap-southeast-2",
+        ),
+        "https://s3.ap-southeast-2.amazonaws.com"
+    );
+}
+
+#[test]
+fn normalized_s3_endpoint_defaults_to_aws_china_host() {
+    assert_eq!(
+        crate::config::normalized_s3_endpoint(None, "cn-north-1"),
+        "https://s3.cn-north-1.amazonaws.com.cn"
+    );
+}
+
+#[test]
+fn normalized_s3_endpoint_defaults_to_aws_china_host_for_mixed_case_region() {
+    assert_eq!(
+        crate::config::normalized_s3_endpoint(None, " CN-NORTH-1 "),
+        "https://s3.cn-north-1.amazonaws.com.cn"
+    );
+}
+
+#[test]
+fn normalized_s3_endpoint_rewrites_official_aws_host_for_china_region() {
+    assert_eq!(
+        crate::config::normalized_s3_endpoint(
+            Some("https://s3.us-east-1.amazonaws.com".to_string()),
+            "cn-northwest-1",
+        ),
+        "https://s3.cn-northwest-1.amazonaws.com.cn"
+    );
+}
+
+#[test]
+fn normalized_s3_endpoint_preserves_custom_gateway_paths() {
+    assert_eq!(
+        crate::config::normalized_s3_endpoint(
+            Some("https://minio.example.test/storage/".to_string()),
+            "us-east-1",
+        ),
+        "https://minio.example.test/storage"
+    );
 }
 
 #[test]
@@ -85,6 +169,7 @@ fn test_app_state() -> AppState {
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
         memory_queue: None,
     }
@@ -103,6 +188,7 @@ fn test_app_state_with_config(config: Config) -> AppState {
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
         memory_queue: None,
     }
@@ -239,6 +325,7 @@ fn resolve_model_uses_config_for_plain_model_id() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
 
     let resolved = config.resolve_model("gpt-4o-mini");
@@ -463,6 +550,7 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
             content: Some("look".into()),
             images: Some(vec![ImageAttachment {
                 url: "https://example.com/photo.png".into(),
+                s3_object_key: None,
                 cache_path: Some("C:/internal/cache/file.b64".into()),
                 data: Some("aW1hZ2U=".into()),
             }]),
@@ -498,6 +586,65 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
     assert_eq!(images[0]["url"], "https://example.com/photo.png");
     assert!(images[0].get("cache_path").is_none());
     assert!(images[0].get("data").is_none());
+}
+
+#[test]
+fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: Some("look".into()),
+            images: Some(vec![ImageAttachment {
+                url: "https://expired.example.test/photo.png".into(),
+                s3_object_key: Some("lingclaw/images/2026/demo.png".into()),
+                cache_path: None,
+                data: None,
+            }]),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(123),
+        }],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+    let s3_cfg = crate::config::S3Config {
+        endpoint: "https://minio.example.test/storage".into(),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "lingclaw/images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    };
+
+    let payload = crate::session_store::build_history_payload_with_s3(&session, Some(&s3_cfg));
+    let url = payload["messages"][0]["images"][0]["url"]
+        .as_str()
+        .expect("history image url should exist");
+
+    assert!(
+        url.starts_with("https://minio.example.test/storage/bucket/lingclaw/images/2026/demo.png?")
+    );
+    assert!(url.contains("X-Amz-Signature="));
 }
 
 #[test]
@@ -567,6 +714,7 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
 
     let resolved = config.resolve_model("llama3.2");
@@ -640,6 +788,7 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
 
     assert!(crate::cli::is_default_model_row(
@@ -719,6 +868,7 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -790,6 +940,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -843,6 +994,7 @@ fn canonical_model_ref_expands_unique_plain_id() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
 
     let canonical = config
@@ -913,6 +1065,7 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
 
     let err = config
@@ -985,6 +1138,7 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
 
     let available = config.available_models();
@@ -1037,6 +1191,7 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
 
     let err = config
@@ -1089,6 +1244,7 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
 
     let canonical = config
@@ -1121,6 +1277,7 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
 
     let canonical = config
@@ -1153,6 +1310,7 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
 
     let resolved = config.resolve_model("anthropic/claude-sonnet-4-20250514");
@@ -1185,6 +1343,7 @@ fn resolve_model_accepts_ollama_prefix_without_provider_config() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
 
     let resolved = config.resolve_model("ollama/llama3.2");
@@ -1237,6 +1396,7 @@ fn build_session_status_reports_resolved_target() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
     let mut session = test_session("abc", "Test", Some("anthropic/claude-sonnet-4-20250514"));
     session.think_level = "medium".to_string();
@@ -1993,10 +2153,75 @@ fn read_file_reports_workspace_escape_clearly() {
 
 #[test]
 fn generate_shutdown_token_returns_64_hex_chars() {
-    let token = generate_shutdown_token();
+    let token = generate_shutdown_token().expect("secure shutdown token should be generated");
 
     assert_eq!(token.len(), 64);
     assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
+}
+
+#[tokio::test]
+async fn api_client_config_returns_upload_token() {
+    let state = Arc::new(test_app_state());
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_client_config(headers, State(state.clone()))
+        .await
+        .expect("local request should be accepted");
+
+    assert_eq!(payload["upload_token"], state.upload_token);
+}
+
+#[test]
+fn validate_local_request_headers_accepts_loopback_host_and_origin() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("localhost:18989"));
+    headers.insert("origin", HeaderValue::from_static("http://127.0.0.1:18989"));
+
+    assert!(validate_local_request_headers(&headers).is_ok());
+}
+
+#[test]
+fn validate_local_request_headers_rejects_non_local_host() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("evil.example"));
+
+    let err = validate_local_request_headers(&headers).expect_err("remote host must be rejected");
+
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        err.1.0["error"],
+        "Blocked non-local request: Host header must target localhost or a loopback address"
+    );
+}
+
+#[test]
+fn validate_local_request_headers_rejects_non_local_origin() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    headers.insert("origin", HeaderValue::from_static("https://evil.example"));
+
+    let err = validate_local_request_headers(&headers)
+        .expect_err("remote origin must be rejected even for loopback host");
+
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        err.1.0["error"],
+        "Blocked non-local request: Origin/Referer must be localhost or a loopback address"
+    );
+}
+
+#[tokio::test]
+async fn api_client_config_rejects_non_local_host() {
+    let state = Arc::new(test_app_state());
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("evil.example"));
+
+    let err = api_client_config(headers, State(state))
+        .await
+        .expect_err("remote host should not receive upload token");
+
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
 }
 
 #[test]
@@ -3626,6 +3851,7 @@ fn context_input_budget_reserves_headroom() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+        s3: None,
     };
 
     let budget = context_input_budget_for_model(&config, "anthropic/claude-sonnet-4-20250514");

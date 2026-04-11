@@ -18,7 +18,7 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
             let supports_image = state.config.model_supports_image(model);
             (
                 session.name.clone(),
-                build_history_payload(session),
+                build_history_payload_with_s3(session, state.config.s3.as_ref()),
                 build_view_state_payload(session),
                 supports_image,
             )
@@ -32,9 +32,10 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
         }
     };
 
+    let s3_available = state.config.s3.is_some();
     ws_send(
         tx,
-        &json!({"type":"session","id":session_id,"name":name,"capabilities":{"image":supports_image}}),
+        &json!({"type":"session","id":session_id,"name":name,"capabilities":{"image":supports_image,"s3":s3_available}}),
     )
     .await;
     ws_send(tx, &view_state).await;
@@ -49,7 +50,8 @@ pub(crate) fn build_session_info_payload(
     effective_model: &str,
 ) -> serde_json::Value {
     let supports_image = state.config.model_supports_image(effective_model);
-    json!({"type":"session","id":session_id,"name":name,"capabilities":{"image":supports_image}})
+    let s3_available = state.config.s3.is_some();
+    json!({"type":"session","id":session_id,"name":name,"capabilities":{"image":supports_image,"s3":s3_available}})
 }
 
 pub(crate) async fn send_command_refresh(
@@ -63,7 +65,10 @@ pub(crate) async fn send_command_refresh(
         sessions.get(session_id).map(|session| {
             let view_state = build_view_state_payload(session);
             let history = if include_history {
-                Some(build_history_payload(session))
+                Some(build_history_payload_with_s3(
+                    session,
+                    state.config.s3.as_ref(),
+                ))
             } else {
                 None
             };
