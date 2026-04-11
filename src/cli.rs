@@ -569,6 +569,83 @@ fn print_start_details(port: u16, manager: &str) {
     }
 }
 
+fn build_s3_start_detail_lines(
+    config: &Config,
+    raw_s3_present: bool,
+    settings_enable_s3: Option<bool>,
+    env_enable_s3: Option<bool>,
+) -> Vec<String> {
+    if let Some(s3) = config.s3.as_ref() {
+        let mut lines = vec![
+            "  S3:      enabled".to_string(),
+            format!("  S3 URL:  {}", s3.endpoint),
+            format!(
+                "  S3 To:   bucket={} region={} prefix={}",
+                s3.bucket, s3.region, s3.prefix
+            ),
+            format!(
+                "  S3 Opts: presign={}s lifecycle={}d",
+                s3.url_expiry_secs, s3.lifecycle_days
+            ),
+        ];
+
+        if env_enable_s3 == Some(true) && settings_enable_s3 == Some(false) {
+            lines.push(
+                "  S3 Note: LINGCLAW_ENABLE_S3=true overrides settings.enableS3=false".to_string(),
+            );
+        } else if env_enable_s3 == Some(true) {
+            lines.push("  S3 Note: enabled by LINGCLAW_ENABLE_S3=true".to_string());
+        }
+
+        return lines;
+    }
+
+    if env_enable_s3 == Some(false) {
+        let mut lines = vec!["  S3:      disabled by LINGCLAW_ENABLE_S3=false".to_string()];
+        if raw_s3_present {
+            lines.push("  S3 Note: s3 section exists but runtime uploads are disabled".to_string());
+        }
+        return lines;
+    }
+
+    if settings_enable_s3 == Some(false) {
+        let mut lines = vec!["  S3:      disabled by settings.enableS3=false".to_string()];
+        if raw_s3_present {
+            lines.push("  S3 Note: s3 section exists but runtime uploads are disabled".to_string());
+        }
+        return lines;
+    }
+
+    if raw_s3_present {
+        return vec![
+            "  S3:      configured but incomplete (missing required s3 fields)".to_string(),
+        ];
+    }
+
+    vec!["  S3:      not configured".to_string()]
+}
+
+fn print_s3_start_details(config: &Config) {
+    let raw_cfg = crate::config::load_config_file();
+    let settings_enable_s3 = raw_cfg
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.enable_s3);
+    let env_enable_s3 = crate::config::parse_boolish_env("LINGCLAW_ENABLE_S3");
+    let raw_s3_present = raw_cfg.s3.is_some();
+
+    for line in
+        build_s3_start_detail_lines(config, raw_s3_present, settings_enable_s3, env_enable_s3)
+    {
+        println!("{line}");
+    }
+}
+
+fn print_start_details_with_s3(port: u16, manager: &str, config: &Config) {
+    print_start_details(port, manager);
+    print_s3_start_details(config);
+}
+
 // ── PATH Installation ────────────────────────────────────────────────────────
 
 fn install_global_path() {
@@ -825,7 +902,7 @@ fn handle_start_command(port_override: Option<u16>) -> bool {
     #[cfg(not(target_os = "windows"))]
     if managed_by_systemd {
         println!("Starting LingClaw via systemd...");
-        print_start_details(effective_port, "systemd");
+        print_start_details_with_s3(effective_port, "systemd", &config);
         match run_systemctl(&["start", SYSTEMD_SERVICE_NAME]) {
             Ok(true) => println!("Started {}.", SYSTEMD_SERVICE_NAME),
             Ok(false) => eprintln!("Failed to start {}.", SYSTEMD_SERVICE_NAME),
@@ -847,13 +924,14 @@ fn handle_start_command(port_override: Option<u16>) -> bool {
         extra_args.push(p.to_string());
     }
     println!("Starting LingClaw daemon...");
-    print_start_details(
+    print_start_details_with_s3(
         effective_port,
         if cfg!(target_os = "windows") {
             "detached-process"
         } else {
             "nohup"
         },
+        &config,
     );
     #[cfg(target_os = "windows")]
     {
@@ -990,7 +1068,7 @@ fn handle_restart_command(port_override: Option<u16>) -> bool {
     #[cfg(not(target_os = "windows"))]
     if systemd_service_installed() {
         println!("Restarting LingClaw via systemd...");
-        print_start_details(config.port, "systemd");
+        print_start_details_with_s3(config.port, "systemd", &config);
         match run_systemctl(&["restart", SYSTEMD_SERVICE_NAME]) {
             Ok(true) => println!("Restarted {}.", SYSTEMD_SERVICE_NAME),
             Ok(false) => eprintln!("Failed to restart {}.", SYSTEMD_SERVICE_NAME),
@@ -1200,6 +1278,7 @@ fn handle_status_command(port_override: Option<u16>) -> bool {
     );
     println!("  LLM retries:  {}", config.max_llm_retries);
     println!("  Context limit: {} tokens", config.max_context_tokens);
+    print_s3_start_details(&config);
     println!();
 
     if config.providers.is_empty() {

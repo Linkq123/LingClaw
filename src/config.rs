@@ -154,6 +154,23 @@ fn trimmed_nonempty(value: Option<String>) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
+pub(crate) fn parse_boolish_env(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+}
+
+pub(crate) fn effective_enable_s3(
+    settings_enable_s3: Option<bool>,
+    env_enable_s3: Option<bool>,
+) -> Option<bool> {
+    env_enable_s3.or(settings_enable_s3)
+}
+
 pub(crate) fn normalized_s3_region(region: &str) -> String {
     let region = region.trim().to_ascii_lowercase();
     if region.is_empty() {
@@ -223,15 +240,8 @@ impl Config {
 
         // S3 config: gated by enableS3 setting (default: true when s3 section present).
         // Env var LINGCLAW_ENABLE_S3 overrides the JSON setting.
-        let enable_s3 = settings.enable_s3.or_else(|| {
-            std::env::var("LINGCLAW_ENABLE_S3").ok().and_then(|v| {
-                match v.trim().to_ascii_lowercase().as_str() {
-                    "1" | "true" | "yes" | "on" => Some(true),
-                    "0" | "false" | "no" | "off" => Some(false),
-                    _ => None,
-                }
-            })
-        });
+        let enable_s3 =
+            effective_enable_s3(settings.enable_s3, parse_boolish_env("LINGCLAW_ENABLE_S3"));
         let s3 = if enable_s3 == Some(false) {
             None
         } else {

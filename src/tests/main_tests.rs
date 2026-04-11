@@ -382,6 +382,41 @@ fn settings_openai_stream_include_usage_deserializes() {
 }
 
 #[test]
+fn settings_enable_s3_deserializes() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "settings": {
+                "enableS3": true
+            }
+        }"#,
+    )
+    .expect("enableS3 should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.enable_s3, Some(true));
+}
+
+#[test]
+fn effective_enable_s3_prefers_env_override() {
+    assert_eq!(
+        crate::config::effective_enable_s3(Some(false), Some(true)),
+        Some(true)
+    );
+    assert_eq!(
+        crate::config::effective_enable_s3(Some(true), Some(false)),
+        Some(false)
+    );
+    assert_eq!(
+        crate::config::effective_enable_s3(Some(true), None),
+        Some(true)
+    );
+    assert_eq!(
+        crate::config::effective_enable_s3(None, Some(false)),
+        Some(false)
+    );
+}
+
+#[test]
 fn settings_tool_timeout_deserializes() {
     let cfg: JsonConfig = serde_json::from_str(
         r#"{
