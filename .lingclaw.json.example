@@ -7,7 +7,8 @@
     "maxLlmRetries": 2,
     "maxContextTokens": 32000,
     "maxOutputBytes": 51200,
-    "maxFileBytes": 204800
+    "maxFileBytes": 204800,
+    "enableS3": true
   },
   "models": {
     "providers": {

@@ -221,23 +221,37 @@ impl Config {
         let mcp_servers: HashMap<String, JsonMcpServerConfig> =
             json_cfg.mcp_servers.unwrap_or_default();
 
-        // S3 config: require region/bucket/access key/secret key; default endpoint when omitted.
-        let s3 = json_cfg.s3.and_then(|j| {
-            let region = normalized_s3_region(&trimmed_nonempty(j.region)?);
-            let bucket = trimmed_nonempty(j.bucket)?;
-            let access_key = trimmed_nonempty(j.access_key)?;
-            let secret_key = trimmed_nonempty(j.secret_key)?;
-            Some(S3Config {
-                endpoint: normalized_s3_endpoint(j.endpoint, &region),
-                region,
-                bucket,
-                access_key,
-                secret_key,
-                prefix: normalized_s3_prefix(j.prefix),
-                url_expiry_secs: j.url_expiry_secs.unwrap_or(604_800), // 7 days (AWS-compatible default)
-                lifecycle_days: j.lifecycle_days.unwrap_or(14),
+        // S3 config: gated by enableS3 setting (default: true when s3 section present).
+        // Env var LINGCLAW_ENABLE_S3 overrides the JSON setting.
+        let enable_s3 = settings.enable_s3.or_else(|| {
+            std::env::var("LINGCLAW_ENABLE_S3").ok().and_then(|v| {
+                match v.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "yes" | "on" => Some(true),
+                    "0" | "false" | "no" | "off" => Some(false),
+                    _ => None,
+                }
             })
         });
+        let s3 = if enable_s3 == Some(false) {
+            None
+        } else {
+            json_cfg.s3.and_then(|j| {
+                let region = normalized_s3_region(&trimmed_nonempty(j.region)?);
+                let bucket = trimmed_nonempty(j.bucket)?;
+                let access_key = trimmed_nonempty(j.access_key)?;
+                let secret_key = trimmed_nonempty(j.secret_key)?;
+                Some(S3Config {
+                    endpoint: normalized_s3_endpoint(j.endpoint, &region),
+                    region,
+                    bucket,
+                    access_key,
+                    secret_key,
+                    prefix: normalized_s3_prefix(j.prefix),
+                    url_expiry_secs: j.url_expiry_secs.unwrap_or(604_800),
+                    lifecycle_days: j.lifecycle_days.unwrap_or(14),
+                })
+            })
+        };
 
         // Default model: JSON agents.defaults.model.primary → env LINGCLAW_MODEL → "gpt-4o-mini"
         let model_config = json_cfg
@@ -727,6 +741,9 @@ pub(crate) struct JsonSettings {
     /// Enable structured async memory (default: false).
     #[serde(rename = "structuredMemory")]
     pub(crate) structured_memory: Option<bool>,
+    /// Enable S3-compatible image upload (default: true when s3 section is configured).
+    #[serde(rename = "enableS3")]
+    pub(crate) enable_s3: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]

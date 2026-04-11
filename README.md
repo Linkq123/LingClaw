@@ -101,7 +101,8 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
     "maxContextTokens": 32000,
     "maxOutputBytes": 51200,
     "maxFileBytes": 204800,
-    "structuredMemory": false
+    "structuredMemory": false,
+    "enableS3": true
   },
   "models": {
     "providers": {
