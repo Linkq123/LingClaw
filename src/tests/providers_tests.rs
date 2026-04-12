@@ -1,10 +1,14 @@
 use super::*;
+use crate::ImageAttachment;
+use crate::config::S3Config;
 use std::{
+    fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
+    path::PathBuf,
     sync::mpsc,
     thread,
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 struct CapturedHttpRequest {
@@ -109,6 +113,14 @@ fn spawn_one_shot_http_server(
     (format!("http://{}", address), request_rx, handle)
 }
 
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be valid")
+        .as_nanos();
+    std::env::temp_dir().join(format!("{prefix}-{nanos}"))
+}
+
 #[test]
 fn think_level_to_reasoning_effort_all_levels() {
     assert_eq!(think_level_to_reasoning_effort("minimal"), "low");
@@ -152,6 +164,7 @@ fn convert_messages_to_openai_all_roles() {
         ChatMessage {
             role: "system".into(),
             content: Some("you are helpful".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -159,6 +172,7 @@ fn convert_messages_to_openai_all_roles() {
         ChatMessage {
             role: "user".into(),
             content: Some("hello".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -166,6 +180,7 @@ fn convert_messages_to_openai_all_roles() {
         ChatMessage {
             role: "assistant".into(),
             content: Some("hi".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -173,6 +188,7 @@ fn convert_messages_to_openai_all_roles() {
         ChatMessage {
             role: "tool".into(),
             content: Some("result".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -180,6 +196,7 @@ fn convert_messages_to_openai_all_roles() {
         ChatMessage {
             role: "unknown_role".into(),
             content: Some("skip me".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -199,6 +216,7 @@ fn convert_messages_to_openai_assistant_with_tool_calls() {
     let messages = vec![ChatMessage {
         role: "assistant".into(),
         content: None,
+        images: None,
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
@@ -222,6 +240,7 @@ fn convert_messages_to_anthropic_system_extraction() {
         ChatMessage {
             role: "system".into(),
             content: Some("system prompt".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -229,6 +248,7 @@ fn convert_messages_to_anthropic_system_extraction() {
         ChatMessage {
             role: "user".into(),
             content: Some("hello".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -245,6 +265,7 @@ fn convert_messages_to_anthropic_tool_as_user_message() {
     let messages = vec![ChatMessage {
         role: "tool".into(),
         content: Some("file contents".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: Some("tc1".into()),
         timestamp: None,
@@ -261,6 +282,7 @@ fn convert_messages_to_anthropic_assistant_with_tool_use() {
     let messages = vec![ChatMessage {
         role: "assistant".into(),
         content: Some("let me check".into()),
+        images: None,
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
@@ -286,6 +308,7 @@ fn convert_messages_to_anthropic_empty_assistant_gets_placeholder() {
     let messages = vec![ChatMessage {
         role: "assistant".into(),
         content: None,
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -303,6 +326,7 @@ fn convert_messages_to_ollama_all_roles() {
         ChatMessage {
             role: "system".into(),
             content: Some("system prompt".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -310,6 +334,7 @@ fn convert_messages_to_ollama_all_roles() {
         ChatMessage {
             role: "user".into(),
             content: Some("hello".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -317,6 +342,7 @@ fn convert_messages_to_ollama_all_roles() {
         ChatMessage {
             role: "assistant".into(),
             content: Some("checking".into()),
+            images: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -331,13 +357,14 @@ fn convert_messages_to_ollama_all_roles() {
         ChatMessage {
             role: "tool".into(),
             content: Some("done".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
         },
     ];
 
-    let out = convert_messages_to_ollama(&messages);
+    let out = convert_messages_to_ollama(&messages, &std::collections::HashMap::new());
 
     assert_eq!(out.len(), 4);
     assert_eq!(out[0]["role"], "system");
@@ -492,8 +519,8 @@ fn process_anthropic_sse_line_keeps_event_type_between_lines() {
     assert!(rx.try_recv().is_ok());
 }
 
-#[test]
-fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
+#[tokio::test]
+async fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
     let resolved = ResolvedModel {
         provider: Provider::Ollama,
         api_base: "http://127.0.0.1:11434".into(),
@@ -509,12 +536,16 @@ fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
     let messages = vec![ChatMessage {
         role: "user".into(),
         content: Some("hello".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
     }];
 
-    let body = build_ollama_stream_body(&resolved, &messages, "high", &[]);
+    let workspace = unique_temp_dir("lingclaw-ollama-body");
+    let body = build_ollama_stream_body(&resolved, &messages, &workspace, None, "high", &[])
+        .await
+        .unwrap();
 
     assert_eq!(body["model"], "qwen3");
     assert_eq!(body["stream"], true);
@@ -524,8 +555,8 @@ fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
     assert!(body["tools"].is_array());
 }
 
-#[test]
-fn build_ollama_stream_body_uses_levels_for_gpt_oss() {
+#[tokio::test]
+async fn build_ollama_stream_body_uses_levels_for_gpt_oss() {
     let resolved = ResolvedModel {
         provider: Provider::Ollama,
         api_base: "http://127.0.0.1:11434".into(),
@@ -539,7 +570,10 @@ fn build_ollama_stream_body_uses_levels_for_gpt_oss() {
         anthropic_prompt_caching: false,
     };
 
-    let body = build_ollama_stream_body(&resolved, &[], "high", &[]);
+    let workspace = unique_temp_dir("lingclaw-ollama-levels");
+    let body = build_ollama_stream_body(&resolved, &[], &workspace, None, "high", &[])
+        .await
+        .unwrap();
 
     assert_eq!(body["think"], "high");
 }
@@ -594,13 +628,15 @@ fn call_llm_simple_ollama_sends_auth_and_expected_body() {
     let messages = vec![ChatMessage {
         role: "user".into(),
         content: Some("hi".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
     }];
 
+    let workspace = unique_temp_dir("lingclaw-call-simple");
     let content = runtime
-        .block_on(async { call_llm_simple(&http, &resolved, &messages).await })
+        .block_on(async { call_llm_simple(&http, &resolved, &messages, &workspace, None, 2).await })
         .expect("ollama simple call should succeed");
 
     let request = request_rx.recv().expect("captured request should exist");
@@ -651,6 +687,7 @@ fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
     let messages = vec![ChatMessage {
         role: "user".into(),
         content: Some("inspect readme".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -658,9 +695,21 @@ fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
     let live_tx: LiveTx = tx;
 
+    let workspace = unique_temp_dir("lingclaw-call-stream");
     let response = runtime
         .block_on(async {
-            call_llm_stream_ollama(&http, &resolved, &messages, &live_tx, "high", &[]).await
+            call_llm_stream_ollama(
+                &http,
+                &resolved,
+                &messages,
+                &workspace,
+                None,
+                &live_tx,
+                "high",
+                &[],
+                2,
+            )
+            .await
         })
         .expect("ollama stream call should succeed");
 
@@ -801,4 +850,405 @@ fn anthropic_prompt_caching_can_be_forced_for_compatible_api() {
     };
 
     assert!(anthropic_prompt_caching_enabled(&resolved));
+}
+
+// ── is_transient_llm_error ──────────────────────────────────────────────
+
+#[test]
+fn transient_error_detects_429() {
+    assert!(is_transient_llm_error(
+        "API 429 (after 3 attempts): rate limited"
+    ));
+}
+
+#[test]
+fn transient_error_detects_5xx() {
+    assert!(is_transient_llm_error(
+        "API 502 (after 3 attempts): bad gateway"
+    ));
+    assert!(is_transient_llm_error(
+        "API 500 (after 3 attempts): internal"
+    ));
+    assert!(is_transient_llm_error(
+        "API 503 (after 3 attempts): unavailable"
+    ));
+    assert!(is_transient_llm_error(
+        "API 504 (after 3 attempts): timeout"
+    ));
+}
+
+#[test]
+fn transient_error_detects_http_error() {
+    assert!(is_transient_llm_error("HTTP error: connection reset"));
+    assert!(is_transient_llm_error("HTTP error: request timed out"));
+}
+
+#[test]
+fn transient_error_detects_exhausted_retries() {
+    assert!(is_transient_llm_error(
+        "LLM request failed after all retries"
+    ));
+}
+
+#[test]
+fn transient_error_rejects_stream_errors() {
+    assert!(!is_transient_llm_error(
+        "stream error: connection reset by peer"
+    ));
+}
+
+#[test]
+fn transient_error_rejects_client_disconnected() {
+    assert!(!is_transient_llm_error("Client disconnected"));
+}
+
+#[test]
+fn transient_error_rejects_auth_errors() {
+    assert!(!is_transient_llm_error("API 401: Unauthorized"));
+    assert!(!is_transient_llm_error("API 403: Forbidden"));
+}
+
+#[test]
+fn transient_error_rejects_bad_request() {
+    assert!(!is_transient_llm_error("API 400: Bad Request"));
+}
+
+#[test]
+fn transient_error_rejects_unrecognized() {
+    assert!(!is_transient_llm_error("some random error"));
+    assert!(!is_transient_llm_error(""));
+}
+
+// ── Image attachment conversion tests ──────────────────────────
+
+#[test]
+fn convert_messages_to_openai_user_with_images() {
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("describe this".into()),
+        images: Some(vec![
+            ImageAttachment {
+                url: "https://example.com/a.png".into(),
+                s3_object_key: None,
+                cache_path: None,
+                data: None,
+            },
+            ImageAttachment {
+                url: "https://example.com/b.jpg".into(),
+                s3_object_key: None,
+                cache_path: None,
+                data: None,
+            },
+        ]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let out = convert_messages_to_openai(&messages);
+    assert_eq!(out.len(), 1);
+    let content = out[0]["content"]
+        .as_array()
+        .expect("content should be array");
+    assert_eq!(content.len(), 3);
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "describe this");
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(content[1]["image_url"]["url"], "https://example.com/a.png");
+    assert_eq!(content[2]["type"], "image_url");
+    assert_eq!(content[2]["image_url"]["url"], "https://example.com/b.jpg");
+}
+
+#[test]
+fn convert_messages_to_anthropic_user_with_images() {
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("what is this?".into()),
+        images: Some(vec![ImageAttachment {
+            url: "https://example.com/photo.png".into(),
+            s3_object_key: None,
+            cache_path: None,
+            data: None,
+        }]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let (_, out) = convert_messages_to_anthropic(&messages);
+    assert_eq!(out.len(), 1);
+    let content = out[0]["content"]
+        .as_array()
+        .expect("content should be array");
+    assert_eq!(content.len(), 2);
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "what is this?");
+    assert_eq!(content[1]["type"], "image");
+    assert_eq!(content[1]["source"]["type"], "url");
+    assert_eq!(content[1]["source"]["url"], "https://example.com/photo.png");
+}
+
+#[test]
+fn convert_messages_to_ollama_user_with_images() {
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("describe".into()),
+        images: Some(vec![
+            ImageAttachment {
+                url: "https://example.com/x.png".into(),
+                s3_object_key: None,
+                cache_path: Some("C:/tmp/x.b64".into()),
+                data: Some("aW1hZ2VfZGF0YV94".into()),
+            },
+            ImageAttachment {
+                url: "https://example.com/y.jpg".into(),
+                s3_object_key: None,
+                cache_path: Some("C:/tmp/y.b64".into()),
+                data: Some("aW1hZ2VfZGF0YV95".into()),
+            },
+        ]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    // Simulate pre-fetched base64 data (as the real flow would do).
+    let mut images_b64 = std::collections::HashMap::new();
+    images_b64.insert(
+        "https://example.com/x.png".to_string(),
+        "aW1hZ2VfZGF0YV94".to_string(),
+    );
+    images_b64.insert(
+        "https://example.com/y.jpg".to_string(),
+        "aW1hZ2VfZGF0YV95".to_string(),
+    );
+    let out = convert_messages_to_ollama(&messages, &images_b64);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0]["role"], "user");
+    assert_eq!(out[0]["content"], "describe");
+    let images = out[0]["images"].as_array().expect("images should be array");
+    assert_eq!(images.len(), 2);
+    assert_eq!(images[0], "aW1hZ2VfZGF0YV94");
+    assert_eq!(images[1], "aW1hZ2VfZGF0YV95");
+}
+
+#[test]
+fn convert_messages_to_ollama_user_with_images_missing_b64() {
+    // When base64 map is empty, images should be omitted (unfetchable images are skipped).
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("describe".into()),
+        images: Some(vec![ImageAttachment {
+            url: "https://example.com/x.png".into(),
+            s3_object_key: None,
+            cache_path: None,
+            data: None,
+        }]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let images_b64 = std::collections::HashMap::new();
+    let out = convert_messages_to_ollama(&messages, &images_b64);
+    assert_eq!(out.len(), 1);
+    assert!(out[0].get("images").is_none());
+}
+
+#[tokio::test]
+async fn fetch_images_base64_reads_persisted_cache_without_refetch() {
+    let workspace = unique_temp_dir("lingclaw-image-cache");
+    fs::create_dir_all(&workspace).expect("workspace should be created");
+    let cached = "aW1hZ2VfY2FjaGVk";
+    let cache_path =
+        persist_image_base64_cache(&workspace, "https://example.com/cached.png", cached)
+            .await
+            .expect("cache should be persisted");
+
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("describe".into()),
+        images: Some(vec![ImageAttachment {
+            url: "https://example.com/cached.png".into(),
+            s3_object_key: None,
+            cache_path: Some(cache_path),
+            data: None,
+        }]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let images_b64 = fetch_images_base64(&messages, &workspace, None)
+        .await
+        .expect("cached image should load");
+    assert_eq!(
+        images_b64
+            .get("https://example.com/cached.png")
+            .map(String::as_str),
+        Some(cached)
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn fetch_images_base64_skips_uncached_historical_fetch_failures() {
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("describe".into()),
+        images: Some(vec![ImageAttachment {
+            url: "http://127.0.0.1/stale.png".into(),
+            s3_object_key: None,
+            cache_path: None,
+            data: None,
+        }]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let workspace = unique_temp_dir("lingclaw-stale-image-cache");
+    let images_b64 = fetch_images_base64(&messages, &workspace, None)
+        .await
+        .expect("stale historical images should be skipped, not fail the request");
+    assert!(images_b64.is_empty());
+}
+
+#[tokio::test]
+async fn fetch_images_base64_trusted_uploaded_urls_bypass_ssrf_on_cache_miss() {
+    let (base_url, request_rx, handle) =
+        spawn_one_shot_http_server("image/png", "historical-image-body".to_string());
+    let cfg = S3Config {
+        endpoint: format!("{base_url}/storage"),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("describe".into()),
+        images: Some(vec![ImageAttachment {
+            url: "https://expired.example.test/old.png".into(),
+            s3_object_key: Some("images/2026/demo.png".into()),
+            cache_path: None,
+            data: None,
+        }]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let hydrated =
+        materialize_image_urls(&messages, Some(&cfg)).expect("uploaded image should presign");
+    let workspace = unique_temp_dir("lingclaw-trusted-history-image");
+    let images_b64 = fetch_images_base64(&hydrated, &workspace, Some(&cfg))
+        .await
+        .expect("trusted uploaded image should load on cache miss");
+
+    assert_eq!(
+        images_b64.get(hydrated[0].images.as_ref().unwrap()[0].url.as_str()),
+        Some(&"aGlzdG9yaWNhbC1pbWFnZS1ib2R5".to_string())
+    );
+
+    let request = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("trusted request should reach local gateway");
+    assert!(
+        request
+            .request_line
+            .starts_with("GET /storage/bucket/images/2026/demo.png?")
+    );
+    handle.join().expect("server thread should exit cleanly");
+}
+
+#[test]
+fn fetch_single_image_base64_trusted_allows_localhost_s3_gateways() {
+    let (base_url, _request_rx, handle) =
+        spawn_one_shot_http_server("image/png", "trusted-image-body".to_string());
+    let safe_http = build_image_fetch_client().expect("safe image client should build");
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should build");
+
+    let result = runtime
+        .block_on(async {
+            fetch_single_image_base64_trusted(&format!("{base_url}/photo.png"), &safe_http).await
+        })
+        .expect("trusted localhost image fetch should bypass SSRF checks");
+
+    assert_eq!(result, "dHJ1c3RlZC1pbWFnZS1ib2R5");
+    handle.join().expect("server thread should exit cleanly");
+}
+
+#[test]
+fn materialize_image_urls_refreshes_uploaded_s3_urls() {
+    let cfg = S3Config {
+        endpoint: "https://minio.example.test/storage".into(),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("describe".into()),
+        images: Some(vec![ImageAttachment {
+            url: "https://expired.example.test/old.png".into(),
+            s3_object_key: Some("images/2026/demo.png".into()),
+            cache_path: None,
+            data: None,
+        }]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let hydrated =
+        materialize_image_urls(&messages, Some(&cfg)).expect("s3 object key should presign");
+    let url = hydrated[0].images.as_ref().unwrap()[0].url.as_str();
+
+    assert!(url.starts_with("https://minio.example.test/storage/bucket/images/2026/demo.png?"));
+    assert!(url.contains("X-Amz-Signature="));
+}
+
+#[test]
+fn resolve_image_cache_path_accepts_session_cache_and_rejects_external_path() {
+    let workspace = unique_temp_dir("lingclaw-image-cache-validate");
+    let cache_dir = workspace.join(".image-cache");
+    fs::create_dir_all(&cache_dir).expect("cache dir should be created");
+
+    let valid_path = cache_dir.join("valid.b64");
+    fs::write(&valid_path, "aW1hZ2U=").expect("valid cache file should be written");
+    let resolved = resolve_image_cache_path(valid_path.to_str().expect("utf8 path"), &workspace)
+        .expect("workspace cache should be accepted");
+    assert_eq!(resolved, valid_path.canonicalize().expect("canonical path"));
+
+    let relative = resolve_image_cache_path(".image-cache/valid.b64", &workspace)
+        .expect("relative cache path should resolve inside workspace");
+    assert_eq!(relative, valid_path.canonicalize().expect("canonical path"));
+
+    let outside_workspace = unique_temp_dir("lingclaw-image-cache-external");
+    let outside_cache_dir = outside_workspace.join(".image-cache");
+    fs::create_dir_all(&outside_cache_dir).expect("external cache dir should be created");
+    let outside_path = outside_cache_dir.join("external.b64");
+    fs::write(&outside_path, "aW1hZ2U=").expect("external cache file should be written");
+    assert!(
+        resolve_image_cache_path(outside_path.to_str().expect("utf8 path"), &workspace).is_err()
+    );
+
+    let non_cache_file = workspace.join("secret.b64");
+    fs::write(&non_cache_file, "aW1hZ2U=").expect("non-cache file should be written");
+    assert!(
+        resolve_image_cache_path(non_cache_file.to_str().expect("utf8 path"), &workspace).is_err()
+    );
+
+    let traversal_path = cache_dir.join("..").join("secret.b64");
+    assert!(
+        resolve_image_cache_path(traversal_path.to_str().expect("utf8 path"), &workspace).is_err()
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+    let _ = fs::remove_dir_all(&outside_workspace);
 }

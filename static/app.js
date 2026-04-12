@@ -28,6 +28,18 @@ const SOFT_SPLIT_MIN_CHARS = 72;
 const SOFT_SPLIT_MAX_CHARS = 160;
 const SOFT_SPLIT_TAIL_MIN_CHARS = 18;
 
+const attachBtn = document.getElementById('attach-btn');
+const imagePreviewBar = document.getElementById('image-preview-bar');
+const attachPopup = document.getElementById('attach-popup');
+const attachMenu = document.getElementById('attach-menu');
+const attachLocalBtn = document.getElementById('attach-local-btn');
+const attachUrlBtn = document.getElementById('attach-url-btn');
+const attachUrlInput = document.getElementById('attach-url-input');
+const imageUrlField = document.getElementById('image-url-field');
+const imageUrlAddBtn = document.getElementById('image-url-add');
+const attachUploadStatus = document.getElementById('attach-upload-status');
+const imageFileInput = document.getElementById('image-file-input');
+
 let ws = null;
 let currentMsg = null;
 let busy = false;
@@ -63,6 +75,11 @@ let unreadMessageCount = 0;
 let bulkRenderingChat = false;
 let suppressScrollTracking = false;
 let currentAppVersion = '';
+let imageCapable = false;
+let s3Capable = false;
+let uploadToken = '';
+let uploadTokenPromise = null;
+let pendingImages = [];
 const inputHistory = [];
 const INPUT_HISTORY_MAX = 10;
 let inputHistoryIndex = -1;
@@ -105,6 +122,35 @@ async function loadAppVersion() {
   } catch {
     // Version is optional UI metadata; ignore fetch failures.
   }
+}
+
+async function ensureUploadToken() {
+  return ensureUploadTokenInternal(false);
+}
+
+async function ensureUploadTokenInternal(forceRefresh) {
+  if (forceRefresh) {
+    uploadToken = '';
+  }
+  if (uploadToken) return uploadToken;
+  if (!uploadTokenPromise) {
+    uploadTokenPromise = fetch('/api/client-config', { cache: 'no-store' })
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`client config request failed (${response.status})`);
+        }
+        const data = await response.json();
+        if (typeof data.upload_token !== 'string' || !data.upload_token) {
+          throw new Error('upload token missing');
+        }
+        uploadToken = data.upload_token;
+        return uploadToken;
+      })
+      .finally(() => {
+        uploadTokenPromise = null;
+      });
+  }
+  return uploadTokenPromise;
 }
 
 function afterNextPaint(callback) {
@@ -384,6 +430,248 @@ function applyViewState(viewState) {
 
   updateViewToggleButtons();
 }
+
+// ── Image Attachment ──
+
+function updateAttachButton() {
+  if (attachBtn) attachBtn.style.display = imageCapable ? '' : 'none';
+  // Clear pending images when capability is lost
+  if (!imageCapable && pendingImages.length > 0) {
+    pendingImages = [];
+    renderImagePreviews();
+  }
+}
+
+function isUploadedPendingImage(image) {
+  return !!(image && (image.object_key || image.attachment_token));
+}
+
+function dropUnavailablePendingUploads(notify = false) {
+  if (pendingImages.length === 0) return;
+  const keptImages = pendingImages.filter((image) => !isUploadedPendingImage(image));
+  if (keptImages.length === pendingImages.length) return;
+  pendingImages = keptImages;
+  renderImagePreviews();
+  closeAttachPopup();
+  if (imageFileInput) imageFileInput.value = '';
+  if (notify) {
+    addSystem('Local uploaded images were cleared because S3 uploads are unavailable. Please re-attach them or use an image URL.');
+  }
+}
+
+function closeAttachPopup() {
+  if (attachPopup) attachPopup.style.display = 'none';
+  if (attachUrlInput) attachUrlInput.style.display = 'none';
+  if (attachUploadStatus) attachUploadStatus.style.display = 'none';
+  if (attachMenu) attachMenu.style.display = 'flex';
+}
+
+function openAttachPopup() {
+  if (!attachPopup) return;
+  // If no S3, go directly to URL input mode
+  if (!s3Capable) {
+    attachMenu.style.display = 'none';
+    attachUrlInput.style.display = 'flex';
+    attachUploadStatus.style.display = 'none';
+  } else {
+    attachMenu.style.display = 'flex';
+    attachUrlInput.style.display = 'none';
+    attachUploadStatus.style.display = 'none';
+  }
+  attachPopup.style.display = 'block';
+  if (!s3Capable && imageUrlField) {
+    setTimeout(() => imageUrlField.focus(), 50);
+  }
+}
+
+function toggleAttachPopup() {
+  if (!attachPopup) return;
+  if (attachPopup.style.display === 'none' || !attachPopup.style.display) {
+    openAttachPopup();
+  } else {
+    closeAttachPopup();
+  }
+}
+
+function addImageUrl(url) {
+  if (!url || !url.trim()) return;
+  const trimmed = url.trim();
+  let parsed;
+  try {
+    parsed = new URL(trimmed);
+  } catch {
+    addSystem('Invalid URL format.');
+    return;
+  }
+  if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
+    addSystem('Only http:// and https:// URLs are allowed.');
+    return;
+  }
+  const path = parsed.pathname;
+  const rawLastSegment = path.split('/').filter(Boolean).pop() || '';
+  let lastSegment = rawLastSegment;
+  try {
+    lastSegment = decodeURIComponent(rawLastSegment);
+  } catch {
+    lastSegment = rawLastSegment;
+  }
+  lastSegment = lastSegment.toLowerCase().replace(/\.+$/, '');
+  const dotIndex = lastSegment.lastIndexOf('.');
+  const hasExplicitExtension = dotIndex >= 0 && dotIndex < lastSegment.length - 1;
+  if (hasExplicitExtension) {
+    if (/\.(png|jpe?g)$/.test(lastSegment)) {
+      // Accepted explicit image suffix.
+    } else if (/\.(gif|webp|svg|bmp|ico|tif|tiff|avif)$/.test(lastSegment)) {
+      addSystem('Only PNG and JPEG image URLs are supported.');
+      return;
+    } else {
+      addSystem('URL does not appear to be an image.');
+      return;
+    }
+  }
+  pendingImages.push({ url: trimmed });
+  renderImagePreviews();
+  closeAttachPopup();
+}
+
+async function uploadLocalImages(files) {
+  if (!files || files.length === 0) return;
+  if (attachUploadStatus) {
+    attachMenu.style.display = 'none';
+    attachUrlInput.style.display = 'none';
+    attachUploadStatus.style.display = 'flex';
+  }
+  let token;
+  try {
+    token = await ensureUploadToken();
+  } catch (e) {
+    addSystem('Upload failed: ' + e.message);
+    closeAttachPopup();
+    if (imageFileInput) imageFileInput.value = '';
+    return;
+  }
+  const formData = new FormData();
+  for (const file of files) {
+    formData.append('file', file);
+  }
+  try {
+    let resp = await fetch('/api/upload-images', {
+      method: 'POST',
+      headers: { 'X-LingClaw-Upload-Token': token },
+      body: formData
+    });
+    if (resp.status === 403) {
+      token = await ensureUploadTokenInternal(true);
+      resp = await fetch('/api/upload-images', {
+        method: 'POST',
+        headers: { 'X-LingClaw-Upload-Token': token },
+        body: formData
+      });
+    }
+    if (!resp.ok) {
+      if (resp.status === 403) {
+        uploadToken = '';
+      }
+      const errText = await resp.text().catch(() => resp.statusText);
+      addSystem('Upload failed: ' + errText);
+      closeAttachPopup();
+      if (imageFileInput) imageFileInput.value = '';
+      return;
+    }
+    const data = await resp.json();
+    if (data.images && data.images.length > 0) {
+      for (const image of data.images) {
+        pendingImages.push({
+          url: image.url,
+          object_key: image.object_key,
+          attachment_token: image.attachment_token
+        });
+      }
+      renderImagePreviews();
+    } else if (data.urls && data.urls.length > 0) {
+      for (const url of data.urls) {
+        pendingImages.push({ url });
+      }
+      renderImagePreviews();
+    }
+    if (data.errors && data.errors.length > 0) {
+      for (const err of data.errors) {
+        addSystem('Upload error: ' + err);
+      }
+    }
+    if (!data.urls || data.urls.length === 0) {
+      if (!data.errors || data.errors.length === 0) {
+        addSystem('No images uploaded.');
+      }
+    }
+  } catch (e) {
+    addSystem('Upload failed: ' + e.message);
+  }
+  closeAttachPopup();
+  // Reset file input so same files can be re-selected
+  if (imageFileInput) imageFileInput.value = '';
+}
+
+function removeImage(index) {
+  pendingImages.splice(index, 1);
+  renderImagePreviews();
+}
+
+function renderImagePreviews() {
+  if (!imagePreviewBar) return;
+  imagePreviewBar.innerHTML = '';
+  if (pendingImages.length === 0) {
+    imagePreviewBar.style.display = 'none';
+    return;
+  }
+  imagePreviewBar.style.display = 'flex';
+  pendingImages.forEach((img, idx) => {
+    const item = document.createElement('div');
+    item.className = 'image-preview-item';
+    const imgEl = document.createElement('img');
+    imgEl.src = img.url;
+    imgEl.alt = 'Attached image';
+    imgEl.onerror = () => { imgEl.style.display = 'none'; };
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'remove-btn';
+    removeBtn.textContent = '×';
+    removeBtn.onclick = (e) => { e.stopPropagation(); removeImage(idx); };
+    item.appendChild(imgEl);
+    item.appendChild(removeBtn);
+    imagePreviewBar.appendChild(item);
+  });
+}
+
+if (attachBtn) attachBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleAttachPopup(); });
+if (attachUrlBtn) attachUrlBtn.addEventListener('click', () => {
+  if (attachMenu) attachMenu.style.display = 'none';
+  if (attachUrlInput) attachUrlInput.style.display = 'flex';
+  if (imageUrlField) setTimeout(() => imageUrlField.focus(), 50);
+});
+if (attachLocalBtn) attachLocalBtn.addEventListener('click', () => {
+  if (imageFileInput) imageFileInput.click();
+});
+if (imageUrlAddBtn) imageUrlAddBtn.addEventListener('click', () => {
+  if (imageUrlField) { addImageUrl(imageUrlField.value); imageUrlField.value = ''; }
+});
+if (imageUrlField) imageUrlField.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); addImageUrl(imageUrlField.value); imageUrlField.value = ''; }
+  if (e.key === 'Escape') closeAttachPopup();
+});
+if (imageFileInput) imageFileInput.addEventListener('change', () => {
+  if (imageFileInput.files && imageFileInput.files.length > 0) {
+    uploadLocalImages(imageFileInput.files);
+  }
+});
+// Close popup when clicking outside
+document.addEventListener('click', (e) => {
+  if (attachPopup && attachPopup.style.display !== 'none') {
+    const wrapper = attachBtn ? attachBtn.closest('.attach-wrapper') : null;
+    if (wrapper && !wrapper.contains(e.target)) {
+      closeAttachPopup();
+    }
+  }
+});
 
 function toggleToolsVisibility() {
   if (!ws || ws.readyState !== 1) return;
@@ -1109,6 +1397,21 @@ function handleMessage(data) {
       currentSessionId = data.id;
       sessionNameEl.textContent = data.name || 'Main';
       sessionIdEl.textContent = data.id.slice(0, 12);
+      if (data.capabilities && typeof data.capabilities.image === 'boolean') {
+        imageCapable = data.capabilities.image;
+        updateAttachButton();
+      }
+      if (data.capabilities && typeof data.capabilities.s3 === 'boolean') {
+        const previousS3Capable = s3Capable;
+        s3Capable = data.capabilities.s3;
+        if (s3Capable) {
+          void ensureUploadTokenInternal(true).catch(() => {});
+        } else {
+          uploadToken = '';
+          uploadTokenPromise = null;
+          dropUnavailablePendingUploads(previousS3Capable);
+        }
+      }
       applyViewState(data);
       break;
 
@@ -1360,6 +1663,29 @@ function addMsg(cls, text, timestamp, options = {}) {
 }
 
 function addAssistant(text, options = {}) { return addMsg('assistant', text, undefined, options); }
+
+function renderUserImageThumbnails(msgEl, images) {
+  if (!images || images.length === 0) return;
+  const container = document.createElement('div');
+  container.className = 'user-images';
+  for (const img of images) {
+    const imgEl = document.createElement('img');
+    imgEl.src = img.url;
+    imgEl.alt = 'Attached image';
+    imgEl.title = img.url;
+    imgEl.onerror = () => { imgEl.style.display = 'none'; };
+    imgEl.onclick = () => window.open(img.url, '_blank', 'noopener');
+    container.appendChild(imgEl);
+  }
+  // Insert the thumbnails after the message text bubble
+  const row = msgEl.closest('.msg-row');
+  if (row) {
+    const content = row.querySelector('.msg-content');
+    if (content) {
+      content.insertBefore(container, content.querySelector('.msg-time'));
+    }
+  }
+}
 
 function addSystem(t, kind = 'info') {
   const row = document.createElement('div');
@@ -1735,7 +2061,11 @@ function findHistoryRenderStart(messages, preferredStart) {
 function renderHistoryMessage(m, options = {}) {
   const { followMarkdown = true } = options;
   switch (m.role) {
-    case 'user': addMsg('user', m.content, m.timestamp); break;
+    case 'user': {
+      const el = addMsg('user', m.content, m.timestamp);
+      if (m.images && m.images.length > 0) renderUserImageThumbnails(el, m.images);
+      break;
+    }
     case 'assistant': {
       const el = addMsg('assistant', m.content, m.timestamp);
       el._rawText = m.content;
@@ -1773,9 +2103,9 @@ function send() {
   if (!ws || ws.readyState !== 1) return;
 
   const text = input.value.trim();
-  if (!text) return;
+  if (!text && pendingImages.length === 0) return;
 
-  if (text.startsWith('/')) {
+  if (text.startsWith('/') && pendingImages.length === 0) {
     if (busy && !canSendWhileBusy(text)) {
       addSystem('Agent 运行中时，只允许 /stop、/tool 和 /reasoning。');
       return;
@@ -1788,16 +2118,34 @@ function send() {
     return;
   }
 
-  addMsg('user', text);
+  const hasImages = pendingImages.length > 0;
+
+  // When agent is busy, images are dropped server-side; don't render them
+  // optimistically — the user would see thumbnails followed by a contradicting
+  // "text only" server notice.
+  const effectiveImages = busy ? [] : pendingImages.slice();
+
+  // Render user message with images
+  const el = addMsg('user', text || '(image)');
+  if (effectiveImages.length > 0) {
+    renderUserImageThumbnails(el, effectiveImages);
+  }
   scrollDown(true);
 
   if (!busy) {
     setBusy(true);
-  } else {
-    addSystem('📝 干预消息已发送，将在下一个推理周期应用');
   }
+  // When busy, the server sends its own progress event confirming receipt
+  // (with/without "images dropped" context), so no local addSystem here.
 
-  ws.send(text);
+  // Send structured JSON when images are attached, plain text otherwise
+  if (hasImages) {
+    ws.send(JSON.stringify({ text: text || '', images: pendingImages }));
+    pendingImages = [];
+    renderImagePreviews();
+  } else {
+    ws.send(text);
+  }
   pushInputHistory(text);
   input.value = '';
   input.style.height = 'auto';

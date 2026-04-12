@@ -1,5 +1,8 @@
 use super::*;
-use crate::{Provider, config::JsonMcpServerConfig};
+use crate::{
+    Provider,
+    config::{JsonMcpServerConfig, S3Config},
+};
 use std::{collections::HashMap, time::Duration};
 
 fn test_config_with_broken_mcp() -> Config {
@@ -23,9 +26,13 @@ fn test_config_with_broken_mcp() -> Config {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
         mcp_servers,
@@ -33,9 +40,27 @@ fn test_config_with_broken_mcp() -> Config {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        s3: None,
     }
+}
+
+fn test_s3_config() -> Config {
+    let mut config = test_config_with_broken_mcp();
+    config.s3 = Some(S3Config {
+        endpoint: "https://s3.us-east-1.amazonaws.com".to_string(),
+        region: "us-east-1".to_string(),
+        bucket: "demo-bucket".to_string(),
+        access_key: "AKIAEXAMPLE".to_string(),
+        secret_key: "secret".to_string(),
+        prefix: "lingclaw/images/".to_string(),
+        url_expiry_secs: 604_800,
+        lifecycle_days: 14,
+    });
+    config
 }
 
 #[test]
@@ -180,6 +205,50 @@ fn mcp_check_succeeded_returns_false_when_any_server_fails() {
 #[test]
 fn mcp_check_succeeded_returns_true_for_empty_reports() {
     assert!(mcp_check_succeeded(&[]));
+}
+
+#[test]
+fn build_s3_start_detail_lines_show_enabled_summary() {
+    let lines = build_s3_start_detail_lines(&test_s3_config(), true, Some(true), None);
+
+    assert_eq!(lines[0], "  S3:      enabled");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("https://s3.us-east-1.amazonaws.com"))
+    );
+    assert!(
+        lines.iter().any(
+            |line| line.contains("bucket=demo-bucket region=us-east-1 prefix=lingclaw/images/")
+        )
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("presign=604800s lifecycle=14d"))
+    );
+}
+
+#[test]
+fn build_s3_start_detail_lines_report_disabled_by_setting() {
+    let lines =
+        build_s3_start_detail_lines(&test_config_with_broken_mcp(), true, Some(false), None);
+
+    assert_eq!(lines[0], "  S3:      disabled by settings.enableS3=false");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("s3 section exists but runtime uploads are disabled"))
+    );
+}
+
+#[test]
+fn build_s3_start_detail_lines_report_env_override_note() {
+    let lines = build_s3_start_detail_lines(&test_s3_config(), true, Some(false), Some(true));
+
+    assert!(lines.iter().any(|line| {
+        line.contains("LINGCLAW_ENABLE_S3=true overrides settings.enableS3=false")
+    }));
 }
 
 #[test]

@@ -1,12 +1,12 @@
 [package]
 name = "lingclaw"
-version = "0.4.5"
+version = "0.4.7"
 edition = "2024"
 description = "A Rust personal AI assistant"
 license = "MIT"
 
 [dependencies]
-axum = { version = "0.8", features = ["ws"] }
+axum = { version = "0.8", features = ["ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -18,3 +18,7 @@ tokio-util = "0.7"
 base64 = "0.22"
 getrandom = "0.2"
 chrono = { version = "0.4", features = ["clock"] }
+hmac = "0.12"
+md-5 = "0.10"
+sha2 = "0.10"
+rpassword = "7"

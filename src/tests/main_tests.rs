@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::JsonMcpServerConfig;
+use axum::http::{HeaderMap, HeaderValue};
 use serde_json::json;
 use std::{collections::HashMap, sync::atomic::AtomicU64};
 
@@ -27,6 +28,8 @@ fn test_config() -> Config {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -35,16 +38,103 @@ fn test_config() -> Config {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     }
 }
 
 #[test]
 fn default_port_constant_is_18989() {
     assert_eq!(DEFAULT_PORT, 18989);
+}
+
+#[test]
+fn normalized_s3_prefix_defaults_when_empty() {
+    assert_eq!(
+        crate::config::normalized_s3_prefix(Some("  /  ".to_string())),
+        "lingclaw/images/"
+    );
+}
+
+#[test]
+fn normalized_s3_region_defaults_and_lowercases() {
+    assert_eq!(crate::config::normalized_s3_region("  "), "us-east-1");
+    assert_eq!(
+        crate::config::normalized_s3_region(" CN-NORTH-1 "),
+        "cn-north-1"
+    );
+}
+
+#[test]
+fn normalized_s3_prefix_trims_and_enforces_trailing_slash() {
+    assert_eq!(
+        crate::config::normalized_s3_prefix(Some(" /tmp/uploads// ".to_string())),
+        "tmp/uploads/"
+    );
+}
+
+#[test]
+fn normalized_s3_endpoint_defaults_to_regional_aws_host() {
+    assert_eq!(
+        crate::config::normalized_s3_endpoint(None, "eu-west-1"),
+        "https://s3.eu-west-1.amazonaws.com"
+    );
+}
+
+#[test]
+fn normalized_s3_endpoint_rewrites_legacy_aws_global_host() {
+    assert_eq!(
+        crate::config::normalized_s3_endpoint(
+            Some("https://s3.amazonaws.com".to_string()),
+            "ap-southeast-2",
+        ),
+        "https://s3.ap-southeast-2.amazonaws.com"
+    );
+}
+
+#[test]
+fn normalized_s3_endpoint_defaults_to_aws_china_host() {
+    assert_eq!(
+        crate::config::normalized_s3_endpoint(None, "cn-north-1"),
+        "https://s3.cn-north-1.amazonaws.com.cn"
+    );
+}
+
+#[test]
+fn normalized_s3_endpoint_defaults_to_aws_china_host_for_mixed_case_region() {
+    assert_eq!(
+        crate::config::normalized_s3_endpoint(None, " CN-NORTH-1 "),
+        "https://s3.cn-north-1.amazonaws.com.cn"
+    );
+}
+
+#[test]
+fn normalized_s3_endpoint_rewrites_official_aws_host_for_china_region() {
+    assert_eq!(
+        crate::config::normalized_s3_endpoint(
+            Some("https://s3.us-east-1.amazonaws.com".to_string()),
+            "cn-northwest-1",
+        ),
+        "https://s3.cn-northwest-1.amazonaws.com.cn"
+    );
+}
+
+#[test]
+fn normalized_s3_endpoint_preserves_custom_gateway_paths() {
+    assert_eq!(
+        crate::config::normalized_s3_endpoint(
+            Some("https://minio.example.test/storage/".to_string()),
+            "us-east-1",
+        ),
+        "https://minio.example.test/storage"
+    );
 }
 
 #[test]
@@ -83,6 +173,7 @@ fn test_app_state() -> AppState {
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
         memory_queue: None,
     }
@@ -101,6 +192,7 @@ fn test_app_state_with_config(config: Config) -> AppState {
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
         memory_queue: None,
     }
@@ -113,6 +205,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         messages: vec![ChatMessage {
             role: "system".into(),
             content: Some("system".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -142,6 +235,7 @@ fn make_message(role: &str, content: &str) -> ChatMessage {
     ChatMessage {
         role: role.to_string(),
         content: Some(content.to_string()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -221,6 +315,8 @@ fn resolve_model_uses_config_for_plain_model_id() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -229,10 +325,15 @@ fn resolve_model_uses_config_for_plain_model_id() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
 
     let resolved = config.resolve_model("gpt-4o-mini");
@@ -289,6 +390,41 @@ fn settings_openai_stream_include_usage_deserializes() {
 }
 
 #[test]
+fn settings_enable_s3_deserializes() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "settings": {
+                "enableS3": true
+            }
+        }"#,
+    )
+    .expect("enableS3 should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.enable_s3, Some(true));
+}
+
+#[test]
+fn effective_enable_s3_prefers_env_override() {
+    assert_eq!(
+        crate::config::effective_enable_s3(Some(false), Some(true)),
+        Some(true)
+    );
+    assert_eq!(
+        crate::config::effective_enable_s3(Some(true), Some(false)),
+        Some(false)
+    );
+    assert_eq!(
+        crate::config::effective_enable_s3(Some(true), None),
+        Some(true)
+    );
+    assert_eq!(
+        crate::config::effective_enable_s3(None, Some(false)),
+        Some(false)
+    );
+}
+
+#[test]
 fn settings_tool_timeout_deserializes() {
     let cfg: JsonConfig = serde_json::from_str(
         r#"{
@@ -301,6 +437,111 @@ fn settings_tool_timeout_deserializes() {
 
     let settings = cfg.settings.expect("settings should deserialize");
     assert_eq!(settings.tool_timeout, Some(45));
+}
+
+#[test]
+fn settings_daily_reflection_deserializes() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "settings": {
+                "dailyReflection": true
+            }
+        }"#,
+    )
+    .expect("dailyReflection should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.daily_reflection, Some(true));
+}
+
+#[test]
+fn reflection_model_config_deserializes() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "agents": {
+                "defaults": {
+                    "model": {
+                        "primary": "gpt-4o",
+                        "reflection": "gpt-4o-mini"
+                    }
+                }
+            }
+        }"#,
+    )
+    .expect("reflection model should deserialize");
+
+    let model = cfg.agents.unwrap().defaults.unwrap().model.unwrap();
+    assert_eq!(model.reflection.as_deref(), Some("gpt-4o-mini"));
+}
+
+#[test]
+fn settings_sub_agent_timeout_deserializes() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "settings": {
+                "subAgentTimeout": 600
+            }
+        }"#,
+    )
+    .expect("subAgentTimeout should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.sub_agent_timeout, Some(600));
+}
+
+#[test]
+fn settings_sub_agent_timeout_zero_means_unlimited() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "settings": {
+                "subAgentTimeout": 0
+            }
+        }"#,
+    )
+    .expect("subAgentTimeout=0 should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.sub_agent_timeout, Some(0));
+}
+
+#[test]
+fn format_sub_agent_timeout_renders_unlimited_for_zero() {
+    assert_eq!(
+        crate::config::format_sub_agent_timeout(Duration::ZERO),
+        "unlimited"
+    );
+}
+
+#[test]
+fn format_sub_agent_timeout_renders_seconds_when_nonzero() {
+    assert_eq!(
+        crate::config::format_sub_agent_timeout(Duration::from_secs(7)),
+        "7s"
+    );
+}
+
+#[test]
+fn settings_max_llm_retries_deserializes() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "settings": {
+                "maxLlmRetries": 5
+            }
+        }"#,
+    )
+    .expect("maxLlmRetries should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.max_llm_retries, Some(5));
+}
+
+#[test]
+fn settings_max_llm_retries_defaults_to_none() {
+    let cfg: JsonConfig =
+        serde_json::from_str(r#"{"settings": {}}"#).expect("empty settings should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.max_llm_retries, None);
 }
 
 #[test]
@@ -328,6 +569,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
             ChatMessage {
                 role: "system".into(),
                 content: Some("system".into()),
+                images: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -335,6 +577,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
             ChatMessage {
                 role: "tool".into(),
                 content: Some(long_raw_result.clone()),
+                images: None,
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
                 timestamp: Some(123),
@@ -373,6 +616,113 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         tool_result["result"].as_str(),
         Some(long_raw_result.as_str())
     );
+}
+
+#[test]
+fn build_history_payload_hides_internal_image_cache_metadata() {
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: Some("look".into()),
+            images: Some(vec![ImageAttachment {
+                url: "https://example.com/photo.png".into(),
+                s3_object_key: None,
+                cache_path: Some("C:/internal/cache/file.b64".into()),
+                data: Some("aW1hZ2U=".into()),
+            }]),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(123),
+        }],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let payload = build_history_payload(&session);
+    let images = payload["messages"][0]["images"]
+        .as_array()
+        .expect("images should be present");
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0]["url"], "https://example.com/photo.png");
+    assert!(images[0].get("cache_path").is_none());
+    assert!(images[0].get("data").is_none());
+}
+
+#[test]
+fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: Some("look".into()),
+            images: Some(vec![ImageAttachment {
+                url: "https://expired.example.test/photo.png".into(),
+                s3_object_key: Some("lingclaw/images/2026/demo.png".into()),
+                cache_path: None,
+                data: None,
+            }]),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(123),
+        }],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+    let s3_cfg = crate::config::S3Config {
+        endpoint: "https://minio.example.test/storage".into(),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "lingclaw/images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    };
+
+    let payload = crate::session_store::build_history_payload_with_s3(&session, Some(&s3_cfg));
+    let url = payload["messages"][0]["images"][0]["url"]
+        .as_str()
+        .expect("history image url should exist");
+
+    assert!(
+        url.starts_with("https://minio.example.test/storage/bucket/lingclaw/images/2026/demo.png?")
+    );
+    assert!(url.contains("X-Amz-Signature="));
 }
 
 #[test]
@@ -428,6 +778,8 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::Ollama,
         anthropic_prompt_caching: false,
         providers,
@@ -436,10 +788,15 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
 
     let resolved = config.resolve_model("llama3.2");
@@ -499,6 +856,8 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -507,10 +866,15 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
 
     assert!(crate::cli::is_default_model_row(
@@ -576,6 +940,8 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -584,10 +950,15 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -645,6 +1016,8 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -653,10 +1026,15 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -696,6 +1074,8 @@ fn canonical_model_ref_expands_unique_plain_id() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -704,10 +1084,15 @@ fn canonical_model_ref_expands_unique_plain_id() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
 
     let canonical = config
@@ -764,6 +1149,8 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -772,10 +1159,15 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
 
     let err = config
@@ -834,6 +1226,8 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -842,10 +1236,15 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
 
     let available = config.available_models();
@@ -884,6 +1283,8 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -892,10 +1293,15 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
 
     let err = config
@@ -934,6 +1340,8 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -942,10 +1350,15 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
 
     let canonical = config
@@ -964,6 +1377,8 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -972,10 +1387,15 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
 
     let canonical = config
@@ -994,6 +1414,8 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -1002,10 +1424,15 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
 
     let resolved = config.resolve_model("anthropic/claude-sonnet-4-20250514");
@@ -1024,6 +1451,8 @@ fn resolve_model_accepts_ollama_prefix_without_provider_config() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::Ollama,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -1032,10 +1461,15 @@ fn resolve_model_accepts_ollama_prefix_without_provider_config() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
 
     let resolved = config.resolve_model("ollama/llama3.2");
@@ -1074,6 +1508,8 @@ fn build_session_status_reports_resolved_target() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1082,10 +1518,15 @@ fn build_session_status_reports_resolved_target() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
     let mut session = test_session("abc", "Test", Some("anthropic/claude-sonnet-4-20250514"));
     session.think_level = "medium".to_string();
@@ -1393,6 +1834,7 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
         ChatMessage {
             role: "system".into(),
             content: Some("system".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1400,6 +1842,7 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
         ChatMessage {
             role: "user".into(),
             content: Some("a".repeat(500)),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1407,6 +1850,7 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
         ChatMessage {
             role: "assistant".into(),
             content: Some("b".repeat(500)),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1414,6 +1858,7 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
         ChatMessage {
             role: "user".into(),
             content: Some("keep".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1433,6 +1878,7 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
         ChatMessage {
             role: "system".into(),
             content: Some("system".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1440,6 +1886,7 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
         ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: Some(1),
@@ -1447,6 +1894,7 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
         ChatMessage {
             role: "assistant".into(),
             content: Some(String::new()),
+            images: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call-1".into(),
                 call_type: "function".into(),
@@ -1531,6 +1979,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
             ChatMessage {
                 role: "system".into(),
                 content: Some("system".into()),
+                images: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -1538,6 +1987,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
             ChatMessage {
                 role: "assistant".into(),
                 content: None,
+                images: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: Some(1773669433),
@@ -1545,6 +1995,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
             ChatMessage {
                 role: "user".into(),
                 content: Some("next".into()),
+                images: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -1618,6 +2069,7 @@ fn save_session_to_disk_overwrites_existing_file() {
         messages: vec![ChatMessage {
             role: "system".into(),
             content: Some("first".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -1831,10 +2283,75 @@ fn read_file_reports_workspace_escape_clearly() {
 
 #[test]
 fn generate_shutdown_token_returns_64_hex_chars() {
-    let token = generate_shutdown_token();
+    let token = generate_shutdown_token().expect("secure shutdown token should be generated");
 
     assert_eq!(token.len(), 64);
     assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
+}
+
+#[tokio::test]
+async fn api_client_config_returns_upload_token() {
+    let state = Arc::new(test_app_state());
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_client_config(headers, State(state.clone()))
+        .await
+        .expect("local request should be accepted");
+
+    assert_eq!(payload["upload_token"], state.upload_token);
+}
+
+#[test]
+fn validate_local_request_headers_accepts_loopback_host_and_origin() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("localhost:18989"));
+    headers.insert("origin", HeaderValue::from_static("http://127.0.0.1:18989"));
+
+    assert!(validate_local_request_headers(&headers).is_ok());
+}
+
+#[test]
+fn validate_local_request_headers_rejects_non_local_host() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("evil.example"));
+
+    let err = validate_local_request_headers(&headers).expect_err("remote host must be rejected");
+
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        err.1.0["error"],
+        "Blocked non-local request: Host header must target localhost or a loopback address"
+    );
+}
+
+#[test]
+fn validate_local_request_headers_rejects_non_local_origin() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    headers.insert("origin", HeaderValue::from_static("https://evil.example"));
+
+    let err = validate_local_request_headers(&headers)
+        .expect_err("remote origin must be rejected even for loopback host");
+
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
+    assert_eq!(
+        err.1.0["error"],
+        "Blocked non-local request: Origin/Referer must be localhost or a loopback address"
+    );
+}
+
+#[tokio::test]
+async fn api_client_config_rejects_non_local_host() {
+    let state = Arc::new(test_app_state());
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("evil.example"));
+
+    let err = api_client_config(headers, State(state))
+        .await
+        .expect_err("remote host should not receive upload token");
+
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
 }
 
 #[test]
@@ -1901,6 +2418,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
             ChatMessage {
                 role: "system".into(),
                 content: Some("system".into()),
+                images: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -1908,6 +2426,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
             ChatMessage {
                 role: "assistant".into(),
                 content: Some(String::new()),
+                images: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_obs".into(),
                     call_type: "function".into(),
@@ -1922,6 +2441,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
             ChatMessage {
                 role: "tool".into(),
                 content: Some(big_result.clone()),
+                images: None,
                 tool_calls: None,
                 tool_call_id: Some("call_obs".into()),
                 timestamp: Some(101),
@@ -1994,6 +2514,7 @@ fn system_prompt_with_observation_hint_preserves_original_content() {
     let mut msg = ChatMessage {
         role: "system".into(),
         content: Some("You are an assistant.".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -2701,6 +3222,11 @@ fn help_command_lists_usage_without_extra_indent() {
     assert!(
         result
             .response
+            .contains("/system-prompt   Show current system prompt and estimated tokens")
+    );
+    assert!(
+        result
+            .response
             .contains("/mcp [refresh]   Show MCP load status or refresh cache")
     );
     assert!(
@@ -3080,6 +3606,7 @@ fn prune_messages_tracks_removal_count() {
         ChatMessage {
             role: "system".into(),
             content: Some("sys".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3087,6 +3614,7 @@ fn prune_messages_tracks_removal_count() {
         ChatMessage {
             role: "user".into(),
             content: Some("a".repeat(200_000)),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3094,6 +3622,7 @@ fn prune_messages_tracks_removal_count() {
         ChatMessage {
             role: "assistant".into(),
             content: Some("b".repeat(200_000)),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3101,6 +3630,7 @@ fn prune_messages_tracks_removal_count() {
         ChatMessage {
             role: "user".into(),
             content: Some("latest".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3253,6 +3783,7 @@ fn message_token_len_empty_message() {
     let msg = ChatMessage {
         role: "user".into(),
         content: None,
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3266,6 +3797,7 @@ fn message_token_len_content_only() {
     let msg = ChatMessage {
         role: "user".into(),
         content: Some("hello world".into()), // 11 chars
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3279,6 +3811,7 @@ fn message_token_len_with_tool_calls() {
     let msg = ChatMessage {
         role: "assistant".into(),
         content: None,
+        images: None,
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
@@ -3300,6 +3833,7 @@ fn estimate_tokens_sums_messages() {
         ChatMessage {
             role: "system".into(),
             content: Some("sys".into()), // 3
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3307,6 +3841,7 @@ fn estimate_tokens_sums_messages() {
         ChatMessage {
             role: "user".into(),
             content: Some("hello".into()), // 5
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3322,6 +3857,7 @@ fn provider_aware_estimate_adds_tool_protocol_overhead() {
         ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -3336,6 +3872,7 @@ fn provider_aware_estimate_adds_tool_protocol_overhead() {
         ChatMessage {
             role: "tool".into(),
             content: Some("file-a\nfile-b".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -3355,6 +3892,7 @@ fn request_estimate_includes_tool_schema_overhead() {
     let messages = vec![ChatMessage {
         role: "system".into(),
         content: Some("system prompt".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3388,6 +3926,7 @@ fn openai_request_estimate_includes_builtin_tool_schemas() {
     let messages = vec![ChatMessage {
         role: "system".into(),
         content: Some("system prompt".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3428,6 +3967,8 @@ fn context_input_budget_reserves_headroom() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -3436,10 +3977,15 @@ fn context_input_budget_reserves_headroom() {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     };
 
     let budget = context_input_budget_for_model(&config, "anthropic/claude-sonnet-4-20250514");
@@ -3454,6 +4000,7 @@ fn turn_len_standalone_user() {
     let messages = vec![ChatMessage {
         role: "user".into(),
         content: Some("hi".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3467,6 +4014,7 @@ fn turn_len_user_plus_assistant() {
         ChatMessage {
             role: "user".into(),
             content: Some("hi".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3474,6 +4022,7 @@ fn turn_len_user_plus_assistant() {
         ChatMessage {
             role: "assistant".into(),
             content: Some("hello".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3488,6 +4037,7 @@ fn turn_len_user_assistant_with_tool_calls_and_results() {
         ChatMessage {
             role: "user".into(),
             content: Some("list files".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3495,6 +4045,7 @@ fn turn_len_user_assistant_with_tool_calls_and_results() {
         ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -3509,6 +4060,7 @@ fn turn_len_user_assistant_with_tool_calls_and_results() {
         ChatMessage {
             role: "tool".into(),
             content: Some("file1.txt\nfile2.txt".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -3524,6 +4076,7 @@ fn turn_len_orphan_assistant_with_tool_results() {
         ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -3538,6 +4091,7 @@ fn turn_len_orphan_assistant_with_tool_results() {
         ChatMessage {
             role: "tool".into(),
             content: Some("ok".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -3545,6 +4099,7 @@ fn turn_len_orphan_assistant_with_tool_results() {
         ChatMessage {
             role: "tool".into(),
             content: Some("ok2".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc2".into()),
             timestamp: None,
@@ -3559,6 +4114,7 @@ fn turn_len_standalone_assistant_text() {
     let messages = vec![ChatMessage {
         role: "assistant".into(),
         content: Some("just text".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3573,6 +4129,7 @@ fn chat_message_has_nonempty_content() {
     let none_content = ChatMessage {
         role: "user".into(),
         content: None,
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3582,6 +4139,7 @@ fn chat_message_has_nonempty_content() {
     let empty_content = ChatMessage {
         role: "user".into(),
         content: Some(String::new()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3591,6 +4149,7 @@ fn chat_message_has_nonempty_content() {
     let with_content = ChatMessage {
         role: "user".into(),
         content: Some("hello".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3603,6 +4162,7 @@ fn chat_message_has_tool_calls() {
     let none_tc = ChatMessage {
         role: "assistant".into(),
         content: None,
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3612,6 +4172,7 @@ fn chat_message_has_tool_calls() {
     let empty_tc = ChatMessage {
         role: "assistant".into(),
         content: None,
+        images: None,
         tool_calls: Some(vec![]),
         tool_call_id: None,
         timestamp: None,
@@ -3621,6 +4182,7 @@ fn chat_message_has_tool_calls() {
     let with_tc = ChatMessage {
         role: "assistant".into(),
         content: None,
+        images: None,
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
@@ -3640,6 +4202,7 @@ fn chat_message_is_empty_assistant_message() {
     let empty_asst = ChatMessage {
         role: "assistant".into(),
         content: None,
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3649,6 +4212,7 @@ fn chat_message_is_empty_assistant_message() {
     let with_content = ChatMessage {
         role: "assistant".into(),
         content: Some("reply".into()),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3658,6 +4222,7 @@ fn chat_message_is_empty_assistant_message() {
     let user_msg = ChatMessage {
         role: "user".into(),
         content: None,
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -3674,6 +4239,7 @@ fn prune_messages_removes_complete_tool_turn() {
         ChatMessage {
             role: "system".into(),
             content: Some("sys".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3681,6 +4247,7 @@ fn prune_messages_removes_complete_tool_turn() {
         ChatMessage {
             role: "user".into(),
             content: Some(big.clone()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3688,6 +4255,7 @@ fn prune_messages_removes_complete_tool_turn() {
         ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -3702,6 +4270,7 @@ fn prune_messages_removes_complete_tool_turn() {
         ChatMessage {
             role: "tool".into(),
             content: Some(big.clone()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -3709,6 +4278,7 @@ fn prune_messages_removes_complete_tool_turn() {
         ChatMessage {
             role: "user".into(),
             content: Some("latest".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3733,6 +4303,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
         ChatMessage {
             role: "system".into(),
             content: Some("sys".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3740,6 +4311,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
         ChatMessage {
             role: "user".into(),
             content: Some("do something".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3747,6 +4319,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
         ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: Some(vec![
                 ToolCall {
                     id: "tc1".into(),
@@ -3771,6 +4344,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
         ChatMessage {
             role: "tool".into(),
             content: Some("result1".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -3778,6 +4352,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
         ChatMessage {
             role: "tool".into(),
             content: Some("result2".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc2".into()),
             timestamp: None,
@@ -3794,6 +4369,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
         ChatMessage {
             role: "system".into(),
             content: Some("sys".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3801,6 +4377,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
         ChatMessage {
             role: "user".into(),
             content: Some("do something".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3808,6 +4385,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
         ChatMessage {
             role: "assistant".into(),
             content: None,
+            images: None,
             tool_calls: Some(vec![
                 ToolCall {
                     id: "tc1".into(),
@@ -3833,6 +4411,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
         ChatMessage {
             role: "tool".into(),
             content: Some("result1".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,

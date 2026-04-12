@@ -15,15 +15,16 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 ## Features
 
 - **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
-- **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断；server 启动连续失败会进入短暂冷却，避免请求风暴
+- **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；主 Agent 与子代理都会按需发现并使用这些 MCP tools；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断；server 启动连续失败会进入短暂冷却，避免请求风暴
 - **单主会话**：运行时固定使用 `main`，不再创建、切换或删除其他会话
-- **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、coder）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤
-- **文档化斜杠命令**：`/new`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/mcp`、`/usage`、`/clear`、`/memory`、`/help`
+- **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、coder）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
+- **文档化斜杠命令**：`/new`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/help`
 - **三 Provider 模型路由**：OpenAI + Anthropic + Ollama，支持 `provider/model` 和纯 model ID
 - **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
 - **持久化主会话**：固定保存 `main` 工作区和磁盘存档
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
 - **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端，增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、输入框上下键历史导航（最多 10 条）
+- **图片附件**：支持通过 URL 或本地 JPEG/PNG 上传附加图片到用户消息；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；私网、localhost 或仅局域网可达的网关仅保证 Ollama 可用，因为 LingClaw 会本地预取为 base64 并持久化缓存到会话工作区；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
 - **Structured Memory（可选）**：启用 `structuredMemory` 后，Finish 阶段会异步抽取稳定偏好、项目上下文和长期事实，写入 workspace 下的 `structured_memory.json`，并记录 `structured_memory.audit.jsonl` 诊断轨迹；`/memory`、`/memory stats`、`/memory debug` 可查看状态与最近审计信息
@@ -87,7 +88,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 
 ## Configuration
 
-配置文件在 `~/.lingclaw/.lingclaw.json`，首次运行由设置向导自动写入。
+配置文件在 `~/.lingclaw/.lingclaw.json`，首次运行由设置向导自动写入；如需本地图片上传，可在向导里额外配置顶层 `s3`，也可以之后手动补充。若要配合 OpenAI/Anthropic 使用，`s3.endpoint` 对应的现签 URL 必须公网可达；私网或 localhost 网关仅推荐与 Ollama 搭配。
 
 ```json
 {
@@ -95,10 +96,13 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
     "port": 18989,
     "execTimeout": 30,
     "toolTimeout": 30,
+    "subAgentTimeout": 300,
+    "maxLlmRetries": 2,
     "maxContextTokens": 32000,
     "maxOutputBytes": 51200,
     "maxFileBytes": 204800,
-    "structuredMemory": false
+    "structuredMemory": false,
+    "enableS3": true
   },
   "models": {
     "providers": {
@@ -162,6 +166,16 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
         "memory": "openai/gpt-4o-mini"
       }
     }
+  },
+  "s3": {
+    "endpoint": "https://s3.us-east-1.amazonaws.com",
+    "region": "us-east-1",
+    "bucket": "my-bucket",
+    "accessKey": "AKIA...",
+    "secretKey": "your-secret-key",
+    "prefix": "lingclaw/images/",
+    "urlExpirySecs": 604800,
+    "lifecycleDays": 14
   }
 }
 ```
@@ -171,6 +185,9 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 - 推荐使用 `provider/model` 格式引用模型
 - 多个 provider 暴露同一 model ID 时，必须使用显式前缀
 - `structuredMemory` 默认为 `false`；启用后会在 Finish 阶段后台更新结构化记忆，并在后续 system prompt 中注入摘要；若配置了 `agents.defaults.model.memory` 或 `LINGCLAW_MEMORY_MODEL`，后台抽取优先使用该模型，否则回退到当前会话有效模型
+- 顶层 `s3` 为可选项；配置后聊天页会额外启用本地 JPEG/PNG 上传，上传对象以 object key 持久化，历史回放和 provider 请求都会即时重新现签 URL
+- AWS S3 若使用官方 endpoint，建议使用与 `region` 对应的区域 host；设置向导留空 endpoint 时会自动默认到该区域地址
+- OpenAI/Anthropic 直接使用现签 URL，因此 `s3.endpoint` 必须能被远端 provider 访问；私网、localhost 或 VPN-only 网关仅保证 Ollama 可用，因为 Ollama 路径会在本地预取并转成 base64
 - 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容
 - `models.providers.*.api` 目前支持 `openai-completions`、`anthropic`、`ollama`
 - Ollama 的 thinking / tool calling 依赖模型能力，推荐优先使用 `qwen3`、`gpt-oss`、`deepseek-r1` 等官方支持模型，而不是把任意本地模型都视为支持深度思考和工具调用
@@ -179,6 +196,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 - `start` / `restart` 的 MCP 预检使用受限的一次性探测，不会把预检进程保留为运行时 MCP 会话；`mcp-check` 会按配置的运行时超时做更深诊断
 - `/mcp` 会在聊天页面列出当前已加载的 MCP servers；如果某个 server 失败，页面会显示失败原因，便于排查启动、命令解析或超时问题
 - `/mcp refresh` 会清空当前 workspace 对应的 MCP 工具缓存、空闲会话和最近失败冷却状态，然后重新探测已启用 servers；运行时空闲 MCP 会话也会自动回收，`notifications/tools/list_changed` 会触发下一次工具发现时自动刷新
+- 子代理执行和 `/agents` 展示都会在使用前按需预热 MCP 工具缓存，因此首次使用也能拿到最新的 MCP 工具列表
 
 聊天页运行时交互说明：
 
@@ -213,7 +231,9 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 | `LINGCLAW_MODEL` | `gpt-4o-mini` | 默认模型 |
 | `LINGCLAW_PORT` | `18989` | HTTP 端口 |
 | `LINGCLAW_EXEC_TIMEOUT` | `30` | Shell 命令超时（秒） |
-| `LINGCLAW_TOOL_TIMEOUT` | `30` | 非 shell 的 Act 阶段工具超时（秒） |
+| `LINGCLAW_TOOL_TIMEOUT` | `30` | 非 shell 的 Act 阶段工具超时（秒），不适用于子代理 |
+| `LINGCLAW_SUB_AGENT_TIMEOUT` | `300` | 子代理总执行超时（秒，0=无限，仅 max_turns 和 /stop 限制） |
+| `LINGCLAW_MAX_LLM_RETRIES` | `2` | LLM API 瞬态错误（429/5xx/连接/超时）的 HTTP 级重试次数 |
 | `LINGCLAW_MAX_CONTEXT_TOKENS` | `32000` | 默认上下文 token 预算 |
 | `LINGCLAW_FAST_MODEL` | 无 | 简单首轮查询使用的轻量模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_SUB_AGENT_MODEL` | 无 | 子代理委托任务使用的模型（如 `openai/gpt-4o-mini`） |
@@ -235,8 +255,9 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 | `/skills-system [install\|uninstall <pattern>]` | 列出系统内置 Skills 状态；`install`/`uninstall` 子命令可运行时启用/禁用 Skill 或 Skill 组（如 `anthropics`、`anthropics/pdf`） |
 | `/skills-global` | 仅列出全局 Skills（`~/.lingclaw/skills/`） |
 | `/skills-session` | 仅列出当前 session Skills（workspace `skills/`） |
-| `/agents` | 列出已发现的子代理（含来源标签：system / global / session） |
+| `/agents` | 列出已发现的子代理（含来源标签）以及每个子代理当前可用的有效工具列表（含 MCP 工具） |
 | `/status` | 显示模型、provider、上下文估算、最大输出 token、思维级别，token 数值按 K/M 显示 |
+| `/system-prompt` | 输出当前会话的新鲜系统提示词，以及该系统提示词按当前 provider 估算的 token 开销 |
 | `/mcp [refresh]` | 查看当前已加载的 MCP server 状态；加上 `refresh` 时强制刷新工具缓存并重建运行时 MCP 会话 |
 | `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；单会话模式下同时显示主会话今日总 token 估算，按 K/M 显示 |
 | `/clear` | 清空消息但保留系统提示 |
@@ -356,6 +377,8 @@ tools:
 详细的行为指令...
 ```
 
+`tools.allow` / `tools.deny` 同时作用于内置工具和 `mcp__...` 形式暴露出的 MCP 工具名。若启用了 MCP server，可先用 `/agents` 查看当前子代理的有效工具列表，再决定是否在 `AGENT.md` 中做精确白名单或黑名单控制。
+
 ### 模型选择
 
 所有子代理统一使用配置文件中的模型设置：
@@ -369,11 +392,12 @@ tools:
 
 - **发现**：系统自动扫描三层目录下的 `agents/*/AGENT.md`，解析 YAML frontmatter
 - **动态注册**：当发现至少一个子代理时，`task` 工具会被动态添加到模型工具列表
-- **隔离执行**：子代理拥有独立的消息历史、过滤后的工具集、独立的 ReAct 循环
+- **隔离执行**：子代理拥有独立的消息历史、过滤后的工具集、独立的 ReAct 循环；工具集同时可包含内置工具和 MCP 工具
+- **超时与安全**：子代理总执行时间受 `subAgentTimeout`（默认 300s）限制，内部各工具保留各自超时；`max_turns` 有 50 轮硬上限；`/stop` 和断开连接可随时取消
 - **Hook 集成**：子代理的工具执行经过 BeforeToolExec / AfterToolExec Hook 链，Reject 事件会转发给父 Agent
 - **递归阻断**：`task` 工具始终被排除在子代理的工具集之外，防止无限委托
 - **事件流**：`task_started`、`task_progress`、`task_tool`、`task_completed`、`task_failed` 事件实时流向前端
-- **查看代理**：`/agents` 列出所有已发现的子代理及其来源
+- **查看代理**：`/agents` 列出所有已发现的子代理、来源以及当前过滤后的有效工具列表
 
 ---
 
@@ -536,8 +560,8 @@ src/
     ├── exec.rs        (~60 行)   — exec (shell), think (scratchpad)
     └── mcp.rs         (~1250 行) — stdio MCP 工具发现/执行桥接, 会话缓存, preflight
 ├── subagents/
-│   ├── mod.rs         (~220 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, 工具过滤
-│   ├── executor.rs    (~400 行)  — 隔离 mini-ReAct 执行循环, Hook 集成, 父级事件流
+│   ├── mod.rs         (~220 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, 工具过滤（含 MCP）
+│   ├── executor.rs    (~400 行)  — 隔离 mini-ReAct 执行循环, Hook 集成, MCP 工具调度, 父级事件流
 │   └── discovery.rs   (~200 行)  — 三层发现 (system/global/session), YAML frontmatter 解析
 
 static/

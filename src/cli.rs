@@ -26,6 +26,18 @@ fn prompt_line(msg: &str) -> String {
     buf.trim().to_string()
 }
 
+fn prompt_secret(msg: &str) -> String {
+    print!("{msg}");
+    io::stdout().flush().ok();
+    match rpassword::read_password() {
+        Ok(value) => value.trim().to_string(),
+        Err(_) => {
+            eprintln!("\n  Warning: secure input unavailable, input will be visible.");
+            prompt_line("  ")
+        }
+    }
+}
+
 fn prompt_choice(options: &[&str]) -> usize {
     loop {
         for (i, opt) in options.iter().enumerate() {
@@ -557,6 +569,83 @@ fn print_start_details(port: u16, manager: &str) {
     }
 }
 
+fn build_s3_start_detail_lines(
+    config: &Config,
+    raw_s3_present: bool,
+    settings_enable_s3: Option<bool>,
+    env_enable_s3: Option<bool>,
+) -> Vec<String> {
+    if let Some(s3) = config.s3.as_ref() {
+        let mut lines = vec![
+            "  S3:      enabled".to_string(),
+            format!("  S3 URL:  {}", s3.endpoint),
+            format!(
+                "  S3 To:   bucket={} region={} prefix={}",
+                s3.bucket, s3.region, s3.prefix
+            ),
+            format!(
+                "  S3 Opts: presign={}s lifecycle={}d",
+                s3.url_expiry_secs, s3.lifecycle_days
+            ),
+        ];
+
+        if env_enable_s3 == Some(true) && settings_enable_s3 == Some(false) {
+            lines.push(
+                "  S3 Note: LINGCLAW_ENABLE_S3=true overrides settings.enableS3=false".to_string(),
+            );
+        } else if env_enable_s3 == Some(true) {
+            lines.push("  S3 Note: enabled by LINGCLAW_ENABLE_S3=true".to_string());
+        }
+
+        return lines;
+    }
+
+    if env_enable_s3 == Some(false) {
+        let mut lines = vec!["  S3:      disabled by LINGCLAW_ENABLE_S3=false".to_string()];
+        if raw_s3_present {
+            lines.push("  S3 Note: s3 section exists but runtime uploads are disabled".to_string());
+        }
+        return lines;
+    }
+
+    if settings_enable_s3 == Some(false) {
+        let mut lines = vec!["  S3:      disabled by settings.enableS3=false".to_string()];
+        if raw_s3_present {
+            lines.push("  S3 Note: s3 section exists but runtime uploads are disabled".to_string());
+        }
+        return lines;
+    }
+
+    if raw_s3_present {
+        return vec![
+            "  S3:      configured but incomplete (missing required s3 fields)".to_string(),
+        ];
+    }
+
+    vec!["  S3:      not configured".to_string()]
+}
+
+fn print_s3_start_details(config: &Config) {
+    let raw_cfg = crate::config::load_config_file();
+    let settings_enable_s3 = raw_cfg
+        .settings
+        .as_ref()
+        .and_then(|settings| settings.enable_s3);
+    let env_enable_s3 = crate::config::parse_boolish_env("LINGCLAW_ENABLE_S3");
+    let raw_s3_present = raw_cfg.s3.is_some();
+
+    for line in
+        build_s3_start_detail_lines(config, raw_s3_present, settings_enable_s3, env_enable_s3)
+    {
+        println!("{line}");
+    }
+}
+
+fn print_start_details_with_s3(port: u16, manager: &str, config: &Config) {
+    print_start_details(port, manager);
+    print_s3_start_details(config);
+}
+
 // ── PATH Installation ────────────────────────────────────────────────────────
 
 fn install_global_path() {
@@ -813,7 +902,7 @@ fn handle_start_command(port_override: Option<u16>) -> bool {
     #[cfg(not(target_os = "windows"))]
     if managed_by_systemd {
         println!("Starting LingClaw via systemd...");
-        print_start_details(effective_port, "systemd");
+        print_start_details_with_s3(effective_port, "systemd", &config);
         match run_systemctl(&["start", SYSTEMD_SERVICE_NAME]) {
             Ok(true) => println!("Started {}.", SYSTEMD_SERVICE_NAME),
             Ok(false) => eprintln!("Failed to start {}.", SYSTEMD_SERVICE_NAME),
@@ -835,13 +924,14 @@ fn handle_start_command(port_override: Option<u16>) -> bool {
         extra_args.push(p.to_string());
     }
     println!("Starting LingClaw daemon...");
-    print_start_details(
+    print_start_details_with_s3(
         effective_port,
         if cfg!(target_os = "windows") {
             "detached-process"
         } else {
             "nohup"
         },
+        &config,
     );
     #[cfg(target_os = "windows")]
     {
@@ -978,7 +1068,7 @@ fn handle_restart_command(port_override: Option<u16>) -> bool {
     #[cfg(not(target_os = "windows"))]
     if systemd_service_installed() {
         println!("Restarting LingClaw via systemd...");
-        print_start_details(config.port, "systemd");
+        print_start_details_with_s3(config.port, "systemd", &config);
         match run_systemctl(&["restart", SYSTEMD_SERVICE_NAME]) {
             Ok(true) => println!("Restarted {}.", SYSTEMD_SERVICE_NAME),
             Ok(false) => eprintln!("Failed to restart {}.", SYSTEMD_SERVICE_NAME),
@@ -1182,7 +1272,13 @@ fn handle_status_command(port_override: Option<u16>) -> bool {
     println!("  API base:      {}", config.api_base);
     println!("  Exec timeout:  {}s", config.exec_timeout.as_secs());
     println!("  Tool timeout:  {}s", config.tool_timeout.as_secs());
+    println!(
+        "  Agent timeout: {}",
+        crate::config::format_sub_agent_timeout(config.sub_agent_timeout)
+    );
+    println!("  LLM retries:  {}", config.max_llm_retries);
     println!("  Context limit: {} tokens", config.max_context_tokens);
+    print_s3_start_details(&config);
     println!();
 
     if config.providers.is_empty() {
@@ -1987,7 +2083,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
             } else {
                 base_url
             };
-            let api_key = prompt_line("  API Key: ");
+            let api_key = prompt_secret("  API Key: ");
             providers.insert(
                 "openai".to_string(),
                 json!({
@@ -2008,7 +2104,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
             } else {
                 base_url
             };
-            let api_key = prompt_line("  API Key: ");
+            let api_key = prompt_secret("  API Key: ");
             providers.insert(
                 "anthropic".to_string(),
                 json!({
@@ -2029,7 +2125,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
             } else {
                 base_url
             };
-            let api_key = prompt_line("  API Key (optional, leave empty for local Ollama): ");
+            let api_key = prompt_secret("  API Key (optional, leave empty for local Ollama): ");
             providers.insert(
                 "ollama".to_string(),
                 json!({
@@ -2110,14 +2206,72 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     }
     println!();
 
-    // ── Step 3: Select Channel ───────────────────────────────────────────
-    println!("3. Select channel (QuickStart)");
+    // ── Step 3: Optional local image uploads ────────────────────────────
+    println!("3. Optional local image uploads (S3-compatible)");
+    println!("   OpenAI/Anthropic must be able to fetch the presigned URL directly.");
+    println!("   Private or localhost S3 gateways are only guaranteed with Ollama.");
+    println!();
+    let mut s3_config = None;
+    let configure_s3 = prompt_choice(&["Configure now", "Skip for now"]);
+    if configure_s3 == 0 {
+        println!();
+        let region = prompt_line("  Region [us-east-1]: ");
+        let region = if region.is_empty() {
+            "us-east-1".to_string()
+        } else {
+            region
+        };
+        let endpoint_default = crate::config::default_s3_endpoint(&region);
+        let endpoint = prompt_line(&format!("  Endpoint [{endpoint_default}]: "));
+        let endpoint = crate::config::normalized_s3_endpoint(
+            if endpoint.is_empty() {
+                None
+            } else {
+                Some(endpoint)
+            },
+            &region,
+        );
+        let bucket = prompt_line("  Bucket: ");
+        let access_key = prompt_line("  Access key: ");
+        let secret_key = prompt_secret("  Secret key: ");
+        let prefix = prompt_line("  Prefix [lingclaw/images/]: ");
+        let prefix = crate::config::normalized_s3_prefix(if prefix.is_empty() {
+            None
+        } else {
+            Some(prefix)
+        });
+        let expiry = prompt_line("  Presigned URL expiry secs [604800]: ");
+        let url_expiry_secs = expiry.parse::<u64>().unwrap_or(604_800);
+        let lifecycle = prompt_line("  Lifecycle retention days [14, 0 disables]: ");
+        let lifecycle_days = lifecycle.parse::<u32>().unwrap_or(14);
+
+        if bucket.is_empty() || access_key.is_empty() || secret_key.is_empty() {
+            println!(
+                "   ⚠ Skipping S3 setup because bucket/access key/secret key were incomplete."
+            );
+        } else {
+            s3_config = Some(json!({
+                "endpoint": endpoint,
+                "region": region,
+                "bucket": bucket,
+                "accessKey": access_key,
+                "secretKey": secret_key,
+                "prefix": prefix,
+                "urlExpirySecs": url_expiry_secs,
+                "lifecycleDays": lifecycle_days,
+            }));
+        }
+    }
+    println!();
+
+    // ── Step 4: Select Channel ───────────────────────────────────────────
+    println!("4. Select channel (QuickStart)");
     println!();
     let _channel = prompt_choice(&["WebChat", "Skip for now"]);
     println!();
 
-    // ── Step 4: Global PATH ────────────────────────────────────────────
-    println!("4. Do you want to add LingClaw to the global PATH?");
+    // ── Step 5: Global PATH ────────────────────────────────────────────
+    println!("5. Do you want to add LingClaw to the global PATH?");
     println!("   This enables CLI commands: lingclaw start/stop/restart/health/update");
     println!();
     let add_path = prompt_choice(&["YES", "NO"]);
@@ -2128,7 +2282,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
 
     #[cfg(not(target_os = "windows"))]
     let add_systemd = {
-        println!("5. Add systemd service?");
+        println!("6. Add systemd service?");
         println!("   If enabled, LingClaw will be managed by lingclaw.service.");
         println!();
         let choice = prompt_choice(&["YES", "NO"]);
@@ -2138,9 +2292,9 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
 
     // ── Step 5: Install ──────────────────────────────────────────────────
     #[cfg(target_os = "windows")]
-    println!("5. Start installation");
-    #[cfg(not(target_os = "windows"))]
     println!("6. Start installation");
+    #[cfg(not(target_os = "windows"))]
+    println!("7. Start installation");
     prompt_line("   Press Enter to continue...");
     println!();
 
@@ -2177,6 +2331,8 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
             "port": DEFAULT_PORT,
             "execTimeout": 30,
             "toolTimeout": 30,
+            "subAgentTimeout": 300,
+            "maxLlmRetries": 2,
             "maxContextTokens": 32000,
         },
         "models": {
@@ -2188,6 +2344,10 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
             }
         }
     });
+
+    if let Some(s3_config) = s3_config {
+        config["s3"] = s3_config;
+    }
 
     // Add channel info if WebChat selected
     if _channel == 0 {
@@ -2228,6 +2388,12 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     }
     if memory_model.is_some() {
         println!("   💡 Memory model configured for structured memory extraction.");
+    }
+    if config.get("s3").is_some() {
+        println!("   💡 Local JPEG/PNG uploads configured via S3-compatible storage.");
+        println!(
+            "      OpenAI/Anthropic require provider-reachable URLs; private or localhost gateways are Ollama-only."
+        );
     }
     #[cfg(not(target_os = "windows"))]
     if add_systemd {

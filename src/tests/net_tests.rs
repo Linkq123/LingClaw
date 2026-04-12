@@ -76,3 +76,146 @@ async fn check_ssrf_allows_https_public_domain() {
     // Public domains should pass (DNS resolves to public IPs)
     assert!(check_ssrf("https://example.com").await.is_none());
 }
+
+// ── validate_image_url ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn validate_image_url_accepts_common_image_extensions() {
+    assert!(
+        validate_image_url("https://example.com/photo.jpg")
+            .await
+            .is_ok()
+    );
+    assert!(
+        validate_image_url("https://example.com/photo.jpeg")
+            .await
+            .is_ok()
+    );
+    assert!(
+        validate_image_url("https://example.com/photo.png")
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_url_blocks_non_image_extensions() {
+    assert!(
+        validate_image_url("https://example.com/script.js")
+            .await
+            .is_err()
+    );
+    assert!(
+        validate_image_url("https://example.com/page.html")
+            .await
+            .is_err()
+    );
+    assert!(
+        validate_image_url("https://example.com/data.json")
+            .await
+            .is_err()
+    );
+    assert!(
+        validate_image_url("https://example.com/file.pdf")
+            .await
+            .is_err()
+    );
+    assert!(
+        validate_image_url("https://example.com/malware.exe")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_url_blocks_unsupported_image_extensions() {
+    assert!(
+        validate_image_url("https://example.com/photo.gif")
+            .await
+            .is_err()
+    );
+    assert!(
+        validate_image_url("https://example.com/photo.webp")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_url_blocks_other_explicit_non_image_extensions() {
+    assert!(
+        validate_image_url("https://example.com/video.mp4")
+            .await
+            .is_err()
+    );
+    assert!(
+        validate_image_url("https://example.com/report.csv")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_url_blocks_encoded_non_image_extensions() {
+    assert!(
+        validate_image_url("https://example.com/video%2Emp4")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_url_blocks_dotfile_non_image_extensions() {
+    assert!(
+        validate_image_url("https://example.com/.gif")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_url_blocks_trailing_dot_bypass() {
+    assert!(
+        validate_image_url("https://example.com/video.mp4.")
+            .await
+            .is_err()
+    );
+    assert!(
+        validate_image_url("https://example.com/script.js..")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_url_allows_dynamic_urls_without_extensions() {
+    assert!(
+        validate_image_url("https://images.unsplash.com/photo-123456")
+            .await
+            .is_ok()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_url_blocks_private_ips() {
+    assert!(
+        validate_image_url("http://127.0.0.1/image.png")
+            .await
+            .is_err()
+    );
+    assert!(
+        validate_image_url("http://10.0.0.1/image.jpg")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn validate_image_url_blocks_non_http_schemes() {
+    assert!(
+        validate_image_url("ftp://example.com/image.png")
+            .await
+            .is_err()
+    );
+    assert!(validate_image_url("file:///etc/passwd").await.is_err());
+}

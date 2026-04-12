@@ -36,9 +36,13 @@ fn test_config_with_mcp() -> Config {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
         mcp_servers,
@@ -46,8 +50,11 @@ fn test_config_with_mcp() -> Config {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
+        s3: None,
     }
 }
 

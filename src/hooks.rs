@@ -265,6 +265,7 @@ pub(crate) fn build_auto_summary_message(summary: &str) -> ChatMessage {
             "## Context Summary (auto-generated)\n{}",
             truncate(summary.trim(), AUTO_COMPRESS_SUMMARY_CHAR_LIMIT)
         )),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: Some(crate::now_epoch()),
@@ -362,6 +363,7 @@ impl AgentHook for AutoCompressContextHook {
                         "You compress older conversation context for an AI coding assistant. Produce a concise markdown summary that preserves: user goal, important constraints, files or components touched, key tool findings, decisions made, failed attempts, and remaining open issues. Keep it factual and compact. Do not wrap in code blocks. Keep the same language as the source conversation."
                             .into(),
                     ),
+                    images: None,
                     tool_calls: None,
                     tool_call_id: None,
                     timestamp: None,
@@ -369,6 +371,7 @@ impl AgentHook for AutoCompressContextHook {
                 ChatMessage {
                     role: "user".into(),
                     content: Some(source_text),
+                    images: None,
                     tool_calls: None,
                     tool_call_id: None,
                     timestamp: Some(crate::now_epoch()),
@@ -376,7 +379,16 @@ impl AgentHook for AutoCompressContextHook {
             ];
 
             let resolved = config.resolve_model(&input.model);
-            let summary = match providers::call_llm_simple(http, &resolved, &prompt).await {
+            let summary = match providers::call_llm_simple(
+                http,
+                &resolved,
+                &prompt,
+                &input.workspace,
+                config.s3.as_ref(),
+                config.max_llm_retries,
+            )
+            .await
+            {
                 Ok(summary) if !summary.trim().is_empty() => summary,
                 _ => return HookOutput::NoOp,
             };

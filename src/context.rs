@@ -274,7 +274,13 @@ pub(crate) fn message_token_len(message: &ChatMessage) -> usize {
                 .sum::<usize>()
         })
         .unwrap_or(0);
-    (content_len + tc_len + 10) / 4
+    // Each image costs ~85 tokens (conservative; actual varies by resolution).
+    let img_tokens = message
+        .images
+        .as_ref()
+        .map(|imgs| imgs.len() * 85)
+        .unwrap_or(0);
+    (content_len + tc_len + 10) / 4 + img_tokens
 }
 
 /// Measure the size of the conversational "turn" starting at `start`.

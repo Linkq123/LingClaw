@@ -1,9 +1,10 @@
 ---
 name: coder
-description: "General-purpose coding sub-agent for implementing features, fixing bugs, and writing code. Has full tool access except task delegation."
+description: "General-purpose coding sub-agent for implementing features, fixing bugs, and writing code. Has full tool access (including MCP tools) except task delegation."
 max_turns: 15
+mcp_policy: all
 tools:
-  allow: [think, exec, read_file, write_file, patch_file, list_dir, search_files, http_fetch, delete_file]
+  allow: []
   deny: []
 ---
 

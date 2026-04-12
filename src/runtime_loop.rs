@@ -1,6 +1,7 @@
 use super::*;
 
 use serde_json::json;
+use std::sync::atomic::AtomicI64;
 use tokio::time::MissedTickBehavior;
 
 mod socket_input;
@@ -9,6 +10,62 @@ pub(crate) use socket_input::{
     IdleSocketInputAction, handle_idle_socket_input, resolve_or_create_socket_session,
 };
 use socket_input::{drain_busy_socket_messages, persist_pending_interventions};
+
+/// Minimum reasoning cycles before a reflection is worthwhile.
+const REFLECTION_MIN_CYCLES: usize = 3;
+
+/// Minimum cooldown between consecutive reflections (seconds).
+const REFLECTION_COOLDOWN_SECS: i64 = 600; // 10 minutes
+
+/// Epoch-seconds timestamp of the last reflection run (0 = never).
+static LAST_REFLECTION_EPOCH: AtomicI64 = AtomicI64::new(0);
+
+fn epoch_secs_now() -> i64 {
+    chrono::Local::now().timestamp()
+}
+
+/// Decide whether the current run warrants a post-execution reflection
+/// **and** atomically claim the cooldown slot if so.
+///
+/// Returns `Some((previous_epoch, claimed_epoch))` when the caller wins the
+/// slot.  Pass both values to `rollback_reflection_claim()` on failure/no-op.
+/// Returns `None` when the cooldown hasn't elapsed or cycles are too few.
+fn try_claim_reflection(cycles: usize, _tool_calls: usize) -> Option<(i64, i64)> {
+    if cycles < REFLECTION_MIN_CYCLES {
+        return None;
+    }
+    let now = epoch_secs_now();
+    let last = LAST_REFLECTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    if now - last < REFLECTION_COOLDOWN_SECS {
+        return None;
+    }
+    // Atomically swap in `now`; if another thread already swapped, the CAS
+    // fails and we back off — only one reflection per cooldown window.
+    LAST_REFLECTION_EPOCH
+        .compare_exchange(
+            last,
+            now,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .ok()
+        .map(|prev| (prev, now))
+}
+
+/// Roll back a previously claimed cooldown slot so the next non-trivial run
+/// can trigger a reflection (used when the reflection was a no-op or failed).
+///
+/// Uses CAS to restore the previous epoch only if no other run has claimed a
+/// newer slot in the meantime — safe even when reflection timeout exceeds the
+/// cooldown duration.
+fn rollback_reflection_claim(previous: i64, claimed: i64) {
+    let _ = LAST_REFLECTION_EPOCH.compare_exchange(
+        claimed,
+        previous,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
 
 pub(crate) struct AgentRunOutcome {
     pub(crate) rerun_agent: bool,
@@ -102,6 +159,8 @@ const AGENT_HARD_CAP_ROUNDS: usize = 200;
 /// Post-execution reflection: analyze what went well/poorly in a multi-step task.
 /// Writes a brief reflection to the session's daily memory file.
 /// Runs as a non-blocking background task — failures are non-critical.
+/// Returns `Ok(true)` when a reflection was actually written to disk,
+/// `Ok(false)` when the conversation was too trivial for a meaningful reflection.
 async fn run_post_execution_reflection(
     config: &Config,
     http: &reqwest::Client,
@@ -110,11 +169,11 @@ async fn run_post_execution_reflection(
     messages: &[ChatMessage],
     cycles: usize,
     tool_calls: usize,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // Build a compact excerpt of the conversation for reflection.
     let excerpt = crate::memory::build_conversation_excerpt(messages);
     if excerpt.trim().is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     // Cap excerpt to avoid excessive token use for reflection.
     let excerpt = crate::truncate(&excerpt, 8_000);
@@ -134,6 +193,7 @@ async fn run_post_execution_reflection(
         ChatMessage {
             role: "system".into(),
             content: Some(system_prompt),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -141,6 +201,7 @@ async fn run_post_execution_reflection(
         ChatMessage {
             role: "user".into(),
             content: Some(excerpt),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -148,13 +209,20 @@ async fn run_post_execution_reflection(
     ];
 
     let resolved = config.resolve_model(model);
-    let reflection = providers::call_llm_simple(http, &resolved, &prompt_messages)
-        .await
-        .map_err(|e| format!("Reflection LLM call failed: {e}"))?;
+    let reflection = providers::call_llm_simple(
+        http,
+        &resolved,
+        &prompt_messages,
+        workspace,
+        config.s3.as_ref(),
+        config.max_llm_retries,
+    )
+    .await
+    .map_err(|e| format!("Reflection LLM call failed: {e}"))?;
 
     let reflection = reflection.trim();
     if reflection.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     // Write reflection to daily memory file.
@@ -168,15 +236,26 @@ async fn run_post_execution_reflection(
     let entry = format!(
         "\n\n---\n\n## {time} Local — Reflection ({cycles} cycles, {tool_calls} tools)\n\n{reflection}"
     );
+    let initial_content = format!("# {today}\n{entry}");
 
+    use tokio::io::AsyncWriteExt;
     match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+        .create_new(true)
+        .write(true)
         .open(&memory_path)
         .await
     {
         Ok(mut file) => {
-            use tokio::io::AsyncWriteExt;
+            file.write_all(initial_content.as_bytes())
+                .await
+                .map_err(|e| format!("Write reflection: {e}"))?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut file = tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&memory_path)
+                .await
+                .map_err(|e| format!("Open memory file: {e}"))?;
             file.write_all(entry.as_bytes())
                 .await
                 .map_err(|e| format!("Write reflection: {e}"))?;
@@ -184,7 +263,7 @@ async fn run_post_execution_reflection(
         Err(e) => return Err(format!("Open memory file: {e}")),
     }
 
-    Ok(())
+    Ok(true)
 }
 
 async fn send_react_phase_event(live_tx: &LiveTx, react_ctx: &agent::AgentLoopCtx, phase: &str) {
@@ -690,7 +769,7 @@ async fn run_tool_with_feedback<F>(
     cancel: &CancellationToken,
     tool_id: &str,
     tool_name: &str,
-    timeout: Duration,
+    timeout: Option<Duration>,
     future: F,
 ) -> ToolRunState
 where
@@ -701,8 +780,9 @@ where
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     heartbeat.tick().await;
 
-    let timeout_secs = timeout.as_secs();
-    let sleep = tokio::time::sleep(timeout);
+    let has_timeout = timeout.is_some();
+    let timeout_secs = timeout.map(|t| t.as_secs()).unwrap_or(0);
+    let sleep = tokio::time::sleep(timeout.unwrap_or(Duration::ZERO));
     tokio::pin!(sleep);
     tokio::pin!(future);
 
@@ -712,7 +792,7 @@ where
             _ = cancel.cancelled() => {
                 return ToolRunState::Abort;
             }
-            _ = &mut sleep => {
+            _ = &mut sleep, if has_timeout => {
                 return ToolRunState::Completed(tools::ToolOutcome {
                     output: format!("{tool_name} error: tool execution timed out ({}s)", timeout_secs),
                     is_error: true,
@@ -819,15 +899,15 @@ async fn execute_tool_call(
     }
 
     let run_state = if tools::is_task_tool(&tc.function.name) {
-        // Sub-agent task: use dedicated executor with LiveTx for streaming events.
-        // Task tool gets its own child cancel token for isolation.
+        // Sub-agent task: no outer timeout — the sub-agent enforces its own
+        // deadline via config.sub_agent_timeout inside run_subagent().
         let task_cancel = ctx.run_cancel.child_token();
         run_tool_with_feedback(
             ctx.live_tx,
             ctx.run_cancel,
             &tc.id,
             &tc.function.name,
-            tool_timeout,
+            None,
             execute_task_tool(
                 &effective_args,
                 &ctx.state.config,
@@ -845,7 +925,7 @@ async fn execute_tool_call(
             ctx.run_cancel,
             &tc.id,
             &tc.function.name,
-            tool_timeout,
+            Some(tool_timeout),
             execute_tool(
                 &tc.function.name,
                 &effective_args,
@@ -932,6 +1012,7 @@ async fn record_tool_result(
             session.messages.push(ChatMessage {
                 role: "tool".into(),
                 content: Some(result.output),
+                images: None,
                 tool_calls: None,
                 tool_call_id: Some(tc.id.clone()),
                 timestamp: Some(now_epoch()),
@@ -1121,21 +1202,57 @@ async fn run_analyze_phase(
         return AgentPhaseControl::Break;
     }
 
-    let llm_result = tokio::select! {
-        biased;
-        _ = ctx.run_cancel.cancelled() => {
-            phase_state.shutting_down = ctx.cancel.is_cancelled();
-            phase_state.run_detached = !phase_state.shutting_down;
-            return AgentPhaseControl::Break;
+    // Agent-level retry: retry the entire LLM call once for transient HTTP-level
+    // errors (429/5xx/connect/timeout that already exhausted provider-level retries).
+    // Stream-phase errors are NOT retried because partial tokens were already sent.
+    // NOTE: BeforeLlmCall hooks are intentionally NOT re-run on retry — the retry
+    // reuses the same snapshot produced by the single hook pass above, since hooks
+    // modify system prompt / think level which shouldn't change between retries of
+    // the same logical request.
+    let mut agent_llm_attempt = 0u8;
+    let llm_result = loop {
+        let result = tokio::select! {
+            biased;
+            _ = ctx.run_cancel.cancelled() => {
+                phase_state.shutting_down = ctx.cancel.is_cancelled();
+                phase_state.run_detached = !phase_state.shutting_down;
+                return AgentPhaseControl::Break;
+            }
+            result = providers::call_llm_stream(
+                &ctx.state.http,
+                &resolved,
+                &final_msgs_snapshot,
+                &phase_state.cycle_workspace,
+                ctx.state.config.s3.as_ref(),
+                ctx.live_tx,
+                &effective_think,
+                &extra_tools,
+                ctx.state.config.max_llm_retries,
+            ) => result,
+        };
+
+        match &result {
+            Err(e) if agent_llm_attempt == 0 && providers::is_transient_llm_error(e) => {
+                agent_llm_attempt += 1;
+                let _ = live_send(
+                    ctx.live_tx,
+                    json!({"type":"system","content":format!("LLM request failed ({e}), retrying...")}),
+                )
+                .await;
+                // Backoff before agent-level retry, respecting cancellation.
+                tokio::select! {
+                    biased;
+                    _ = ctx.run_cancel.cancelled() => {
+                        phase_state.shutting_down = ctx.cancel.is_cancelled();
+                        phase_state.run_detached = !phase_state.shutting_down;
+                        return AgentPhaseControl::Break;
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(3)) => {}
+                }
+                continue;
+            }
+            _ => break result,
         }
-        result = providers::call_llm_stream(
-            &ctx.state.http,
-            &resolved,
-            &final_msgs_snapshot,
-            ctx.live_tx,
-            &effective_think,
-            &extra_tools,
-        ) => result,
     };
 
     match llm_result {
@@ -1304,7 +1421,7 @@ async fn run_act_phase(
                     ctx.run_cancel,
                     &tc.id,
                     &tc.function.name,
-                    tool_timeout,
+                    Some(tool_timeout),
                     execute_tool(
                         &tc.function.name,
                         args,
@@ -1465,20 +1582,30 @@ async fn run_finish_phase(
         queue.enqueue(session.workspace.clone(), model, excerpt);
     }
 
-    // Post-execution reflection for multi-step tasks.
+    // Post-execution reflection for non-trivial multi-step tasks.
+    // Gated by config.daily_reflection + minimum complexity + cooldown.
     // Spawned as a background task to avoid delaying the "done" event.
-    if phase_state.react_ctx.cycles > 0
-        && phase_state.react_ctx.tool_calls > 0
+    // NOTE: snapshot check must precede try_claim_reflection() because the
+    // CAS has a side-effect; if it fires but the session is gone, nobody
+    // would roll back the cooldown slot.
+    if ctx.state.config.daily_reflection
         && let Some(ref session) = snapshot
+        && let Some((previous_epoch, claimed_epoch)) = try_claim_reflection(
+            phase_state.react_ctx.cycles,
+            phase_state.react_ctx.tool_calls,
+        )
     {
         let config = ctx.state.config.clone();
         let http = ctx.state.http.clone();
         let workspace = session.workspace.clone();
-        let model = session.effective_model(&config.model).to_string();
+        let fallback_model = session.effective_model(&config.model).to_string();
+        let model = config.reflection_model_or(&fallback_model).to_string();
         let messages = crate::memory::prefilter_for_memory(&session.messages);
         let cycles = phase_state.react_ctx.cycles;
         let tool_calls = phase_state.react_ctx.tool_calls;
-        let reflection_timeout = config.tool_timeout;
+        // Match structured memory: floor at 30s so a low toolTimeout doesn't
+        // cause reflections to time out systematically.
+        let reflection_timeout = config.tool_timeout.max(std::time::Duration::from_secs(30));
         tokio::spawn(async move {
             match tokio::time::timeout(
                 reflection_timeout,
@@ -1490,11 +1617,21 @@ async fn run_finish_phase(
             {
                 Ok(Err(e)) => {
                     eprintln!("Reflection failed (non-critical): {e}");
+                    // Roll back so the next non-trivial run can try again.
+                    rollback_reflection_claim(previous_epoch, claimed_epoch);
                 }
                 Err(_elapsed) => {
                     eprintln!("Reflection timed out (non-critical)");
+                    rollback_reflection_claim(previous_epoch, claimed_epoch);
                 }
-                Ok(Ok(())) => {}
+                Ok(Ok(true)) => {
+                    // CAS already claimed the slot — nothing more to do.
+                }
+                Ok(Ok(false)) => {
+                    // Conversation was too trivial — no reflection written.
+                    // Roll back so the next non-trivial run can reflect.
+                    rollback_reflection_claim(previous_epoch, claimed_epoch);
+                }
             }
         });
     }

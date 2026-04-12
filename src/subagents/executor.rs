@@ -27,6 +27,37 @@ use crate::{
 /// Maximum characters in the sub-agent's final result returned to the parent.
 const MAX_RESULT_CHARS: usize = 30_000;
 
+/// Apply the sub-agent AfterToolExec hook to a real or synthetic tool outcome.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_after_tool_exec_hook(
+    hooks: &HookRegistry,
+    config: &Config,
+    workspace: &Path,
+    cycle: usize,
+    tool_name: &str,
+    effective_args: &str,
+    tool_id: &str,
+    mut outcome: tools::ToolOutcome,
+) -> tools::ToolOutcome {
+    let after_input = ToolHookInput {
+        tool_name: tool_name.to_string(),
+        tool_args: serde_json::from_str(effective_args)
+            .unwrap_or_else(|_| serde_json::Value::String(effective_args.to_string())),
+        tool_id: tool_id.to_string(),
+        cycle,
+        workspace: workspace.to_path_buf(),
+        outcome_output: Some(outcome.output.clone()),
+        outcome_is_error: Some(outcome.is_error),
+        outcome_duration_ms: Some(outcome.duration_ms),
+    };
+    let after_output =
+        run_tool_hooks(hooks, agent::HookPoint::AfterToolExec, after_input, config).await;
+    if let hooks::HookOutput::ModifyToolResult { result } = after_output {
+        outcome.output = result;
+    }
+    outcome
+}
+
 /// Sub-agent execution outcome.
 pub(crate) struct SubAgentOutcome {
     /// Final text result to inject into parent context.
@@ -67,16 +98,22 @@ pub(crate) async fn run_subagent(
     let model_id = resolve_subagent_model(config).to_string();
     let resolved = config.resolve_model(&model_id);
 
-    // Build filtered tool definitions for this sub-agent.
-    let allowed_tools = super::filter_tools_for_agent(spec);
-    let tool_defs = build_filtered_tool_defs(&allowed_tools, resolved.provider);
+    // Ensure MCP tool cache is warm before building the sub-agent tool set.
+    // The main loop's Analyze phase usually warms it, but cache may have expired
+    // (TTL=30s) if LLM inference was slow, or if this is a re-invocation.
+    tools::mcp::ensure_tools_cached(config, workspace).await;
+
+    // Build filtered tool definitions for this sub-agent (includes MCP tools).
+    let allowed_tools = super::filter_tools_for_agent_with_mcp(spec, config, workspace);
+    let tool_defs = build_filtered_tool_defs(&allowed_tools, config, workspace, resolved.provider);
 
     // Build isolated message history.
-    let system_prompt = build_subagent_system_prompt(spec, &allowed_tools, config);
+    let system_prompt = build_subagent_system_prompt(spec, &allowed_tools, config, workspace);
     let mut messages: Vec<ChatMessage> = vec![
         ChatMessage {
             role: "system".into(),
             content: Some(system_prompt),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -84,6 +121,7 @@ pub(crate) async fn run_subagent(
         ChatMessage {
             role: "user".into(),
             content: Some(prompt.to_string()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -93,11 +131,24 @@ pub(crate) async fn run_subagent(
     let mut cycles: usize = 0;
     let mut total_tool_calls: usize = 0;
     let mut aborted = false;
+    let mut timed_out = false;
+
+    // Sub-agent deadline: 0 = unlimited.
+    let sa_timeout = config.sub_agent_timeout;
+    let unlimited = sa_timeout.is_zero();
+    let deadline = tokio::time::Instant::now() + sa_timeout;
 
     // Mini ReAct loop
     'react: for _cycle in 0..spec.max_turns {
         if cancel.is_cancelled() {
             aborted = true;
+            break;
+        }
+
+        // Check sub-agent deadline.
+        if !unlimited && tokio::time::Instant::now() >= deadline {
+            aborted = true;
+            timed_out = true;
             break;
         }
 
@@ -115,20 +166,6 @@ pub(crate) async fn run_subagent(
         )
         .await;
 
-        // Create a per-cycle channel for LLM streaming events.
-        // The forwarder task tags events with the sub-agent name and relays them.
-        let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
-        let parent_tx = parent_live_tx.clone();
-        let agent_name = spec.name.clone();
-        let forward_handle = tokio::spawn(async move {
-            while let Some(mut event) = sub_rx.recv().await {
-                if let Some(obj) = event.as_object_mut() {
-                    obj.insert("subagent".into(), json!(agent_name));
-                }
-                let _ = live_send(&parent_tx, event).await;
-            }
-        });
-
         // Prune context before each LLM call to stay within budget.
         // Use message_budget_for_tool_defs which accounts for thinking budget,
         // tool schema tokens, and structural overhead — matching the main loop's
@@ -139,26 +176,74 @@ pub(crate) async fn run_subagent(
             context::message_budget_for_tool_defs(config, &model_id, think_level, &tool_defs);
         context::prune_messages_for_provider(&mut messages, resolved.provider, budget);
 
-        // Call LLM with the sub-agent's isolated context
-        let llm_result = tokio::select! {
-            biased;
-            _ = cancel.cancelled() => {
-                aborted = true;
-                drop(sub_tx);
-                let _ = forward_handle.await;
-                break 'react;
-            }
-            result = providers::call_llm_stream(
-                http,
-                &resolved,
-                &messages,
-                &sub_tx,
-                think_level,
-                &tool_defs,
-            ) => {
-                drop(sub_tx);
-                let _ = forward_handle.await;
-                result
+        // Call LLM with the sub-agent's isolated context.
+        // Agent-level retry: on transient HTTP errors, retry once before aborting.
+        let llm_result = 'llm_call: {
+            let mut llm_attempt = 0u8;
+            loop {
+                let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
+                let parent_tx = parent_live_tx.clone();
+                let agent_name = spec.name.clone();
+                let forward_handle = tokio::spawn(async move {
+                    while let Some(mut event) = sub_rx.recv().await {
+                        if let Some(obj) = event.as_object_mut() {
+                            obj.insert("subagent".into(), json!(agent_name));
+                        }
+                        let _ = live_send(&parent_tx, event).await;
+                    }
+                });
+
+                let result = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        aborted = true;
+                        drop(sub_tx);
+                        let _ = forward_handle.await;
+                        break 'react;
+                    }
+                    _ = tokio::time::sleep_until(deadline), if !unlimited => {
+                        aborted = true;
+                        timed_out = true;
+                        drop(sub_tx);
+                        let _ = forward_handle.await;
+                        break 'react;
+                    }
+                    result = providers::call_llm_stream(
+                        http,
+                        &resolved,
+                        &messages,
+                        workspace,
+                        config.s3.as_ref(),
+                        &sub_tx,
+                        think_level,
+                        &tool_defs,
+                        config.max_llm_retries,
+                    ) => {
+                        drop(sub_tx);
+                        let _ = forward_handle.await;
+                        result
+                    }
+                };
+
+                match &result {
+                    Err(e) if llm_attempt == 0 && providers::is_transient_llm_error(e) => {
+                        llm_attempt += 1;
+                        eprintln!("Sub-agent '{}' LLM error, retrying: {e}", spec.name);
+                        // Backoff before retry, respecting cancel/deadline.
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => { aborted = true; break 'react; }
+                            _ = tokio::time::sleep_until(deadline), if !unlimited => {
+                                aborted = true;
+                                timed_out = true;
+                                break 'react;
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+                        }
+                        continue;
+                    }
+                    _ => break 'llm_call result,
+                }
             }
         };
 
@@ -180,9 +265,16 @@ pub(crate) async fn run_subagent(
                             aborted = true;
                             break 'react;
                         }
+                        // Check sub-agent deadline between tool calls.
+                        if !unlimited && tokio::time::Instant::now() >= deadline {
+                            aborted = true;
+                            timed_out = true;
+                            break 'react;
+                        }
 
-                        // Check tool permission
-                        if !spec.tools.is_allowed(&tc.function.name) {
+                        // Check tool permission against the pre-computed
+                        // allowed list (accounts for mcp_policy + deny overrides).
+                        if !allowed_tools.iter().any(|t| t == &tc.function.name) {
                             let result_msg = format!(
                                 "Tool '{}' is not allowed for sub-agent '{}'",
                                 tc.function.name, spec.name
@@ -190,6 +282,7 @@ pub(crate) async fn run_subagent(
                             messages.push(ChatMessage {
                                 role: "tool".into(),
                                 content: Some(result_msg),
+                                images: None,
                                 tool_calls: None,
                                 tool_call_id: Some(tc.id.clone()),
                                 timestamp: None,
@@ -228,6 +321,7 @@ pub(crate) async fn run_subagent(
                                 messages.push(ChatMessage {
                                     role: "tool".into(),
                                     content: Some(format!("[rejected by hook] {reason}")),
+                                    images: None,
                                     tool_calls: None,
                                     tool_call_id: Some(tc.id.clone()),
                                     timestamp: None,
@@ -253,49 +347,73 @@ pub(crate) async fn run_subagent(
                         )
                         .await;
 
-                        // Execute the tool
-                        let mut outcome = execute_subagent_tool(
-                            &tc.function.name,
-                            &effective_args,
-                            config,
-                            http,
-                            workspace,
-                        )
-                        .await;
+                        // Execute the tool, bounded by sub-agent deadline.
+                        let tool_started = tokio::time::Instant::now();
+                        let (outcome, hit_deadline) = if unlimited {
+                            (
+                                execute_subagent_tool(
+                                    &tc.function.name,
+                                    &effective_args,
+                                    config,
+                                    http,
+                                    workspace,
+                                )
+                                .await,
+                                false,
+                            )
+                        } else {
+                            tokio::select! {
+                                res = execute_subagent_tool(
+                                    &tc.function.name,
+                                    &effective_args,
+                                    config,
+                                    http,
+                                    workspace,
+                                ) => (res, false),
+                                _ = tokio::time::sleep_until(deadline) => {
+                                    timed_out = true;
+                                    aborted = true;
+                                    (
+                                        tools::ToolOutcome {
+                                            output: format!(
+                                                "Tool '{}' aborted: sub-agent deadline exceeded",
+                                                tc.function.name
+                                            ),
+                                            is_error: true,
+                                            duration_ms: tool_started.elapsed().as_millis() as u64,
+                                        },
+                                        true,
+                                    )
+                                }
+                            }
+                        };
 
                         total_tool_calls += 1;
 
-                        // ── AfterToolExec hook ──
-                        let after_input = ToolHookInput {
-                            tool_name: tc.function.name.clone(),
-                            tool_args: serde_json::from_str(&effective_args).unwrap_or_else(|_| {
-                                serde_json::Value::String(effective_args.clone())
-                            }),
-                            tool_id: tc.id.clone(),
-                            cycle: cycles,
-                            workspace: workspace.to_path_buf(),
-                            outcome_output: Some(outcome.output.clone()),
-                            outcome_is_error: Some(outcome.is_error),
-                            outcome_duration_ms: Some(outcome.duration_ms),
-                        };
-                        let after_output = run_tool_hooks(
+                        let outcome = apply_after_tool_exec_hook(
                             hooks,
-                            agent::HookPoint::AfterToolExec,
-                            after_input,
                             config,
+                            workspace,
+                            cycles,
+                            &tc.function.name,
+                            &effective_args,
+                            &tc.id,
+                            outcome,
                         )
                         .await;
-                        if let hooks::HookOutput::ModifyToolResult { result } = after_output {
-                            outcome.output = result;
-                        }
 
                         messages.push(ChatMessage {
                             role: "tool".into(),
                             content: Some(outcome.output),
+                            images: None,
                             tool_calls: None,
                             tool_call_id: Some(tc.id.clone()),
                             timestamp: None,
                         });
+
+                        if hit_deadline {
+                            break 'react;
+                        }
                     }
                 }
             }
@@ -319,14 +437,36 @@ pub(crate) async fn run_subagent(
         .rev()
         .find(|m| m.role == "assistant" && m.has_nonempty_content())
         .and_then(|m| m.content.clone())
-        .unwrap_or_else(|| {
-            format!(
-                "Sub-agent '{}' completed {} cycles with {} tool calls but produced no final output.",
-                spec.name, cycles, total_tool_calls
-            )
-        });
+        .unwrap_or_default();
 
-    let result = truncate(&final_content, MAX_RESULT_CHARS).to_string();
+    let result = if timed_out {
+        let partial = truncate(&final_content, MAX_RESULT_CHARS.saturating_sub(200));
+        if partial.is_empty() {
+            format!(
+                "Sub-agent '{}' timed out after {}s ({} cycles, {} tool calls) with no output.",
+                spec.name,
+                sa_timeout.as_secs(),
+                cycles,
+                total_tool_calls
+            )
+        } else {
+            format!(
+                "Sub-agent '{}' timed out after {}s ({} cycles, {} tool calls). Partial result:\n\n{}",
+                spec.name,
+                sa_timeout.as_secs(),
+                cycles,
+                total_tool_calls,
+                partial
+            )
+        }
+    } else if final_content.is_empty() {
+        format!(
+            "Sub-agent '{}' completed {} cycles with {} tool calls but produced no final output.",
+            spec.name, cycles, total_tool_calls
+        )
+    } else {
+        truncate(&final_content, MAX_RESULT_CHARS).to_string()
+    };
 
     SubAgentOutcome {
         result,
@@ -339,19 +479,29 @@ pub(crate) async fn run_subagent(
 fn build_subagent_system_prompt(
     spec: &SubAgentSpec,
     allowed_tools: &[String],
-    _config: &Config,
+    config: &Config,
+    workspace: &Path,
 ) -> String {
     let tool_list = if allowed_tools.is_empty() {
         "(no tools available)".to_string()
     } else {
+        // Build a lookup of MCP tool descriptions from cache.
+        let mcp_descriptors = tools::mcp::cached_list_tools(config, workspace);
+        let mcp_desc_map: std::collections::HashMap<&str, &str> = mcp_descriptors
+            .iter()
+            .map(|d| (d.exposed_name.as_str(), d.description.as_str()))
+            .collect();
+
         allowed_tools
             .iter()
             .enumerate()
             .map(|(i, name)| {
+                // Try built-in description first, then MCP description.
                 let desc = crate::tools::tool_specs()
                     .iter()
                     .find(|ts| ts.name == name)
                     .map(|ts| ts.description)
+                    .or_else(|| mcp_desc_map.get(name.as_str()).copied())
                     .unwrap_or("");
                 format!("{}. **{}** — {}", i + 1, name, desc)
             })
@@ -377,10 +527,12 @@ fn build_subagent_system_prompt(
 
 fn build_filtered_tool_defs(
     allowed_tools: &[String],
+    config: &Config,
+    workspace: &Path,
     provider: crate::config::Provider,
 ) -> Vec<serde_json::Value> {
     let all_specs = crate::tools::tool_specs();
-    all_specs
+    let mut defs: Vec<serde_json::Value> = all_specs
         .iter()
         .filter(|ts| allowed_tools.iter().any(|a| a == ts.name))
         .map(|spec| match provider {
@@ -402,12 +554,42 @@ fn build_filtered_tool_defs(
                 })
             }
         })
-        .collect()
+        .collect();
+
+    // Append MCP tool definitions from cache.
+    let mcp_descriptors = tools::mcp::cached_list_tools(config, workspace);
+    for descriptor in mcp_descriptors {
+        if !allowed_tools.iter().any(|a| a == &descriptor.exposed_name) {
+            continue;
+        }
+        let def = match provider {
+            crate::config::Provider::OpenAI | crate::config::Provider::Ollama => {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": descriptor.exposed_name,
+                        "description": descriptor.description,
+                        "parameters": descriptor.input_schema,
+                    }
+                })
+            }
+            crate::config::Provider::Anthropic => {
+                json!({
+                    "name": descriptor.exposed_name,
+                    "description": descriptor.description,
+                    "input_schema": descriptor.input_schema,
+                })
+            }
+        };
+        defs.push(def);
+    }
+
+    defs
 }
 
 /// Execute a tool within the sub-agent context.
-/// Uses the same tool registry as the parent, but goes through the built-in
-/// execute path only (no MCP tools for sub-agents to keep isolation simple).
+/// Tries MCP tools first (matching the main loop pattern), then falls back
+/// to the built-in tool registry.
 async fn execute_subagent_tool(
     name: &str,
     args_str: &str,
@@ -415,5 +597,9 @@ async fn execute_subagent_tool(
     http: &Client,
     workspace: &Path,
 ) -> tools::ToolOutcome {
-    tools::execute_tool(name, args_str, config, http, workspace).await
+    if let Some(result) = tools::mcp::execute_tool(name, args_str, config, workspace).await {
+        result
+    } else {
+        tools::execute_tool(name, args_str, config, http, workspace).await
+    }
 }

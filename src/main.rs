@@ -1,11 +1,12 @@
 use axum::{
     Json, Router,
     extract::{
-        State,
+        DefaultBodyLimit, Multipart, Request, State,
         ws::{Message as WsMsg, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures::{SinkExt, StreamExt};
@@ -31,6 +32,7 @@ mod commands;
 mod config;
 mod context;
 mod hooks;
+mod image_uploads;
 mod memory;
 mod prompts;
 mod providers;
@@ -60,7 +62,9 @@ use runtime_loop::{
     run_agent_session,
 };
 use session_store::{load_session_from_disk, refresh_session_system_prompt, save_session_to_disk};
-use socket_sync::{send_command_refresh, send_existing_session_payloads};
+use socket_sync::{
+    build_session_info_payload, send_command_refresh, send_existing_session_payloads,
+};
 use socket_tasks::{ConnectionCleanup, finalize_connection, spawn_connection_tasks};
 
 #[cfg(test)]
@@ -90,10 +94,33 @@ const INBOUND_BUFFER_CAPACITY: usize = 128;
 // ── Data Models ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
+struct ImageAttachment {
+    url: String,
+    /// Persisted S3 object key for locally uploaded images so fresh
+    /// presigned URLs can be generated for history replay and provider calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    s3_object_key: Option<String>,
+    /// Persisted path to a cached base64 file inside the session workspace.
+    /// This keeps historical Ollama images available across restarts without
+    /// bloating the session JSON itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_path: Option<String>,
+    /// Cached base64-encoded image data.  Populated at intake so Ollama
+    /// requests never re-fetch historical URLs.  Not persisted to disk
+    /// (`skip_serializing`) to avoid bloating session files; after a reload
+    /// the disk cache or legacy network fallback in `fetch_images_base64`
+    /// handles it.
+    #[serde(skip_serializing, default)]
+    data: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct ChatMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    images: Option<Vec<ImageAttachment>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -264,6 +291,8 @@ impl Session {
     }
 }
 
+const UPLOAD_TOKEN_HEADER: &str = "x-lingclaw-upload-token";
+
 struct AppState {
     config: Config,
     http: Client,
@@ -279,6 +308,7 @@ struct AppState {
     next_connection_id: AtomicU64,
     shutdown: CancellationToken,
     shutdown_token: String,
+    upload_token: String,
     hooks: HookRegistry,
     /// Background structured memory updater (active when config.structured_memory is true).
     memory_queue: Option<MemoryUpdateQueue>,
@@ -453,6 +483,7 @@ Only read those files if the user explicitly asks to inspect them, if you need t
     ChatMessage {
         role: "system".into(),
         content: Some(prompt),
+        images: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -626,20 +657,87 @@ fn resolve_path_checked(path_str: &str, workspace: &Path) -> Result<PathBuf, Str
     Ok(resolved)
 }
 
-fn generate_shutdown_token() -> String {
+fn generate_secret_token() -> Result<String, String> {
     let mut bytes = [0_u8; 32];
-    match getrandom::getrandom(&mut bytes) {
-        Ok(()) => bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
-        Err(e) => {
-            eprintln!("WARNING: failed to get secure random bytes for shutdown token: {e}");
-            let fallback = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-                ^ u128::from(std::process::id());
-            format!("{fallback:032x}{fallback:032x}")
+    getrandom::getrandom(&mut bytes)
+        .map_err(|e| format!("failed to get secure random bytes for secret token: {e}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn generate_shutdown_token() -> Result<String, String> {
+    generate_secret_token()
+}
+
+fn forbidden_local_api(message: &str) -> (StatusCode, Json<serde_json::Value>) {
+    (StatusCode::FORBIDDEN, Json(json!({"error": message})))
+}
+
+fn authority_host(header_value: &str) -> Option<String> {
+    let trimmed = header_value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Some(stripped) = trimmed.strip_prefix('[') {
+        let end = stripped.find(']')?;
+        return Some(stripped[..end].to_string());
+    }
+    if trimmed.matches(':').count() == 1 {
+        return trimmed.split_once(':').map(|(host, _)| host.to_string());
+    }
+    Some(trimmed.to_string())
+}
+
+fn is_loopback_or_localhost(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+fn validate_local_request_headers(
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let host = headers
+        .get("host")
+        .and_then(|value| value.to_str().ok())
+        .and_then(authority_host)
+        .ok_or_else(|| forbidden_local_api("Blocked non-local request: invalid Host header"))?;
+    if !is_loopback_or_localhost(&host) {
+        return Err(forbidden_local_api(
+            "Blocked non-local request: Host header must target localhost or a loopback address",
+        ));
+    }
+
+    for header_name in ["origin", "referer"] {
+        if let Some(value) = headers.get(header_name) {
+            let origin = value.to_str().map_err(|_| {
+                forbidden_local_api("Blocked non-local request: malformed Origin/Referer header")
+            })?;
+            let parsed = reqwest::Url::parse(origin).map_err(|_| {
+                forbidden_local_api("Blocked non-local request: malformed Origin/Referer URL")
+            })?;
+            let origin_host = parsed.host_str().ok_or_else(|| {
+                forbidden_local_api("Blocked non-local request: Origin/Referer URL has no host")
+            })?;
+            if !is_loopback_or_localhost(origin_host) {
+                return Err(forbidden_local_api(
+                    "Blocked non-local request: Origin/Referer must be localhost or a loopback address",
+                ));
+            }
         }
     }
+
+    Ok(())
+}
+
+async fn enforce_local_request(
+    request: Request,
+    next: Next,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(request.headers())?;
+    Ok(next.run(request).await)
 }
 
 fn find_static_dir_from(exe: Option<&Path>, cwd: Option<&Path>) -> PathBuf {
@@ -1382,6 +1480,144 @@ async fn api_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(json!({"sessions": list}))
 }
 
+async fn api_client_config(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+    Ok(Json(json!({
+        "upload_token": state.upload_token,
+    })))
+}
+
+/// POST /api/upload-images — multipart image upload to S3.
+async fn api_upload_images(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+    let upload_token = headers
+        .get(UPLOAD_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "Missing upload token"})),
+            )
+        })?;
+    if upload_token != state.upload_token {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "Invalid upload token"})),
+        ));
+    }
+
+    let s3_cfg = state.config.s3.as_ref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "S3 not configured"})),
+        )
+    })?;
+
+    let mut uploaded_images: Vec<serde_json::Value> = Vec::new();
+    let mut urls: Vec<String> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    let max_files = image_uploads::MAX_IMAGE_UPLOAD_FILES;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!("Invalid multipart payload: {e}"),
+                    })),
+                ));
+            }
+        };
+
+        if urls.len() + errors.len() >= max_files {
+            errors.push("Maximum 10 images per upload".to_string());
+            break;
+        }
+
+        let declared_content_type = field
+            .content_type()
+            .unwrap_or("application/octet-stream")
+            .to_string();
+
+        let data = match field.bytes().await {
+            Ok(d) => d,
+            Err(e) => {
+                errors.push(format!("Read error: {e}"));
+                continue;
+            }
+        };
+
+        if data.len() > image_uploads::MAX_IMAGE_UPLOAD_BYTES {
+            errors.push(format!(
+                "Image too large ({} bytes, max {})",
+                data.len(),
+                image_uploads::MAX_IMAGE_UPLOAD_BYTES
+            ));
+            continue;
+        }
+
+        if data.is_empty() {
+            errors.push("Empty image file".to_string());
+            continue;
+        }
+
+        let Some(content_type) = image_uploads::detect_image_upload_content_type(&data) else {
+            errors.push(format!(
+                "Unsupported image content (declared type: {declared_content_type})"
+            ));
+            continue;
+        };
+
+        let object_key = image_uploads::generate_s3_object_key(s3_cfg, content_type, &data);
+
+        let upload_timeout = std::time::Duration::from_secs(60);
+        let upload_result = tokio::time::timeout(
+            upload_timeout,
+            image_uploads::s3_put_object(&state.http, s3_cfg, &object_key, &data, content_type),
+        )
+        .await;
+        match upload_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                errors.push(e);
+                continue;
+            }
+            Err(_) => {
+                errors.push("S3 upload timed out".to_string());
+                continue;
+            }
+        }
+
+        match image_uploads::s3_presigned_get_url(s3_cfg, &object_key) {
+            Ok(url) => {
+                let attachment_token =
+                    image_uploads::sign_attachment_object_key(s3_cfg, &object_key);
+                uploaded_images.push(json!({
+                    "url": url.clone(),
+                    "object_key": object_key,
+                    "attachment_token": attachment_token,
+                }));
+                urls.push(url);
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+
+    Ok(Json(
+        json!({ "images": uploaded_images, "urls": urls, "errors": errors }),
+    ))
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1459,6 +1695,11 @@ async fn main() {
     eprintln!("  Exec timeout:  {}s", config.exec_timeout.as_secs());
     eprintln!("  Tool timeout:  {}s", config.tool_timeout.as_secs());
     eprintln!(
+        "  Agent timeout: {}",
+        crate::config::format_sub_agent_timeout(config.sub_agent_timeout)
+    );
+    eprintln!("  LLM retries:  {}", config.max_llm_retries);
+    eprintln!(
         "  Context limit: {} tokens",
         config.context_limit_for_model(&config.model)
     );
@@ -1466,7 +1707,20 @@ async fn main() {
     let shutdown = CancellationToken::new();
 
     // Generate a one-time shutdown token and write it to disk for CLI use
-    let shutdown_token = generate_shutdown_token();
+    let shutdown_token = match generate_shutdown_token() {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("ERROR: {error}");
+            return;
+        }
+    };
+    let upload_token = match generate_secret_token() {
+        Ok(token) => token,
+        Err(error) => {
+            eprintln!("ERROR: {error}");
+            return;
+        }
+    };
     if let Some(dir) = config_dir_path() {
         let _ = std::fs::write(dir.join(format!("shutdown-{port}.token")), &shutdown_token);
     }
@@ -1480,9 +1734,40 @@ async fn main() {
         None
     };
 
+    let http = Client::new();
+    if let Some(s3_cfg) = config.s3.clone()
+        && s3_cfg.lifecycle_days > 0
+    {
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            image_uploads::ensure_s3_temp_image_lifecycle(&http, &s3_cfg),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {
+                eprintln!(
+                    "  S3 lifecycle: configured {}-day expiration for prefix '{}'",
+                    s3_cfg.lifecycle_days, s3_cfg.prefix
+                );
+            }
+            Ok(Ok(false)) => {
+                eprintln!(
+                    "  S3 lifecycle: verified {}-day expiration for prefix '{}'",
+                    s3_cfg.lifecycle_days, s3_cfg.prefix
+                );
+            }
+            Ok(Err(error)) => {
+                eprintln!("WARNING: Failed to ensure S3 lifecycle rule: {error}");
+            }
+            Err(_) => {
+                eprintln!("WARNING: Timed out ensuring S3 lifecycle rule");
+            }
+        }
+    }
+
     let state = Arc::new(AppState {
         config,
-        http: Client::new(),
+        http,
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
@@ -1492,6 +1777,7 @@ async fn main() {
         next_connection_id: AtomicU64::new(1),
         shutdown: shutdown.clone(),
         shutdown_token,
+        upload_token,
         hooks,
         memory_queue,
     });
@@ -1524,9 +1810,17 @@ async fn main() {
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/health", get(api_health))
+        .route("/api/client-config", get(api_client_config))
         .route("/api/sessions", get(api_sessions))
+        .route(
+            "/api/upload-images",
+            post(api_upload_images).layer(DefaultBodyLimit::max(
+                image_uploads::MAX_IMAGE_UPLOAD_REQUEST_BYTES,
+            )),
+        )
         .route("/api/shutdown", post(api_shutdown))
         .fallback_service(ServeDir::new(static_dir).append_index_html_on_directories(true))
+        .layer(middleware::from_fn(enforce_local_request))
         .with_state(state.clone());
 
     let addr = format!("127.0.0.1:{port}");

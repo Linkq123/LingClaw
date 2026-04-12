@@ -1,6 +1,51 @@
 use super::*;
 
+use serde::Deserialize;
 use serde_json::json;
+
+/// Structured user message payload from frontend (when images are attached).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputImageAttachment {
+    url: String,
+    #[serde(default)]
+    object_key: Option<String>,
+    #[serde(default)]
+    attachment_token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct UserMessagePayload {
+    text: String,
+    #[serde(default)]
+    images: Vec<InputImageAttachment>,
+}
+
+pub(super) fn resolve_input_image_url(
+    url: &str,
+    object_key: Option<&str>,
+    attachment_token: Option<&str>,
+    s3_cfg: Option<&crate::config::S3Config>,
+) -> Result<(String, Option<String>), String> {
+    match (object_key, attachment_token) {
+        (Some(object_key), Some(token)) => {
+            let cfg = s3_cfg.ok_or_else(|| {
+                "S3 uploads are no longer configured. Please re-attach the image.".to_string()
+            })?;
+            if !crate::image_uploads::verify_attachment_object_key(cfg, object_key, token) {
+                return Err("Invalid uploaded image token. Please re-attach the image.".to_string());
+            }
+
+            let trusted_url =
+                crate::image_uploads::resolve_image_url("", Some(object_key), Some(cfg))?;
+            Ok((trusted_url, Some(object_key.to_string())))
+        }
+        (Some(_), None) | (None, Some(_)) => {
+            Err("Incomplete uploaded image metadata. Please re-attach the image.".to_string())
+        }
+        (None, None) => Ok((url.to_string(), None)),
+    }
+}
 
 pub(crate) enum IdleSocketInputAction {
     Continue,
@@ -114,18 +159,20 @@ pub(crate) async fn handle_idle_socket_input(
             .await;
 
             if result.sessions_changed {
-                let name = {
+                let payload = {
                     let sessions = state.sessions.lock().await;
-                    sessions
+                    let (name, model) = sessions
                         .get(current_session_id.as_str())
-                        .map(|s| s.name.clone())
-                        .unwrap_or_else(|| "Main".to_string())
+                        .map(|s| {
+                            (
+                                s.name.clone(),
+                                s.effective_model(&state.config.model).to_string(),
+                            )
+                        })
+                        .unwrap_or_else(|| ("Main".to_string(), state.config.model.clone()));
+                    build_session_info_payload(current_session_id, &name, state, &model)
                 };
-                ws_send(
-                    tx,
-                    &json!({"type":"session","id":current_session_id,"name":name}),
-                )
-                .await;
+                ws_send(tx, &payload).await;
             }
         } else {
             ws_send(
@@ -137,12 +184,163 @@ pub(crate) async fn handle_idle_socket_input(
         return IdleSocketInputAction::Continue;
     }
 
+    // Try parsing as structured JSON message (with image attachments).
+    let (msg_text, msg_images) = if trimmed.starts_with('{') {
+        match serde_json::from_str::<UserMessagePayload>(trimmed) {
+            Ok(payload) => {
+                // Limit images per message to prevent abuse.
+                const MAX_IMAGES_PER_MESSAGE: usize = 10;
+                if payload.images.len() > MAX_IMAGES_PER_MESSAGE {
+                    ws_send(tx, &json!({"type":"system","content":format!("Too many images (max {MAX_IMAGES_PER_MESSAGE}).")})).await;
+                    return IdleSocketInputAction::Continue;
+                }
+                // Server-side capability gate: reject images if model doesn't support them.
+                if !payload.images.is_empty() {
+                    let (model, workspace) = {
+                        let sessions = state.sessions.lock().await;
+                        sessions
+                            .get(current_session_id.as_str())
+                            .map(|s| {
+                                (
+                                    s.effective_model(&state.config.model).to_string(),
+                                    s.workspace.clone(),
+                                )
+                            })
+                            .unwrap_or_else(|| {
+                                (
+                                    state.config.model.clone(),
+                                    crate::session_workspace_path(current_session_id),
+                                )
+                            })
+                    };
+                    if !state.config.model_supports_image(&model) {
+                        ws_send(tx, &json!({"type":"system","content":"Current model does not support image input."})).await;
+                        return IdleSocketInputAction::Continue;
+                    }
+                    let prefetch_for_ollama = matches!(
+                        state.config.resolve_model(&model).provider,
+                        Provider::Ollama
+                    );
+
+                    // Validate image URLs before accepting.
+                    let mut validated = Vec::new();
+                    let safe_http = if prefetch_for_ollama {
+                        Some(match crate::providers::build_image_fetch_client() {
+                            Ok(c) => c,
+                            Err(err) => {
+                                ws_send(tx, &json!({"type":"system","content":err})).await;
+                                return IdleSocketInputAction::Continue;
+                            }
+                        })
+                    } else {
+                        None
+                    };
+                    for img in payload.images {
+                        let (image_url, trusted_object_key) = match resolve_input_image_url(
+                            &img.url,
+                            img.object_key.as_deref(),
+                            img.attachment_token.as_deref(),
+                            state.config.s3.as_ref(),
+                        ) {
+                            Ok(resolved) => resolved,
+                            Err(message) => {
+                                ws_send(tx, &json!({"type":"system","content":message})).await;
+                                return IdleSocketInputAction::Continue;
+                            }
+                        };
+                        let is_trusted_upload = trusted_object_key.is_some();
+
+                        let validation = if is_trusted_upload {
+                            Ok(())
+                        } else {
+                            crate::tools::net::validate_image_url(&image_url).await
+                        };
+
+                        match validation {
+                            Ok(()) => {
+                                if let Some(http) = safe_http.as_ref() {
+                                    // Only Ollama needs local base64 data; persist it to the
+                                    // session workspace so historical images survive restarts.
+                                    let fetch_result = if is_trusted_upload {
+                                        crate::providers::fetch_single_image_base64_trusted(
+                                            &image_url, http,
+                                        )
+                                        .await
+                                    } else {
+                                        crate::providers::fetch_single_image_base64(
+                                            &image_url, http,
+                                        )
+                                        .await
+                                    };
+                                    match fetch_result {
+                                        Ok(b64) => {
+                                            match crate::providers::persist_image_base64_cache(
+                                                &workspace, &image_url, &b64,
+                                            )
+                                            .await
+                                            {
+                                                Ok(cache_path) => validated.push(ImageAttachment {
+                                                    url: image_url,
+                                                    s3_object_key: trusted_object_key,
+                                                    cache_path: Some(cache_path),
+                                                    data: Some(b64),
+                                                }),
+                                                Err(err) => {
+                                                    ws_send(
+                                                        tx,
+                                                        &json!({"type":"system","content":err}),
+                                                    )
+                                                    .await;
+                                                    return IdleSocketInputAction::Continue;
+                                                }
+                                            }
+                                        }
+                                        Err(err) => {
+                                            ws_send(tx, &json!({"type":"system","content":err}))
+                                                .await;
+                                            return IdleSocketInputAction::Continue;
+                                        }
+                                    }
+                                } else {
+                                    validated.push(ImageAttachment {
+                                        url: image_url,
+                                        s3_object_key: trusted_object_key,
+                                        cache_path: None,
+                                        data: None,
+                                    });
+                                }
+                            }
+                            Err(err) => {
+                                ws_send(tx, &json!({"type":"system","content":err})).await;
+                                return IdleSocketInputAction::Continue;
+                            }
+                        }
+                    }
+                    let images = if validated.is_empty() {
+                        None
+                    } else {
+                        Some(validated)
+                    };
+                    (payload.text, images)
+                } else {
+                    // No images — treat the raw input as plain text so
+                    // accidental JSON like {"text":"hello"} is not consumed.
+                    (text, None)
+                }
+            }
+            Err(_) => (text, None),
+        }
+    } else {
+        (text, None)
+    };
+
     {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(current_session_id) {
             session.messages.push(ChatMessage {
                 role: "user".into(),
-                content: Some(text),
+                content: Some(msg_text),
+                images: msg_images,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: Some(now_epoch()),
@@ -170,6 +368,7 @@ pub(super) async fn persist_pending_interventions(
             session.messages.push(ChatMessage {
                 role: "user".into(),
                 content: Some(text),
+                images: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: Some(now_epoch()),
@@ -201,12 +400,25 @@ pub(super) async fn drain_busy_socket_messages(
             return true;
         }
         if !trimmed.is_empty() && !trimmed.starts_with('/') {
-            pending_interventions.push(trimmed.to_string());
-            let _ = live_send(
-                live_tx,
-                json!({"type":"progress","content":"📝 Intervention received — will apply at next reasoning cycle"}),
-            )
-            .await;
+            // Extract text from structured JSON payloads (images dropped during busy state).
+            let (intervention_text, had_images) = if trimmed.starts_with('{') {
+                match serde_json::from_str::<UserMessagePayload>(trimmed) {
+                    Ok(p) => {
+                        let had = !p.images.is_empty();
+                        (p.text, had)
+                    }
+                    Err(_) => (trimmed.to_string(), false),
+                }
+            } else {
+                (trimmed.to_string(), false)
+            };
+            pending_interventions.push(intervention_text);
+            let notice = if had_images {
+                "📝 Intervention received (text only — image attachments are not supported during active runs). Will apply at next reasoning cycle."
+            } else {
+                "📝 Intervention received — will apply at next reasoning cycle"
+            };
+            let _ = live_send(live_tx, json!({"type":"progress","content":notice})).await;
         }
     }
 

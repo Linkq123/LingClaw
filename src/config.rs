@@ -107,6 +107,8 @@ pub(crate) struct Config {
     pub(crate) sub_agent_model: Option<String>,
     /// Optional model for structured memory extraction.
     pub(crate) memory_model: Option<String>,
+    /// Optional model for post-execution reflection.
+    pub(crate) reflection_model: Option<String>,
     pub(crate) provider: Provider,
     pub(crate) openai_stream_include_usage: bool,
     pub(crate) anthropic_prompt_caching: bool,
@@ -116,10 +118,117 @@ pub(crate) struct Config {
     pub(crate) max_context_tokens: usize,
     pub(crate) exec_timeout: Duration,
     pub(crate) tool_timeout: Duration,
+    /// Total timeout for sub-agent execution (0 = unlimited, default: 300s).
+    pub(crate) sub_agent_timeout: Duration,
+    /// Maximum HTTP-level retries for transient LLM API errors (429, 5xx, connect/timeout).
+    pub(crate) max_llm_retries: usize,
     pub(crate) max_output_bytes: usize,
     pub(crate) max_file_bytes: usize,
     /// Enable structured async memory (auto-extracts facts from conversations).
     pub(crate) structured_memory: bool,
+    /// Enable post-execution daily reflection (writes to daily memory file).
+    pub(crate) daily_reflection: bool,
+    /// Optional S3-compatible storage for image uploads.
+    pub(crate) s3: Option<S3Config>,
+}
+
+#[derive(Clone)]
+pub(crate) struct S3Config {
+    pub(crate) endpoint: String,
+    pub(crate) region: String,
+    pub(crate) bucket: String,
+    pub(crate) access_key: String,
+    pub(crate) secret_key: String,
+    pub(crate) prefix: String,
+    pub(crate) url_expiry_secs: u64,
+    /// Bucket lifecycle retention in days for uploaded temp images (0 disables auto-management).
+    pub(crate) lifecycle_days: u32,
+}
+
+pub(crate) fn format_sub_agent_timeout(timeout: Duration) -> String {
+    if timeout.is_zero() {
+        "unlimited".to_string()
+    } else {
+        format!("{}s", timeout.as_secs())
+    }
+}
+
+fn trimmed_nonempty(value: Option<String>) -> Option<String> {
+    let value = value?.trim().to_string();
+    if value.is_empty() { None } else { Some(value) }
+}
+
+pub(crate) fn parse_boolish_env(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Some(true),
+            "0" | "false" | "no" | "off" => Some(false),
+            _ => None,
+        })
+}
+
+pub(crate) fn effective_enable_s3(
+    settings_enable_s3: Option<bool>,
+    env_enable_s3: Option<bool>,
+) -> Option<bool> {
+    env_enable_s3.or(settings_enable_s3)
+}
+
+pub(crate) fn normalized_s3_region(region: &str) -> String {
+    let region = region.trim().to_ascii_lowercase();
+    if region.is_empty() {
+        "us-east-1".to_string()
+    } else {
+        region
+    }
+}
+
+fn aws_s3_host_for_region(region: &str) -> String {
+    let region = normalized_s3_region(region);
+    let domain_suffix = if region.starts_with("cn-") {
+        "amazonaws.com.cn"
+    } else {
+        "amazonaws.com"
+    };
+    format!("s3.{region}.{domain_suffix}")
+}
+
+fn is_official_aws_s3_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    host == "s3.amazonaws.com"
+        || (host.starts_with("s3.")
+            && (host.ends_with(".amazonaws.com") || host.ends_with(".amazonaws.com.cn")))
+}
+
+pub(crate) fn default_s3_endpoint(region: &str) -> String {
+    format!("https://{}", aws_s3_host_for_region(region))
+}
+
+pub(crate) fn normalized_s3_endpoint(endpoint: Option<String>, region: &str) -> String {
+    let endpoint = trimmed_nonempty(endpoint).unwrap_or_else(|| default_s3_endpoint(region));
+    let trimmed = endpoint.trim_end_matches('/').to_string();
+
+    if let Ok(mut parsed) = reqwest::Url::parse(&trimmed)
+        && parsed.host_str().is_some_and(is_official_aws_s3_host)
+    {
+        let regional_host = aws_s3_host_for_region(region);
+        if parsed.set_host(Some(&regional_host)).is_ok() {
+            return parsed.to_string().trim_end_matches('/').to_string();
+        }
+    }
+
+    trimmed
+}
+
+pub(crate) fn normalized_s3_prefix(prefix: Option<String>) -> String {
+    let raw = prefix.unwrap_or_else(|| "lingclaw/images/".to_string());
+    let normalized = raw.trim().trim_matches('/');
+    if normalized.is_empty() {
+        "lingclaw/images/".to_string()
+    } else {
+        format!("{normalized}/")
+    }
 }
 
 impl Config {
@@ -132,6 +241,31 @@ impl Config {
             .unwrap_or_default();
         let mcp_servers: HashMap<String, JsonMcpServerConfig> =
             json_cfg.mcp_servers.unwrap_or_default();
+
+        // S3 config: gated by enableS3 setting (default: true when s3 section present).
+        // Env var LINGCLAW_ENABLE_S3 overrides the JSON setting.
+        let enable_s3 =
+            effective_enable_s3(settings.enable_s3, parse_boolish_env("LINGCLAW_ENABLE_S3"));
+        let s3 = if enable_s3 == Some(false) {
+            None
+        } else {
+            json_cfg.s3.and_then(|j| {
+                let region = normalized_s3_region(&trimmed_nonempty(j.region)?);
+                let bucket = trimmed_nonempty(j.bucket)?;
+                let access_key = trimmed_nonempty(j.access_key)?;
+                let secret_key = trimmed_nonempty(j.secret_key)?;
+                Some(S3Config {
+                    endpoint: normalized_s3_endpoint(j.endpoint, &region),
+                    region,
+                    bucket,
+                    access_key,
+                    secret_key,
+                    prefix: normalized_s3_prefix(j.prefix),
+                    url_expiry_secs: j.url_expiry_secs.unwrap_or(604_800),
+                    lifecycle_days: j.lifecycle_days.unwrap_or(14),
+                })
+            })
+        };
 
         // Default model: JSON agents.defaults.model.primary → env LINGCLAW_MODEL → "gpt-4o-mini"
         let model_config = json_cfg
@@ -151,6 +285,10 @@ impl Config {
             .as_ref()
             .and_then(|m| m.memory.clone())
             .or_else(|| std::env::var("LINGCLAW_MEMORY_MODEL").ok());
+        let reflection_model = model_config
+            .as_ref()
+            .and_then(|m| m.reflection.clone())
+            .or_else(|| std::env::var("LINGCLAW_REFLECTION_MODEL").ok());
 
         let model = default_from_json
             .or_else(|| std::env::var("LINGCLAW_MODEL").ok())
@@ -201,6 +339,7 @@ impl Config {
             fast_model,
             sub_agent_model,
             memory_model,
+            reflection_model,
             provider,
             openai_stream_include_usage: settings
                 .openai_stream_include_usage
@@ -253,6 +392,22 @@ impl Config {
                     .or_else(|| std::env::var("LINGCLAW_TOOL_TIMEOUT").ok()?.parse().ok())
                     .unwrap_or(30),
             ),
+            sub_agent_timeout: Duration::from_secs(
+                settings
+                    .sub_agent_timeout
+                    .or_else(|| {
+                        std::env::var("LINGCLAW_SUB_AGENT_TIMEOUT")
+                            .ok()?
+                            .parse()
+                            .ok()
+                    })
+                    .unwrap_or(300),
+            ),
+            max_llm_retries: settings
+                .max_llm_retries
+                .or_else(|| std::env::var("LINGCLAW_MAX_LLM_RETRIES").ok()?.parse().ok())
+                .unwrap_or(2)
+                .min(10),
             max_output_bytes: settings.max_output_bytes.unwrap_or(50 * 1024),
             max_file_bytes: settings.max_file_bytes.unwrap_or(200 * 1024),
             structured_memory: settings
@@ -267,11 +422,23 @@ impl Config {
                         })
                 })
                 .unwrap_or(false),
+            daily_reflection: settings
+                .daily_reflection
+                .or_else(|| parse_boolish_env("LINGCLAW_DAILY_REFLECTION"))
+                .unwrap_or(false),
+            s3,
         }
     }
 
     pub(crate) fn memory_model_or<'a>(&'a self, fallback: &'a str) -> &'a str {
         self.memory_model.as_deref().unwrap_or(fallback)
+    }
+
+    pub(crate) fn reflection_model_or<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.reflection_model
+            .as_deref()
+            .or(self.memory_model.as_deref())
+            .unwrap_or(fallback)
     }
 
     /// Resolve a model reference ("provider/model" or plain "model-name") to
@@ -552,6 +719,13 @@ impl Config {
         }
         self.max_context_tokens
     }
+
+    /// Check if a model supports image input based on its config `input` array.
+    pub(crate) fn model_supports_image(&self, model_ref: &str) -> bool {
+        self.find_model_entry(model_ref)
+            .and_then(|e| e.input.as_ref())
+            .is_some_and(|inputs| inputs.iter().any(|i| i == "image"))
+    }
 }
 
 // ── Config File (lingclaw.json) ──────────────────────────────────────────────
@@ -563,6 +737,7 @@ pub(crate) struct JsonConfig {
     pub(crate) agents: Option<JsonAgentsConfig>,
     #[serde(rename = "mcpServers")]
     pub(crate) mcp_servers: Option<HashMap<String, JsonMcpServerConfig>>,
+    pub(crate) s3: Option<JsonS3Config>,
 }
 
 #[derive(Deserialize, Default)]
@@ -581,6 +756,12 @@ pub(crate) struct JsonSettings {
     pub(crate) exec_timeout: Option<u64>,
     #[serde(rename = "toolTimeout")]
     pub(crate) tool_timeout: Option<u64>,
+    /// Total timeout for sub-agent execution in seconds (0 = unlimited, default: 300).
+    #[serde(rename = "subAgentTimeout")]
+    pub(crate) sub_agent_timeout: Option<u64>,
+    /// Maximum HTTP-level retries for transient LLM API errors (default: 2).
+    #[serde(rename = "maxLlmRetries")]
+    pub(crate) max_llm_retries: Option<usize>,
     #[serde(rename = "maxContextTokens")]
     pub(crate) max_context_tokens: Option<usize>,
     #[serde(rename = "maxOutputBytes")]
@@ -590,6 +771,12 @@ pub(crate) struct JsonSettings {
     /// Enable structured async memory (default: false).
     #[serde(rename = "structuredMemory")]
     pub(crate) structured_memory: Option<bool>,
+    /// Enable post-execution daily reflection (default: false).
+    #[serde(rename = "dailyReflection")]
+    pub(crate) daily_reflection: Option<bool>,
+    /// Enable S3-compatible image upload (default: true when s3 section is configured).
+    #[serde(rename = "enableS3")]
+    pub(crate) enable_s3: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -651,6 +838,24 @@ pub(crate) struct JsonModelEntry {
     pub(crate) compat: Option<serde_json::Value>,
 }
 
+#[derive(Deserialize, Clone)]
+pub(crate) struct JsonS3Config {
+    pub(crate) endpoint: Option<String>,
+    pub(crate) region: Option<String>,
+    pub(crate) bucket: Option<String>,
+    #[serde(rename = "accessKey")]
+    pub(crate) access_key: Option<String>,
+    #[serde(rename = "secretKey")]
+    pub(crate) secret_key: Option<String>,
+    pub(crate) prefix: Option<String>,
+    /// Presigned URL expiry in seconds (default: 604800 = 7 days for AWS compatibility).
+    #[serde(rename = "urlExpirySecs")]
+    pub(crate) url_expiry_secs: Option<u64>,
+    /// Temp image lifecycle retention in days (default: 14, 0 disables auto-management).
+    #[serde(rename = "lifecycleDays")]
+    pub(crate) lifecycle_days: Option<u32>,
+}
+
 #[derive(Deserialize, Default)]
 pub(crate) struct JsonAgentsConfig {
     pub(crate) defaults: Option<JsonAgentDefaults>,
@@ -671,6 +876,8 @@ pub(crate) struct JsonDefaultModel {
     pub(crate) sub_agent: Option<String>,
     /// Optional model for structured memory extraction.
     pub(crate) memory: Option<String>,
+    /// Optional model for post-execution reflection.
+    pub(crate) reflection: Option<String>,
 }
 
 pub(crate) fn config_dir_path() -> Option<PathBuf> {

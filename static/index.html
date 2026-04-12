@@ -63,7 +63,25 @@
     <span class="jump-to-latest-badge" id="jump-to-latest-badge" hidden></span>
   </button>
   <div id="input-area">
+    <div id="image-preview-bar" class="image-preview-bar" style="display:none"></div>
     <div class="input-composer">
+      <div class="attach-wrapper">
+        <button id="attach-btn" class="attach-btn" aria-label="Attach image" title="Attach image" style="display:none">📎</button>
+        <div id="attach-popup" class="attach-popup" style="display:none">
+          <div id="attach-menu" class="attach-menu">
+            <button class="attach-menu-item" id="attach-local-btn">📁 上传本地图片</button>
+            <button class="attach-menu-item" id="attach-url-btn">🔗 输入图片 URL</button>
+          </div>
+          <div id="attach-url-input" class="attach-url-input" style="display:none">
+            <input type="text" id="image-url-field" placeholder="https://example.com/image.jpg" autocomplete="off" />
+            <button id="image-url-add" class="attach-url-add-btn">添加</button>
+          </div>
+          <div id="attach-upload-status" class="attach-upload-status" style="display:none">
+            <span class="upload-spinner"></span> 上传中...
+          </div>
+        </div>
+      </div>
+      <input type="file" id="image-file-input" accept="image/jpeg,image/png" multiple hidden />
       <textarea id="input" placeholder="Message LingClaw... (/ for commands)" rows="1" aria-label="Message input"></textarea>
       <button id="stop" aria-label="Stop agent" title="Stop" style="display:none"><span id="stop-icon">■</span></button>
       <button id="send" aria-label="Send message"><span id="send-icon">↑</span></button>

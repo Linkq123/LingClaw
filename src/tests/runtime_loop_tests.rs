@@ -2,6 +2,8 @@ use super::*;
 
 use std::{collections::HashMap, sync::atomic::AtomicU64};
 
+use crate::config::S3Config;
+
 fn test_config() -> Config {
     Config {
         api_key: "env-key".to_string(),
@@ -10,6 +12,8 @@ fn test_config() -> Config {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -18,10 +22,15 @@ fn test_config() -> Config {
         max_context_tokens: 32000,
         exec_timeout: Duration::from_secs(30),
         tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
         max_output_bytes: 50 * 1024,
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
     }
 }
 
@@ -38,6 +47,7 @@ fn test_app_state() -> AppState {
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
         memory_queue: None,
     }
@@ -50,6 +60,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         messages: vec![ChatMessage {
             role: "system".into(),
             content: Some("system".into()),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -72,6 +83,19 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         disabled_system_skills: HashSet::new(),
         version: 0,
         workspace: PathBuf::new(),
+    }
+}
+
+fn test_s3_config() -> S3Config {
+    S3Config {
+        endpoint: "https://minio.example.test/storage".to_string(),
+        region: "us-east-1".to_string(),
+        bucket: "bucket".to_string(),
+        access_key: "access-key".to_string(),
+        secret_key: "secret-key".to_string(),
+        prefix: "images/".to_string(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
     }
 }
 
@@ -205,6 +229,7 @@ fn update_llm_response_usage_uses_request_estimate_when_provider_usage_missing()
             message: ChatMessage {
                 role: "assistant".into(),
                 content: Some("done".into()),
+                images: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -228,4 +253,157 @@ fn update_llm_response_usage_uses_request_estimate_when_provider_usage_missing()
 
     assert_eq!(persisted.input_tokens, 777);
     assert_eq!(persisted.input_token_source, "estimated");
+}
+
+#[test]
+fn resolve_input_image_url_prefers_verified_s3_object_url() {
+    let s3_cfg = test_s3_config();
+    let object_key = "images/2026/demo.png";
+    let token = crate::image_uploads::sign_attachment_object_key(&s3_cfg, object_key);
+
+    let (url, trusted_object_key) = socket_input::resolve_input_image_url(
+        "https://example.com/decoy.png",
+        Some(object_key),
+        Some(&token),
+        Some(&s3_cfg),
+    )
+    .expect("verified uploads should resolve to a trusted S3 URL");
+
+    assert_eq!(trusted_object_key.as_deref(), Some(object_key));
+    assert!(url.starts_with("https://minio.example.test/storage/bucket/images/2026/demo.png?"));
+    assert!(url.contains("X-Amz-Signature="));
+}
+
+#[test]
+fn resolve_input_image_url_rejects_incomplete_uploaded_metadata() {
+    let err = socket_input::resolve_input_image_url(
+        "https://example.com/photo.png",
+        Some("images/2026/demo.png"),
+        None,
+        Some(&test_s3_config()),
+    )
+    .expect_err("partial upload metadata should be rejected");
+
+    assert_eq!(
+        err,
+        "Incomplete uploaded image metadata. Please re-attach the image."
+    );
+}
+
+/// Serialize tests that mutate the process-global `LAST_REFLECTION_EPOCH`
+/// so parallel cargo-test threads cannot interfere with each other.
+static REFLECTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn try_claim_reflection_requires_minimum_cycles() {
+    let _guard = REFLECTION_TEST_LOCK.lock().unwrap();
+    // Reset cooldown so it doesn't interfere.
+    LAST_REFLECTION_EPOCH.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    assert!(try_claim_reflection(0, 5).is_none());
+    assert!(try_claim_reflection(1, 10).is_none());
+    assert!(try_claim_reflection(2, 20).is_none());
+
+    // cycles >= 3 should succeed and return the previous epoch.
+    let prev = try_claim_reflection(3, 1);
+    assert!(prev.is_some());
+    let (prev_epoch, claimed_epoch) = prev.unwrap();
+    rollback_reflection_claim(prev_epoch, claimed_epoch); // restore for next assertion
+
+    let prev = try_claim_reflection(10, 5);
+    assert!(prev.is_some());
+    let (prev_epoch, claimed_epoch) = prev.unwrap();
+    rollback_reflection_claim(prev_epoch, claimed_epoch);
+}
+
+#[test]
+fn try_claim_reflection_respects_cooldown() {
+    let _guard = REFLECTION_TEST_LOCK.lock().unwrap();
+    let now = epoch_secs_now();
+
+    // Last reflection was just now — should be blocked.
+    LAST_REFLECTION_EPOCH.store(now, std::sync::atomic::Ordering::Relaxed);
+    assert!(try_claim_reflection(5, 5).is_none());
+
+    // Last reflection was long ago — should be allowed.
+    LAST_REFLECTION_EPOCH.store(
+        now - REFLECTION_COOLDOWN_SECS - 1,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let prev = try_claim_reflection(5, 5);
+    assert!(prev.is_some());
+    let (prev_epoch, claimed_epoch) = prev.unwrap();
+    rollback_reflection_claim(prev_epoch, claimed_epoch);
+
+    // Exactly at the boundary — should be allowed.
+    LAST_REFLECTION_EPOCH.store(
+        now - REFLECTION_COOLDOWN_SECS,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let prev = try_claim_reflection(5, 5);
+    assert!(prev.is_some());
+    let (prev_epoch, claimed_epoch) = prev.unwrap();
+    rollback_reflection_claim(prev_epoch, claimed_epoch);
+}
+
+#[test]
+fn try_claim_reflection_prevents_concurrent_claims() {
+    let _guard = REFLECTION_TEST_LOCK.lock().unwrap();
+    // Ensure cooldown is clear.
+    LAST_REFLECTION_EPOCH.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    // First claim succeeds.
+    let first = try_claim_reflection(5, 5);
+    assert!(first.is_some());
+
+    // Second claim sees the just-written timestamp and fails (CAS mismatch).
+    assert!(try_claim_reflection(5, 5).is_none());
+
+    // Clean up.
+    let (prev_epoch, claimed_epoch) = first.unwrap();
+    rollback_reflection_claim(prev_epoch, claimed_epoch);
+}
+
+#[test]
+fn rollback_reflection_claim_is_noop_when_slot_already_reclaimed() {
+    let _guard = REFLECTION_TEST_LOCK.lock().unwrap();
+    // Clear cooldown.
+    LAST_REFLECTION_EPOCH.store(0, std::sync::atomic::Ordering::Relaxed);
+
+    // First run claims the slot.
+    let first = try_claim_reflection(5, 5);
+    assert!(first.is_some());
+    let (prev_epoch, claimed_epoch) = first.unwrap();
+
+    // Simulate another run claiming a newer slot while the first reflection
+    // is still in-flight (e.g. after toolTimeout > cooldown).
+    let newer_epoch = claimed_epoch + REFLECTION_COOLDOWN_SECS + 1;
+    LAST_REFLECTION_EPOCH.store(newer_epoch, std::sync::atomic::Ordering::Relaxed);
+
+    // The first run's rollback should be a no-op — CAS fails because the
+    // stored value (newer_epoch) != claimed_epoch.
+    rollback_reflection_claim(prev_epoch, claimed_epoch);
+    assert_eq!(
+        LAST_REFLECTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed),
+        newer_epoch,
+        "rollback must not overwrite a newer legitimate claim"
+    );
+}
+
+#[test]
+fn reflection_model_or_fallback_chain() {
+    // No reflection_model, no memory_model → use fallback.
+    let mut config = test_config();
+    assert_eq!(config.reflection_model_or("primary-model"), "primary-model");
+
+    // memory_model set → reflection inherits from memory.
+    config.memory_model = Some("memory-llm".to_string());
+    assert_eq!(config.reflection_model_or("primary-model"), "memory-llm");
+
+    // reflection_model set → overrides memory_model.
+    config.reflection_model = Some("reflection-llm".to_string());
+    assert_eq!(
+        config.reflection_model_or("primary-model"),
+        "reflection-llm"
+    );
 }

@@ -822,6 +822,7 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
         crate::ChatMessage {
             role: "system".into(),
             content: Some(system_prompt),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -829,6 +830,7 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
         crate::ChatMessage {
             role: "user".into(),
             content: Some(format!("Conversation to analyze:\n\n{excerpt}")),
+            images: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -836,9 +838,16 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
     ];
 
     let resolved = config.resolve_model(&req.model);
-    let response = providers::call_llm_simple(http, &resolved, &messages)
-        .await
-        .map_err(|e| format!("LLM call failed: {e}"))?;
+    let response = providers::call_llm_simple(
+        http,
+        &resolved,
+        &messages,
+        &req.workspace,
+        config.s3.as_ref(),
+        config.max_llm_retries,
+    )
+    .await
+    .map_err(|e| format!("LLM call failed: {e}"))?;
 
     let response = response.trim();
     if response.is_empty() {

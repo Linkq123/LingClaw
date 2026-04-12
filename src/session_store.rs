@@ -231,14 +231,39 @@ pub(crate) fn list_saved_session_ids_in_dir(dir: &Path) -> HashSet<String> {
     ids
 }
 
+#[allow(dead_code)]
 pub(crate) fn build_history_payload(session: &Session) -> serde_json::Value {
+    build_history_payload_with_s3(session, None)
+}
+
+pub(crate) fn build_history_payload_with_s3(
+    session: &Session,
+    s3_cfg: Option<&crate::config::S3Config>,
+) -> serde_json::Value {
     let mut msgs = Vec::new();
     for msg in &session.messages {
         match msg.role.as_str() {
             "system" => {}
             "user" => {
                 if let Some(c) = &msg.content {
-                    msgs.push(json!({"role":"user","content":c,"timestamp":msg.timestamp}));
+                    let mut entry = json!({"role":"user","content":c,"timestamp":msg.timestamp});
+                    if let Some(images) = &msg.images {
+                        entry["images"] = json!(
+                            images
+                                .iter()
+                                .map(|image| {
+                                    let url = crate::image_uploads::resolve_image_url(
+                                        &image.url,
+                                        image.s3_object_key.as_deref(),
+                                        s3_cfg,
+                                    )
+                                    .unwrap_or_else(|_| image.url.clone());
+                                    json!({"url": url})
+                                })
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    msgs.push(entry);
                 }
             }
             "assistant" => {
