@@ -28,6 +28,8 @@ fn test_config() -> Config {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -42,6 +44,8 @@ fn test_config() -> Config {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     }
 }
@@ -311,6 +315,8 @@ fn resolve_model_uses_config_for_plain_model_id() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -325,6 +331,8 @@ fn resolve_model_uses_config_for_plain_model_id() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
 
@@ -429,6 +437,41 @@ fn settings_tool_timeout_deserializes() {
 
     let settings = cfg.settings.expect("settings should deserialize");
     assert_eq!(settings.tool_timeout, Some(45));
+}
+
+#[test]
+fn settings_daily_reflection_deserializes() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "settings": {
+                "dailyReflection": true
+            }
+        }"#,
+    )
+    .expect("dailyReflection should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.daily_reflection, Some(true));
+}
+
+#[test]
+fn reflection_model_config_deserializes() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "agents": {
+                "defaults": {
+                    "model": {
+                        "primary": "gpt-4o",
+                        "reflection": "gpt-4o-mini"
+                    }
+                }
+            }
+        }"#,
+    )
+    .expect("reflection model should deserialize");
+
+    let model = cfg.agents.unwrap().defaults.unwrap().model.unwrap();
+    assert_eq!(model.reflection.as_deref(), Some("gpt-4o-mini"));
 }
 
 #[test]
@@ -735,6 +778,8 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::Ollama,
         anthropic_prompt_caching: false,
         providers,
@@ -749,6 +794,8 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
 
@@ -809,6 +856,8 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -823,6 +872,8 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
 
@@ -889,6 +940,8 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -903,6 +956,8 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
 
@@ -961,6 +1016,8 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -975,6 +1032,8 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
 
@@ -1015,6 +1074,8 @@ fn canonical_model_ref_expands_unique_plain_id() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1029,6 +1090,8 @@ fn canonical_model_ref_expands_unique_plain_id() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
 
@@ -1086,6 +1149,8 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1100,6 +1165,8 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
 
@@ -1159,6 +1226,8 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1173,6 +1242,8 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
 
@@ -1212,6 +1283,8 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1226,6 +1299,8 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
 
@@ -1265,6 +1340,8 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1279,6 +1356,8 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
 
@@ -1298,6 +1377,8 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -1312,6 +1393,8 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
 
@@ -1331,6 +1414,8 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -1345,6 +1430,8 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
 
@@ -1364,6 +1451,8 @@ fn resolve_model_accepts_ollama_prefix_without_provider_config() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::Ollama,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -1378,6 +1467,8 @@ fn resolve_model_accepts_ollama_prefix_without_provider_config() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
 
@@ -1417,6 +1508,8 @@ fn build_session_status_reports_resolved_target() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1431,6 +1524,8 @@ fn build_session_status_reports_resolved_target() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
     let mut session = test_session("abc", "Test", Some("anthropic/claude-sonnet-4-20250514"));
@@ -3872,6 +3967,8 @@ fn context_input_budget_reserves_headroom() {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -3886,6 +3983,8 @@ fn context_input_budget_reserves_headroom() {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     };
 

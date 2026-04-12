@@ -8,6 +8,8 @@
     "maxContextTokens": 32000,
     "maxOutputBytes": 51200,
     "maxFileBytes": 204800,
+    "structuredMemory": false,
+    "dailyReflection": false,
     "enableS3": true
   },
   "models": {
@@ -77,7 +79,8 @@
       "model": {
         "primary": "openai/gpt-4o-mini",
         "sub-agent": "openai/gpt-4o-mini",
-        "memory": "openai/gpt-4o-mini"
+        "memory": "openai/gpt-4o-mini",
+        "reflection": "openai/gpt-4o-mini"
       }
     }
   },

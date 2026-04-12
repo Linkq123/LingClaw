@@ -107,6 +107,8 @@ pub(crate) struct Config {
     pub(crate) sub_agent_model: Option<String>,
     /// Optional model for structured memory extraction.
     pub(crate) memory_model: Option<String>,
+    /// Optional model for post-execution reflection.
+    pub(crate) reflection_model: Option<String>,
     pub(crate) provider: Provider,
     pub(crate) openai_stream_include_usage: bool,
     pub(crate) anthropic_prompt_caching: bool,
@@ -124,6 +126,8 @@ pub(crate) struct Config {
     pub(crate) max_file_bytes: usize,
     /// Enable structured async memory (auto-extracts facts from conversations).
     pub(crate) structured_memory: bool,
+    /// Enable post-execution daily reflection (writes to daily memory file).
+    pub(crate) daily_reflection: bool,
     /// Optional S3-compatible storage for image uploads.
     pub(crate) s3: Option<S3Config>,
 }
@@ -281,6 +285,10 @@ impl Config {
             .as_ref()
             .and_then(|m| m.memory.clone())
             .or_else(|| std::env::var("LINGCLAW_MEMORY_MODEL").ok());
+        let reflection_model = model_config
+            .as_ref()
+            .and_then(|m| m.reflection.clone())
+            .or_else(|| std::env::var("LINGCLAW_REFLECTION_MODEL").ok());
 
         let model = default_from_json
             .or_else(|| std::env::var("LINGCLAW_MODEL").ok())
@@ -331,6 +339,7 @@ impl Config {
             fast_model,
             sub_agent_model,
             memory_model,
+            reflection_model,
             provider,
             openai_stream_include_usage: settings
                 .openai_stream_include_usage
@@ -413,12 +422,23 @@ impl Config {
                         })
                 })
                 .unwrap_or(false),
+            daily_reflection: settings
+                .daily_reflection
+                .or_else(|| parse_boolish_env("LINGCLAW_DAILY_REFLECTION"))
+                .unwrap_or(false),
             s3,
         }
     }
 
     pub(crate) fn memory_model_or<'a>(&'a self, fallback: &'a str) -> &'a str {
         self.memory_model.as_deref().unwrap_or(fallback)
+    }
+
+    pub(crate) fn reflection_model_or<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.reflection_model
+            .as_deref()
+            .or(self.memory_model.as_deref())
+            .unwrap_or(fallback)
     }
 
     /// Resolve a model reference ("provider/model" or plain "model-name") to
@@ -751,6 +771,9 @@ pub(crate) struct JsonSettings {
     /// Enable structured async memory (default: false).
     #[serde(rename = "structuredMemory")]
     pub(crate) structured_memory: Option<bool>,
+    /// Enable post-execution daily reflection (default: false).
+    #[serde(rename = "dailyReflection")]
+    pub(crate) daily_reflection: Option<bool>,
     /// Enable S3-compatible image upload (default: true when s3 section is configured).
     #[serde(rename = "enableS3")]
     pub(crate) enable_s3: Option<bool>,
@@ -853,6 +876,8 @@ pub(crate) struct JsonDefaultModel {
     pub(crate) sub_agent: Option<String>,
     /// Optional model for structured memory extraction.
     pub(crate) memory: Option<String>,
+    /// Optional model for post-execution reflection.
+    pub(crate) reflection: Option<String>,
 }
 
 pub(crate) fn config_dir_path() -> Option<PathBuf> {

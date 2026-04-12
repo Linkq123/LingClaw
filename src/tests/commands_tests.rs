@@ -108,6 +108,8 @@ async fn status_command_reports_runtime_request_estimate() {
             fast_model: None,
             sub_agent_model: None,
             memory_model: None,
+
+            reflection_model: None,
             provider: crate::Provider::OpenAI,
             anthropic_prompt_caching: false,
             providers,
@@ -122,6 +124,8 @@ async fn status_command_reports_runtime_request_estimate() {
             max_file_bytes: 200 * 1024,
             openai_stream_include_usage: false,
             structured_memory: false,
+
+            daily_reflection: false,
             s3: None,
         },
         http: reqwest::Client::new(),
@@ -233,6 +237,8 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
             fast_model: None,
             sub_agent_model: None,
             memory_model: None,
+
+            reflection_model: None,
             provider: crate::Provider::OpenAI,
             anthropic_prompt_caching: false,
             providers,
@@ -247,6 +253,8 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
             max_file_bytes: 200 * 1024,
             openai_stream_include_usage: false,
             structured_memory: false,
+
+            daily_reflection: false,
             s3: None,
         },
         http: reqwest::Client::new(),
@@ -334,6 +342,8 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
             fast_model: None,
             sub_agent_model: None,
             memory_model: None,
+
+            reflection_model: None,
             provider: crate::Provider::OpenAI,
             anthropic_prompt_caching: false,
             providers: HashMap::new(),
@@ -348,6 +358,8 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
             max_file_bytes: 200 * 1024,
             openai_stream_include_usage: false,
             structured_memory: false,
+
+            daily_reflection: false,
             s3: None,
         },
         http: reqwest::Client::new(),
@@ -442,6 +454,8 @@ async fn switch_command_is_blocked_in_single_session_mode() {
             fast_model: None,
             sub_agent_model: None,
             memory_model: None,
+
+            reflection_model: None,
             provider: crate::Provider::OpenAI,
             anthropic_prompt_caching: false,
             providers: HashMap::new(),
@@ -456,6 +470,8 @@ async fn switch_command_is_blocked_in_single_session_mode() {
             max_file_bytes: 200 * 1024,
             openai_stream_include_usage: false,
             structured_memory: false,
+
+            daily_reflection: false,
             s3: None,
         },
         http: reqwest::Client::new(),
@@ -509,6 +525,8 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
             fast_model: None,
             sub_agent_model: None,
             memory_model: None,
+
+            reflection_model: None,
             provider: crate::Provider::OpenAI,
             anthropic_prompt_caching: false,
             providers: HashMap::new(),
@@ -523,6 +541,8 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
             max_file_bytes: 200 * 1024,
             openai_stream_include_usage: false,
             structured_memory: true,
+
+            daily_reflection: false,
             s3: None,
         },
         http: reqwest::Client::new(),
@@ -612,6 +632,8 @@ async fn memory_command_rejects_unknown_subcommand() {
             fast_model: None,
             sub_agent_model: None,
             memory_model: None,
+
+            reflection_model: None,
             provider: crate::Provider::OpenAI,
             anthropic_prompt_caching: false,
             providers: HashMap::new(),
@@ -626,6 +648,8 @@ async fn memory_command_rejects_unknown_subcommand() {
             max_file_bytes: 200 * 1024,
             openai_stream_include_usage: false,
             structured_memory: true,
+
+            daily_reflection: false,
             s3: None,
         },
         http: reqwest::Client::new(),

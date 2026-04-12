@@ -18,6 +18,8 @@ fn test_config() -> Config {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: crate::config::Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -32,6 +34,8 @@ fn test_config() -> Config {
         max_file_bytes: 200 * 1024,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         s3: None,
     }
 }

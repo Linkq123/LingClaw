@@ -26,9 +26,13 @@ fn test_config_with_broken_mcp() -> Config {
         fast_model: None,
         sub_agent_model: None,
         memory_model: None,
+
+        reflection_model: None,
         provider: Provider::OpenAI,
         openai_stream_include_usage: false,
         structured_memory: false,
+
+        daily_reflection: false,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
         mcp_servers,

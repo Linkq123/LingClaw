@@ -1,6 +1,7 @@
 use super::*;
 
 use serde_json::json;
+use std::sync::atomic::AtomicI64;
 use tokio::time::MissedTickBehavior;
 
 mod socket_input;
@@ -9,6 +10,62 @@ pub(crate) use socket_input::{
     IdleSocketInputAction, handle_idle_socket_input, resolve_or_create_socket_session,
 };
 use socket_input::{drain_busy_socket_messages, persist_pending_interventions};
+
+/// Minimum reasoning cycles before a reflection is worthwhile.
+const REFLECTION_MIN_CYCLES: usize = 3;
+
+/// Minimum cooldown between consecutive reflections (seconds).
+const REFLECTION_COOLDOWN_SECS: i64 = 600; // 10 minutes
+
+/// Epoch-seconds timestamp of the last reflection run (0 = never).
+static LAST_REFLECTION_EPOCH: AtomicI64 = AtomicI64::new(0);
+
+fn epoch_secs_now() -> i64 {
+    chrono::Local::now().timestamp()
+}
+
+/// Decide whether the current run warrants a post-execution reflection
+/// **and** atomically claim the cooldown slot if so.
+///
+/// Returns `Some((previous_epoch, claimed_epoch))` when the caller wins the
+/// slot.  Pass both values to `rollback_reflection_claim()` on failure/no-op.
+/// Returns `None` when the cooldown hasn't elapsed or cycles are too few.
+fn try_claim_reflection(cycles: usize, _tool_calls: usize) -> Option<(i64, i64)> {
+    if cycles < REFLECTION_MIN_CYCLES {
+        return None;
+    }
+    let now = epoch_secs_now();
+    let last = LAST_REFLECTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    if now - last < REFLECTION_COOLDOWN_SECS {
+        return None;
+    }
+    // Atomically swap in `now`; if another thread already swapped, the CAS
+    // fails and we back off — only one reflection per cooldown window.
+    LAST_REFLECTION_EPOCH
+        .compare_exchange(
+            last,
+            now,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        )
+        .ok()
+        .map(|prev| (prev, now))
+}
+
+/// Roll back a previously claimed cooldown slot so the next non-trivial run
+/// can trigger a reflection (used when the reflection was a no-op or failed).
+///
+/// Uses CAS to restore the previous epoch only if no other run has claimed a
+/// newer slot in the meantime — safe even when reflection timeout exceeds the
+/// cooldown duration.
+fn rollback_reflection_claim(previous: i64, claimed: i64) {
+    let _ = LAST_REFLECTION_EPOCH.compare_exchange(
+        claimed,
+        previous,
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
 
 pub(crate) struct AgentRunOutcome {
     pub(crate) rerun_agent: bool,
@@ -102,6 +159,8 @@ const AGENT_HARD_CAP_ROUNDS: usize = 200;
 /// Post-execution reflection: analyze what went well/poorly in a multi-step task.
 /// Writes a brief reflection to the session's daily memory file.
 /// Runs as a non-blocking background task — failures are non-critical.
+/// Returns `Ok(true)` when a reflection was actually written to disk,
+/// `Ok(false)` when the conversation was too trivial for a meaningful reflection.
 async fn run_post_execution_reflection(
     config: &Config,
     http: &reqwest::Client,
@@ -110,11 +169,11 @@ async fn run_post_execution_reflection(
     messages: &[ChatMessage],
     cycles: usize,
     tool_calls: usize,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     // Build a compact excerpt of the conversation for reflection.
     let excerpt = crate::memory::build_conversation_excerpt(messages);
     if excerpt.trim().is_empty() {
-        return Ok(());
+        return Ok(false);
     }
     // Cap excerpt to avoid excessive token use for reflection.
     let excerpt = crate::truncate(&excerpt, 8_000);
@@ -163,7 +222,7 @@ async fn run_post_execution_reflection(
 
     let reflection = reflection.trim();
     if reflection.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     // Write reflection to daily memory file.
@@ -177,15 +236,26 @@ async fn run_post_execution_reflection(
     let entry = format!(
         "\n\n---\n\n## {time} Local — Reflection ({cycles} cycles, {tool_calls} tools)\n\n{reflection}"
     );
+    let initial_content = format!("# {today}\n{entry}");
 
+    use tokio::io::AsyncWriteExt;
     match tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
+        .create_new(true)
+        .write(true)
         .open(&memory_path)
         .await
     {
         Ok(mut file) => {
-            use tokio::io::AsyncWriteExt;
+            file.write_all(initial_content.as_bytes())
+                .await
+                .map_err(|e| format!("Write reflection: {e}"))?;
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut file = tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(&memory_path)
+                .await
+                .map_err(|e| format!("Open memory file: {e}"))?;
             file.write_all(entry.as_bytes())
                 .await
                 .map_err(|e| format!("Write reflection: {e}"))?;
@@ -193,7 +263,7 @@ async fn run_post_execution_reflection(
         Err(e) => return Err(format!("Open memory file: {e}")),
     }
 
-    Ok(())
+    Ok(true)
 }
 
 async fn send_react_phase_event(live_tx: &LiveTx, react_ctx: &agent::AgentLoopCtx, phase: &str) {
@@ -1512,20 +1582,30 @@ async fn run_finish_phase(
         queue.enqueue(session.workspace.clone(), model, excerpt);
     }
 
-    // Post-execution reflection for multi-step tasks.
+    // Post-execution reflection for non-trivial multi-step tasks.
+    // Gated by config.daily_reflection + minimum complexity + cooldown.
     // Spawned as a background task to avoid delaying the "done" event.
-    if phase_state.react_ctx.cycles > 0
-        && phase_state.react_ctx.tool_calls > 0
+    // NOTE: snapshot check must precede try_claim_reflection() because the
+    // CAS has a side-effect; if it fires but the session is gone, nobody
+    // would roll back the cooldown slot.
+    if ctx.state.config.daily_reflection
         && let Some(ref session) = snapshot
+        && let Some((previous_epoch, claimed_epoch)) = try_claim_reflection(
+            phase_state.react_ctx.cycles,
+            phase_state.react_ctx.tool_calls,
+        )
     {
         let config = ctx.state.config.clone();
         let http = ctx.state.http.clone();
         let workspace = session.workspace.clone();
-        let model = session.effective_model(&config.model).to_string();
+        let fallback_model = session.effective_model(&config.model).to_string();
+        let model = config.reflection_model_or(&fallback_model).to_string();
         let messages = crate::memory::prefilter_for_memory(&session.messages);
         let cycles = phase_state.react_ctx.cycles;
         let tool_calls = phase_state.react_ctx.tool_calls;
-        let reflection_timeout = config.tool_timeout;
+        // Match structured memory: floor at 30s so a low toolTimeout doesn't
+        // cause reflections to time out systematically.
+        let reflection_timeout = config.tool_timeout.max(std::time::Duration::from_secs(30));
         tokio::spawn(async move {
             match tokio::time::timeout(
                 reflection_timeout,
@@ -1537,11 +1617,21 @@ async fn run_finish_phase(
             {
                 Ok(Err(e)) => {
                     eprintln!("Reflection failed (non-critical): {e}");
+                    // Roll back so the next non-trivial run can try again.
+                    rollback_reflection_claim(previous_epoch, claimed_epoch);
                 }
                 Err(_elapsed) => {
                     eprintln!("Reflection timed out (non-critical)");
+                    rollback_reflection_claim(previous_epoch, claimed_epoch);
                 }
-                Ok(Ok(())) => {}
+                Ok(Ok(true)) => {
+                    // CAS already claimed the slot — nothing more to do.
+                }
+                Ok(Ok(false)) => {
+                    // Conversation was too trivial — no reflection written.
+                    // Roll back so the next non-trivial run can reflect.
+                    rollback_reflection_claim(previous_epoch, claimed_epoch);
+                }
             }
         });
     }
