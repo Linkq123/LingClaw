@@ -331,15 +331,25 @@ pub(crate) fn prune_messages(messages: &mut Vec<ChatMessage>, max_tokens: usize)
     // Keep: system message (index 0) + as many recent messages as fit.
     // Remove oldest non-system messages in complete turns so we never
     // leave orphaned tool_calls or tool results.
-    let mut estimated = estimate_tokens(messages);
-    while estimated > max_tokens && messages.len() > 2 {
-        let count = turn_len(messages, 1);
-        let removed = messages[1..1 + count]
-            .iter()
-            .map(message_token_len)
-            .sum::<usize>();
-        messages.drain(1..1 + count);
+    //
+    // Pre-compute per-message costs in a single pass, then walk turns
+    // using cached values. ONE final drain avoids repeated O(n) shifts.
+    let costs: Vec<usize> = messages.iter().map(message_token_len).collect();
+    let mut estimated: usize = costs.iter().sum();
+    let mut total_remove = 0;
+    let mut pos = 1;
+    while estimated > max_tokens
+        && messages.len() - total_remove > 2
+        && pos < messages.len()
+    {
+        let count = turn_len(messages, pos);
+        let removed: usize = costs[pos..pos + count].iter().sum();
+        total_remove += count;
+        pos += count;
         estimated = estimated.saturating_sub(removed);
+    }
+    if total_remove > 0 {
+        messages.drain(1..1 + total_remove);
     }
 }
 
@@ -348,14 +358,24 @@ pub(crate) fn prune_messages_for_provider(
     provider: Provider,
     max_tokens: usize,
 ) {
-    let mut estimated = estimate_tokens_for_provider(provider, messages);
-    while estimated > max_tokens && messages.len() > 2 {
-        let count = turn_len(messages, 1);
-        let removed = messages[1..1 + count]
-            .iter()
-            .map(|message| message_token_len_for_provider(provider, message))
-            .sum::<usize>();
-        messages.drain(1..1 + count);
+    let costs: Vec<usize> = messages
+        .iter()
+        .map(|m| message_token_len_for_provider(provider, m))
+        .collect();
+    let mut estimated: usize = costs.iter().sum();
+    let mut total_remove = 0;
+    let mut pos = 1;
+    while estimated > max_tokens
+        && messages.len() - total_remove > 2
+        && pos < messages.len()
+    {
+        let count = turn_len(messages, pos);
+        let removed: usize = costs[pos..pos + count].iter().sum();
+        total_remove += count;
+        pos += count;
         estimated = estimated.saturating_sub(removed);
+    }
+    if total_remove > 0 {
+        messages.drain(1..1 + total_remove);
     }
 }

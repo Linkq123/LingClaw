@@ -870,6 +870,7 @@ async fn toggle_system_skill(
     .await
     {
         Ok(()) => {
+            crate::prompts::invalidate_skills_cache();
             let verb = if disable { "Disabled" } else { "Enabled" };
             let names: Vec<_> = matched.iter().map(|s| s.name.as_str()).collect();
             command_result(

@@ -26,7 +26,7 @@ pub(crate) async fn save_session_to_disk(session: &Session) -> Result<(), String
     let tmp_path = sessions_dir().join(format!("{}.json.tmp", session.id));
     let mut session = session.clone();
     sanitize_session_messages(&mut session.messages);
-    let data = serde_json::to_string_pretty(&session).map_err(|e| e.to_string())?;
+    let data = serde_json::to_string(&session).map_err(|e| e.to_string())?;
     tokio::fs::write(&tmp_path, data)
         .await
         .map_err(|e| e.to_string())?;

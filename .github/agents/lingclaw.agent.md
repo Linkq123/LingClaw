@@ -74,7 +74,7 @@ Key files:
 - `src/runtime_loop.rs` — phase-execution loop, fast-model routing, parallel read-only tool execution with sequential hook eval (`HookEvalResult`), hook integration (BeforeToolExec/AfterToolExec in `execute_tool_call()`/`record_tool_result()`, BeforeLlmCall with re-prune in `run_analyze_phase()`, `fire_stop_command_hook()` for non-blocking /stop hooks), sub-agent task tool dispatch (`execute_task_tool()` → `run_subagent()`), post-execution reflection, planning/finish nudge injection, tool progress dispatch
 - `src/subagents/mod.rs` — sub-agent registry types (`SubAgentSpec`, `ToolPermissions`, `AgentSource`), catalog rendering (`render_agents_catalog()`), tool filtering (`filter_tools_for_agent()`)
 - `src/subagents/executor.rs` — isolated mini-ReAct loop executor with hook-integrated tool execution, context pruning via `message_budget_for_tool_defs()`, per-cycle LLM streaming with tagged event forwarding, `SubAgentOutcome`
-- `src/subagents/discovery.rs` — three-layer agent discovery (system/global/session), YAML frontmatter parsing (`parse_agent_frontmatter()`), `discover_all_agents()`, `find_agent()`
+- `src/subagents/discovery.rs` — three-layer agent discovery (system/global/session) with dir mtime + TTL cache, YAML frontmatter parsing (`parse_agent_frontmatter()`), `discover_all_agents()`, `find_agent()`, `invalidate_agents_cache()`
 - `src/config.rs` — `Config` (incl. `fast_model: Option<String>`), `JsonConfig`, `JsonSettings`, `JsonMcpServerConfig`, model resolution, timeout/env loading
 - `src/context.rs` — token estimation, context input budget, turn-based pruning, usage formatting
 - `src/commands.rs` — slash commands, per-session view toggles, command persistence helpers

@@ -11,11 +11,32 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Instant, SystemTime};
 
 use super::{AgentSource, McpPolicy, SubAgentSpec, ToolPermissions};
+use crate::prompts::{DISCOVERY_CACHE_TTL_SECS, collect_dir_tree_mtimes};
 
 const AGENTS_DIR: &str = "agents";
 const AGENT_FILE: &str = "AGENT.md";
+
+struct AgentsCacheEntry {
+    workspace: PathBuf,
+    dir_mtimes: Vec<Option<SystemTime>>,
+    cached_at: Instant,
+    items: Vec<SubAgentSpec>,
+}
+
+type AgentsCache = OnceLock<Mutex<Option<AgentsCacheEntry>>>;
+static AGENTS_CACHE: AgentsCache = OnceLock::new();
+
+/// Force-invalidate the agents discovery cache.
+#[allow(dead_code)]
+pub(crate) fn invalidate_agents_cache() {
+    if let Some(cache) = AGENTS_CACHE.get() {
+        *cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
 
 /// Locate the system-bundled agents directory on disk.
 fn system_agents_dir() -> Option<PathBuf> {
@@ -83,7 +104,54 @@ fn discover_agents_in_dir(dir: &Path, source: AgentSource, path_prefix: &str) ->
 
 /// Discover sub-agents from all three layers and merge.
 /// Later sources shadow earlier ones on name collision (session > global > system).
+/// Results are cached and invalidated when source directory mtimes change
+/// (immediate for structural changes) or after [`DISCOVERY_CACHE_TTL_SECS`]
+/// (safety net for in-place content edits).
 pub(crate) fn discover_all_agents(workspace: &Path) -> Vec<SubAgentSpec> {
+    let dir_mtimes = collect_agents_dir_mtimes(workspace);
+    let cache = AGENTS_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref c) = *guard
+            && c.workspace == workspace
+            && c.dir_mtimes == dir_mtimes
+            && c.cached_at.elapsed().as_secs() < DISCOVERY_CACHE_TTL_SECS
+        {
+            return c.items.clone();
+        }
+    }
+    let result = discover_all_agents_uncached(workspace);
+    {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(AgentsCacheEntry {
+            workspace: workspace.to_path_buf(),
+            dir_mtimes,
+            cached_at: Instant::now(),
+            items: result.clone(),
+        });
+    }
+    result
+}
+
+/// Collect mtimes of the three agents source directories (including immediate
+/// subdirectories) for cache invalidation — mirrors the skills pattern.
+fn collect_agents_dir_mtimes(workspace: &Path) -> Vec<Option<SystemTime>> {
+    let mut mtimes = Vec::new();
+    if let Some(p) = system_agents_dir() {
+        mtimes.extend(collect_dir_tree_mtimes(&p));
+    } else {
+        mtimes.push(None);
+    }
+    if let Some(p) = global_agents_dir() {
+        mtimes.extend(collect_dir_tree_mtimes(&p));
+    } else {
+        mtimes.push(None);
+    }
+    mtimes.extend(collect_dir_tree_mtimes(&workspace.join(AGENTS_DIR)));
+    mtimes
+}
+
+fn discover_all_agents_uncached(workspace: &Path) -> Vec<SubAgentSpec> {
     let mut all = Vec::new();
 
     // Layer 1: system (bundled)

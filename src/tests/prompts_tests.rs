@@ -660,3 +660,120 @@ fn load_session_prompt_files_truncates_large_daily_memory() {
 
     let _ = fs::remove_dir_all(&workspace);
 }
+
+// ── Cache invalidation regression tests ──────────────────────────────────────
+
+#[test]
+fn collect_dir_tree_mtimes_tracks_subdirectories() {
+    let dir = std::env::temp_dir().join("lingclaw-dir-tree-mtime-test");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("alpha")).expect("alpha subdir");
+    fs::create_dir_all(dir.join("beta")).expect("beta subdir");
+    // Non-directory entries should be ignored
+    fs::write(dir.join("README.md"), "ignore me").unwrap();
+
+    let mtimes = collect_dir_tree_mtimes(&dir);
+    // Root + 2 subdirectories = 3 entries
+    assert_eq!(mtimes.len(), 3, "root + 2 subdirs");
+    assert!(
+        mtimes.iter().all(|m| m.is_some()),
+        "all existing dirs should have mtimes"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn collect_dir_tree_mtimes_nonexistent_returns_single_none() {
+    let dir = std::env::temp_dir().join("lingclaw-dir-tree-mtime-nonexist");
+    let _ = fs::remove_dir_all(&dir);
+
+    let mtimes = collect_dir_tree_mtimes(&dir);
+    assert_eq!(mtimes, vec![None]);
+}
+
+#[test]
+fn collect_dir_tree_mtimes_detects_new_subdirectory() {
+    let dir = std::env::temp_dir().join("lingclaw-dir-tree-mtime-detect-new");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("root dir");
+
+    let before = collect_dir_tree_mtimes(&dir);
+
+    // Add a new subdirectory — vector length changes
+    fs::create_dir_all(dir.join("new-skill")).expect("new skill subdir");
+    let after = collect_dir_tree_mtimes(&dir);
+
+    assert_ne!(
+        before, after,
+        "adding a subdirectory should change the mtime vector"
+    );
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn invalidate_skills_cache_forces_rediscovery() {
+    let workspace = std::env::temp_dir().join("lingclaw-skills-cache-inval-test");
+    let _ = fs::remove_dir_all(&workspace);
+    let skills_dir = workspace.join("skills");
+
+    // Setup: one skill
+    let skill_a = skills_dir.join("alpha");
+    fs::create_dir_all(&skill_a).expect("skill dir");
+    fs::write(
+        skill_a.join("SKILL.md"),
+        "---\nname: alpha\ndescription: First\n---\n",
+    )
+    .unwrap();
+
+    // Prime the cache
+    invalidate_skills_cache(); // clear any stale global state from other tests
+    let first = discover_all_skills(&workspace);
+    let alpha_count = first.iter().filter(|s| s.name == "alpha").count();
+    assert!(alpha_count >= 1, "alpha should be discovered");
+
+    // Modify the skill content (mtime of SKILL.md changes, but dir mtime
+    // doesn't change on content-only edits on some OSes). Force-invalidate.
+    fs::write(
+        skill_a.join("SKILL.md"),
+        "---\nname: alpha\ndescription: Updated\n---\n",
+    )
+    .unwrap();
+    invalidate_skills_cache();
+
+    let second = discover_all_skills(&workspace);
+    let updated = second.iter().find(|s| s.name == "alpha").unwrap();
+    assert_eq!(
+        updated.description, "Updated",
+        "post-invalidation should pick up new content"
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn prompt_cache_invalidates_on_file_change() {
+    let workspace = std::env::temp_dir().join("lingclaw-prompt-cache-inval-test");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(workspace.join("memory")).unwrap();
+    fs::write(workspace.join("AGENTS.md"), "agent").unwrap();
+    fs::write(workspace.join("IDENTITY.md"), "identity-v1").unwrap();
+    fs::write(workspace.join("USER.md"), "user").unwrap();
+
+    let snapshot = LocalTimeSnapshot::from_datetime(
+        DateTime::parse_from_rfc3339("2026-03-16T12:00:00+08:00").unwrap(),
+    );
+    let first = load_session_prompt_files_with_snapshot(&workspace, snapshot);
+    assert!(first.contains("identity-v1"));
+
+    // Modify IDENTITY.md — mtime changes → cache miss
+    fs::write(workspace.join("IDENTITY.md"), "identity-v2").unwrap();
+    let second = load_session_prompt_files_with_snapshot(&workspace, snapshot);
+    assert!(
+        second.contains("identity-v2"),
+        "changed file should invalidate prompt cache"
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
