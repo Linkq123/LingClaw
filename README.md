@@ -408,7 +408,7 @@ tools:
 ```text
 ┌──────────────────────────────────────────────────────────────────┐
 │                         Browser (static/)                        │
-│   index.html  ·  app.js  ·  style.css                           │
+│   index.html  ·  js/ (ES modules)  ·  css/ (modular CSS)         │
 └────────────────────────┬─────────────────────────────────────────┘
                          │ WebSocket /ws
 ┌────────────────────────▼─────────────────────────────────────────┐
@@ -566,8 +566,20 @@ src/
 
 static/
 ├── index.html                  — 主页面
-├── app.js                      — 前端逻辑（流式渲染、懒加载历史、智能滚动、版本 badge、输入历史导航）
-└── style.css                   — 样式
+├── css/                        — 模块化样式 (base, layout, chat, panels, responsive)
+└── js/                         — 前端 ES Modules
+    ├── main.js                 — 入口模块（流式渲染、懒加载历史、智能滚动、版本 badge）
+    ├── constants.js            — 常量
+    ├── state.js                — 集中状态 + DOM refs
+    ├── utils.js                — 纯工具函数
+    ├── scroll.js               — 滚动/视口管理
+    ├── markdown.js             — Markdown/KaTeX 管线
+    ├── socket.js               — WebSocket 连接
+    ├── images.js               — 图片附件 + 上传
+    ├── input.js                — 输入处理 + 历史导航
+    ├── mobile.js               — 移动端菜单
+    ├── handlers/stream.js      — 流式响应处理
+    └── renderers/              — UI 渲染模块 (chat, tools, react-status, timeline)
 
 docs/reference/templates/       — 7 个提示模板文件 (BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/TOOLS/MEMORY.md)
 docs/reference/skills/          — 17 个系统内置 Skills (安装时部署到 ~/.lingclaw/system-skills/)
