@@ -1,6 +1,6 @@
 ﻿import { dom, state, initDomRefs } from './state.js';
 import { HISTORY_RENDER_LIMIT } from './constants.js';
-import { escHtml, formatToolDuration, hideWelcome } from './utils.js';
+import { escHtml, formatToolDuration, formatTokenCount, hideWelcome } from './utils.js';
 import {
   syncToolDrawerBounds, clearBufferedChatUpdates, setAutoFollowChat,
   scrollDown, syncChatScrollState, jumpToLatest, updateJumpToLatestVisibility
@@ -29,6 +29,10 @@ import {
 } from './images.js';
 import { sendCmd, send, stopAgent, initInputListeners } from './input.js';
 import { toggleMobileMenu, closeMobileMenu, initMobileListeners } from './mobile.js';
+import {
+  createSubagentPanel, addSubagentTool, updateSubagentProgress,
+  updateSubagentToolResult, finishSubagentPanel
+} from './renderers/subagent.js';
 
 // ── Initialize DOM ──
 initDomRefs();
@@ -65,9 +69,10 @@ function applyViewState(viewState) {
     if (!state.showTools) {
       closeToolDrawer();
       state.activeToolPanel = null;
-      for (const panel of dom.chat.querySelectorAll('.tool-panel')) {
+      for (const panel of dom.chat.querySelectorAll('.tool-panel, .subagent-panel')) {
         removeTimelinePanel(panel);
       }
+      state.activeSubagentPanels.clear();
     }
   }
 
@@ -95,6 +100,33 @@ function toggleReasoningVisibility() {
   const nextShowReasoning = !state.showReasoning;
   applyViewState({ show_reasoning: nextShowReasoning });
   sendCmd(`/reasoning ${nextShowReasoning ? 'on' : 'off'}`);
+}
+
+// ── Usage badge ──
+
+function updateUsageBadge() {
+  if (!dom.usageBadge) return;
+  const inp = state.dailyInputTokens;
+  const out = state.dailyOutputTokens;
+  if (inp === 0 && out === 0) {
+    dom.usageBadge.textContent = '';
+    return;
+  }
+  dom.usageBadge.textContent = `📊 ${formatTokenCount(inp)} in / ${formatTokenCount(out)} out`;
+  dom.usageBadge.title = `今日: ${formatTokenCount(inp)} input, ${formatTokenCount(out)} output\n累计: ${formatTokenCount(state.totalInputTokens)} input, ${formatTokenCount(state.totalOutputTokens)} output`;
+}
+
+function appendRoundUsage(messageEl, inputTokens, outputTokens) {
+  const lastAssistantRow = messageEl ? messageEl.closest('.msg-row') : null;
+  if (!lastAssistantRow) return;
+  const content = lastAssistantRow.querySelector('.msg-content');
+  if (!content) return;
+  if (content.querySelector('.msg-usage')) return;
+  const label = document.createElement('div');
+  label.className = 'msg-usage';
+  label.textContent = `${formatTokenCount(inputTokens)} in / ${formatTokenCount(outputTokens)} out`;
+  label.title = `Input: ${inputTokens.toLocaleString()} tokens, Output: ${outputTokens.toLocaleString()} tokens`;
+  content.appendChild(label);
 }
 
 // ── History lazy-load ──
@@ -148,8 +180,36 @@ function renderHistoryMessage(m, options = {}) {
       scheduleMarkdownRender(el, { followScroll: followMarkdown });
       break;
     }
-    case 'tool_call': if (state.showTools) addToolCall(m.name, m.arguments, m.id); break;
-    case 'tool_result': if (state.showTools) addToolResult('', m.result, m.id); break;
+    case 'tool_call': {
+      if (!state.showTools) break;
+      if (m.name === 'task') {
+        try {
+          const args = JSON.parse(m.arguments || '{}');
+          createSubagentPanel(args.agent || 'sub-agent', args.prompt || '');
+          if (!state._historyTaskIds) state._historyTaskIds = new Map();
+          state._historyTaskIds.set(m.id, args.agent || 'sub-agent');
+        } catch { addToolCall(m.name, m.arguments, m.id); }
+        break;
+      }
+      addToolCall(m.name, m.arguments, m.id);
+      break;
+    }
+    case 'tool_result': {
+      if (!state.showTools) break;
+      if (state._historyTaskIds && state._historyTaskIds.has(m.id)) {
+        const agentName = state._historyTaskIds.get(m.id);
+        state._historyTaskIds.delete(m.id);
+        const r = (m.result || '').trimStart();
+        const failed = m.is_error === true
+          || r.startsWith('task error:')
+          || r.startsWith('[rejected')
+          || /^Sub-agent '.+' (failed|timed out)/.test(r);
+        finishSubagentPanel(agentName, !failed, {}, { immediate: true });
+        break;
+      }
+      addToolResult('', m.result, m.id);
+      break;
+    }
   }
 }
 
@@ -196,6 +256,13 @@ function handleMessage(data) {
           dropUnavailablePendingUploads(previousS3Capable);
         }
       }
+      if (data.usage) {
+        state.dailyInputTokens = data.usage.daily_input ?? 0;
+        state.dailyOutputTokens = data.usage.daily_output ?? 0;
+        state.totalInputTokens = data.usage.total_input ?? 0;
+        state.totalOutputTokens = data.usage.total_output ?? 0;
+        updateUsageBadge();
+      }
       applyViewState(data);
       break;
 
@@ -209,6 +276,7 @@ function handleMessage(data) {
       setAutoFollowChat(true);
       dom.chat.innerHTML = '';
       state.deferredHistory = [];
+      state._historyTaskIds = null;
       const msgs = data.messages || [];
       if (msgs.length === 0) {
         showWelcome();
@@ -231,6 +299,12 @@ function handleMessage(data) {
         }
         for (let i = startIdx; i < msgs.length; i++) {
           renderHistoryMessage(msgs[i]);
+        }
+        if (state._historyTaskIds && state._historyTaskIds.size > 0) {
+          for (const name of state._historyTaskIds.values()) {
+            finishSubagentPanel(name, false, {}, { immediate: true });
+          }
+          state._historyTaskIds = null;
         }
         requestAnimationFrame(() => {
           state.bulkRenderingChat = false;
@@ -255,25 +329,42 @@ function handleMessage(data) {
       break;
 
     case 'delta':
+      if (data.subagent) break;
       if (state.currentMsg) {
         state.pendingAssistantText += data.content;
         scheduleFlush();
       }
       break;
 
-    case 'done':
-      finishAssistantStream({ discardIfEmpty: true });
+    case 'done': {
+      const finishedAssistantMsg = finishAssistantStream({ discardIfEmpty: true });
       finishReasoningStream();
       requestClearReactStatus();
       state.reasoningPanel = null;
+      if (data.daily_input_tokens != null) {
+        state.dailyInputTokens = data.daily_input_tokens;
+        state.dailyOutputTokens = data.daily_output_tokens ?? 0;
+        state.totalInputTokens = data.total_input_tokens ?? 0;
+        state.totalOutputTokens = data.total_output_tokens ?? 0;
+        updateUsageBadge();
+      }
+      if (data.round_input_tokens != null || data.round_output_tokens != null) {
+        appendRoundUsage(
+          finishedAssistantMsg,
+          data.round_input_tokens ?? 0,
+          data.round_output_tokens ?? 0,
+        );
+      }
       setBusy(false);
       break;
+    }
 
     case 'react_phase':
       showReactStatus(data.phase, data.cycle);
       break;
 
     case 'thinking_start': {
+      if (data.subagent) break;
       if (!state.showReasoning) break;
       const panel = document.createElement('div');
       panel.className = 'reasoning-panel reasoning-active';
@@ -306,6 +397,7 @@ function handleMessage(data) {
     }
 
     case 'thinking_delta':
+      if (data.subagent) break;
       if (!state.showReasoning) break;
       if (state.reasoningPanel) {
         state.pendingReasoningText += data.content;
@@ -314,6 +406,7 @@ function handleMessage(data) {
       break;
 
     case 'thinking_done':
+      if (data.subagent) break;
       if (!state.showReasoning) {
         finishReasoningStream();
         state.reasoningPanel = null;
@@ -341,18 +434,24 @@ function handleMessage(data) {
       break;
 
     case 'tool_call':
+      if (data.subagent) break;
       setReactActTool(data.name, 0);
       if (!state.showTools) break;
       addToolCall(data.name, data.arguments, data.id);
       break;
 
     case 'tool_progress':
+      if (data.subagent) break;
       setReactActTool(data.name, data.elapsed_ms || 0);
       if (!state.showTools) break;
       updateToolProgress(data.id, data.elapsed_ms || 0);
       break;
 
     case 'tool_result':
+      if (data.subagent) {
+        if (state.showTools) updateSubagentToolResult(data.subagent, data.id, data.duration_ms);
+        break;
+      }
       if (state.reactStatusPhase === 'act' && state.reactStatusToolName === data.name) {
         state.reactStatusElapsedMs = data.duration_ms || state.reactStatusElapsedMs;
         renderReactStatus();
@@ -362,18 +461,19 @@ function handleMessage(data) {
       break;
 
     case 'task_started':
-      if (state.showTools) addSystem(`\ud83e\udd16 Sub-agent **${data.agent}** started`);
+      if (state.showTools) createSubagentPanel(data.agent, data.prompt);
       break;
     case 'task_progress':
+      if (state.showTools) updateSubagentProgress(data.agent, data.cycle);
       break;
     case 'task_tool':
-      if (state.showTools) addSystem(`\ud83d\udd27 **${data.agent}** \u2192 \`${data.tool}\``);
+      if (state.showTools) addSubagentTool(data.agent, data.tool, data.id);
       break;
     case 'task_completed':
-      if (state.showTools) addSystem(`\u2705 Sub-agent **${data.agent}** completed (${data.cycles} cycles, ${data.tool_calls} tools, ${formatToolDuration(data.duration_ms)})`);
+      if (state.showTools) finishSubagentPanel(data.agent, true, { cycles: data.cycles, tool_calls: data.tool_calls, duration_ms: data.duration_ms });
       break;
     case 'task_failed':
-      if (state.showTools) addSystem(`\u274c Sub-agent **${data.agent}** failed${data.error ? ': ' + data.error : ''} (${data.cycles ?? 0} cycles, ${data.tool_calls ?? 0} tools${data.duration_ms ? ', ' + formatToolDuration(data.duration_ms) : ''})`);
+      if (state.showTools) finishSubagentPanel(data.agent, false, { cycles: data.cycles, tool_calls: data.tool_calls, duration_ms: data.duration_ms, error: data.error });
       break;
 
     case 'context_compressed':

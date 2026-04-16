@@ -98,9 +98,10 @@ export function beginAssistantStream() {
 export function finishAssistantStream({ discardIfEmpty = false } = {}) {
   flushAssistantText();
   if (!state.currentMsg) {
-    return;
+    return null;
   }
 
+  const message = state.currentMsg;
   const row = currentMsgRow();
   const rawText = state.currentMsg._rawText || '';
   const raw = rawText.trim();
@@ -109,13 +110,13 @@ export function finishAssistantStream({ discardIfEmpty = false } = {}) {
   if (!raw && discardIfEmpty) {
     row?.remove();
     state.currentMsg = null;
-    return;
+    return null;
   }
 
   if (!raw) {
     row?.removeAttribute('hidden');
     state.currentMsg = null;
-    return;
+    return null;
   }
 
   revealCurrentAssistant();
@@ -131,6 +132,7 @@ export function finishAssistantStream({ discardIfEmpty = false } = {}) {
     scheduleMarkdownRender(state.currentMsg);
   }
   state.currentMsg = null;
+  return message;
 }
 
 export function finishReasoningStream() {

@@ -42,6 +42,11 @@ export const state = {
   inputHistoryDraft: '',
   markdownRenderQueue: [],
   markdownQueueHandle: 0,
+  activeSubagentPanels: new Map(),
+  dailyInputTokens: 0,
+  dailyOutputTokens: 0,
+  totalInputTokens: 0,
+  totalOutputTokens: 0,
 };
 
 /** Populate dom refs from the live document. Call once after DOMContentLoaded. */
@@ -61,6 +66,7 @@ export function initDomRefs() {
   dom.headerVersionEl = document.getElementById('app-version-header');
   dom.toggleToolsBtn = document.getElementById('toggle-tools-btn');
   dom.toggleReasoningBtn = document.getElementById('toggle-reasoning-btn');
+  dom.usageBadge = document.getElementById('usage-badge');
   dom.toolDrawer = document.getElementById('tool-drawer');
   dom.toolDrawerBackdrop = document.getElementById('tool-drawer-backdrop');
   dom.toolDrawerTitle = document.getElementById('tool-drawer-title');

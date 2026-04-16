@@ -74,6 +74,14 @@ export function reactPhaseLabel(phase) {
   }[phase] || phase || 'Analyze';
 }
 
+export function formatTokenCount(n) {
+  if (n == null || n === 0) return '0';
+  if (n < 1000) return String(n);
+  if (n < 10000) return (n / 1000).toFixed(1) + 'K';
+  if (n < 1000000) return Math.round(n / 1000) + 'K';
+  return (n / 1000000).toFixed(1) + 'M';
+}
+
 export function hideWelcome() {
   const w = document.getElementById('welcome');
   if (w) w.remove();

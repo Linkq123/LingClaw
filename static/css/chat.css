@@ -44,6 +44,8 @@
 .msg-row:hover .msg-time { opacity: .6; }
 .msg-row.user .msg-time { text-align: right; }
 
+.msg-usage { font-size: 11px; color: var(--dim); text-align: right; padding-top: 4px; opacity: .55; }
+
 /* ── Message bubbles ── */
 .msg {
   padding: 10px 14px;

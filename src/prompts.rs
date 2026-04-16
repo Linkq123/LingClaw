@@ -799,6 +799,7 @@ const PROMPT_WATCH_FILES: &[&str] = &[
     "IDENTITY.md",
     "USER.md",
     "SOUL.md",
+    "TOOLS.md",
     "MEMORY.md",
 ];
 
@@ -827,10 +828,7 @@ pub(crate) fn collect_dir_tree_mtimes(dir: &Path) -> Vec<Option<SystemTime>> {
     }
     let mut mtimes = vec![root_mtime];
     if let Ok(entries) = std::fs::read_dir(dir) {
-        let mut subdirs: Vec<_> = entries
-            .flatten()
-            .filter(|e| e.path().is_dir())
-            .collect();
+        let mut subdirs: Vec<_> = entries.flatten().filter(|e| e.path().is_dir()).collect();
         subdirs.sort_by_key(|e| e.file_name());
         for entry in subdirs {
             mtimes.push(file_mtime(&entry.path()));
@@ -910,7 +908,7 @@ fn load_prompt_files_uncached(workspace: &Path, today: &str, yesterday: &str) ->
         parts.push(format!("<!-- {name} -->\n{content}"));
     }
 
-    for name in &["IDENTITY.md", "USER.md", "SOUL.md"] {
+    for name in &["IDENTITY.md", "USER.md", "SOUL.md", "TOOLS.md"] {
         if let Some(content) = read_nonempty(workspace.join(name)) {
             parts.push(format!("<!-- {name} -->\n{content}"));
         }

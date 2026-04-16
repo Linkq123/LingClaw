@@ -81,6 +81,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 0,
         workspace: PathBuf::new(),
     }

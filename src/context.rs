@@ -338,10 +338,7 @@ pub(crate) fn prune_messages(messages: &mut Vec<ChatMessage>, max_tokens: usize)
     let mut estimated: usize = costs.iter().sum();
     let mut total_remove = 0;
     let mut pos = 1;
-    while estimated > max_tokens
-        && messages.len() - total_remove > 2
-        && pos < messages.len()
-    {
+    while estimated > max_tokens && messages.len() - total_remove > 2 && pos < messages.len() {
         let count = turn_len(messages, pos);
         let removed: usize = costs[pos..pos + count].iter().sum();
         total_remove += count;
@@ -365,10 +362,7 @@ pub(crate) fn prune_messages_for_provider(
     let mut estimated: usize = costs.iter().sum();
     let mut total_remove = 0;
     let mut pos = 1;
-    while estimated > max_tokens
-        && messages.len() - total_remove > 2
-        && pos < messages.len()
-    {
+    while estimated > max_tokens && messages.len() - total_remove > 2 && pos < messages.len() {
         let count = turn_len(messages, pos);
         let removed: usize = costs[pos..pos + count].iter().sum();
         total_remove += count;

@@ -207,6 +207,9 @@ struct Session {
     /// System skill paths disabled for this session (e.g. "anthropics", "anthropics/pdf").
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     disabled_system_skills: HashSet<String>,
+    /// Tool call ids whose persisted tool result ended in an error state.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    failed_tool_results: HashSet<String>,
     #[serde(default)]
     version: u32,
     #[serde(skip)]
@@ -281,6 +284,7 @@ impl Session {
             show_tools: default_show_tools(),
             show_reasoning: default_show_reasoning(),
             disabled_system_skills: HashSet::new(),
+            failed_tool_results: HashSet::new(),
             version: SESSION_VERSION,
             workspace,
         }
@@ -412,7 +416,7 @@ fn build_system_prompt_with_query(
     let persona = prompts::load_session_prompt_files_with_snapshot(workspace, local_snapshot);
     let prompt_file_note = "## Preloaded Prompt Files\n\
 These prompt-file contents were already loaded into this system prompt from the session workspace.\n\
-Do not call file tools just to verify or re-read BOOTSTRAP.md, AGENTS.md, AGENT.md, IDENTITY.md, USER.md, SOUL.md, or MEMORY.md when their content is already present below.\n\
+Do not call file tools just to verify or re-read BOOTSTRAP.md, AGENTS.md, AGENT.md, IDENTITY.md, USER.md, SOUL.md, TOOLS.md, or MEMORY.md when their content is already present below.\n\
 Only read those files if the user explicitly asks to inspect them, if you need to edit them, or if a task depends on checking whether the on-disk file has changed.";
     let mcp_note = tools::mcp::runtime_tool_note(config)
         .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
@@ -466,6 +470,15 @@ Only read those files if the user explicitly asks to inspect them, if you need t
 - Model: {model}
 
 {prompt_file_note}
+
+## Agent Behavior
+
+You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools, **Observe** the results, then either loop or **Finish**.
+
+- **Tool strategy:** Prefer calling tools to gather information over speculating. Batch independent read-only calls together. Run write operations one at a time.
+- **Error recovery:** When a tool fails, diagnose the cause and try a different approach — different arguments, a different tool, or an alternative path. Do not repeat the same failing call.
+- **Delegation:** For complex, self-contained subtasks, delegate to a sub-agent via the `task` tool. Handle simple, quick work yourself.
+- **Finishing:** When the task is complete, deliver your result. When you are genuinely stuck with no further options, say so honestly. Do not pad with speculative follow-ups.
 
 ## Available Tools
 {tool_lines}{mcp_note}{skills_section}{agents_section}"#,

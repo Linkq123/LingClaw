@@ -226,6 +226,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 0,
         workspace: PathBuf::new(),
     }
@@ -599,6 +600,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 0,
         workspace: PathBuf::new(),
     };
@@ -616,6 +618,54 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         tool_result["result"].as_str(),
         Some(long_raw_result.as_str())
     );
+    assert_eq!(tool_result["is_error"].as_bool(), Some(false));
+}
+
+#[test]
+fn build_history_payload_marks_failed_tool_result_with_is_error() {
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![ChatMessage {
+            role: "tool".into(),
+            content: Some("Sub-agent 'coder' timed out after 30s".into()),
+            images: None,
+            tool_calls: None,
+            tool_call_id: Some("task_1".into()),
+            timestamp: Some(123),
+        }],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: false,
+        show_tools: true,
+        show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: HashSet::from(["task_1".to_string()]),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let payload = build_history_payload(&session);
+    let messages = payload["messages"]
+        .as_array()
+        .expect("history payload should contain a messages array");
+    let tool_result = messages
+        .iter()
+        .find(|message| message["role"] == "tool_result")
+        .expect("history payload should contain a tool_result entry");
+
+    assert_eq!(tool_result["id"].as_str(), Some("task_1"));
+    assert_eq!(tool_result["is_error"].as_bool(), Some(true));
 }
 
 #[test]
@@ -652,6 +702,7 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -700,6 +751,7 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2017,6 +2069,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 0,
         workspace: workspace.clone(),
     };
@@ -2090,6 +2143,7 @@ fn save_session_to_disk_overwrites_existing_file() {
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 1,
         workspace: workspace.clone(),
     };
@@ -2463,6 +2517,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 0,
         workspace: PathBuf::new(),
     };

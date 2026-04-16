@@ -170,7 +170,11 @@ pub(crate) async fn handle_idle_socket_input(
                             )
                         })
                         .unwrap_or_else(|| ("Main".to_string(), state.config.model.clone()));
-                    build_session_info_payload(current_session_id, &name, state, &model)
+                    let usage = sessions
+                        .get(current_session_id.as_str())
+                        .map(crate::socket_sync::build_session_usage_payload)
+                        .unwrap_or_else(|| json!({}));
+                    build_session_info_payload(current_session_id, &name, state, &model, usage)
                 };
                 ws_send(tx, &payload).await;
             }

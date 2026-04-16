@@ -92,6 +92,9 @@ struct AgentPhaseState {
     run_stopped: bool,
     run_detached: bool,
     last_save_instant: Option<std::time::Instant>,
+    /// Token counters snapshotted at loop start for per-round delta calculation.
+    usage_snap_input: u64,
+    usage_snap_output: u64,
 }
 
 /// Minimum interval between observe-phase incremental saves.
@@ -764,6 +767,29 @@ fn build_agent_hard_cap_events(
     )
 }
 
+/// Read session token counters and compute round deltas for the `done` event.
+async fn build_done_usage(
+    state: &AppState,
+    session_id: &str,
+    snap_input: u64,
+    snap_output: u64,
+) -> serde_json::Value {
+    let sessions = state.sessions.lock().await;
+    if let Some(s) = sessions.get(session_id) {
+        let (daily_in, daily_out) = context::current_daily_token_usage(s);
+        json!({
+            "daily_input_tokens": daily_in,
+            "daily_output_tokens": daily_out,
+            "total_input_tokens": s.input_tokens,
+            "total_output_tokens": s.output_tokens,
+            "round_input_tokens": s.input_tokens.saturating_sub(snap_input),
+            "round_output_tokens": s.output_tokens.saturating_sub(snap_output),
+        })
+    } else {
+        json!({})
+    }
+}
+
 async fn run_tool_with_feedback<F>(
     live_tx: &LiveTx,
     cancel: &CancellationToken,
@@ -1009,6 +1035,11 @@ async fn record_tool_result(
     {
         let mut sessions = ctx.state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(ctx.current_session_id) {
+            if result.is_error {
+                session.failed_tool_results.insert(tc.id.clone());
+            } else {
+                session.failed_tool_results.remove(&tc.id);
+            }
             session.messages.push(ChatMessage {
                 role: "tool".into(),
                 content: Some(result.output),
@@ -1034,11 +1065,21 @@ async fn run_analyze_phase(
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
     if phase_state.round >= AGENT_HARD_CAP_ROUNDS {
-        let (system_event, done_event) = build_agent_hard_cap_events(
+        let (system_event, mut done_event) = build_agent_hard_cap_events(
             AGENT_HARD_CAP_ROUNDS,
             phase_state.react_ctx.cycles,
             phase_state.react_ctx.tool_calls,
         );
+        let usage = build_done_usage(
+            ctx.state,
+            ctx.current_session_id,
+            phase_state.usage_snap_input,
+            phase_state.usage_snap_output,
+        )
+        .await;
+        if let (Some(done_obj), Some(usage_obj)) = (done_event.as_object_mut(), usage.as_object()) {
+            done_obj.extend(usage_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
         if !live_send(ctx.live_tx, system_event).await {
             return AgentPhaseControl::Break;
         }
@@ -1642,17 +1683,25 @@ async fn run_finish_phase(
         .map(|reason| reason.label())
         .unwrap_or("complete");
 
-    let _ = live_send(
-        ctx.live_tx,
-        json!({
-            "type":"done",
-            "phase":"finish",
-            "reason": finish_label,
-            "cycles": phase_state.react_ctx.cycles,
-            "tool_calls": phase_state.react_ctx.tool_calls,
-        }),
+    let usage = build_done_usage(
+        ctx.state,
+        ctx.current_session_id,
+        phase_state.usage_snap_input,
+        phase_state.usage_snap_output,
     )
     .await;
+
+    let mut done_event = json!({
+        "type":"done",
+        "phase":"finish",
+        "reason": finish_label,
+        "cycles": phase_state.react_ctx.cycles,
+        "tool_calls": phase_state.react_ctx.tool_calls,
+    });
+    if let (Some(done_obj), Some(usage_obj)) = (done_event.as_object_mut(), usage.as_object()) {
+        done_obj.extend(usage_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    let _ = live_send(ctx.live_tx, done_event).await;
     AgentPhaseControl::Break
 }
 
@@ -1724,7 +1773,18 @@ pub(crate) async fn run_agent_session(
         run_stopped: false,
         run_detached: false,
         last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
     };
+
+    // Snapshot token counts at loop start so we can compute per-round delta.
+    {
+        let sessions = state.sessions.lock().await;
+        if let Some(s) = sessions.get(current_session_id) {
+            phase_state.usage_snap_input = s.input_tokens;
+            phase_state.usage_snap_output = s.output_tokens;
+        }
+    }
 
     'agent: loop {
         if cancel.is_cancelled() {
@@ -1809,17 +1869,24 @@ pub(crate) async fn run_agent_session(
                 session_store::trim_incomplete_tool_calls(&mut session.messages);
             }
         }
-        let _ = live_send(
-            live_tx,
-            json!({
-                "type":"done",
-                "phase":"stopped",
-                "reason":"user_stop",
-                "cycles":phase_state.react_ctx.cycles,
-                "tool_calls":phase_state.react_ctx.tool_calls
-            }),
+        let usage = build_done_usage(
+            state,
+            current_session_id,
+            phase_state.usage_snap_input,
+            phase_state.usage_snap_output,
         )
         .await;
+        let mut done_event = json!({
+            "type":"done",
+            "phase":"stopped",
+            "reason":"user_stop",
+            "cycles":phase_state.react_ctx.cycles,
+            "tool_calls":phase_state.react_ctx.tool_calls
+        });
+        if let (Some(done_obj), Some(usage_obj)) = (done_event.as_object_mut(), usage.as_object()) {
+            done_obj.extend(usage_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        let _ = live_send(live_tx, done_event).await;
     }
 
     if phase_state.run_detached {

@@ -740,7 +740,7 @@ think_level 映射：
 | 模式 | 条件 | 加载文件 |
 |---|---|---|
 | **Bootstrap** | `BOOTSTRAP.md` 存在 | `BOOTSTRAP.md + AGENTS.md` |
-| **Normal** | `BOOTSTRAP.md` 不存在 | `AGENTS.md + IDENTITY.md + USER.md + SOUL.md`，然后加载当前 session 的 `MEMORY.md` + 今日/昨日记忆 |
+| **Normal** | `BOOTSTRAP.md` 不存在 | `AGENTS.md + IDENTITY.md + USER.md + SOUL.md + TOOLS.md`，然后加载当前 session 的 `MEMORY.md` + 今日/昨日记忆 |
 
 关键不变式：
 - 当 `IDENTITY.md` 和 `USER.md` 中的关键字段已被有效填写后，后端会自动删除 `BOOTSTRAP.md` 并切换到 Normal 模式

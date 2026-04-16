@@ -11,16 +11,18 @@ fn default_view_state_payload() -> serde_json::Value {
 }
 
 pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, session_id: &str) {
-    let (name, history, view_state, supports_image) = {
+    let (name, history, view_state, supports_image, usage) = {
         let sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get(session_id) {
             let model = session.effective_model(&state.config.model);
             let supports_image = state.config.model_supports_image(model);
+            let usage = build_session_usage_payload(session);
             (
                 session.name.clone(),
                 build_history_payload_with_s3(session, state.config.s3.as_ref()),
                 build_view_state_payload(session),
                 supports_image,
+                usage,
             )
         } else {
             (
@@ -28,6 +30,7 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
                 default_history_payload(),
                 default_view_state_payload(),
                 false,
+                json!({}),
             )
         }
     };
@@ -35,7 +38,7 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
     let s3_available = state.config.s3.is_some();
     ws_send(
         tx,
-        &json!({"type":"session","id":session_id,"name":name,"capabilities":{"image":supports_image,"s3":s3_available}}),
+        &json!({"type":"session","id":session_id,"name":name,"capabilities":{"image":supports_image,"s3":s3_available},"usage":usage}),
     )
     .await;
     ws_send(tx, &view_state).await;
@@ -48,10 +51,22 @@ pub(crate) fn build_session_info_payload(
     name: &str,
     state: &AppState,
     effective_model: &str,
+    usage: serde_json::Value,
 ) -> serde_json::Value {
     let supports_image = state.config.model_supports_image(effective_model);
     let s3_available = state.config.s3.is_some();
-    json!({"type":"session","id":session_id,"name":name,"capabilities":{"image":supports_image,"s3":s3_available}})
+    json!({"type":"session","id":session_id,"name":name,"capabilities":{"image":supports_image,"s3":s3_available},"usage":usage})
+}
+
+/// Build the usage sub-object for a session event.
+pub(crate) fn build_session_usage_payload(session: &crate::Session) -> serde_json::Value {
+    let (daily_input, daily_output) = crate::context::current_daily_token_usage(session);
+    json!({
+        "daily_input": daily_input,
+        "daily_output": daily_output,
+        "total_input": session.input_tokens,
+        "total_output": session.output_tokens,
+    })
 }
 
 pub(crate) async fn send_command_refresh(

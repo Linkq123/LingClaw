@@ -163,6 +163,7 @@ async fn status_command_reports_runtime_request_estimate() {
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -292,6 +293,7 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -397,6 +399,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -580,6 +583,7 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -687,6 +691,7 @@ async fn memory_command_rejects_unknown_subcommand() {
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 4,
         workspace: workspace.clone(),
     };

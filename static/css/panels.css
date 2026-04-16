@@ -425,3 +425,197 @@
   color: var(--text);
   overflow: auto;
 }
+
+/* ── Sub-agent panels ── */
+.subagent-panel {
+  align-self: flex-start;
+  width: min(var(--chat-output-width), calc(100% - 8px));
+  max-width: 100%;
+  min-width: 320px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  margin: 2px 0;
+  overflow: hidden;
+  font-size: 13px;
+  flex-shrink: 0;
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity .2s ease, transform .24s cubic-bezier(.22,1,.36,1), box-shadow .2s ease;
+  position: relative;
+}
+.subagent-panel::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: linear-gradient(90deg, #8b5cf6, color-mix(in srgb, #8b5cf6 40%, var(--accent2)));
+  border-radius: 12px 12px 0 0;
+}
+.subagent-panel.panel-enter {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.subagent-panel.panel-enter.panel-enter-active {
+  opacity: 1;
+  transform: translateY(0);
+}
+.subagent-panel.subagent-done::before {
+  background: linear-gradient(90deg, var(--accent-success), color-mix(in srgb, var(--accent-success) 40%, #8b5cf6));
+}
+.subagent-panel.subagent-failed::before {
+  background: linear-gradient(90deg, var(--accent-error), color-mix(in srgb, var(--accent-error) 40%, #8b5cf6));
+}
+.subagent-panel.subagent-failed {
+  border-color: color-mix(in srgb, var(--accent-error) 25%, var(--border));
+}
+.subagent-header {
+  padding: 6px 12px;
+  background: rgba(139,92,246,.05);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--dim);
+  transition: background .15s;
+}
+.subagent-header:hover { background: rgba(139,92,246,.1); }
+.subagent-header:active { transform: scale(0.995); }
+.subagent-header .subagent-icon { color: #8b5cf6; }
+.subagent-header .subagent-label { font-weight: 600; color: var(--text); font-size: 12px; }
+.subagent-header .subagent-status {
+  font-size: 11px;
+  color: var(--dim);
+  margin-left: auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  max-width: 50%;
+}
+.subagent-header .chevron { margin-left: 8px; transition: transform .25s ease; }
+.subagent-header .chevron.open { transform: rotate(90deg); }
+.subagent-active .subagent-status::after {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  background: #8b5cf6;
+  border-radius: 50%;
+  margin-left: 6px;
+  animation: pulse 1s infinite;
+}
+.subagent-body {
+  height: 0;
+  opacity: 0;
+  overflow: hidden;
+  padding: 0 12px;
+  background: rgba(139,92,246,.02);
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--dim);
+  transition: height .28s cubic-bezier(.22,1,.36,1), padding .22s ease, opacity .18s ease;
+}
+.subagent-body.show {
+  height: auto;
+  opacity: 1;
+  padding: 6px 12px 8px;
+  overflow-y: auto;
+  max-height: 280px;
+}
+.subagent-body.is-open {
+  opacity: 1;
+}
+.subagent-prompt {
+  font-size: 11px;
+  color: var(--dim);
+  padding: 4px 0 6px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border) 60%, transparent);
+  margin-bottom: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.subagent-tool-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+.subagent-tool-icon {
+  color: var(--accent2);
+  font-size: 11px;
+  flex-shrink: 0;
+}
+.subagent-tool-name {
+  color: var(--text);
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.subagent-tool-status {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--accent2);
+  white-space: nowrap;
+}
+.subagent-tool-done .subagent-tool-status {
+  color: var(--accent-success);
+}
+.subagent-done .subagent-status { color: var(--accent-success); }
+.subagent-failed .subagent-status { color: var(--accent-error); }
+
+/* Timeline connector: sub-agent variant */
+.timeline-node > .subagent-panel {
+  width: 100%;
+  min-width: 0;
+  align-self: auto;
+  margin: 0;
+}
+.timeline-node--subagent::before {
+  background: #8b5cf6;
+  box-shadow: 0 0 0 3px color-mix(in srgb, #8b5cf6 18%, transparent);
+}
+.timeline-node--subagent {
+  --_tl-color: color-mix(in srgb, #8b5cf6 30%, var(--border));
+}
+.timeline-node--subagent + .timeline-node::after {
+  background: linear-gradient(
+    color-mix(in srgb, #8b5cf6 30%, var(--border)),
+    color-mix(in srgb, var(--accent2) 30%, var(--border))
+  );
+}
+.timeline-node--subagent:has(.subagent-active)::before {
+  --_tl-dot: #8b5cf6;
+  animation: dotPulse 1.5s ease-in-out infinite;
+}
+.timeline-node--subagent:has(.subagent-done)::before {
+  background: var(--accent-success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-success) 18%, transparent);
+}
+.timeline-node--subagent:has(.subagent-failed)::before {
+  background: var(--accent-error);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-error) 18%, transparent);
+}
+/* Cross-type gradient: tool → subagent */
+.timeline-node--tool + .timeline-node--subagent::after {
+  background: linear-gradient(
+    color-mix(in srgb, var(--accent2) 30%, var(--border)),
+    color-mix(in srgb, #8b5cf6 30%, var(--border))
+  );
+}
+.timeline-node--reasoning + .timeline-node--subagent::after {
+  background: linear-gradient(
+    color-mix(in srgb, var(--accent-warn) 30%, var(--border)),
+    color-mix(in srgb, #8b5cf6 30%, var(--border))
+  );
+}
