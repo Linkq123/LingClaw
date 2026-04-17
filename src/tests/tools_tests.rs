@@ -168,3 +168,79 @@ fn is_parallelizable_tool_matches_read_only_tools_only() {
         );
     }
 }
+
+// ── validate_string_property pattern enforcement ────────────────────────────
+
+#[test]
+fn validate_tool_args_enforces_string_pattern() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "id": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]+$"
+            }
+        },
+        "required": ["id"]
+    });
+
+    // Valid value
+    assert!(validate_tool_args("test", &json!({"id": "my-task_1"}), &schema).is_none());
+
+    // Invalid value (contains space)
+    let err = validate_tool_args("test", &json!({"id": "bad task"}), &schema)
+        .expect("space should violate pattern");
+    assert!(err.contains("does not match pattern"));
+
+    // Invalid value (contains special chars)
+    let err = validate_tool_args("test", &json!({"id": "bad@task!"}), &schema)
+        .expect("special chars should violate pattern");
+    assert!(err.contains("does not match pattern"));
+}
+
+// ── validate_array_property minItems/maxItems enforcement ───────────────────
+
+#[test]
+fn validate_tool_args_enforces_array_min_items() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3
+            }
+        },
+        "required": ["items"]
+    });
+
+    // Valid
+    assert!(validate_tool_args("test", &json!({"items": [1]}), &schema).is_none());
+    assert!(validate_tool_args("test", &json!({"items": [1, 2, 3]}), &schema).is_none());
+
+    // Too few
+    let err = validate_tool_args("test", &json!({"items": []}), &schema)
+        .expect("empty array should fail minItems");
+    assert!(err.contains("at least 1 items"));
+
+    // Too many
+    let err = validate_tool_args("test", &json!({"items": [1, 2, 3, 4]}), &schema)
+        .expect("4 items should fail maxItems");
+    assert!(err.contains("at most 3 items"));
+}
+
+#[test]
+fn validate_tool_args_rejects_non_array_for_array_type() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array"
+            }
+        },
+        "required": ["items"]
+    });
+    let err = validate_tool_args("test", &json!({"items": "not-array"}), &schema)
+        .expect("string should be rejected for array type");
+    assert!(err.contains("must be an array"));
+}

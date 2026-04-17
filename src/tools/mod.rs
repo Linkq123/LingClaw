@@ -544,6 +544,124 @@ pub(crate) fn task_tool_parameters() -> serde_json::Value {
     })
 }
 
+/// Returns true if the named tool is the multi-agent `orchestrate` tool.
+/// Like `task`, this tool is handled specially by the runtime loop.
+pub(crate) fn is_orchestrate_tool(name: &str) -> bool {
+    name == "orchestrate"
+}
+
+/// Generate the `orchestrate` tool definition for OpenAI format.
+pub(crate) fn orchestrate_tool_definition_openai(agent_names: &[String]) -> serde_json::Value {
+    let catalog = if agent_names.is_empty() {
+        "No sub-agents currently available.".to_string()
+    } else {
+        format!("Available sub-agents: {}", agent_names.join(", "))
+    };
+    json!({
+        "type": "function",
+        "function": {
+            "name": "orchestrate",
+            "description": format!(
+                "Orchestrate a coordinated multi-agent workflow. Define a DAG of tasks where each \
+                 task runs a sub-agent. Tasks without dependencies execute in parallel; dependent \
+                 tasks wait for upstream results. Use {{{{results.<task_id>}}}} in prompts to \
+                 reference outputs from completed upstream tasks.\n\n\
+                 Example — serial review pipeline:\n\
+                 tasks: [{{\"id\":\"impl\",\"agent\":\"coder\",\"prompt\":\"Implement...\"}},\n\
+                  {{\"id\":\"review\",\"agent\":\"reviewer\",\"prompt\":\"Review: {{{{results.impl}}}}\",\"depends_on\":[\"impl\"]}},\n\
+                  {{\"id\":\"fix\",\"agent\":\"coder\",\"prompt\":\"Fix: {{{{results.review}}}}\",\"depends_on\":[\"review\"]}}]\n\n\
+                 Example — parallel exploration then synthesis:\n\
+                 tasks: [{{\"id\":\"code\",\"agent\":\"explore\",\"prompt\":\"Analyze code...\"}},\n\
+                  {{\"id\":\"docs\",\"agent\":\"researcher\",\"prompt\":\"Research docs...\"}},\n\
+                  {{\"id\":\"plan\",\"agent\":\"coder\",\"prompt\":\"Synthesize: {{{{results.code}}}} and {{{{results.docs}}}}\",\"depends_on\":[\"code\",\"docs\"]}}]\n\n\
+                 {catalog}",
+            ),
+            "parameters": orchestrate_tool_parameters(),
+        }
+    })
+}
+
+/// Generate the `orchestrate` tool definition for Anthropic format.
+pub(crate) fn orchestrate_tool_definition_anthropic(agent_names: &[String]) -> serde_json::Value {
+    let catalog = if agent_names.is_empty() {
+        "No sub-agents currently available.".to_string()
+    } else {
+        format!("Available sub-agents: {}", agent_names.join(", "))
+    };
+    json!({
+        "name": "orchestrate",
+        "description": format!(
+            "Orchestrate a coordinated multi-agent workflow. Define a DAG of tasks where each \
+             task runs a sub-agent. Tasks without dependencies execute in parallel; dependent \
+             tasks wait for upstream results. Use {{{{results.<task_id>}}}} in prompts to \
+             reference outputs from completed upstream tasks.\n\n\
+             Example — serial review pipeline:\n\
+             tasks: [{{\"id\":\"impl\",\"agent\":\"coder\",\"prompt\":\"Implement...\"}},\n\
+              {{\"id\":\"review\",\"agent\":\"reviewer\",\"prompt\":\"Review: {{{{results.impl}}}}\",\"depends_on\":[\"impl\"]}},\n\
+              {{\"id\":\"fix\",\"agent\":\"coder\",\"prompt\":\"Fix: {{{{results.review}}}}\",\"depends_on\":[\"review\"]}}]\n\n\
+             Example — parallel exploration then synthesis:\n\
+             tasks: [{{\"id\":\"code\",\"agent\":\"explore\",\"prompt\":\"Analyze code...\"}},\n\
+              {{\"id\":\"docs\",\"agent\":\"researcher\",\"prompt\":\"Research docs...\"}},\n\
+              {{\"id\":\"plan\",\"agent\":\"coder\",\"prompt\":\"Synthesize: {{{{results.code}}}} and {{{{results.docs}}}}\",\"depends_on\":[\"code\",\"docs\"]}}]\n\n\
+             {catalog}",
+        ),
+        "input_schema": orchestrate_tool_parameters(),
+    })
+}
+
+/// Generate the `orchestrate` tool definition for Ollama format (reuses OpenAI format).
+pub(crate) fn orchestrate_tool_definition_ollama(agent_names: &[String]) -> serde_json::Value {
+    orchestrate_tool_definition_openai(agent_names)
+}
+
+pub(crate) fn orchestrate_tool_parameters() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tasks": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 20,
+                "description": "Array of orchestration tasks forming a DAG. Each task specifies a sub-agent and prompt, with optional dependencies on other tasks.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 50,
+                            "pattern": "^[A-Za-z0-9_-]+$",
+                            "description": "Unique identifier for this task. Use only ASCII letters, digits, '_' or '-'; referenced by depends_on and {{results.<id>}} placeholders."
+                        },
+                        "agent": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 100,
+                            "description": "Name of the sub-agent to run this task"
+                        },
+                        "prompt": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 50000,
+                            "description": "Task prompt for the sub-agent. Use {{results.<task_id>}} to inject outputs from dependency tasks."
+                        },
+                        "depends_on": {
+                            "type": "array",
+                            "items": {
+                                "type": "string",
+                                "pattern": "^[A-Za-z0-9_-]+$"
+                            },
+                            "description": "Task IDs that must complete before this task starts. Omit or empty for tasks with no dependencies."
+                        }
+                    },
+                    "required": ["id", "agent", "prompt"]
+                }
+            }
+        },
+        "required": ["tasks"]
+    })
+}
+
 pub(crate) async fn execute_tool(
     name: &str,
     args_str: &str,
@@ -679,16 +797,7 @@ fn validate_property(
                 ))
             }
         }
-        Some("array") => {
-            if value.is_array() {
-                None
-            } else {
-                Some(format!(
-                    "{tool_name} error: parameter '{key}' must be an array, got {}",
-                    json_type_name(value)
-                ))
-            }
-        }
+        Some("array") => validate_array_property(tool_name, key, value, property_schema),
         _ => None,
     }
 }
@@ -719,6 +828,47 @@ fn validate_string_property(
     {
         return Some(format!(
             "{tool_name} error: parameter '{key}' must be at most {max} characters"
+        ));
+    }
+
+    if let Some(pattern) = property_schema.get("pattern").and_then(Value::as_str)
+        && let Ok(re) = regex::Regex::new(pattern)
+        && !re.is_match(text)
+    {
+        return Some(format!(
+            "{tool_name} error: parameter '{key}' does not match pattern '{pattern}'"
+        ));
+    }
+
+    None
+}
+
+fn validate_array_property(
+    tool_name: &str,
+    key: &str,
+    value: &Value,
+    property_schema: &Value,
+) -> Option<String> {
+    let Some(arr) = value.as_array() else {
+        return Some(format!(
+            "{tool_name} error: parameter '{key}' must be an array, got {}",
+            json_type_name(value)
+        ));
+    };
+
+    let len = arr.len() as u64;
+    if let Some(min) = property_schema.get("minItems").and_then(Value::as_u64)
+        && len < min
+    {
+        return Some(format!(
+            "{tool_name} error: parameter '{key}' must have at least {min} items"
+        ));
+    }
+    if let Some(max) = property_schema.get("maxItems").and_then(Value::as_u64)
+        && len > max
+    {
+        return Some(format!(
+            "{tool_name} error: parameter '{key}' must have at most {max} items"
         ));
     }
 

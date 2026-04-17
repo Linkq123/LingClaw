@@ -529,7 +529,7 @@ pub(crate) async fn build_runtime_tools(
 ) -> Vec<serde_json::Value> {
     let mut extra_tools = Vec::new();
 
-    // Sub-agent task tool (only added when agents are discovered)
+    // Sub-agent task + orchestrate tools (only added when agents are discovered)
     let agents = crate::subagents::discovery::discover_all_agents(workspace);
     if !agents.is_empty() {
         let agent_names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
@@ -539,6 +539,13 @@ pub(crate) async fn build_runtime_tools(
             Provider::Ollama => tools::task_tool_definition_ollama(&agent_names),
         };
         extra_tools.push(task_def);
+
+        let orchestrate_def = match provider {
+            Provider::Anthropic => tools::orchestrate_tool_definition_anthropic(&agent_names),
+            Provider::OpenAI => tools::orchestrate_tool_definition_openai(&agent_names),
+            Provider::Ollama => tools::orchestrate_tool_definition_ollama(&agent_names),
+        };
+        extra_tools.push(orchestrate_def);
     }
 
     let mut mcp_tools = match provider {
@@ -766,6 +773,96 @@ async fn execute_task_tool(
     }
 }
 
+/// Execute an `orchestrate` tool call by coordinating multiple sub-agents.
+/// Returns the outcome as a standard ToolOutcome so it integrates with the
+/// existing record_tool_result flow.
+async fn execute_orchestrate_tool(
+    args_str: &str,
+    config: &Config,
+    http: &Client,
+    workspace: &Path,
+    live_tx: &LiveTx,
+    cancel: CancellationToken,
+    hooks: &HookRegistry,
+) -> tools::ToolOutcome {
+    let start = std::time::Instant::now();
+
+    let args: serde_json::Value = match serde_json::from_str(args_str) {
+        Ok(v) => v,
+        Err(e) => {
+            return tools::ToolOutcome {
+                output: format!("orchestrate error: invalid arguments JSON: {e}"),
+                is_error: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    // Validate against schema
+    if let Some(err) =
+        tools::validate_tool_args("orchestrate", &args, &tools::orchestrate_tool_parameters())
+    {
+        return tools::ToolOutcome {
+            output: err,
+            is_error: true,
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
+    }
+
+    // Parse tasks array
+    let tasks: Vec<crate::subagents::orchestrator::OrchestrationTask> = match args
+        .get("tasks")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        Some(t) => t,
+        None => {
+            return tools::ToolOutcome {
+                output: "orchestrate error: missing or invalid 'tasks' array".to_string(),
+                is_error: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    // Validate plan (IDs, agents, dependencies, cycles)
+    let plan = match crate::subagents::orchestrator::validate_plan(tasks, workspace) {
+        Ok(p) => p,
+        Err(e) => {
+            return tools::ToolOutcome {
+                output: e,
+                is_error: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    let task_count = plan.tasks.len();
+
+    // Emit a kickoff system note so the user can see orchestration has started.
+    let _ = live_send(
+        live_tx,
+        json!({
+            "type": "system",
+            "content": format!("Starting orchestration: {task_count} tasks"),
+        }),
+    )
+    .await;
+
+    let outcome = crate::subagents::orchestrator::execute_orchestration(
+        &plan, config, http, workspace, live_tx, cancel, hooks,
+    )
+    .await;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let result = crate::subagents::orchestrator::format_orchestration_result(&outcome);
+
+    tools::ToolOutcome {
+        output: result,
+        is_error: outcome.aborted || outcome.has_non_completed_tasks(),
+        duration_ms,
+    }
+}
+
 fn build_agent_hard_cap_events(
     round_limit: usize,
     cycles: usize,
@@ -963,6 +1060,27 @@ async fn execute_tool_call(
                 &phase_state.cycle_workspace,
                 ctx.live_tx,
                 task_cancel,
+                &ctx.state.hooks,
+            ),
+        )
+        .await
+    } else if tools::is_orchestrate_tool(&tc.function.name) {
+        // Multi-agent orchestration: no outer timeout — individual sub-agents
+        // enforce their own deadlines via config.sub_agent_timeout.
+        let orch_cancel = ctx.run_cancel.child_token();
+        run_tool_with_feedback(
+            ctx.live_tx,
+            ctx.run_cancel,
+            &tc.id,
+            &tc.function.name,
+            None,
+            execute_orchestrate_tool(
+                &effective_args,
+                &ctx.state.config,
+                &ctx.state.http,
+                &phase_state.cycle_workspace,
+                ctx.live_tx,
+                orch_cancel,
                 &ctx.state.hooks,
             ),
         )

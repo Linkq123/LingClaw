@@ -1127,6 +1127,29 @@ async fn dispatch_live_event(
                     round.active_task = None;
                 }
             }
+            // Orchestration events: track per-task lifecycle for live replay
+            "orchestrate_task_started" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                {
+                    round.active_task = Some(LiveTaskState {
+                        agent: event["agent"].as_str().unwrap_or_default().to_string(),
+                        prompt: event["prompt"].as_str().unwrap_or_default().to_string(),
+                        current_cycle: None,
+                        current_phase: None,
+                        tools: Vec::new(),
+                    });
+                }
+            }
+            "orchestrate_task_completed"
+            | "orchestrate_task_failed"
+            | "orchestrate_task_skipped" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                {
+                    round.active_task = None;
+                }
+            }
             "done" | "error" => {
                 if live_rounds.get(session_id).map(|r| r.connection_id) == Some(connection_id) {
                     live_rounds.remove(session_id);

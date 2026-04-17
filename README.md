@@ -10,11 +10,11 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **CLI** — 工具执行层：安全的命令/文件/网络工具、沙盒路径、SSRF 防护、安装与更新
 - **Loop** — 连接层：WebSocket 主会话、流式输出、斜杠命令、持久化、异步记忆更新
 
-整个后端约 11200 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
+整个后端约 19900 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
 
 ## Features
 
-- **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
+- **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`；另有 2 个动态工具：`task`（子代理委托，发现代理时注册）、`orchestrate`（多代理 DAG 编排，发现代理时注册）
 - **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；主 Agent 与子代理都会按需发现并使用这些 MCP tools；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断；server 启动连续失败会进入短暂冷却，避免请求风暴
 - **单主会话**：运行时固定使用 `main`，不再创建、切换或删除其他会话
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
@@ -378,6 +378,7 @@ SKILL.md 的 YAML frontmatter 格式兼容 [Agent Skills 规范](https://agentsk
 | **explore** | 快速只读代码库探索和问答 |
 | **researcher** | 深度研究，综合多源信息 |
 | **coder** | 代码实现与修改 |
+| **reviewer** | 代码审查与质量检查 |
 
 ### AGENT.md 格式
 
@@ -556,32 +557,34 @@ handle_socket()
 
 ```text
 src/
-├── main.rs            (~1290 行) — 共享类型, WebSocket/HTTP 处理, 系统提示构建, 安全检查
-├── runtime_loop.rs    (~790 行)  — 阶段执行循环, 工具进度, 运行取消, 干预持久化
-│   └── socket_input.rs (~185 行) — socket 空闲/忙碌输入辅助
-├── agent.rs           (~290 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
-├── commands.rs        (~1260 行) — 斜杠命令处理器 (handle_command, /skills-system install/uninstall 等)
-├── cli.rs             (~2020 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
-├── config.rs          (~550 行)  — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
-├── context.rs         (~210 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
-├── providers.rs       (~1200 行) — OpenAI/Anthropic/Ollama 调用, 流式解析, 推理模式, prompt caching
-├── prompts.rs         (~660 行)  — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
-├── hooks.rs           (~340 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
-├── memory.rs          (~460 行)  — structured_memory.json 读写, MemoryUpdateQueue, prompt 注入, /memory 状态
-├── session_admin.rs   (~240 行)  — 全局用量统计 (仅主会话)
-├── session_store.rs   (~340 行)  — 会话持久化, 迁移, 磁盘 I/O
-├── socket_sync.rs     (~140 行)  — WebSocket 会话声明, 断线监听, 重绑定
-├── socket_tasks.rs    (~120 行)  — WebSocket 读写任务
+├── main.rs            (~1750 行) — 共享类型, WebSocket/HTTP 处理, 系统提示构建, 安全检查
+├── runtime_loop.rs    (~1900 行) — 阶段执行循环, 工具进度, 运行取消, 干预持久化, orchestrate 执行
+│   └── socket_input.rs (~400 行) — socket 空闲/忙碌输入辅助
+├── agent.rs           (~420 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
+├── commands.rs        (~1460 行) — 斜杠命令处理器 (handle_command, /skills-system install/uninstall 等)
+├── cli.rs             (~2220 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
+├── config.rs          (~840 行)  — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
+├── context.rs         (~350 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
+├── providers.rs       (~1640 行) — OpenAI/Anthropic/Ollama 调用, 流式解析, 推理模式, prompt caching
+├── prompts.rs         (~870 行)  — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
+├── hooks.rs           (~660 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
+├── memory.rs          (~970 行)  — structured_memory.json 读写, MemoryUpdateQueue, prompt 注入, /memory 状态
+├── image_uploads.rs   (~670 行)  — S3 签名/上传, PNG/JPEG 校验, 生命周期管理, 附件令牌签发
+├── session_admin.rs   (~10 行)   — 全局用量统计 (仅主会话)
+├── session_store.rs   (~420 行)  — 会话持久化, 迁移, 磁盘 I/O
+├── socket_sync.rs     (~90 行)   — WebSocket 会话声明, 断线监听, 重绑定
+├── socket_tasks.rs    (~130 行)  — WebSocket 读写任务
 └── tools/
-    ├── mod.rs         (~450 行)  — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验
-    ├── fs.rs          (~320 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files + 虚拟 skill 路径
-    ├── net.rs         (~120 行)  — http_fetch, check_ssrf, is_private_ip
+    ├── mod.rs         (~870 行)  — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验, orchestrate/task 定义
+    ├── fs.rs          (~350 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files + 虚拟 skill 路径
+    ├── net.rs         (~190 行)  — http_fetch, check_ssrf, is_private_ip
     ├── exec.rs        (~60 行)   — exec (shell), think (scratchpad)
-    └── mcp.rs         (~1250 行) — stdio MCP 工具发现/执行桥接, 会话缓存, preflight
+    └── mcp.rs         (~1400 行) — stdio MCP 工具发现/执行桥接, 会话缓存, preflight
 ├── subagents/
-│   ├── mod.rs         (~220 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, 工具过滤（含 MCP）
-│   ├── executor.rs    (~400 行)  — 隔离 mini-ReAct 执行循环, Hook 集成, MCP 工具调度, 父级事件流
-│   └── discovery.rs   (~200 行)  — 三层发现 (system/global/session), YAML frontmatter 解析
+│   ├── mod.rs         (~260 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, 工具过滤（含 MCP）
+│   ├── executor.rs    (~890 行)  — 隔离 mini-ReAct 执行循环, Hook 集成, MCP 工具调度, 父级事件流
+│   ├── discovery.rs   (~320 行)  — 三层发现 (system/global/session), YAML frontmatter 解析
+│   └── orchestrator.rs (~770 行) — DAG 多代理编排引擎, 分层并行执行, 结果插值, 事件流
 
 static/
 ├── index.html                  — 主页面
@@ -604,7 +607,7 @@ docs/reference/templates/       — 7 个提示模板文件 (BOOTSTRAP/AGENTS/ID
 docs/reference/skills/          — 17 个系统内置 Skills (安装时部署到 ~/.lingclaw/system-skills/)
 docs/reference/agents/          — 4 个内置子代理 (explore, researcher, coder, reviewer)
 
-src/tests/                      — 模块测试文件 (~5470 行)
+src/tests/                      — 模块测试文件 (~13600 行)
 ```
 
 ### 核心数据结构
