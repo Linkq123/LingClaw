@@ -116,3 +116,55 @@ async fn execute_tool_rejects_zero_search_results_limit() {
 
     let _ = tokio::fs::remove_dir_all(&workspace).await;
 }
+
+// ── is_parallelizable_tool / is_read_only_tool / is_task_tool tests ─────────
+
+#[test]
+fn is_read_only_tool_covers_expected_set() {
+    for name in &[
+        "think",
+        "read_file",
+        "list_dir",
+        "search_files",
+        "http_fetch",
+    ] {
+        assert!(is_read_only_tool(name), "{name} should be read-only");
+    }
+    for name in &["exec", "write_file", "patch_file", "delete_file", "task"] {
+        assert!(!is_read_only_tool(name), "{name} should NOT be read-only");
+    }
+}
+
+#[test]
+fn is_task_tool_only_matches_task() {
+    assert!(is_task_tool("task"));
+    assert!(!is_task_tool("exec"));
+    assert!(!is_task_tool("read_file"));
+    assert!(!is_task_tool("task_like"));
+}
+
+#[test]
+fn is_parallelizable_tool_matches_read_only_tools_only() {
+    // All read-only tools should be parallelizable.
+    for name in &[
+        "think",
+        "read_file",
+        "list_dir",
+        "search_files",
+        "http_fetch",
+    ] {
+        assert!(
+            is_parallelizable_tool(name),
+            "{name} should be parallelizable"
+        );
+    }
+    // task stays sequential because sub-agents share the parent workspace.
+    assert!(!is_parallelizable_tool("task"));
+    // Write/exec tools are NOT parallelizable.
+    for name in &["exec", "write_file", "patch_file", "delete_file", "task"] {
+        assert!(
+            !is_parallelizable_tool(name),
+            "{name} should NOT be parallelizable"
+        );
+    }
+}

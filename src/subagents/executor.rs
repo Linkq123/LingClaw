@@ -27,7 +27,154 @@ use crate::{
 /// Maximum characters in the sub-agent's final result returned to the parent.
 const MAX_RESULT_CHARS: usize = 30_000;
 
-/// Apply the sub-agent AfterToolExec hook to a real or synthetic tool outcome.
+pub(crate) struct ParallelToolBatchResult {
+    pub results: Vec<Option<tools::ToolOutcome>>,
+    pub interrupted: bool,
+    pub timed_out: bool,
+}
+
+pub(crate) async fn collect_parallel_tool_results(
+    tool_futures: Vec<
+        std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<tools::ToolOutcome>> + Send + 'static>,
+        >,
+    >,
+    cancel: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+) -> ParallelToolBatchResult {
+    let mut join_set = tokio::task::JoinSet::new();
+    let mut results: Vec<Option<tools::ToolOutcome>> = std::iter::repeat_with(|| None)
+        .take(tool_futures.len())
+        .collect();
+
+    for (index, future) in tool_futures.into_iter().enumerate() {
+        join_set.spawn(async move { (index, future.await) });
+    }
+
+    let mut interrupted = false;
+    let mut timed_out = false;
+
+    while !join_set.is_empty() {
+        let join_result = if let Some(deadline) = deadline {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    interrupted = true;
+                    break;
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    interrupted = true;
+                    timed_out = true;
+                    break;
+                }
+                result = join_set.join_next() => result,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    interrupted = true;
+                    break;
+                }
+                result = join_set.join_next() => result,
+            }
+        };
+
+        let Some(join_result) = join_result else {
+            break;
+        };
+        match join_result {
+            Ok((index, outcome)) => {
+                results[index] = outcome;
+            }
+            Err(error) => {
+                eprintln!("[subagent-parallel] tool future dropped before completion: {error}");
+            }
+        }
+    }
+
+    if interrupted {
+        join_set.abort_all();
+        while let Some(join_result) = join_set.join_next().await {
+            match join_result {
+                Ok((index, outcome)) => {
+                    results[index] = outcome;
+                }
+                Err(error) => {
+                    if !error.is_cancelled() {
+                        eprintln!("[subagent-parallel] tool future failed while draining: {error}");
+                    }
+                }
+            }
+        }
+    }
+
+    ParallelToolBatchResult {
+        results,
+        interrupted,
+        timed_out,
+    }
+}
+
+fn interrupted_parallel_tool_outcome(
+    tool_name: &str,
+    interrupted: bool,
+    timed_out: bool,
+    duration_ms: u64,
+) -> tools::ToolOutcome {
+    let output = if interrupted {
+        if timed_out {
+            format!("Tool '{}' aborted: sub-agent deadline exceeded", tool_name)
+        } else {
+            format!("Tool '{}' aborted: sub-agent cancelled", tool_name)
+        }
+    } else {
+        format!(
+            "Tool '{}' failed: internal parallel executor did not return a result",
+            tool_name
+        )
+    };
+
+    tools::ToolOutcome {
+        output,
+        is_error: true,
+        duration_ms,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn finalize_parallel_batch_outcome(
+    hooks: &HookRegistry,
+    config: &Config,
+    workspace: &Path,
+    cycle: usize,
+    tool_name: &str,
+    effective_args: &str,
+    tool_id: &str,
+    result: Option<tools::ToolOutcome>,
+    interrupted: bool,
+    timed_out: bool,
+    duration_ms: u64,
+) -> tools::ToolOutcome {
+    match result {
+        Some(outcome) => {
+            apply_after_tool_exec_hook(
+                hooks,
+                config,
+                workspace,
+                cycle,
+                tool_name,
+                effective_args,
+                tool_id,
+                outcome,
+            )
+            .await
+        }
+        None => interrupted_parallel_tool_outcome(tool_name, interrupted, timed_out, duration_ms),
+    }
+}
+
+/// Apply the sub-agent AfterToolExec hook to a real tool outcome.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn apply_after_tool_exec_hook(
     hooks: &HookRegistry,
@@ -258,69 +405,326 @@ pub(crate) async fn run_subagent(
                     break 'react;
                 }
 
-                // Execute tool calls sequentially
+                // Execute tool calls — parallel for read-only batches, sequential otherwise.
                 if let Some(ref tool_calls) = resp.message.tool_calls {
-                    for tc in tool_calls {
-                        if cancel.is_cancelled() {
-                            aborted = true;
-                            break 'react;
-                        }
-                        // Check sub-agent deadline between tool calls.
-                        if !unlimited && tokio::time::Instant::now() >= deadline {
-                            aborted = true;
-                            timed_out = true;
-                            break 'react;
-                        }
+                    let all_read_only = tool_calls.len() > 1
+                        && tool_calls
+                            .iter()
+                            .all(|tc| tools::is_read_only_tool(&tc.function.name));
 
-                        // Check tool permission against the pre-computed
-                        // allowed list (accounts for mcp_policy + deny overrides).
-                        if !allowed_tools.iter().any(|t| t == &tc.function.name) {
-                            let result_msg = format!(
-                                "Tool '{}' is not allowed for sub-agent '{}'",
-                                tc.function.name, spec.name
-                            );
+                    if !all_read_only {
+                        // ── Sequential path ──────────────────────────────────────
+                        for tc in tool_calls {
+                            if cancel.is_cancelled() {
+                                aborted = true;
+                                break 'react;
+                            }
+                            // Check sub-agent deadline between tool calls.
+                            if !unlimited && tokio::time::Instant::now() >= deadline {
+                                aborted = true;
+                                timed_out = true;
+                                break 'react;
+                            }
+
+                            // Check tool permission against the pre-computed
+                            // allowed list (accounts for mcp_policy + deny overrides).
+                            if !allowed_tools.iter().any(|t| t == &tc.function.name) {
+                                let result_msg = format!(
+                                    "Tool '{}' is not allowed for sub-agent '{}'",
+                                    tc.function.name, spec.name
+                                );
+                                messages.push(ChatMessage {
+                                    role: "tool".into(),
+                                    content: Some(result_msg),
+                                    images: None,
+                                    tool_calls: None,
+                                    tool_call_id: Some(tc.id.clone()),
+                                    timestamp: None,
+                                });
+                                total_tool_calls += 1;
+                                continue;
+                            }
+
+                            // ── BeforeToolExec hook ──
+                            let before_input = ToolHookInput {
+                                tool_name: tc.function.name.clone(),
+                                tool_args: serde_json::from_str(&tc.function.arguments)
+                                    .unwrap_or_else(|_| {
+                                        serde_json::Value::String(tc.function.arguments.clone())
+                                    }),
+                                tool_id: tc.id.clone(),
+                                cycle: cycles,
+                                workspace: workspace.to_path_buf(),
+                                outcome_output: None,
+                                outcome_is_error: None,
+                                outcome_duration_ms: None,
+                            };
+                            let hook_output = run_tool_hooks(
+                                hooks,
+                                agent::HookPoint::BeforeToolExec,
+                                before_input,
+                                config,
+                            )
+                            .await;
+
+                            let effective_args = match hook_output {
+                                hooks::HookOutput::Reject { reason, events } => {
+                                    for ev in events {
+                                        let _ = live_send(parent_live_tx, ev).await;
+                                    }
+                                    total_tool_calls += 1;
+                                    messages.push(ChatMessage {
+                                        role: "tool".into(),
+                                        content: Some(format!("[rejected by hook] {reason}")),
+                                        images: None,
+                                        tool_calls: None,
+                                        tool_call_id: Some(tc.id.clone()),
+                                        timestamp: None,
+                                    });
+                                    continue;
+                                }
+                                hooks::HookOutput::ModifyToolArgs { args } => {
+                                    serde_json::to_string(&args)
+                                        .unwrap_or_else(|_| tc.function.arguments.clone())
+                                }
+                                _ => tc.function.arguments.clone(),
+                            };
+
+                            // Send tool event to parent
+                            let _ = live_send(
+                                parent_live_tx,
+                                json!({
+                                    "type": "task_tool",
+                                    "agent": spec.name,
+                                    "tool": tc.function.name,
+                                    "id": tc.id,
+                                }),
+                            )
+                            .await;
+
+                            // Execute the tool, bounded by sub-agent deadline.
+                            let tool_started = tokio::time::Instant::now();
+                            let (outcome, hit_deadline) = if unlimited {
+                                (
+                                    execute_subagent_tool(
+                                        &tc.function.name,
+                                        &effective_args,
+                                        config,
+                                        http,
+                                        workspace,
+                                    )
+                                    .await,
+                                    false,
+                                )
+                            } else {
+                                tokio::select! {
+                                    res = execute_subagent_tool(
+                                        &tc.function.name,
+                                        &effective_args,
+                                        config,
+                                        http,
+                                        workspace,
+                                    ) => (res, false),
+                                    _ = tokio::time::sleep_until(deadline) => {
+                                        timed_out = true;
+                                        aborted = true;
+                                        (
+                                            tools::ToolOutcome {
+                                                output: format!(
+                                                    "Tool '{}' aborted: sub-agent deadline exceeded",
+                                                    tc.function.name
+                                                ),
+                                                is_error: true,
+                                                duration_ms: tool_started.elapsed().as_millis() as u64,
+                                            },
+                                            true,
+                                        )
+                                    }
+                                }
+                            };
+
+                            total_tool_calls += 1;
+
+                            let outcome = apply_after_tool_exec_hook(
+                                hooks,
+                                config,
+                                workspace,
+                                cycles,
+                                &tc.function.name,
+                                &effective_args,
+                                &tc.id,
+                                outcome,
+                            )
+                            .await;
+
                             messages.push(ChatMessage {
                                 role: "tool".into(),
-                                content: Some(result_msg),
+                                content: Some(outcome.output),
                                 images: None,
                                 tool_calls: None,
                                 tool_call_id: Some(tc.id.clone()),
                                 timestamp: None,
                             });
-                            total_tool_calls += 1;
-                            continue;
+
+                            if hit_deadline {
+                                break 'react;
+                            }
+                        }
+                    } else {
+                        // ── Parallel path for read-only tool batches ─────────────
+                        // Covers built-in read-only tools only.
+                        // MCP read-only classification is a permission heuristic,
+                        // not a strong enough signal for safe parallel scheduling.
+                        // Mirrors the parent run_act_phase() 4-phase pattern:
+                        //   1. Sequential hook evaluation
+                        //   2. Send task_tool events
+                        //   3. Parallel execution bounded by deadline
+                        //   4. Sequential result recording
+
+                        // Phase 1: Evaluate BeforeToolExec hooks sequentially.
+                        struct SubHookEval {
+                            effective_args: Option<String>,
+                            rejected_output: Option<String>,
+                            reject_events: Vec<serde_json::Value>,
+                            disallowed: bool,
+                        }
+                        let mut hook_evals: Vec<SubHookEval> = Vec::with_capacity(tool_calls.len());
+                        for tc in tool_calls {
+                            if !allowed_tools.iter().any(|t| t == &tc.function.name) {
+                                hook_evals.push(SubHookEval {
+                                    effective_args: None,
+                                    rejected_output: Some(format!(
+                                        "Tool '{}' is not allowed for sub-agent '{}'",
+                                        tc.function.name, spec.name
+                                    )),
+                                    reject_events: Vec::new(),
+                                    disallowed: true,
+                                });
+                                continue;
+                            }
+                            let before_input = ToolHookInput {
+                                tool_name: tc.function.name.clone(),
+                                tool_args: serde_json::from_str(&tc.function.arguments)
+                                    .unwrap_or_else(|_| {
+                                        serde_json::Value::String(tc.function.arguments.clone())
+                                    }),
+                                tool_id: tc.id.clone(),
+                                cycle: cycles,
+                                workspace: workspace.to_path_buf(),
+                                outcome_output: None,
+                                outcome_is_error: None,
+                                outcome_duration_ms: None,
+                            };
+                            let hook_output = run_tool_hooks(
+                                hooks,
+                                agent::HookPoint::BeforeToolExec,
+                                before_input,
+                                config,
+                            )
+                            .await;
+                            hook_evals.push(match hook_output {
+                                hooks::HookOutput::Reject { reason, events } => SubHookEval {
+                                    effective_args: None,
+                                    rejected_output: Some(format!("[rejected by hook] {reason}")),
+                                    reject_events: events,
+                                    disallowed: false,
+                                },
+                                hooks::HookOutput::ModifyToolArgs { args } => SubHookEval {
+                                    effective_args: Some(
+                                        serde_json::to_string(&args)
+                                            .unwrap_or_else(|_| tc.function.arguments.clone()),
+                                    ),
+                                    rejected_output: None,
+                                    reject_events: Vec::new(),
+                                    disallowed: false,
+                                },
+                                _ => SubHookEval {
+                                    effective_args: Some(tc.function.arguments.clone()),
+                                    rejected_output: None,
+                                    reject_events: Vec::new(),
+                                    disallowed: false,
+                                },
+                            });
                         }
 
-                        // ── BeforeToolExec hook ──
-                        let before_input = ToolHookInput {
-                            tool_name: tc.function.name.clone(),
-                            tool_args: serde_json::from_str(&tc.function.arguments).unwrap_or_else(
-                                |_| serde_json::Value::String(tc.function.arguments.clone()),
-                            ),
-                            tool_id: tc.id.clone(),
-                            cycle: cycles,
-                            workspace: workspace.to_path_buf(),
-                            outcome_output: None,
-                            outcome_is_error: None,
-                            outcome_duration_ms: None,
-                        };
-                        let hook_output = run_tool_hooks(
-                            hooks,
-                            agent::HookPoint::BeforeToolExec,
-                            before_input,
-                            config,
+                        // Phase 2: Send task_tool events and hook reject events.
+                        for (tc, he) in tool_calls.iter().zip(hook_evals.iter()) {
+                            if cancel.is_cancelled() {
+                                aborted = true;
+                                break 'react;
+                            }
+                            if he.disallowed || he.rejected_output.is_some() {
+                                for ev in &he.reject_events {
+                                    let _ = live_send(parent_live_tx, ev.clone()).await;
+                                }
+                                continue;
+                            }
+                            let _ = live_send(
+                                parent_live_tx,
+                                json!({
+                                    "type": "task_tool",
+                                    "agent": spec.name,
+                                    "tool": tc.function.name,
+                                    "id": tc.id,
+                                }),
+                            )
+                            .await;
+                        }
+
+                        // Phase 3: Launch tool futures concurrently and preserve any
+                        // completed results if cancellation or the sub-agent deadline hits.
+                        let batch_started = tokio::time::Instant::now();
+                        let tool_futures: Vec<_> = tool_calls
+                            .iter()
+                            .zip(hook_evals.iter())
+                            .map(|(tc, he)| {
+                                if he.rejected_output.is_some() || he.disallowed {
+                                    return Box::pin(async { None })
+                                        as std::pin::Pin<
+                                            Box<
+                                                dyn std::future::Future<
+                                                        Output = Option<tools::ToolOutcome>,
+                                                    > + Send,
+                                            >,
+                                        >;
+                                }
+                                let args = he
+                                    .effective_args
+                                    .as_deref()
+                                    .unwrap_or(&tc.function.arguments)
+                                    .to_string();
+                                let name = tc.function.name.clone();
+                                let cfg = config.clone();
+                                let cl = http.clone();
+                                let ws = workspace.to_path_buf();
+                                Box::pin(async move {
+                                    Some(execute_subagent_tool(&name, &args, &cfg, &cl, &ws).await)
+                                })
+                            })
+                            .collect();
+
+                        let batch_result = collect_parallel_tool_results(
+                            tool_futures,
+                            &cancel,
+                            (!unlimited).then_some(deadline),
                         )
                         .await;
 
-                        let effective_args = match hook_output {
-                            hooks::HookOutput::Reject { reason, events } => {
-                                for ev in events {
-                                    let _ = live_send(parent_live_tx, ev).await;
-                                }
-                                total_tool_calls += 1;
+                        if batch_result.interrupted {
+                            aborted = true;
+                            timed_out |= batch_result.timed_out;
+                        }
+
+                        // Phase 4: Record results sequentially, apply AfterToolExec hooks.
+                        for (tc, (result_opt, he)) in tool_calls
+                            .iter()
+                            .zip(batch_result.results.into_iter().zip(hook_evals.into_iter()))
+                        {
+                            total_tool_calls += 1;
+                            if let Some(rejected_msg) = he.rejected_output {
                                 messages.push(ChatMessage {
                                     role: "tool".into(),
-                                    content: Some(format!("[rejected by hook] {reason}")),
+                                    content: Some(rejected_msg),
                                     images: None,
                                     tool_calls: None,
                                     tool_call_id: Some(tc.id.clone()),
@@ -328,93 +732,38 @@ pub(crate) async fn run_subagent(
                                 });
                                 continue;
                             }
-                            hooks::HookOutput::ModifyToolArgs { args } => {
-                                serde_json::to_string(&args)
-                                    .unwrap_or_else(|_| tc.function.arguments.clone())
-                            }
-                            _ => tc.function.arguments.clone(),
-                        };
-
-                        // Send tool event to parent
-                        let _ = live_send(
-                            parent_live_tx,
-                            json!({
-                                "type": "task_tool",
-                                "agent": spec.name,
-                                "tool": tc.function.name,
-                                "id": tc.id,
-                            }),
-                        )
-                        .await;
-
-                        // Execute the tool, bounded by sub-agent deadline.
-                        let tool_started = tokio::time::Instant::now();
-                        let (outcome, hit_deadline) = if unlimited {
-                            (
-                                execute_subagent_tool(
-                                    &tc.function.name,
-                                    &effective_args,
-                                    config,
-                                    http,
-                                    workspace,
-                                )
-                                .await,
-                                false,
+                            let eff_args = he
+                                .effective_args
+                                .as_deref()
+                                .unwrap_or(&tc.function.arguments);
+                            let outcome = finalize_parallel_batch_outcome(
+                                hooks,
+                                config,
+                                workspace,
+                                cycles,
+                                &tc.function.name,
+                                eff_args,
+                                &tc.id,
+                                result_opt,
+                                batch_result.interrupted,
+                                batch_result.timed_out,
+                                batch_started.elapsed().as_millis() as u64,
                             )
-                        } else {
-                            tokio::select! {
-                                res = execute_subagent_tool(
-                                    &tc.function.name,
-                                    &effective_args,
-                                    config,
-                                    http,
-                                    workspace,
-                                ) => (res, false),
-                                _ = tokio::time::sleep_until(deadline) => {
-                                    timed_out = true;
-                                    aborted = true;
-                                    (
-                                        tools::ToolOutcome {
-                                            output: format!(
-                                                "Tool '{}' aborted: sub-agent deadline exceeded",
-                                                tc.function.name
-                                            ),
-                                            is_error: true,
-                                            duration_ms: tool_started.elapsed().as_millis() as u64,
-                                        },
-                                        true,
-                                    )
-                                }
-                            }
-                        };
+                            .await;
+                            messages.push(ChatMessage {
+                                role: "tool".into(),
+                                content: Some(outcome.output),
+                                images: None,
+                                tool_calls: None,
+                                tool_call_id: Some(tc.id.clone()),
+                                timestamp: None,
+                            });
+                        }
 
-                        total_tool_calls += 1;
-
-                        let outcome = apply_after_tool_exec_hook(
-                            hooks,
-                            config,
-                            workspace,
-                            cycles,
-                            &tc.function.name,
-                            &effective_args,
-                            &tc.id,
-                            outcome,
-                        )
-                        .await;
-
-                        messages.push(ChatMessage {
-                            role: "tool".into(),
-                            content: Some(outcome.output),
-                            images: None,
-                            tool_calls: None,
-                            tool_call_id: Some(tc.id.clone()),
-                            timestamp: None,
-                        });
-
-                        if hit_deadline {
+                        if batch_result.interrupted {
                             break 'react;
                         }
-                    }
+                    } // end parallel path
                 }
             }
             Err(error) => {

@@ -475,6 +475,14 @@ pub(crate) fn is_task_tool(name: &str) -> bool {
     name == "task"
 }
 
+/// Returns true if the named tool can safely run in parallel with other parallelizable tools.
+/// Parent runs share a single workspace, so this is intentionally limited to
+/// read-only tools until delegated tasks gain real filesystem isolation.
+/// Used by `run_act_phase()` to decide between sequential and parallel dispatch.
+pub(crate) fn is_parallelizable_tool(name: &str) -> bool {
+    is_read_only_tool(name)
+}
+
 /// Generate the `task` tool definition for OpenAI format.
 /// The description is dynamically enriched with discovered sub-agent names.
 pub(crate) fn task_tool_definition_openai(agent_names: &[String]) -> serde_json::Value {

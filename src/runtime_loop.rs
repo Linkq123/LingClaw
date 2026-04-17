@@ -1344,12 +1344,12 @@ async fn run_act_phase(
     phase_state.collected_results.clear();
     let tool_calls = std::mem::take(&mut phase_state.pending_tool_calls);
 
-    let all_read_only = tool_calls.len() > 1
+    let all_parallelizable = tool_calls.len() > 1
         && tool_calls
             .iter()
-            .all(|tc| tools::is_read_only_tool(&tc.function.name));
+            .all(|tc| tools::is_parallelizable_tool(&tc.function.name));
 
-    if !all_read_only {
+    if !all_parallelizable {
         // Sequential path: single tool call or any mutating tool in the batch.
         for tc in &tool_calls {
             if ctx.run_cancel.is_cancelled() {
@@ -1371,7 +1371,9 @@ async fn run_act_phase(
             }
         }
     } else {
-        // Multiple read-only tool calls: parallel execution with ordered result recording.
+        // Multiple parallel-safe read-only tool calls: parallel execution with
+        // ordered result recording. Mutating tools and delegated `task` runs
+        // stay sequential because they share the parent workspace.
         // 1. Run BeforeToolExec hooks sequentially (may reject or modify args).
         struct HookEvalResult {
             effective_args: Option<String>,

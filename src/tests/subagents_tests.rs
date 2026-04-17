@@ -1,6 +1,7 @@
 use crate::subagents::discovery::discover_all_agents;
 use crate::subagents::{AgentSource, SubAgentSpec, ToolPermissions, render_agents_catalog};
 use crate::{ChatMessage, agent};
+use tokio_util::sync::CancellationToken;
 
 #[test]
 fn test_tool_permissions_basic() {
@@ -320,6 +321,40 @@ fn test_mcp_tool_classification_no_false_positives_from_substrings() {
     )));
 }
 
+#[tokio::test]
+async fn test_mcp_read_only_tools_remain_sequential_for_parallel_dispatch() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-parallel-readonly-mcp");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    let log_path = workspace.join("mock.log");
+
+    let config = base_config_with_mock_mcp_server("normal", &log_path);
+    crate::tools::mcp::ensure_tools_cached(&config, &workspace).await;
+    let reports = crate::tools::mcp::refresh_servers(&config, &workspace)
+        .await
+        .expect("mock MCP server should refresh");
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].error.is_none(), "{:?}", reports[0].error);
+    let tool_name = reports[0]
+        .tool_names
+        .first()
+        .cloned()
+        .expect("mock MCP server should expose a tool");
+
+    let descriptor = crate::tools::mcp::cached_list_tools(&config, &workspace)
+        .into_iter()
+        .find(|tool| tool.exposed_name == tool_name)
+        .expect("mock MCP tool should be cached");
+
+    assert!(is_mcp_tool_read_only(&descriptor));
+    assert!(crate::tools::is_read_only_tool("read_file"));
+    assert!(!crate::tools::is_read_only_tool(&tool_name));
+    assert!(!crate::tools::is_read_only_tool("exec"));
+
+    let _ = crate::tools::mcp::refresh_servers(&config, &workspace).await;
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 #[test]
 fn test_parse_agent_frontmatter_with_mcp_policy() {
     let content = r#"---
@@ -592,12 +627,86 @@ fn build_openai_tool_call_stream(tool_name: &str, args: serde_json::Value) -> St
     format!("data: {}\n\ndata: [DONE]\n\n", chunk)
 }
 
+fn build_openai_multi_tool_call_stream(tool_calls: Vec<(&str, serde_json::Value)>) -> String {
+    let calls: Vec<_> = tool_calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, (tool_name, args))| {
+            let args_json = serde_json::to_string(&args).expect("tool args should serialize");
+            serde_json::json!({
+                "index": index,
+                "id": format!("call_{}", index + 1),
+                "function": {
+                    "name": tool_name,
+                    "arguments": args_json
+                }
+            })
+        })
+        .collect();
+    let chunk = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": calls
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    format!("data: {}\n\ndata: [DONE]\n\n", chunk)
+}
+
 fn slow_tool_command() -> String {
     if cfg!(windows) {
         "timeout /T 2 /NOBREAK > NUL".to_string()
     } else {
         "while :; do :; done".to_string()
     }
+}
+
+#[tokio::test]
+async fn collect_parallel_tool_results_preserves_finished_results_on_deadline() {
+    let fast_future = Box::pin(async {
+        Some(crate::tools::ToolOutcome {
+            output: "fast result".to_string(),
+            is_error: false,
+            duration_ms: 1,
+        })
+    })
+        as std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Option<crate::tools::ToolOutcome>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+    let slow_future = Box::pin(async {
+        std::future::pending::<()>().await;
+        #[allow(unreachable_code)]
+        None
+    })
+        as std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Option<crate::tools::ToolOutcome>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+
+    let cancel = CancellationToken::new();
+    let batch = crate::subagents::executor::collect_parallel_tool_results(
+        vec![fast_future, slow_future],
+        &cancel,
+        Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+    )
+    .await;
+
+    assert!(batch.interrupted);
+    assert!(batch.timed_out);
+    assert_eq!(batch.results.len(), 2);
+    assert_eq!(
+        batch.results[0].as_ref().map(|o| o.output.as_str()),
+        Some("fast result")
+    );
+    assert!(batch.results[1].is_none());
 }
 
 /// Sub-agents use the configured delegated model when set.
@@ -651,6 +760,14 @@ struct TimeoutMarkerHook;
 
 struct ObservedTimeoutHook {
     expected_command: String,
+    called: Arc<AtomicBool>,
+}
+
+struct RecordingAfterToolHook {
+    seen_tools: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+struct GuardedAfterToolHook {
     called: Arc<AtomicBool>,
 }
 
@@ -751,6 +868,85 @@ impl AgentHook for ObservedTimeoutHook {
     }
 }
 
+impl AgentHook for RecordingAfterToolHook {
+    fn name(&self) -> &'static str {
+        "recording_after_tool"
+    }
+
+    fn point(&self) -> agent::HookPoint {
+        agent::HookPoint::AfterToolExec
+    }
+
+    fn should_run(&self, _: &[ChatMessage], _: Provider, _: usize, _: usize) -> bool {
+        false
+    }
+
+    fn run<'a>(
+        &'a self,
+        _: HookInput,
+        _: &'a Config,
+        _: &'a reqwest::Client,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async { HookOutput::NoOp })
+    }
+
+    fn should_run_tool(&self, _: &str, point: agent::HookPoint) -> bool {
+        point == agent::HookPoint::AfterToolExec
+    }
+
+    fn run_tool<'a>(
+        &'a self,
+        input: ToolHookInput,
+        _: &'a Config,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async move {
+            self.seen_tools
+                .lock()
+                .expect("after-tool hook state should lock")
+                .push(input.tool_name.clone());
+            HookOutput::NoOp
+        })
+    }
+}
+
+impl AgentHook for GuardedAfterToolHook {
+    fn name(&self) -> &'static str {
+        "guarded_after_tool"
+    }
+
+    fn point(&self) -> agent::HookPoint {
+        agent::HookPoint::AfterToolExec
+    }
+
+    fn should_run(&self, _: &[ChatMessage], _: Provider, _: usize, _: usize) -> bool {
+        false
+    }
+
+    fn run<'a>(
+        &'a self,
+        _: HookInput,
+        _: &'a Config,
+        _: &'a reqwest::Client,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async { HookOutput::NoOp })
+    }
+
+    fn should_run_tool(&self, _: &str, point: agent::HookPoint) -> bool {
+        point == agent::HookPoint::AfterToolExec
+    }
+
+    fn run_tool<'a>(
+        &'a self,
+        _: ToolHookInput,
+        _: &'a Config,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async move {
+            self.called.store(true, Ordering::SeqCst);
+            HookOutput::NoOp
+        })
+    }
+}
+
 #[tokio::test]
 async fn timeout_outcome_still_runs_after_tool_exec_hook() {
     let mut registry = HookRegistry::new();
@@ -778,6 +974,230 @@ async fn timeout_outcome_still_runs_after_tool_exec_hook() {
     assert_eq!(
         outcome.output,
         "Tool 'exec' aborted: sub-agent deadline exceeded [after-hook]"
+    );
+}
+
+#[tokio::test]
+async fn interrupted_parallel_batch_outcome_skips_after_tool_exec_hook_without_result() {
+    let called = Arc::new(AtomicBool::new(false));
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(GuardedAfterToolHook {
+        called: called.clone(),
+    }));
+
+    let workspace = std::env::temp_dir();
+    let outcome = crate::subagents::executor::finalize_parallel_batch_outcome(
+        &registry,
+        &base_config(),
+        &workspace,
+        1,
+        "read_file",
+        r#"{"path":"notes.txt"}"#,
+        "tc-interrupted",
+        None,
+        true,
+        true,
+        25,
+    )
+    .await;
+
+    assert!(!called.load(Ordering::SeqCst));
+    assert!(outcome.is_error);
+    assert_eq!(outcome.duration_ms, 25);
+    assert!(outcome.output.contains("deadline exceeded"));
+}
+
+#[tokio::test]
+async fn run_subagent_multi_read_only_batch_executes_after_tool_exec_hooks() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-readonly-batch");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")
+        .expect("fixture file should be written");
+
+    let response_body = build_openai_multi_tool_call_stream(vec![
+        (
+            "read_file",
+            serde_json::json!({
+                "path": "notes.txt"
+            }),
+        ),
+        (
+            "list_dir",
+            serde_json::json!({
+                "path": "."
+            }),
+        ),
+    ]);
+    let (api_base, handle) = spawn_one_shot_http_server("text/event-stream", response_body);
+
+    let mut config = base_config();
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+
+    let spec = SubAgentSpec {
+        name: "batch-agent".into(),
+        description: String::new(),
+        system_prompt: "Inspect the workspace with read-only tools.".into(),
+        max_turns: 1,
+        tools: ToolPermissions {
+            allow: vec!["read_file".into(), "list_dir".into()],
+            deny: vec![],
+        },
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let seen_tools = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut hooks = HookRegistry::new();
+    hooks.register(Box::new(RecordingAfterToolHook {
+        seen_tools: seen_tools.clone(),
+    }));
+
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(16);
+    let http = reqwest::Client::new();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Read the file and list the directory.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &hooks,
+    )
+    .await;
+
+    handle.join().expect("server thread should join");
+
+    let seen = seen_tools
+        .lock()
+        .expect("after-tool hook state should lock")
+        .clone();
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.cycles, 1);
+    assert_eq!(outcome.tool_calls, 2);
+    assert_eq!(seen.len(), 2);
+    assert!(seen.iter().any(|tool| tool == "read_file"));
+    assert!(seen.iter().any(|tool| tool == "list_dir"));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+/// Integration test: chains Phase 3 (`collect_parallel_tool_results` with a deadline
+/// that interrupts one tool) into Phase 4 (`finalize_parallel_batch_outcome` for each
+/// slot). Verifies that `AfterToolExec` fires only for the tool whose future completed,
+/// and the interrupted slot receives a synthetic error without triggering the hook.
+#[tokio::test]
+async fn parallel_batch_interrupt_fires_hooks_only_for_completed_tools() {
+    // Phase 3: One fast future and one pending (never-completes) future.
+    let fast_future = Box::pin(async {
+        Some(crate::tools::ToolOutcome {
+            output: "file contents here".to_string(),
+            is_error: false,
+            duration_ms: 1,
+        })
+    })
+        as std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Option<crate::tools::ToolOutcome>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+    let slow_future = Box::pin(async {
+        std::future::pending::<()>().await;
+        #[allow(unreachable_code)]
+        None
+    })
+        as std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Option<crate::tools::ToolOutcome>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+
+    let cancel = CancellationToken::new();
+    let batch = crate::subagents::executor::collect_parallel_tool_results(
+        vec![fast_future, slow_future],
+        &cancel,
+        Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+    )
+    .await;
+
+    assert!(batch.interrupted);
+    assert!(batch.timed_out);
+    assert_eq!(batch.results.len(), 2);
+    // Fast tool completed.
+    assert!(batch.results[0].is_some());
+    // Slow tool did not complete.
+    assert!(batch.results[1].is_none());
+
+    // Phase 4: Record results through finalize_parallel_batch_outcome.
+    let seen_tools = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut hooks = HookRegistry::new();
+    hooks.register(Box::new(RecordingAfterToolHook {
+        seen_tools: seen_tools.clone(),
+    }));
+    let config = base_config();
+    let workspace = std::env::temp_dir();
+    let elapsed_ms = 20_u64;
+
+    let mut results_iter = batch.results.into_iter();
+
+    // Slot 0: read_file (completed)
+    let outcome0 = crate::subagents::executor::finalize_parallel_batch_outcome(
+        &hooks,
+        &config,
+        &workspace,
+        1,
+        "read_file",
+        r#"{"path":"notes.txt"}"#,
+        "tc-0",
+        results_iter.next().unwrap(),
+        batch.interrupted,
+        batch.timed_out,
+        elapsed_ms,
+    )
+    .await;
+
+    // Slot 1: list_dir (interrupted — None)
+    let outcome1 = crate::subagents::executor::finalize_parallel_batch_outcome(
+        &hooks,
+        &config,
+        &workspace,
+        1,
+        "list_dir",
+        r#"{"path":"."}"#,
+        "tc-1",
+        results_iter.next().unwrap(),
+        batch.interrupted,
+        batch.timed_out,
+        elapsed_ms,
+    )
+    .await;
+
+    // AfterToolExec should fire only for the completed tool.
+    let seen = seen_tools.lock().expect("hook state should lock").clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "AfterToolExec should fire only for completed tools, got: {seen:?}"
+    );
+    assert_eq!(seen[0], "read_file");
+
+    // Completed tool gets its real result through the hook pipeline.
+    assert!(!outcome0.is_error);
+    assert_eq!(outcome0.output, "file contents here");
+
+    // Interrupted tool gets a synthetic error without touching the hook.
+    assert!(outcome1.is_error);
+    assert!(
+        outcome1.output.contains("deadline exceeded"),
+        "expected deadline exceeded message, got: {}",
+        outcome1.output
     );
 }
 

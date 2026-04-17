@@ -20,8 +20,8 @@ pub(crate) mod executor;
 
 use serde::{Deserialize, Serialize};
 
-/// Maximum number of concurrent sub-agent tasks in a single Act phase.
-#[allow(dead_code)] // Reserved for future parallel task execution
+/// Reserved for future task-level workspace isolation work.
+#[allow(dead_code)]
 pub(crate) const MAX_CONCURRENT_SUBAGENTS: usize = 3;
 
 /// Hard upper limit on sub-agent max_turns (prevents runaway custom agents).
