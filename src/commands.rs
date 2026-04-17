@@ -1197,6 +1197,7 @@ Commands:
     /agents          List discovered sub-agents
     /clear           Clear messages (keep system prompt)
     /memory [stats|debug] Show structured memory status or updater diagnostics
+    /reflection [today|yesterday|list] Show daily reflection status and reflection entries
     /help            Show this help"
         .to_string();
     if current_session_id == MAIN_SESSION_ID {
@@ -1261,6 +1262,188 @@ async fn handle_memory_command(
     };
 
     command_result(response, "system", false)
+}
+
+async fn handle_reflection_command(
+    arg: &str,
+    current_session_id: &str,
+    state: &AppState,
+) -> CommandResult {
+    let workspace = {
+        let sessions = state.sessions.lock().await;
+        match sessions.get(current_session_id) {
+            Some(s) => s.workspace.clone(),
+            None => return command_result("Session not found", "error", false),
+        }
+    };
+    let memory_dir = workspace.join("memory");
+    let local = prompts::current_local_snapshot();
+    let today = local.today();
+    let yesterday = local.yesterday();
+    let enabled = state.config.daily_reflection;
+
+    let response = match arg {
+        "" => {
+            // Overview: config + runtime status + today preview.
+            let mut lines = vec![format!(
+                "Daily Reflection: {}",
+                if enabled {
+                    "**enabled**"
+                } else {
+                    "**disabled**"
+                }
+            )];
+            if enabled {
+                let runtime = crate::runtime_loop::reflection_runtime_status();
+                let model = state
+                    .config
+                    .reflection_model
+                    .as_deref()
+                    .unwrap_or("(inherits memory_model or primary)");
+                lines.push(format!("Model: {model}"));
+                lines.push("Min cycles: 3 | Cooldown: 10 min".to_string());
+                lines.push(runtime);
+            } else {
+                lines.push(
+                    "Enable with `\"dailyReflection\": true` in settings or `LINGCLAW_DAILY_REFLECTION=true`."
+                        .to_string(),
+                );
+            }
+            let today_preview = read_reflection_entries_preview(&memory_dir, &today, 500).await;
+            if let Some(preview) = today_preview {
+                lines.push(format!(
+                    "\n--- Today's reflections ({today}) ---\n{preview}"
+                ));
+            } else {
+                lines.push(format!("\nNo reflections today ({today})."));
+            }
+            lines.join("\n")
+        }
+        "today" => read_reflection_entries_full(&memory_dir, &today)
+            .await
+            .unwrap_or_else(|| format!("No reflections for {today}.")),
+        "yesterday" => read_reflection_entries_full(&memory_dir, &yesterday)
+            .await
+            .unwrap_or_else(|| format!("No reflections for {yesterday}.")),
+        "list" => list_daily_memory_files(&memory_dir).await,
+        _ => return command_result("Usage: /reflection [today|yesterday|list]", "system", false),
+    };
+
+    command_result(response, "system", false)
+}
+
+/// Extract only reflection sections from daily memory content.
+/// Entries are recognized by their `## HH:MM Local` header shape, which avoids
+/// mis-parsing Markdown horizontal rules inside the reflection body.
+fn is_daily_memory_entry_header(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("## ") else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    if bytes.len() < 11 {
+        return false;
+    }
+    if !(bytes[0].is_ascii_digit()
+        && bytes[1].is_ascii_digit()
+        && bytes[2] == b':'
+        && bytes[3].is_ascii_digit()
+        && bytes[4].is_ascii_digit()
+        && &bytes[5..11] == b" Local")
+    {
+        return false;
+    }
+    bytes.len() == 11 || rest[11..].starts_with(" \u{2014} Reflection")
+}
+
+fn filter_reflection_sections(content: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let entry_starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| is_daily_memory_entry_header(line).then_some(idx))
+        .collect();
+    let mut sections: Vec<String> = Vec::new();
+    for (idx, start) in entry_starts.iter().copied().enumerate() {
+        if !lines[start].contains("\u{2014} Reflection") {
+            continue;
+        }
+        let mut end = entry_starts.get(idx + 1).copied().unwrap_or(lines.len());
+        if idx + 1 < entry_starts.len() {
+            while end > start {
+                let line = lines[end - 1].trim();
+                if line.is_empty() || line == "---" {
+                    end -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        let section = lines[start..end].join("\n");
+        let trimmed = section.trim();
+        if !trimmed.is_empty() {
+            sections.push(trimmed.to_string());
+        }
+    }
+    if sections.is_empty() {
+        return None;
+    }
+    let joined = sections.join("\n\n---\n\n");
+    let trimmed = joined.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Read reflection entries from a daily memory file, returning a truncated preview.
+async fn read_reflection_entries_preview(
+    memory_dir: &Path,
+    date: &str,
+    max_chars: usize,
+) -> Option<String> {
+    let path = memory_dir.join(format!("{date}.md"));
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+    let filtered = filter_reflection_sections(&content)?;
+    Some(truncate(&filtered, max_chars).to_string())
+}
+
+/// Read the full reflection entries from a daily memory file.
+async fn read_reflection_entries_full(memory_dir: &Path, date: &str) -> Option<String> {
+    let path = memory_dir.join(format!("{date}.md"));
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+    filter_reflection_sections(&content)
+}
+
+/// List all daily memory files in the memory directory, newest first.
+async fn list_daily_memory_files(memory_dir: &Path) -> String {
+    let mut rd = match tokio::fs::read_dir(memory_dir).await {
+        Ok(rd) => rd,
+        Err(_) => return "No reflection files found.".to_string(),
+    };
+    let mut files: Vec<String> = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".md") {
+            continue;
+        }
+        let Ok(content) = tokio::fs::read_to_string(entry.path()).await else {
+            continue;
+        };
+        if filter_reflection_sections(&content).is_some() {
+            files.push(name);
+        }
+    }
+    if files.is_empty() {
+        return "No reflection files found.".to_string();
+    }
+    files.sort();
+    files.reverse();
+    let mut lines = vec![format!("Reflection files ({} total):", files.len())];
+    for f in &files {
+        lines.push(format!("  {f}"));
+    }
+    lines.join("\n")
 }
 
 async fn handle_agents_command(current_session_id: &str, state: &AppState) -> CommandResult {
@@ -1369,6 +1552,7 @@ pub(crate) async fn handle_command(
         "/sessions" => Some(handle_sessions_command(current_session_id, state).await),
         "/delete" => Some(handle_delete_command(arg, current_session_id, state).await),
         "/memory" => Some(handle_memory_command(arg, current_session_id, state).await),
+        "/reflection" => Some(handle_reflection_command(arg, current_session_id, state).await),
         "/agents" => Some(handle_agents_command(current_session_id, state).await),
 
         // /stop when not busy — the in-flight case is handled by the agent loop drain

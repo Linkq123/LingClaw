@@ -18,7 +18,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；主 Agent 与子代理都会按需发现并使用这些 MCP tools；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断；server 启动连续失败会进入短暂冷却，避免请求风暴
 - **单主会话**：运行时固定使用 `main`，不再创建、切换或删除其他会话
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、coder）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
-- **文档化斜杠命令**：`/new`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/help`
+- **文档化斜杠命令**：`/new`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/reflection`、`/help`
 - **三 Provider 模型路由**：OpenAI + Anthropic + Ollama，支持 `provider/model` 和纯 model ID
 - **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
 - **持久化主会话**：固定保存 `main` 工作区和磁盘存档
@@ -28,6 +28,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
 - **Structured Memory（可选）**：启用 `structuredMemory` 后，Finish 阶段会异步抽取稳定偏好、项目上下文和长期事实，写入 workspace 下的 `structured_memory.json`，并记录 `structured_memory.audit.jsonl` 诊断轨迹；`/memory`、`/memory stats`、`/memory debug` 可查看状态与最近审计信息
+- **Daily Reflection（可选）**：启用 `dailyReflection` 后，多步任务完成时会在 Finish 后台异步生成简短 reflection，追加到 workspace 下的 `memory/YYYY-MM-DD.md`；`/reflection`、`/reflection today`、`/reflection yesterday`、`/reflection list` 可查看状态和已过滤的 reflection 条目
 - **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环，`evaluate_finish()` 结构化完成判定，`auto_think_level()` 按循环深度动态调整推理预算
 - **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留；错误工具标记 `[FAILED]` 并附带耗时
 - **推理可见性控制**：默认开启 ReAct 阶段转换 WS 事件（`react_phase`），可通过 `/react on|off` 手动切换；浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
@@ -102,6 +103,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
     "maxOutputBytes": 51200,
     "maxFileBytes": 204800,
     "structuredMemory": false,
+    "dailyReflection": false,
     "enableS3": true
   },
   "models": {
@@ -163,7 +165,8 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
         "primary": "openai/gpt-4o-mini",
         "fast": "openai/gpt-4o-mini",
         "sub-agent": "openai/gpt-4o-mini",
-        "memory": "openai/gpt-4o-mini"
+        "memory": "openai/gpt-4o-mini",
+        "reflection": "openai/gpt-4o-mini"
       }
     }
   },
@@ -185,6 +188,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 - 推荐使用 `provider/model` 格式引用模型
 - 多个 provider 暴露同一 model ID 时，必须使用显式前缀
 - `structuredMemory` 默认为 `false`；启用后会在 Finish 阶段后台更新结构化记忆，并在后续 system prompt 中注入摘要；若配置了 `agents.defaults.model.memory` 或 `LINGCLAW_MEMORY_MODEL`，后台抽取优先使用该模型，否则回退到当前会话有效模型
+- `dailyReflection` 默认为 `false`；启用后会在满足轮次和冷却条件时，于 Finish 后台生成 post-execution reflection，并追加到 `memory/YYYY-MM-DD.md`；若配置了 `agents.defaults.model.reflection` 或 `LINGCLAW_REFLECTION_MODEL`，reflection 优先使用该模型，否则回退到 memory 模型，再回退到当前会话有效模型
 - 顶层 `s3` 为可选项；配置后聊天页会额外启用本地 JPEG/PNG 上传，上传对象以 object key 持久化，历史回放和 provider 请求都会即时重新现签 URL
 - AWS S3 若使用官方 endpoint，建议使用与 `region` 对应的区域 host；设置向导留空 endpoint 时会自动默认到该区域地址
 - OpenAI/Anthropic 直接使用现签 URL，因此 `s3.endpoint` 必须能被远端 provider 访问；私网、localhost 或 VPN-only 网关仅保证 Ollama 可用，因为 Ollama 路径会在本地预取并转成 base64
@@ -218,6 +222,18 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 - 超时策略：memory 更新请求沿用 `toolTimeout` 预算，并设 30 秒下限，避免配置过小导致后台更新恒定超时
 - 查看状态：`/memory` 显示当前摘要和 updater 运行状态，`/memory stats` 显示 updater 计数器，`/memory debug` 额外显示最近审计记录
 
+### Daily Reflection
+
+`dailyReflection` 是一个默认关闭的可选功能，用于把多步任务结束后的简短复盘写入每日记忆文件。它与 `structuredMemory` 不同：前者写的是面向人阅读的 daily log 条目，后者维护的是机器可读的 `structured_memory.json`。
+
+- 启用方式：在 `settings.dailyReflection` 中设为 `true`，或设置环境变量 `LINGCLAW_DAILY_REFLECTION=true`
+- 存储位置：`~/.lingclaw/main/workspace/memory/YYYY-MM-DD.md`
+- 写入格式：reflection 会以 `## HH:MM Local — Reflection (...)` 形式追加到 daily memory 文件中，与 `/new` 写入的普通压缩摘要共存
+- 触发条件：仅在完成阶段触发，默认至少需要 3 个 agent cycle，并受 10 分钟冷却限制；不阻塞主 agent loop
+- 模型选择：优先使用 `agents.defaults.model.reflection` 或环境变量 `LINGCLAW_REFLECTION_MODEL`；未设置时回退到 `memory` 模型，再回退到当前会话有效模型
+- 查看状态：`/reflection` 显示 feature 状态、运行时冷却信息和今天的 reflection 预览；`/reflection today` 与 `/reflection yesterday` 显示完整 reflection 条目；`/reflection list` 只列出实际包含 reflection 的日期文件
+- 读取行为：`/reflection` 会从 `memory/YYYY-MM-DD.md` 中只提取带 `— Reflection` 头部的条目，自动忽略 `/new` 写入的普通摘要段落
+
 ## Environment Variables
 
 | 变量 | 默认值 | 说明 |
@@ -238,7 +254,9 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 | `LINGCLAW_FAST_MODEL` | 无 | 简单首轮查询使用的轻量模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_SUB_AGENT_MODEL` | 无 | 子代理委托任务使用的模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_MEMORY_MODEL` | 无 | structured memory 后台抽取优先使用的模型（如 `openai/gpt-4o-mini`） |
+| `LINGCLAW_REFLECTION_MODEL` | 无 | daily reflection 后台生成优先使用的模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_STRUCTURED_MEMORY` | `false` | 启用后台结构化记忆提取与 prompt 注入 |
+| `LINGCLAW_DAILY_REFLECTION` | `false` | 启用后台 daily reflection 生成与 `/reflection` 查看能力 |
 
 ## Slash Commands
 
@@ -262,6 +280,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 | `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；单会话模式下同时显示主会话今日总 token 估算，按 K/M 显示 |
 | `/clear` | 清空消息但保留系统提示 |
 | `/memory [stats\|debug]` | 查看当前 structured memory 摘要与 updater 状态；`stats` 仅显示运行状态，`debug` 额外显示最近审计记录 |
+| `/reflection [today\|yesterday\|list]` | 查看当前 daily reflection 状态与 reflection 条目；默认显示 feature 状态、冷却信息和今天的 reflection 预览，`list` 只列出实际包含 reflection 的日期文件 |
 | `/help` | 命令帮助 |
 
 ## Tools

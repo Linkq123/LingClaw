@@ -67,6 +67,28 @@ fn rollback_reflection_claim(previous: i64, claimed: i64) {
     );
 }
 
+/// Return runtime reflection status for the `/reflection` command.
+pub(crate) fn reflection_runtime_status() -> String {
+    let last = LAST_REFLECTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 {
+        return "Last reflection: never (since server start)".to_string();
+    }
+    let now = epoch_secs_now();
+    let elapsed = now - last;
+    let remaining = REFLECTION_COOLDOWN_SECS - elapsed;
+    if remaining > 0 {
+        format!(
+            "Last reflection: {}s ago (cooldown: {}s remaining)",
+            elapsed, remaining
+        )
+    } else {
+        format!(
+            "Last reflection: {}s ago (cooldown elapsed, ready)",
+            elapsed
+        )
+    }
+}
+
 pub(crate) struct AgentRunOutcome {
     pub(crate) rerun_agent: bool,
     pub(crate) shutting_down: bool,

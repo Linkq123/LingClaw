@@ -476,7 +476,7 @@ impl LocalTimeSnapshot {
         format_local_date(self.now)
     }
 
-    fn yesterday(self) -> String {
+    pub(crate) fn yesterday(self) -> String {
         format_local_date(self.now - ChronoDuration::days(1))
     }
 
