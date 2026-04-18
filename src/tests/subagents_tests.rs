@@ -1177,6 +1177,93 @@ async fn run_subagent_emits_tool_result_event_for_completed_tool() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
+#[tokio::test]
+async fn run_subagent_sequential_tools_emit_interleaved_tool_events() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-sequential-tool-events");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")
+        .expect("fixture file should be written");
+
+    let response_body = build_openai_multi_tool_call_stream(vec![
+        (
+            "read_file",
+            serde_json::json!({
+                "path": "notes.txt"
+            }),
+        ),
+        (
+            "exec",
+            serde_json::json!({
+                "command": "echo sequential"
+            }),
+        ),
+    ]);
+    let (api_base, handle) = spawn_one_shot_http_server("text/event-stream", response_body);
+
+    let mut config = base_config();
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+
+    let spec = SubAgentSpec {
+        name: "sequential-event-agent".into(),
+        description: String::new(),
+        system_prompt: "Read the file and run a harmless command.".into(),
+        max_turns: 1,
+        tools: ToolPermissions {
+            allow: vec!["read_file".into(), "exec".into()],
+            deny: vec![],
+        },
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(16);
+    let http = reqwest::Client::new();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Read notes.txt and echo sequential.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &HookRegistry::new(),
+        "test-task-sequential-events",
+    )
+    .await;
+
+    handle.join().expect("server thread should join");
+
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.cycles, 1);
+    assert_eq!(outcome.tool_calls, 2);
+
+    let mut tool_events = Vec::new();
+    while let Ok(event) = live_rx.try_recv() {
+        if matches!(event["type"].as_str(), Some("task_tool" | "tool_result")) {
+            tool_events.push(event);
+        }
+    }
+
+    assert_eq!(tool_events.len(), 4);
+    assert_eq!(tool_events[0]["type"], "task_tool");
+    assert_eq!(tool_events[0]["id"], "call_1");
+    assert_eq!(tool_events[0]["tool"], "read_file");
+    assert_eq!(tool_events[1]["type"], "tool_result");
+    assert_eq!(tool_events[1]["id"], "call_1");
+    assert_eq!(tool_events[1]["name"], "read_file");
+    assert_eq!(tool_events[2]["type"], "task_tool");
+    assert_eq!(tool_events[2]["id"], "call_2");
+    assert_eq!(tool_events[2]["tool"], "exec");
+    assert_eq!(tool_events[3]["type"], "tool_result");
+    assert_eq!(tool_events[3]["id"], "call_2");
+    assert_eq!(tool_events[3]["name"], "exec");
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 /// Integration test: chains Phase 3 (`collect_parallel_tool_results` with a deadline
 /// that interrupts one tool) into Phase 4 (`finalize_parallel_batch_outcome` for each
 /// slot). Verifies that `AfterToolExec` fires only for the tool whose future completed,
