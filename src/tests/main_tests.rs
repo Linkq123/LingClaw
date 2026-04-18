@@ -1171,6 +1171,162 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
 }
 
 #[test]
+fn resolve_model_prefers_exact_runtime_match_for_same_anthropic_provider_type() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "anthropic-a".to_string(),
+        JsonProviderConfig {
+            base_url: "https://anthropic-a.example".to_string(),
+            api_key: "ant-key-a".to_string(),
+            api: "anthropic".to_string(),
+            models: vec![JsonModelEntry {
+                id: "shared-model".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(200000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+    providers.insert(
+        "anthropic-b".to_string(),
+        JsonProviderConfig {
+            base_url: "https://anthropic-b.example".to_string(),
+            api_key: "ant-key-b".to_string(),
+            api: "anthropic".to_string(),
+            models: vec![JsonModelEntry {
+                id: "shared-model".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(200000),
+                max_tokens: Some(12288),
+                compat: None,
+            }],
+        },
+    );
+
+    let config = Config {
+        api_key: "ant-key-b".to_string(),
+        api_base: "https://anthropic-b.example".to_string(),
+        model: "shared-model".to_string(),
+        fast_model: None,
+        sub_agent_model: None,
+        memory_model: None,
+
+        reflection_model: None,
+        context_model: None,
+        provider: Provider::Anthropic,
+        anthropic_prompt_caching: false,
+        providers,
+        mcp_servers: HashMap::new(),
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
+        structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
+    };
+
+    let resolved = config.resolve_model("shared-model");
+
+    assert_eq!(resolved.provider, Provider::Anthropic);
+    assert_eq!(resolved.api_base, "https://anthropic-b.example");
+    assert_eq!(resolved.api_key, "ant-key-b");
+    assert_eq!(resolved.max_tokens, Some(12288));
+}
+
+#[test]
+fn resolve_model_prefers_exact_runtime_match_for_same_ollama_provider_type() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "ollama-a".to_string(),
+        JsonProviderConfig {
+            base_url: "http://127.0.0.1:11434".to_string(),
+            api_key: "ollama-key-a".to_string(),
+            api: "ollama".to_string(),
+            models: vec![JsonModelEntry {
+                id: "qwen3".to_string(),
+                name: None,
+                reasoning: Some(true),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(8192),
+                compat: Some(json!({"thinkingFormat": "qwen"})),
+            }],
+        },
+    );
+    providers.insert(
+        "ollama-b".to_string(),
+        JsonProviderConfig {
+            base_url: "http://127.0.0.1:11435".to_string(),
+            api_key: "ollama-key-b".to_string(),
+            api: "ollama".to_string(),
+            models: vec![JsonModelEntry {
+                id: "qwen3".to_string(),
+                name: None,
+                reasoning: Some(true),
+                input: None,
+                cost: None,
+                context_window: Some(256000),
+                max_tokens: Some(16384),
+                compat: Some(json!({"thinkingFormat": "ollama"})),
+            }],
+        },
+    );
+
+    let config = Config {
+        api_key: "ollama-key-b".to_string(),
+        api_base: "http://127.0.0.1:11435".to_string(),
+        model: "qwen3".to_string(),
+        fast_model: None,
+        sub_agent_model: None,
+        memory_model: None,
+
+        reflection_model: None,
+        context_model: None,
+        provider: Provider::Ollama,
+        anthropic_prompt_caching: false,
+        providers,
+        mcp_servers: HashMap::new(),
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
+        structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
+    };
+
+    let resolved = config.resolve_model("qwen3");
+
+    assert_eq!(resolved.provider, Provider::Ollama);
+    assert_eq!(resolved.api_base, "http://127.0.0.1:11435");
+    assert_eq!(resolved.api_key, "ollama-key-b");
+    assert_eq!(resolved.max_tokens, Some(16384));
+    assert_eq!(resolved.context_window, 256000);
+    assert_eq!(resolved.thinking_format.as_deref(), Some("ollama"));
+}
+
+#[test]
 fn canonical_model_ref_expands_unique_plain_id() {
     let mut providers = HashMap::new();
     providers.insert(

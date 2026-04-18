@@ -312,15 +312,17 @@ volumes:
 | JSON 字段 | 默认值 | 说明 | 环境变量覆盖 |
 |-----------|--------|------|--------------|
 | `port` | `18989` | HTTP 监听端口 | `LINGCLAW_PORT` |
-| `provider` | `"auto"` | 强制指定：`openai` / `anthropic` / `ollama` / `auto` | `LINGCLAW_PROVIDER` |
-| `apiKey` | — | 通用 API Key（若未使用 providers 多配置） | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `OLLAMA_API_KEY` |
-| `apiBase` | 按 provider 默认 | API 端点地址 | `OPENAI_API_BASE` / `OLLAMA_API_BASE` |
+| `provider` | `"auto"` | 遗留兼容字段；仅在未使用 `models.providers` 时用于强制指定 `openai` / `anthropic` / `ollama` / `auto` | `LINGCLAW_PROVIDER` |
+| `apiKey` | — | 遗留兼容字段；新配置应优先写入 `models.providers.*.apiKey` | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `OLLAMA_API_KEY` |
+| `apiBase` | 按 provider 默认 | 遗留兼容字段；新配置应优先写入 `models.providers.*.baseUrl` | `OPENAI_API_BASE` / `OLLAMA_API_BASE` |
 | `execTimeout` | `30` | Shell 命令超时（秒） | `LINGCLAW_EXEC_TIMEOUT` |
 | `maxContextTokens` | `32000` | 上下文窗口 Token 预算 | `LINGCLAW_MAX_CONTEXT_TOKENS` |
 | `maxOutputBytes` | `51200` | 工具输出截断阈值 | — |
 | `maxFileBytes` | `204800` | 文件读取大小上限 | — |
 
 > 优先级：JSON 配置文件 > 环境变量 > 内置默认值
+
+> 新配置建议：用 `models.providers` 定义 provider 实例，用 `agents.defaults.model.primary` 选择默认模型。Setup Wizard 已不再写入 `settings.provider`、`settings.apiKey`、`settings.apiBase`。
 
 ## 文件结构
 

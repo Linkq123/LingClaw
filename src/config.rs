@@ -233,10 +233,36 @@ pub(crate) fn normalized_s3_prefix(prefix: Option<String>) -> String {
     }
 }
 
+fn align_runtime_provider_config(
+    config: &mut Config,
+    override_provider: bool,
+    override_api_base: bool,
+    override_api_key: bool,
+) {
+    if config.providers.is_empty() || !(override_provider || override_api_base || override_api_key)
+    {
+        return;
+    }
+
+    let resolved = config.resolve_model(&config.model);
+    if override_provider {
+        config.provider = resolved.provider;
+    }
+    if override_api_base {
+        config.api_base = resolved.api_base.clone();
+    }
+    if override_api_key {
+        config.api_key = resolved.api_key.clone();
+    }
+}
+
 impl Config {
     pub(crate) fn load() -> Self {
         let json_cfg = load_config_file();
         let settings = json_cfg.settings.unwrap_or_default();
+        let settings_has_provider = settings.provider.is_some();
+        let settings_has_api_key = settings.api_key.is_some();
+        let settings_has_api_base = settings.api_base.is_some();
         let providers: HashMap<String, JsonProviderConfig> = json_cfg
             .models
             .and_then(|m| m.providers)
@@ -338,7 +364,7 @@ impl Config {
             }
         };
 
-        Self {
+        let mut config = Self {
             api_key,
             api_base,
             model,
@@ -434,7 +460,14 @@ impl Config {
                 .or_else(|| parse_boolish_env("LINGCLAW_DAILY_REFLECTION"))
                 .unwrap_or(false),
             s3,
-        }
+        };
+        align_runtime_provider_config(
+            &mut config,
+            !settings_has_provider,
+            !settings_has_api_base,
+            !settings_has_api_key,
+        );
+        config
     }
 
     pub(crate) fn memory_model_or<'a>(&'a self, fallback: &'a str) -> &'a str {
@@ -920,3 +953,7 @@ pub(crate) fn load_config_file() -> JsonConfig {
         Err(_) => JsonConfig::default(),
     }
 }
+
+#[cfg(test)]
+#[path = "tests/config_tests.rs"]
+mod config_tests;
