@@ -362,25 +362,102 @@ struct LiveRoundState {
     reasoning_text: String,
     reasoning_done: bool,
     tools: Vec<LiveToolState>,
-    /// Currently active sub-agent task (set on `task_started`, cleared on terminal).
-    active_task: Option<LiveTaskState>,
+    /// Currently active delegated tasks keyed by stable replay identifier.
+    active_tasks: HashMap<String, LiveTaskState>,
+    /// Active orchestration state, if an `orchestrate` tool call is currently running.
+    active_orchestration: Option<LiveOrchestrationState>,
 }
 
 #[derive(Clone)]
 struct LiveTaskState {
-    agent: String,
-    prompt: String,
-    /// Latest cycle/phase from `task_progress` events.
-    current_cycle: Option<usize>,
-    current_phase: Option<String>,
+    started_event: serde_json::Value,
+    /// Latest progress event from `task_progress`.
+    progress_event: Option<serde_json::Value>,
     /// Tool calls reported via `task_tool` events (for replay on reconnect).
-    tools: Vec<LiveTaskToolState>,
+    tool_events: Vec<serde_json::Value>,
+    /// Tool result events forwarded from the sub-agent's internal execution.
+    tool_result_events: Vec<serde_json::Value>,
+    /// Terminal event (`task_completed`/`task_failed`) — kept until round ends.
+    terminal_event: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
-struct LiveTaskToolState {
-    tool: String,
-    id: String,
+struct LiveOrchestrationState {
+    started_event: serde_json::Value,
+    layer_event: Option<serde_json::Value>,
+    /// Latest terminal event for each orchestration task (completed/failed/skipped).
+    terminal_task_events: HashMap<String, serde_json::Value>,
+    /// Terminal event (`orchestrate_completed`) — kept until round ends.
+    completed_event: Option<serde_json::Value>,
+}
+
+fn live_task_key_from_event(event: &serde_json::Value) -> Option<String> {
+    if let Some(task_id) = event["task_id"].as_str().filter(|value| !value.is_empty()) {
+        return Some(task_id.to_string());
+    }
+
+    let orchestrate_id = event["orchestrate_id"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    let task_id = event["id"].as_str().filter(|value| !value.is_empty());
+    if let (Some(orchestrate_id), Some(task_id)) = (orchestrate_id, task_id) {
+        return Some(format!("{orchestrate_id}:{task_id}"));
+    }
+
+    event["agent"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn is_subagent_live_event(event: &serde_json::Value) -> bool {
+    event["subagent"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn truncated_live_tool_result_event(event: &serde_json::Value) -> serde_json::Value {
+    let mut truncated = event.clone();
+    if let Some(obj) = truncated.as_object_mut()
+        && let Some(result) = obj.get_mut("result")
+        && let Some(result_text) = result.as_str()
+    {
+        let mut capped = result_text.to_string();
+        capped.truncate(LIVE_REPLAY_CAP);
+        *result = serde_json::Value::String(capped);
+    }
+    truncated
+}
+
+fn orchestrate_task_order(started_event: &serde_json::Value) -> Vec<String> {
+    started_event["tasks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|task| task["id"].as_str())
+        .filter(|task_id| !task_id.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+async fn replay_active_task(tx: &WsTx, task: &LiveTaskState) {
+    ws_send(tx, &task.started_event).await;
+
+    if let Some(progress_event) = &task.progress_event {
+        ws_send(tx, progress_event).await;
+    }
+
+    for tool_event in &task.tool_events {
+        ws_send(tx, tool_event).await;
+    }
+
+    for tool_result_event in &task.tool_result_events {
+        ws_send(tx, tool_result_event).await;
+    }
+
+    if let Some(terminal_event) = &task.terminal_event {
+        ws_send(tx, terminal_event).await;
+    }
 }
 
 /// Cap for replay buffer strings (128 KB). Keeps memory bounded for long outputs.
@@ -983,13 +1060,15 @@ async fn dispatch_live_event(
                         reasoning_text: String::new(),
                         reasoning_done: false,
                         tools: Vec::new(),
-                        active_task: None,
+                        active_tasks: HashMap::new(),
+                        active_orchestration: None,
                     },
                 );
             }
             "delta" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
                     && let Some(content) = event["content"].as_str()
                     && round.assistant_text.len() < LIVE_REPLAY_CAP
                 {
@@ -1000,6 +1079,7 @@ async fn dispatch_live_event(
             "thinking_start" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
                 {
                     round.reasoning_text.clear();
                     round.reasoning_done = false;
@@ -1008,6 +1088,7 @@ async fn dispatch_live_event(
             "thinking_delta" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
                     && let Some(content) = event["content"].as_str()
                     && round.reasoning_text.len() < LIVE_REPLAY_CAP
                 {
@@ -1018,6 +1099,7 @@ async fn dispatch_live_event(
             "thinking_done" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
                 {
                     round.reasoning_done = true;
                 }
@@ -1025,6 +1107,7 @@ async fn dispatch_live_event(
             "tool_call" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
                 {
                     round.tools.push(LiveToolState {
                         id: event["id"].as_str().unwrap_or_default().to_string(),
@@ -1038,6 +1121,7 @@ async fn dispatch_live_event(
             "tool_progress" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
                 {
                     let tool_id = event["id"].as_str().unwrap_or_default();
                     let elapsed_ms = event["elapsed_ms"].as_u64().unwrap_or(0);
@@ -1058,20 +1142,29 @@ async fn dispatch_live_event(
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
                 {
-                    let tool_id = event["id"].as_str().unwrap_or_default();
-                    let mut result = event["result"].as_str().unwrap_or_default().to_string();
-                    result.truncate(LIVE_REPLAY_CAP);
-                    if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
-                        tool.result = Some(result);
-                        tool.elapsed_ms = event["duration_ms"].as_u64().unwrap_or(tool.elapsed_ms);
-                    } else {
-                        round.tools.push(LiveToolState {
-                            id: tool_id.to_string(),
-                            name: event["name"].as_str().unwrap_or_default().to_string(),
-                            arguments: String::new(),
-                            result: Some(result),
-                            elapsed_ms: event["duration_ms"].as_u64().unwrap_or(0),
-                        });
+                    if is_subagent_live_event(&event)
+                        && let Some(task_key) = live_task_key_from_event(&event)
+                        && let Some(task) = round.active_tasks.get_mut(&task_key)
+                    {
+                        task.tool_result_events
+                            .push(truncated_live_tool_result_event(&event));
+                    } else if !is_subagent_live_event(&event) {
+                        let tool_id = event["id"].as_str().unwrap_or_default();
+                        let mut result = event["result"].as_str().unwrap_or_default().to_string();
+                        result.truncate(LIVE_REPLAY_CAP);
+                        if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
+                            tool.result = Some(result);
+                            tool.elapsed_ms =
+                                event["duration_ms"].as_u64().unwrap_or(tool.elapsed_ms);
+                        } else {
+                            round.tools.push(LiveToolState {
+                                id: tool_id.to_string(),
+                                name: event["name"].as_str().unwrap_or_default().to_string(),
+                                arguments: String::new(),
+                                result: Some(result),
+                                elapsed_ms: event["duration_ms"].as_u64().unwrap_or(0),
+                            });
+                        }
                     }
                 }
             }
@@ -1093,55 +1186,86 @@ async fn dispatch_live_event(
             "task_started" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && let Some(task_key) = live_task_key_from_event(&event)
                 {
-                    round.active_task = Some(LiveTaskState {
-                        agent: event["agent"].as_str().unwrap_or_default().to_string(),
-                        prompt: event["prompt"].as_str().unwrap_or_default().to_string(),
-                        current_cycle: None,
-                        current_phase: None,
-                        tools: Vec::new(),
-                    });
+                    round.active_tasks.insert(
+                        task_key,
+                        LiveTaskState {
+                            started_event: event.clone(),
+                            progress_event: None,
+                            tool_events: Vec::new(),
+                            tool_result_events: Vec::new(),
+                            terminal_event: None,
+                        },
+                    );
                 }
             }
             "task_progress" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
-                    && let Some(task) = round.active_task.as_mut()
+                    && let Some(task_key) = live_task_key_from_event(&event)
+                    && let Some(task) = round.active_tasks.get_mut(&task_key)
                 {
-                    task.current_cycle = event["cycle"].as_u64().map(|v| v as usize);
-                    task.current_phase = event["phase"].as_str().map(str::to_string);
+                    task.progress_event = Some(event.clone());
                 }
             }
             "task_tool" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
-                    && let Some(task) = round.active_task.as_mut()
+                    && let Some(task_key) = live_task_key_from_event(&event)
+                    && let Some(task) = round.active_tasks.get_mut(&task_key)
                 {
-                    task.tools.push(LiveTaskToolState {
-                        tool: event["tool"].as_str().unwrap_or_default().to_string(),
-                        id: event["id"].as_str().unwrap_or_default().to_string(),
-                    });
+                    task.tool_events.push(event.clone());
                 }
             }
             "task_completed" | "task_failed" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && let Some(task_key) = live_task_key_from_event(&event)
+                    && let Some(task) = round.active_tasks.get_mut(&task_key)
                 {
-                    round.active_task = None;
+                    task.terminal_event = Some(event.clone());
+                }
+            }
+            "orchestrate_started" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                {
+                    round.active_orchestration = Some(LiveOrchestrationState {
+                        started_event: event.clone(),
+                        layer_event: None,
+                        terminal_task_events: HashMap::new(),
+                        completed_event: None,
+                    });
+                }
+            }
+            "orchestrate_layer" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && let Some(orchestrate_id) = event["orchestrate_id"].as_str()
+                    && let Some(orchestration) = round.active_orchestration.as_mut()
+                    && orchestration.started_event["orchestrate_id"].as_str()
+                        == Some(orchestrate_id)
+                {
+                    orchestration.layer_event = Some(event.clone());
                 }
             }
             // Orchestration events: track per-task lifecycle for live replay
             "orchestrate_task_started" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && let Some(task_key) = live_task_key_from_event(&event)
                 {
-                    round.active_task = Some(LiveTaskState {
-                        agent: event["agent"].as_str().unwrap_or_default().to_string(),
-                        prompt: event["prompt"].as_str().unwrap_or_default().to_string(),
-                        current_cycle: None,
-                        current_phase: None,
-                        tools: Vec::new(),
-                    });
+                    round.active_tasks.insert(
+                        task_key,
+                        LiveTaskState {
+                            started_event: event.clone(),
+                            progress_event: None,
+                            tool_events: Vec::new(),
+                            tool_result_events: Vec::new(),
+                            terminal_event: None,
+                        },
+                    );
                 }
             }
             "orchestrate_task_completed"
@@ -1150,7 +1274,36 @@ async fn dispatch_live_event(
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
                 {
-                    round.active_task = None;
+                    if let Some(task_key) = live_task_key_from_event(&event) {
+                        round.active_tasks.remove(&task_key);
+                    }
+                    if let Some(orchestrate_id) = event["orchestrate_id"].as_str()
+                        && let Some(orchestration) = round.active_orchestration.as_mut()
+                        && orchestration.started_event["orchestrate_id"].as_str()
+                            == Some(orchestrate_id)
+                        && let Some(task_id) =
+                            event["id"].as_str().filter(|value| !value.is_empty())
+                    {
+                        orchestration
+                            .terminal_task_events
+                            .insert(task_id.to_string(), event.clone());
+                    }
+                }
+            }
+            "orchestrate_completed" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && let Some(orchestrate_id) = event["orchestrate_id"].as_str()
+                {
+                    round
+                        .active_tasks
+                        .retain(|task_key, _| !task_key.starts_with(&format!("{orchestrate_id}:")));
+                    if let Some(orchestration) = round.active_orchestration.as_mut()
+                        && orchestration.started_event["orchestrate_id"].as_str()
+                            == Some(orchestrate_id)
+                    {
+                        orchestration.completed_event = Some(event.clone());
+                    }
                 }
             }
             "done" | "error" => {
@@ -1261,45 +1414,46 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
         .await;
     }
 
-    // Replay active sub-agent task if one is running.
-    if let Some(task) = &live_round.active_task {
-        ws_send(
-            tx,
-            &json!({
-                "type": "task_started",
-                "agent": task.agent,
-                "prompt": task.prompt,
-            }),
-        )
-        .await;
+    if let Some(orchestration) = &live_round.active_orchestration {
+        ws_send(tx, &orchestration.started_event).await;
 
-        // Replay latest progress (cycle/phase).
-        if let Some(cycle) = task.current_cycle {
-            ws_send(
-                tx,
-                &json!({
-                    "type": "task_progress",
-                    "agent": task.agent,
-                    "cycle": cycle,
-                    "phase": task.current_phase.as_deref().unwrap_or("analyze"),
-                }),
-            )
-            .await;
+        if let Some(layer_event) = &orchestration.layer_event {
+            ws_send(tx, layer_event).await;
         }
 
-        // Replay tool calls reported by the sub-agent.
-        for tool in &task.tools {
-            ws_send(
-                tx,
-                &json!({
-                    "type": "task_tool",
-                    "agent": task.agent,
-                    "tool": tool.tool,
-                    "id": tool.id,
-                }),
-            )
-            .await;
+        for task_id in orchestrate_task_order(&orchestration.started_event) {
+            if let Some(event) = orchestration.terminal_task_events.get(&task_id) {
+                ws_send(tx, event).await;
+            }
         }
+    }
+
+    let mut active_tasks = live_round.active_tasks;
+    if let Some(orchestration) = &live_round.active_orchestration
+        && let Some(orchestrate_id) = orchestration.started_event["orchestrate_id"].as_str()
+    {
+        for task_id in orchestrate_task_order(&orchestration.started_event) {
+            let task_key = format!("{orchestrate_id}:{task_id}");
+            if let Some(task) = active_tasks.remove(&task_key) {
+                replay_active_task(tx, &task).await;
+            }
+        }
+    }
+
+    let mut remaining_task_keys: Vec<_> = active_tasks.keys().cloned().collect();
+    remaining_task_keys.sort();
+    for task_key in remaining_task_keys {
+        if let Some(task) = active_tasks.get(&task_key) {
+            replay_active_task(tx, task).await;
+        }
+    }
+
+    // Send orchestrate_completed after all task events so the frontend
+    // receives the full DAG state before the terminal summary.
+    if let Some(orchestration) = &live_round.active_orchestration
+        && let Some(completed_event) = &orchestration.completed_event
+    {
+        ws_send(tx, completed_event).await;
     }
 }
 

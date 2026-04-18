@@ -3554,6 +3554,516 @@ fn replay_live_round_rehydrates_inflight_round_state() {
 }
 
 #[test]
+fn replay_live_round_rehydrates_active_task_with_task_id() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-task-replay-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 1,
+            "phase": "act",
+            "cycle": 1,
+            "react_visible": true,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_started",
+            "task_id": "task-123",
+            "agent": "coder",
+            "prompt": "Implement feature",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_progress",
+            "task_id": "task-123",
+            "agent": "coder",
+            "cycle": 2,
+            "phase": "analyze",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_tool",
+            "task_id": "task-123",
+            "agent": "coder",
+            "tool": "read_file",
+            "id": "tool-a",
+        }),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed = (0..4)
+        .map(|_| {
+            let raw = rt
+                .block_on(replay_rx.recv())
+                .expect("replay should produce serialized event");
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .expect("replayed event should be valid json")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "task_started");
+    assert_eq!(replayed[1]["task_id"], "task-123");
+    assert_eq!(replayed[1]["agent"], "coder");
+    assert_eq!(replayed[2]["type"], "task_progress");
+    assert_eq!(replayed[2]["task_id"], "task-123");
+    assert_eq!(replayed[3]["type"], "task_tool");
+    assert_eq!(replayed[3]["task_id"], "task-123");
+    assert_eq!(replayed[3]["id"], "tool-a");
+}
+
+#[test]
+fn replay_live_round_scopes_subagent_tool_results_to_task() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-task-tool-result-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 1,
+            "phase": "act",
+            "cycle": 1,
+            "react_visible": true,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_started",
+            "task_id": "task-123",
+            "agent": "coder",
+            "prompt": "Implement feature",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "thinking_start",
+            "task_id": "task-123",
+            "subagent": "coder",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "thinking_delta",
+            "task_id": "task-123",
+            "subagent": "coder",
+            "content": "internal reasoning",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "delta",
+            "task_id": "task-123",
+            "subagent": "coder",
+            "content": "subagent content",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_tool",
+            "task_id": "task-123",
+            "agent": "coder",
+            "tool": "read_file",
+            "id": "tool-a",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "tool_result",
+            "task_id": "task-123",
+            "subagent": "coder",
+            "id": "tool-a",
+            "name": "read_file",
+            "duration_ms": 42,
+            "is_error": false,
+        }),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed = (0..4)
+        .map(|_| {
+            let raw = rt
+                .block_on(replay_rx.recv())
+                .expect("replay should produce serialized event");
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .expect("replayed event should be valid json")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "task_started");
+    assert_eq!(replayed[2]["type"], "task_tool");
+    assert_eq!(replayed[2]["task_id"], "task-123");
+    assert_eq!(replayed[3]["type"], "tool_result");
+    assert_eq!(replayed[3]["task_id"], "task-123");
+    assert_eq!(replayed[3]["subagent"], "coder");
+    assert_eq!(replayed[3]["id"], "tool-a");
+    assert_eq!(replayed[3]["duration_ms"], 42);
+    assert!(matches!(
+        replay_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn replay_live_round_rehydrates_active_orchestration_state() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-orch-replay-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 1,
+            "phase": "act",
+            "cycle": 1,
+            "react_visible": true,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "orchestrate_started",
+            "orchestrate_id": "orch-1",
+            "task_count": 3,
+            "layer_count": 2,
+            "tasks": [
+                {"id": "code", "agent": "explore", "depends_on": []},
+                {"id": "docs", "agent": "researcher", "depends_on": []},
+                {"id": "plan", "agent": "coder", "depends_on": ["code", "docs"]}
+            ],
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "orchestrate_layer",
+            "orchestrate_id": "orch-1",
+            "layer": 1,
+            "total_layers": 2,
+            "tasks": ["code", "docs"],
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "orchestrate_task_started",
+            "orchestrate_id": "orch-1",
+            "id": "code",
+            "agent": "explore",
+            "prompt": "Analyze code",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "orchestrate_task_started",
+            "orchestrate_id": "orch-1",
+            "id": "docs",
+            "agent": "researcher",
+            "prompt": "Read docs",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_progress",
+            "task_id": "orch-1:docs",
+            "agent": "researcher",
+            "cycle": 2,
+            "phase": "analyze",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_tool",
+            "task_id": "orch-1:docs",
+            "agent": "researcher",
+            "tool": "grep_search",
+            "id": "tool-docs",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "orchestrate_task_completed",
+            "orchestrate_id": "orch-1",
+            "id": "code",
+            "agent": "explore",
+            "cycles": 1,
+            "tool_calls": 1,
+            "input_tokens": 11,
+            "output_tokens": 7,
+            "duration_ms": 250,
+        }),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed = (0..7)
+        .map(|_| {
+            let raw = rt
+                .block_on(replay_rx.recv())
+                .expect("replay should produce serialized event");
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .expect("replayed event should be valid json")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "orchestrate_started");
+    assert_eq!(replayed[1]["orchestrate_id"], "orch-1");
+    assert_eq!(replayed[2]["type"], "orchestrate_layer");
+    assert_eq!(replayed[2]["layer"], 1);
+    assert_eq!(replayed[3]["type"], "orchestrate_task_completed");
+    assert_eq!(replayed[3]["id"], "code");
+    assert_eq!(replayed[4]["type"], "orchestrate_task_started");
+    assert_eq!(replayed[4]["orchestrate_id"], "orch-1");
+    assert_eq!(replayed[4]["id"], "docs");
+    assert_eq!(replayed[5]["type"], "task_progress");
+    assert_eq!(replayed[5]["task_id"], "orch-1:docs");
+    assert_eq!(replayed[6]["type"], "task_tool");
+    assert_eq!(replayed[6]["task_id"], "orch-1:docs");
+}
+
+#[test]
+fn replay_preserves_completed_standalone_task_until_round_ends() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-task-done-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"task_started","task_id":"t-1","agent":"coder","prompt":"Do stuff"}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"task_tool","task_id":"t-1","agent":"coder","tool":"read_file","id":"tl-1"}),
+    ));
+    // Task completes — should still be replayable until round "done"
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"task_completed","task_id":"t-1","agent":"coder",
+            "cycles":2,"tool_calls":1,"duration_ms":500,
+        }),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed: Vec<serde_json::Value> = (0..4)
+        .map(|_| {
+            let raw = rt
+                .block_on(replay_rx.recv())
+                .expect("replay should produce event");
+            serde_json::from_str(&raw).expect("valid json")
+        })
+        .collect();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "task_started");
+    assert_eq!(replayed[1]["task_id"], "t-1");
+    assert_eq!(replayed[2]["type"], "task_tool");
+    assert_eq!(replayed[3]["type"], "task_completed");
+    assert_eq!(replayed[3]["task_id"], "t-1");
+}
+
+#[test]
+fn replay_preserves_completed_orchestration_until_round_ends() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-orch-done-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_started",
+            "orchestrate_id":"orch-2",
+            "task_count":2,
+            "layer_count":1,
+            "tasks":[
+                {"id":"a","agent":"explore","depends_on":[]},
+                {"id":"b","agent":"coder","depends_on":[]}
+            ],
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_task_completed",
+            "orchestrate_id":"orch-2","id":"a","agent":"explore",
+            "cycles":1,"tool_calls":0,"duration_ms":100,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_task_completed",
+            "orchestrate_id":"orch-2","id":"b","agent":"coder",
+            "cycles":2,"tool_calls":3,"duration_ms":400,
+        }),
+    ));
+    // Orchestration completes — should still be replayable until round "done"
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_completed",
+            "orchestrate_id":"orch-2","task_count":2,"duration_ms":500,
+        }),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed: Vec<serde_json::Value> = (0..5)
+        .map(|_| {
+            let raw = rt
+                .block_on(replay_rx.recv())
+                .expect("replay should produce event");
+            serde_json::from_str(&raw).expect("valid json")
+        })
+        .collect();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "orchestrate_started");
+    assert_eq!(replayed[1]["orchestrate_id"], "orch-2");
+    assert_eq!(replayed[2]["type"], "orchestrate_task_completed");
+    assert_eq!(replayed[2]["id"], "a");
+    assert_eq!(replayed[3]["type"], "orchestrate_task_completed");
+    assert_eq!(replayed[3]["id"], "b");
+    assert_eq!(replayed[4]["type"], "orchestrate_completed");
+    assert_eq!(replayed[4]["orchestrate_id"], "orch-2");
+}
+
+#[test]
 fn dispatch_live_event_ignores_stale_connection_after_rebind() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = test_app_state();

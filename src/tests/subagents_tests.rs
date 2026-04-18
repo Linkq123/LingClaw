@@ -1092,6 +1092,91 @@ async fn run_subagent_multi_read_only_batch_executes_after_tool_exec_hooks() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
+#[tokio::test]
+async fn run_subagent_emits_tool_result_event_for_completed_tool() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-tool-result-event");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")
+        .expect("fixture file should be written");
+
+    let response_body = build_openai_tool_call_stream(
+        "read_file",
+        serde_json::json!({
+            "path": "notes.txt"
+        }),
+    );
+    let (api_base, handle) = spawn_one_shot_http_server("text/event-stream", response_body);
+
+    let mut config = base_config();
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+
+    let spec = SubAgentSpec {
+        name: "tool-result-agent".into(),
+        description: String::new(),
+        system_prompt: "Read the delegated file.".into(),
+        max_turns: 1,
+        tools: ToolPermissions {
+            allow: vec!["read_file".into()],
+            deny: vec![],
+        },
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(16);
+    let http = reqwest::Client::new();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Read notes.txt.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &HookRegistry::new(),
+        "test-task-tool-result",
+    )
+    .await;
+
+    handle.join().expect("server thread should join");
+
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.cycles, 1);
+    assert_eq!(outcome.tool_calls, 1);
+
+    let mut saw_task_tool = false;
+    let mut saw_tool_result = false;
+    while let Ok(event) = live_rx.try_recv() {
+        match event["type"].as_str() {
+            Some("task_tool") => {
+                saw_task_tool = true;
+                assert_eq!(event["task_id"].as_str(), Some("test-task-tool-result"));
+                assert_eq!(event["agent"].as_str(), Some("tool-result-agent"));
+                assert_eq!(event["tool"].as_str(), Some("read_file"));
+                assert_eq!(event["id"].as_str(), Some("call_1"));
+            }
+            Some("tool_result") => {
+                saw_tool_result = true;
+                assert_eq!(event["task_id"].as_str(), Some("test-task-tool-result"));
+                assert_eq!(event["subagent"].as_str(), Some("tool-result-agent"));
+                assert_eq!(event["name"].as_str(), Some("read_file"));
+                assert_eq!(event["id"].as_str(), Some("call_1"));
+                assert_eq!(event["is_error"].as_bool(), Some(false));
+                assert!(event["duration_ms"].as_u64().is_some());
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_task_tool);
+    assert!(saw_tool_result);
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 /// Integration test: chains Phase 3 (`collect_parallel_tool_results` with a deadline
 /// that interrupts one tool) into Phase 4 (`finalize_parallel_batch_outcome` for each
 /// slot). Verifies that `AfterToolExec` fires only for the tool whose future completed,

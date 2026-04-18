@@ -205,6 +205,29 @@ pub(crate) async fn apply_after_tool_exec_hook(
     outcome
 }
 
+async fn emit_subagent_tool_result_event(
+    live_tx: &LiveTx,
+    task_id: &str,
+    agent_name: &str,
+    tool_name: &str,
+    tool_id: &str,
+    outcome: &tools::ToolOutcome,
+) {
+    let _ = live_send(
+        live_tx,
+        json!({
+            "type": "tool_result",
+            "task_id": task_id,
+            "subagent": agent_name,
+            "id": tool_id,
+            "name": tool_name,
+            "duration_ms": outcome.duration_ms,
+            "is_error": outcome.is_error,
+        }),
+    )
+    .await;
+}
+
 /// Sub-agent execution outcome.
 pub(crate) struct SubAgentOutcome {
     /// Final text result to inject into parent context.
@@ -583,6 +606,16 @@ pub(crate) async fn run_subagent(
                             )
                             .await;
 
+                            emit_subagent_tool_result_event(
+                                parent_live_tx,
+                                task_id,
+                                &spec.name,
+                                &tc.function.name,
+                                &tc.id,
+                                &outcome,
+                            )
+                            .await;
+
                             messages.push(ChatMessage {
                                 role: "tool".into(),
                                 content: Some(outcome.output),
@@ -775,6 +808,15 @@ pub(crate) async fn run_subagent(
                                 batch_result.interrupted,
                                 batch_result.timed_out,
                                 batch_started.elapsed().as_millis() as u64,
+                            )
+                            .await;
+                            emit_subagent_tool_result_event(
+                                parent_live_tx,
+                                task_id,
+                                &spec.name,
+                                &tc.function.name,
+                                &tc.id,
+                                &outcome,
                             )
                             .await;
                             messages.push(ChatMessage {
