@@ -263,14 +263,58 @@ pub(crate) fn update_session_token_usage(
     session.output_token_source = output_source.to_string();
 }
 
+/// Estimate token count for a string with CJK awareness.
+///
+/// Latin/ASCII text averages ~4 bytes per token. CJK characters (Chinese,
+/// Japanese Kanji, Korean) average ~1.5 characters per token in typical
+/// tokenizers (cl100k, o200k). This function splits the estimation
+/// accordingly instead of a flat `len / 4`.
+fn estimate_text_tokens(text: &str) -> usize {
+    let mut cjk_chars: usize = 0;
+    let mut other_bytes: usize = 0;
+    for c in text.chars() {
+        if is_cjk_like(c) {
+            cjk_chars += 1;
+        } else {
+            other_bytes += c.len_utf8();
+        }
+    }
+    // CJK: ~1-2 tokens per character in typical tokenizers; use 1 token/char
+    // as a conservative (slightly over-counting) estimate.
+    // Other: ~4 bytes per token.
+    let cjk_tokens = cjk_chars;
+    let other_tokens = other_bytes / 4;
+    cjk_tokens + other_tokens
+}
+
+/// Quick CJK character classifier for token estimation.
+fn is_cjk_like(c: char) -> bool {
+    matches!(
+        c,
+        '\u{4E00}'..='\u{9FFF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{3040}'..='\u{309F}'
+            | '\u{30A0}'..='\u{30FF}'
+            | '\u{AC00}'..='\u{D7AF}'
+    )
+}
+
 pub(crate) fn message_token_len(message: &ChatMessage) -> usize {
-    let content_len = message.content.as_ref().map(|c| c.len()).unwrap_or(0);
-    let tc_len = message
+    let content_tokens = message
+        .content
+        .as_ref()
+        .map(|c| estimate_text_tokens(c))
+        .unwrap_or(0);
+    let tc_tokens = message
         .tool_calls
         .as_ref()
         .map(|tcs| {
             tcs.iter()
-                .map(|tc| tc.function.name.len() + tc.function.arguments.len())
+                .map(|tc| {
+                    // Tool call JSON is typically ASCII, use simple /4.
+                    (tc.function.name.len() + tc.function.arguments.len()) / 4
+                })
                 .sum::<usize>()
         })
         .unwrap_or(0);
@@ -280,7 +324,7 @@ pub(crate) fn message_token_len(message: &ChatMessage) -> usize {
         .as_ref()
         .map(|imgs| imgs.len() * 85)
         .unwrap_or(0);
-    (content_len + tc_len + 10) / 4 + img_tokens
+    content_tokens + tc_tokens + 3 + img_tokens
 }
 
 /// Measure the size of the conversational "turn" starting at `start`.

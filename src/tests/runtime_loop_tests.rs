@@ -14,6 +14,7 @@ fn test_config() -> Config {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),

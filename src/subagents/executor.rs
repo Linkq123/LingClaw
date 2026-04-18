@@ -215,6 +215,12 @@ pub(crate) struct SubAgentOutcome {
     pub tool_calls: usize,
     /// Whether the execution was aborted (cancel/timeout).
     pub aborted: bool,
+    /// Total input tokens consumed across all LLM calls made by this sub-agent.
+    /// Uses provider-reported usage when available; falls back to a local
+    /// estimate so parent usage tracking still reflects sub-agent cost.
+    pub total_input_tokens: u64,
+    /// Total output tokens consumed across all LLM calls made by this sub-agent.
+    pub total_output_tokens: u64,
 }
 
 /// Resolve which model a sub-agent should use.
@@ -241,6 +247,7 @@ pub(crate) async fn run_subagent(
     parent_live_tx: &LiveTx,
     cancel: CancellationToken,
     hooks: &HookRegistry,
+    task_id: &str,
 ) -> SubAgentOutcome {
     let model_id = resolve_subagent_model(config).to_string();
     let resolved = config.resolve_model(&model_id);
@@ -277,6 +284,8 @@ pub(crate) async fn run_subagent(
 
     let mut cycles: usize = 0;
     let mut total_tool_calls: usize = 0;
+    let mut total_input_tokens: u64 = 0;
+    let mut total_output_tokens: u64 = 0;
     let mut aborted = false;
     let mut timed_out = false;
 
@@ -306,6 +315,7 @@ pub(crate) async fn run_subagent(
             parent_live_tx,
             json!({
                 "type": "task_progress",
+                "task_id": task_id,
                 "agent": spec.name,
                 "cycle": cycles,
                 "phase": "analyze",
@@ -331,10 +341,12 @@ pub(crate) async fn run_subagent(
                 let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
                 let parent_tx = parent_live_tx.clone();
                 let agent_name = spec.name.clone();
+                let forward_task_id = task_id.to_string();
                 let forward_handle = tokio::spawn(async move {
                     while let Some(mut event) = sub_rx.recv().await {
                         if let Some(obj) = event.as_object_mut() {
                             obj.insert("subagent".into(), json!(agent_name));
+                            obj.insert("task_id".into(), json!(forward_task_id));
                         }
                         let _ = live_send(&parent_tx, event).await;
                     }
@@ -397,6 +409,19 @@ pub(crate) async fn run_subagent(
         match llm_result {
             Ok(resp) => {
                 let has_tools = resp.message.has_tool_calls();
+
+                // Accumulate token usage so parent session stats include
+                // sub-agent cost. Prefer provider-reported numbers; fall back
+                // to local estimates keyed on provider, matching the parent
+                // loop's usage accounting pattern.
+                let input_used = resp.input_tokens.unwrap_or_else(|| {
+                    context::estimate_tokens_for_provider(resolved.provider, &messages) as u64
+                });
+                let output_used = resp.output_tokens.unwrap_or_else(|| {
+                    context::message_token_len_for_provider(resolved.provider, &resp.message) as u64
+                });
+                total_input_tokens = total_input_tokens.saturating_add(input_used);
+                total_output_tokens = total_output_tokens.saturating_add(output_used);
 
                 messages.push(resp.message.clone());
 
@@ -495,6 +520,7 @@ pub(crate) async fn run_subagent(
                                 parent_live_tx,
                                 json!({
                                     "type": "task_tool",
+                                    "task_id": task_id,
                                     "agent": spec.name,
                                     "tool": tc.function.name,
                                     "id": tc.id,
@@ -663,6 +689,7 @@ pub(crate) async fn run_subagent(
                                 parent_live_tx,
                                 json!({
                                     "type": "task_tool",
+                                    "task_id": task_id,
                                     "agent": spec.name,
                                     "tool": tc.function.name,
                                     "id": tc.id,
@@ -775,6 +802,8 @@ pub(crate) async fn run_subagent(
                     cycles,
                     tool_calls: total_tool_calls,
                     aborted: true,
+                    total_input_tokens,
+                    total_output_tokens,
                 };
             }
         }
@@ -822,6 +851,8 @@ pub(crate) async fn run_subagent(
         cycles,
         tool_calls: total_tool_calls,
         aborted,
+        total_input_tokens,
+        total_output_tokens,
     }
 }
 

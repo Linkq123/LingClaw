@@ -550,6 +550,33 @@ pub(crate) fn is_orchestrate_tool(name: &str) -> bool {
     name == "orchestrate"
 }
 
+/// Shared description body for the `orchestrate` tool. Used by both the
+/// OpenAI and Anthropic definitions to guarantee identical wording.
+fn orchestrate_tool_description(catalog: &str) -> String {
+    format!(
+        "Run a DAG of sub-agent tasks in one call. Tasks with no dependencies \
+         execute in parallel; dependent tasks wait for their upstream results. \
+         Reference upstream output inside prompts with {{{{results.<task_id>}}}}.\n\n\
+         Use orchestrate only when you actually benefit from parallelism or \
+         pipelined hand-offs (2+ independent tasks, or a produce→review→fix \
+         chain). For a single delegation, call `task` instead — it is cheaper \
+         and easier to debug.\n\n\
+         Cost reminder: every task spawns its own sub-agent loop, so an \
+         orchestration of N tasks roughly costs the sum of their individual \
+         token budgets. Keep the DAG small (typically ≤5 tasks) and scope each \
+         prompt tightly.\n\n\
+         Example — parallel exploration then synthesis:\n\
+         tasks: [{{\"id\":\"code\",\"agent\":\"explore\",\"prompt\":\"Analyze code...\"}},\n\
+          {{\"id\":\"docs\",\"agent\":\"researcher\",\"prompt\":\"Research docs...\"}},\n\
+          {{\"id\":\"plan\",\"agent\":\"coder\",\"prompt\":\"Synthesize: {{{{results.code}}}} and {{{{results.docs}}}}\",\"depends_on\":[\"code\",\"docs\"]}}]\n\n\
+         Example — serial review pipeline:\n\
+         tasks: [{{\"id\":\"impl\",\"agent\":\"coder\",\"prompt\":\"Implement...\"}},\n\
+          {{\"id\":\"review\",\"agent\":\"reviewer\",\"prompt\":\"Review: {{{{results.impl}}}}\",\"depends_on\":[\"impl\"]}},\n\
+          {{\"id\":\"fix\",\"agent\":\"coder\",\"prompt\":\"Fix: {{{{results.review}}}}\",\"depends_on\":[\"review\"]}}]\n\n\
+         {catalog}"
+    )
+}
+
 /// Generate the `orchestrate` tool definition for OpenAI format.
 pub(crate) fn orchestrate_tool_definition_openai(agent_names: &[String]) -> serde_json::Value {
     let catalog = if agent_names.is_empty() {
@@ -561,21 +588,7 @@ pub(crate) fn orchestrate_tool_definition_openai(agent_names: &[String]) -> serd
         "type": "function",
         "function": {
             "name": "orchestrate",
-            "description": format!(
-                "Orchestrate a coordinated multi-agent workflow. Define a DAG of tasks where each \
-                 task runs a sub-agent. Tasks without dependencies execute in parallel; dependent \
-                 tasks wait for upstream results. Use {{{{results.<task_id>}}}} in prompts to \
-                 reference outputs from completed upstream tasks.\n\n\
-                 Example — serial review pipeline:\n\
-                 tasks: [{{\"id\":\"impl\",\"agent\":\"coder\",\"prompt\":\"Implement...\"}},\n\
-                  {{\"id\":\"review\",\"agent\":\"reviewer\",\"prompt\":\"Review: {{{{results.impl}}}}\",\"depends_on\":[\"impl\"]}},\n\
-                  {{\"id\":\"fix\",\"agent\":\"coder\",\"prompt\":\"Fix: {{{{results.review}}}}\",\"depends_on\":[\"review\"]}}]\n\n\
-                 Example — parallel exploration then synthesis:\n\
-                 tasks: [{{\"id\":\"code\",\"agent\":\"explore\",\"prompt\":\"Analyze code...\"}},\n\
-                  {{\"id\":\"docs\",\"agent\":\"researcher\",\"prompt\":\"Research docs...\"}},\n\
-                  {{\"id\":\"plan\",\"agent\":\"coder\",\"prompt\":\"Synthesize: {{{{results.code}}}} and {{{{results.docs}}}}\",\"depends_on\":[\"code\",\"docs\"]}}]\n\n\
-                 {catalog}",
-            ),
+            "description": orchestrate_tool_description(&catalog),
             "parameters": orchestrate_tool_parameters(),
         }
     })
@@ -590,21 +603,7 @@ pub(crate) fn orchestrate_tool_definition_anthropic(agent_names: &[String]) -> s
     };
     json!({
         "name": "orchestrate",
-        "description": format!(
-            "Orchestrate a coordinated multi-agent workflow. Define a DAG of tasks where each \
-             task runs a sub-agent. Tasks without dependencies execute in parallel; dependent \
-             tasks wait for upstream results. Use {{{{results.<task_id>}}}} in prompts to \
-             reference outputs from completed upstream tasks.\n\n\
-             Example — serial review pipeline:\n\
-             tasks: [{{\"id\":\"impl\",\"agent\":\"coder\",\"prompt\":\"Implement...\"}},\n\
-              {{\"id\":\"review\",\"agent\":\"reviewer\",\"prompt\":\"Review: {{{{results.impl}}}}\",\"depends_on\":[\"impl\"]}},\n\
-              {{\"id\":\"fix\",\"agent\":\"coder\",\"prompt\":\"Fix: {{{{results.review}}}}\",\"depends_on\":[\"review\"]}}]\n\n\
-             Example — parallel exploration then synthesis:\n\
-             tasks: [{{\"id\":\"code\",\"agent\":\"explore\",\"prompt\":\"Analyze code...\"}},\n\
-              {{\"id\":\"docs\",\"agent\":\"researcher\",\"prompt\":\"Research docs...\"}},\n\
-              {{\"id\":\"plan\",\"agent\":\"coder\",\"prompt\":\"Synthesize: {{{{results.code}}}} and {{{{results.docs}}}}\",\"depends_on\":[\"code\",\"docs\"]}}]\n\n\
-             {catalog}",
-        ),
+        "description": orchestrate_tool_description(&catalog),
         "input_schema": orchestrate_tool_parameters(),
     })
 }

@@ -27,7 +27,18 @@ export function animateCollapsibleSection(body, expand) {
 
   const startHeight = body.getBoundingClientRect().height;
   body.classList.toggle('show', expand);
-  const targetHeight = expand ? body.scrollHeight : 0;
+
+  // When expanding, clamp target to CSS max-height (if any) so the
+  // animation ends exactly at the visible cap instead of overshooting
+  // invisibly — otherwise the user sees a pause while height transitions
+  // past the visible region.
+  let targetHeight = expand ? body.scrollHeight : 0;
+  if (expand) {
+    const maxH = parseFloat(getComputedStyle(body).maxHeight);
+    if (Number.isFinite(maxH) && maxH > 0 && targetHeight > maxH) {
+      targetHeight = maxH;
+    }
+  }
 
   body.style.height = `${startHeight}px`;
   body.getBoundingClientRect();

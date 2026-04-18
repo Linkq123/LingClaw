@@ -109,6 +109,8 @@ pub(crate) struct Config {
     pub(crate) memory_model: Option<String>,
     /// Optional model for post-execution reflection.
     pub(crate) reflection_model: Option<String>,
+    /// Optional model for context compression (auto-compress hook).
+    pub(crate) context_model: Option<String>,
     pub(crate) provider: Provider,
     pub(crate) openai_stream_include_usage: bool,
     pub(crate) anthropic_prompt_caching: bool,
@@ -289,6 +291,10 @@ impl Config {
             .as_ref()
             .and_then(|m| m.reflection.clone())
             .or_else(|| std::env::var("LINGCLAW_REFLECTION_MODEL").ok());
+        let context_model = model_config
+            .as_ref()
+            .and_then(|m| m.context.clone())
+            .or_else(|| std::env::var("LINGCLAW_CONTEXT_MODEL").ok());
 
         let model = default_from_json
             .or_else(|| std::env::var("LINGCLAW_MODEL").ok())
@@ -340,6 +346,7 @@ impl Config {
             sub_agent_model,
             memory_model,
             reflection_model,
+            context_model,
             provider,
             openai_stream_include_usage: settings
                 .openai_stream_include_usage
@@ -439,6 +446,10 @@ impl Config {
             .as_deref()
             .or(self.memory_model.as_deref())
             .unwrap_or(fallback)
+    }
+
+    pub(crate) fn context_model_or<'a>(&'a self, fallback: &'a str) -> &'a str {
+        self.context_model.as_deref().unwrap_or(fallback)
     }
 
     /// Resolve a model reference ("provider/model" or plain "model-name") to
@@ -878,6 +889,8 @@ pub(crate) struct JsonDefaultModel {
     pub(crate) memory: Option<String>,
     /// Optional model for post-execution reflection.
     pub(crate) reflection: Option<String>,
+    /// Optional model for context compression.
+    pub(crate) context: Option<String>,
 }
 
 pub(crate) fn config_dir_path() -> Option<PathBuf> {

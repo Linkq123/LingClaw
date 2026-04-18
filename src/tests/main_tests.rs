@@ -30,6 +30,7 @@ fn test_config() -> Config {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -288,6 +289,73 @@ fn build_compressed_messages_inserts_summary_and_keeps_recent_tail() {
 }
 
 #[test]
+fn compression_source_text_skips_auto_generated_summary() {
+    let summary_msg = build_auto_summary_message("Some previous summary");
+    let messages = vec![
+        make_message("system", "system"),
+        summary_msg,
+        make_message("user", "after-summary"),
+        make_message("assistant", "reply"),
+    ];
+    let source = build_compression_source_text(&messages);
+    assert!(
+        !source.contains("Context Summary (auto-generated)"),
+        "compression source should not include previous auto-summaries"
+    );
+    assert!(source.contains("after-summary"));
+    assert!(source.contains("reply"));
+}
+
+#[test]
+fn compression_source_text_includes_image_markers() {
+    let mut user_msg = make_message("user", "look at this");
+    user_msg.images = Some(vec![
+        ImageAttachment {
+            url: "https://example.com/a.png".to_string(),
+            s3_object_key: None,
+            cache_path: None,
+            data: None,
+        },
+        ImageAttachment {
+            url: "https://example.com/b.png".to_string(),
+            s3_object_key: None,
+            cache_path: None,
+            data: None,
+        },
+    ]);
+    let messages = vec![
+        make_message("system", "system"),
+        user_msg,
+        make_message("assistant", "I see"),
+    ];
+    let source = build_compression_source_text(&messages);
+    assert!(
+        source.contains("2 image(s)"),
+        "compression source should note image attachments"
+    );
+    assert!(source.contains("look at this"));
+}
+
+#[test]
+fn repeated_compression_excludes_previous_summary() {
+    let messages_after_first_compress = vec![
+        make_message("system", "system"),
+        build_auto_summary_message("summary of early conversation"),
+        make_message("user", "new question"),
+        make_message("assistant", "new answer"),
+        make_message("user", "follow up"),
+        make_message("assistant", "follow up answer"),
+    ];
+    let source = build_compression_source_text(&messages_after_first_compress);
+    assert!(
+        !source.contains("summary of early conversation"),
+        "second compression should not include the first summary text"
+    );
+    assert!(source.contains("new question"));
+    assert!(source.contains("follow up"));
+}
+
+#[test]
 fn resolve_model_uses_config_for_plain_model_id() {
     let mut providers = HashMap::new();
     providers.insert(
@@ -318,6 +386,7 @@ fn resolve_model_uses_config_for_plain_model_id() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -832,6 +901,7 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::Ollama,
         anthropic_prompt_caching: false,
         providers,
@@ -910,6 +980,7 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -994,6 +1065,7 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1070,6 +1142,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1128,6 +1201,7 @@ fn canonical_model_ref_expands_unique_plain_id() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1203,6 +1277,7 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1280,6 +1355,7 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1337,6 +1413,7 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1394,6 +1471,7 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1431,6 +1509,7 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -1468,6 +1547,7 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -1505,6 +1585,7 @@ fn resolve_model_accepts_ollama_prefix_without_provider_config() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::Ollama,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -1562,6 +1643,7 @@ fn build_session_status_reports_resolved_target() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -3843,8 +3925,8 @@ fn message_token_len_empty_message() {
         tool_call_id: None,
         timestamp: None,
     };
-    // (0 + 0 + 10) / 4 = 2
-    assert_eq!(message_token_len(&msg), 2);
+    // content=0 + tc=0 + overhead=3 = 3
+    assert_eq!(message_token_len(&msg), 3);
 }
 
 #[test]
@@ -3857,7 +3939,7 @@ fn message_token_len_content_only() {
         tool_call_id: None,
         timestamp: None,
     };
-    // (11 + 0 + 10) / 4 = 5
+    // content: 11 ASCII bytes / 4 = 2, + overhead 3 = 5
     assert_eq!(message_token_len(&msg), 5);
 }
 
@@ -3878,8 +3960,8 @@ fn message_token_len_with_tool_calls() {
         tool_call_id: None,
         timestamp: None,
     };
-    // (0 + (4+12) + 10) / 4 = 26/4 = 6
-    assert_eq!(message_token_len(&msg), 6);
+    // content=0, tc: (4+12)/4 = 4, + overhead 3 = 7
+    assert_eq!(message_token_len(&msg), 7);
 }
 
 #[test]
@@ -3902,8 +3984,40 @@ fn estimate_tokens_sums_messages() {
             timestamp: None,
         },
     ];
-    // (3+0+10)/4 + (5+0+10)/4 = 3 + 3 = 6
-    assert_eq!(estimate_tokens(&messages), 6);
+    // "sys": 3/4=0 + 3=3, "hello": 5/4=1 + 3=4, total=7
+    assert_eq!(estimate_tokens(&messages), 7);
+}
+
+#[test]
+fn message_token_len_cjk_aware() {
+    // CJK text: 6 Chinese characters = 18 UTF-8 bytes, but ~6 tokens (1 per char)
+    let msg = ChatMessage {
+        role: "user".into(),
+        content: Some("你好世界测试".into()),
+        images: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    let cjk_estimate = message_token_len(&msg);
+
+    // Same byte-length ASCII text
+    let ascii_msg = ChatMessage {
+        role: "user".into(),
+        content: Some("a".repeat(18)),
+        images: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    let ascii_estimate = message_token_len(&ascii_msg);
+
+    // CJK should yield more tokens than ASCII for the same byte length,
+    // because CJK characters are ~1 char/token vs ~4 bytes/token.
+    assert!(
+        cjk_estimate > ascii_estimate,
+        "CJK ({cjk_estimate}) should be > ASCII ({ascii_estimate}) for same byte length"
+    );
 }
 
 #[test]
@@ -4024,6 +4138,7 @@ fn context_input_budget_reserves_headroom() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,

@@ -33,6 +33,10 @@ import {
   createSubagentPanel, addSubagentTool, updateSubagentProgress,
   updateSubagentToolResult, finishSubagentPanel
 } from './renderers/subagent.js';
+import {
+  createOrchestratePanel, updateOrchestrateLayer, markOrchestrateTask,
+  finishOrchestratePanel
+} from './renderers/orchestrate.js';
 
 // ── Initialize DOM ──
 initDomRefs();
@@ -66,13 +70,10 @@ function applyViewState(viewState) {
 
   if (typeof viewState.show_tools === 'boolean') {
     state.showTools = viewState.show_tools;
+    dom.chat.classList.toggle('hide-tools', !state.showTools);
     if (!state.showTools) {
       closeToolDrawer();
       state.activeToolPanel = null;
-      for (const panel of dom.chat.querySelectorAll('.tool-panel, .subagent-panel')) {
-        removeTimelinePanel(panel);
-      }
-      state.activeSubagentPanels.clear();
     }
   }
 
@@ -166,6 +167,35 @@ function findHistoryRenderStart(messages, preferredStart) {
   return startIdx;
 }
 
+function parseOrchestrationHistoryResult(resultText) {
+  const text = (resultText || '').trimStart();
+  const aborted = /^## Orchestration Aborted\b/m.test(text);
+  const completedMatch = text.match(/(\d+) completed/);
+  const failedMatch = text.match(/(\d+) failed/);
+  const skippedMatch = text.match(/(\d+) skipped/);
+  const taskStatuses = new Map();
+  const taskHeaderRe = /^### \[\d+\] (.+?) \((.+?)\) — (✅|❌|⏭️)/gm;
+
+  let match;
+  while ((match = taskHeaderRe.exec(text)) !== null) {
+    const [, taskId, _agent, icon] = match;
+    const status = icon === '✅'
+      ? 'completed'
+      : icon === '❌'
+        ? 'failed'
+        : 'skipped';
+    taskStatuses.set(taskId, status);
+  }
+
+  return {
+    aborted,
+    completed: completedMatch ? parseInt(completedMatch[1], 10) : 0,
+    failed: failedMatch ? parseInt(failedMatch[1], 10) : 0,
+    skipped: skippedMatch ? parseInt(skippedMatch[1], 10) : 0,
+    taskStatuses,
+  };
+}
+
 function renderHistoryMessage(m, options = {}) {
   const { followMarkdown = true } = options;
   switch (m.role) {
@@ -181,13 +211,29 @@ function renderHistoryMessage(m, options = {}) {
       break;
     }
     case 'tool_call': {
-      if (!state.showTools) break;
       if (m.name === 'task') {
         try {
           const args = JSON.parse(m.arguments || '{}');
-          createSubagentPanel(args.agent || 'sub-agent', args.prompt || '');
+          const ref = { task_id: m.id, agent: args.agent || 'sub-agent' };
+          createSubagentPanel(ref.agent, args.prompt || '', ref.task_id);
           if (!state._historyTaskIds) state._historyTaskIds = new Map();
-          state._historyTaskIds.set(m.id, args.agent || 'sub-agent');
+          state._historyTaskIds.set(m.id, ref);
+        } catch { addToolCall(m.name, m.arguments, m.id); }
+        break;
+      }
+      if (m.name === 'orchestrate') {
+        try {
+          const args = JSON.parse(m.arguments || '{}');
+          const tasks = Array.isArray(args.tasks) ? args.tasks : [];
+          const orchestrateId = `hist-${m.id || Date.now()}`;
+          createOrchestratePanel({
+            orchestrate_id: orchestrateId,
+            task_count: tasks.length,
+            layer_count: 0,
+            tasks: tasks.map(t => ({ id: t.id, agent: t.agent, depends_on: t.depends_on || [] })),
+          });
+          if (!state._historyOrchestrateIds) state._historyOrchestrateIds = new Map();
+          state._historyOrchestrateIds.set(m.id, orchestrateId);
         } catch { addToolCall(m.name, m.arguments, m.id); }
         break;
       }
@@ -195,16 +241,38 @@ function renderHistoryMessage(m, options = {}) {
       break;
     }
     case 'tool_result': {
-      if (!state.showTools) break;
       if (state._historyTaskIds && state._historyTaskIds.has(m.id)) {
-        const agentName = state._historyTaskIds.get(m.id);
+        const ref = state._historyTaskIds.get(m.id);
         state._historyTaskIds.delete(m.id);
         const r = (m.result || '').trimStart();
         const failed = m.is_error === true
           || r.startsWith('task error:')
           || r.startsWith('[rejected')
           || /^Sub-agent '.+' (failed|timed out)/.test(r);
-        finishSubagentPanel(agentName, !failed, {}, { immediate: true });
+        finishSubagentPanel(ref, !failed, {}, { immediate: true });
+        break;
+      }
+      if (state._historyOrchestrateIds && state._historyOrchestrateIds.has(m.id)) {
+        const orchestrateId = state._historyOrchestrateIds.get(m.id);
+        state._historyOrchestrateIds.delete(m.id);
+        const r = (m.result || '').trimStart();
+        const summary = parseOrchestrationHistoryResult(r);
+        const registry = state.activeOrchestrations;
+        const entry = registry && registry.get(orchestrateId);
+        if (entry) {
+          for (const [taskId, status] of summary.taskStatuses.entries()) {
+            if (entry.taskRows.has(taskId)) {
+              markOrchestrateTask({ orchestrate_id: orchestrateId, id: taskId }, status);
+            }
+          }
+        }
+        finishOrchestratePanel({
+          orchestrate_id: orchestrateId,
+          aborted: summary.aborted,
+          completed: summary.completed,
+          failed: summary.failed,
+          skipped: summary.skipped,
+        });
         break;
       }
       addToolResult('', m.result, m.id);
@@ -216,6 +284,8 @@ function renderHistoryMessage(m, options = {}) {
 function loadEarlierMessages() {
   const msgs = state.deferredHistory;
   state.deferredHistory = [];
+  state._historyTaskIds = null;
+  state._historyOrchestrateIds = null;
   const loadMoreRow = document.getElementById('load-more-row');
   const anchor = loadMoreRow ? loadMoreRow.nextElementSibling : dom.chat.firstElementChild;
   if (loadMoreRow) loadMoreRow.remove();
@@ -224,6 +294,19 @@ function loadEarlierMessages() {
   dom.chat.classList.add('no-animate');
   state.bulkRenderingChat = true;
   for (const m of msgs) renderHistoryMessage(m, { followMarkdown: false });
+  // Finalize orphaned panels from deferred history.
+  if (state._historyTaskIds && state._historyTaskIds.size > 0) {
+    for (const ref of state._historyTaskIds.values()) {
+      finishSubagentPanel(ref, false, {}, { immediate: true });
+    }
+    state._historyTaskIds = null;
+  }
+  if (state._historyOrchestrateIds && state._historyOrchestrateIds.size > 0) {
+    for (const orchestrateId of state._historyOrchestrateIds.values()) {
+      finishOrchestratePanel({ orchestrate_id: orchestrateId, aborted: true });
+    }
+    state._historyOrchestrateIds = null;
+  }
   for (const el of existing) dom.chat.appendChild(el);
   requestAnimationFrame(() => {
     state.bulkRenderingChat = false;
@@ -267,16 +350,16 @@ function handleMessage(data) {
       break;
 
     case 'history': {
-      if (!state.showTools) {
-        data.messages = (data.messages || []).filter(m => m.role !== 'tool_call' && m.role !== 'tool_result');
-      }
       closeToolDrawer();
       clearReactStatus();
       clearBufferedChatUpdates();
       setAutoFollowChat(true);
       dom.chat.innerHTML = '';
       state.deferredHistory = [];
+      state.activeSubagentPanels.clear();
+      state.activeOrchestrations.clear();
       state._historyTaskIds = null;
+      state._historyOrchestrateIds = null;
       const msgs = data.messages || [];
       if (msgs.length === 0) {
         showWelcome();
@@ -301,10 +384,17 @@ function handleMessage(data) {
           renderHistoryMessage(msgs[i]);
         }
         if (state._historyTaskIds && state._historyTaskIds.size > 0) {
-          for (const name of state._historyTaskIds.values()) {
-            finishSubagentPanel(name, false, {}, { immediate: true });
+          for (const ref of state._historyTaskIds.values()) {
+            finishSubagentPanel(ref, false, {}, { immediate: true });
           }
           state._historyTaskIds = null;
+        }
+        // Finalize orphaned orchestrate panels that never got a tool_result.
+        if (state._historyOrchestrateIds && state._historyOrchestrateIds.size > 0) {
+          for (const orchestrateId of state._historyOrchestrateIds.values()) {
+            finishOrchestratePanel({ orchestrate_id: orchestrateId, aborted: true });
+          }
+          state._historyOrchestrateIds = null;
         }
         requestAnimationFrame(() => {
           state.bulkRenderingChat = false;
@@ -436,50 +526,95 @@ function handleMessage(data) {
     case 'tool_call':
       if (data.subagent) break;
       setReactActTool(data.name, 0);
-      if (!state.showTools) break;
       addToolCall(data.name, data.arguments, data.id);
       break;
 
     case 'tool_progress':
       if (data.subagent) break;
       setReactActTool(data.name, data.elapsed_ms || 0);
-      if (!state.showTools) break;
       updateToolProgress(data.id, data.elapsed_ms || 0);
       break;
 
     case 'tool_result':
       if (data.subagent) {
-        if (state.showTools) updateSubagentToolResult(data.subagent, data.id, data.duration_ms);
+        updateSubagentToolResult({ task_id: data.task_id, agent: data.subagent }, data.id, data.duration_ms);
         break;
       }
       if (state.reactStatusPhase === 'act' && state.reactStatusToolName === data.name) {
         state.reactStatusElapsedMs = data.duration_ms || state.reactStatusElapsedMs;
         renderReactStatus();
       }
-      if (!state.showTools) break;
       addToolResult(data.name, data.result, data.id, data.duration_ms ?? null);
       break;
 
     case 'task_started':
-      if (state.showTools) createSubagentPanel(data.agent, data.prompt);
+      createSubagentPanel(data.agent, data.prompt, data.task_id);
       break;
     case 'task_progress':
-      if (state.showTools) updateSubagentProgress(data.agent, data.cycle);
+      updateSubagentProgress({ task_id: data.task_id, agent: data.agent }, data.cycle);
       break;
     case 'task_tool':
-      if (state.showTools) addSubagentTool(data.agent, data.tool, data.id);
+      addSubagentTool({ task_id: data.task_id, agent: data.agent }, data.tool, data.id);
       break;
     case 'task_completed':
-      if (state.showTools) finishSubagentPanel(data.agent, true, { cycles: data.cycles, tool_calls: data.tool_calls, duration_ms: data.duration_ms });
+      finishSubagentPanel(
+        { task_id: data.task_id, agent: data.agent },
+        true,
+        {
+          cycles: data.cycles,
+          tool_calls: data.tool_calls,
+          duration_ms: data.duration_ms,
+          input_tokens: data.input_tokens,
+          output_tokens: data.output_tokens,
+          result_preview: data.result_preview,
+        }
+      );
       break;
     case 'task_failed':
-      if (state.showTools) finishSubagentPanel(data.agent, false, { cycles: data.cycles, tool_calls: data.tool_calls, duration_ms: data.duration_ms, error: data.error });
+      finishSubagentPanel(
+        { task_id: data.task_id, agent: data.agent },
+        false,
+        {
+          cycles: data.cycles,
+          tool_calls: data.tool_calls,
+          duration_ms: data.duration_ms,
+          input_tokens: data.input_tokens,
+          output_tokens: data.output_tokens,
+          error: data.error,
+        }
+      );
+      break;
+
+    case 'orchestrate_started':
+      createOrchestratePanel(data);
+      break;
+    case 'orchestrate_layer':
+      updateOrchestrateLayer(data);
+      break;
+    case 'orchestrate_task_started':
+      markOrchestrateTask(data, 'running');
+      break;
+    case 'orchestrate_task_completed':
+      markOrchestrateTask(data, 'completed');
+      break;
+    case 'orchestrate_task_failed':
+      markOrchestrateTask(data, 'failed');
+      break;
+    case 'orchestrate_task_skipped':
+      markOrchestrateTask(data, 'skipped');
+      break;
+    case 'orchestrate_completed':
+      finishOrchestratePanel(data);
       break;
 
     case 'context_compressed':
       addSystem(
         `Context auto-compressed: removed ${data.messages_removed || 0} messages, token estimate ${data.before_estimate || 0} -> ${data.after_estimate || 0}`
       );
+      break;
+
+    case 'context_compress_failed':
+      addError(`Context auto-compress failed: ${data.error || 'unknown error'}`);
       break;
 
     case 'progress':

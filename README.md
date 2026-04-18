@@ -166,7 +166,8 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
         "fast": "openai/gpt-4o-mini",
         "sub-agent": "openai/gpt-4o-mini",
         "memory": "openai/gpt-4o-mini",
-        "reflection": "openai/gpt-4o-mini"
+        "reflection": "openai/gpt-4o-mini",
+        "context": "openai/gpt-4o-mini"
       }
     }
   },
@@ -255,6 +256,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 | `LINGCLAW_SUB_AGENT_MODEL` | 无 | 子代理委托任务使用的模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_MEMORY_MODEL` | 无 | structured memory 后台抽取优先使用的模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_REFLECTION_MODEL` | 无 | daily reflection 后台生成优先使用的模型（如 `openai/gpt-4o-mini`） |
+| `LINGCLAW_CONTEXT_MODEL` | 无 | 上下文自动压缩优先使用的模型（如 `openai/gpt-4o-mini`），未设置时回退到当前会话有效模型 |
 | `LINGCLAW_STRUCTURED_MEMORY` | `false` | 启用后台结构化记忆提取与 prompt 注入 |
 | `LINGCLAW_DAILY_REFLECTION` | `false` | 启用后台 daily reflection 生成与 `/reflection` 查看能力 |
 

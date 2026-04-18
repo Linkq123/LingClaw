@@ -73,6 +73,8 @@ pub(crate) struct TaskResult {
     pub cycles: usize,
     pub tool_calls: usize,
     pub duration_ms: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 /// Status of an individual task in the orchestration.
@@ -95,6 +97,22 @@ impl OrchestrationOutcome {
             .iter()
             .any(|result| result.status != TaskStatus::Completed)
     }
+
+    /// Total input tokens consumed across all sub-agent calls in this run.
+    pub(crate) fn total_input_tokens(&self) -> u64 {
+        self.task_results
+            .iter()
+            .map(|r| r.input_tokens)
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Total output tokens consumed across all sub-agent calls in this run.
+    pub(crate) fn total_output_tokens(&self) -> u64 {
+        self.task_results
+            .iter()
+            .map(|r| r.output_tokens)
+            .fold(0u64, u64::saturating_add)
+    }
 }
 
 /// Drop guard that sends an `orchestrate_task_failed` event if a task future is
@@ -102,15 +120,17 @@ impl OrchestrationOutcome {
 /// Uses `try_send` because `Drop` cannot await.
 struct OrchestrateTaskEventGuard<'a> {
     live_tx: &'a LiveTx,
+    orchestrate_id: String,
     task_id: String,
     agent: String,
     finished: bool,
 }
 
 impl<'a> OrchestrateTaskEventGuard<'a> {
-    fn new(live_tx: &'a LiveTx, task_id: &str, agent: &str) -> Self {
+    fn new(live_tx: &'a LiveTx, orchestrate_id: &str, task_id: &str, agent: &str) -> Self {
         Self {
             live_tx,
+            orchestrate_id: orchestrate_id.to_string(),
             task_id: task_id.to_string(),
             agent: agent.to_string(),
             finished: false,
@@ -127,12 +147,29 @@ impl Drop for OrchestrateTaskEventGuard<'_> {
         if !self.finished {
             let _ = self.live_tx.try_send(json!({
                 "type": "orchestrate_task_failed",
+                "orchestrate_id": self.orchestrate_id,
                 "id": self.task_id,
                 "agent": self.agent,
                 "error": "task aborted (timeout or cancellation)",
             }));
         }
     }
+}
+
+/// Generate a short random identifier that disambiguates concurrent
+/// orchestration runs in the frontend. 8 bytes of entropy = 16 hex chars.
+fn generate_orchestrate_id() -> String {
+    let mut bytes = [0u8; 8];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // Fallback: timestamp-based id. Collision risk is negligible because
+        // we only need uniqueness within an active session.
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        return format!("orch-{ts:x}");
+    }
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 // ── Validation ───────────────────────────────────────────────────────────────
@@ -375,6 +412,7 @@ pub(crate) async fn execute_orchestration(
     hooks: &HookRegistry,
 ) -> OrchestrationOutcome {
     let orchestration_start = std::time::Instant::now();
+    let orchestrate_id = generate_orchestrate_id();
     let layers = compute_execution_layers(plan);
     let mut completed_results: HashMap<String, String> = HashMap::new();
     let mut failed_ids: HashSet<String> = HashSet::new();
@@ -397,6 +435,7 @@ pub(crate) async fn execute_orchestration(
         live_tx,
         json!({
             "type": "orchestrate_started",
+            "orchestrate_id": orchestrate_id,
             "task_count": plan.tasks.len(),
             "layer_count": layers.len(),
             "tasks": task_summary,
@@ -414,6 +453,7 @@ pub(crate) async fn execute_orchestration(
                 &mut failed_ids,
                 live_tx,
                 "Orchestration cancelled",
+                &orchestrate_id,
             )
             .await;
             break;
@@ -425,6 +465,7 @@ pub(crate) async fn execute_orchestration(
             live_tx,
             json!({
                 "type": "orchestrate_layer",
+                "orchestrate_id": orchestrate_id,
                 "layer": layer_idx + 1,
                 "total_layers": layers.len(),
                 "tasks": layer_task_ids,
@@ -443,6 +484,7 @@ pub(crate) async fn execute_orchestration(
                     live_tx,
                     json!({
                         "type": "orchestrate_task_skipped",
+                        "orchestrate_id": orchestrate_id,
                         "id": task.id,
                         "agent": task.agent,
                         "reason": reason,
@@ -458,6 +500,8 @@ pub(crate) async fn execute_orchestration(
                     cycles: 0,
                     tool_calls: 0,
                     duration_ms: 0,
+                    input_tokens: 0,
+                    output_tokens: 0,
                 });
             } else {
                 runnable.push(idx);
@@ -480,6 +524,7 @@ pub(crate) async fn execute_orchestration(
                 cancel.child_token(),
                 hooks,
                 &completed_results,
+                &orchestrate_id,
             )
             .await;
             vec![(idx, result)]
@@ -494,6 +539,7 @@ pub(crate) async fn execute_orchestration(
                 &cancel,
                 hooks,
                 &completed_results,
+                &orchestrate_id,
             )
             .await
         };
@@ -522,6 +568,7 @@ pub(crate) async fn execute_orchestration(
                 &mut failed_ids,
                 live_tx,
                 "Orchestration cancelled",
+                &orchestrate_id,
             )
             .await;
             break;
@@ -544,15 +591,26 @@ pub(crate) async fn execute_orchestration(
     // Wall-clock duration of the orchestration. Summing task durations would
     // overcount parallel layers.
     let total_duration_ms = orchestration_start.elapsed().as_millis() as u64;
+    let total_input_tokens: u64 = task_results
+        .iter()
+        .map(|r| r.input_tokens)
+        .fold(0u64, u64::saturating_add);
+    let total_output_tokens: u64 = task_results
+        .iter()
+        .map(|r| r.output_tokens)
+        .fold(0u64, u64::saturating_add);
 
     let _ = live_send(
         live_tx,
         json!({
             "type": "orchestrate_completed",
+            "orchestrate_id": orchestrate_id,
             "completed": completed_count,
             "failed": failed_count,
             "skipped": skipped_count,
             "total_tasks": plan.tasks.len(),
+            "input_tokens": total_input_tokens,
+            "output_tokens": total_output_tokens,
             "duration_ms": total_duration_ms,
             "aborted": aborted,
         }),
@@ -572,6 +630,7 @@ async fn mark_remaining_skipped(
     failed_ids: &mut HashSet<String>,
     live_tx: &LiveTx,
     reason: &str,
+    orchestrate_id: &str,
 ) {
     let processed: HashSet<String> = task_results.iter().map(|r| r.id.clone()).collect();
     for task in &plan.tasks {
@@ -580,6 +639,7 @@ async fn mark_remaining_skipped(
                 live_tx,
                 json!({
                     "type": "orchestrate_task_skipped",
+                    "orchestrate_id": orchestrate_id,
                     "id": task.id,
                     "agent": task.agent,
                     "reason": reason,
@@ -595,6 +655,8 @@ async fn mark_remaining_skipped(
                 cycles: 0,
                 tool_calls: 0,
                 duration_ms: 0,
+                input_tokens: 0,
+                output_tokens: 0,
             });
         }
     }
@@ -611,6 +673,7 @@ async fn execute_single_task(
     cancel: CancellationToken,
     hooks: &HookRegistry,
     completed_results: &HashMap<String, String>,
+    orchestrate_id: &str,
 ) -> TaskResult {
     let start = std::time::Instant::now();
 
@@ -622,6 +685,7 @@ async fn execute_single_task(
                 live_tx,
                 json!({
                     "type": "orchestrate_task_failed",
+                    "orchestrate_id": orchestrate_id,
                     "id": task.id,
                     "agent": task.agent,
                     "error": format!("agent '{}' not found", task.agent),
@@ -636,6 +700,8 @@ async fn execute_single_task(
                 cycles: 0,
                 tool_calls: 0,
                 duration_ms: start.elapsed().as_millis() as u64,
+                input_tokens: 0,
+                output_tokens: 0,
             };
         }
     };
@@ -648,13 +714,19 @@ async fn execute_single_task(
         live_tx,
         json!({
             "type": "orchestrate_task_started",
+            "orchestrate_id": orchestrate_id,
             "id": task.id,
             "agent": task.agent,
             "prompt": truncate(&resolved_prompt, 500),
         }),
     )
     .await;
-    let mut guard = OrchestrateTaskEventGuard::new(live_tx, &task.id, &task.agent);
+    let mut guard = OrchestrateTaskEventGuard::new(live_tx, orchestrate_id, &task.id, &task.agent);
+
+    // Compose a composite task_id so forwarded inner events (task_progress /
+    // task_tool / tool_result with `subagent` tag) can still be disambiguated
+    // in the frontend even when an orchestration runs the same agent twice.
+    let composite_task_id = format!("{orchestrate_id}:{}", task.id);
 
     // Run sub-agent
     let outcome = run_subagent(
@@ -666,6 +738,7 @@ async fn execute_single_task(
         live_tx,
         cancel,
         hooks,
+        &composite_task_id,
     )
     .await;
 
@@ -676,11 +749,14 @@ async fn execute_single_task(
             live_tx,
             json!({
                 "type": "orchestrate_task_failed",
+                "orchestrate_id": orchestrate_id,
                 "id": task.id,
                 "agent": task.agent,
                 "error": outcome.result,
                 "cycles": outcome.cycles,
                 "tool_calls": outcome.tool_calls,
+                "input_tokens": outcome.total_input_tokens,
+                "output_tokens": outcome.total_output_tokens,
                 "duration_ms": duration_ms,
             }),
         )
@@ -694,16 +770,21 @@ async fn execute_single_task(
             cycles: outcome.cycles,
             tool_calls: outcome.tool_calls,
             duration_ms,
+            input_tokens: outcome.total_input_tokens,
+            output_tokens: outcome.total_output_tokens,
         }
     } else {
         let _ = live_send(
             live_tx,
             json!({
                 "type": "orchestrate_task_completed",
+                "orchestrate_id": orchestrate_id,
                 "id": task.id,
                 "agent": task.agent,
                 "cycles": outcome.cycles,
                 "tool_calls": outcome.tool_calls,
+                "input_tokens": outcome.total_input_tokens,
+                "output_tokens": outcome.total_output_tokens,
                 "duration_ms": duration_ms,
             }),
         )
@@ -717,6 +798,8 @@ async fn execute_single_task(
             cycles: outcome.cycles,
             tool_calls: outcome.tool_calls,
             duration_ms,
+            input_tokens: outcome.total_input_tokens,
+            output_tokens: outcome.total_output_tokens,
         }
     }
 }
@@ -736,6 +819,7 @@ async fn execute_parallel_tasks(
     cancel: &CancellationToken,
     hooks: &HookRegistry,
     completed_results: &HashMap<String, String>,
+    orchestrate_id: &str,
 ) -> Vec<(usize, TaskResult)> {
     let futures: Vec<_> = runnable
         .iter()
@@ -752,6 +836,7 @@ async fn execute_parallel_tasks(
                     child_cancel,
                     hooks,
                     completed_results,
+                    orchestrate_id,
                 )
                 .await;
                 (idx, result)

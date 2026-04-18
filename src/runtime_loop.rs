@@ -1,7 +1,7 @@
 use super::*;
 
 use serde_json::json;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicI64, AtomicU64};
 use tokio::time::MissedTickBehavior;
 
 mod socket_input;
@@ -19,6 +19,10 @@ const REFLECTION_COOLDOWN_SECS: i64 = 600; // 10 minutes
 
 /// Epoch-seconds timestamp of the last reflection run (0 = never).
 static LAST_REFLECTION_EPOCH: AtomicI64 = AtomicI64::new(0);
+
+/// Monotonic counter used to make fallback task ids unique even if the system
+/// clock has coarse granularity or multiple tasks start within the same tick.
+static NEXT_FALLBACK_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
 fn epoch_secs_now() -> i64 {
     chrono::Local::now().timestamp()
@@ -146,14 +150,16 @@ enum ToolRunState {
 struct TaskEventGuard<'a> {
     live_tx: &'a LiveTx,
     agent_name: String,
+    task_id: String,
     finished: bool,
 }
 
 impl<'a> TaskEventGuard<'a> {
-    fn new(live_tx: &'a LiveTx, agent_name: &str) -> Self {
+    fn new(live_tx: &'a LiveTx, agent_name: &str, task_id: &str) -> Self {
         Self {
             live_tx,
             agent_name: agent_name.to_string(),
+            task_id: task_id.to_string(),
             finished: false,
         }
     }
@@ -172,6 +178,7 @@ impl Drop for TaskEventGuard<'_> {
             );
             let _ = self.live_tx.try_send(json!({
                 "type": "task_failed",
+                "task_id": self.task_id,
                 "agent": self.agent_name,
                 "error": "task aborted (timeout or cancellation)",
             }));
@@ -432,21 +439,10 @@ async fn fit_messages_to_request_budget(
 
 async fn send_before_analyze_events(
     ctx: &AgentRunCtx<'_>,
-    react_ctx: &agent::AgentLoopCtx,
     model: &str,
+    mut hook_events: Vec<serde_json::Value>,
     pruned_count: usize,
 ) -> Option<Vec<ChatMessage>> {
-    let mut before_analyze_events = run_hooks(
-        &ctx.state.hooks,
-        agent::HookPoint::BeforeAnalyze,
-        &ctx.state.sessions,
-        ctx.current_session_id,
-        &ctx.state.config,
-        &ctx.state.http,
-        react_ctx.cycles,
-    )
-    .await;
-
     let final_messages = {
         let sessions = ctx.state.sessions.lock().await;
         sessions
@@ -458,13 +454,13 @@ async fn send_before_analyze_events(
         ctx.state.config.resolve_model(model).provider,
         &final_messages,
     );
-    for event in &mut before_analyze_events {
+    for event in &mut hook_events {
         if event["type"] == "context_compressed" {
             event["after_estimate"] = json!(final_context_estimate);
         }
     }
 
-    for event in before_analyze_events {
+    for event in hook_events {
         if !live_send(ctx.live_tx, event).await {
             return None;
         }
@@ -647,7 +643,9 @@ async fn execute_tool(
 
 /// Execute a `task` tool call by delegating to a sub-agent.
 /// Returns the outcome as a standard ToolOutcome so it integrates with the
-/// existing record_tool_result flow.
+/// existing record_tool_result flow. Sub-agent token usage is accumulated into
+/// the parent session counters so global/daily stats remain accurate.
+#[allow(clippy::too_many_arguments)]
 async fn execute_task_tool(
     args_str: &str,
     config: &Config,
@@ -656,6 +654,8 @@ async fn execute_task_tool(
     live_tx: &LiveTx,
     cancel: CancellationToken,
     hooks: &HookRegistry,
+    state: &Arc<AppState>,
+    session_id: &str,
 ) -> tools::ToolOutcome {
     let start = std::time::Instant::now();
 
@@ -722,11 +722,28 @@ async fn execute_task_tool(
         }
     };
 
+    // Generate a unique task_id so the frontend can key parallel same-agent
+    // task panels independently. 8 bytes = 16 hex chars, ample for a session.
+    let task_id = {
+        let mut bytes = [0u8; 8];
+        if getrandom::getrandom(&mut bytes).is_ok() {
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        } else {
+            let seq = NEXT_FALLBACK_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(seq as u128);
+            format!("task-{nanos:x}-{seq:x}")
+        }
+    };
+
     // Send task_started event
     let _ = live_send(
         live_tx,
         json!({
             "type": "task_started",
+            "task_id": task_id,
             "agent": agent_name,
             "prompt": crate::truncate(prompt, 500),
         }),
@@ -735,32 +752,56 @@ async fn execute_task_tool(
 
     // Guard ensures task_failed is sent if we're dropped after task_started
     // (e.g. timeout or cancellation in run_tool_with_feedback).
-    let mut guard = TaskEventGuard::new(live_tx, agent_name);
+    let mut guard = TaskEventGuard::new(live_tx, agent_name, &task_id);
 
     let outcome = crate::subagents::executor::run_subagent(
-        &spec, prompt, config, http, workspace, live_tx, cancel, hooks,
+        &spec, prompt, config, http, workspace, live_tx, cancel, hooks, &task_id,
     )
     .await;
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
+    // Propagate sub-agent token usage into the parent session so stats reflect
+    // the full cost of delegation.  The executor mixes provider-reported and
+    // locally-estimated counts (prefer provider, fall back to estimate), so
+    // the source label is conservatively "estimated".
+    if outcome.total_input_tokens > 0 || outcome.total_output_tokens > 0 {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(session_id) {
+            context::update_session_token_usage(
+                session,
+                outcome.total_input_tokens,
+                outcome.total_output_tokens,
+                "estimated",
+                "estimated",
+            );
+        }
+    }
+
     // Send task_completed / task_failed event
     let terminal_event = if outcome.aborted {
         json!({
             "type": "task_failed",
+            "task_id": task_id,
             "agent": agent_name,
             "error": outcome.result,
             "cycles": outcome.cycles,
             "tool_calls": outcome.tool_calls,
+            "input_tokens": outcome.total_input_tokens,
+            "output_tokens": outcome.total_output_tokens,
             "duration_ms": duration_ms,
         })
     } else {
         json!({
             "type": "task_completed",
+            "task_id": task_id,
             "agent": agent_name,
             "cycles": outcome.cycles,
             "tool_calls": outcome.tool_calls,
+            "input_tokens": outcome.total_input_tokens,
+            "output_tokens": outcome.total_output_tokens,
             "duration_ms": duration_ms,
+            "result_preview": crate::truncate(&outcome.result, 400),
         })
     };
     let _ = live_send(live_tx, terminal_event).await;
@@ -775,7 +816,9 @@ async fn execute_task_tool(
 
 /// Execute an `orchestrate` tool call by coordinating multiple sub-agents.
 /// Returns the outcome as a standard ToolOutcome so it integrates with the
-/// existing record_tool_result flow.
+/// existing record_tool_result flow. Aggregated sub-agent token usage is
+/// written back to the parent session for accurate stats tracking.
+#[allow(clippy::too_many_arguments)]
 async fn execute_orchestrate_tool(
     args_str: &str,
     config: &Config,
@@ -784,6 +827,8 @@ async fn execute_orchestrate_tool(
     live_tx: &LiveTx,
     cancel: CancellationToken,
     hooks: &HookRegistry,
+    state: &Arc<AppState>,
+    session_id: &str,
 ) -> tools::ToolOutcome {
     let start = std::time::Instant::now();
 
@@ -855,6 +900,25 @@ async fn execute_orchestrate_tool(
 
     let duration_ms = start.elapsed().as_millis() as u64;
     let result = crate::subagents::orchestrator::format_orchestration_result(&outcome);
+
+    // Propagate aggregated sub-agent token usage into the parent session so
+    // the user-facing stats and daily totals include the cost of delegation.
+    // Inner executors mix provider-reported and estimated counts, so the
+    // source label is conservatively "estimated".
+    let input_tokens = outcome.total_input_tokens();
+    let output_tokens = outcome.total_output_tokens();
+    if input_tokens > 0 || output_tokens > 0 {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(session_id) {
+            context::update_session_token_usage(
+                session,
+                input_tokens,
+                output_tokens,
+                "estimated",
+                "estimated",
+            );
+        }
+    }
 
     tools::ToolOutcome {
         output: result,
@@ -1061,6 +1125,8 @@ async fn execute_tool_call(
                 ctx.live_tx,
                 task_cancel,
                 &ctx.state.hooks,
+                ctx.state,
+                ctx.current_session_id,
             ),
         )
         .await
@@ -1082,6 +1148,8 @@ async fn execute_tool_call(
                 ctx.live_tx,
                 orch_cancel,
                 &ctx.state.hooks,
+                ctx.state,
+                ctx.current_session_id,
             ),
         )
         .await
@@ -1259,6 +1327,19 @@ async fn run_analyze_phase(
     );
     let extra_tools = build_cycle_tools(ctx, phase_state, &resolved).await;
 
+    // Run BeforeAnalyze hooks (including auto-compress) BEFORE the fine prune
+    // so compression can preserve context that would otherwise be hard-deleted.
+    let before_analyze_events = run_hooks(
+        &ctx.state.hooks,
+        agent::HookPoint::BeforeAnalyze,
+        &ctx.state.sessions,
+        ctx.current_session_id,
+        &ctx.state.config,
+        &ctx.state.http,
+        phase_state.react_ctx.cycles,
+    )
+    .await;
+
     let (extra_pruned_count, request_budget) =
         match fit_messages_to_request_budget(ctx, &snapshot.model, &effective_think, &extra_tools)
             .await
@@ -1270,8 +1351,8 @@ async fn run_analyze_phase(
 
     let final_msgs_snapshot = match send_before_analyze_events(
         ctx,
-        &phase_state.react_ctx,
         &snapshot.model,
+        before_analyze_events,
         total_pruned_count,
     )
     .await

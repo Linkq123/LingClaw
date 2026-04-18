@@ -75,7 +75,10 @@ use context::{
     turn_len,
 };
 #[cfg(test)]
-use hooks::{build_compressed_messages, find_auto_compress_cutoff};
+use hooks::{
+    build_auto_summary_message, build_compressed_messages, build_compression_source_text,
+    find_auto_compress_cutoff,
+};
 #[cfg(test)]
 use session_admin::gather_global_today_usage;
 #[cfg(test)]

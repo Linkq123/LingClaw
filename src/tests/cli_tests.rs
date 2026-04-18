@@ -28,6 +28,7 @@ fn test_config_with_broken_mcp() -> Config {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         openai_stream_include_usage: false,
         structured_memory: false,

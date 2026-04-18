@@ -43,6 +43,7 @@ export const state = {
   markdownRenderQueue: [],
   markdownQueueHandle: 0,
   activeSubagentPanels: new Map(),
+  activeOrchestrations: new Map(),
   dailyInputTokens: 0,
   dailyOutputTokens: 0,
   totalInputTokens: 0,

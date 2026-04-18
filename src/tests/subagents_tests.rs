@@ -457,6 +457,7 @@ fn base_config() -> Config {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         openai_stream_include_usage: false,
@@ -1071,6 +1072,7 @@ async fn run_subagent_multi_read_only_batch_executes_after_tool_exec_hooks() {
         &live_tx,
         tokio_util::sync::CancellationToken::new(),
         &hooks,
+        "test-task-1",
     )
     .await;
 
@@ -1252,6 +1254,7 @@ async fn run_subagent_timeout_during_tool_exec_still_runs_after_tool_exec_hook()
         &live_tx,
         tokio_util::sync::CancellationToken::new(),
         &hooks,
+        "test-task-timeout",
     )
     .await;
 
@@ -1316,6 +1319,7 @@ async fn run_subagent_executes_mcp_tool_allowed_by_policy() {
         &live_tx,
         tokio_util::sync::CancellationToken::new(),
         &HookRegistry::new(),
+        "test-task-mcp",
     )
     .await;
 
@@ -1705,6 +1709,8 @@ fn test_format_result_basic() {
                 cycles: 3,
                 tool_calls: 5,
                 duration_ms: 12000,
+                input_tokens: 0,
+                output_tokens: 0,
             },
             TaskResult {
                 id: "implement".into(),
@@ -1714,6 +1720,8 @@ fn test_format_result_basic() {
                 cycles: 8,
                 tool_calls: 15,
                 duration_ms: 45000,
+                input_tokens: 0,
+                output_tokens: 0,
             },
         ],
         aborted: false,
@@ -1738,6 +1746,8 @@ fn test_format_result_with_failures() {
                 cycles: 5,
                 tool_calls: 10,
                 duration_ms: 30000,
+                input_tokens: 0,
+                output_tokens: 0,
             },
             TaskResult {
                 id: "review".into(),
@@ -1747,6 +1757,8 @@ fn test_format_result_with_failures() {
                 cycles: 1,
                 tool_calls: 0,
                 duration_ms: 5000,
+                input_tokens: 0,
+                output_tokens: 0,
             },
             TaskResult {
                 id: "fix".into(),
@@ -1756,6 +1768,8 @@ fn test_format_result_with_failures() {
                 cycles: 0,
                 tool_calls: 0,
                 duration_ms: 0,
+                input_tokens: 0,
+                output_tokens: 0,
             },
         ],
         aborted: false,
@@ -1799,6 +1813,8 @@ fn test_orchestrate_format_result_all_completed() {
                 cycles: 3,
                 tool_calls: 5,
                 duration_ms: 12000,
+                input_tokens: 0,
+                output_tokens: 0,
             },
             TaskResult {
                 id: "implement".into(),
@@ -1808,6 +1824,8 @@ fn test_orchestrate_format_result_all_completed() {
                 cycles: 8,
                 tool_calls: 15,
                 duration_ms: 45000,
+                input_tokens: 0,
+                output_tokens: 0,
             },
         ],
         aborted: false,
@@ -1834,6 +1852,8 @@ fn test_orchestrate_format_result_with_skipped() {
                 cycles: 1,
                 tool_calls: 0,
                 duration_ms: 5000,
+                input_tokens: 0,
+                output_tokens: 0,
             },
             TaskResult {
                 id: "review".into(),
@@ -1843,6 +1863,8 @@ fn test_orchestrate_format_result_with_skipped() {
                 cycles: 0,
                 tool_calls: 0,
                 duration_ms: 0,
+                input_tokens: 0,
+                output_tokens: 0,
             },
         ],
         aborted: false,
@@ -1864,6 +1886,8 @@ fn test_orchestrate_format_result_aborted() {
             cycles: 3,
             tool_calls: 5,
             duration_ms: 10000,
+            input_tokens: 0,
+            output_tokens: 0,
         }],
         aborted: true,
     };
