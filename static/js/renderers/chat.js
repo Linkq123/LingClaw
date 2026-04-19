@@ -155,7 +155,7 @@ export function addError(t, options = {}) {
   const card = document.createElement('div');
   card.className = 'system-card system-inline error-card';
   if (dismissible) card.classList.add('is-dismissible');
-  card.innerHTML = `<span class="system-icon">⚠️</span><span class="system-inline-text" style="color:var(--accent-error)">${escHtml(t)}</span>${dismissible ? buildDismissButton() : ''}`;
+  card.innerHTML = `<span class="system-icon">⚠️</span><span class="system-inline-text">${escHtml(t)}</span>${dismissible ? buildDismissButton() : ''}`;
   row.appendChild(card);
   dom.chat.appendChild(row);
   queueUnreadContent({ countable: true });

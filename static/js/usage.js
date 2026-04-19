@@ -111,7 +111,17 @@ function renderRoleBreakdown(data) {
     ...ROLE_ORDER,
     ...Object.keys(dailyRoles),
     ...Object.keys(totalRoles),
-  ])).filter(Boolean);
+  ])).filter(name => {
+    if (!name) return false;
+    const today = normalizeUsagePair(dailyRoles[name]);
+    const total = normalizeUsagePair(totalRoles[name]);
+    return today.input + today.output + total.input + total.output > 0;
+  });
+
+  if (names.length === 0) {
+    container.innerHTML = '<p class="usage-empty-note">No role usage data yet.</p>';
+    return;
+  }
 
   container.innerHTML = names.map(name => {
     const today = normalizeUsagePair(dailyRoles[name]);

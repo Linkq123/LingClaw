@@ -26,7 +26,6 @@ use crate::{
     config::Config,
     context::{USAGE_ROLE_MEMORY, UsageUpdate, apply_usage_update, build_usage_labels},
     providers,
-    session_store::save_session_to_disk,
 };
 
 // ── Schema ──────────────────────────────────────────────────────────────────
@@ -642,18 +641,11 @@ async fn memory_updater_loop(
                     eprintln!("{error}");
                 }
                 Ok(Ok(stats)) => {
-                    let mut session_to_save = None;
                     if let Some(usage) = stats.usage.as_ref() {
                         let mut sessions = sessions.lock().await;
                         if let Some(session) = sessions.get_mut(&final_req.session_id) {
                             apply_usage_update(session, usage);
-                            session_to_save = Some(session.clone());
                         }
-                    }
-                    if let Some(session) = session_to_save.as_ref()
-                        && let Err(error) = save_session_to_disk(session).await
-                    {
-                        eprintln!("failed to persist memory usage update: {error}");
                     }
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let now = now_epoch_secs();

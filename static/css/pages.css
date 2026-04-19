@@ -344,6 +344,11 @@
   grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
   gap: 12px;
 }
+.usage-empty-note {
+  color: var(--muted);
+  font-size: 0.9rem;
+  padding: 8px 0;
+}
 .usage-role-card {
   background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 84%, white), var(--bg));
   border: 1px solid var(--border);

@@ -730,6 +730,7 @@ const actionHandlers = {
   'toggle-mobile-menu': () => toggleMobileMenu(),
   'close-tool-drawer': () => closeToolDrawer(),
   'dismiss-system-card': (el) => {
+    if (!el) return;
     const row = el.closest('.msg-row.system, .msg-row.error');
     if (row) row.remove();
   },

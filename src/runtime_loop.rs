@@ -289,7 +289,6 @@ async fn run_post_execution_reflection(
         ) as u64
     });
 
-    let mut session_to_save = None;
     {
         let mut sessions = sessions.lock().await;
         if let Some(session) = sessions.get_mut(&session_id) {
@@ -302,13 +301,7 @@ async fn run_post_execution_reflection(
                 Some(&provider_name),
                 Some(crate::context::USAGE_ROLE_REFLECTION),
             );
-            session_to_save = Some(session.clone());
         }
-    }
-    if let Some(session) = session_to_save.as_ref()
-        && let Err(error) = save_session_to_disk(session).await
-    {
-        eprintln!("Failed to persist reflection usage update: {error}");
     }
 
     let reflection = reflection.content.trim().to_string();

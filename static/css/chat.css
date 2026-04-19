@@ -196,6 +196,7 @@
 .system-card.system-inline { display: flex; align-items: center; gap: 8px; padding: 8px 14px; }
 .system-card.is-dismissible { padding-right: 10px; }
 .system-card.error-card { border-left-color: var(--accent-error); }
+.error-card .system-inline-text { color: var(--accent-error); }
 .system-card.success-card { border-left-color: var(--accent-success); }
 .system-header {
   display: flex;

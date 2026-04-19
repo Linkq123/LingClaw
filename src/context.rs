@@ -36,10 +36,10 @@ pub(crate) fn build_usage_labels(
     role_label: Option<&str>,
 ) -> HashMap<String, [u64; 2]> {
     let mut labels = HashMap::new();
-    if let Some(label) = provider_label.filter(|label| !label.trim().is_empty()) {
+    if let Some(label) = provider_label.filter(|label| !label.is_empty()) {
         labels.insert(usage_provider_label(label), [input_tokens, output_tokens]);
     }
-    if let Some(label) = role_label.filter(|label| !label.trim().is_empty()) {
+    if let Some(label) = role_label.filter(|label| !label.is_empty()) {
         labels.insert(usage_role_label(label), [input_tokens, output_tokens]);
     }
     labels
