@@ -2594,6 +2594,68 @@ async fn api_client_config_returns_upload_token() {
     assert_eq!(payload["upload_token"], state.upload_token);
 }
 
+#[tokio::test]
+async fn api_usage_returns_token_sources() {
+    let state = Arc::new(test_app_state());
+    let mut session = test_session(MAIN_SESSION_ID, "Main", None);
+    session.input_tokens = 123;
+    session.output_tokens = 45;
+    session.daily_input_tokens = 12;
+    session.daily_output_tokens = 3;
+    session.input_token_source = "provider".to_string();
+    session.output_token_source = "estimated".to_string();
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session.id.clone(), session);
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_usage(headers, State(state))
+        .await
+        .expect("local request should be accepted");
+
+    assert_eq!(payload["input_source"], "provider");
+    assert_eq!(payload["output_source"], "estimated");
+    assert_eq!(payload["source_scope"], "latest_update");
+    assert_eq!(payload["total"], 168);
+}
+
+#[tokio::test]
+async fn read_config_file_snapshot_waits_for_active_writer() {
+    let base = std::env::temp_dir().join(format!("lingclaw-config-read-{}", now_epoch()));
+    std::fs::create_dir_all(&base).expect("temp dir should be created");
+    let path = base.join("config.json");
+    std::fs::write(&path, "{\"ok\":true}").expect("config file should be written");
+
+    let write_guard = CONFIG_FILE_LOCK.write().await;
+    let task = tokio::spawn({
+        let path = path.clone();
+        async move {
+            read_config_file_snapshot(&path)
+                .await
+                .expect("config read should succeed")
+        }
+    });
+
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !task.is_finished(),
+        "reader should wait for active config writer"
+    );
+
+    drop(write_guard);
+
+    let content = task.await.expect("reader task should join");
+    assert_eq!(content, "{\"ok\":true}");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn validate_local_request_headers_accepts_loopback_host_and_origin() {
     let mut headers = HeaderMap::new();
@@ -5980,4 +6042,39 @@ fn tool_think_records_thought() {
 fn tool_think_fallback_when_no_thought() {
     let result = tools::exec::tool_think(&json!({}));
     assert!(result.contains("(no thought provided)"));
+}
+
+// ───── parse_serde_error_position ─────
+
+#[test]
+fn parse_serde_error_position_extracts_line_and_column() {
+    let (line, col) =
+        parse_serde_error_position("invalid type: map, expected a string at line 5 column 10");
+    assert_eq!(line, Some(5));
+    assert_eq!(col, Some(10));
+}
+
+#[test]
+fn parse_serde_error_position_returns_none_for_no_match() {
+    let (line, col) = parse_serde_error_position("something went wrong");
+    assert_eq!(line, None);
+    assert_eq!(col, None);
+}
+
+#[test]
+fn replace_file_from_temp_replaces_existing_file_without_losing_data() {
+    let base = std::env::temp_dir().join(format!("lingclaw-config-replace-{}", now_epoch()));
+    let path = base.join(".lingclaw.json");
+    let tmp_path = base.join(".lingclaw.json.tmp");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(&path, "old-value").unwrap();
+    std::fs::write(&tmp_path, "new-value").unwrap();
+
+    replace_file_from_temp(&path, &tmp_path).unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new-value");
+    assert!(!tmp_path.exists());
+    assert!(!base.join(".lingclaw.json.lingclaw-save-backup").exists());
+
+    let _ = std::fs::remove_dir_all(&base);
 }

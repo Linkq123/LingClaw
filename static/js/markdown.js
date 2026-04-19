@@ -305,9 +305,15 @@ export function decorateCodeBlocks(container) {
 export function appendRenderedSegment(el, markdownText) {
   const { text: preprocessed, blocks: mathBlocks } = extractMath(markdownText);
   const html = marked.parse(preprocessed);
-  const sanitized = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : escHtml(html);
+  const sanitized = typeof DOMPurify !== 'undefined'
+    ? DOMPurify.sanitize(html, { ADD_ATTR: ['target'] })
+    : escHtml(html);
   const temp = document.createElement('div');
   temp.innerHTML = renderMathPlaceholders(sanitized, mathBlocks);
+  temp.querySelectorAll('a[href]').forEach(a => {
+    a.setAttribute('target', '_blank');
+    a.setAttribute('rel', 'noopener noreferrer');
+  });
   decorateCodeBlocks(temp);
   const codeBlocks = [...temp.querySelectorAll('pre code')];
   const tail = el._liveTail;
@@ -406,8 +412,14 @@ export function renderMarkdown(el) {
   const raw = el._rawText || el.textContent;
   const { text: preprocessed, blocks: mathBlocks } = extractMath(raw);
   const html = marked.parse(preprocessed);
-  const sanitized = typeof DOMPurify !== 'undefined' ? DOMPurify.sanitize(html) : escHtml(html);
+  const sanitized = typeof DOMPurify !== 'undefined'
+    ? DOMPurify.sanitize(html, { ADD_ATTR: ['target'] })
+    : escHtml(html);
   el.innerHTML = renderMathPlaceholders(sanitized, mathBlocks);
+  el.querySelectorAll('a[href]').forEach(a => {
+    a.setAttribute('target', '_blank');
+    a.setAttribute('rel', 'noopener noreferrer');
+  });
   el._markdownIdleHandle = 0;
 
   decorateCodeBlocks(el);

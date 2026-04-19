@@ -296,6 +296,50 @@ pub(crate) async fn inspect_servers(config: &Config, workspace: &Path) -> Vec<Mc
     .await
 }
 
+/// Test a single MCP server by spawning it, running tools/list, and returning the tool count.
+/// Uses a temporary Config with just the one server so it does not require a pre-existing config.
+pub(crate) async fn test_mcp_server(
+    mcp_cfg: &JsonMcpServerConfig,
+    workspace: &Path,
+    default_tool_timeout: Duration,
+) -> Result<usize, String> {
+    let server_name = "__test__";
+    let mut mcp_servers = HashMap::new();
+    mcp_servers.insert(server_name.to_string(), mcp_cfg.clone());
+    let temp_config = Config {
+        api_key: String::new(),
+        api_base: String::new(),
+        model: String::new(),
+        fast_model: None,
+        sub_agent_model: None,
+        memory_model: None,
+        reflection_model: None,
+        context_model: None,
+        provider: crate::Provider::OpenAI,
+        openai_stream_include_usage: false,
+        anthropic_prompt_caching: false,
+        providers: HashMap::new(),
+        mcp_servers,
+        port: 0,
+        max_context_tokens: 4096,
+        exec_timeout: Duration::from_secs(30),
+        tool_timeout: Duration::from_secs(
+            mcp_cfg
+                .timeout_secs
+                .unwrap_or(default_tool_timeout.as_secs()),
+        ),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 1,
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+        structured_memory: false,
+        daily_reflection: false,
+        s3: None,
+    };
+    let tools = list_server_tools_uncached(server_name, &temp_config, workspace).await?;
+    Ok(tools.len())
+}
+
 pub(crate) async fn refresh_servers(
     config: &Config,
     workspace: &Path,

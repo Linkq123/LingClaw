@@ -12,6 +12,7 @@
 <link rel="stylesheet" href="css/layout.css">
 <link rel="stylesheet" href="css/chat.css">
 <link rel="stylesheet" href="css/panels.css">
+<link rel="stylesheet" href="css/pages.css">
 <link rel="stylesheet" href="css/responsive.css">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.0/marked.min.js" integrity="sha384-NNQgBjjuhtXzPmmy4gurS5X7P4uTt1DThyevz4Ua0IVK5+kazYQI1W27JHjbbxQz" crossorigin="anonymous"></script>
@@ -35,6 +36,8 @@
     <span class="session-id" id="session-id"></span>
     <div class="actions">
       <span class="usage-badge" id="usage-badge" title="今日 Token 用量"></span>
+      <button id="nav-settings-btn" data-action="nav-settings" aria-label="Settings" class="mobile-hide">Settings</button>
+      <button id="nav-usage-btn" data-action="nav-usage" aria-label="Usage" class="mobile-hide">Usage</button>
       <button id="toggle-tools-btn" data-action="toggle-tools" aria-label="Toggle tools visibility">Tools: On</button>
       <button id="toggle-reasoning-btn" data-action="toggle-reasoning" aria-label="Toggle reasoning visibility">Reasoning: On</button>
       <button class="mobile-hide" data-action="cmd" data-cmd="/status" aria-label="Show status">Status</button>
@@ -42,6 +45,8 @@
       <button class="mobile-hide" data-action="cmd" data-cmd="/help" aria-label="Show help">Help</button>
       <button class="mobile-menu-toggle" id="mobile-menu-toggle" data-action="toggle-mobile-menu" aria-label="More actions" aria-expanded="false" aria-controls="mobile-menu">⋯</button>
       <div class="mobile-menu" id="mobile-menu" role="menu">
+        <button data-action="nav-settings">Settings</button>
+        <button data-action="nav-usage">Usage</button>
         <button data-action="cmd-close-menu" data-cmd="/status">Status</button>
         <button data-action="cmd-close-menu" data-cmd="/clear">Clear</button>
         <button data-action="cmd-close-menu" data-cmd="/help">Help</button>
@@ -95,6 +100,59 @@
 </div>
 
 <div class="tool-drawer-backdrop" id="tool-drawer-backdrop" data-action="close-tool-drawer"></div>
+
+<!-- Settings Page -->
+<div class="page-overlay" id="settings-page" hidden>
+  <div class="page-panel">
+    <div class="page-header">
+      <h2>Settings</h2>
+      <button class="page-close" data-action="close-page" aria-label="Close">×</button>
+    </div>
+    <div class="page-tabs" id="settings-tabs">
+      <button class="page-tab active" data-tab="tab-general">General</button>
+      <button class="page-tab" data-tab="tab-models">Models</button>
+      <button class="page-tab" data-tab="tab-agents">Agent Models</button>
+      <button class="page-tab" data-tab="tab-mcp">MCP Servers</button>
+      <button class="page-tab" data-tab="tab-s3">File Storage</button>
+    </div>
+    <div class="page-body" id="settings-body">
+      <div class="tab-content active" id="tab-general"></div>
+      <div class="tab-content" id="tab-models"></div>
+      <div class="tab-content" id="tab-agents"></div>
+      <div class="tab-content" id="tab-mcp"></div>
+      <div class="tab-content" id="tab-s3"></div>
+    </div>
+    <div class="page-footer">
+      <span class="settings-status" id="settings-status"></span>
+      <button class="btn-primary" id="settings-save-btn">Save</button>
+    </div>
+  </div>
+</div>
+
+<!-- Usage Page -->
+<div class="page-overlay" id="usage-page" hidden>
+  <div class="page-panel page-panel-wide">
+    <div class="page-header">
+      <h2>Token Usage</h2>
+      <button class="page-close" data-action="close-page" aria-label="Close">×</button>
+    </div>
+    <div class="page-body" id="usage-body">
+      <div class="usage-summary" id="usage-summary"></div>
+      <div class="usage-chart-section">
+        <div class="usage-chart-header">
+          <h3>Today</h3>
+        </div>
+        <div class="usage-chart-container"><canvas id="daily-chart"></canvas></div>
+      </div>
+      <div class="usage-chart-section">
+        <div class="usage-chart-header">
+          <h3>All-Time Breakdown</h3>
+        </div>
+        <div class="usage-chart-container"><canvas id="provider-chart"></canvas></div>
+      </div>
+    </div>
+  </div>
+</div>
 <aside class="tool-drawer" id="tool-drawer" aria-hidden="true">
   <div class="tool-drawer-header">
     <div class="tool-drawer-title-wrap">

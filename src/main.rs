@@ -93,6 +93,8 @@ use std::collections::HashSet;
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const MAIN_SESSION_ID: &str = "main";
 const INBOUND_BUFFER_CAPACITY: usize = 128;
+static CONFIG_FILE_LOCK: std::sync::LazyLock<tokio::sync::RwLock<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::RwLock::new(()));
 
 // ── Data Models ──────────────────────────────────────────────────────────────
 
@@ -1763,6 +1765,329 @@ async fn api_upload_images(
     ))
 }
 
+// ── Config & Usage API ───────────────────────────────────────────────────────
+
+/// GET /api/config — read the raw JSON config file.
+async fn api_get_config(
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+    let path = config_file_path().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Cannot determine config path"})),
+        )
+    })?;
+    let content = read_config_file_snapshot(&path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Cannot read config: {e}")})),
+        )
+    })?;
+    match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(value) => Ok(Json(json!({
+            "config": value,
+            "path": path.display().to_string(),
+        }))),
+        Err(e) => {
+            let msg = e.to_string();
+            let (line, column) = parse_serde_error_position(&msg);
+            Ok(Json(json!({
+                "config": null,
+                "raw": content,
+                "path": path.display().to_string(),
+                "parse_error": msg,
+                "line": line,
+                "column": column,
+            })))
+        }
+    }
+}
+
+/// PUT /api/config — validate and save the JSON config file.
+async fn api_put_config(
+    headers: HeaderMap,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+    let config_value = body
+        .get("config")
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Missing 'config' field"})),
+            )
+        })?
+        .clone();
+
+    // Validate: must be a valid JSON object and deserializable as JsonConfig
+    if !config_value.is_object() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Config must be a JSON object"})),
+        ));
+    }
+    if let Err(e) = serde_json::from_value::<config::JsonConfig>(config_value.clone()) {
+        let msg = e.to_string();
+        // Extract line/column info from serde error when available
+        let (line, column) = parse_serde_error_position(&msg);
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": msg, "line": line, "column": column})),
+        ));
+    }
+
+    let path = config_file_path().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Cannot determine config path"})),
+        )
+    })?;
+
+    let pretty =
+        serde_json::to_string_pretty(&config_value).unwrap_or_else(|_| config_value.to_string());
+
+    let _save_guard = CONFIG_FILE_LOCK.write().await;
+
+    // Write to temp file then replace original without discarding the old file
+    // if the final swap fails on Windows.
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, &pretty).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to write config: {e}")})),
+        )
+    })?;
+    replace_file_from_temp(&path, &tmp_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to finalize config: {e}")})),
+        )
+    })?;
+
+    Ok(Json(json!({"ok": true})))
+}
+
+/// POST /api/config/test-model — test a model provider connection.
+async fn api_test_model(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let base_url = body["baseUrl"].as_str().unwrap_or_default().to_string();
+    let api_key = body["apiKey"].as_str().unwrap_or_default().to_string();
+    let api = body["api"]
+        .as_str()
+        .unwrap_or("openai-completions")
+        .to_string();
+    let model_id = body["modelId"].as_str().unwrap_or_default().to_string();
+
+    if base_url.is_empty() || model_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "baseUrl and modelId are required"})),
+        ));
+    }
+
+    let provider = Provider::from_api_kind(&api);
+    let resolved = providers::ResolvedModel {
+        provider,
+        api_base: base_url,
+        api_key,
+        model_id,
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(16),
+        context_window: 4096,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+
+    let messages = vec![ChatMessage {
+        role: "user".to_string(),
+        content: Some("Hi".to_string()),
+        images: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    match providers::call_llm_simple(&state.http, &resolved, &messages, &PathBuf::new(), None, 1)
+        .await
+    {
+        Ok(reply) => Ok(Json(json!({"ok": true, "reply": truncate(&reply, 200)}))),
+        Err(e) => {
+            eprintln!("Model test failed: {e}");
+            Ok(Json(json!({"ok": false, "error": truncate(&e, 200)})))
+        }
+    }
+}
+
+/// POST /api/config/test-mcp — test an MCP server connection.
+async fn api_test_mcp(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let command = body["command"].as_str().unwrap_or_default().to_string();
+    let args: Vec<String> = body["args"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let env: HashMap<String, String> = body["env"]
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let timeout_secs = body["timeoutSecs"].as_u64();
+
+    let cwd = body["cwd"].as_str().map(|s| s.to_string());
+
+    if command.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "command is required"})),
+        ));
+    }
+
+    let workspace = session_workspace_path(MAIN_SESSION_ID);
+    let mcp_cfg = config::JsonMcpServerConfig {
+        command,
+        args,
+        env,
+        cwd,
+        enabled: true,
+        timeout_secs,
+    };
+
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(state.config.tool_timeout.as_secs()));
+    match tokio::time::timeout(
+        timeout,
+        tools::mcp::test_mcp_server(&mcp_cfg, &workspace, state.config.tool_timeout),
+    )
+    .await
+    {
+        Ok(Ok(tool_count)) => Ok(Json(json!({"ok": true, "tools": tool_count}))),
+        Ok(Err(e)) => Ok(Json(json!({"ok": false, "error": e}))),
+        Err(_) => Ok(Json(json!({"ok": false, "error": "Connection timed out"}))),
+    }
+}
+
+/// GET /api/usage — token usage statistics.
+async fn api_usage(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions.get(MAIN_SESSION_ID);
+    let (daily_input, daily_output) = session.map(current_daily_token_usage).unwrap_or((0, 0));
+    let total_input = session.map(|s| s.input_tokens).unwrap_or(0);
+    let total_output = session.map(|s| s.output_tokens).unwrap_or(0);
+    let input_source = session
+        .map(|s| s.input_token_source.clone())
+        .unwrap_or_else(default_token_usage_source);
+    let output_source = session
+        .map(|s| s.output_token_source.clone())
+        .unwrap_or_else(default_token_usage_source);
+
+    Ok(Json(json!({
+        "daily_input": daily_input,
+        "daily_output": daily_output,
+        "total_input": total_input,
+        "total_output": total_output,
+        "total": total_input.saturating_add(total_output),
+        "input_source": input_source,
+        "output_source": output_source,
+        "source_scope": "latest_update",
+    })))
+}
+
+async fn read_config_file_snapshot(path: &Path) -> std::io::Result<String> {
+    let _read_guard = CONFIG_FILE_LOCK.read().await;
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok("{}".to_string()),
+        Err(err) => Err(err),
+    }
+}
+
+fn parse_serde_error_position(msg: &str) -> (Option<u64>, Option<u64>) {
+    // serde_json errors: "... at line X column Y"
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"line (\d+) column (\d+)").unwrap());
+    if let Some(caps) = RE.captures(msg) {
+        let line = caps.get(1).and_then(|m| m.as_str().parse().ok());
+        let col = caps.get(2).and_then(|m| m.as_str().parse().ok());
+        return (line, col);
+    }
+    (None, None)
+}
+
+fn replace_file_from_temp(path: &Path, tmp_path: &Path) -> std::io::Result<()> {
+    match std::fs::rename(tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            if !path.exists() {
+                return Err(rename_err);
+            }
+
+            let mut backup_name = path
+                .file_name()
+                .map(|name| name.to_os_string())
+                .unwrap_or_else(|| std::ffi::OsString::from("config"));
+            backup_name.push(".lingclaw-save-backup");
+            let backup_path = path.with_file_name(backup_name);
+
+            match std::fs::remove_file(&backup_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+
+            std::fs::rename(path, &backup_path)?;
+
+            match std::fs::rename(tmp_path, path) {
+                Ok(()) => {
+                    if let Err(err) = std::fs::remove_file(&backup_path)
+                        && err.kind() != std::io::ErrorKind::NotFound
+                    {
+                        eprintln!(
+                            "Warning: failed to remove temporary config backup {}: {err}",
+                            backup_path.display()
+                        );
+                    }
+                    Ok(())
+                }
+                Err(finalize_err) => {
+                    if let Err(restore_err) = std::fs::rename(&backup_path, path) {
+                        return Err(std::io::Error::new(
+                            finalize_err.kind(),
+                            format!(
+                                "{finalize_err}; failed to restore previous config: {restore_err}"
+                            ),
+                        ));
+                    }
+                    Err(finalize_err)
+                }
+            }
+        }
+    }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1957,6 +2282,10 @@ async fn main() {
         .route("/api/health", get(api_health))
         .route("/api/client-config", get(api_client_config))
         .route("/api/sessions", get(api_sessions))
+        .route("/api/config", get(api_get_config).put(api_put_config))
+        .route("/api/config/test-model", post(api_test_model))
+        .route("/api/config/test-mcp", post(api_test_mcp))
+        .route("/api/usage", get(api_usage))
         .route(
             "/api/upload-images",
             post(api_upload_images).layer(DefaultBodyLimit::max(

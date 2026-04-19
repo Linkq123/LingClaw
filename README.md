@@ -23,7 +23,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
 - **持久化主会话**：固定保存 `main` 工作区和磁盘存档
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
-- **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端，增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、输入框上下键历史导航（最多 10 条）
+- **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端，增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、输入框上下键历史导航（最多 10 条）；Settings 页面支持在线编辑配置、Provider 连接测试、MCP Server 连接测试；Usage 页面显示 Token 用量统计和图表
 - **图片附件**：支持通过 URL 或本地 JPEG/PNG 上传附加图片到用户消息；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；私网、localhost 或仅局域网可达的网关仅保证 Ollama 可用，因为 LingClaw 会本地预取为 base64 并持久化缓存到会话工作区；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
@@ -437,6 +437,8 @@ tools:
 ┌────────────────────────▼─────────────────────────────────────────┐
 │                     Axum HTTP Server                             │
 │   GET /api/health · GET /api/sessions · POST /api/shutdown       │
+│   GET/PUT /api/config · POST /api/config/test-model              │
+│   POST /api/config/test-mcp · GET /api/usage                     │
 │   GET /ws (WebSocket upgrade)                                    │
 └────────────────────────┬─────────────────────────────────────────┘
                          │
@@ -591,7 +593,7 @@ src/
 
 static/
 ├── index.html                  — 主页面
-├── css/                        — 模块化样式 (base, layout, chat, panels, responsive)
+├── css/                        — 模块化样式 (base, layout, chat, panels, pages, responsive)
 └── js/                         — 前端 ES Modules
     ├── main.js                 — 入口模块（流式渲染、懒加载历史、智能滚动、版本 badge）
     ├── constants.js            — 常量
@@ -603,6 +605,8 @@ static/
     ├── images.js               — 图片附件 + 上传
     ├── input.js                — 输入处理 + 历史导航
     ├── mobile.js               — 移动端菜单
+    ├── settings.js             — Settings 页面（配置编辑、Provider 测试、MCP 测试）
+    ├── usage.js                — Usage 页面（Token 用量统计 + 图表）
     ├── handlers/stream.js      — 流式响应处理
     └── renderers/              — UI 渲染模块 (chat, tools, react-status, timeline)
 
@@ -819,6 +823,13 @@ think_level 映射：
 |---|---|---|
 | `/api/health` | GET | 健康检查（返回 `version`、`model`、`sessions`） |
 | `/api/sessions` | GET | 返回主会话信息 |
+| `/api/client-config` | GET | 返回前端配置（上传 token、S3 能力标记等） |
+| `/api/config` | GET | 读取原始 JSON 配置文件（含解析错误回退） |
+| `/api/config` | PUT | 校验并保存 JSON 配置文件（原子写入 + 备份恢复） |
+| `/api/config/test-model` | POST | 测试模型 Provider 连接（发送 "Hi" 并检查响应） |
+| `/api/config/test-mcp` | POST | 测试 MCP Server 连接（spawn + tools/list） |
+| `/api/usage` | GET | 返回 Token 用量统计（今日/累计/来源） |
+| `/api/upload-images` | POST | 上传本地图片到 S3（需启用 S3 配置） |
 | `/api/shutdown` | POST | 认证的本地关停端点（CLI 使用） |
 | `/ws` | GET | WebSocket 升级端点 |
 

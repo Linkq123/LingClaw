@@ -37,6 +37,8 @@ import {
   createOrchestratePanel, updateOrchestrateLayer, markOrchestrateTask,
   finishOrchestratePanel
 } from './renderers/orchestrate.js';
+import { openSettingsPage, closeSettingsPage, initSettingsListeners } from './settings.js';
+import { openUsagePage, closeUsagePage, initUsageListeners } from './usage.js';
 
 // ── Initialize DOM ──
 initDomRefs();
@@ -649,6 +651,12 @@ function handleMessage(data) {
 const actionHandlers = {
   'toggle-tools': () => toggleToolsVisibility(),
   'toggle-reasoning': () => toggleReasoningVisibility(),
+  'nav-settings': () => { closeMobileMenu(); openSettingsPage(); },
+  'nav-usage': () => { closeMobileMenu(); openUsagePage(); },
+  'close-page': (el) => {
+    const overlay = el.closest('.page-overlay');
+    if (overlay) overlay.hidden = true;
+  },
   'cmd': (el) => {
     const cmd = el.dataset.cmd;
     if (cmd) sendCmd(cmd);
@@ -667,7 +675,13 @@ const actionHandlers = {
 
 document.addEventListener('click', (e) => {
   const el = e.target.closest('[data-action]');
-  if (!el) return;
+  if (!el) {
+    // Click on overlay backdrop to close
+    if (e.target.classList.contains('page-overlay')) {
+      e.target.hidden = true;
+    }
+    return;
+  }
   const handler = actionHandlers[el.dataset.action];
   if (handler) handler(el);
 });
@@ -680,11 +694,15 @@ updateJumpToLatestVisibility();
 initImageListeners();
 initInputListeners();
 initMobileListeners();
+initSettingsListeners();
+initUsageListeners();
 
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     closeToolDrawer();
     closeMobileMenu();
+    closeSettingsPage();
+    closeUsagePage();
   }
 });
 dom.chat.addEventListener('scroll', () => {
