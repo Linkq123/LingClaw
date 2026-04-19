@@ -32,14 +32,17 @@ import { toggleMobileMenu, closeMobileMenu, initMobileListeners } from './mobile
 import {
   createSubagentPanel, addSubagentTool, updateSubagentProgress,
   updateSubagentToolResult, finishSubagentPanel,
+  startSubagentReasoning, appendSubagentReasoning, finishSubagentReasoning,
   focusSubagentTool,
   toggleSubagentTools, focusSubagentCurrent, copySubagentSummary
 } from './renderers/subagent.js';
 import {
   createOrchestratePanel, updateOrchestrateLayer, markOrchestrateTask,
   finishOrchestratePanel, toggleOrchestrateTasks,
-  focusOrchestrateActive, copyOrchestrateSummary,
-  parseOrchestrateCompositeTaskId, addOrchestrateTaskTool, updateOrchestrateTaskTool,
+  focusOrchestrateActive, copyOrchestrateSummary, focusOrchestrateTool,
+  parseOrchestrateCompositeTaskId,
+  startOrchestrateTaskReasoning, appendOrchestrateTaskReasoning, finishOrchestrateTaskReasoning,
+  addOrchestrateTaskTool, updateOrchestrateTaskTool,
 } from './renderers/orchestrate.js';
 import { openSettingsPage, closeSettingsPage, initSettingsListeners } from './settings.js';
 import { openUsagePage, closeUsagePage, initUsageListeners } from './usage.js';
@@ -465,8 +468,16 @@ function handleMessage(data) {
       break;
 
     case 'thinking_start': {
-      if (data.subagent) break;
       if (!state.showReasoning) break;
+      if (data.subagent) {
+        const orchInfo = parseOrchestrateCompositeTaskId(data.task_id);
+        if (orchInfo) {
+          startOrchestrateTaskReasoning(orchInfo.orchestrateId, orchInfo.taskId, data.subagent);
+          break;
+        }
+        startSubagentReasoning({ task_id: data.task_id, agent: data.subagent });
+        break;
+      }
       const panel = document.createElement('div');
       panel.className = 'reasoning-panel reasoning-active';
       const header = document.createElement('div');
@@ -498,8 +509,16 @@ function handleMessage(data) {
     }
 
     case 'thinking_delta':
-      if (data.subagent) break;
       if (!state.showReasoning) break;
+      if (data.subagent) {
+        const orchInfo = parseOrchestrateCompositeTaskId(data.task_id);
+        if (orchInfo) {
+          appendOrchestrateTaskReasoning(orchInfo.orchestrateId, orchInfo.taskId, data.content || '');
+          break;
+        }
+        appendSubagentReasoning({ task_id: data.task_id, agent: data.subagent }, data.content || '');
+        break;
+      }
       if (state.reasoningPanel) {
         state.pendingReasoningText += data.content;
         scheduleFlush();
@@ -507,10 +526,18 @@ function handleMessage(data) {
       break;
 
     case 'thinking_done':
-      if (data.subagent) break;
       if (!state.showReasoning) {
         finishReasoningStream();
         state.reasoningPanel = null;
+        break;
+      }
+      if (data.subagent) {
+        const orchInfo = parseOrchestrateCompositeTaskId(data.task_id);
+        if (orchInfo) {
+          finishOrchestrateTaskReasoning(orchInfo.orchestrateId, orchInfo.taskId);
+          break;
+        }
+        finishSubagentReasoning({ task_id: data.task_id, agent: data.subagent });
         break;
       }
       if (state.reasoningPanel) {
@@ -552,7 +579,7 @@ function handleMessage(data) {
         if (orchInfo) {
           updateOrchestrateTaskTool(
             orchInfo.orchestrateId, orchInfo.taskId,
-            data.id, data.duration_ms, data.is_error, data.name,
+            data.id, data.duration_ms, data.result, data.is_error, data.name,
           );
           break;
         }
@@ -711,6 +738,7 @@ const actionHandlers = {
   'subagent-copy-summary': (el) => copySubagentSummary(el),
   'orchestrate-toggle-all': (el) => toggleOrchestrateTasks(el),
   'orchestrate-focus-active': (el) => focusOrchestrateActive(el),
+  'orchestrate-focus-tool': (el) => focusOrchestrateTool(el),
   'orchestrate-copy-summary': (el) => copyOrchestrateSummary(el),
 };
 

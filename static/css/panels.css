@@ -670,6 +670,27 @@
   font-size: 11px;
   font-weight: 700;
 }
+.subagent-reasoning-card .subagent-section-meta {
+  max-width: min(320px, 100%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-reasoning-body {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 220px;
+  overflow: auto;
+}
 .subagent-prompt {
   font-size: 12px;
   color: var(--text);
@@ -1288,17 +1309,32 @@
   flex-direction: column;
   gap: 6px;
 }
+.orchestrate-tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
 .orchestrate-tool-pill {
   display: flex;
   align-items: center;
+  justify-content: flex-start;
   gap: 8px;
+  width: 100%;
   padding: 6px 10px;
   border-radius: 8px;
   border: 1px solid var(--border);
   background: var(--surface);
+  font: inherit;
+  text-align: left;
   font-size: 11.5px;
   transition: border-color .18s ease, background .18s ease;
   min-width: 0;
+  cursor: pointer;
+}
+.orchestrate-tool-pill:hover {
+  border-color: color-mix(in srgb, var(--accent2) 24%, var(--border));
+  background: var(--surface2);
 }
 .orchestrate-tool-pill-index {
   display: inline-flex;
@@ -1365,6 +1401,116 @@
   border-color: color-mix(in srgb, var(--accent-error) 22%, var(--border));
 }
 .orchestrate-tool-pill.is-failed .orchestrate-tool-pill-state {
+  color: var(--accent-error);
+  background: color-mix(in srgb, var(--accent-error) 10%, transparent);
+}
+.orchestrate-tool-row {
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  overflow: hidden;
+}
+.orchestrate-tool-row.orchestrate-tool-running {
+  border-color: color-mix(in srgb, var(--accent2) 20%, var(--border));
+}
+.orchestrate-tool-summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  cursor: pointer;
+  background: transparent;
+  transition: background .15s;
+}
+.orchestrate-tool-summary:hover {
+  background: var(--surface2);
+}
+.orchestrate-tool-main {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  flex: 1 1 0;
+  min-width: 0;
+}
+.orchestrate-tool-icon {
+  color: var(--accent2);
+  font-size: 12px;
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+.orchestrate-tool-name {
+  color: var(--text);
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.orchestrate-tool-preview {
+  color: var(--dim);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.orchestrate-tool-status {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--accent2);
+  white-space: nowrap;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent2) 8%, transparent);
+}
+.orchestrate-tool-summary .chevron {
+  margin-left: 8px;
+  transition: transform .25s ease;
+}
+.orchestrate-tool-summary .chevron.open {
+  transform: rotate(90deg);
+}
+.orchestrate-tool-details {
+  height: 0;
+  opacity: 0;
+  overflow: hidden;
+  padding: 0 12px;
+  transition: height .28s cubic-bezier(.22,1,.36,1), padding .22s ease, opacity .18s ease;
+}
+.orchestrate-tool-details.show {
+  height: auto;
+  opacity: 1;
+  padding: 0 12px 12px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+.orchestrate-tool-details.is-open {
+  opacity: 1;
+}
+.orchestrate-tool-section + .orchestrate-tool-section {
+  margin-top: 10px;
+}
+.orchestrate-tool-output[hidden] {
+  display: none;
+}
+.orchestrate-tool-section-title {
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: .08em;
+  color: var(--dim);
+  margin-bottom: 6px;
+}
+.orchestrate-tool-row.orchestrate-tool-done:not(.orchestrate-tool-failed) {
+  border-color: color-mix(in srgb, var(--accent-success) 20%, var(--border));
+}
+.orchestrate-tool-row.orchestrate-tool-failed {
+  border-color: color-mix(in srgb, var(--accent-error) 22%, var(--border));
+}
+.orchestrate-tool-done .orchestrate-tool-status {
+  color: var(--accent-success);
+  background: color-mix(in srgb, var(--accent-success) 10%, transparent);
+}
+.orchestrate-tool-failed .orchestrate-tool-status {
   color: var(--accent-error);
   background: color-mix(in srgb, var(--accent-error) 10%, transparent);
 }

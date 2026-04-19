@@ -201,6 +201,12 @@ function setTaskPreview(row, text) {
   previewEl.textContent = inlinePreview(text || '等待执行');
 }
 
+function reasoningPreview(rawText, fallback = '完成') {
+  const summaryText = (rawText || '').trim().replace(/\n+/g, ' ');
+  const preview = summaryText.slice(0, 60);
+  return preview ? preview + (summaryText.length > 60 ? '…' : '') : fallback;
+}
+
 function setTaskStatusTone(row, status) {
   row.classList.toggle('orchestrate-task-has-error', status === 'failed');
   row.classList.toggle('orchestrate-task-has-result', status === 'completed');
@@ -208,6 +214,35 @@ function setTaskStatusTone(row, status) {
 
 function maybeOpenTaskDetails(row, shouldOpen) {
   setTaskExpanded(row, shouldOpen);
+}
+
+function getTaskReasoningBody(row) {
+  return row?.querySelector('[data-orchestrate-reasoning-body]') || null;
+}
+
+function getTaskReasoningLabel(row) {
+  return row?.querySelector('[data-orchestrate-reasoning-label]') || null;
+}
+
+function ensureTaskReasoningSection(row) {
+  const details = row?.querySelector('.orchestrate-task-details');
+  if (!details) return null;
+
+  let section = row.querySelector('[data-orchestrate-section="reasoning"]');
+  if (!section) {
+    section = document.createElement('div');
+    section.className = 'orchestrate-task-section orchestrate-task-reasoning';
+    section.dataset.orchestrateSection = 'reasoning';
+    section.innerHTML = `
+      <div class="orchestrate-task-section-title" data-orchestrate-reasoning-label>思考链 · 等待中</div>
+      <pre class="orchestrate-task-code orchestrate-task-reasoning-code" data-orchestrate-reasoning-body></pre>
+    `;
+    const anchor = details.querySelector('[data-orchestrate-section="tools"], [data-orchestrate-section="result"]');
+    details.insertBefore(section, anchor || null);
+  }
+
+  section.classList.remove('hidden');
+  return section;
 }
 
 function updateHeaderProgress(entry) {
@@ -600,6 +635,90 @@ export function copyOrchestrateSummary(button) {
   void copyButtonText(button, orchestrationSummaryText(panel), '复制摘要');
 }
 
+export function focusOrchestrateTool(button) {
+  const panel = button.closest('.orchestrate-panel');
+  if (!panel) return;
+
+  const taskId = button.dataset.taskId || '';
+  const toolId = button.dataset.toolId || '';
+  const taskRow = taskId
+    ? panel.querySelector(`.orchestrate-task[data-task-id="${CSS.escape(taskId)}"]`)
+    : null;
+  if (!taskRow) return;
+
+  maybeOpenTaskDetails(taskRow, true);
+  const toolRow = findOrchestrateToolRow(taskRow, toolId);
+  if (!toolRow) {
+    focusTaskRow(taskRow);
+    return;
+  }
+
+  setOrchestrateToolRowExpanded(toolRow, true);
+  pulseFocus(toolRow);
+  toolRow.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+
+export function startOrchestrateTaskReasoning(orchestrateId, taskId, agentName = '') {
+  const entry = state.activeOrchestrations.get(orchestrateId);
+  const row = getTaskRow(entry, taskId);
+  if (!row) return;
+
+  const section = ensureTaskReasoningSection(row);
+  const body = getTaskReasoningBody(row);
+  const label = getTaskReasoningLabel(row);
+  if (!section || !body || !label) return;
+
+  if (!body._textNode) {
+    body.textContent = '';
+    body._textNode = document.createTextNode('');
+    body.appendChild(body._textNode);
+  }
+
+  if (body._textNode.nodeValue.trim()) body._textNode.nodeValue += '\n\n';
+  if (agentName) body._textNode.nodeValue += `[${agentName}]\n`;
+
+  label.textContent = agentName ? `思考链 · ${agentName} 推理中` : '思考链 · 推理中';
+  label.title = label.textContent;
+  maybeOpenTaskDetails(row, true);
+  scrollDown();
+}
+
+export function appendOrchestrateTaskReasoning(orchestrateId, taskId, content) {
+  if (!content) return;
+
+  const entry = state.activeOrchestrations.get(orchestrateId);
+  const row = getTaskRow(entry, taskId);
+  if (!row) return;
+
+  const section = ensureTaskReasoningSection(row);
+  const body = getTaskReasoningBody(row);
+  if (!section || !body) return;
+
+  if (!body._textNode) {
+    body.textContent = '';
+    body._textNode = document.createTextNode('');
+    body.appendChild(body._textNode);
+  }
+
+  body._textNode.nodeValue += content;
+  scrollDown();
+}
+
+export function finishOrchestrateTaskReasoning(orchestrateId, taskId) {
+  const entry = state.activeOrchestrations.get(orchestrateId);
+  const row = getTaskRow(entry, taskId);
+  if (!row) return;
+
+  const body = getTaskReasoningBody(row);
+  const label = getTaskReasoningLabel(row);
+  if (!body || !label) return;
+
+  const rawText = body._textNode?.nodeValue || body.textContent || '';
+  const preview = reasoningPreview(rawText);
+  label.textContent = `思考链 · ${preview}`;
+  label.title = rawText.trim() || '完成';
+}
+
 /* ──────────────────── Inner tool chain (per task row) ──────────────────── */
 
 function getTaskRow(entry, taskId) {
@@ -618,6 +737,7 @@ function ensureToolChainSection(row) {
     section.innerHTML = `
       <div class="orchestrate-task-section-title">工具链</div>
       <div class="orchestrate-tool-chain" data-orchestrate-tool-chain></div>
+      <div class="orchestrate-tool-list" data-orchestrate-tool-list></div>
     `;
     details.appendChild(section);
   }
@@ -630,9 +750,71 @@ function toolChainContainer(row) {
   return section ? section.querySelector('[data-orchestrate-tool-chain]') : null;
 }
 
+function toolListContainer(row) {
+  const section = ensureToolChainSection(row);
+  return section ? section.querySelector('[data-orchestrate-tool-list]') : null;
+}
+
 function findOrchestrateToolPill(row, toolId) {
   if (!row || !toolId) return null;
   return row.querySelector(`.orchestrate-tool-pill[data-tool-id="${CSS.escape(toolId)}"]`) || null;
+}
+
+function findOrchestrateToolRow(row, toolId) {
+  if (!row || !toolId) return null;
+  return row.querySelector(`.orchestrate-tool-row[data-tool-id="${CSS.escape(toolId)}"]`) || null;
+}
+
+function setOrchestrateToolRowExpanded(toolRow, expand) {
+  const details = toolRow?.querySelector('.orchestrate-tool-details');
+  const chevron = toolRow?.querySelector('.orchestrate-tool-summary .chevron');
+  if (!details) return;
+  animateCollapsibleSection(details, expand);
+  if (chevron) chevron.classList.toggle('open', expand);
+}
+
+function ensureOrchestrateToolRow(taskRow, toolName, toolId, toolArgs = '') {
+  const list = toolListContainer(taskRow);
+  if (!list) return null;
+
+  const formattedArgs = formatDetailText(toolArgs || '');
+  let toolRow = toolId ? findOrchestrateToolRow(taskRow, toolId) : null;
+  if (toolRow) {
+    const nameEl = toolRow.querySelector('.orchestrate-tool-name');
+    const previewEl = toolRow.querySelector('.orchestrate-tool-preview');
+    const argsEl = toolRow.querySelector('.orchestrate-tool-args-code');
+    if (nameEl) nameEl.textContent = toolName || 'tool';
+    if (previewEl && formattedArgs) previewEl.textContent = inlinePreview(formattedArgs || '无参数');
+    if (argsEl && formattedArgs) argsEl.textContent = formattedArgs;
+    return toolRow;
+  }
+
+  toolRow = document.createElement('div');
+  toolRow.className = 'orchestrate-tool-row orchestrate-tool-running';
+  if (toolId) toolRow.dataset.toolId = toolId;
+  toolRow.innerHTML = `
+    <div class="orchestrate-tool-summary" data-action="toggle-tool">
+      <span class="orchestrate-tool-icon">⚡</span>
+      <span class="orchestrate-tool-main">
+        <span class="orchestrate-tool-name">${escHtml(toolName || 'tool')}</span>
+        <span class="orchestrate-tool-preview">${escHtml(inlinePreview(formattedArgs || '无参数'))}</span>
+      </span>
+      <span class="orchestrate-tool-status">执行中</span>
+      <span class="chevron">▸</span>
+    </div>
+    <div class="orchestrate-tool-details">
+      <div class="orchestrate-tool-section">
+        <div class="orchestrate-tool-section-title">参数</div>
+        <pre class="orchestrate-task-code orchestrate-tool-args-code">${escHtml(formattedArgs || '无参数')}</pre>
+      </div>
+      <div class="orchestrate-tool-section orchestrate-tool-output" hidden>
+        <div class="orchestrate-tool-section-title">输出</div>
+        <pre class="orchestrate-task-code orchestrate-tool-output-code"></pre>
+      </div>
+    </div>
+  `;
+  list.appendChild(toolRow);
+  return toolRow;
 }
 
 function setToolPillState(pill, stateLabel, tone) {
@@ -641,6 +823,28 @@ function setToolPillState(pill, stateLabel, tone) {
   if (tone) pill.classList.add(tone);
   const stateEl = pill.querySelector('.orchestrate-tool-pill-state');
   if (stateEl) stateEl.textContent = stateLabel;
+}
+
+function syncToolPillContent(pill, toolName, toolArgs = '') {
+  if (!pill) return;
+
+  const nameEl = pill.querySelector('.orchestrate-tool-pill-name');
+  if (nameEl) nameEl.textContent = toolName || 'tool';
+
+  const previewText = inlinePreview(formatDetailText(toolArgs || ''), 80);
+  let previewEl = pill.querySelector('.orchestrate-tool-pill-preview');
+  const stateEl = pill.querySelector('.orchestrate-tool-pill-state');
+  if (previewText) {
+    if (!previewEl) {
+      previewEl = document.createElement('span');
+      previewEl.className = 'orchestrate-tool-pill-preview';
+      if (stateEl) pill.insertBefore(previewEl, stateEl);
+      else pill.appendChild(previewEl);
+    }
+    previewEl.textContent = previewText;
+  } else if (previewEl) {
+    previewEl.remove();
+  }
 }
 
 /**
@@ -655,37 +859,78 @@ export function addOrchestrateTaskTool(orchestrateId, taskId, toolName, toolId, 
   const container = toolChainContainer(row);
   if (!container) return;
 
-  if (toolId && findOrchestrateToolPill(row, toolId)) return;
+  ensureOrchestrateToolRow(row, toolName, toolId, toolArgs);
 
-  const pill = document.createElement('div');
+  const existingPill = toolId ? findOrchestrateToolPill(row, toolId) : null;
+  if (existingPill) {
+    syncToolPillContent(existingPill, toolName, toolArgs);
+    return;
+  }
+
+  const pill = document.createElement('button');
+  pill.type = 'button';
   pill.className = 'orchestrate-tool-pill is-running';
+  pill.dataset.action = 'orchestrate-focus-tool';
+  pill.dataset.taskId = taskId;
+  pill.dataset.orchestrateId = orchestrateId;
   if (toolId) pill.dataset.toolId = toolId;
   const previewText = inlinePreview(formatDetailText(toolArgs || ''), 80);
   pill.innerHTML = `
     <span class="orchestrate-tool-pill-index">${container.childElementCount + 1}</span>
     <span class="orchestrate-tool-pill-name">${escHtml(toolName || 'tool')}</span>
-    ${previewText ? `<span class="orchestrate-tool-pill-preview">${escHtml(previewText)}</span>` : ''}
     <span class="orchestrate-tool-pill-state">执行中</span>
   `;
+  syncToolPillContent(pill, toolName, toolArgs);
   container.appendChild(pill);
 }
 
 /**
  * Mark an existing tool pill as completed / failed.
  */
-export function updateOrchestrateTaskTool(orchestrateId, taskId, toolId, durationMs, isError = false, toolName = '') {
+export function updateOrchestrateTaskTool(orchestrateId, taskId, toolId, durationMs, result, isError = false, toolName = '') {
   const entry = state.activeOrchestrations.get(orchestrateId);
   const row = getTaskRow(entry, taskId);
   if (!row) return;
 
   let pill = findOrchestrateToolPill(row, toolId);
+  let toolRow = findOrchestrateToolRow(row, toolId);
   if (!pill) {
     addOrchestrateTaskTool(orchestrateId, taskId, toolName || 'tool', toolId, '');
     pill = findOrchestrateToolPill(row, toolId);
+    toolRow = findOrchestrateToolRow(row, toolId);
   }
   if (!pill) return;
 
   const durationLabel = formatToolDuration(durationMs);
   const stateText = `${isError ? '失败' : '完成'}${durationLabel ? ` · ${durationLabel}` : ''}`;
   setToolPillState(pill, stateText, isError ? 'is-failed' : 'is-done');
+
+  if (!toolRow) return;
+
+  toolRow.classList.remove('orchestrate-tool-running');
+  toolRow.classList.add('orchestrate-tool-done');
+  toolRow.classList.toggle('orchestrate-tool-failed', isError);
+
+  const statusEl = toolRow.querySelector('.orchestrate-tool-status');
+  if (statusEl) statusEl.textContent = stateText;
+
+  const hasResult = typeof result === 'string';
+  const formattedResult = hasResult ? formatDetailText(result) : '';
+  const previewEl = toolRow.querySelector('.orchestrate-tool-preview');
+  if (previewEl && formattedResult) {
+    previewEl.textContent = inlinePreview(formattedResult, 120);
+  }
+
+  const outputSection = toolRow.querySelector('.orchestrate-tool-output');
+  const outputCode = toolRow.querySelector('.orchestrate-tool-output-code');
+  if (outputSection && outputCode && (hasResult || isError)) {
+    outputCode.textContent = formattedResult || (isError ? '工具执行失败，未返回可展示的输出。' : '无输出');
+    outputSection.hidden = false;
+  }
+
+  if (isError) {
+    maybeOpenTaskDetails(row, true);
+    setOrchestrateToolRowExpanded(toolRow, true);
+    pulseFocus(toolRow);
+  }
 }

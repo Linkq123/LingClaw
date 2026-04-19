@@ -16,6 +16,50 @@ function getToolTrailEmpty(panel) {
   return panel.querySelector('[data-subagent-tool-empty]');
 }
 
+function getReasoningCard(panel) {
+  return panel.querySelector('[data-subagent-reasoning]');
+}
+
+function getReasoningMeta(panel) {
+  return panel.querySelector('[data-subagent-reasoning-meta]');
+}
+
+function getReasoningBody(panel) {
+  return panel.querySelector('[data-subagent-reasoning-body]');
+}
+
+function ensureReasoningCard(panel) {
+  if (!panel) return null;
+
+  let card = getReasoningCard(panel);
+  if (card) return card;
+
+  card = document.createElement('div');
+  card.className = 'subagent-section-card subagent-reasoning-card';
+  card.dataset.subagentReasoning = 'true';
+  card.hidden = true;
+  card.innerHTML = `
+    <div class="subagent-section-head">
+      <div class="subagent-section-title">思考链</div>
+      <div class="subagent-section-meta" data-subagent-reasoning-meta>等待中</div>
+    </div>
+    <pre class="subagent-reasoning-body" data-subagent-reasoning-body></pre>
+  `;
+
+  const body = panel.querySelector('.subagent-body');
+  const toolOverview = panel.querySelector('.subagent-tools-overview');
+  if (body) {
+    body.insertBefore(card, toolOverview || body.querySelector('.subagent-summary') || null);
+  }
+  return card;
+}
+
+function reasoningPreview(rawText, fallback = '完成') {
+  const summaryText = (rawText || '').trim().replace(/\n+/g, ' ');
+  const preview = summaryText.slice(0, 60);
+  return preview ? preview + (summaryText.length > 60 ? '…' : '') : fallback;
+}
+
 function setChipText(panel, key, value, extraClass = '') {
   const chip = panel.querySelector(`[data-subagent-chip="${key}"]`);
   if (!chip) return;
@@ -446,6 +490,69 @@ export function updateSubagentProgress(ref, cycle) {
     status.textContent = `执行中 (cycle ${cycle})`;
   }
   setChipText(panel, 'cycle', `Cycle ${cycle}`);
+}
+
+export function startSubagentReasoning(ref) {
+  const panel = resolvePanel(ref);
+  if (!panel) return;
+
+  const card = ensureReasoningCard(panel);
+  const body = getReasoningBody(panel);
+  const meta = getReasoningMeta(panel);
+  if (!card || !body) return;
+
+  if (!body._textNode) {
+    body.textContent = '';
+    body._textNode = document.createTextNode('');
+    body.appendChild(body._textNode);
+  }
+
+  const cycleLabel = panel.querySelector('[data-subagent-chip="cycle"]')?.textContent?.trim() || '';
+  if (body._textNode.nodeValue.trim()) body._textNode.nodeValue += '\n\n';
+  if (cycleLabel) body._textNode.nodeValue += `[${cycleLabel}]\n`;
+
+  card.hidden = false;
+  if (meta) {
+    meta.textContent = cycleLabel ? `${cycleLabel} · 推理中` : '推理中';
+    meta.title = meta.textContent;
+  }
+
+  scrollDown();
+}
+
+export function appendSubagentReasoning(ref, content) {
+  if (!content) return;
+
+  const panel = resolvePanel(ref);
+  if (!panel) return;
+
+  const card = ensureReasoningCard(panel);
+  const body = getReasoningBody(panel);
+  if (!card || !body) return;
+
+  if (!body._textNode) {
+    body.textContent = '';
+    body._textNode = document.createTextNode('');
+    body.appendChild(body._textNode);
+  }
+
+  card.hidden = false;
+  body._textNode.nodeValue += content;
+  scrollDown();
+}
+
+export function finishSubagentReasoning(ref) {
+  const panel = resolvePanel(ref);
+  if (!panel) return;
+
+  const meta = getReasoningMeta(panel);
+  const body = getReasoningBody(panel);
+  if (!meta || !body) return;
+
+  const rawText = body._textNode?.nodeValue || body.textContent || '';
+  const preview = reasoningPreview(rawText);
+  meta.textContent = preview;
+  meta.title = rawText.trim() || '完成';
 }
 
 /**

@@ -890,18 +890,6 @@ async fn execute_orchestrate_tool(
         }
     };
 
-    let task_count = plan.tasks.len();
-
-    // Emit a kickoff system note so the user can see orchestration has started.
-    let _ = live_send(
-        live_tx,
-        json!({
-            "type": "system",
-            "content": format!("Starting orchestration: {task_count} tasks"),
-        }),
-    )
-    .await;
-
     let outcome = crate::subagents::orchestrator::execute_orchestration(
         &plan, config, http, workspace, live_tx, cancel, hooks,
     )
