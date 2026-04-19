@@ -4,6 +4,19 @@ import { scrollDown } from '../scroll.js';
 import { wrapInTimeline, animatePanelIn, animateCollapsibleSection, removeTimelinePanel } from './timeline.js';
 import { pinReactStatusToBottom } from './react-status.js';
 
+// Parse a composite task_id of the form `<orchestrate_id>:<task_id>` emitted by
+// orchestrator-wrapped sub-agent runs. Returns { orchestrateId, taskId } when
+// the first segment matches a known orchestration, else null.
+export function parseOrchestrateCompositeTaskId(compositeId) {
+  if (typeof compositeId !== 'string' || !compositeId.includes(':')) return null;
+  const idx = compositeId.indexOf(':');
+  const orchestrateId = compositeId.slice(0, idx);
+  const taskId = compositeId.slice(idx + 1);
+  if (!orchestrateId || !taskId) return null;
+  if (!state.activeOrchestrations.has(orchestrateId)) return null;
+  return { orchestrateId, taskId };
+}
+
 function getTaskRows(panel) {
   return Array.from(panel.querySelectorAll('.orchestrate-task'));
 }
@@ -585,4 +598,94 @@ export function copyOrchestrateSummary(button) {
   const panel = button.closest('.orchestrate-panel');
   if (!panel) return;
   void copyButtonText(button, orchestrationSummaryText(panel), '复制摘要');
+}
+
+/* ──────────────────── Inner tool chain (per task row) ──────────────────── */
+
+function getTaskRow(entry, taskId) {
+  if (!entry || !taskId) return null;
+  return entry.taskRows.get(taskId) || null;
+}
+
+function ensureToolChainSection(row) {
+  const details = row?.querySelector('.orchestrate-task-details');
+  if (!details) return null;
+  let section = row.querySelector('[data-orchestrate-section="tools"]');
+  if (!section) {
+    section = document.createElement('div');
+    section.className = 'orchestrate-task-section orchestrate-task-tools';
+    section.dataset.orchestrateSection = 'tools';
+    section.innerHTML = `
+      <div class="orchestrate-task-section-title">工具链</div>
+      <div class="orchestrate-tool-chain" data-orchestrate-tool-chain></div>
+    `;
+    details.appendChild(section);
+  }
+  section.classList.remove('hidden');
+  return section;
+}
+
+function toolChainContainer(row) {
+  const section = ensureToolChainSection(row);
+  return section ? section.querySelector('[data-orchestrate-tool-chain]') : null;
+}
+
+function findOrchestrateToolPill(row, toolId) {
+  if (!row || !toolId) return null;
+  return row.querySelector(`.orchestrate-tool-pill[data-tool-id="${CSS.escape(toolId)}"]`) || null;
+}
+
+function setToolPillState(pill, stateLabel, tone) {
+  if (!pill) return;
+  pill.classList.remove('is-running', 'is-done', 'is-failed');
+  if (tone) pill.classList.add(tone);
+  const stateEl = pill.querySelector('.orchestrate-tool-pill-state');
+  if (stateEl) stateEl.textContent = stateLabel;
+}
+
+/**
+ * Append a tool pill to the task row's inline tool chain.
+ * No-op if the task/orchestration is unknown.
+ */
+export function addOrchestrateTaskTool(orchestrateId, taskId, toolName, toolId, toolArgs = '') {
+  const entry = state.activeOrchestrations.get(orchestrateId);
+  const row = getTaskRow(entry, taskId);
+  if (!row) return;
+
+  const container = toolChainContainer(row);
+  if (!container) return;
+
+  if (toolId && findOrchestrateToolPill(row, toolId)) return;
+
+  const pill = document.createElement('div');
+  pill.className = 'orchestrate-tool-pill is-running';
+  if (toolId) pill.dataset.toolId = toolId;
+  const previewText = inlinePreview(formatDetailText(toolArgs || ''), 80);
+  pill.innerHTML = `
+    <span class="orchestrate-tool-pill-index">${container.childElementCount + 1}</span>
+    <span class="orchestrate-tool-pill-name">${escHtml(toolName || 'tool')}</span>
+    ${previewText ? `<span class="orchestrate-tool-pill-preview">${escHtml(previewText)}</span>` : ''}
+    <span class="orchestrate-tool-pill-state">执行中</span>
+  `;
+  container.appendChild(pill);
+}
+
+/**
+ * Mark an existing tool pill as completed / failed.
+ */
+export function updateOrchestrateTaskTool(orchestrateId, taskId, toolId, durationMs, isError = false, toolName = '') {
+  const entry = state.activeOrchestrations.get(orchestrateId);
+  const row = getTaskRow(entry, taskId);
+  if (!row) return;
+
+  let pill = findOrchestrateToolPill(row, toolId);
+  if (!pill) {
+    addOrchestrateTaskTool(orchestrateId, taskId, toolName || 'tool', toolId, '');
+    pill = findOrchestrateToolPill(row, toolId);
+  }
+  if (!pill) return;
+
+  const durationLabel = formatToolDuration(durationMs);
+  const stateText = `${isError ? '失败' : '完成'}${durationLabel ? ` · ${durationLabel}` : ''}`;
+  setToolPillState(pill, stateText, isError ? 'is-failed' : 'is-done');
 }

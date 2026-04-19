@@ -38,7 +38,8 @@ import {
 import {
   createOrchestratePanel, updateOrchestrateLayer, markOrchestrateTask,
   finishOrchestratePanel, toggleOrchestrateTasks,
-  focusOrchestrateActive, copyOrchestrateSummary
+  focusOrchestrateActive, copyOrchestrateSummary,
+  parseOrchestrateCompositeTaskId, addOrchestrateTaskTool, updateOrchestrateTaskTool,
 } from './renderers/orchestrate.js';
 import { openSettingsPage, closeSettingsPage, initSettingsListeners } from './settings.js';
 import { openUsagePage, closeUsagePage, initUsageListeners } from './usage.js';
@@ -547,6 +548,14 @@ function handleMessage(data) {
 
     case 'tool_result':
       if (data.subagent) {
+        const orchInfo = parseOrchestrateCompositeTaskId(data.task_id);
+        if (orchInfo) {
+          updateOrchestrateTaskTool(
+            orchInfo.orchestrateId, orchInfo.taskId,
+            data.id, data.duration_ms, data.is_error, data.name,
+          );
+          break;
+        }
         updateSubagentToolResult(
           { task_id: data.task_id, agent: data.subagent },
           data.id,
@@ -570,9 +579,18 @@ function handleMessage(data) {
     case 'task_progress':
       updateSubagentProgress({ task_id: data.task_id, agent: data.agent }, data.cycle);
       break;
-    case 'task_tool':
+    case 'task_tool': {
+      const orchInfo = parseOrchestrateCompositeTaskId(data.task_id);
+      if (orchInfo) {
+        addOrchestrateTaskTool(
+          orchInfo.orchestrateId, orchInfo.taskId,
+          data.tool, data.id, data.arguments,
+        );
+        break;
+      }
       addSubagentTool({ task_id: data.task_id, agent: data.agent }, data.tool, data.id, data.arguments);
       break;
+    }
     case 'task_completed':
       finishSubagentPanel(
         { task_id: data.task_id, agent: data.agent },
