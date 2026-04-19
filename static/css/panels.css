@@ -1309,12 +1309,6 @@
   flex-direction: column;
   gap: 6px;
 }
-.orchestrate-tool-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 8px;
-}
 .orchestrate-tool-pill {
   display: flex;
   align-items: center;
@@ -1404,115 +1398,73 @@
   color: var(--accent-error);
   background: color-mix(in srgb, var(--accent-error) 10%, transparent);
 }
-.orchestrate-tool-row {
-  border-radius: 10px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  overflow: hidden;
+.orchestrate-tool-pill.tool-panel-active {
+  border-color: var(--accent2);
+  background: color-mix(in srgb, var(--accent2) 12%, var(--surface));
+  box-shadow: 0 0 0 1px var(--accent2);
 }
-.orchestrate-tool-row.orchestrate-tool-running {
-  border-color: color-mix(in srgb, var(--accent2) 20%, var(--border));
-}
-.orchestrate-tool-summary {
+
+/* ── Orchestrate task reasoning (collapsed by default) ── */
+.orchestrate-task-reasoning-header {
   display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 10px 12px;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
   cursor: pointer;
-  background: transparent;
-  transition: background .15s;
+  user-select: none;
 }
-.orchestrate-tool-summary:hover {
-  background: var(--surface2);
+.orchestrate-task-reasoning-header:hover {
+  opacity: .85;
 }
-.orchestrate-tool-main {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  flex: 1 1 0;
-  min-width: 0;
-}
-.orchestrate-tool-icon {
-  color: var(--accent2);
-  font-size: 12px;
+.orchestrate-task-reasoning-icon {
+  font-size: 14px;
   flex-shrink: 0;
-  margin-top: 2px;
 }
-.orchestrate-tool-name {
-  color: var(--text);
+.orchestrate-task-reasoning-label {
+  font-size: 11px;
   font-weight: 700;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.orchestrate-tool-preview {
   color: var(--dim);
-  font-size: 11px;
+  flex: 1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.orchestrate-tool-status {
-  margin-left: auto;
-  font-size: 11px;
-  color: var(--accent2);
-  white-space: nowrap;
-  font-weight: 600;
-  padding: 2px 8px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--accent2) 8%, transparent);
-}
-.orchestrate-tool-summary .chevron {
-  margin-left: 8px;
+.orchestrate-task-reasoning-header .chevron {
+  font-size: 10px;
+  color: var(--dim);
   transition: transform .25s ease;
+  flex-shrink: 0;
 }
-.orchestrate-tool-summary .chevron.open {
+.orchestrate-task-reasoning-header .chevron.open {
   transform: rotate(90deg);
 }
-.orchestrate-tool-details {
+.orchestrate-task-reasoning-body {
+  margin: 0;
   height: 0;
   opacity: 0;
   overflow: hidden;
-  padding: 0 12px;
-  transition: height .28s cubic-bezier(.22,1,.36,1), padding .22s ease, opacity .18s ease;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.65;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 0 solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  transition: height .28s cubic-bezier(.22,1,.36,1), padding .22s ease, opacity .18s ease, border-width .18s ease;
 }
-.orchestrate-tool-details.show {
+.orchestrate-task-reasoning-body.show {
   height: auto;
   opacity: 1;
-  padding: 0 12px 12px;
-  max-height: 360px;
+  padding: 10px 12px;
+  border-width: 1px;
+  max-height: 300px;
   overflow-y: auto;
 }
-.orchestrate-tool-details.is-open {
+.orchestrate-task-reasoning-body.is-open {
   opacity: 1;
-}
-.orchestrate-tool-section + .orchestrate-tool-section {
-  margin-top: 10px;
-}
-.orchestrate-tool-output[hidden] {
-  display: none;
-}
-.orchestrate-tool-section-title {
-  font-size: 10px;
-  font-weight: 800;
-  text-transform: uppercase;
-  letter-spacing: .08em;
-  color: var(--dim);
-  margin-bottom: 6px;
-}
-.orchestrate-tool-row.orchestrate-tool-done:not(.orchestrate-tool-failed) {
-  border-color: color-mix(in srgb, var(--accent-success) 20%, var(--border));
-}
-.orchestrate-tool-row.orchestrate-tool-failed {
-  border-color: color-mix(in srgb, var(--accent-error) 22%, var(--border));
-}
-.orchestrate-tool-done .orchestrate-tool-status {
-  color: var(--accent-success);
-  background: color-mix(in srgb, var(--accent-success) 10%, transparent);
-}
-.orchestrate-tool-failed .orchestrate-tool-status {
-  color: var(--accent-error);
-  background: color-mix(in srgb, var(--accent-error) 10%, transparent);
 }
 .orchestrate-task-dep {
   display: inline-flex;

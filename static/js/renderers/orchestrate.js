@@ -3,6 +3,7 @@ import { escHtml, formatToolDuration, formatTokenCount, formatDetailText, inline
 import { scrollDown } from '../scroll.js';
 import { wrapInTimeline, animatePanelIn, animateCollapsibleSection, removeTimelinePanel } from './timeline.js';
 import { pinReactStatusToBottom } from './react-status.js';
+import { openToolDrawer, syncToolDrawer } from './tools.js';
 
 // Parse a composite task_id of the form `<orchestrate_id>:<task_id>` emitted by
 // orchestrator-wrapped sub-agent runs. Returns { orchestrateId, taskId } when
@@ -234,8 +235,12 @@ function ensureTaskReasoningSection(row) {
     section.className = 'orchestrate-task-section orchestrate-task-reasoning';
     section.dataset.orchestrateSection = 'reasoning';
     section.innerHTML = `
-      <div class="orchestrate-task-section-title" data-orchestrate-reasoning-label>思考链 · 等待中</div>
-      <pre class="orchestrate-task-code orchestrate-task-reasoning-code" data-orchestrate-reasoning-body></pre>
+      <div class="orchestrate-task-reasoning-header" data-action="toggle-tool">
+        <span class="orchestrate-task-reasoning-icon">\ud83d\udcad</span>
+        <span class="orchestrate-task-reasoning-label" data-orchestrate-reasoning-label>思考链</span>
+        <span class="chevron">\u25b8</span>
+      </div>
+      <pre class="orchestrate-task-reasoning-body" data-orchestrate-reasoning-body></pre>
     `;
     const anchor = details.querySelector('[data-orchestrate-section="tools"], [data-orchestrate-section="result"]');
     details.insertBefore(section, anchor || null);
@@ -636,26 +641,9 @@ export function copyOrchestrateSummary(button) {
 }
 
 export function focusOrchestrateTool(button) {
-  const panel = button.closest('.orchestrate-panel');
-  if (!panel) return;
-
-  const taskId = button.dataset.taskId || '';
-  const toolId = button.dataset.toolId || '';
-  const taskRow = taskId
-    ? panel.querySelector(`.orchestrate-task[data-task-id="${CSS.escape(taskId)}"]`)
-    : null;
-  if (!taskRow) return;
-
-  maybeOpenTaskDetails(taskRow, true);
-  const toolRow = findOrchestrateToolRow(taskRow, toolId);
-  if (!toolRow) {
-    focusTaskRow(taskRow);
-    return;
-  }
-
-  setOrchestrateToolRowExpanded(toolRow, true);
-  pulseFocus(toolRow);
-  toolRow.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  // button is the pill element itself (it carries data-action).
+  // Open the shared tool drawer using the pill's dataset.
+  openToolDrawer(button);
 }
 
 export function startOrchestrateTaskReasoning(orchestrateId, taskId, agentName = '') {
@@ -679,8 +667,6 @@ export function startOrchestrateTaskReasoning(orchestrateId, taskId, agentName =
 
   label.textContent = agentName ? `思考链 · ${agentName} 推理中` : '思考链 · 推理中';
   label.title = label.textContent;
-  maybeOpenTaskDetails(row, true);
-  scrollDown();
 }
 
 export function appendOrchestrateTaskReasoning(orchestrateId, taskId, content) {
@@ -701,7 +687,6 @@ export function appendOrchestrateTaskReasoning(orchestrateId, taskId, content) {
   }
 
   body._textNode.nodeValue += content;
-  scrollDown();
 }
 
 export function finishOrchestrateTaskReasoning(orchestrateId, taskId) {
@@ -737,7 +722,6 @@ function ensureToolChainSection(row) {
     section.innerHTML = `
       <div class="orchestrate-task-section-title">工具链</div>
       <div class="orchestrate-tool-chain" data-orchestrate-tool-chain></div>
-      <div class="orchestrate-tool-list" data-orchestrate-tool-list></div>
     `;
     details.appendChild(section);
   }
@@ -750,71 +734,9 @@ function toolChainContainer(row) {
   return section ? section.querySelector('[data-orchestrate-tool-chain]') : null;
 }
 
-function toolListContainer(row) {
-  const section = ensureToolChainSection(row);
-  return section ? section.querySelector('[data-orchestrate-tool-list]') : null;
-}
-
 function findOrchestrateToolPill(row, toolId) {
   if (!row || !toolId) return null;
   return row.querySelector(`.orchestrate-tool-pill[data-tool-id="${CSS.escape(toolId)}"]`) || null;
-}
-
-function findOrchestrateToolRow(row, toolId) {
-  if (!row || !toolId) return null;
-  return row.querySelector(`.orchestrate-tool-row[data-tool-id="${CSS.escape(toolId)}"]`) || null;
-}
-
-function setOrchestrateToolRowExpanded(toolRow, expand) {
-  const details = toolRow?.querySelector('.orchestrate-tool-details');
-  const chevron = toolRow?.querySelector('.orchestrate-tool-summary .chevron');
-  if (!details) return;
-  animateCollapsibleSection(details, expand);
-  if (chevron) chevron.classList.toggle('open', expand);
-}
-
-function ensureOrchestrateToolRow(taskRow, toolName, toolId, toolArgs = '') {
-  const list = toolListContainer(taskRow);
-  if (!list) return null;
-
-  const formattedArgs = formatDetailText(toolArgs || '');
-  let toolRow = toolId ? findOrchestrateToolRow(taskRow, toolId) : null;
-  if (toolRow) {
-    const nameEl = toolRow.querySelector('.orchestrate-tool-name');
-    const previewEl = toolRow.querySelector('.orchestrate-tool-preview');
-    const argsEl = toolRow.querySelector('.orchestrate-tool-args-code');
-    if (nameEl) nameEl.textContent = toolName || 'tool';
-    if (previewEl && formattedArgs) previewEl.textContent = inlinePreview(formattedArgs || '无参数');
-    if (argsEl && formattedArgs) argsEl.textContent = formattedArgs;
-    return toolRow;
-  }
-
-  toolRow = document.createElement('div');
-  toolRow.className = 'orchestrate-tool-row orchestrate-tool-running';
-  if (toolId) toolRow.dataset.toolId = toolId;
-  toolRow.innerHTML = `
-    <div class="orchestrate-tool-summary" data-action="toggle-tool">
-      <span class="orchestrate-tool-icon">⚡</span>
-      <span class="orchestrate-tool-main">
-        <span class="orchestrate-tool-name">${escHtml(toolName || 'tool')}</span>
-        <span class="orchestrate-tool-preview">${escHtml(inlinePreview(formattedArgs || '无参数'))}</span>
-      </span>
-      <span class="orchestrate-tool-status">执行中</span>
-      <span class="chevron">▸</span>
-    </div>
-    <div class="orchestrate-tool-details">
-      <div class="orchestrate-tool-section">
-        <div class="orchestrate-tool-section-title">参数</div>
-        <pre class="orchestrate-task-code orchestrate-tool-args-code">${escHtml(formattedArgs || '无参数')}</pre>
-      </div>
-      <div class="orchestrate-tool-section orchestrate-tool-output" hidden>
-        <div class="orchestrate-tool-section-title">输出</div>
-        <pre class="orchestrate-task-code orchestrate-tool-output-code"></pre>
-      </div>
-    </div>
-  `;
-  list.appendChild(toolRow);
-  return toolRow;
 }
 
 function setToolPillState(pill, stateLabel, tone) {
@@ -859,11 +781,12 @@ export function addOrchestrateTaskTool(orchestrateId, taskId, toolName, toolId, 
   const container = toolChainContainer(row);
   if (!container) return;
 
-  ensureOrchestrateToolRow(row, toolName, toolId, toolArgs);
-
+  const formattedArgs = formatDetailText(toolArgs || '');
   const existingPill = toolId ? findOrchestrateToolPill(row, toolId) : null;
   if (existingPill) {
     syncToolPillContent(existingPill, toolName, toolArgs);
+    existingPill.dataset.toolName = toolName || 'tool';
+    existingPill.dataset.toolArgs = formattedArgs;
     return;
   }
 
@@ -874,7 +797,14 @@ export function addOrchestrateTaskTool(orchestrateId, taskId, toolName, toolId, 
   pill.dataset.taskId = taskId;
   pill.dataset.orchestrateId = orchestrateId;
   if (toolId) pill.dataset.toolId = toolId;
-  const previewText = inlinePreview(formatDetailText(toolArgs || ''), 80);
+
+  // Drawer-compatible dataset for openToolDrawer / syncToolDrawer.
+  pill.dataset.toolName = toolName || 'tool';
+  pill.dataset.toolArgs = formattedArgs;
+  pill.dataset.toolResult = '';
+  pill.dataset.toolHasResult = 'false';
+  pill.dataset.toolStatus = '执行中';
+
   pill.innerHTML = `
     <span class="orchestrate-tool-pill-index">${container.childElementCount + 1}</span>
     <span class="orchestrate-tool-pill-name">${escHtml(toolName || 'tool')}</span>
@@ -886,6 +816,7 @@ export function addOrchestrateTaskTool(orchestrateId, taskId, toolName, toolId, 
 
 /**
  * Mark an existing tool pill as completed / failed.
+ * Updates drawer-compatible dataset and syncs to the tool drawer if active.
  */
 export function updateOrchestrateTaskTool(orchestrateId, taskId, toolId, durationMs, result, isError = false, toolName = '') {
   const entry = state.activeOrchestrations.get(orchestrateId);
@@ -893,11 +824,9 @@ export function updateOrchestrateTaskTool(orchestrateId, taskId, toolId, duratio
   if (!row) return;
 
   let pill = findOrchestrateToolPill(row, toolId);
-  let toolRow = findOrchestrateToolRow(row, toolId);
   if (!pill) {
     addOrchestrateTaskTool(orchestrateId, taskId, toolName || 'tool', toolId, '');
     pill = findOrchestrateToolPill(row, toolId);
-    toolRow = findOrchestrateToolRow(row, toolId);
   }
   if (!pill) return;
 
@@ -905,32 +834,20 @@ export function updateOrchestrateTaskTool(orchestrateId, taskId, toolId, duratio
   const stateText = `${isError ? '失败' : '完成'}${durationLabel ? ` · ${durationLabel}` : ''}`;
   setToolPillState(pill, stateText, isError ? 'is-failed' : 'is-done');
 
-  if (!toolRow) return;
+  // Update drawer-compatible dataset on the pill.
+  const formattedResult = typeof result === 'string' ? formatDetailText(result) : '';
+  pill.dataset.toolResult = formattedResult;
+  pill.dataset.toolHasResult = typeof result === 'string' ? 'true' : 'false';
+  pill.dataset.toolStatus = stateText;
+  if (toolName) pill.dataset.toolName = toolName;
 
-  toolRow.classList.remove('orchestrate-tool-running');
-  toolRow.classList.add('orchestrate-tool-done');
-  toolRow.classList.toggle('orchestrate-tool-failed', isError);
-
-  const statusEl = toolRow.querySelector('.orchestrate-tool-status');
-  if (statusEl) statusEl.textContent = stateText;
-
-  const hasResult = typeof result === 'string';
-  const formattedResult = hasResult ? formatDetailText(result) : '';
-  const previewEl = toolRow.querySelector('.orchestrate-tool-preview');
-  if (previewEl && formattedResult) {
-    previewEl.textContent = inlinePreview(formattedResult, 120);
-  }
-
-  const outputSection = toolRow.querySelector('.orchestrate-tool-output');
-  const outputCode = toolRow.querySelector('.orchestrate-tool-output-code');
-  if (outputSection && outputCode && (hasResult || isError)) {
-    outputCode.textContent = formattedResult || (isError ? '工具执行失败，未返回可展示的输出。' : '无输出');
-    outputSection.hidden = false;
+  // Sync to the shared tool drawer if this pill is the active panel.
+  if (state.activeToolPanel === pill) {
+    syncToolDrawer(pill);
   }
 
   if (isError) {
     maybeOpenTaskDetails(row, true);
-    setOrchestrateToolRowExpanded(toolRow, true);
-    pulseFocus(toolRow);
+    pulseFocus(pill);
   }
 }
