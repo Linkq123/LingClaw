@@ -990,7 +990,26 @@ async fn process_openai_data_line(data: &str, tx: &LiveTx, state: &mut OpenAiStr
                                 .await;
                     }
                 }
-                if let Some(text) = &choice.delta.content {
+                let has_content = choice
+                    .delta
+                    .content
+                    .as_ref()
+                    .is_some_and(|text| !text.is_empty());
+                let has_tool_calls = choice
+                    .delta
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty());
+
+                if (has_content || has_tool_calls) && state.reasoning_started && !state.client_gone
+                {
+                    state.reasoning_started = false;
+                    state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+                }
+
+                if let Some(text) = &choice.delta.content
+                    && !text.is_empty()
+                {
                     if state.reasoning_started && !state.client_gone {
                         state.reasoning_started = false;
                         state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
