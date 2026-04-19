@@ -312,9 +312,10 @@ async fn prepare_analyze_snapshot(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> Option<AnalyzeSnapshot> {
+    let config = ctx.state.config();
     let mut sessions = ctx.state.sessions.lock().await;
     let session = sessions.get_mut(ctx.current_session_id)?;
-    let base_model = session.effective_model(&ctx.state.config.model).to_string();
+    let base_model = session.effective_model(&config.model).to_string();
     let disabled = session.disabled_system_skills.clone();
 
     // Extract latest user message for query-aware memory retrieval and complexity sensing.
@@ -331,7 +332,7 @@ async fn prepare_analyze_snapshot(
 
     // On the first cycle, downgrade to fast model for simple queries when configured.
     let model_str = if phase_state.react_ctx.cycles == 0 && session.model_override.is_none() {
-        if let Some(ref fast) = ctx.state.config.fast_model {
+        if let Some(ref fast) = config.fast_model {
             if latest_query
                 .as_deref()
                 .map(agent::is_simple_query)
@@ -349,7 +350,7 @@ async fn prepare_analyze_snapshot(
     };
 
     let mut fresh_system = build_system_prompt_with_query(
-        &ctx.state.config,
+        &config,
         &session.workspace,
         &model_str,
         &disabled,
@@ -387,8 +388,8 @@ async fn prepare_analyze_snapshot(
     let msg_count_before = session.messages.len();
     crate::context::prune_messages_for_provider(
         &mut session.messages,
-        ctx.state.config.resolve_model(&model_str).provider,
-        context_input_budget_for_model(&ctx.state.config, &model_str),
+        config.resolve_model(&model_str).provider,
+        context_input_budget_for_model(&config, &model_str),
     );
     let pruned_count = msg_count_before - session.messages.len();
 
@@ -408,11 +409,12 @@ async fn fit_messages_to_request_budget(
     think_level: &str,
     extra_tools: &[serde_json::Value],
 ) -> Option<(usize, usize)> {
-    let provider = ctx.state.config.resolve_model(model).provider;
+    let config = ctx.state.config();
+    let provider = config.resolve_model(model).provider;
     let request_budget =
-        crate::context::context_input_budget_for_runtime(&ctx.state.config, model, think_level);
+        crate::context::context_input_budget_for_runtime(&config, model, think_level);
     let message_budget = crate::context::request_message_budget_for_runtime(
-        &ctx.state.config,
+        &config,
         model,
         think_level,
         extra_tools,
@@ -443,6 +445,7 @@ async fn send_before_analyze_events(
     mut hook_events: Vec<serde_json::Value>,
     pruned_count: usize,
 ) -> Option<Vec<ChatMessage>> {
+    let config = ctx.state.config();
     let final_messages = {
         let sessions = ctx.state.sessions.lock().await;
         sessions
@@ -450,10 +453,8 @@ async fn send_before_analyze_events(
             .map(|session| session.messages.clone())
             .unwrap_or_default()
     };
-    let final_context_estimate = estimate_tokens_for_provider(
-        ctx.state.config.resolve_model(model).provider,
-        &final_messages,
-    );
+    let final_context_estimate =
+        estimate_tokens_for_provider(config.resolve_model(model).provider, &final_messages);
     for event in &mut hook_events {
         if event["type"] == "context_compressed" {
             event["after_estimate"] = json!(final_context_estimate);
@@ -510,12 +511,8 @@ async fn build_cycle_tools(
     phase_state: &AgentPhaseState,
     resolved: &providers::ResolvedModel,
 ) -> Vec<serde_json::Value> {
-    build_runtime_tools(
-        &ctx.state.config,
-        resolved.provider,
-        &phase_state.cycle_workspace,
-    )
-    .await
+    let config = ctx.state.config();
+    build_runtime_tools(&config, resolved.provider, &phase_state.cycle_workspace).await
 }
 
 pub(crate) async fn build_runtime_tools(
@@ -1051,7 +1048,8 @@ async fn execute_tool_call(
     phase_state: &mut AgentPhaseState,
     tc: &ToolCall,
 ) -> Result<(tools::ToolOutcome, Option<String>), AgentPhaseControl> {
-    let tool_timeout = ctx.state.config.tool_timeout;
+    let config = ctx.state.config();
+    let tool_timeout = config.tool_timeout;
 
     // ── BeforeToolExec hook (evaluated before the WS event so the frontend
     //    always sees the arguments that will actually be executed) ─────────
@@ -1070,7 +1068,7 @@ async fn execute_tool_call(
         &ctx.state.hooks,
         agent::HookPoint::BeforeToolExec,
         tool_hook_input,
-        &ctx.state.config,
+        &config,
     )
     .await;
 
@@ -1132,7 +1130,7 @@ async fn execute_tool_call(
             None,
             execute_task_tool(
                 &effective_args,
-                &ctx.state.config,
+                &config,
                 &ctx.state.http,
                 &phase_state.cycle_workspace,
                 ctx.live_tx,
@@ -1155,7 +1153,7 @@ async fn execute_tool_call(
             None,
             execute_orchestrate_tool(
                 &effective_args,
-                &ctx.state.config,
+                &config,
                 &ctx.state.http,
                 &phase_state.cycle_workspace,
                 ctx.live_tx,
@@ -1176,7 +1174,7 @@ async fn execute_tool_call(
             execute_tool(
                 &tc.function.name,
                 &effective_args,
-                &ctx.state.config,
+                &config,
                 &ctx.state.http,
                 &phase_state.cycle_workspace,
             ),
@@ -1205,6 +1203,7 @@ async fn record_tool_result(
     effective_args: Option<&str>,
 ) -> AgentPhaseControl {
     // ── AfterToolExec hook (skipped when tool was rejected) ──────────────
+    let config = ctx.state.config();
     if let Some(eff_args) = effective_args {
         let after_input = ToolHookInput {
             tool_name: tc.function.name.clone(),
@@ -1221,7 +1220,7 @@ async fn record_tool_result(
             &ctx.state.hooks,
             agent::HookPoint::AfterToolExec,
             after_input,
-            &ctx.state.config,
+            &config,
         )
         .await;
         if let hooks::HookOutput::ModifyToolResult { result: new_output } = hook_output {
@@ -1285,6 +1284,7 @@ async fn run_analyze_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
+    let config = ctx.state.config();
     if phase_state.round >= AGENT_HARD_CAP_ROUNDS {
         let (system_event, mut done_event) = build_agent_hard_cap_events(
             AGENT_HARD_CAP_ROUNDS,
@@ -1320,7 +1320,7 @@ async fn run_analyze_phase(
         None => return AgentPhaseControl::Break,
     };
 
-    let resolved = ctx.state.config.resolve_model(&snapshot.model);
+    let resolved = config.resolve_model(&snapshot.model);
 
     // Complexity signals for adaptive think level.
     let consecutive_errors = phase_state
@@ -1347,7 +1347,7 @@ async fn run_analyze_phase(
         agent::HookPoint::BeforeAnalyze,
         &ctx.state.sessions,
         ctx.current_session_id,
-        &ctx.state.config,
+        &config,
         &ctx.state.http,
         phase_state.react_ctx.cycles,
     )
@@ -1381,7 +1381,7 @@ async fn run_analyze_phase(
         cycle: phase_state.react_ctx.cycles,
         tool_count: extra_tools.len(),
     };
-    let llm_hook_output = run_llm_hooks(&ctx.state.hooks, &llm_hook_input, &ctx.state.config).await;
+    let llm_hook_output = run_llm_hooks(&ctx.state.hooks, &llm_hook_input, &config).await;
 
     let (effective_think, mut final_msgs_snapshot, request_budget) = match llm_hook_output {
         hooks::HookOutput::ModifyLlmParams {
@@ -1392,11 +1392,7 @@ async fn run_analyze_phase(
             let think = think_override.unwrap_or(effective_think);
             // Recalculate budget when think_level changed so the reserve matches.
             let budget = if has_think_override {
-                crate::context::context_input_budget_for_runtime(
-                    &ctx.state.config,
-                    &snapshot.model,
-                    &think,
-                )
+                crate::context::context_input_budget_for_runtime(&config, &snapshot.model, &think)
             } else {
                 request_budget
             };
@@ -1430,7 +1426,7 @@ async fn run_analyze_phase(
     // snapshot before erroring — the messages may still fit after trimming.
     if request_estimate > request_budget {
         let message_budget = crate::context::request_message_budget_for_runtime(
-            &ctx.state.config,
+            &config,
             &snapshot.model,
             &effective_think,
             &extra_tools,
@@ -1498,11 +1494,11 @@ async fn run_analyze_phase(
                 &resolved,
                 &final_msgs_snapshot,
                 &phase_state.cycle_workspace,
-                ctx.state.config.s3.as_ref(),
+                config.s3.as_ref(),
                 ctx.live_tx,
                 &effective_think,
                 &extra_tools,
-                ctx.state.config.max_llm_retries,
+                config.max_llm_retries,
             ) => result,
         };
 
@@ -1532,7 +1528,7 @@ async fn run_analyze_phase(
 
     match llm_result {
         Ok(resp) => {
-            let provider_name = ctx.state.config.resolve_provider_name(&snapshot.model);
+            let provider_name = config.resolve_provider_name(&snapshot.model);
             apply_llm_response(
                 ctx,
                 phase_state,
@@ -1555,6 +1551,7 @@ async fn run_act_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
+    let config = ctx.state.config();
     phase_state.collected_results.clear();
     let tool_calls = std::mem::take(&mut phase_state.pending_tool_calls);
 
@@ -1611,7 +1608,7 @@ async fn run_act_phase(
                 &ctx.state.hooks,
                 agent::HookPoint::BeforeToolExec,
                 hook_input,
-                &ctx.state.config,
+                &config,
             )
             .await;
             hook_results.push(match hook_output {
@@ -1676,7 +1673,7 @@ async fn run_act_phase(
         }
 
         // 3. Launch non-rejected tool futures concurrently.
-        let tool_timeout = ctx.state.config.tool_timeout;
+        let tool_timeout = config.tool_timeout;
         let futures: Vec<_> = tool_calls
             .iter()
             .zip(hook_results.iter())
@@ -1704,7 +1701,7 @@ async fn run_act_phase(
                     execute_tool(
                         &tc.function.name,
                         args,
-                        &ctx.state.config,
+                        &config,
                         &ctx.state.http,
                         &phase_state.cycle_workspace,
                     ),
@@ -1759,6 +1756,7 @@ async fn run_observe_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
+    let config = ctx.state.config();
     let summaries = agent::summarize_observations(&phase_state.collected_results);
     for summary in &summaries {
         let _ = live_send(
@@ -1808,7 +1806,7 @@ async fn run_observe_phase(
         agent::HookPoint::AfterObserve,
         &ctx.state.sessions,
         ctx.current_session_id,
-        &ctx.state.config,
+        &config,
         &ctx.state.http,
         phase_state.react_ctx.cycles,
     )
@@ -1827,6 +1825,7 @@ async fn run_finish_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
+    let config = ctx.state.config();
     let snapshot = {
         let sessions = ctx.state.sessions.lock().await;
         sessions.get(ctx.current_session_id).cloned()
@@ -1842,7 +1841,7 @@ async fn run_finish_phase(
         agent::HookPoint::OnFinish,
         &ctx.state.sessions,
         ctx.current_session_id,
-        &ctx.state.config,
+        &config,
         &ctx.state.http,
         phase_state.react_ctx.cycles,
     )
@@ -1855,8 +1854,8 @@ async fn run_finish_phase(
     // Enqueue structured memory update (async, non-blocking).
     // Pre-filter messages to avoid cloning the full session history.
     if let (Some(queue), Some(session)) = (&ctx.state.memory_queue, &snapshot) {
-        let fallback_model = session.effective_model(&ctx.state.config.model);
-        let model = ctx.state.config.memory_model_or(fallback_model).to_string();
+        let fallback_model = session.effective_model(&config.model);
+        let model = config.memory_model_or(fallback_model).to_string();
         let excerpt = crate::memory::prefilter_for_memory(&session.messages);
         queue.enqueue(session.workspace.clone(), model, excerpt);
     }
@@ -1867,14 +1866,14 @@ async fn run_finish_phase(
     // NOTE: snapshot check must precede try_claim_reflection() because the
     // CAS has a side-effect; if it fires but the session is gone, nobody
     // would roll back the cooldown slot.
-    if ctx.state.config.daily_reflection
+    if config.daily_reflection
         && let Some(ref session) = snapshot
         && let Some((previous_epoch, claimed_epoch)) = try_claim_reflection(
             phase_state.react_ctx.cycles,
             phase_state.react_ctx.tool_calls,
         )
     {
-        let config = ctx.state.config.clone();
+        let config = config.clone();
         let http = ctx.state.http.clone();
         let workspace = session.workspace.clone();
         let fallback_model = session.effective_model(&config.model).to_string();
@@ -1950,13 +1949,14 @@ fn fire_stop_command_hook(state: &Arc<AppState>, session_id: &str, live_tx: &Liv
     let live_tx = live_tx.clone();
     let session_id = session_id.to_string();
     tokio::spawn(async move {
+        let config = state.config();
         let hook_input = CommandHookInput {
             command: "/stop".to_string(),
             args: String::new(),
             result_type: "system".to_string(),
             session_id,
         };
-        let hook_events = run_command_hooks(&state.hooks, &hook_input, &state.config).await;
+        let hook_events = run_command_hooks(&state.hooks, &hook_input, &config).await;
         for ev in hook_events {
             let _ = live_send(&live_tx, ev).await;
         }

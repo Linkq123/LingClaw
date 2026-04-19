@@ -329,7 +329,7 @@ impl Session {
 const UPLOAD_TOKEN_HEADER: &str = "x-lingclaw-upload-token";
 
 struct AppState {
-    config: Config,
+    config: std::sync::Mutex<Arc<Config>>,
     http: Client,
     sessions: Mutex<HashMap<String, Session>>,
     /// Session IDs with the connection currently attached to live streaming output.
@@ -347,6 +347,18 @@ struct AppState {
     hooks: HookRegistry,
     /// Background structured memory updater (active when config.structured_memory is true).
     memory_queue: Option<MemoryUpdateQueue>,
+}
+
+impl AppState {
+    /// Return a snapshot of the current runtime config.
+    fn config(&self) -> Arc<Config> {
+        self.config.lock().expect("config lock poisoned").clone()
+    }
+
+    /// Hot-swap the runtime config (called after saving to disk).
+    fn replace_config(&self, new: Config) {
+        *self.config.lock().expect("config lock poisoned") = Arc::new(new);
+    }
 }
 
 #[derive(Clone)]
@@ -1625,16 +1637,18 @@ async fn api_shutdown(headers: HeaderMap, State(state): State<Arc<AppState>>) ->
 
 async fn api_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let sessions = state.sessions.lock().await;
+    let config = state.config();
     Json(json!({
         "status": "ok",
         "version": VERSION,
-        "model": state.config.model,
+        "model": config.model,
         "sessions": sessions.len(),
     }))
 }
 
 async fn api_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let sessions = state.sessions.lock().await;
+    let config = state.config();
     let list: Vec<serde_json::Value> = sessions
         .get(MAIN_SESSION_ID)
         .map(|s| {
@@ -1643,7 +1657,7 @@ async fn api_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 "name": s.name,
                 "messages": s.messages.len(),
                 "tool_calls": s.tool_calls_count,
-                "model": s.effective_model(&state.config.model),
+                "model": s.effective_model(&config.model),
                 "created_at": s.created_at,
                 "updated_at": s.updated_at,
             })
@@ -1686,7 +1700,8 @@ async fn api_upload_images(
         ));
     }
 
-    let s3_cfg = state.config.s3.as_ref().ok_or_else(|| {
+    let config = state.config();
+    let s3_cfg = config.s3.as_ref().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "S3 not configured"})),
@@ -1833,6 +1848,7 @@ async fn api_get_config(
 /// PUT /api/config — validate and save the JSON config file.
 async fn api_put_config(
     headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_local_request_headers(&headers)?;
@@ -1909,6 +1925,19 @@ async fn api_put_config(
             Json(json!({"error": format!("Failed to finalize config: {e}")})),
         )
     })?;
+
+    // Hot-reload: re-read the saved config into the runtime so that
+    // model/MCP changes take effect without a restart.
+    let new_config = Config::load();
+    state.replace_config(new_config);
+
+    // Release the config file lock before potentially slow MCP I/O.
+    drop(_save_guard);
+
+    // Invalidate cached MCP tool definitions so the next round picks up
+    // any server additions/removals.
+    let workspace = session_workspace_path(MAIN_SESSION_ID);
+    let _ = tools::mcp::refresh_servers(&state.config(), &workspace).await;
 
     Ok(Json(json!({"ok": true})))
 }
@@ -2016,10 +2045,11 @@ async fn api_test_mcp(
         timeout_secs,
     };
 
-    let timeout = Duration::from_secs(timeout_secs.unwrap_or(state.config.tool_timeout.as_secs()));
+    let config = state.config();
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(config.tool_timeout.as_secs()));
     match tokio::time::timeout(
         timeout,
-        tools::mcp::test_mcp_server(&mcp_cfg, &workspace, state.config.tool_timeout),
+        tools::mcp::test_mcp_server(&mcp_cfg, &workspace, config.tool_timeout),
     )
     .await
     {
@@ -2306,7 +2336,7 @@ async fn main() {
     }
 
     let state = Arc::new(AppState {
-        config,
+        config: std::sync::Mutex::new(Arc::new(config)),
         http,
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -2326,13 +2356,9 @@ async fn main() {
     {
         let main_session = load_session_from_disk(MAIN_SESSION_ID).unwrap_or_else(|| {
             let mut s = Session::new_with_id(MAIN_SESSION_ID, "Main");
-            let model = s.effective_model(&state.config.model).to_string();
-            let sys = build_system_prompt(
-                &state.config,
-                &s.workspace,
-                &model,
-                &s.disabled_system_skills,
-            );
+            let config = state.config();
+            let model = s.effective_model(&config.model).to_string();
+            let sys = build_system_prompt(&config, &s.workspace, &model, &s.disabled_system_skills);
             s.messages.push(sys);
             s
         });

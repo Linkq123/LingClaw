@@ -37,7 +37,7 @@ fn test_config() -> Config {
 
 fn test_app_state() -> AppState {
     AppState {
-        config: test_config(),
+        config: std::sync::Mutex::new(Arc::new(test_config())),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -56,7 +56,7 @@ fn test_app_state() -> AppState {
 
 fn test_app_state_with_config(config: Config) -> AppState {
     AppState {
-        config,
+        config: std::sync::Mutex::new(Arc::new(config)),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -399,7 +399,8 @@ fn update_llm_response_usage_uses_configured_provider_name() {
             output_tokens: Some(12),
         };
 
-        let provider_name = state.config.resolve_provider_name(&state.config.model);
+        let config = state.config();
+        let provider_name = config.resolve_provider_name(&config.model);
         update_llm_response_usage(&ctx, Provider::OpenAI, &provider_name, 321, &resp).await;
     });
 

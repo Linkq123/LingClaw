@@ -163,7 +163,7 @@ fn memory_model_falls_back_when_unset() {
 
 fn test_app_state() -> AppState {
     AppState {
-        config: test_config(),
+        config: std::sync::Mutex::new(Arc::new(test_config())),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -182,7 +182,7 @@ fn test_app_state() -> AppState {
 
 fn test_app_state_with_config(config: Config) -> AppState {
     AppState {
-        config,
+        config: std::sync::Mutex::new(Arc::new(config)),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -2696,8 +2696,10 @@ async fn api_put_config_rejects_invalid_provider_names() {
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
 
+    let state = Arc::new(test_app_state());
     let result = api_put_config(
         headers,
+        State(state),
         Json(json!({
             "config": {
                 "models": {
@@ -2729,8 +2731,10 @@ async fn api_put_config_rejects_unknown_agent_provider_alias() {
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
 
+    let state = Arc::new(test_app_state());
     let result = api_put_config(
         headers,
+        State(state),
         Json(json!({
             "config": {
                 "models": {
@@ -2773,8 +2777,10 @@ async fn api_put_config_rejects_unknown_agent_provider_prefix_without_models_con
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
 
+    let state = Arc::new(test_app_state());
     let result = api_put_config(
         headers,
+        State(state),
         Json(json!({
             "config": {
                 "agents": {
@@ -2804,8 +2810,10 @@ async fn api_put_config_rejects_unknown_agent_model_id_for_configured_provider()
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
 
+    let state = Arc::new(test_app_state());
     let result = api_put_config(
         headers,
+        State(state),
         Json(json!({
             "config": {
                 "models": {
@@ -2848,8 +2856,10 @@ async fn api_put_config_rejects_empty_mcp_command() {
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
 
+    let state = Arc::new(test_app_state());
     let result = api_put_config(
         headers,
+        State(state),
         Json(json!({
             "config": {
                 "mcpServers": {
@@ -2877,8 +2887,10 @@ async fn api_put_config_rejects_invalid_provider_api_kind() {
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
 
+    let state = Arc::new(test_app_state());
     let result = api_put_config(
         headers,
+        State(state),
         Json(json!({
             "config": {
                 "models": {
@@ -2910,8 +2922,10 @@ async fn api_put_config_rejects_zero_mcp_timeout() {
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
 
+    let state = Arc::new(test_app_state());
     let result = api_put_config(
         headers,
+        State(state),
         Json(json!({
             "config": {
                 "mcpServers": {
@@ -2940,8 +2954,10 @@ async fn api_put_config_rejects_mcp_cwd_outside_workspace() {
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
 
+    let state = Arc::new(test_app_state());
     let result = api_put_config(
         headers,
+        State(state),
         Json(json!({
             "config": {
                 "mcpServers": {
@@ -2969,8 +2985,10 @@ async fn api_put_config_rejects_empty_provider_model_id() {
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
 
+    let state = Arc::new(test_app_state());
     let result = api_put_config(
         headers,
+        State(state),
         Json(json!({
             "config": {
                 "models": {
@@ -3207,7 +3225,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
     let tool_entry = msgs.iter().find(|m| m["role"] == "tool_result").unwrap();
     let result_str = tool_entry["result"].as_str().unwrap();
 
-    // Must be exact raw content — no "[Observation:" prefix
+    // Must be exact raw content —no "[Observation:" prefix
     assert_eq!(result_str, big_result.as_str());
     assert!(!result_str.starts_with("[Observation:"));
 }
@@ -3260,7 +3278,7 @@ fn system_prompt_with_observation_hint_preserves_original_content() {
         tool_name: "exec".into(),
         byte_size: 8000,
         line_count: 200,
-        hint: "exec returned 200 lines / 8000 bytes — focus on key findings".into(),
+        hint: "exec returned 200 lines / 8000 bytes —focus on key findings".into(),
     }];
     if let Some(hint) = agent::build_observation_context_hint(&summaries, 0)
         && let Some(ref mut content) = msg.content
@@ -3285,7 +3303,7 @@ fn finish_reason_label_appears_in_done_event_shape() {
 #[test]
 fn auto_think_adapts_in_agent_loop_context() {
     // Simulate the pattern used in the Analyze arm:
-    // auto mode + reasoning model — phase-adapted level
+    // auto mode + reasoning model —phase-adapted level
     let think_level = "auto";
     let model_supports_reasoning = true;
 
@@ -3313,7 +3331,7 @@ fn auto_think_adapts_in_agent_loop_context() {
     };
     assert_eq!(effective, "low");
 
-    // Explicit level — no adaptation
+    // Explicit level —no adaptation
     let think_level = "high";
     let effective = if think_level == "auto" && model_supports_reasoning {
         agent::auto_think_level(5, true, 0, 0).to_owned()
@@ -4403,7 +4421,7 @@ fn replay_ignores_orphaned_tool_result_after_task_completed() {
         1,
         json!({"type":"task_completed","task_id":"t-1","agent":"coder","cycles":1,"tool_calls":0,"duration_ms":100}),
     ));
-    // Late tool_result arrives after terminal event — should be silently dropped.
+    // Late tool_result arrives after terminal event —should be silently dropped.
     rt.block_on(dispatch_live_event(
         &state,
         &session_id,
@@ -4598,7 +4616,7 @@ fn delegated_events_cap_prevents_unbounded_growth() {
     }
 
     // Terminal events for tasks whose started event was NOT stored (past cap)
-    // should be dropped — no panel exists on the frontend to close.
+    // should be dropped —no panel exists on the frontend to close.
     for i in (DELEGATED_EVENTS_CAP)..(DELEGATED_EVENTS_CAP + 3) {
         rt.block_on(dispatch_live_event(
             &state,
@@ -4935,7 +4953,7 @@ fn replay_preserves_completed_standalone_task_until_round_ends() {
         1,
         json!({"type":"task_tool","task_id":"t-1","agent":"coder","tool":"read_file","id":"tl-1"}),
     ));
-    // Task completes — should still be replayable until round "done"
+    // Task completes —should still be replayable until round "done"
     rt.block_on(dispatch_live_event(
         &state,
         &session_id,
@@ -5044,7 +5062,7 @@ fn replay_preserves_completed_orchestration_until_round_ends() {
             "cycles":2,"tool_calls":3,"duration_ms":400,
         }),
     ));
-    // Orchestration completes — should still be replayable until round "done"
+    // Orchestration completes —should still be replayable until round "done"
     rt.block_on(dispatch_live_event(
         &state,
         &session_id,
@@ -5447,7 +5465,7 @@ fn session_version_is_preserved_in_serialization() {
 fn tool_outcome_error_detection_by_convention() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // Unknown tool — is_error
+    // Unknown tool —is_error
     let outcome = rt.block_on(tools::execute_tool(
         "nonexistent",
         "{}",
@@ -5571,7 +5589,7 @@ fn prune_messages_tracks_removal_count() {
         },
     ];
     let before = messages.len();
-    prune_messages(&mut messages, 1000); // very small limit — must prune
+    prune_messages(&mut messages, 1000); // very small limit —must prune
     let pruned = before - messages.len();
     assert!(pruned > 0, "should have removed at least one turn");
     // System + latest user should remain
@@ -5680,7 +5698,7 @@ fn truncate_safe_preserves_char_boundary() {
     truncate_safe(&mut s, 5);
     assert_eq!(s, "\u{1F980}");
 
-    // Already within limit — unchanged.
+    // Already within limit —unchanged.
     let mut s = "hello".to_string();
     truncate_safe(&mut s, 100);
     assert_eq!(s, "hello");
@@ -6392,7 +6410,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
             tool_call_id: None,
             timestamp: None,
         },
-        // Only 1 of 2 tool results present — incomplete
+        // Only 1 of 2 tool results present —incomplete
         ChatMessage {
             role: "tool".into(),
             content: Some("result1".into()),

@@ -124,32 +124,33 @@ async fn status_effective_think_level(
 }
 
 async fn build_runtime_status(session: &Session, state: &AppState) -> String {
-    let model = session.effective_model(&state.config.model).to_string();
-    let resolved = state.config.resolve_model(&model);
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
+    let resolved = config.resolve_model(&model);
     let effective_think = status_effective_think_level(session, state, &resolved).await;
     let mut extra_tools = Vec::new();
     let mut cached_mcp_tools = match resolved.provider {
         crate::Provider::Anthropic => {
-            tools::mcp::cached_tool_definitions_anthropic(&state.config, &session.workspace)
+            tools::mcp::cached_tool_definitions_anthropic(&config, &session.workspace)
         }
         crate::Provider::OpenAI => {
-            tools::mcp::cached_tool_definitions_openai(&state.config, &session.workspace)
+            tools::mcp::cached_tool_definitions_openai(&config, &session.workspace)
         }
         crate::Provider::Ollama => {
-            tools::mcp::cached_tool_definitions_ollama(&state.config, &session.workspace)
+            tools::mcp::cached_tool_definitions_ollama(&config, &session.workspace)
         }
     };
     extra_tools.append(&mut cached_mcp_tools);
     let (cached_mcp_servers, enabled_mcp_servers) =
-        tools::mcp::cached_server_counts(&state.config, &session.workspace);
+        tools::mcp::cached_server_counts(&config, &session.workspace);
     let request_budget =
-        crate::context::context_input_budget_for_runtime(&state.config, &model, &effective_think);
+        crate::context::context_input_budget_for_runtime(&config, &model, &effective_think);
     let tool_estimate =
         crate::context::estimate_tool_schema_tokens_for_provider(resolved.provider, &extra_tools);
 
     let mut request_messages = session.messages.clone();
     let fresh_system = build_system_prompt(
-        &state.config,
+        &config,
         &session.workspace,
         &model,
         &session.disabled_system_skills,
@@ -184,7 +185,7 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
 
     format!(
         "{}\nrequest_est: {}/{} (tools {} think {})\nrequest_status: {}{}\nrequest_note: {}",
-        build_session_status(session, &state.config),
+        build_session_status(session, &config),
         crate::format_token_count(request_estimate as u64),
         crate::format_token_count(request_budget as u64),
         crate::format_token_count(tool_estimate as u64),
@@ -230,6 +231,7 @@ async fn reset_session_context_and_persist(
     state: &AppState,
     current_session_id: &str,
 ) -> Result<(), String> {
+    let config = state.config();
     persist_session_update(
         state,
         current_session_id,
@@ -241,9 +243,9 @@ async fn reset_session_context_and_persist(
             )
         },
         |session| {
-            let model = session.effective_model(&state.config.model).to_string();
+            let model = session.effective_model(&config.model).to_string();
             let sys = build_system_prompt(
-                &state.config,
+                &config,
                 &session.workspace,
                 &model,
                 &session.disabled_system_skills,
@@ -266,6 +268,7 @@ async fn handle_new_command(
     tx: &WsTx,
     cancel: &CancellationToken,
 ) -> Option<CommandResult> {
+    let config = state.config();
     let (conversation_text, workspace, model_str) = {
         let sessions = state.sessions.lock().await;
         let session = match sessions.get(current_session_id) {
@@ -293,7 +296,7 @@ async fn handle_new_command(
         (
             lines.join("\n"),
             session.workspace.clone(),
-            session.effective_model(&state.config.model).to_string(),
+            session.effective_model(&config.model).to_string(),
         )
     };
 
@@ -349,7 +352,7 @@ async fn handle_new_command(
             timestamp: Some(now_epoch()),
         },
     ];
-    let resolved = state.config.resolve_model(&model_str);
+    let resolved = config.resolve_model(&model_str);
     let summary = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
@@ -359,7 +362,7 @@ async fn handle_new_command(
                 false,
             ));
         }
-        result = providers::call_llm_simple(&state.http, &resolved, &compress_prompt, &workspace, state.config.s3.as_ref(), state.config.max_llm_retries) => {
+        result = providers::call_llm_simple(&state.http, &resolved, &compress_prompt, &workspace, config.s3.as_ref(), config.max_llm_retries) => {
             match result {
                 Ok(s) => s,
                 Err(e) => {
@@ -441,18 +444,16 @@ async fn handle_model_command(
     current_session_id: &str,
     state: &AppState,
 ) -> CommandResult {
+    let config = state.config();
     if arg.is_empty() {
         let sessions = state.sessions.lock().await;
         let model = sessions
             .get(current_session_id)
-            .map(|s| s.effective_model(&state.config.model))
-            .unwrap_or(&state.config.model)
+            .map(|s| s.effective_model(&config.model))
+            .unwrap_or(&config.model)
             .to_string();
-        let current = state
-            .config
-            .canonical_model_ref(&model)
-            .unwrap_or(model.clone());
-        let available = state.config.available_models();
+        let current = config.canonical_model_ref(&model).unwrap_or(model.clone());
+        let available = config.available_models();
         let list = available
             .iter()
             .map(|m| {
@@ -471,7 +472,7 @@ async fn handle_model_command(
         );
     }
 
-    let canonical = match state.config.canonical_model_ref(arg) {
+    let canonical = match config.canonical_model_ref(arg) {
         Ok(value) => value,
         Err(err) => return command_result(err, "error", false),
     };
@@ -513,6 +514,7 @@ async fn handle_status_command(current_session_id: &str, state: &AppState) -> Co
 }
 
 async fn handle_system_prompt_command(current_session_id: &str, state: &AppState) -> CommandResult {
+    let config = state.config();
     let session = {
         let sessions = state.sessions.lock().await;
         sessions.get(current_session_id).cloned()
@@ -520,8 +522,8 @@ async fn handle_system_prompt_command(current_session_id: &str, state: &AppState
 
     match session {
         Some(session) => {
-            let model = session.effective_model(&state.config.model).to_string();
-            let resolved = state.config.resolve_model(&model);
+            let model = session.effective_model(&config.model).to_string();
+            let resolved = config.resolve_model(&model);
             let latest_query = session
                 .messages
                 .iter()
@@ -529,7 +531,7 @@ async fn handle_system_prompt_command(current_session_id: &str, state: &AppState
                 .find(|message| message.role == "user")
                 .and_then(|message| message.content.as_deref());
             let system_prompt = build_system_prompt_with_query(
-                &state.config,
+                &config,
                 &session.workspace,
                 &model,
                 &session.disabled_system_skills,
@@ -921,6 +923,7 @@ async fn handle_mcp_command_with_arg(
     current_session_id: &str,
     state: &AppState,
 ) -> CommandResult {
+    let config = state.config();
     let workspace = {
         let sessions = state.sessions.lock().await;
         match sessions.get(current_session_id) {
@@ -929,8 +932,7 @@ async fn handle_mcp_command_with_arg(
         }
     };
 
-    let enabled_servers = state
-        .config
+    let enabled_servers = config
         .mcp_servers
         .values()
         .filter(|server| server.enabled)
@@ -941,10 +943,10 @@ async fn handle_mcp_command_with_arg(
 
     match arg {
         "" => {
-            let reports = tools::mcp::inspect_servers(&state.config, &workspace).await;
+            let reports = tools::mcp::inspect_servers(&config, &workspace).await;
             command_result(format_mcp_reports(&reports), "system", false)
         }
-        "refresh" => match tools::mcp::refresh_servers(&state.config, &workspace).await {
+        "refresh" => match tools::mcp::refresh_servers(&config, &workspace).await {
             Ok(reports) => command_result(
                 format!("Refreshed MCP cache.\n\n{}", format_mcp_reports(&reports)),
                 "system",
@@ -1231,7 +1233,8 @@ async fn handle_memory_command(
     current_session_id: &str,
     state: &AppState,
 ) -> CommandResult {
-    if !state.config.structured_memory {
+    let config = state.config();
+    if !config.structured_memory {
         return command_result(
             "Structured memory is disabled. Enable with `\"structuredMemory\": true` in settings or `LINGCLAW_STRUCTURED_MEMORY=true`.",
             "system",
@@ -1269,6 +1272,7 @@ async fn handle_reflection_command(
     current_session_id: &str,
     state: &AppState,
 ) -> CommandResult {
+    let config = state.config();
     let workspace = {
         let sessions = state.sessions.lock().await;
         match sessions.get(current_session_id) {
@@ -1280,7 +1284,7 @@ async fn handle_reflection_command(
     let local = prompts::current_local_snapshot();
     let today = local.today();
     let yesterday = local.yesterday();
-    let enabled = state.config.daily_reflection;
+    let enabled = config.daily_reflection;
 
     let response = match arg {
         "" => {
@@ -1295,8 +1299,7 @@ async fn handle_reflection_command(
             )];
             if enabled {
                 let runtime = crate::runtime_loop::reflection_runtime_status();
-                let model = state
-                    .config
+                let model = config
                     .reflection_model
                     .as_deref()
                     .unwrap_or("(inherits memory_model or primary)");
@@ -1447,7 +1450,7 @@ async fn list_daily_memory_files(memory_dir: &Path) -> String {
 }
 
 async fn handle_agents_command(current_session_id: &str, state: &AppState) -> CommandResult {
-    let config = &state.config;
+    let config = state.config();
     let workspace = {
         let sessions = state.sessions.lock().await;
         match sessions.get(current_session_id) {
@@ -1457,7 +1460,7 @@ async fn handle_agents_command(current_session_id: &str, state: &AppState) -> Co
     };
 
     // Ensure MCP tool cache is warm so the tool listing includes MCP tools.
-    crate::tools::mcp::ensure_tools_cached(config, &workspace).await;
+    crate::tools::mcp::ensure_tools_cached(&config, &workspace).await;
 
     let agents = crate::subagents::discovery::discover_all_agents(&workspace);
     if agents.is_empty() {
@@ -1475,7 +1478,7 @@ async fn handle_agents_command(current_session_id: &str, state: &AppState) -> Co
     let mut lines = Vec::with_capacity(agents.len() + 2);
     lines.push(format!("**{} sub-agent(s) available:**\n", agents.len()));
     for agent in &agents {
-        let tools = crate::subagents::filter_tools_for_agent_with_mcp(agent, config, &workspace);
+        let tools = crate::subagents::filter_tools_for_agent_with_mcp(agent, &config, &workspace);
         let tool_list = if tools.is_empty() {
             "(no tools)".to_string()
         } else {

@@ -522,6 +522,9 @@ function renderProviderForm(name, provider) {
 }
 
 function renderModelEntryForm(provName, idx, model) {
+  const inputArr = Array.isArray(model.input) ? model.input : ['text'];
+  const hasText = inputArr.includes('text');
+  const hasImage = inputArr.includes('image');
   return `
     <div class="model-entry-form" data-model-idx="${idx}" style="border:1px solid var(--border);border-radius:6px;padding:8px;margin-bottom:6px;background:var(--bg)">
       <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
@@ -531,13 +534,22 @@ function renderModelEntryForm(provName, idx, model) {
         </label>
         <button class="btn-danger-sm" data-delete-model="${escHtml(provName)}" data-model-idx="${idx}" title="Remove model">✕</button>
       </div>
-      <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap">
+      <div style="display:flex;gap:8px;margin-top:6px;flex-wrap:wrap;align-items:center">
         <label style="font-size:11px;color:var(--dim);display:flex;align-items:center;gap:4px">
           Context Window <input type="number" data-model-field="contextWindow" data-prov="${escHtml(provName)}" data-idx="${idx}" value="${model.contextWindow ?? ''}" placeholder="128000" style="width:90px">
         </label>
         <label style="font-size:11px;color:var(--dim);display:flex;align-items:center;gap:4px">
           Max Tokens <input type="number" data-model-field="maxTokens" data-prov="${escHtml(provName)}" data-idx="${idx}" value="${model.maxTokens ?? ''}" placeholder="16384" style="width:90px">
         </label>
+        <span style="font-size:11px;color:var(--dim);display:flex;align-items:center;gap:6px;margin-left:4px">
+          Input:
+          <label style="display:flex;align-items:center;gap:2px">
+            <input type="checkbox" data-model-field="input-text" data-prov="${escHtml(provName)}" data-idx="${idx}" ${hasText ? 'checked' : ''}> Text
+          </label>
+          <label style="display:flex;align-items:center;gap:2px">
+            <input type="checkbox" data-model-field="input-image" data-prov="${escHtml(provName)}" data-idx="${idx}" ${hasImage ? 'checked' : ''}> Image
+          </label>
+        </span>
       </div>
     </div>`;
 }
@@ -595,11 +607,14 @@ function collectModelsFromForms(options = {}) {
       const reasoningEl = mForm.querySelector('[data-model-field="reasoning"]');
       const cwEl = mForm.querySelector('[data-model-field="contextWindow"]');
       const mtEl = mForm.querySelector('[data-model-field="maxTokens"]');
+      const inputTextEl = mForm.querySelector('[data-model-field="input-text"]');
+      const inputImageEl = mForm.querySelector('[data-model-field="input-image"]');
       if (!id) {
         const hasEditableInput = Boolean(
           (reasoningEl && reasoningEl.checked)
           || (cwEl && cwEl.value !== '')
           || (mtEl && mtEl.value !== '')
+          || (inputImageEl && inputImageEl.checked)
         );
         if (hasEditableInput || (!preserveBlankExistingEntries && existingModel)) {
           throw new Error('Model id cannot be empty.');
@@ -623,6 +638,11 @@ function collectModelsFromForms(options = {}) {
         : undefined;
       if (parsedMaxTokens === undefined) delete entry.maxTokens;
       else entry.maxTokens = parsedMaxTokens;
+      const inputArr = [];
+      if (inputTextEl && inputTextEl.checked) inputArr.push('text');
+      if (inputImageEl && inputImageEl.checked) inputArr.push('image');
+      if (inputArr.length > 0) entry.input = inputArr;
+      else delete entry.input;
       models.push(entry);
     });
     prov.models = models;

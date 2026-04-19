@@ -11,15 +11,16 @@ fn default_view_state_payload() -> serde_json::Value {
 }
 
 pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, session_id: &str) {
+    let config = state.config();
     let (name, history, view_state, supports_image, usage) = {
         let sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get(session_id) {
-            let model = session.effective_model(&state.config.model);
-            let supports_image = state.config.model_supports_image(model);
+            let model = session.effective_model(&config.model);
+            let supports_image = config.model_supports_image(model);
             let usage = build_session_usage_payload(session);
             (
                 session.name.clone(),
-                build_history_payload_with_s3(session, state.config.s3.as_ref()),
+                build_history_payload_with_s3(session, config.s3.as_ref()),
                 build_view_state_payload(session),
                 supports_image,
                 usage,
@@ -35,7 +36,7 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
         }
     };
 
-    let s3_available = state.config.s3.is_some();
+    let s3_available = config.s3.is_some();
     ws_send(
         tx,
         &json!({"type":"session","id":session_id,"name":name,"capabilities":{"image":supports_image,"s3":s3_available},"usage":usage}),
@@ -53,8 +54,9 @@ pub(crate) fn build_session_info_payload(
     effective_model: &str,
     usage: serde_json::Value,
 ) -> serde_json::Value {
-    let supports_image = state.config.model_supports_image(effective_model);
-    let s3_available = state.config.s3.is_some();
+    let config = state.config();
+    let supports_image = config.model_supports_image(effective_model);
+    let s3_available = config.s3.is_some();
     json!({"type":"session","id":session_id,"name":name,"capabilities":{"image":supports_image,"s3":s3_available},"usage":usage})
 }
 
@@ -75,15 +77,13 @@ pub(crate) async fn send_command_refresh(
     session_id: &str,
     include_history: bool,
 ) {
+    let config = state.config();
     let refresh_view_state = {
         let sessions = state.sessions.lock().await;
         sessions.get(session_id).map(|session| {
             let view_state = build_view_state_payload(session);
             let history = if include_history {
-                Some(build_history_payload_with_s3(
-                    session,
-                    state.config.s3.as_ref(),
-                ))
+                Some(build_history_payload_with_s3(session, config.s3.as_ref()))
             } else {
                 None
             };

@@ -1,7 +1,7 @@
 use super::*;
 use std::{
     collections::{HashMap, HashSet},
-    sync::atomic::AtomicU64,
+    sync::{Arc, atomic::AtomicU64},
     time::Duration,
 };
 use tokio::sync::Mutex;
@@ -101,7 +101,7 @@ async fn status_command_reports_runtime_request_estimate() {
     );
 
     let state = AppState {
-        config: crate::Config {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "env-key".to_string(),
             api_base: "https://fallback.example/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -128,7 +128,7 @@ async fn status_command_reports_runtime_request_estimate() {
 
             daily_reflection: false,
             s3: None,
-        },
+        })),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -170,9 +170,10 @@ async fn status_command_reports_runtime_request_estimate() {
         version: 4,
         workspace: workspace.clone(),
     };
-    let model = session.effective_model(&state.config.model).to_string();
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
     session.messages.push(build_system_prompt(
-        &state.config,
+        &config,
         &workspace,
         &model,
         &session.disabled_system_skills,
@@ -234,7 +235,7 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
     );
 
     let state = AppState {
-        config: crate::Config {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "openai/gpt-4o-reasoner".to_string(),
@@ -261,7 +262,7 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
 
             daily_reflection: false,
             s3: None,
-        },
+        })),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -303,9 +304,10 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
         version: 4,
         workspace: workspace.clone(),
     };
-    let model = session.effective_model(&state.config.model).to_string();
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
     session.messages.push(build_system_prompt(
-        &state.config,
+        &config,
         &workspace,
         &model,
         &session.disabled_system_skills,
@@ -343,7 +345,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
     prompts::init_session_prompt_files(&workspace);
 
     let state = AppState {
-        config: crate::Config {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -370,7 +372,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
 
             daily_reflection: false,
             s3: None,
-        },
+        })),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -412,9 +414,10 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
         version: 4,
         workspace: workspace.clone(),
     };
-    let model = session.effective_model(&state.config.model).to_string();
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
     session.messages.push(build_system_prompt(
-        &state.config,
+        &config,
         &workspace,
         &model,
         &session.disabled_system_skills,
@@ -459,7 +462,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
 #[tokio::test]
 async fn switch_command_is_blocked_in_single_session_mode() {
     let state = AppState {
-        config: crate::Config {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -486,7 +489,7 @@ async fn switch_command_is_blocked_in_single_session_mode() {
 
             daily_reflection: false,
             s3: None,
-        },
+        })),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -531,7 +534,7 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
     prompts::init_session_prompt_files(&workspace);
 
     let state = AppState {
-        config: crate::Config {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -558,7 +561,7 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
 
             daily_reflection: false,
             s3: None,
-        },
+        })),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -600,9 +603,10 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
         version: 4,
         workspace: workspace.clone(),
     };
-    let model = session.effective_model(&state.config.model).to_string();
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
     session.messages.push(build_system_prompt(
-        &state.config,
+        &config,
         &workspace,
         &model,
         &session.disabled_system_skills,
@@ -642,7 +646,7 @@ async fn memory_command_rejects_unknown_subcommand() {
     prompts::init_session_prompt_files(&workspace);
 
     let state = AppState {
-        config: crate::Config {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -669,7 +673,7 @@ async fn memory_command_rejects_unknown_subcommand() {
 
             daily_reflection: false,
             s3: None,
-        },
+        })),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -711,9 +715,10 @@ async fn memory_command_rejects_unknown_subcommand() {
         version: 4,
         workspace: workspace.clone(),
     };
-    let model = session.effective_model(&state.config.model).to_string();
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
     session.messages.push(build_system_prompt(
-        &state.config,
+        &config,
         &workspace,
         &model,
         &session.disabled_system_skills,
@@ -773,7 +778,7 @@ async fn reflection_command_disabled_shows_hint() {
     );
 
     let state = AppState {
-        config: crate::Config {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -798,7 +803,7 @@ async fn reflection_command_disabled_shows_hint() {
             structured_memory: false,
             daily_reflection: false,
             s3: None,
-        },
+        })),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -840,10 +845,11 @@ async fn reflection_command_disabled_shows_hint() {
         version: 4,
         workspace: workspace.clone(),
     };
+    let config = state.config();
     session.messages.push(build_system_prompt(
-        &state.config,
+        &config,
         &workspace,
-        &state.config.model,
+        &config.model,
         &session.disabled_system_skills,
     ));
     state
@@ -911,7 +917,7 @@ async fn reflection_command_disabled_allows_read_today() {
     );
 
     let state = AppState {
-        config: crate::Config {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -936,7 +942,7 @@ async fn reflection_command_disabled_allows_read_today() {
             structured_memory: false,
             daily_reflection: false,
             s3: None,
-        },
+        })),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -978,10 +984,11 @@ async fn reflection_command_disabled_allows_read_today() {
         version: 4,
         workspace: workspace.clone(),
     };
+    let config = state.config();
     session.messages.push(build_system_prompt(
-        &state.config,
+        &config,
         &workspace,
-        &state.config.model,
+        &config.model,
         &session.disabled_system_skills,
     ));
     state
@@ -1038,7 +1045,7 @@ async fn reflection_command_enabled_shows_status() {
     );
 
     let state = AppState {
-        config: crate::Config {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -1063,7 +1070,7 @@ async fn reflection_command_enabled_shows_status() {
             structured_memory: false,
             daily_reflection: true,
             s3: None,
-        },
+        })),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -1105,10 +1112,11 @@ async fn reflection_command_enabled_shows_status() {
         version: 4,
         workspace: workspace.clone(),
     };
+    let config = state.config();
     session.messages.push(build_system_prompt(
-        &state.config,
+        &config,
         &workspace,
-        &state.config.model,
+        &config.model,
         &session.disabled_system_skills,
     ));
     state
@@ -1177,7 +1185,7 @@ async fn reflection_command_today_shows_content() {
     );
 
     let state = AppState {
-        config: crate::Config {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -1202,7 +1210,7 @@ async fn reflection_command_today_shows_content() {
             structured_memory: false,
             daily_reflection: true,
             s3: None,
-        },
+        })),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -1244,10 +1252,11 @@ async fn reflection_command_today_shows_content() {
         version: 4,
         workspace: workspace.clone(),
     };
+    let config = state.config();
     session.messages.push(build_system_prompt(
-        &state.config,
+        &config,
         &workspace,
-        &state.config.model,
+        &config.model,
         &session.disabled_system_skills,
     ));
     state
@@ -1323,7 +1332,7 @@ async fn reflection_command_today_filters_out_new_summaries() {
     );
 
     let state = AppState {
-        config: crate::Config {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -1348,7 +1357,7 @@ async fn reflection_command_today_filters_out_new_summaries() {
             structured_memory: false,
             daily_reflection: true,
             s3: None,
-        },
+        })),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -1390,10 +1399,11 @@ async fn reflection_command_today_filters_out_new_summaries() {
         version: 4,
         workspace: workspace.clone(),
     };
+    let config = state.config();
     session.messages.push(build_system_prompt(
-        &state.config,
+        &config,
         &workspace,
-        &state.config.model,
+        &config.model,
         &session.disabled_system_skills,
     ));
     state
@@ -1472,7 +1482,7 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
     );
 
     let state = AppState {
-        config: crate::Config {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -1497,7 +1507,7 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
             structured_memory: false,
             daily_reflection: true,
             s3: None,
-        },
+        })),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -1539,10 +1549,11 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
         version: 4,
         workspace: workspace.clone(),
     };
+    let config = state.config();
     session.messages.push(build_system_prompt(
-        &state.config,
+        &config,
         &workspace,
-        &state.config.model,
+        &config.model,
         &session.disabled_system_skills,
     ));
     state
@@ -1624,7 +1635,7 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
     );
 
     let state = AppState {
-        config: crate::Config {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -1649,7 +1660,7 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
             structured_memory: false,
             daily_reflection: true,
             s3: None,
-        },
+        })),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -1691,10 +1702,11 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
         version: 4,
         workspace: workspace.clone(),
     };
+    let config = state.config();
     session.messages.push(build_system_prompt(
-        &state.config,
+        &config,
         &workspace,
-        &state.config.model,
+        &config.model,
         &session.disabled_system_skills,
     ));
     state
@@ -1753,7 +1765,7 @@ async fn reflection_command_invalid_arg_shows_usage() {
     );
 
     let state = AppState {
-        config: crate::Config {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -1778,7 +1790,7 @@ async fn reflection_command_invalid_arg_shows_usage() {
             structured_memory: false,
             daily_reflection: true,
             s3: None,
-        },
+        })),
         http: reqwest::Client::new(),
         sessions: Mutex::new(HashMap::new()),
         active_connections: Mutex::new(HashMap::new()),
@@ -1820,10 +1832,11 @@ async fn reflection_command_invalid_arg_shows_usage() {
         version: 4,
         workspace: workspace.clone(),
     };
+    let config = state.config();
     session.messages.push(build_system_prompt(
-        &state.config,
+        &config,
         &workspace,
-        &state.config.model,
+        &config.model,
         &session.disabled_system_skills,
     ));
     state

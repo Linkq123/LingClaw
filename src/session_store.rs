@@ -149,9 +149,10 @@ pub(crate) fn load_session_from_disk(id: &str) -> Option<Session> {
 }
 
 pub(crate) fn refresh_session_system_prompt(state: &AppState, session: &mut Session) {
-    let model = session.effective_model(&state.config.model).to_string();
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
     let sys = super::build_system_prompt(
-        &state.config,
+        &config,
         &session.workspace,
         &model,
         &session.disabled_system_skills,
