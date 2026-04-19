@@ -4,6 +4,18 @@ import { scrollDown } from '../scroll.js';
 import { wrapInTimeline, animatePanelIn, animateCollapsibleSection } from './timeline.js';
 import { pinReactStatusToBottom } from './react-status.js';
 
+function getToolTrail(panel) {
+  return panel.querySelector('[data-subagent-tool-trail]');
+}
+
+function getToolTrailMeta(panel) {
+  return panel.querySelector('[data-subagent-tools-meta]');
+}
+
+function getToolTrailEmpty(panel) {
+  return panel.querySelector('[data-subagent-tool-empty]');
+}
+
 function setChipText(panel, key, value, extraClass = '') {
   const chip = panel.querySelector(`[data-subagent-chip="${key}"]`);
   if (!chip) return;
@@ -16,12 +28,100 @@ function getToolRows(panel) {
   return Array.from(panel.querySelectorAll('.subagent-tool-row'));
 }
 
+function findToolRowById(panel, toolId) {
+  if (!panel || !toolId) return null;
+  for (const row of getToolRows(panel)) {
+    if (row.dataset.toolId === toolId) return row;
+  }
+  return null;
+}
+
+function getToolBadges(panel) {
+  const trail = getToolTrail(panel);
+  if (!trail) return [];
+  return Array.from(trail.querySelectorAll('.subagent-tool-pill'));
+}
+
+function findToolBadge(panel, toolId) {
+  if (!panel || !toolId) return null;
+  return getToolBadges(panel).find((badge) => badge.dataset.toolId === toolId) || null;
+}
+
 function setToolRowExpanded(row, expand) {
   const details = row?.querySelector('.subagent-tool-details');
   const chevron = row?.querySelector('.subagent-tool-summary .chevron');
   if (!details) return;
   animateCollapsibleSection(details, expand);
   if (chevron) chevron.classList.toggle('open', expand);
+}
+
+function updateToolBadgeState(badge, stateLabel, tone) {
+  if (!badge) return;
+  badge.classList.remove('is-running', 'is-done', 'is-failed');
+  if (tone) badge.classList.add(tone);
+  const status = badge.querySelector('.subagent-tool-pill-state');
+  if (status) status.textContent = stateLabel;
+}
+
+function ensureToolBadge(panel, toolId, toolName) {
+  const trail = getToolTrail(panel);
+  if (!trail) return null;
+
+  let badge = toolId ? findToolBadge(panel, toolId) : null;
+  if (badge) {
+    const nameEl = badge.querySelector('.subagent-tool-pill-name');
+    if (nameEl) nameEl.textContent = toolName;
+    return badge;
+  }
+
+  badge = document.createElement('button');
+  badge.type = 'button';
+  badge.className = 'subagent-tool-pill is-running';
+  badge.dataset.action = 'subagent-focus-tool';
+  badge.dataset.toolId = toolId || '';
+  badge.innerHTML = `
+    <span class="subagent-tool-pill-index">${trail.childElementCount + 1}</span>
+    <span class="subagent-tool-pill-name">${escHtml(toolName)}</span>
+    <span class="subagent-tool-pill-state">执行中</span>
+  `;
+  trail.appendChild(badge);
+  return badge;
+}
+
+function syncToolOverview(panel, fallbackTotal = null, counts = null) {
+  if (!panel) return;
+
+  const rows = counts ? null : getToolRows(panel);
+  const total = counts ? counts.total : rows.length;
+  const settled = counts ? counts.settled : rows.filter((row) => row.classList.contains('subagent-tool-done')).length;
+  const failed = counts ? counts.failed : rows.filter((row) => row.classList.contains('subagent-tool-failed')).length;
+  const running = counts ? counts.running : rows.filter((row) => row.classList.contains('subagent-tool-running')).length;
+  const succeeded = Math.max(0, settled - failed);
+
+  const meta = getToolTrailMeta(panel);
+  const empty = getToolTrailEmpty(panel);
+  const trail = getToolTrail(panel);
+
+  if (meta) {
+    if (total === 0) {
+      meta.textContent = fallbackTotal != null && fallbackTotal > 0
+        ? `历史记录保留了 ${fallbackTotal} 次调用统计`
+        : '尚未调用';
+    } else {
+      const parts = [`${total} 次调用`];
+      if (running) parts.push(`${running} 运行中`);
+      if (succeeded) parts.push(`${succeeded} 成功`);
+      if (failed) parts.push(`${failed} 失败`);
+      meta.textContent = parts.join(' · ');
+    }
+  }
+  if (empty) {
+    empty.hidden = total > 0;
+    empty.textContent = fallbackTotal != null && fallbackTotal > 0
+      ? '当前是历史回放视图，未保存具体工具名。'
+      : '暂无工具调用';
+  }
+  if (trail) trail.hidden = total === 0;
 }
 
 function findPriorityToolRow(panel) {
@@ -56,10 +156,19 @@ function summaryCopyText(panel) {
     .map((node) => node.textContent.trim())
     .filter(Boolean)
     .slice(-1)[0];
+  const toolsUsed = getToolBadges(panel)
+    .map((badge) => {
+      const index = badge.querySelector('.subagent-tool-pill-index')?.textContent?.trim();
+      const name = badge.querySelector('.subagent-tool-pill-name')?.textContent?.trim();
+      return [index, name].filter(Boolean).join('. ');
+    })
+    .filter(Boolean)
+    .join('\n');
 
   if (label) parts.push(label);
   if (status) parts.push(status);
   if (prompt) parts.push(`委托任务\n${prompt}`);
+  if (toolsUsed) parts.push(`工具轨迹\n${toolsUsed}`);
   if (metrics) parts.push(metrics);
   if (summaryBody) parts.push(summaryBody);
   if (!summaryBody && latestOutput) parts.push(latestOutput);
@@ -88,11 +197,17 @@ function syncPanelActions(panel) {
   }
 }
 
-function syncToolCount(panel) {
+function syncToolCount(panel, fallbackTotal = null) {
   const rows = getToolRows(panel);
   const total = rows.length;
-  const done = rows.filter((row) => row.classList.contains('subagent-tool-done')).length;
-  setChipText(panel, 'tools', total ? `${done}/${total} tools` : '0 tools');
+  const settled = rows.filter((row) => row.classList.contains('subagent-tool-done')).length;
+  const failed = rows.filter((row) => row.classList.contains('subagent-tool-failed')).length;
+  const running = rows.filter((row) => row.classList.contains('subagent-tool-running')).length;
+  const displayText = total
+    ? `${settled}/${total} tools`
+    : (fallbackTotal != null ? `${fallbackTotal} tools` : '0 tools');
+  setChipText(panel, 'tools', displayText);
+  syncToolOverview(panel, fallbackTotal, { total, settled, failed, running });
 }
 
 function renderSummary(panel, success, stats = {}) {
@@ -219,9 +334,31 @@ export function createSubagentPanel(agentName, prompt, taskId) {
     body.appendChild(promptCard);
   }
 
+  const toolOverview = document.createElement('div');
+  toolOverview.className = 'subagent-section-card subagent-tools-overview';
+  toolOverview.innerHTML = `
+    <div class="subagent-section-head">
+      <div class="subagent-section-title">工具轨迹</div>
+      <div class="subagent-section-meta" data-subagent-tools-meta>尚未调用</div>
+    </div>
+    <div class="subagent-tool-empty" data-subagent-tool-empty>暂无工具调用</div>
+    <div class="subagent-tool-trail" data-subagent-tool-trail hidden></div>
+  `;
+  body.appendChild(toolOverview);
+
+  const toolListSection = document.createElement('div');
+  toolListSection.className = 'subagent-section-card subagent-tool-list-section';
+  toolListSection.innerHTML = `
+    <div class="subagent-section-head">
+      <div class="subagent-section-title">工具明细</div>
+      <div class="subagent-section-meta">展开可查看参数与输出</div>
+    </div>
+  `;
+  body.appendChild(toolListSection);
+
   const toolList = document.createElement('div');
   toolList.className = 'subagent-tool-list';
-  body.appendChild(toolList);
+  toolListSection.appendChild(toolList);
 
   // Result / stats block — filled on terminal event.
   const summary = document.createElement('div');
@@ -243,6 +380,7 @@ export function createSubagentPanel(agentName, prompt, taskId) {
   scrollDown();
 
   state.activeSubagentPanels.set(panelKey({ task_id: taskId, agent: agentName }), panel);
+  syncToolOverview(panel);
   syncPanelActions(panel);
 }
 
@@ -280,13 +418,15 @@ export function addSubagentTool(ref, toolName, toolId, toolArgs = '') {
         <div class="subagent-tool-section-title">参数</div>
         <pre class="subagent-tool-code">${escHtml(formattedArgs || '无参数')}</pre>
       </div>
-      <div class="subagent-tool-section subagent-tool-output hidden">
+      <div class="subagent-tool-section subagent-tool-output" hidden>
         <div class="subagent-tool-section-title">输出</div>
         <pre class="subagent-tool-code subagent-tool-output-code"></pre>
       </div>
     </div>
   `;
   toolList.appendChild(row);
+  const badge = ensureToolBadge(panel, toolId, toolName);
+  updateToolBadgeState(badge, '执行中', 'is-running');
   syncToolCount(panel);
   syncPanelActions(panel);
   scrollDown();
@@ -356,8 +496,11 @@ export function updateSubagentToolResult(ref, toolId, durationMs, result, isErro
   const outputCode = row.querySelector('.subagent-tool-output-code');
   if (outputSection && outputCode && (hasResult || isError)) {
     outputCode.textContent = formattedResult || (isError ? '工具执行失败，未返回可展示的输出。' : '无输出');
-    outputSection.classList.remove('hidden');
+    outputSection.hidden = false;
   }
+
+  const badge = findToolBadge(panel, toolId);
+  updateToolBadgeState(badge, isError ? '失败' : '完成', isError ? 'is-failed' : 'is-done');
 
   syncToolCount(panel);
   syncPanelActions(panel);
@@ -401,9 +544,9 @@ export function finishSubagentPanel(ref, success, stats, { immediate = false } =
 
   setChipText(panel, 'state', success ? '已完成' : '失败', success ? 'is-success' : 'is-error');
   if (stats.cycles != null) setChipText(panel, 'cycle', `Cycle ${stats.cycles}`);
-  if (stats.tool_calls != null) setChipText(panel, 'tools', `${stats.tool_calls} tools`);
 
   renderSummary(panel, success, stats);
+  syncToolCount(panel, stats.tool_calls);
   syncPanelActions(panel);
 
   const collapsePanel = () => {
@@ -447,4 +590,13 @@ export function copySubagentSummary(button) {
   const panel = button.closest('.subagent-panel');
   if (!panel) return;
   void copyButtonText(button, summaryCopyText(panel), '复制摘要');
+}
+
+export function focusSubagentTool(button) {
+  const panel = button.closest('.subagent-panel');
+  if (!panel) return;
+
+  const row = findToolRowById(panel, button.dataset.toolId || '');
+  if (!row) return;
+  focusToolRow(row);
 }

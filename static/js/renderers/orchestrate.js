@@ -96,9 +96,13 @@ function syncProgressVisuals(entry) {
   const panel = entry.panel;
   const counts = summarizeTaskCounts(getTaskRows(panel));
   const total = Math.max(1, counts.total);
+  const completionPercent = counts.total > 0
+    ? Math.round((counts.completed / counts.total) * 100)
+    : 0;
   const progressLabel = panel.querySelector('[data-orchestrate-progress-label]');
   if (progressLabel) {
     const parts = [`${counts.completed}/${counts.total} 完成`];
+    parts.push(`${completionPercent}%`);
     if (counts.running) parts.push(`${counts.running} 执行中`);
     if (counts.failed) parts.push(`${counts.failed} 失败`);
     if (counts.skipped) parts.push(`${counts.skipped} 跳过`);
@@ -117,8 +121,8 @@ function syncProgressVisuals(entry) {
     const segment = panel.querySelector(`[data-orchestrate-progress="${key}"]`);
     if (!segment) return;
     segment.style.width = `${(value / total) * 100}%`;
-    segment.classList.toggle('hidden', value === 0);
-    segment.title = `${key}: ${value}`;
+    segment.hidden = value === 0;
+    segment.title = `${({ completed: '完成', running: '执行中', failed: '失败', skipped: '跳过', pending: '等待' })[key] || key}: ${value}`;
   });
 
   syncTaskHighlights(panel);
@@ -357,10 +361,10 @@ export function createOrchestratePanel(data) {
   overview.innerHTML = `
     <div class="orchestrate-progress">
       <div class="orchestrate-progress-bar">
-        <span class="orchestrate-progress-segment is-completed hidden" data-orchestrate-progress="completed"></span>
-        <span class="orchestrate-progress-segment is-running hidden" data-orchestrate-progress="running"></span>
-        <span class="orchestrate-progress-segment is-failed hidden" data-orchestrate-progress="failed"></span>
-        <span class="orchestrate-progress-segment is-skipped hidden" data-orchestrate-progress="skipped"></span>
+        <span class="orchestrate-progress-segment is-completed" data-orchestrate-progress="completed" hidden></span>
+        <span class="orchestrate-progress-segment is-running" data-orchestrate-progress="running" hidden></span>
+        <span class="orchestrate-progress-segment is-failed" data-orchestrate-progress="failed" hidden></span>
+        <span class="orchestrate-progress-segment is-skipped" data-orchestrate-progress="skipped" hidden></span>
         <span class="orchestrate-progress-segment is-pending" data-orchestrate-progress="pending"></span>
       </div>
       <div class="orchestrate-progress-label" data-orchestrate-progress-label>0/${Array.isArray(data.tasks) ? data.tasks.length : 0} 完成</div>

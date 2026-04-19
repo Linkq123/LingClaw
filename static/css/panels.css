@@ -676,6 +676,22 @@
   color: color-mix(in srgb, var(--accent2) 60%, var(--dim));
   margin-bottom: 8px;
 }
+.subagent-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+.subagent-section-head .subagent-section-title {
+  margin-bottom: 0;
+}
+.subagent-section-meta {
+  color: var(--dim);
+  font-size: 11px;
+  font-weight: 700;
+}
 .subagent-prompt {
   font-size: 12px;
   color: var(--text);
@@ -683,6 +699,83 @@
   word-break: break-word;
   max-height: 160px;
   overflow-y: auto;
+}
+.subagent-tool-empty {
+  color: var(--dim);
+  font-size: 12px;
+}
+.subagent-tool-trail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.subagent-tool-trail[hidden] {
+  display: none;
+}
+.subagent-tool-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  min-height: 32px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(226,229,238,.94);
+  background: rgba(255,255,255,.92);
+  color: var(--text);
+  cursor: pointer;
+  transition: transform .15s ease, box-shadow .18s ease, border-color .18s ease, background .18s ease;
+}
+.subagent-tool-pill:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 18px rgba(20,24,38,.08);
+}
+.subagent-tool-pill-index {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 20px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: rgba(240,242,248,.96);
+  color: var(--dim);
+  font-size: 10px;
+  font-weight: 800;
+}
+.subagent-tool-pill-name {
+  font-size: 12px;
+  font-weight: 700;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-tool-pill-state {
+  font-size: 11px;
+  color: var(--dim);
+  font-weight: 700;
+}
+.subagent-tool-pill.is-running {
+  border-color: color-mix(in srgb, var(--accent2) 20%, var(--border));
+  background: color-mix(in srgb, var(--accent2) 8%, white);
+}
+.subagent-tool-pill.is-running .subagent-tool-pill-state {
+  color: var(--accent2);
+}
+.subagent-tool-pill.is-done {
+  border-color: color-mix(in srgb, var(--accent-success) 20%, var(--border));
+  background: color-mix(in srgb, var(--accent-success) 7%, white);
+}
+.subagent-tool-pill.is-done .subagent-tool-pill-state {
+  color: var(--accent-success);
+}
+.subagent-tool-pill.is-failed {
+  border-color: color-mix(in srgb, var(--accent-error) 20%, var(--border));
+  background: color-mix(in srgb, var(--accent-error) 8%, white);
+}
+.subagent-tool-pill.is-failed .subagent-tool-pill-state {
+  color: var(--accent-error);
 }
 .subagent-tool-list {
   display: flex;
@@ -775,6 +868,9 @@
 }
 .subagent-tool-section + .subagent-tool-section {
   margin-top: 10px;
+}
+.subagent-tool-output[hidden] {
+  display: none;
 }
 .subagent-tool-section-title {
   font-size: 10px;
@@ -1024,9 +1120,8 @@
   border-radius: 999px;
   transition: width .24s ease, opacity .2s ease;
 }
-.orchestrate-progress-segment.hidden {
-  width: 0 !important;
-  opacity: 0;
+.orchestrate-progress-segment[hidden] {
+  display: none;
 }
 .orchestrate-progress-segment.is-completed {
   background: var(--accent-success);

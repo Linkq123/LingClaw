@@ -32,6 +32,7 @@ import { toggleMobileMenu, closeMobileMenu, initMobileListeners } from './mobile
 import {
   createSubagentPanel, addSubagentTool, updateSubagentProgress,
   updateSubagentToolResult, finishSubagentPanel,
+  focusSubagentTool,
   toggleSubagentTools, focusSubagentCurrent, copySubagentSummary
 } from './renderers/subagent.js';
 import {
@@ -688,6 +689,7 @@ const actionHandlers = {
   'toggle-tool': (el) => toggleTool(el),
   'subagent-toggle-all': (el) => toggleSubagentTools(el),
   'subagent-focus-current': (el) => focusSubagentCurrent(el),
+  'subagent-focus-tool': (el) => focusSubagentTool(el),
   'subagent-copy-summary': (el) => copySubagentSummary(el),
   'orchestrate-toggle-all': (el) => toggleOrchestrateTasks(el),
   'orchestrate-focus-active': (el) => focusOrchestrateActive(el),
