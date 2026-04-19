@@ -221,6 +221,8 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: model_override.map(|value| value.to_string()),
         think_level: default_think_level(),
         show_react: false,
@@ -663,6 +665,8 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
@@ -713,6 +717,8 @@ fn build_history_payload_marks_failed_tool_result_with_is_error() {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
@@ -765,6 +771,8 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
         show_react: default_show_react(),
@@ -814,6 +822,8 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
         show_react: default_show_react(),
@@ -2301,6 +2311,8 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
@@ -2375,6 +2387,8 @@ fn save_session_to_disk_overwrites_existing_file() {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
@@ -2624,6 +2638,370 @@ async fn api_usage_returns_token_sources() {
 }
 
 #[tokio::test]
+async fn api_usage_rolls_over_stale_daily_usage_before_serializing() {
+    let state = Arc::new(test_app_state());
+    let mut session = test_session(MAIN_SESSION_ID, "Main", None);
+    let yesterday = (chrono::Local::now().date_naive() - chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let mut providers = HashMap::new();
+    providers.insert("openai".to_string(), [12, 3]);
+    session.token_usage_day = yesterday.clone();
+    session.daily_input_tokens = 12;
+    session.daily_output_tokens = 3;
+    session.daily_provider_usage = providers;
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session.id.clone(), session);
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_usage(headers, State(state.clone()))
+        .await
+        .expect("local request should be accepted");
+
+    assert_eq!(payload["daily_input"], 0);
+    assert_eq!(payload["daily_output"], 0);
+    assert_eq!(payload["daily_providers"], json!({}));
+    assert_eq!(
+        payload["usage_history"],
+        json!([{
+            "date": yesterday,
+            "input": 12,
+            "output": 3,
+            "providers": {
+                "openai": [12, 3]
+            }
+        }])
+    );
+
+    let persisted = state
+        .sessions
+        .lock()
+        .await
+        .get(MAIN_SESSION_ID)
+        .cloned()
+        .expect("session should still exist");
+    assert_eq!(persisted.daily_input_tokens, 0);
+    assert_eq!(persisted.daily_output_tokens, 0);
+    assert!(persisted.daily_provider_usage.is_empty());
+    assert_eq!(persisted.usage_history.len(), 1);
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_invalid_provider_names() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let result = api_put_config(
+        headers,
+        Json(json!({
+            "config": {
+                "models": {
+                    "providers": {
+                        "openai/test": {
+                            "api": "openai-completions",
+                            "baseUrl": "https://api.openai.com/v1",
+                            "apiKey": "key",
+                            "models": []
+                        }
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("invalid provider names should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("cannot contain '/'"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_unknown_agent_provider_alias() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let result = api_put_config(
+        headers,
+        Json(json!({
+            "config": {
+                "models": {
+                    "providers": {
+                        "openai-work": {
+                            "api": "openai-completions",
+                            "baseUrl": "https://gateway.example/v1",
+                            "apiKey": "key",
+                            "models": [
+                                {
+                                    "id": "gpt-4o-mini"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "agents": {
+                    "defaults": {
+                        "model": {
+                            "primary": "missing/gpt-4o-mini"
+                        }
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("unknown agent provider aliases should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("agents.defaults.model.primary"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_unknown_agent_provider_prefix_without_models_config() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let result = api_put_config(
+        headers,
+        Json(json!({
+            "config": {
+                "agents": {
+                    "defaults": {
+                        "model": {
+                            "primary": "missing/gpt-4o-mini"
+                        }
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) =
+        result.expect_err("unknown provider prefixes should fail without models config");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("agents.defaults.model.primary"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_unknown_agent_model_id_for_configured_provider() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let result = api_put_config(
+        headers,
+        Json(json!({
+            "config": {
+                "models": {
+                    "providers": {
+                        "openai-work": {
+                            "api": "openai-completions",
+                            "baseUrl": "https://gateway.example/v1",
+                            "apiKey": "key",
+                            "models": [
+                                {
+                                    "id": "gpt-4o-mini"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "agents": {
+                    "defaults": {
+                        "model": {
+                            "primary": "openai-work/typo-model"
+                        }
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("unknown configured model ids should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("unknown model 'typo-model'"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_empty_mcp_command() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let result = api_put_config(
+        headers,
+        Json(json!({
+            "config": {
+                "mcpServers": {
+                    "empty-command": {
+                        "command": "",
+                        "args": []
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("empty MCP command should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("mcpServers.empty-command"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_invalid_provider_api_kind() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let result = api_put_config(
+        headers,
+        Json(json!({
+            "config": {
+                "models": {
+                    "providers": {
+                        "openai-work": {
+                            "api": "anthorpic",
+                            "baseUrl": "https://gateway.example/v1",
+                            "apiKey": "key",
+                            "models": []
+                        }
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("invalid provider api kinds should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("unsupported api 'anthorpic'"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_zero_mcp_timeout() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let result = api_put_config(
+        headers,
+        Json(json!({
+            "config": {
+                "mcpServers": {
+                    "zero-timeout": {
+                        "command": "uvx",
+                        "args": [],
+                        "timeoutSecs": 0
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("zero MCP timeout should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("greater than 0"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_mcp_cwd_outside_workspace() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let result = api_put_config(
+        headers,
+        Json(json!({
+            "config": {
+                "mcpServers": {
+                    "outside-workspace": {
+                        "command": "uvx",
+                        "args": [],
+                        "cwd": "../outside"
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("MCP cwd escaping the workspace should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().is_some_and(|msg| {
+        msg.contains("mcpServers.outside-workspace.cwd")
+            && msg.contains("outside the session workspace")
+    }));
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_empty_provider_model_id() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let result = api_put_config(
+        headers,
+        Json(json!({
+            "config": {
+                "models": {
+                    "providers": {
+                        "openai-work": {
+                            "api": "openai-completions",
+                            "baseUrl": "https://gateway.example/v1",
+                            "apiKey": "key",
+                            "models": [
+                                {
+                                    "id": ""
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("empty provider model ids should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("model id cannot be empty"))
+    );
+}
+
+#[tokio::test]
 async fn read_config_file_snapshot_waits_for_active_writer() {
     let base = std::env::temp_dir().join(format!("lingclaw-config-read-{}", now_epoch()));
     std::fs::create_dir_all(&base).expect("temp dir should be created");
@@ -2811,6 +3189,8 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
         show_react: false,

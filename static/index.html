@@ -110,15 +110,15 @@
     </div>
     <div class="page-tabs" id="settings-tabs">
       <button class="page-tab active" data-tab="tab-general">General</button>
-      <button class="page-tab" data-tab="tab-models">Models</button>
       <button class="page-tab" data-tab="tab-agents">Agent Models</button>
+      <button class="page-tab" data-tab="tab-models">Models</button>
       <button class="page-tab" data-tab="tab-mcp">MCP Servers</button>
       <button class="page-tab" data-tab="tab-s3">File Storage</button>
     </div>
     <div class="page-body" id="settings-body">
       <div class="tab-content active" id="tab-general"></div>
-      <div class="tab-content" id="tab-models"></div>
       <div class="tab-content" id="tab-agents"></div>
+      <div class="tab-content" id="tab-models"></div>
       <div class="tab-content" id="tab-mcp"></div>
       <div class="tab-content" id="tab-s3"></div>
     </div>
@@ -140,13 +140,21 @@
       <div class="usage-summary" id="usage-summary"></div>
       <div class="usage-chart-section">
         <div class="usage-chart-header">
-          <h3>Today</h3>
+          <h3>Daily Token Usage</h3>
+          <div class="usage-range-picker" id="daily-range-picker">
+            <button class="range-btn active" data-range="7">7d</button>
+            <button class="range-btn" data-range="14">14d</button>
+          </div>
         </div>
         <div class="usage-chart-container"><canvas id="daily-chart"></canvas></div>
       </div>
       <div class="usage-chart-section">
         <div class="usage-chart-header">
-          <h3>All-Time Breakdown</h3>
+          <h3>Provider Breakdown</h3>
+          <div class="usage-range-picker" id="provider-range-picker">
+            <button class="range-btn active" data-range="7">7d</button>
+            <button class="range-btn" data-range="14">14d</button>
+          </div>
         </div>
         <div class="usage-chart-container"><canvas id="provider-chart"></canvas></div>
       </div>

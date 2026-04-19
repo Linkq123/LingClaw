@@ -256,9 +256,137 @@ fn align_runtime_provider_config(
     }
 }
 
+pub(crate) fn validate_provider_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Provider name cannot be empty.".to_string());
+    }
+    if name.contains('/') {
+        return Err("Provider name cannot contain '/'.".to_string());
+    }
+    if name.chars().any(char::is_whitespace) {
+        return Err("Provider name cannot contain whitespace.".to_string());
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
+    {
+        return Err(
+            "Provider name may only contain letters, numbers, '.', '-' or '_'.".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn is_builtin_provider_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "openai" | "anthropic" | "ollama"
+    )
+}
+
+fn validate_provider_api_kind(api_kind: &str) -> Result<(), String> {
+    if matches!(
+        api_kind.trim().to_ascii_lowercase().as_str(),
+        "openai-completions" | "anthropic" | "ollama"
+    ) {
+        Ok(())
+    } else {
+        Err(format!(
+            "unsupported api '{api_kind}'. Expected one of: openai-completions, anthropic, ollama."
+        ))
+    }
+}
+
+fn validate_provider_entry(name: &str, provider: &JsonProviderConfig) -> Result<(), String> {
+    validate_provider_name(name)
+        .map_err(|error| format!("Invalid models.providers entry '{name}': {error}"))?;
+    validate_provider_api_kind(&provider.api)
+        .map_err(|error| format!("Invalid models.providers entry '{name}': {error}"))?;
+    if provider.base_url.trim().is_empty() {
+        return Err(format!(
+            "Invalid models.providers entry '{name}': baseUrl cannot be empty."
+        ));
+    }
+    Ok(())
+}
+
+fn validate_mcp_server_cwd(name: &str, cwd: &str, workspace: &Path) -> Result<(), String> {
+    let workspace_root = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let raw = Path::new(cwd);
+    let relative = if raw.is_absolute() {
+        if let Ok(relative) = raw.strip_prefix(workspace) {
+            relative.to_path_buf()
+        } else if let Ok(relative) = raw.strip_prefix(&workspace_root) {
+            relative.to_path_buf()
+        } else if let Ok(canonical_raw) = raw.canonicalize() {
+            canonical_raw
+                .strip_prefix(&workspace_root)
+                .map(PathBuf::from)
+                .map_err(|_| {
+                    format!(
+                        "Invalid mcpServers.{name}.cwd: path '{cwd}' is outside the session workspace '{}'",
+                        workspace_root.display()
+                    )
+                })?
+        } else {
+            return Err(format!(
+                "Invalid mcpServers.{name}.cwd: path '{cwd}' is outside the session workspace '{}'",
+                workspace_root.display()
+            ));
+        }
+    } else {
+        raw.to_path_buf()
+    };
+
+    if relative.components().any(|component| {
+        matches!(component, std::path::Component::Normal(part) if part == ".lingclaw-bootstrap")
+    }) {
+        return Err(format!(
+            "Invalid mcpServers.{name}.cwd: path '{cwd}' targets protected internal workspace data."
+        ));
+    }
+
+    let mut resolved = workspace_root.clone();
+    for component in relative.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                if resolved == workspace_root {
+                    return Err(format!(
+                        "Invalid mcpServers.{name}.cwd: path '{cwd}' is outside the session workspace '{}'",
+                        workspace_root.display()
+                    ));
+                }
+                resolved.pop();
+            }
+            std::path::Component::Normal(part) => {
+                resolved.push(part);
+                if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+                    && meta.file_type().is_symlink()
+                {
+                    return Err(format!(
+                        "Invalid mcpServers.{name}.cwd: path '{cwd}' traverses symlink '{}' which is not permitted for security reasons.",
+                        resolved.display()
+                    ));
+                }
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(format!(
+                    "Invalid mcpServers.{name}.cwd: path '{cwd}' is outside the session workspace '{}'",
+                    workspace_root.display()
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 impl Config {
     pub(crate) fn load() -> Self {
-        let json_cfg = load_config_file();
+        let json_cfg = sanitize_loaded_json_config(load_config_file());
         let settings = json_cfg.settings.unwrap_or_default();
         let settings_has_provider = settings.provider.is_some();
         let settings_has_api_key = settings.api_key.is_some();
@@ -470,6 +598,52 @@ impl Config {
         config
     }
 
+    pub(crate) fn validate_json_mcp_servers(json_cfg: &JsonConfig) -> Result<(), String> {
+        let Some(servers) = json_cfg.mcp_servers.as_ref() else {
+            return Ok(());
+        };
+
+        for (name, server) in servers {
+            if server.command.trim().is_empty() {
+                return Err(format!(
+                    "Invalid mcpServers.{name}: command cannot be empty."
+                ));
+            }
+            if server.timeout_secs == Some(0) {
+                return Err(format!(
+                    "Invalid mcpServers.{name}: timeoutSecs must be greater than 0."
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn validate_json_mcp_servers_for_workspace(
+        json_cfg: &JsonConfig,
+        workspace: &Path,
+    ) -> Result<(), String> {
+        Self::validate_json_mcp_servers(json_cfg)?;
+
+        let Some(servers) = json_cfg.mcp_servers.as_ref() else {
+            return Ok(());
+        };
+
+        for (name, server) in servers {
+            let Some(cwd) = server
+                .cwd
+                .as_deref()
+                .map(str::trim)
+                .filter(|cwd| !cwd.is_empty())
+            else {
+                continue;
+            };
+            validate_mcp_server_cwd(name, cwd, workspace)?;
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn memory_model_or<'a>(&'a self, fallback: &'a str) -> &'a str {
         self.memory_model.as_deref().unwrap_or(fallback)
     }
@@ -618,6 +792,29 @@ impl Config {
 
         // Fallback to env-based config
         fallback_resolved(self.provider, model_ref)
+    }
+
+    pub(crate) fn resolve_provider_name(&self, model_ref: &str) -> String {
+        if let Some((prov_name, _)) = model_ref.split_once('/') {
+            if self.providers.contains_key(prov_name) {
+                return prov_name.to_string();
+            }
+            if self.providers.is_empty() && is_builtin_provider_name(prov_name) {
+                return prov_name.to_ascii_lowercase();
+            }
+        }
+
+        let resolved_ref = self.resolved_model_ref(model_ref);
+        if let Some((prov_name, _)) = resolved_ref.split_once('/') {
+            if self.providers.contains_key(prov_name) {
+                return prov_name.to_string();
+            }
+            if self.providers.is_empty() && is_builtin_provider_name(prov_name) {
+                return prov_name.to_ascii_lowercase();
+            }
+        }
+
+        self.resolve_model(model_ref).provider.label().to_string()
     }
 
     /// List all available models: from config file providers + the default env model.
@@ -772,6 +969,94 @@ impl Config {
     }
 }
 
+fn sanitize_loaded_json_config(json_cfg: JsonConfig) -> JsonConfig {
+    let mut json_cfg = json_cfg;
+
+    let mut providers = json_cfg
+        .models
+        .as_ref()
+        .and_then(|models| models.providers.as_ref())
+        .cloned()
+        .unwrap_or_default();
+
+    providers.retain(
+        |name, provider| match validate_provider_entry(name, provider) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("WARNING: {error}");
+                false
+            }
+        },
+    );
+
+    for (name, provider) in providers.iter_mut() {
+        provider.models.retain(|model| {
+            if model.id.trim().is_empty() {
+                eprintln!(
+                    "WARNING: Ignoring invalid models.providers.{name}.models entry with empty id."
+                );
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    if let Some(models) = json_cfg.models.as_mut() {
+        models.providers = if providers.is_empty() {
+            None
+        } else {
+            Some(providers.clone())
+        };
+    }
+
+    if let Some(servers) = json_cfg.mcp_servers.as_mut() {
+        servers.retain(|name, server| {
+            if server.command.trim().is_empty() {
+                eprintln!("WARNING: Ignoring invalid mcpServers.{name}: command cannot be empty.");
+                false
+            } else if server.timeout_secs == Some(0) {
+                eprintln!(
+                    "WARNING: Ignoring invalid mcpServers.{name}.timeoutSecs: 0 is not allowed; using default timeout instead."
+                );
+                server.timeout_secs = None;
+                true
+            } else {
+                true
+            }
+        });
+        if servers.is_empty() {
+            json_cfg.mcp_servers = None;
+        }
+    }
+
+    if let Some(model_defaults) = json_cfg
+        .agents
+        .as_mut()
+        .and_then(|agents| agents.defaults.as_mut())
+        .and_then(|defaults| defaults.model.as_mut())
+    {
+        for (field, model_ref) in [
+            ("primary", &mut model_defaults.primary),
+            ("fast", &mut model_defaults.fast),
+            ("sub-agent", &mut model_defaults.sub_agent),
+            ("memory", &mut model_defaults.memory),
+            ("reflection", &mut model_defaults.reflection),
+            ("context", &mut model_defaults.context),
+        ] {
+            let Some(value) = model_ref.as_deref() else {
+                continue;
+            };
+            if let Err(error) = validate_agent_model_ref(field, value, &providers) {
+                eprintln!("WARNING: Ignoring invalid config file entry: {error}");
+                *model_ref = None;
+            }
+        }
+    }
+
+    json_cfg
+}
+
 // ── Config File (lingclaw.json) ──────────────────────────────────────────────
 
 #[derive(Deserialize, Default)]
@@ -880,6 +1165,111 @@ pub(crate) struct JsonModelEntry {
     pub(crate) max_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) compat: Option<serde_json::Value>,
+}
+
+pub(crate) fn validate_json_provider_names(json_cfg: &JsonConfig) -> Result<(), String> {
+    let Some(providers) = json_cfg
+        .models
+        .as_ref()
+        .and_then(|models| models.providers.as_ref())
+    else {
+        return Ok(());
+    };
+
+    for (name, provider) in providers {
+        validate_provider_entry(name, provider)?;
+    }
+
+    Ok(())
+}
+
+pub(crate) fn validate_json_agent_model_refs(json_cfg: &JsonConfig) -> Result<(), String> {
+    let providers = json_cfg
+        .models
+        .as_ref()
+        .and_then(|models| models.providers.as_ref())
+        .cloned()
+        .unwrap_or_default();
+
+    let Some(model_defaults) = json_cfg
+        .agents
+        .as_ref()
+        .and_then(|agents| agents.defaults.as_ref())
+        .and_then(|defaults| defaults.model.as_ref())
+    else {
+        return Ok(());
+    };
+
+    for (field, model_ref) in [
+        ("primary", model_defaults.primary.as_deref()),
+        ("fast", model_defaults.fast.as_deref()),
+        ("sub-agent", model_defaults.sub_agent.as_deref()),
+        ("memory", model_defaults.memory.as_deref()),
+        ("reflection", model_defaults.reflection.as_deref()),
+        ("context", model_defaults.context.as_deref()),
+    ] {
+        let Some(model_ref) = model_ref else {
+            continue;
+        };
+        validate_agent_model_ref(field, model_ref, &providers)?;
+    }
+
+    Ok(())
+}
+
+fn validate_agent_model_ref(
+    field: &str,
+    model_ref: &str,
+    providers: &HashMap<String, JsonProviderConfig>,
+) -> Result<(), String> {
+    let has_configured_providers = !providers.is_empty();
+    let Some((provider_name, model_id)) = model_ref.split_once('/') else {
+        return Ok(());
+    };
+    if model_id.trim().is_empty() {
+        return Err(format!(
+            "Invalid agents.defaults.model.{field}: model id cannot be empty."
+        ));
+    }
+    if has_configured_providers && providers.contains_key(provider_name) {
+        if let Some(provider_cfg) = providers.get(provider_name)
+            && !provider_cfg.models.is_empty()
+            && !provider_cfg.models.iter().any(|model| model.id == model_id)
+        {
+            return Err(format!(
+                "Invalid agents.defaults.model.{field}: unknown model '{model_id}' for provider '{provider_name}'. Add it in models.providers.{provider_name}.models first."
+            ));
+        }
+        return Ok(());
+    }
+    if !has_configured_providers && is_builtin_provider_name(provider_name) {
+        return Ok(());
+    }
+    Err(format!(
+        "Invalid agents.defaults.model.{field}: unknown provider '{provider_name}'. Add it in models.providers first."
+    ))
+}
+
+pub(crate) fn validate_json_provider_models(json_cfg: &JsonConfig) -> Result<(), String> {
+    let Some(providers) = json_cfg
+        .models
+        .as_ref()
+        .and_then(|models| models.providers.as_ref())
+    else {
+        return Ok(());
+    };
+
+    for (name, provider) in providers {
+        for (index, model) in provider.models.iter().enumerate() {
+            if model.id.trim().is_empty() {
+                return Err(format!(
+                    "Invalid models.providers.{name}.models[{index}].id: model id cannot be empty."
+                ));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[derive(Deserialize, Clone)]

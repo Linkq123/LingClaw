@@ -564,6 +564,7 @@ fn token_usage_source(token_count: Option<u64>) -> &'static str {
 async fn update_llm_response_usage(
     ctx: &AgentRunCtx<'_>,
     resolved_provider: Provider,
+    provider_name: &str,
     request_input_estimate: u64,
     resp: &providers::LlmResponse,
 ) {
@@ -574,12 +575,13 @@ async fn update_llm_response_usage(
 
     let mut sessions = ctx.state.sessions.lock().await;
     if let Some(session) = sessions.get_mut(ctx.current_session_id) {
-        update_session_token_usage(
+        crate::update_session_token_usage_with_provider(
             session,
             input_tokens,
             output_tokens,
             token_usage_source(resp.input_tokens),
             token_usage_source(resp.output_tokens),
+            Some(provider_name),
         );
     }
 }
@@ -619,10 +621,18 @@ async fn apply_llm_response(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
     resolved_provider: Provider,
+    provider_name: String,
     request_input_estimate: u64,
     resp: providers::LlmResponse,
 ) {
-    update_llm_response_usage(ctx, resolved_provider, request_input_estimate, &resp).await;
+    update_llm_response_usage(
+        ctx,
+        resolved_provider,
+        &provider_name,
+        request_input_estimate,
+        &resp,
+    )
+    .await;
     persist_assistant_message(ctx, &resp.message).await;
     advance_after_llm_response(ctx.live_tx, phase_state, &resp.message).await;
 }
@@ -768,12 +778,13 @@ async fn execute_task_tool(
     if outcome.total_input_tokens > 0 || outcome.total_output_tokens > 0 {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(session_id) {
-            context::update_session_token_usage(
+            crate::update_session_token_usage_with_providers(
                 session,
                 outcome.total_input_tokens,
                 outcome.total_output_tokens,
                 "estimated",
                 "estimated",
+                &outcome.provider_usage,
             );
         }
     }
@@ -907,15 +918,17 @@ async fn execute_orchestrate_tool(
     // source label is conservatively "estimated".
     let input_tokens = outcome.total_input_tokens();
     let output_tokens = outcome.total_output_tokens();
+    let provider_usage = outcome.provider_usage();
     if input_tokens > 0 || output_tokens > 0 {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(session_id) {
-            context::update_session_token_usage(
+            crate::update_session_token_usage_with_providers(
                 session,
                 input_tokens,
                 output_tokens,
                 "estimated",
                 "estimated",
+                &provider_usage,
             );
         }
     }
@@ -1519,10 +1532,12 @@ async fn run_analyze_phase(
 
     match llm_result {
         Ok(resp) => {
+            let provider_name = ctx.state.config.resolve_provider_name(&snapshot.model);
             apply_llm_response(
                 ctx,
                 phase_state,
                 resolved.provider,
+                provider_name,
                 request_estimate as u64,
                 resp,
             )

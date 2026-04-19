@@ -2099,23 +2099,7 @@ fn wizard_validate_provider_name(
     name: &str,
     providers: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), String> {
-    if name.is_empty() {
-        return Err("Provider name cannot be empty.".to_string());
-    }
-    if name.contains('/') {
-        return Err("Provider name cannot contain '/'.".to_string());
-    }
-    if name.chars().any(char::is_whitespace) {
-        return Err("Provider name cannot contain whitespace.".to_string());
-    }
-    if !name
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.')
-    {
-        return Err(
-            "Provider name may only contain letters, numbers, '.', '-' or '_'.".to_string(),
-        );
-    }
+    crate::config::validate_provider_name(name)?;
     if providers.contains_key(name) {
         return Err(format!("Provider name '{name}' already exists."));
     }

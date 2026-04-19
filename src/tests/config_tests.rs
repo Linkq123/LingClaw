@@ -127,3 +127,389 @@ fn align_runtime_provider_config_updates_provider_family_from_primary_model() {
     assert_eq!(config.api_base, "https://anthropic-gateway.example");
     assert_eq!(config.api_key, "sk-ant-secondary");
 }
+
+#[test]
+fn resolve_provider_name_prefers_configured_provider_alias() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-a".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api-a.example/v1".to_string(),
+            api_key: "key-a".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "shared-model".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(4096),
+                compat: None,
+            }],
+        },
+    );
+    providers.insert(
+        "openai-b".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api-b.example/v1".to_string(),
+            api_key: "key-b".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "shared-model".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+
+    let config = runtime_alignment_config(
+        Provider::OpenAI,
+        "https://api-b.example/v1",
+        "key-b",
+        "shared-model",
+        providers,
+    );
+
+    assert_eq!(config.resolve_provider_name("shared-model"), "openai-b");
+}
+
+#[test]
+fn validate_json_provider_names_rejects_invalid_provider_keys() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai/test".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "key".to_string(),
+            api: "openai-completions".to_string(),
+            models: Vec::new(),
+        },
+    );
+    let json_cfg = JsonConfig {
+        settings: None,
+        models: Some(JsonModelsConfig {
+            providers: Some(providers),
+        }),
+        agents: None,
+        mcp_servers: None,
+        s3: None,
+    };
+
+    let err = validate_json_provider_names(&json_cfg)
+        .expect_err("invalid provider keys should be rejected");
+    assert!(err.contains("openai/test"));
+    assert!(err.contains("cannot contain '/'"));
+}
+
+#[test]
+fn validate_json_agent_model_refs_rejects_unknown_provider_alias() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-work".to_string(),
+        JsonProviderConfig {
+            base_url: "https://gateway.example/v1".to_string(),
+            api_key: "key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "gpt-4o-mini".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(16384),
+                compat: None,
+            }],
+        },
+    );
+    let json_cfg = JsonConfig {
+        settings: None,
+        models: Some(JsonModelsConfig {
+            providers: Some(providers),
+        }),
+        agents: Some(JsonAgentsConfig {
+            defaults: Some(JsonAgentDefaults {
+                model: Some(JsonDefaultModel {
+                    primary: Some("missing/gpt-4o-mini".to_string()),
+                    fast: None,
+                    sub_agent: None,
+                    memory: None,
+                    reflection: None,
+                    context: None,
+                }),
+            }),
+        }),
+        mcp_servers: None,
+        s3: None,
+    };
+
+    let err = validate_json_agent_model_refs(&json_cfg)
+        .expect_err("unknown provider aliases should be rejected");
+    assert!(err.contains("agents.defaults.model.primary"));
+    assert!(err.contains("missing"));
+}
+
+#[test]
+fn validate_json_agent_model_refs_rejects_unknown_prefix_without_provider_config() {
+    let json_cfg = JsonConfig {
+        settings: None,
+        models: None,
+        agents: Some(JsonAgentsConfig {
+            defaults: Some(JsonAgentDefaults {
+                model: Some(JsonDefaultModel {
+                    primary: Some("missing/gpt-4o-mini".to_string()),
+                    fast: None,
+                    sub_agent: None,
+                    memory: None,
+                    reflection: None,
+                    context: None,
+                }),
+            }),
+        }),
+        mcp_servers: None,
+        s3: None,
+    };
+
+    let err = validate_json_agent_model_refs(&json_cfg)
+        .expect_err("unknown provider prefixes should be rejected without provider config");
+    assert!(err.contains("agents.defaults.model.primary"));
+    assert!(err.contains("missing"));
+}
+
+#[test]
+fn validate_json_agent_model_refs_rejects_unknown_model_for_configured_provider() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-work".to_string(),
+        JsonProviderConfig {
+            base_url: "https://gateway.example/v1".to_string(),
+            api_key: "key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "gpt-4o-mini".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(16384),
+                compat: None,
+            }],
+        },
+    );
+    let json_cfg = JsonConfig {
+        settings: None,
+        models: Some(JsonModelsConfig {
+            providers: Some(providers),
+        }),
+        agents: Some(JsonAgentsConfig {
+            defaults: Some(JsonAgentDefaults {
+                model: Some(JsonDefaultModel {
+                    primary: Some("openai-work/typo-model".to_string()),
+                    fast: None,
+                    sub_agent: None,
+                    memory: None,
+                    reflection: None,
+                    context: None,
+                }),
+            }),
+        }),
+        mcp_servers: None,
+        s3: None,
+    };
+
+    let err = validate_json_agent_model_refs(&json_cfg)
+        .expect_err("unknown configured model ids should be rejected");
+    assert!(err.contains("unknown model 'typo-model'"));
+    assert!(err.contains("openai-work"));
+}
+
+#[test]
+fn sanitize_loaded_json_config_filters_invalid_provider_names() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai/test".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "key".to_string(),
+            api: "openai-completions".to_string(),
+            models: Vec::new(),
+        },
+    );
+
+    let sanitized = sanitize_loaded_json_config(JsonConfig {
+        settings: Some(JsonSettings {
+            port: Some(DEFAULT_PORT),
+            ..Default::default()
+        }),
+        models: Some(JsonModelsConfig {
+            providers: Some(providers),
+        }),
+        agents: None,
+        mcp_servers: None,
+        s3: None,
+    });
+
+    assert!(
+        sanitized
+            .models
+            .as_ref()
+            .and_then(|models| models.providers.as_ref())
+            .is_none()
+    );
+    assert!(sanitized.agents.is_none());
+    assert_eq!(
+        sanitized.settings.and_then(|settings| settings.port),
+        Some(DEFAULT_PORT)
+    );
+}
+
+#[test]
+fn validate_json_mcp_servers_rejects_empty_command() {
+    let mut mcp_servers = HashMap::new();
+    mcp_servers.insert(
+        "empty-command".to_string(),
+        JsonMcpServerConfig {
+            command: "".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            enabled: true,
+            timeout_secs: None,
+        },
+    );
+
+    let err = Config::validate_json_mcp_servers(&JsonConfig {
+        settings: None,
+        models: None,
+        agents: None,
+        mcp_servers: Some(mcp_servers),
+        s3: None,
+    })
+    .expect_err("empty MCP command should be rejected");
+
+    assert!(err.contains("mcpServers.empty-command"));
+}
+
+#[test]
+fn validate_json_provider_names_rejects_invalid_api_kind() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-work".to_string(),
+        JsonProviderConfig {
+            base_url: "https://gateway.example/v1".to_string(),
+            api_key: "key".to_string(),
+            api: "anthorpic".to_string(),
+            models: Vec::new(),
+        },
+    );
+
+    let err = validate_json_provider_names(&JsonConfig {
+        settings: None,
+        models: Some(JsonModelsConfig {
+            providers: Some(providers),
+        }),
+        agents: None,
+        mcp_servers: None,
+        s3: None,
+    })
+    .expect_err("unsupported provider api kinds should be rejected");
+
+    assert!(err.contains("openai-work"));
+    assert!(err.contains("unsupported api 'anthorpic'"));
+}
+
+#[test]
+fn validate_json_provider_names_allows_case_insensitive_api_kind() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "anthropic-work".to_string(),
+        JsonProviderConfig {
+            base_url: "https://gateway.example/v1".to_string(),
+            api_key: "key".to_string(),
+            api: "Anthropic".to_string(),
+            models: Vec::new(),
+        },
+    );
+
+    validate_json_provider_names(&JsonConfig {
+        settings: None,
+        models: Some(JsonModelsConfig {
+            providers: Some(providers),
+        }),
+        agents: None,
+        mcp_servers: None,
+        s3: None,
+    })
+    .expect("case-insensitive provider api kinds should be accepted");
+}
+
+#[test]
+fn validate_json_provider_models_rejects_empty_model_id() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-work".to_string(),
+        JsonProviderConfig {
+            base_url: "https://gateway.example/v1".to_string(),
+            api_key: "key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: " ".to_string(),
+                name: None,
+                reasoning: None,
+                input: None,
+                cost: None,
+                context_window: None,
+                max_tokens: None,
+                compat: None,
+            }],
+        },
+    );
+
+    let err = validate_json_provider_models(&JsonConfig {
+        settings: None,
+        models: Some(JsonModelsConfig {
+            providers: Some(providers),
+        }),
+        agents: None,
+        mcp_servers: None,
+        s3: None,
+    })
+    .expect_err("empty model ids should be rejected");
+
+    assert!(err.contains("model id cannot be empty"));
+}
+
+#[test]
+fn validate_json_mcp_servers_rejects_zero_timeout() {
+    let mut mcp_servers = HashMap::new();
+    mcp_servers.insert(
+        "zero-timeout".to_string(),
+        JsonMcpServerConfig {
+            command: "uvx".to_string(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            cwd: None,
+            enabled: true,
+            timeout_secs: Some(0),
+        },
+    );
+
+    let err = Config::validate_json_mcp_servers(&JsonConfig {
+        settings: None,
+        models: None,
+        agents: None,
+        mcp_servers: Some(mcp_servers),
+        s3: None,
+    })
+    .expect_err("zero MCP timeout should be rejected");
+
+    assert!(err.contains("zero-timeout"));
+    assert!(err.contains("greater than 0"));
+}

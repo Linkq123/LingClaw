@@ -11,7 +11,7 @@
 //  - OpenClaw: session-level isolation
 // ══════════════════════════════════════════════════════════════════════════════
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
 use reqwest::Client;
 use serde_json::json;
@@ -244,6 +244,8 @@ pub(crate) struct SubAgentOutcome {
     pub total_input_tokens: u64,
     /// Total output tokens consumed across all LLM calls made by this sub-agent.
     pub total_output_tokens: u64,
+    /// Per-provider usage aggregated across the sub-agent run.
+    pub provider_usage: HashMap<String, [u64; 2]>,
 }
 
 /// Resolve which model a sub-agent should use.
@@ -274,6 +276,7 @@ pub(crate) async fn run_subagent(
 ) -> SubAgentOutcome {
     let model_id = resolve_subagent_model(config).to_string();
     let resolved = config.resolve_model(&model_id);
+    let provider_name = config.resolve_provider_name(&model_id);
 
     // Ensure MCP tool cache is warm before building the sub-agent tool set.
     // The main loop's Analyze phase usually warms it, but cache may have expired
@@ -309,6 +312,7 @@ pub(crate) async fn run_subagent(
     let mut total_tool_calls: usize = 0;
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
+    let mut provider_usage: HashMap<String, [u64; 2]> = HashMap::new();
     let mut aborted = false;
     let mut timed_out = false;
 
@@ -445,6 +449,11 @@ pub(crate) async fn run_subagent(
                 });
                 total_input_tokens = total_input_tokens.saturating_add(input_used);
                 total_output_tokens = total_output_tokens.saturating_add(output_used);
+                let entry = provider_usage
+                    .entry(provider_name.clone())
+                    .or_insert([0, 0]);
+                entry[0] = entry[0].saturating_add(input_used);
+                entry[1] = entry[1].saturating_add(output_used);
 
                 messages.push(resp.message.clone());
 
@@ -846,6 +855,7 @@ pub(crate) async fn run_subagent(
                     aborted: true,
                     total_input_tokens,
                     total_output_tokens,
+                    provider_usage,
                 };
             }
         }
@@ -895,6 +905,7 @@ pub(crate) async fn run_subagent(
         aborted,
         total_input_tokens,
         total_output_tokens,
+        provider_usage,
     }
 }
 

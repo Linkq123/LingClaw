@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::{ChatMessage, Session, config::Config, config::Provider, prompts};
 
 // ── Context Management ──────────────────────────────────────────────────────
@@ -242,25 +244,83 @@ pub(crate) fn format_usage_block(
     )
 }
 
-pub(crate) fn update_session_token_usage(
+pub(crate) fn rollover_daily_usage_if_needed(session: &mut Session) {
+    let today = prompts::current_local_snapshot().today();
+    if session.token_usage_day != today {
+        // Snapshot the previous day before resetting.
+        if (session.daily_input_tokens > 0 || session.daily_output_tokens > 0)
+            && !session.token_usage_day.is_empty()
+        {
+            let snapshot = crate::DailyUsageSnapshot {
+                date: session.token_usage_day.clone(),
+                input: session.daily_input_tokens,
+                output: session.daily_output_tokens,
+                providers: session.daily_provider_usage.clone(),
+            };
+            session.usage_history.push(snapshot);
+            if session.usage_history.len() > crate::USAGE_HISTORY_CAP {
+                let excess = session.usage_history.len() - crate::USAGE_HISTORY_CAP;
+                session.usage_history.drain(..excess);
+            }
+        }
+        session.daily_input_tokens = 0;
+        session.daily_output_tokens = 0;
+        session.daily_provider_usage.clear();
+        session.token_usage_day = today;
+    }
+}
+
+fn merge_daily_provider_usage(session: &mut Session, provider_usage: &HashMap<String, [u64; 2]>) {
+    for (label, [input_tokens, output_tokens]) in provider_usage {
+        let entry = session
+            .daily_provider_usage
+            .entry(label.clone())
+            .or_insert([0, 0]);
+        entry[0] = entry[0].saturating_add(*input_tokens);
+        entry[1] = entry[1].saturating_add(*output_tokens);
+    }
+}
+
+pub(crate) fn update_session_token_usage_with_provider(
     session: &mut Session,
     input_tokens: u64,
     output_tokens: u64,
     input_source: &str,
     output_source: &str,
+    provider_label: Option<&str>,
 ) {
-    let today = prompts::current_local_snapshot().today();
-    if session.token_usage_day != today {
-        session.daily_input_tokens = 0;
-        session.daily_output_tokens = 0;
-        session.token_usage_day = today;
+    let mut provider_usage = HashMap::new();
+    if let Some(label) = provider_label {
+        provider_usage.insert(label.to_string(), [input_tokens, output_tokens]);
     }
+
+    update_session_token_usage_with_providers(
+        session,
+        input_tokens,
+        output_tokens,
+        input_source,
+        output_source,
+        &provider_usage,
+    );
+}
+
+pub(crate) fn update_session_token_usage_with_providers(
+    session: &mut Session,
+    input_tokens: u64,
+    output_tokens: u64,
+    input_source: &str,
+    output_source: &str,
+    provider_usage: &HashMap<String, [u64; 2]>,
+) {
+    rollover_daily_usage_if_needed(session);
     session.input_tokens = session.input_tokens.saturating_add(input_tokens);
     session.output_tokens = session.output_tokens.saturating_add(output_tokens);
     session.daily_input_tokens = session.daily_input_tokens.saturating_add(input_tokens);
     session.daily_output_tokens = session.daily_output_tokens.saturating_add(output_tokens);
     session.input_token_source = input_source.to_string();
     session.output_token_source = output_source.to_string();
+
+    merge_daily_provider_usage(session, provider_usage);
 }
 
 /// Estimate token count for a string with CJK awareness.

@@ -48,7 +48,8 @@ pub(crate) use config::{Config, DEFAULT_PORT, Provider, config_dir_path, config_
 pub(crate) use context::{
     accumulate_daily_token_usage, context_input_budget_for_model, current_daily_token_usage,
     estimate_tokens_for_provider, format_token_count, format_usage_block,
-    message_token_len_for_provider, update_session_token_usage,
+    message_token_len_for_provider, update_session_token_usage_with_provider,
+    update_session_token_usage_with_providers,
 };
 pub(crate) use hooks::{
     AutoCompressContextHook, CommandHookInput, HookRegistry, LlmHookInput, ToolHookInput,
@@ -199,6 +200,12 @@ struct Session {
     output_token_source: String,
     #[serde(default)]
     token_usage_day: String,
+    /// Per-provider daily token counters (reset on day boundary together with daily totals).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    daily_provider_usage: HashMap<String, [u64; 2]>,
+    /// Historical daily usage snapshots (capped at USAGE_HISTORY_CAP days).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    usage_history: Vec<DailyUsageSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_override: Option<String>,
     #[serde(default = "default_think_level")]
@@ -220,6 +227,23 @@ struct Session {
     #[serde(skip)]
     workspace: PathBuf,
 }
+
+/// One day's aggregated token usage (stored in `usage_history`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct DailyUsageSnapshot {
+    #[serde(default)]
+    pub(crate) date: String,
+    #[serde(default)]
+    pub(crate) input: u64,
+    #[serde(default)]
+    pub(crate) output: u64,
+    /// Per-provider breakdown: provider label → [input, output].
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) providers: HashMap<String, [u64; 2]>,
+}
+
+/// Maximum number of daily snapshots kept in usage_history.
+const USAGE_HISTORY_CAP: usize = 30;
 
 fn default_think_level() -> String {
     "auto".to_string()
@@ -283,6 +307,8 @@ impl Session {
             input_token_source: default_token_usage_source(),
             output_token_source: default_token_usage_source(),
             token_usage_day: prompts::current_local_snapshot().today(),
+            daily_provider_usage: HashMap::new(),
+            usage_history: Vec::new(),
             model_override: None,
             think_level: default_think_level(),
             show_react: default_show_react(),
@@ -1827,14 +1853,32 @@ async fn api_put_config(
             Json(json!({"error": "Config must be a JSON object"})),
         ));
     }
-    if let Err(e) = serde_json::from_value::<config::JsonConfig>(config_value.clone()) {
-        let msg = e.to_string();
-        // Extract line/column info from serde error when available
-        let (line, column) = parse_serde_error_position(&msg);
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": msg, "line": line, "column": column})),
-        ));
+    let parsed = match serde_json::from_value::<config::JsonConfig>(config_value.clone()) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            let msg = e.to_string();
+            // Extract line/column info from serde error when available
+            let (line, column) = parse_serde_error_position(&msg);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": msg, "line": line, "column": column})),
+            ));
+        }
+    };
+    if let Err(error) = config::validate_json_provider_names(&parsed) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": error}))));
+    }
+    if let Err(error) = config::validate_json_provider_models(&parsed) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": error}))));
+    }
+    if let Err(error) = config::validate_json_agent_model_refs(&parsed) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": error}))));
+    }
+    if let Err(error) = config::Config::validate_json_mcp_servers_for_workspace(
+        &parsed,
+        &session_workspace_path(MAIN_SESSION_ID),
+    ) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": error}))));
     }
 
     let path = config_file_path().ok_or_else(|| {
@@ -1992,17 +2036,41 @@ async fn api_usage(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_local_request_headers(&headers)?;
 
-    let sessions = state.sessions.lock().await;
-    let session = sessions.get(MAIN_SESSION_ID);
-    let (daily_input, daily_output) = session.map(current_daily_token_usage).unwrap_or((0, 0));
-    let total_input = session.map(|s| s.input_tokens).unwrap_or(0);
-    let total_output = session.map(|s| s.output_tokens).unwrap_or(0);
-    let input_source = session
-        .map(|s| s.input_token_source.clone())
-        .unwrap_or_else(default_token_usage_source);
-    let output_source = session
-        .map(|s| s.output_token_source.clone())
-        .unwrap_or_else(default_token_usage_source);
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions.get_mut(MAIN_SESSION_ID);
+    let (
+        daily_input,
+        daily_output,
+        total_input,
+        total_output,
+        input_source,
+        output_source,
+        usage_history,
+        daily_providers,
+    ) = if let Some(session) = session {
+        context::rollover_daily_usage_if_needed(session);
+        (
+            session.daily_input_tokens,
+            session.daily_output_tokens,
+            session.input_tokens,
+            session.output_tokens,
+            session.input_token_source.clone(),
+            session.output_token_source.clone(),
+            serde_json::to_value(&session.usage_history).unwrap_or_else(|_| json!([])),
+            serde_json::to_value(&session.daily_provider_usage).unwrap_or_else(|_| json!({})),
+        )
+    } else {
+        (
+            0,
+            0,
+            0,
+            0,
+            default_token_usage_source(),
+            default_token_usage_source(),
+            json!([]),
+            json!({}),
+        )
+    };
 
     Ok(Json(json!({
         "daily_input": daily_input,
@@ -2013,6 +2081,8 @@ async fn api_usage(
         "input_source": input_source,
         "output_source": output_source,
         "source_scope": "latest_update",
+        "usage_history": usage_history,
+        "daily_providers": daily_providers,
     })))
 }
 

@@ -75,6 +75,7 @@ pub(crate) struct TaskResult {
     pub duration_ms: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub provider_usage: HashMap<String, [u64; 2]>,
 }
 
 /// Status of an individual task in the orchestration.
@@ -112,6 +113,18 @@ impl OrchestrationOutcome {
             .iter()
             .map(|r| r.output_tokens)
             .fold(0u64, u64::saturating_add)
+    }
+
+    pub(crate) fn provider_usage(&self) -> HashMap<String, [u64; 2]> {
+        let mut totals: HashMap<String, [u64; 2]> = HashMap::new();
+        for result in &self.task_results {
+            for (label, [input_tokens, output_tokens]) in &result.provider_usage {
+                let entry = totals.entry(label.clone()).or_insert([0, 0]);
+                entry[0] = entry[0].saturating_add(*input_tokens);
+                entry[1] = entry[1].saturating_add(*output_tokens);
+            }
+        }
+        totals
     }
 }
 
@@ -502,6 +515,7 @@ pub(crate) async fn execute_orchestration(
                     duration_ms: 0,
                     input_tokens: 0,
                     output_tokens: 0,
+                    provider_usage: HashMap::new(),
                 });
             } else {
                 runnable.push(idx);
@@ -657,6 +671,7 @@ async fn mark_remaining_skipped(
                 duration_ms: 0,
                 input_tokens: 0,
                 output_tokens: 0,
+                provider_usage: HashMap::new(),
             });
         }
     }
@@ -702,6 +717,7 @@ async fn execute_single_task(
                 duration_ms: start.elapsed().as_millis() as u64,
                 input_tokens: 0,
                 output_tokens: 0,
+                provider_usage: HashMap::new(),
             };
         }
     };
@@ -772,6 +788,7 @@ async fn execute_single_task(
             duration_ms,
             input_tokens: outcome.total_input_tokens,
             output_tokens: outcome.total_output_tokens,
+            provider_usage: outcome.provider_usage,
         }
     } else {
         let _ = live_send(
@@ -800,6 +817,7 @@ async fn execute_single_task(
             duration_ms,
             input_tokens: outcome.total_input_tokens,
             output_tokens: outcome.total_output_tokens,
+            provider_usage: outcome.provider_usage,
         }
     }
 }

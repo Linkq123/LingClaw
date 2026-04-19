@@ -1883,6 +1883,7 @@ fn test_format_result_basic() {
                 duration_ms: 12000,
                 input_tokens: 0,
                 output_tokens: 0,
+                provider_usage: HashMap::new(),
             },
             TaskResult {
                 id: "implement".into(),
@@ -1894,6 +1895,7 @@ fn test_format_result_basic() {
                 duration_ms: 45000,
                 input_tokens: 0,
                 output_tokens: 0,
+                provider_usage: HashMap::new(),
             },
         ],
         aborted: false,
@@ -1920,6 +1922,7 @@ fn test_format_result_with_failures() {
                 duration_ms: 30000,
                 input_tokens: 0,
                 output_tokens: 0,
+                provider_usage: HashMap::new(),
             },
             TaskResult {
                 id: "review".into(),
@@ -1931,6 +1934,7 @@ fn test_format_result_with_failures() {
                 duration_ms: 5000,
                 input_tokens: 0,
                 output_tokens: 0,
+                provider_usage: HashMap::new(),
             },
             TaskResult {
                 id: "fix".into(),
@@ -1942,6 +1946,7 @@ fn test_format_result_with_failures() {
                 duration_ms: 0,
                 input_tokens: 0,
                 output_tokens: 0,
+                provider_usage: HashMap::new(),
             },
         ],
         aborted: false,
@@ -1987,6 +1992,7 @@ fn test_orchestrate_format_result_all_completed() {
                 duration_ms: 12000,
                 input_tokens: 0,
                 output_tokens: 0,
+                provider_usage: HashMap::new(),
             },
             TaskResult {
                 id: "implement".into(),
@@ -1998,6 +2004,7 @@ fn test_orchestrate_format_result_all_completed() {
                 duration_ms: 45000,
                 input_tokens: 0,
                 output_tokens: 0,
+                provider_usage: HashMap::new(),
             },
         ],
         aborted: false,
@@ -2026,6 +2033,7 @@ fn test_orchestrate_format_result_with_skipped() {
                 duration_ms: 5000,
                 input_tokens: 0,
                 output_tokens: 0,
+                provider_usage: HashMap::new(),
             },
             TaskResult {
                 id: "review".into(),
@@ -2037,6 +2045,7 @@ fn test_orchestrate_format_result_with_skipped() {
                 duration_ms: 0,
                 input_tokens: 0,
                 output_tokens: 0,
+                provider_usage: HashMap::new(),
             },
         ],
         aborted: false,
@@ -2060,11 +2069,55 @@ fn test_orchestrate_format_result_aborted() {
             duration_ms: 10000,
             input_tokens: 0,
             output_tokens: 0,
+            provider_usage: HashMap::new(),
         }],
         aborted: true,
     };
     let report = format_orchestration_result(&outcome);
     assert!(report.contains("Orchestration Aborted"));
+}
+
+#[test]
+fn test_orchestrate_provider_usage_aggregates_tasks() {
+    let mut first_usage = HashMap::new();
+    first_usage.insert("openai".into(), [120, 30]);
+    let mut second_usage = HashMap::new();
+    second_usage.insert("openai".into(), [80, 20]);
+    second_usage.insert("anthropic".into(), [25, 5]);
+
+    let outcome = OrchestrationOutcome {
+        task_results: vec![
+            TaskResult {
+                id: "task-a".into(),
+                agent: "coder".into(),
+                status: TaskStatus::Completed,
+                result: "Done".into(),
+                cycles: 2,
+                tool_calls: 1,
+                duration_ms: 1000,
+                input_tokens: 120,
+                output_tokens: 30,
+                provider_usage: first_usage,
+            },
+            TaskResult {
+                id: "task-b".into(),
+                agent: "reviewer".into(),
+                status: TaskStatus::Completed,
+                result: "Reviewed".into(),
+                cycles: 1,
+                tool_calls: 0,
+                duration_ms: 800,
+                input_tokens: 105,
+                output_tokens: 25,
+                provider_usage: second_usage,
+            },
+        ],
+        aborted: false,
+    };
+
+    let usage = outcome.provider_usage();
+    assert_eq!(usage["openai"], [200, 50]);
+    assert_eq!(usage["anthropic"], [25, 5]);
 }
 
 #[test]
