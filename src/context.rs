@@ -2,6 +2,91 @@ use std::collections::HashMap;
 
 use crate::{ChatMessage, Session, config::Config, config::Provider, prompts};
 
+pub(crate) const USAGE_ROLE_PRIMARY: &str = "Primary";
+pub(crate) const USAGE_ROLE_FAST: &str = "Fast";
+pub(crate) const USAGE_ROLE_SUB_AGENT: &str = "Sub-Agent";
+pub(crate) const USAGE_ROLE_MEMORY: &str = "Memory";
+pub(crate) const USAGE_ROLE_REFLECTION: &str = "Reflection";
+pub(crate) const USAGE_ROLE_CONTEXT: &str = "Context";
+
+const USAGE_PROVIDER_PREFIX: &str = "provider:";
+const USAGE_ROLE_PREFIX: &str = "role:";
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UsageUpdate {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) input_source: String,
+    pub(crate) output_source: String,
+    pub(crate) labels: HashMap<String, [u64; 2]>,
+}
+
+pub(crate) fn usage_provider_label(label: &str) -> String {
+    format!("{USAGE_PROVIDER_PREFIX}{label}")
+}
+
+pub(crate) fn usage_role_label(label: &str) -> String {
+    format!("{USAGE_ROLE_PREFIX}{label}")
+}
+
+pub(crate) fn build_usage_labels(
+    input_tokens: u64,
+    output_tokens: u64,
+    provider_label: Option<&str>,
+    role_label: Option<&str>,
+) -> HashMap<String, [u64; 2]> {
+    let mut labels = HashMap::new();
+    if let Some(label) = provider_label.filter(|label| !label.trim().is_empty()) {
+        labels.insert(usage_provider_label(label), [input_tokens, output_tokens]);
+    }
+    if let Some(label) = role_label.filter(|label| !label.trim().is_empty()) {
+        labels.insert(usage_role_label(label), [input_tokens, output_tokens]);
+    }
+    labels
+}
+
+pub(crate) fn split_usage_labels(
+    labels: &HashMap<String, [u64; 2]>,
+) -> (HashMap<String, [u64; 2]>, HashMap<String, [u64; 2]>) {
+    let mut providers = HashMap::new();
+    let mut roles = HashMap::new();
+    for (label, pair) in labels {
+        if let Some(name) = label.strip_prefix(USAGE_PROVIDER_PREFIX) {
+            providers.insert(name.to_string(), *pair);
+        } else if let Some(name) = label.strip_prefix(USAGE_ROLE_PREFIX) {
+            roles.insert(name.to_string(), *pair);
+        } else {
+            // Backward compatibility: old snapshots stored raw provider names.
+            providers.insert(label.clone(), *pair);
+        }
+    }
+    (providers, roles)
+}
+
+fn merge_usage_labels(into: &mut HashMap<String, [u64; 2]>, labels: &HashMap<String, [u64; 2]>) {
+    for (label, [input_tokens, output_tokens]) in labels {
+        let entry = into.entry(label.clone()).or_insert([0, 0]);
+        entry[0] = entry[0].saturating_add(*input_tokens);
+        entry[1] = entry[1].saturating_add(*output_tokens);
+    }
+}
+
+pub(crate) fn apply_usage_update(session: &mut Session, update: &UsageUpdate) {
+    rollover_daily_usage_if_needed(session);
+    session.input_tokens = session.input_tokens.saturating_add(update.input_tokens);
+    session.output_tokens = session.output_tokens.saturating_add(update.output_tokens);
+    session.daily_input_tokens = session
+        .daily_input_tokens
+        .saturating_add(update.input_tokens);
+    session.daily_output_tokens = session
+        .daily_output_tokens
+        .saturating_add(update.output_tokens);
+    session.input_token_source = update.input_source.clone();
+    session.output_token_source = update.output_source.clone();
+    merge_usage_labels(&mut session.daily_provider_usage, &update.labels);
+    merge_usage_labels(&mut session.total_label_usage, &update.labels);
+}
+
 // ── Context Management ──────────────────────────────────────────────────────
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -270,17 +355,6 @@ pub(crate) fn rollover_daily_usage_if_needed(session: &mut Session) {
     }
 }
 
-fn merge_daily_provider_usage(session: &mut Session, provider_usage: &HashMap<String, [u64; 2]>) {
-    for (label, [input_tokens, output_tokens]) in provider_usage {
-        let entry = session
-            .daily_provider_usage
-            .entry(label.clone())
-            .or_insert([0, 0]);
-        entry[0] = entry[0].saturating_add(*input_tokens);
-        entry[1] = entry[1].saturating_add(*output_tokens);
-    }
-}
-
 pub(crate) fn update_session_token_usage_with_provider(
     session: &mut Session,
     input_tokens: u64,
@@ -288,19 +362,15 @@ pub(crate) fn update_session_token_usage_with_provider(
     input_source: &str,
     output_source: &str,
     provider_label: Option<&str>,
+    role_label: Option<&str>,
 ) {
-    let mut provider_usage = HashMap::new();
-    if let Some(label) = provider_label {
-        provider_usage.insert(label.to_string(), [input_tokens, output_tokens]);
-    }
-
     update_session_token_usage_with_providers(
         session,
         input_tokens,
         output_tokens,
         input_source,
         output_source,
-        &provider_usage,
+        &build_usage_labels(input_tokens, output_tokens, provider_label, role_label),
     );
 }
 
@@ -312,15 +382,16 @@ pub(crate) fn update_session_token_usage_with_providers(
     output_source: &str,
     provider_usage: &HashMap<String, [u64; 2]>,
 ) {
-    rollover_daily_usage_if_needed(session);
-    session.input_tokens = session.input_tokens.saturating_add(input_tokens);
-    session.output_tokens = session.output_tokens.saturating_add(output_tokens);
-    session.daily_input_tokens = session.daily_input_tokens.saturating_add(input_tokens);
-    session.daily_output_tokens = session.daily_output_tokens.saturating_add(output_tokens);
-    session.input_token_source = input_source.to_string();
-    session.output_token_source = output_source.to_string();
-
-    merge_daily_provider_usage(session, provider_usage);
+    apply_usage_update(
+        session,
+        &UsageUpdate {
+            input_tokens,
+            output_tokens,
+            input_source: input_source.to_string(),
+            output_source: output_source.to_string(),
+            labels: provider_usage.clone(),
+        },
+    );
 }
 
 /// Estimate token count for a string with CJK awareness.

@@ -133,6 +133,7 @@ enum AgentPhaseControl {
 
 struct AnalyzeSnapshot {
     model: String,
+    usage_role: &'static str,
     think_level: String,
     pruned_count: usize,
     /// Character count of latest user message, for complexity-aware think level.
@@ -188,22 +189,40 @@ impl Drop for TaskEventGuard<'_> {
 
 const AGENT_HARD_CAP_ROUNDS: usize = 200;
 
+struct PostExecutionReflectionInput {
+    config: std::sync::Arc<Config>,
+    http: reqwest::Client,
+    sessions: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, Session>>>,
+    session_id: String,
+    workspace: std::path::PathBuf,
+    model: String,
+    messages: Vec<ChatMessage>,
+    cycles: usize,
+    tool_calls: usize,
+}
+
 /// Post-execution reflection: analyze what went well/poorly in a multi-step task.
 /// Writes a brief reflection to the session's daily memory file.
 /// Runs as a non-blocking background task — failures are non-critical.
 /// Returns `Ok(true)` when a reflection was actually written to disk,
 /// `Ok(false)` when the conversation was too trivial for a meaningful reflection.
 async fn run_post_execution_reflection(
-    config: &Config,
-    http: &reqwest::Client,
-    workspace: &std::path::Path,
-    model: &str,
-    messages: &[ChatMessage],
-    cycles: usize,
-    tool_calls: usize,
+    input: PostExecutionReflectionInput,
 ) -> Result<bool, String> {
+    let PostExecutionReflectionInput {
+        config,
+        http,
+        sessions,
+        session_id,
+        workspace,
+        model,
+        messages,
+        cycles,
+        tool_calls,
+    } = input;
+
     // Build a compact excerpt of the conversation for reflection.
-    let excerpt = crate::memory::build_conversation_excerpt(messages);
+    let excerpt = crate::memory::build_conversation_excerpt(&messages);
     if excerpt.trim().is_empty() {
         return Ok(false);
     }
@@ -240,19 +259,59 @@ async fn run_post_execution_reflection(
         },
     ];
 
-    let resolved = config.resolve_model(model);
-    let reflection = providers::call_llm_simple(
-        http,
+    let resolved = config.resolve_model(&model);
+    let reflection = providers::call_llm_simple_with_usage(
+        &http,
         &resolved,
         &prompt_messages,
-        workspace,
+        &workspace,
         config.s3.as_ref(),
         config.max_llm_retries,
     )
     .await
     .map_err(|e| format!("Reflection LLM call failed: {e}"))?;
 
-    let reflection = reflection.trim();
+    let provider_name = config.resolve_provider_name(&model);
+    let input_tokens = reflection.input_tokens.unwrap_or_else(|| {
+        crate::estimate_tokens_for_provider(resolved.provider, &prompt_messages) as u64
+    });
+    let output_tokens = reflection.output_tokens.unwrap_or_else(|| {
+        crate::message_token_len_for_provider(
+            resolved.provider,
+            &ChatMessage {
+                role: "assistant".into(),
+                content: Some(reflection.content.clone()),
+                images: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+        ) as u64
+    });
+
+    let mut session_to_save = None;
+    {
+        let mut sessions = sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            crate::update_session_token_usage_with_provider(
+                session,
+                input_tokens,
+                output_tokens,
+                token_usage_source(reflection.input_tokens),
+                token_usage_source(reflection.output_tokens),
+                Some(&provider_name),
+                Some(crate::context::USAGE_ROLE_REFLECTION),
+            );
+            session_to_save = Some(session.clone());
+        }
+    }
+    if let Some(session) = session_to_save.as_ref()
+        && let Err(error) = save_session_to_disk(session).await
+    {
+        eprintln!("Failed to persist reflection usage update: {error}");
+    }
+
+    let reflection = reflection.content.trim().to_string();
     if reflection.is_empty() {
         return Ok(false);
     }
@@ -331,23 +390,24 @@ async fn prepare_analyze_snapshot(
         .unwrap_or(0);
 
     // On the first cycle, downgrade to fast model for simple queries when configured.
-    let model_str = if phase_state.react_ctx.cycles == 0 && session.model_override.is_none() {
-        if let Some(ref fast) = config.fast_model {
-            if latest_query
-                .as_deref()
-                .map(agent::is_simple_query)
-                .unwrap_or(false)
-            {
-                fast.clone()
+    let (model_str, usage_role) =
+        if phase_state.react_ctx.cycles == 0 && session.model_override.is_none() {
+            if let Some(ref fast) = config.fast_model {
+                if latest_query
+                    .as_deref()
+                    .map(agent::is_simple_query)
+                    .unwrap_or(false)
+                {
+                    (fast.clone(), crate::context::USAGE_ROLE_FAST)
+                } else {
+                    (base_model, crate::context::USAGE_ROLE_PRIMARY)
+                }
             } else {
-                base_model
+                (base_model, crate::context::USAGE_ROLE_PRIMARY)
             }
         } else {
-            base_model
-        }
-    } else {
-        base_model
-    };
+            (base_model, crate::context::USAGE_ROLE_PRIMARY)
+        };
 
     let mut fresh_system = build_system_prompt_with_query(
         &config,
@@ -397,6 +457,7 @@ async fn prepare_analyze_snapshot(
 
     Some(AnalyzeSnapshot {
         model: model_str,
+        usage_role,
         think_level: session.think_level.clone(),
         pruned_count,
         user_msg_chars,
@@ -562,6 +623,7 @@ async fn update_llm_response_usage(
     ctx: &AgentRunCtx<'_>,
     resolved_provider: Provider,
     provider_name: &str,
+    usage_role: &str,
     request_input_estimate: u64,
     resp: &providers::LlmResponse,
 ) {
@@ -579,6 +641,7 @@ async fn update_llm_response_usage(
             token_usage_source(resp.input_tokens),
             token_usage_source(resp.output_tokens),
             Some(provider_name),
+            Some(usage_role),
         );
     }
 }
@@ -619,6 +682,7 @@ async fn apply_llm_response(
     phase_state: &mut AgentPhaseState,
     resolved_provider: Provider,
     provider_name: String,
+    usage_role: &'static str,
     request_input_estimate: u64,
     resp: providers::LlmResponse,
 ) {
@@ -626,6 +690,7 @@ async fn apply_llm_response(
         ctx,
         resolved_provider,
         &provider_name,
+        usage_role,
         request_input_estimate,
         &resp,
     )
@@ -773,6 +838,13 @@ async fn execute_task_tool(
     // locally-estimated counts (prefer provider, fall back to estimate), so
     // the source label is conservatively "estimated".
     if outcome.total_input_tokens > 0 || outcome.total_output_tokens > 0 {
+        let mut usage_labels = outcome.provider_usage.clone();
+        usage_labels.extend(crate::context::build_usage_labels(
+            outcome.total_input_tokens,
+            outcome.total_output_tokens,
+            None,
+            Some(crate::context::USAGE_ROLE_SUB_AGENT),
+        ));
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(session_id) {
             crate::update_session_token_usage_with_providers(
@@ -781,7 +853,7 @@ async fn execute_task_tool(
                 outcome.total_output_tokens,
                 "estimated",
                 "estimated",
-                &outcome.provider_usage,
+                &usage_labels,
             );
         }
     }
@@ -906,6 +978,13 @@ async fn execute_orchestrate_tool(
     let output_tokens = outcome.total_output_tokens();
     let provider_usage = outcome.provider_usage();
     if input_tokens > 0 || output_tokens > 0 {
+        let mut usage_labels = provider_usage.clone();
+        usage_labels.extend(crate::context::build_usage_labels(
+            input_tokens,
+            output_tokens,
+            None,
+            Some(crate::context::USAGE_ROLE_SUB_AGENT),
+        ));
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(session_id) {
             crate::update_session_token_usage_with_providers(
@@ -914,7 +993,7 @@ async fn execute_orchestrate_tool(
                 output_tokens,
                 "estimated",
                 "estimated",
-                &provider_usage,
+                &usage_labels,
             );
         }
     }
@@ -1523,6 +1602,7 @@ async fn run_analyze_phase(
                 phase_state,
                 resolved.provider,
                 provider_name,
+                snapshot.usage_role,
                 request_estimate as u64,
                 resp,
             )
@@ -1846,7 +1926,12 @@ async fn run_finish_phase(
         let fallback_model = session.effective_model(&config.model);
         let model = config.memory_model_or(fallback_model).to_string();
         let excerpt = crate::memory::prefilter_for_memory(&session.messages);
-        queue.enqueue(session.workspace.clone(), model, excerpt);
+        queue.enqueue(
+            session.id.clone(),
+            session.workspace.clone(),
+            model,
+            excerpt,
+        );
     }
 
     // Post-execution reflection for non-trivial multi-step tasks.
@@ -1864,6 +1949,8 @@ async fn run_finish_phase(
     {
         let config = config.clone();
         let http = ctx.state.http.clone();
+        let sessions = ctx.state.sessions.clone();
+        let session_id = session.id.clone();
         let workspace = session.workspace.clone();
         let fallback_model = session.effective_model(&config.model).to_string();
         let model = config.reflection_model_or(&fallback_model).to_string();
@@ -1876,9 +1963,17 @@ async fn run_finish_phase(
         tokio::spawn(async move {
             match tokio::time::timeout(
                 reflection_timeout,
-                run_post_execution_reflection(
-                    &config, &http, &workspace, &model, &messages, cycles, tool_calls,
-                ),
+                run_post_execution_reflection(PostExecutionReflectionInput {
+                    config,
+                    http,
+                    sessions,
+                    session_id,
+                    workspace,
+                    model,
+                    messages,
+                    cycles,
+                    tool_calls,
+                }),
             )
             .await
             {

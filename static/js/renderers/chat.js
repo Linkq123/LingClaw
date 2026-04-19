@@ -121,19 +121,25 @@ export function renderUserImageThumbnails(msgEl, images) {
   }
 }
 
-export function addSystem(t, kind = 'info') {
+function buildDismissButton() {
+  return '<button class="system-dismiss" type="button" data-action="dismiss-system-card" aria-label="Dismiss">×</button>';
+}
+
+export function addSystem(t, kind = 'info', options = {}) {
+  const { dismissible = false } = options;
   const row = document.createElement('div');
   row.className = 'msg-row system';
   const card = document.createElement('div');
   card.className = 'system-card';
+  if (dismissible) card.classList.add('is-dismissible');
   const icon = kind === 'success' ? '✅' : 'ℹ️';
   if (kind === 'success') card.classList.add('success-card');
   const isBlock = t.includes('\n') || t.length > 80;
   if (isBlock) {
-    card.innerHTML = `<div class="system-header"><span class="system-icon">📋</span> System</div><pre class="system-body">${escHtml(t)}</pre>`;
+    card.innerHTML = `<div class="system-header"><span class="system-icon">📋</span><span>System</span>${dismissible ? buildDismissButton() : ''}</div><pre class="system-body">${escHtml(t)}</pre>`;
   } else {
     card.classList.add('system-inline');
-    card.innerHTML = `<span class="system-icon">${icon}</span> <span>${escHtml(t)}</span>`;
+    card.innerHTML = `<span class="system-icon">${icon}</span><span class="system-inline-text">${escHtml(t)}</span>${dismissible ? buildDismissButton() : ''}`;
   }
   row.appendChild(card);
   dom.chat.appendChild(row);
@@ -142,12 +148,14 @@ export function addSystem(t, kind = 'info') {
   scrollDown();
 }
 
-export function addError(t) {
+export function addError(t, options = {}) {
+  const { dismissible = false } = options;
   const row = document.createElement('div');
   row.className = 'msg-row error';
   const card = document.createElement('div');
   card.className = 'system-card system-inline error-card';
-  card.innerHTML = `<span class="system-icon">⚠️</span> <span style="color:var(--accent-error)">${escHtml(t)}</span>`;
+  if (dismissible) card.classList.add('is-dismissible');
+  card.innerHTML = `<span class="system-icon">⚠️</span><span class="system-inline-text" style="color:var(--accent-error)">${escHtml(t)}</span>${dismissible ? buildDismissButton() : ''}`;
   row.appendChild(card);
   dom.chat.appendChild(row);
   queueUnreadContent({ countable: true });

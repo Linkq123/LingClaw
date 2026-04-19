@@ -194,8 +194,38 @@
   box-shadow: 0 1px 4px rgba(0,0,0,.03);
 }
 .system-card.system-inline { display: flex; align-items: center; gap: 8px; padding: 8px 14px; }
+.system-card.is-dismissible { padding-right: 10px; }
 .system-card.error-card { border-left-color: var(--accent-error); }
 .system-card.success-card { border-left-color: var(--accent-success); }
+.system-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.system-inline-text {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.system-dismiss {
+  margin-left: auto;
+  width: 24px;
+  height: 24px;
+  border: 0;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background .15s ease, color .15s ease;
+}
+.system-dismiss:hover {
+  background: color-mix(in srgb, var(--accent2) 10%, transparent);
+  color: var(--text);
+}
 .system-icon { font-size: 14px; flex-shrink: 0; }
 .react-status-row {
   align-self: flex-start;

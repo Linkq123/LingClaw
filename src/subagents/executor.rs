@@ -451,7 +451,7 @@ pub(crate) async fn run_subagent(
                 total_input_tokens = total_input_tokens.saturating_add(input_used);
                 total_output_tokens = total_output_tokens.saturating_add(output_used);
                 let entry = provider_usage
-                    .entry(provider_name.clone())
+                    .entry(context::usage_provider_label(&provider_name))
                     .or_insert([0, 0]);
                 entry[0] = entry[0].saturating_add(input_used);
                 entry[1] = entry[1].saturating_add(output_used);

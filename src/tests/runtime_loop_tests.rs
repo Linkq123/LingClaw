@@ -39,7 +39,7 @@ fn test_app_state() -> AppState {
     AppState {
         config: std::sync::Mutex::new(Arc::new(test_config())),
         http: reqwest::Client::new(),
-        sessions: Mutex::new(HashMap::new()),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
@@ -58,7 +58,7 @@ fn test_app_state_with_config(config: Config) -> AppState {
     AppState {
         config: std::sync::Mutex::new(Arc::new(config)),
         http: reqwest::Client::new(),
-        sessions: Mutex::new(HashMap::new()),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
@@ -96,6 +96,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
         daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
         usage_history: Vec::new(),
         model_override: model_override.map(|value| value.to_string()),
         think_level: default_think_level(),
@@ -261,7 +262,15 @@ fn update_llm_response_usage_uses_request_estimate_when_provider_usage_missing()
             output_tokens: None,
         };
 
-        update_llm_response_usage(&ctx, Provider::OpenAI, "openai", 777, &resp).await;
+        update_llm_response_usage(
+            &ctx,
+            Provider::OpenAI,
+            "openai",
+            crate::context::USAGE_ROLE_PRIMARY,
+            777,
+            &resp,
+        )
+        .await;
     });
 
     let persisted = rt.block_on(async {
@@ -276,10 +285,18 @@ fn update_llm_response_usage_uses_request_estimate_when_provider_usage_missing()
 
     assert_eq!(persisted.input_tokens, 777);
     assert_eq!(persisted.input_token_source, "estimated");
-    assert_eq!(persisted.daily_provider_usage["openai"][0], 777);
     assert_eq!(
-        persisted.daily_provider_usage["openai"][1],
+        persisted.daily_provider_usage[&crate::context::usage_provider_label("openai")][0],
+        777
+    );
+    assert_eq!(
+        persisted.daily_provider_usage[&crate::context::usage_provider_label("openai")][1],
         persisted.output_tokens
+    );
+    assert_eq!(
+        persisted.daily_provider_usage
+            [&crate::context::usage_role_label(crate::context::USAGE_ROLE_PRIMARY)],
+        [777, persisted.output_tokens]
     );
 }
 
@@ -287,8 +304,12 @@ fn update_llm_response_usage_uses_request_estimate_when_provider_usage_missing()
 fn update_session_token_usage_with_providers_merges_breakdown() {
     let mut session = test_session("usage-session", "Usage Session", None);
     let mut provider_usage = HashMap::new();
-    provider_usage.insert("openai".to_string(), [100, 25]);
-    provider_usage.insert("anthropic".to_string(), [50, 10]);
+    provider_usage.insert(crate::context::usage_provider_label("openai"), [100, 25]);
+    provider_usage.insert(crate::context::usage_provider_label("anthropic"), [50, 10]);
+    provider_usage.insert(
+        crate::context::usage_role_label(crate::context::USAGE_ROLE_SUB_AGENT),
+        [150, 35],
+    );
 
     crate::update_session_token_usage_with_providers(
         &mut session,
@@ -301,8 +322,19 @@ fn update_session_token_usage_with_providers_merges_breakdown() {
 
     assert_eq!(session.input_tokens, 150);
     assert_eq!(session.output_tokens, 35);
-    assert_eq!(session.daily_provider_usage["openai"], [100, 25]);
-    assert_eq!(session.daily_provider_usage["anthropic"], [50, 10]);
+    assert_eq!(
+        session.daily_provider_usage[&crate::context::usage_provider_label("openai")],
+        [100, 25]
+    );
+    assert_eq!(
+        session.daily_provider_usage[&crate::context::usage_provider_label("anthropic")],
+        [50, 10]
+    );
+    assert_eq!(
+        session.daily_provider_usage
+            [&crate::context::usage_role_label(crate::context::USAGE_ROLE_SUB_AGENT)],
+        [150, 35]
+    );
 }
 
 #[test]
@@ -401,7 +433,15 @@ fn update_llm_response_usage_uses_configured_provider_name() {
 
         let config = state.config();
         let provider_name = config.resolve_provider_name(&config.model);
-        update_llm_response_usage(&ctx, Provider::OpenAI, &provider_name, 321, &resp).await;
+        update_llm_response_usage(
+            &ctx,
+            Provider::OpenAI,
+            &provider_name,
+            crate::context::USAGE_ROLE_PRIMARY,
+            321,
+            &resp,
+        )
+        .await;
     });
 
     let persisted = rt.block_on(async {
@@ -414,7 +454,10 @@ fn update_llm_response_usage_uses_configured_provider_name() {
             .expect("session should exist")
     });
 
-    assert_eq!(persisted.daily_provider_usage["openai-work"], [321, 12]);
+    assert_eq!(
+        persisted.daily_provider_usage[&crate::context::usage_provider_label("openai-work")],
+        [321, 12]
+    );
 }
 
 #[test]

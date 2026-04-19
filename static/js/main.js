@@ -686,13 +686,13 @@ function handleMessage(data) {
 
     case 'success':
       clearReactStatus();
-      addSystem(data.content, 'success');
+      addSystem(data.content, 'success', { dismissible: data.dismissible === true });
       setBusy(false);
       break;
 
     case 'system':
       clearReactStatus();
-      addSystem(data.content);
+      addSystem(data.content, 'info', { dismissible: data.dismissible === true });
       setBusy(false);
       break;
 
@@ -700,7 +700,7 @@ function handleMessage(data) {
       finishAssistantStream({ discardIfEmpty: true });
       finishReasoningStream();
       clearReactStatus();
-      addError(data.content);
+      addError(data.content, { dismissible: data.dismissible === true });
       state.reasoningPanel = null;
       setBusy(false);
       break;
@@ -729,6 +729,10 @@ const actionHandlers = {
   },
   'toggle-mobile-menu': () => toggleMobileMenu(),
   'close-tool-drawer': () => closeToolDrawer(),
+  'dismiss-system-card': (el) => {
+    const row = el.closest('.msg-row.system, .msg-row.error');
+    if (row) row.remove();
+  },
   'load-earlier': () => loadEarlierMessages(),
   'open-tool-drawer': (el) => openToolDrawerFromHeader(el),
   'toggle-tool': (el) => toggleTool(el),

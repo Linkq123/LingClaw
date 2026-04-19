@@ -21,6 +21,7 @@ pub(crate) struct CommandResult {
     pub(crate) response_type: &'static str,
     pub(crate) sessions_changed: bool,
     pub(crate) refresh_history: bool,
+    pub(crate) dismissible: bool,
 }
 
 pub(crate) fn command_result(
@@ -33,6 +34,7 @@ pub(crate) fn command_result(
         response_type,
         sessions_changed,
         refresh_history: false,
+        dismissible: true,
     }
 }
 
@@ -362,7 +364,7 @@ async fn handle_new_command(
                 false,
             ));
         }
-        result = providers::call_llm_simple(&state.http, &resolved, &compress_prompt, &workspace, config.s3.as_ref(), config.max_llm_retries) => {
+        result = providers::call_llm_simple_with_usage(&state.http, &resolved, &compress_prompt, &workspace, config.s3.as_ref(), config.max_llm_retries) => {
             match result {
                 Ok(s) => s,
                 Err(e) => {
@@ -375,6 +377,47 @@ async fn handle_new_command(
             }
         }
     };
+
+    let provider_name = config.resolve_provider_name(&model_str);
+    let input_tokens = summary.input_tokens.unwrap_or_else(|| {
+        crate::estimate_tokens_for_provider(resolved.provider, &compress_prompt) as u64
+    });
+    let output_tokens = summary.output_tokens.unwrap_or_else(|| {
+        crate::message_token_len_for_provider(
+            resolved.provider,
+            &crate::ChatMessage {
+                role: "assistant".into(),
+                content: Some(summary.content.clone()),
+                images: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+        ) as u64
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(current_session_id) {
+            crate::update_session_token_usage_with_provider(
+                session,
+                input_tokens,
+                output_tokens,
+                if summary.input_tokens.is_some() {
+                    "provider"
+                } else {
+                    "estimated"
+                },
+                if summary.output_tokens.is_some() {
+                    "provider"
+                } else {
+                    "estimated"
+                },
+                Some(&provider_name),
+                Some(crate::context::USAGE_ROLE_CONTEXT),
+            );
+        }
+    }
+    let summary = summary.content;
 
     if !ws_send(
         tx,

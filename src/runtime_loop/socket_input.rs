@@ -156,7 +156,11 @@ pub(crate) async fn handle_idle_socket_input(
 
             ws_send(
                 tx,
-                &json!({"type":result.response_type,"content":result.response}),
+                &json!({
+                    "type": result.response_type,
+                    "content": result.response,
+                    "dismissible": result.dismissible,
+                }),
             )
             .await;
 
@@ -179,7 +183,11 @@ pub(crate) async fn handle_idle_socket_input(
         } else {
             ws_send(
                 tx,
-                &json!({"type":"system","content":"Unknown command. Type /help."}),
+                &json!({
+                    "type":"system",
+                    "content":"Unknown command. Type /help.",
+                    "dismissible": true,
+                }),
             )
             .await;
         }

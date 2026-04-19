@@ -336,6 +336,66 @@
   line-height: 1.6;
   padding: 0 4px;
 }
+.usage-role-section {
+  margin-bottom: 28px;
+}
+.usage-role-breakdown {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.usage-role-card {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 84%, white), var(--bg));
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  box-shadow: 0 8px 24px rgba(44,46,62,.04);
+}
+.usage-role-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+.usage-role-header h3 {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+.usage-role-chip {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent2);
+  background: color-mix(in srgb, var(--accent2) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent2) 18%, transparent);
+  border-radius: 999px;
+  padding: 4px 8px;
+}
+.usage-role-metrics {
+  display: grid;
+  gap: 12px;
+}
+.usage-role-metrics div {
+  display: grid;
+  gap: 4px;
+}
+.usage-role-kicker {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--dim);
+}
+.usage-role-metrics strong {
+  font-family: var(--font-mono);
+  font-size: 20px;
+  color: var(--text);
+}
+.usage-role-metrics span:last-child {
+  font-size: 12px;
+  color: var(--dim);
+}
 .usage-chart-section {
   margin-bottom: 28px;
 }
@@ -402,4 +462,5 @@
   }
   .settings-row label { min-width: auto; }
   .usage-summary { grid-template-columns: repeat(2, 1fr); }
+  .usage-role-breakdown { grid-template-columns: 1fr; }
 }

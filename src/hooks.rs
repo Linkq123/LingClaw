@@ -7,7 +7,10 @@ use tokio::sync::Mutex;
 use crate::{
     ChatMessage, Session, agent,
     config::{Config, Provider},
-    context::{context_input_budget_for_model, estimate_tokens_for_provider, turn_len},
+    context::{
+        USAGE_ROLE_CONTEXT, UsageUpdate, apply_usage_update, build_usage_labels,
+        context_input_budget_for_model, estimate_tokens_for_provider, turn_len,
+    },
     providers, truncate,
 };
 
@@ -33,6 +36,7 @@ pub(crate) enum HookOutput {
     ReplaceMessages {
         messages: Vec<ChatMessage>,
         events: Vec<serde_json::Value>,
+        usage: Option<UsageUpdate>,
     },
     /// Modify tool arguments before execution (BeforeToolExec only).
     ModifyToolArgs { args: serde_json::Value },
@@ -426,7 +430,7 @@ impl AgentHook for AutoCompressContextHook {
             // Use context_model → primary fallback chain for compression.
             let compress_model = config.context_model_or(&input.model);
             let resolved = config.resolve_model(compress_model);
-            let summary = match providers::call_llm_simple(
+            let summary = match providers::call_llm_simple_with_usage(
                 http,
                 &resolved,
                 &prompt,
@@ -436,7 +440,7 @@ impl AgentHook for AutoCompressContextHook {
             )
             .await
             {
-                Ok(summary) if !summary.trim().is_empty() => summary,
+                Ok(summary) if !summary.content.trim().is_empty() => summary,
                 Ok(_) => return HookOutput::NoOp,
                 Err(e) => {
                     // Emit failure event so the frontend can inform the user.
@@ -446,14 +450,23 @@ impl AgentHook for AutoCompressContextHook {
                             "type": "context_compress_failed",
                             "error": e.to_string(),
                         })],
+                        usage: None,
                     };
                 }
             };
 
-            let messages = build_compressed_messages(&input.messages, compress_end, &summary);
+            let summary_text = summary.content;
+            let messages = build_compressed_messages(&input.messages, compress_end, &summary_text);
             let after_estimate = estimate_tokens_for_provider(input.provider, &messages);
             let removed_messages = compress_end.saturating_sub(1);
             let summary_tokens = estimate_tokens_for_provider(input.provider, &messages[1..2]);
+            let provider_name = config.resolve_provider_name(compress_model);
+            let input_tokens = summary
+                .input_tokens
+                .unwrap_or_else(|| estimate_tokens_for_provider(resolved.provider, &prompt) as u64);
+            let output_tokens = summary.output_tokens.unwrap_or_else(|| {
+                estimate_tokens_for_provider(resolved.provider, &messages[1..2]) as u64
+            });
 
             HookOutput::ReplaceMessages {
                 messages,
@@ -464,6 +477,26 @@ impl AgentHook for AutoCompressContextHook {
                     summary_tokens,
                     existing_summary.is_some(),
                 )],
+                usage: Some(UsageUpdate {
+                    input_tokens,
+                    output_tokens,
+                    input_source: if summary.input_tokens.is_some() {
+                        "provider".to_string()
+                    } else {
+                        "estimated".to_string()
+                    },
+                    output_source: if summary.output_tokens.is_some() {
+                        "provider".to_string()
+                    } else {
+                        "estimated".to_string()
+                    },
+                    labels: build_usage_labels(
+                        input_tokens,
+                        output_tokens,
+                        Some(&provider_name),
+                        Some(USAGE_ROLE_CONTEXT),
+                    ),
+                }),
             }
         })
     }
@@ -537,11 +570,15 @@ pub(crate) async fn run_hooks(
             HookOutput::ReplaceMessages {
                 messages: new_msgs,
                 events: hook_events,
+                usage,
             } => {
                 let mut sessions_guard = sessions.lock().await;
                 if let Some(session) = sessions_guard.get_mut(session_id) {
                     session.messages = new_msgs;
                     session.updated_at = crate::now_epoch();
+                    if let Some(usage) = usage.as_ref() {
+                        apply_usage_update(session, usage);
+                    }
                 }
                 events.extend(hook_events);
             }

@@ -23,12 +23,14 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
 - **持久化主会话**：固定保存 `main` 工作区和磁盘存档
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
-- **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端，增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、输入框上下键历史导航（最多 10 条）；Settings 页面支持在线编辑配置、Provider 连接测试、MCP Server 连接测试；Usage 页面显示 Token 用量统计和图表
+- **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端，增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、输入框上下键历史导航（最多 10 条）；Settings 页面支持在线编辑配置、Provider 连接测试、MCP Server 连接测试；Usage 页面显示 Token 用量统计、按 Model Role 拆分的明细卡片与图表
 - **图片附件**：支持通过 URL 或本地 JPEG/PNG 上传附加图片到用户消息；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；私网、localhost 或仅局域网可达的网关仅保证 Ollama 可用，因为 LingClaw 会本地预取为 base64 并持久化缓存到会话工作区；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
 - **Structured Memory（可选）**：启用 `structuredMemory` 后，Finish 阶段会异步抽取稳定偏好、项目上下文和长期事实，写入 workspace 下的 `structured_memory.json`，并记录 `structured_memory.audit.jsonl` 诊断轨迹；`/memory`、`/memory stats`、`/memory debug` 可查看状态与最近审计信息
 - **Daily Reflection（可选）**：启用 `dailyReflection` 后，多步任务完成时会在 Finish 后台异步生成简短 reflection，追加到 workspace 下的 `memory/YYYY-MM-DD.md`；`/reflection`、`/reflection today`、`/reflection yesterday`、`/reflection list` 可查看状态和已过滤的 reflection 条目
+- **更细粒度的 Token 统计**：Primary、Fast、Sub-Agent、Memory、Reflection、Context 六类模型角色都会分别累计 token；`/new` 压缩、自动上下文压缩、Structured Memory 和 Daily Reflection 的非流式调用也会计入 Usage
+- **可关闭的 Slash Command 卡片**：聊天页中由斜杠命令返回的 `success`、`system`、`error` 卡片支持点击关闭；运行进度和自动压缩通知仍保持常驻提示
 - **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环，`evaluate_finish()` 结构化完成判定，`auto_think_level()` 按循环深度动态调整推理预算
 - **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留；错误工具标记 `[FAILED]` 并附带耗时
 - **推理可见性控制**：默认开启 ReAct 阶段转换 WS 事件（`react_phase`），可通过 `/react on|off` 手动切换；浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
@@ -285,6 +287,10 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 | `/memory [stats\|debug]` | 查看当前 structured memory 摘要与 updater 状态；`stats` 仅显示运行状态，`debug` 额外显示最近审计记录 |
 | `/reflection [today\|yesterday\|list]` | 查看当前 daily reflection 状态与 reflection 条目；默认显示 feature 状态、冷却信息和今天的 reflection 预览，`list` 只列出实际包含 reflection 的日期文件 |
 | `/help` | 命令帮助 |
+
+聊天页里由斜杠命令生成的 `success`、`system`、`error` 卡片支持点击右上角关闭；`progress`、`context_pruned`、`context_compressed`、`context_compress_failed` 这类运行态通知不提供关闭按钮。
+
+Settings → Usage 页面除了现有今日/累计图表外，还会显示按 `Primary`、`Fast`、`Sub-Agent`、`Memory`、`Reflection`、`Context` 划分的 Token Breakdown。对于升级前已经存在的旧会话，角色级累计值会从 0.5.6 开始逐步建立；旧快照中仍保留的 provider 数据会继续在历史图表里展示。
 
 ## Tools
 
@@ -828,7 +834,7 @@ think_level 映射：
 | `/api/config` | PUT | 校验并保存 JSON 配置文件（原子写入 + 备份恢复） |
 | `/api/config/test-model` | POST | 测试模型 Provider 连接（发送 "Hi" 并检查响应） |
 | `/api/config/test-mcp` | POST | 测试 MCP Server 连接（spawn + tools/list） |
-| `/api/usage` | GET | 返回 Token 用量统计（今日/累计/来源） |
+| `/api/usage` | GET | 返回 Token 用量统计（今日/累计/来源），并额外提供 `daily_roles`、`total_providers`、`total_roles`，以及按天拆分后的 `usage_history[].providers` / `usage_history[].roles` |
 | `/api/upload-images` | POST | 上传本地图片到 S3（需启用 S3 配置） |
 | `/api/shutdown` | POST | 认证的本地关停端点（CLI 使用） |
 | `/ws` | GET | WebSocket 升级端点 |

@@ -3,6 +3,7 @@ import { escHtml, formatTokenCount } from './utils.js';
 let cachedUsageData = null;
 let dailyRange = 7;
 let providerRange = 7;
+const ROLE_ORDER = ['Primary', 'Fast', 'Sub-Agent', 'Memory', 'Reflection', 'Context'];
 
 export function openUsagePage() {
   const page = document.getElementById('usage-page');
@@ -47,6 +48,7 @@ async function loadUsage() {
     }
     cachedUsageData = await resp.json();
     renderSummary(cachedUsageData);
+    renderRoleBreakdown(cachedUsageData);
     renderDailyChart(cachedUsageData, dailyRange);
     renderProviderChart(cachedUsageData, providerRange);
   } catch (e) {
@@ -90,6 +92,50 @@ function renderSummary(data) {
       <div class="usage-stat-label">All-Time Output</div>
     </div>
     <div class="usage-summary-note">${sourceNote}</div>`;
+}
+
+function normalizeUsagePair(pair) {
+  return {
+    input: Array.isArray(pair) ? (pair[0] || 0) : 0,
+    output: Array.isArray(pair) ? (pair[1] || 0) : 0,
+  };
+}
+
+function renderRoleBreakdown(data) {
+  const container = document.getElementById('usage-role-breakdown');
+  if (!container) return;
+
+  const dailyRoles = data.daily_roles || {};
+  const totalRoles = data.total_roles || {};
+  const names = Array.from(new Set([
+    ...ROLE_ORDER,
+    ...Object.keys(dailyRoles),
+    ...Object.keys(totalRoles),
+  ])).filter(Boolean);
+
+  container.innerHTML = names.map(name => {
+    const today = normalizeUsagePair(dailyRoles[name]);
+    const total = normalizeUsagePair(totalRoles[name]);
+    return `
+      <article class="usage-role-card">
+        <div class="usage-role-header">
+          <h3>${escHtml(name)}</h3>
+          <span class="usage-role-chip">${formatTokenCount(total.input + total.output)}</span>
+        </div>
+        <div class="usage-role-metrics">
+          <div>
+            <span class="usage-role-kicker">Today</span>
+            <strong>${formatTokenCount(today.input + today.output)}</strong>
+            <span>${formatTokenCount(today.input)} in / ${formatTokenCount(today.output)} out</span>
+          </div>
+          <div>
+            <span class="usage-role-kicker">All-Time</span>
+            <strong>${formatTokenCount(total.input + total.output)}</strong>
+            <span>${formatTokenCount(total.input)} in / ${formatTokenCount(total.output)} out</span>
+          </div>
+        </div>
+      </article>`;
+  }).join('');
 }
 
 // ── Daily line chart ──

@@ -48,7 +48,7 @@ pub(crate) use config::{Config, DEFAULT_PORT, Provider, config_dir_path, config_
 pub(crate) use context::{
     accumulate_daily_token_usage, context_input_budget_for_model, current_daily_token_usage,
     estimate_tokens_for_provider, format_token_count, format_usage_block,
-    message_token_len_for_provider, update_session_token_usage_with_provider,
+    message_token_len_for_provider, split_usage_labels, update_session_token_usage_with_provider,
     update_session_token_usage_with_providers,
 };
 pub(crate) use hooks::{
@@ -200,9 +200,12 @@ struct Session {
     output_token_source: String,
     #[serde(default)]
     token_usage_day: String,
-    /// Per-provider daily token counters (reset on day boundary together with daily totals).
+    /// Per-day usage labels (provider:* / role:*) reset together with daily totals.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     daily_provider_usage: HashMap<String, [u64; 2]>,
+    /// Lifetime usage labels (provider:* / role:*), never reset unless the session is deleted.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    total_label_usage: HashMap<String, [u64; 2]>,
     /// Historical daily usage snapshots (capped at USAGE_HISTORY_CAP days).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     usage_history: Vec<DailyUsageSnapshot>,
@@ -237,7 +240,7 @@ pub(crate) struct DailyUsageSnapshot {
     pub(crate) input: u64,
     #[serde(default)]
     pub(crate) output: u64,
-    /// Per-provider breakdown: provider label → [input, output].
+    /// Per-day usage labels (legacy raw provider names or provider:* / role:*).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub(crate) providers: HashMap<String, [u64; 2]>,
 }
@@ -308,6 +311,7 @@ impl Session {
             output_token_source: default_token_usage_source(),
             token_usage_day: prompts::current_local_snapshot().today(),
             daily_provider_usage: HashMap::new(),
+            total_label_usage: HashMap::new(),
             usage_history: Vec::new(),
             model_override: None,
             think_level: default_think_level(),
@@ -331,7 +335,7 @@ const UPLOAD_TOKEN_HEADER: &str = "x-lingclaw-upload-token";
 struct AppState {
     config: std::sync::Mutex<Arc<Config>>,
     http: Client,
-    sessions: Mutex<HashMap<String, Session>>,
+    sessions: Arc<Mutex<HashMap<String, Session>>>,
     /// Session IDs with the connection currently attached to live streaming output.
     active_connections: Mutex<HashMap<String, u64>>,
     session_clients: Mutex<HashMap<String, SessionClientBinding>>,
@@ -2077,8 +2081,27 @@ async fn api_usage(
         output_source,
         usage_history,
         daily_providers,
+        daily_roles,
+        total_providers,
+        total_roles,
     ) = if let Some(session) = session {
         context::rollover_daily_usage_if_needed(session);
+        let (daily_providers, daily_roles) = split_usage_labels(&session.daily_provider_usage);
+        let (total_providers, total_roles) = split_usage_labels(&session.total_label_usage);
+        let usage_history = session
+            .usage_history
+            .iter()
+            .map(|snapshot| {
+                let (providers, roles) = split_usage_labels(&snapshot.providers);
+                json!({
+                    "date": snapshot.date,
+                    "input": snapshot.input,
+                    "output": snapshot.output,
+                    "providers": providers,
+                    "roles": roles,
+                })
+            })
+            .collect::<Vec<_>>();
         (
             session.daily_input_tokens,
             session.daily_output_tokens,
@@ -2086,8 +2109,11 @@ async fn api_usage(
             session.output_tokens,
             session.input_token_source.clone(),
             session.output_token_source.clone(),
-            serde_json::to_value(&session.usage_history).unwrap_or_else(|_| json!([])),
-            serde_json::to_value(&session.daily_provider_usage).unwrap_or_else(|_| json!({})),
+            serde_json::to_value(usage_history).unwrap_or_else(|_| json!([])),
+            serde_json::to_value(daily_providers).unwrap_or_else(|_| json!({})),
+            serde_json::to_value(daily_roles).unwrap_or_else(|_| json!({})),
+            serde_json::to_value(total_providers).unwrap_or_else(|_| json!({})),
+            serde_json::to_value(total_roles).unwrap_or_else(|_| json!({})),
         )
     } else {
         (
@@ -2098,6 +2124,9 @@ async fn api_usage(
             default_token_usage_source(),
             default_token_usage_source(),
             json!([]),
+            json!({}),
+            json!({}),
+            json!({}),
             json!({}),
         )
     };
@@ -2113,6 +2142,9 @@ async fn api_usage(
         "source_scope": "latest_update",
         "usage_history": usage_history,
         "daily_providers": daily_providers,
+        "daily_roles": daily_roles,
+        "total_providers": total_providers,
+        "total_roles": total_roles,
     })))
 }
 
@@ -2298,8 +2330,10 @@ async fn main() {
     let mut hooks = HookRegistry::new();
     hooks.register(Box::new(AutoCompressContextHook::new()));
 
+    let sessions = Arc::new(Mutex::new(HashMap::new()));
+
     let memory_queue = if config.structured_memory {
-        Some(MemoryUpdateQueue::spawn(config.clone()))
+        Some(MemoryUpdateQueue::spawn(config.clone(), sessions.clone()))
     } else {
         None
     };
@@ -2338,7 +2372,7 @@ async fn main() {
     let state = Arc::new(AppState {
         config: std::sync::Mutex::new(Arc::new(config)),
         http,
-        sessions: Mutex::new(HashMap::new()),
+        sessions,
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),

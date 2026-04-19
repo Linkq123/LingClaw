@@ -403,11 +403,11 @@ export function createOrchestratePanel(data) {
     <span class="orchestrate-icon">🗺️</span>
     <span class="orchestrate-label">Orchestrate · ${data.task_count || 0} tasks · ${data.layer_count || 0} layers</span>
     <span class="orchestrate-status">执行中</span>
-    <span class="chevron open">▸</span>
+    <span class="chevron">▸</span>
   `;
 
   const body = document.createElement('div');
-  body.className = 'orchestrate-body show';
+  body.className = 'orchestrate-body';
 
   const overview = document.createElement('div');
   overview.className = 'orchestrate-overview';
@@ -537,7 +537,6 @@ export function markOrchestrateTask(data, status) {
 
   if (status === 'running') {
     setTaskPreview(row, data.prompt || row.dataset.promptPreview || '正在执行');
-    maybeOpenTaskDetails(row, true);
     pulseFocus(row);
   } else if (status === 'completed') {
     ensureTaskSection(row, 'result', '任务输出', data.result_excerpt || '', 'is-result');
@@ -608,6 +607,13 @@ export function finishOrchestratePanel(data) {
     `;
     summary.classList.remove('hidden');
   }
+
+  const body = panel.querySelector('.orchestrate-body');
+  const chevron = panel.querySelector('.orchestrate-header .chevron');
+  if (body?.classList.contains('show')) {
+    animateCollapsibleSection(body, false);
+  }
+  if (chevron) chevron.classList.remove('open');
 
   syncProgressVisuals(entry);
 

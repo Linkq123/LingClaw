@@ -165,7 +165,7 @@ fn test_app_state() -> AppState {
     AppState {
         config: std::sync::Mutex::new(Arc::new(test_config())),
         http: reqwest::Client::new(),
-        sessions: Mutex::new(HashMap::new()),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
@@ -184,7 +184,7 @@ fn test_app_state_with_config(config: Config) -> AppState {
     AppState {
         config: std::sync::Mutex::new(Arc::new(config)),
         http: reqwest::Client::new(),
-        sessions: Mutex::new(HashMap::new()),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
@@ -222,6 +222,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
         daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
         usage_history: Vec::new(),
         model_override: model_override.map(|value| value.to_string()),
         think_level: default_think_level(),
@@ -666,6 +667,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
         daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
         usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
@@ -718,6 +720,7 @@ fn build_history_payload_marks_failed_tool_result_with_is_error() {
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
         daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
         usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
@@ -772,6 +775,7 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
         daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
         usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
@@ -823,6 +827,7 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
         daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
         usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
@@ -2312,6 +2317,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
         daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
         usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
@@ -2388,6 +2394,7 @@ fn save_session_to_disk_overwrites_existing_file() {
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
         daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
         usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
@@ -2666,6 +2673,7 @@ async fn api_usage_rolls_over_stale_daily_usage_before_serializing() {
     assert_eq!(payload["daily_input"], 0);
     assert_eq!(payload["daily_output"], 0);
     assert_eq!(payload["daily_providers"], json!({}));
+    assert_eq!(payload["daily_roles"], json!({}));
     assert_eq!(
         payload["usage_history"],
         json!([{
@@ -2674,7 +2682,8 @@ async fn api_usage_rolls_over_stale_daily_usage_before_serializing() {
             "output": 3,
             "providers": {
                 "openai": [12, 3]
-            }
+            },
+            "roles": {}
         }])
     );
 
@@ -3208,6 +3217,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
         daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
         usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
