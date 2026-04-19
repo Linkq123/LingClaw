@@ -31,11 +31,13 @@ import { sendCmd, send, stopAgent, initInputListeners } from './input.js';
 import { toggleMobileMenu, closeMobileMenu, initMobileListeners } from './mobile.js';
 import {
   createSubagentPanel, addSubagentTool, updateSubagentProgress,
-  updateSubagentToolResult, finishSubagentPanel
+  updateSubagentToolResult, finishSubagentPanel,
+  toggleSubagentTools, focusSubagentCurrent, copySubagentSummary
 } from './renderers/subagent.js';
 import {
   createOrchestratePanel, updateOrchestrateLayer, markOrchestrateTask,
-  finishOrchestratePanel
+  finishOrchestratePanel, toggleOrchestrateTasks,
+  focusOrchestrateActive, copyOrchestrateSummary
 } from './renderers/orchestrate.js';
 import { openSettingsPage, closeSettingsPage, initSettingsListeners } from './settings.js';
 import { openUsagePage, closeUsagePage, initUsageListeners } from './usage.js';
@@ -232,7 +234,12 @@ function renderHistoryMessage(m, options = {}) {
             orchestrate_id: orchestrateId,
             task_count: tasks.length,
             layer_count: 0,
-            tasks: tasks.map(t => ({ id: t.id, agent: t.agent, depends_on: t.depends_on || [] })),
+            tasks: tasks.map(t => ({
+              id: t.id,
+              agent: t.agent,
+              depends_on: t.depends_on || [],
+              prompt_preview: t.prompt || '',
+            })),
           });
           if (!state._historyOrchestrateIds) state._historyOrchestrateIds = new Map();
           state._historyOrchestrateIds.set(m.id, orchestrateId);
@@ -539,7 +546,14 @@ function handleMessage(data) {
 
     case 'tool_result':
       if (data.subagent) {
-        updateSubagentToolResult({ task_id: data.task_id, agent: data.subagent }, data.id, data.duration_ms);
+        updateSubagentToolResult(
+          { task_id: data.task_id, agent: data.subagent },
+          data.id,
+          data.duration_ms,
+          data.result,
+          data.is_error,
+          data.name,
+        );
         break;
       }
       if (state.reactStatusPhase === 'act' && state.reactStatusToolName === data.name) {
@@ -556,7 +570,7 @@ function handleMessage(data) {
       updateSubagentProgress({ task_id: data.task_id, agent: data.agent }, data.cycle);
       break;
     case 'task_tool':
-      addSubagentTool({ task_id: data.task_id, agent: data.agent }, data.tool, data.id);
+      addSubagentTool({ task_id: data.task_id, agent: data.agent }, data.tool, data.id, data.arguments);
       break;
     case 'task_completed':
       finishSubagentPanel(
@@ -569,6 +583,7 @@ function handleMessage(data) {
           input_tokens: data.input_tokens,
           output_tokens: data.output_tokens,
           result_preview: data.result_preview,
+          result_excerpt: data.result_excerpt,
         }
       );
       break;
@@ -671,6 +686,12 @@ const actionHandlers = {
   'load-earlier': () => loadEarlierMessages(),
   'open-tool-drawer': (el) => openToolDrawerFromHeader(el),
   'toggle-tool': (el) => toggleTool(el),
+  'subagent-toggle-all': (el) => toggleSubagentTools(el),
+  'subagent-focus-current': (el) => focusSubagentCurrent(el),
+  'subagent-copy-summary': (el) => copySubagentSummary(el),
+  'orchestrate-toggle-all': (el) => toggleOrchestrateTasks(el),
+  'orchestrate-focus-active': (el) => focusOrchestrateActive(el),
+  'orchestrate-copy-summary': (el) => copyOrchestrateSummary(el),
 };
 
 document.addEventListener('click', (e) => {

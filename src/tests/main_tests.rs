@@ -4804,9 +4804,9 @@ fn replay_live_round_rehydrates_active_orchestration_state() {
             "task_count": 3,
             "layer_count": 2,
             "tasks": [
-                {"id": "code", "agent": "explore", "depends_on": []},
-                {"id": "docs", "agent": "researcher", "depends_on": []},
-                {"id": "plan", "agent": "coder", "depends_on": ["code", "docs"]}
+                {"id": "code", "agent": "explore", "depends_on": [], "prompt_preview": "Analyze codebase structure"},
+                {"id": "docs", "agent": "researcher", "depends_on": [], "prompt_preview": "Read docs and changelog"},
+                {"id": "plan", "agent": "coder", "depends_on": ["code", "docs"], "prompt_preview": "Draft final plan"}
             ],
         }),
     ));
@@ -4884,6 +4884,7 @@ fn replay_live_round_rehydrates_active_orchestration_state() {
             "input_tokens": 11,
             "output_tokens": 7,
             "duration_ms": 250,
+            "result_excerpt": "Code structure summarized",
         }),
     ));
 
@@ -4906,6 +4907,10 @@ fn replay_live_round_rehydrates_active_orchestration_state() {
     assert_eq!(replayed[0]["type"], "start");
     assert_eq!(replayed[1]["type"], "orchestrate_started");
     assert_eq!(replayed[1]["orchestrate_id"], "orch-1");
+    assert_eq!(
+        replayed[1]["tasks"][0]["prompt_preview"],
+        "Analyze codebase structure"
+    );
     assert_eq!(replayed[2]["type"], "orchestrate_layer");
     assert_eq!(replayed[2]["layer"], 1);
     assert_eq!(replayed[3]["type"], "orchestrate_task_started");
@@ -4919,6 +4924,7 @@ fn replay_live_round_rehydrates_active_orchestration_state() {
     assert_eq!(replayed[6]["task_id"], "orch-1:docs");
     assert_eq!(replayed[7]["type"], "orchestrate_task_completed");
     assert_eq!(replayed[7]["id"], "code");
+    assert_eq!(replayed[7]["result_excerpt"], "Code structure summarized");
 }
 
 #[test]
@@ -4951,7 +4957,14 @@ fn replay_preserves_completed_standalone_task_until_round_ends() {
         &state,
         &session_id,
         1,
-        json!({"type":"task_tool","task_id":"t-1","agent":"coder","tool":"read_file","id":"tl-1"}),
+        json!({
+            "type":"task_tool",
+            "task_id":"t-1",
+            "agent":"coder",
+            "tool":"read_file",
+            "id":"tl-1",
+            "arguments":"{\"path\":\"README.md\"}"
+        }),
     ));
     // Task completes —should still be replayable until round "done"
     rt.block_on(dispatch_live_event(
@@ -4961,6 +4974,7 @@ fn replay_preserves_completed_standalone_task_until_round_ends() {
         json!({
             "type":"task_completed","task_id":"t-1","agent":"coder",
             "cycles":2,"tool_calls":1,"duration_ms":500,
+            "result_excerpt":"Delegated analysis complete"
         }),
     ));
 
@@ -4983,8 +4997,10 @@ fn replay_preserves_completed_standalone_task_until_round_ends() {
     assert_eq!(replayed[1]["type"], "task_started");
     assert_eq!(replayed[1]["task_id"], "t-1");
     assert_eq!(replayed[2]["type"], "task_tool");
+    assert_eq!(replayed[2]["arguments"], "{\"path\":\"README.md\"}");
     assert_eq!(replayed[3]["type"], "task_completed");
     assert_eq!(replayed[3]["task_id"], "t-1");
+    assert_eq!(replayed[3]["result_excerpt"], "Delegated analysis complete");
 }
 
 #[test]

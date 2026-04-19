@@ -221,6 +221,7 @@ async fn emit_subagent_tool_result_event(
             "subagent": agent_name,
             "id": tool_id,
             "name": tool_name,
+            "result": crate::truncate(&outcome.output, 8_000),
             "duration_ms": outcome.duration_ms,
             "is_error": outcome.is_error,
         }),
@@ -556,6 +557,7 @@ pub(crate) async fn run_subagent(
                                     "agent": spec.name,
                                     "tool": tc.function.name,
                                     "id": tc.id,
+                                    "arguments": crate::truncate(&effective_args, 4_000),
                                 }),
                             )
                             .await;
@@ -735,6 +737,12 @@ pub(crate) async fn run_subagent(
                                     "agent": spec.name,
                                     "tool": tc.function.name,
                                     "id": tc.id,
+                                    "arguments": crate::truncate(
+                                        he.effective_args
+                                            .as_deref()
+                                            .unwrap_or(&tc.function.arguments),
+                                        4_000,
+                                    ),
                                 }),
                             )
                             .await;

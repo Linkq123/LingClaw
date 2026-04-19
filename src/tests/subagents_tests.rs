@@ -1157,6 +1157,10 @@ async fn run_subagent_emits_tool_result_event_for_completed_tool() {
                 assert_eq!(event["agent"].as_str(), Some("tool-result-agent"));
                 assert_eq!(event["tool"].as_str(), Some("read_file"));
                 assert_eq!(event["id"].as_str(), Some("call_1"));
+                assert_eq!(
+                    event["arguments"].as_str(),
+                    Some("{\"path\":\"notes.txt\"}")
+                );
             }
             Some("tool_result") => {
                 saw_tool_result = true;
@@ -1165,6 +1169,11 @@ async fn run_subagent_emits_tool_result_event_for_completed_tool() {
                 assert_eq!(event["name"].as_str(), Some("read_file"));
                 assert_eq!(event["id"].as_str(), Some("call_1"));
                 assert_eq!(event["is_error"].as_bool(), Some(false));
+                assert!(
+                    event["result"]
+                        .as_str()
+                        .is_some_and(|result| result.contains("alpha"))
+                );
                 assert!(event["duration_ms"].as_u64().is_some());
             }
             _ => {}
@@ -1251,15 +1260,35 @@ async fn run_subagent_sequential_tools_emit_interleaved_tool_events() {
     assert_eq!(tool_events[0]["type"], "task_tool");
     assert_eq!(tool_events[0]["id"], "call_1");
     assert_eq!(tool_events[0]["tool"], "read_file");
+    assert!(
+        tool_events[0]["arguments"]
+            .as_str()
+            .is_some_and(|args| args.contains("notes.txt"))
+    );
     assert_eq!(tool_events[1]["type"], "tool_result");
     assert_eq!(tool_events[1]["id"], "call_1");
     assert_eq!(tool_events[1]["name"], "read_file");
+    assert!(
+        tool_events[1]["result"]
+            .as_str()
+            .is_some_and(|result| result.contains("alpha"))
+    );
     assert_eq!(tool_events[2]["type"], "task_tool");
     assert_eq!(tool_events[2]["id"], "call_2");
     assert_eq!(tool_events[2]["tool"], "exec");
+    assert!(
+        tool_events[2]["arguments"]
+            .as_str()
+            .is_some_and(|args| args.contains("echo sequential"))
+    );
     assert_eq!(tool_events[3]["type"], "tool_result");
     assert_eq!(tool_events[3]["id"], "call_2");
     assert_eq!(tool_events[3]["name"], "exec");
+    assert!(
+        tool_events[3]["result"]
+            .as_str()
+            .is_some_and(|result| result.contains("sequential"))
+    );
 
     let _ = fs::remove_dir_all(&workspace);
 }

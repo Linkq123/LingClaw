@@ -441,6 +441,7 @@ pub(crate) async fn execute_orchestration(
                 "id": t.id,
                 "agent": t.agent,
                 "depends_on": t.depends_on,
+                "prompt_preview": truncate(&t.prompt, 240),
             })
         })
         .collect();
@@ -803,6 +804,7 @@ async fn execute_single_task(
                 "input_tokens": outcome.total_input_tokens,
                 "output_tokens": outcome.total_output_tokens,
                 "duration_ms": duration_ms,
+                "result_excerpt": truncate(&outcome.result, 1_500),
             }),
         )
         .await;

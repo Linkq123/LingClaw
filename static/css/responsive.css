@@ -73,7 +73,9 @@
   .msg-row { max-width: 95%; }
   .msg-row.assistant { width: 95%; min-width: 0; }
   .reasoning-panel,
-  .tool-panel {
+  .tool-panel,
+  .subagent-panel,
+  .orchestrate-panel {
     width: 95%;
     max-width: 95%;
     min-width: 0;
@@ -111,6 +113,31 @@
     bottom: var(--tool-drawer-bottom);
     right: 8px;
     width: calc(100vw - 16px);
+  }
+  .subagent-header,
+  .orchestrate-header,
+  .subagent-tool-summary,
+  .orchestrate-task-summary,
+  .orchestrate-task-title {
+    flex-wrap: wrap;
+  }
+  .panel-actions {
+    width: 100%;
+  }
+  .panel-action-btn {
+    flex: 1 1 calc(50% - 4px);
+  }
+  .orchestrate-overview {
+    gap: 10px;
+  }
+  .subagent-header .subagent-status,
+  .orchestrate-status,
+  .subagent-tool-status,
+  .orchestrate-task-status {
+    margin-left: 0;
+  }
+  .subagent-summary-head {
+    align-items: stretch;
   }
   #jump-to-latest {
     right: 12px;

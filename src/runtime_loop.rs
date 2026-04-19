@@ -810,6 +810,7 @@ async fn execute_task_tool(
             "output_tokens": outcome.total_output_tokens,
             "duration_ms": duration_ms,
             "result_preview": crate::truncate(&outcome.result, 400),
+            "result_excerpt": crate::truncate(&outcome.result, 4_000),
         })
     };
     let _ = live_send(live_tx, terminal_event).await;

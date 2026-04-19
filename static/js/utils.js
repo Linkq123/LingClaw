@@ -42,6 +42,69 @@ export function fallbackCopy(text) {
   document.body.removeChild(ta);
 }
 
+export function copyText(text) {
+  const value = String(text ?? '');
+  if (!value) return Promise.resolve(false);
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    return navigator.clipboard.writeText(value)
+      .then(() => true)
+      .catch(() => {
+        fallbackCopy(value);
+        return true;
+      });
+  }
+  fallbackCopy(value);
+  return Promise.resolve(true);
+}
+
+export function formatDetailText(text) {
+  const raw = String(text ?? '');
+  if (!raw) return '';
+  try {
+    return JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    return raw;
+  }
+}
+
+export function inlinePreview(text, max = 100) {
+  return truncateStr(String(text ?? '').replace(/\s+/g, ' ').trim(), max);
+}
+
+export function pulseFocus(el) {
+  if (!el) return;
+  el.classList.remove('focus-flash');
+  void el.offsetWidth;
+  el.classList.add('focus-flash');
+  if (el._focusFlashTimer) window.clearTimeout(el._focusFlashTimer);
+  el._focusFlashTimer = window.setTimeout(() => {
+    el.classList.remove('focus-flash');
+  }, 1100);
+}
+
+export async function copyButtonText(button, text, idleLabel) {
+  const payload = String(text ?? '').trim();
+  if (!button || !payload) return;
+
+  const original = button.dataset.idleLabel || idleLabel || button.textContent || '复制摘要';
+  button.dataset.idleLabel = original;
+  button.disabled = true;
+  button.textContent = '复制中…';
+
+  try {
+    await copyText(payload);
+    button.textContent = '已复制';
+  } catch {
+    button.textContent = '复制失败';
+  }
+
+  if (button._resetLabelTimer) window.clearTimeout(button._resetLabelTimer);
+  button._resetLabelTimer = window.setTimeout(() => {
+    button.disabled = false;
+    button.textContent = original;
+  }, 1200);
+}
+
 export function afterNextPaint(callback) {
   requestAnimationFrame(() => requestAnimationFrame(callback));
 }
