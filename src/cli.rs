@@ -2011,6 +2011,221 @@ pub(crate) fn handle_cli_command(cmd: &str, port_override: Option<u16>) -> bool 
 
 // ── Setup Wizard ─────────────────────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WizardProviderKind {
+    OpenAI,
+    Anthropic,
+    Ollama,
+}
+
+impl WizardProviderKind {
+    fn from_choice(choice: usize) -> Option<Self> {
+        match choice {
+            0 => Some(Self::OpenAI),
+            1 => Some(Self::Anthropic),
+            2 => Some(Self::Ollama),
+            _ => None,
+        }
+    }
+
+    fn api_kind(self) -> &'static str {
+        match self {
+            Self::OpenAI => "openai-completions",
+            Self::Anthropic => "anthropic",
+            Self::Ollama => "ollama",
+        }
+    }
+
+    fn default_base_url(self) -> &'static str {
+        match self {
+            Self::OpenAI => "https://api.openai.com/v1",
+            Self::Anthropic => "https://api.anthropic.com",
+            Self::Ollama => "http://127.0.0.1:11434",
+        }
+    }
+
+    fn default_provider_name(self) -> &'static str {
+        match self {
+            Self::OpenAI => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Ollama => "ollama",
+        }
+    }
+
+    fn fallback_model_id(self) -> &'static str {
+        match self {
+            Self::OpenAI => "gpt-4o-mini",
+            Self::Anthropic => "claude-sonnet-4-20250514",
+            Self::Ollama => "qwen3",
+        }
+    }
+
+    fn preferred_fast_model_id(self) -> Option<&'static str> {
+        match self {
+            Self::OpenAI => Some("gpt-4o-mini"),
+            Self::Anthropic => Some("claude-haiku-3-20250306"),
+            Self::Ollama => None,
+        }
+    }
+
+    fn api_key_prompt(self) -> &'static str {
+        match self {
+            Self::OpenAI | Self::Anthropic => "  API Key: ",
+            Self::Ollama => "  API Key (optional, leave empty for local Ollama): ",
+        }
+    }
+}
+
+fn wizard_next_provider_name(
+    kind: WizardProviderKind,
+    providers: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let base = kind.default_provider_name();
+    if !providers.contains_key(base) {
+        return base.to_string();
+    }
+
+    let mut suffix = 2_usize;
+    loop {
+        let candidate = format!("{base}-{suffix}");
+        if !providers.contains_key(&candidate) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn wizard_validate_provider_name(
+    name: &str,
+    providers: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    crate::config::validate_provider_name(name)?;
+    if providers.contains_key(name) {
+        return Err(format!("Provider name '{name}' already exists."));
+    }
+    Ok(())
+}
+
+fn prompt_wizard_provider_name(
+    kind: WizardProviderKind,
+    providers: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let suggested = wizard_next_provider_name(kind, providers);
+    loop {
+        let input = prompt_line(&format!("  Provider name [{suggested}]: "));
+        let name = if input.is_empty() {
+            suggested.clone()
+        } else {
+            input
+        };
+        match wizard_validate_provider_name(&name, providers) {
+            Ok(()) => return name,
+            Err(err) => println!("  {err}"),
+        }
+    }
+}
+
+fn wizard_build_provider_entry(
+    kind: WizardProviderKind,
+    base_url: String,
+    api_key: String,
+) -> serde_json::Value {
+    json!({
+        "baseUrl": base_url,
+        "apiKey": api_key,
+        "api": kind.api_kind(),
+        "models": []
+    })
+}
+
+fn configure_wizard_provider_models(
+    provider_name: &str,
+) -> (Vec<serde_json::Value>, Option<String>) {
+    println!();
+    println!("   Configure models for provider '{provider_name}'.");
+    println!("   Enter model details (leave Name empty to finish):");
+
+    let mut models_list: Vec<serde_json::Value> = Vec::new();
+    let mut first_model_ref: Option<String> = None;
+    loop {
+        println!();
+        let name = prompt_line("  Model Name (empty to finish): ");
+        if name.is_empty() {
+            break;
+        }
+        let id = prompt_line(&format!("  Model ID [{name}]: "));
+        let id = if id.is_empty() { name.clone() } else { id };
+
+        let reasoning_str = prompt_line("  Reasoning? (y/N): ").to_lowercase();
+        let reasoning = reasoning_str == "y" || reasoning_str == "yes";
+
+        let input_str = prompt_line("  Input types [text]: ");
+        let input: Vec<String> = if input_str.is_empty() {
+            vec!["text".to_string()]
+        } else {
+            input_str.split(',').map(|s| s.trim().to_string()).collect()
+        };
+
+        let ctx_str = prompt_line("  Context window tokens [128000]: ");
+        let context_window: u64 = ctx_str.parse().unwrap_or(128000);
+
+        let max_str = prompt_line("  Max output tokens [32768]: ");
+        let max_tokens: u64 = max_str.parse().unwrap_or(32768);
+
+        let thinking_fmt = prompt_line("  Thinking format (empty=none, e.g. qwen/openai): ");
+
+        let mut model = json!({
+            "id": id,
+            "name": name,
+            "reasoning": reasoning,
+            "input": input,
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": context_window,
+            "maxTokens": max_tokens,
+        });
+        if !thinking_fmt.is_empty() {
+            model["compat"] = json!({ "thinkingFormat": thinking_fmt });
+        }
+
+        if first_model_ref.is_none() {
+            first_model_ref = Some(format!("{provider_name}/{id}"));
+        }
+        println!("   ✅ Added {name}");
+        models_list.push(model);
+    }
+
+    (models_list, first_model_ref)
+}
+
+fn wizard_suggested_fast_model(
+    providers: &serde_json::Map<String, serde_json::Value>,
+    primary_model: Option<&str>,
+) -> Option<String> {
+    let primary_model = primary_model?;
+    let (provider_name, _) = primary_model.split_once('/')?;
+    let provider = providers.get(provider_name)?;
+    let api_kind = provider.get("api").and_then(|value| value.as_str())?;
+    let kind = match api_kind {
+        "anthropic" => WizardProviderKind::Anthropic,
+        "ollama" => WizardProviderKind::Ollama,
+        _ => WizardProviderKind::OpenAI,
+    };
+    if let Some(fast_model_id) = kind.preferred_fast_model_id()
+        && provider
+            .get("models")
+            .and_then(|value| value.as_array())
+            .is_some_and(|models| {
+                models.iter().any(|model| {
+                    model.get("id").and_then(|value| value.as_str()) == Some(fast_model_id)
+                })
+            })
+    {
+        return Some(format!("{provider_name}/{fast_model_id}"));
+    }
+
+    Some(primary_model.to_string())
+}
+
 pub(crate) fn run_setup_wizard(force: bool) -> bool {
     let config_path = match config_file_path() {
         Some(p) => p,
@@ -2066,143 +2281,59 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     println!();
 
     // ── Step 2: Model/Auth Provider ──────────────────────────────────────
-    println!("2. Model/auth provider");
+    println!("2. Model/auth providers");
+    println!("   You can add multiple providers. Provider names become the model prefix.");
     println!();
-    let provider_choice = prompt_choice(&["OpenAI", "Anthropic", "Ollama", "Skip for now"]);
-
     let mut providers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     let mut default_model: Option<String> = None;
+    let mut fallback_default_model: Option<String> = None;
 
-    match provider_choice {
-        0 => {
-            // OpenAI
-            println!();
-            let base_url = prompt_line("  Base URL [https://api.openai.com/v1]: ");
-            let base_url = if base_url.is_empty() {
-                "https://api.openai.com/v1".to_string()
-            } else {
-                base_url
-            };
-            let api_key = prompt_secret("  API Key: ");
-            providers.insert(
-                "openai".to_string(),
-                json!({
-                    "baseUrl": base_url,
-                    "apiKey": api_key,
-                    "api": "openai-completions",
-                    "models": []
-                }),
-            );
-            default_model = Some("openai/gpt-4o-mini".to_string());
-        }
-        1 => {
-            // Anthropic
-            println!();
-            let base_url = prompt_line("  Base URL [https://api.anthropic.com]: ");
-            let base_url = if base_url.is_empty() {
-                "https://api.anthropic.com".to_string()
-            } else {
-                base_url
-            };
-            let api_key = prompt_secret("  API Key: ");
-            providers.insert(
-                "anthropic".to_string(),
-                json!({
-                    "baseUrl": base_url,
-                    "apiKey": api_key,
-                    "api": "anthropic",
-                    "models": []
-                }),
-            );
-            default_model = Some("anthropic/claude-sonnet-4-20250514".to_string());
-        }
-        2 => {
-            // Ollama
-            println!();
-            let base_url = prompt_line("  Base URL [http://127.0.0.1:11434]: ");
-            let base_url = if base_url.is_empty() {
-                "http://127.0.0.1:11434".to_string()
-            } else {
-                base_url
-            };
-            let api_key = prompt_secret("  API Key (optional, leave empty for local Ollama): ");
-            providers.insert(
-                "ollama".to_string(),
-                json!({
-                    "baseUrl": base_url,
-                    "apiKey": api_key,
-                    "api": "ollama",
-                    "models": []
-                }),
-            );
-            default_model = Some("ollama/qwen3".to_string());
-        }
-        _ => {
-            // Skip
-        }
-    }
-
-    // ── Step 2b: Configure Models for Provider ───────────────────────────
-    if !providers.is_empty() {
-        println!();
-        println!("   Configure models for your provider.");
-        println!("   Enter model details (leave Name empty to finish):");
-        let Some(prov_name) = providers.keys().next().cloned() else {
-            return true;
+    loop {
+        let provider_choice = if providers.is_empty() {
+            prompt_choice(&[
+                "OpenAI-compatible",
+                "Anthropic-compatible",
+                "Ollama",
+                "Skip for now",
+            ])
+        } else {
+            prompt_choice(&[
+                "OpenAI-compatible",
+                "Anthropic-compatible",
+                "Ollama",
+                "Done adding providers",
+            ])
         };
-        let mut models_list: Vec<serde_json::Value> = Vec::new();
-        loop {
-            println!();
-            let name = prompt_line("  Model Name (empty to finish): ");
-            if name.is_empty() {
-                break;
-            }
-            let id = prompt_line(&format!("  Model ID [{name}]: "));
-            let id = if id.is_empty() { name.clone() } else { id };
+        let Some(kind) = WizardProviderKind::from_choice(provider_choice) else {
+            break;
+        };
 
-            let reasoning_str = prompt_line("  Reasoning? (y/N): ").to_lowercase();
-            let reasoning = reasoning_str == "y" || reasoning_str == "yes";
-
-            let input_str = prompt_line("  Input types [text]: ");
-            let input: Vec<String> = if input_str.is_empty() {
-                vec!["text".to_string()]
-            } else {
-                input_str.split(',').map(|s| s.trim().to_string()).collect()
-            };
-
-            let ctx_str = prompt_line("  Context window tokens [128000]: ");
-            let context_window: u64 = ctx_str.parse().unwrap_or(128000);
-
-            let max_str = prompt_line("  Max output tokens [32768]: ");
-            let max_tokens: u64 = max_str.parse().unwrap_or(32768);
-
-            let thinking_fmt = prompt_line("  Thinking format (empty=none, e.g. qwen/openai): ");
-
-            let mut model = json!({
-                "id": id,
-                "name": name,
-                "reasoning": reasoning,
-                "input": input,
-                "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-                "contextWindow": context_window,
-                "maxTokens": max_tokens,
-            });
-            if !thinking_fmt.is_empty() {
-                model["compat"] = json!({ "thinkingFormat": thinking_fmt });
-            }
-
-            // Set first model as default if not already set
-            if default_model.is_none() || models_list.is_empty() {
-                default_model = Some(format!("{prov_name}/{id}"));
-            }
-            println!("   ✅ Added {name}");
-            models_list.push(model);
+        println!();
+        let provider_name = prompt_wizard_provider_name(kind, &providers);
+        let base_url = prompt_line(&format!("  Base URL [{}]: ", kind.default_base_url()));
+        let base_url = if base_url.is_empty() {
+            kind.default_base_url().to_string()
+        } else {
+            base_url
+        };
+        let api_key = prompt_secret(kind.api_key_prompt());
+        if fallback_default_model.is_none() {
+            fallback_default_model =
+                Some(format!("{}/{}", provider_name, kind.fallback_model_id()));
         }
+        providers.insert(
+            provider_name.clone(),
+            wizard_build_provider_entry(kind, base_url, api_key),
+        );
 
-        // Inject models into the provider entry
-        if let Some(prov) = providers.get_mut(&prov_name) {
-            prov["models"] = json!(models_list);
+        let (models_list, first_model_ref) = configure_wizard_provider_models(&provider_name);
+        if let Some(provider) = providers.get_mut(&provider_name) {
+            provider["models"] = json!(models_list);
         }
+        if default_model.is_none() {
+            default_model = first_model_ref;
+        }
+        println!();
     }
     println!();
 
@@ -2298,13 +2429,9 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     prompt_line("   Press Enter to continue...");
     println!();
 
-    // Derive a sensible fast model from the chosen provider.
-    let fast_model: Option<String> = match provider_choice {
-        0 => Some("openai/gpt-4o-mini".to_string()),
-        1 => Some("anthropic/claude-haiku-3-20250306".to_string()),
-        2 => default_model.clone(),
-        _ => None,
-    };
+    let primary_model = default_model.clone().or(fallback_default_model.clone());
+    let fast_model: Option<String> =
+        wizard_suggested_fast_model(&providers, primary_model.as_deref());
     // Sub-agent model defaults to the same as fast model (cheaper for delegated tasks).
     let sub_agent_model: Option<String> = fast_model.clone();
     // Structured memory extraction also defaults to the lighter model when available.
@@ -2314,7 +2441,11 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     let mut model_block = serde_json::Map::new();
     model_block.insert(
         "primary".to_string(),
-        json!(default_model.unwrap_or_else(|| "gpt-4o-mini".to_string())),
+        json!(
+            primary_model
+                .clone()
+                .unwrap_or_else(|| "gpt-4o-mini".to_string())
+        ),
     );
     if let Some(ref fast) = fast_model {
         model_block.insert("fast".to_string(), json!(fast));
@@ -2326,15 +2457,17 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
         model_block.insert("memory".to_string(), json!(memory));
     }
 
+    let settings = json!({
+        "port": DEFAULT_PORT,
+        "execTimeout": 30,
+        "toolTimeout": 30,
+        "subAgentTimeout": 300,
+        "maxLlmRetries": 2,
+        "maxContextTokens": 32000,
+    });
+
     let mut config = json!({
-        "settings": {
-            "port": DEFAULT_PORT,
-            "execTimeout": 30,
-            "toolTimeout": 30,
-            "subAgentTimeout": 300,
-            "maxLlmRetries": 2,
-            "maxContextTokens": 32000,
-        },
+        "settings": settings,
         "models": {
             "providers": providers,
         },

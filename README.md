@@ -10,24 +10,27 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **CLI** — 工具执行层：安全的命令/文件/网络工具、沙盒路径、SSRF 防护、安装与更新
 - **Loop** — 连接层：WebSocket 主会话、流式输出、斜杠命令、持久化、异步记忆更新
 
-整个后端约 11200 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
+整个后端约 19900 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
 
 ## Features
 
-- **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`
+- **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`；另有 2 个动态工具：`task`（子代理委托，发现代理时注册）、`orchestrate`（多代理 DAG 编排，发现代理时注册）
 - **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；主 Agent 与子代理都会按需发现并使用这些 MCP tools；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断；server 启动连续失败会进入短暂冷却，避免请求风暴
 - **单主会话**：运行时固定使用 `main`，不再创建、切换或删除其他会话
-- **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、coder）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
-- **文档化斜杠命令**：`/new`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/help`
+- **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
+- **文档化斜杠命令**：`/new`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/reflection`、`/help`
 - **三 Provider 模型路由**：OpenAI + Anthropic + Ollama，支持 `provider/model` 和纯 model ID
 - **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
 - **持久化主会话**：固定保存 `main` 工作区和磁盘存档
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
-- **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端，增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、输入框上下键历史导航（最多 10 条）
+- **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端，增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、输入框上下键历史导航（最多 10 条）；Settings 页面支持在线编辑配置、Provider 连接测试、MCP Server 连接测试；Usage 页面显示 Token 用量统计、按 Model Role 拆分的明细卡片与图表
 - **图片附件**：支持通过 URL 或本地 JPEG/PNG 上传附加图片到用户消息；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；私网、localhost 或仅局域网可达的网关仅保证 Ollama 可用，因为 LingClaw 会本地预取为 base64 并持久化缓存到会话工作区；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
 - **Structured Memory（可选）**：启用 `structuredMemory` 后，Finish 阶段会异步抽取稳定偏好、项目上下文和长期事实，写入 workspace 下的 `structured_memory.json`，并记录 `structured_memory.audit.jsonl` 诊断轨迹；`/memory`、`/memory stats`、`/memory debug` 可查看状态与最近审计信息
+- **Daily Reflection（可选）**：启用 `dailyReflection` 后，多步任务完成时会在 Finish 后台异步生成简短 reflection，追加到 workspace 下的 `memory/YYYY-MM-DD.md`；`/reflection`、`/reflection today`、`/reflection yesterday`、`/reflection list` 可查看状态和已过滤的 reflection 条目
+- **更细粒度的 Token 统计**：Primary、Fast、Sub-Agent、Memory、Reflection、Context 六类模型角色都会分别累计 token；`/new` 压缩、自动上下文压缩、Structured Memory 和 Daily Reflection 的非流式调用也会计入 Usage
+- **可关闭的 Slash Command 卡片**：聊天页中由斜杠命令返回的 `success`、`system`、`error` 卡片支持点击关闭；运行进度和自动压缩通知仍保持常驻提示
 - **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环，`evaluate_finish()` 结构化完成判定，`auto_think_level()` 按循环深度动态调整推理预算
 - **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留；错误工具标记 `[FAILED]` 并附带耗时
 - **推理可见性控制**：默认开启 ReAct 阶段转换 WS 事件（`react_phase`），可通过 `/react on|off` 手动切换；浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
@@ -102,6 +105,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
     "maxOutputBytes": 51200,
     "maxFileBytes": 204800,
     "structuredMemory": false,
+    "dailyReflection": false,
     "enableS3": true
   },
   "models": {
@@ -163,7 +167,9 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
         "primary": "openai/gpt-4o-mini",
         "fast": "openai/gpt-4o-mini",
         "sub-agent": "openai/gpt-4o-mini",
-        "memory": "openai/gpt-4o-mini"
+        "memory": "openai/gpt-4o-mini",
+        "reflection": "openai/gpt-4o-mini",
+        "context": "openai/gpt-4o-mini"
       }
     }
   },
@@ -184,11 +190,13 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 
 - 推荐使用 `provider/model` 格式引用模型
 - 多个 provider 暴露同一 model ID 时，必须使用显式前缀
+- 新配置应通过 `models.providers` 定义 provider 实例，并用 `agents.defaults.model.primary` 选择默认模型
 - `structuredMemory` 默认为 `false`；启用后会在 Finish 阶段后台更新结构化记忆，并在后续 system prompt 中注入摘要；若配置了 `agents.defaults.model.memory` 或 `LINGCLAW_MEMORY_MODEL`，后台抽取优先使用该模型，否则回退到当前会话有效模型
+- `dailyReflection` 默认为 `false`；启用后会在满足轮次和冷却条件时，于 Finish 后台生成 post-execution reflection，并追加到 `memory/YYYY-MM-DD.md`；若配置了 `agents.defaults.model.reflection` 或 `LINGCLAW_REFLECTION_MODEL`，reflection 优先使用该模型，否则回退到 memory 模型，再回退到当前会话有效模型
 - 顶层 `s3` 为可选项；配置后聊天页会额外启用本地 JPEG/PNG 上传，上传对象以 object key 持久化，历史回放和 provider 请求都会即时重新现签 URL
 - AWS S3 若使用官方 endpoint，建议使用与 `region` 对应的区域 host；设置向导留空 endpoint 时会自动默认到该区域地址
 - OpenAI/Anthropic 直接使用现签 URL，因此 `s3.endpoint` 必须能被远端 provider 访问；私网、localhost 或 VPN-only 网关仅保证 Ollama 可用，因为 Ollama 路径会在本地预取并转成 base64
-- 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容
+- 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容，但 Setup Wizard 不再生成它们；新配置应省略这些字段
 - `models.providers.*.api` 目前支持 `openai-completions`、`anthropic`、`ollama`
 - Ollama 的 thinking / tool calling 依赖模型能力，推荐优先使用 `qwen3`、`gpt-oss`、`deepseek-r1` 等官方支持模型，而不是把任意本地模型都视为支持深度思考和工具调用
 - 可选的 `mcpServers` 顶层对象可声明 MCP server，例如 `command`、`args`、`env`、`cwd`、`timeoutSecs`
@@ -218,6 +226,18 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 - 超时策略：memory 更新请求沿用 `toolTimeout` 预算，并设 30 秒下限，避免配置过小导致后台更新恒定超时
 - 查看状态：`/memory` 显示当前摘要和 updater 运行状态，`/memory stats` 显示 updater 计数器，`/memory debug` 额外显示最近审计记录
 
+### Daily Reflection
+
+`dailyReflection` 是一个默认关闭的可选功能，用于把多步任务结束后的简短复盘写入每日记忆文件。它与 `structuredMemory` 不同：前者写的是面向人阅读的 daily log 条目，后者维护的是机器可读的 `structured_memory.json`。
+
+- 启用方式：在 `settings.dailyReflection` 中设为 `true`，或设置环境变量 `LINGCLAW_DAILY_REFLECTION=true`
+- 存储位置：`~/.lingclaw/main/workspace/memory/YYYY-MM-DD.md`
+- 写入格式：reflection 会以 `## HH:MM Local — Reflection (...)` 形式追加到 daily memory 文件中，与 `/new` 写入的普通压缩摘要共存
+- 触发条件：仅在完成阶段触发，默认至少需要 3 个 agent cycle，并受 10 分钟冷却限制；不阻塞主 agent loop
+- 模型选择：优先使用 `agents.defaults.model.reflection` 或环境变量 `LINGCLAW_REFLECTION_MODEL`；未设置时回退到 `memory` 模型，再回退到当前会话有效模型
+- 查看状态：`/reflection` 显示 feature 状态、运行时冷却信息和今天的 reflection 预览；`/reflection today` 与 `/reflection yesterday` 显示完整 reflection 条目；`/reflection list` 只列出实际包含 reflection 的日期文件
+- 读取行为：`/reflection` 会从 `memory/YYYY-MM-DD.md` 中只提取带 `— Reflection` 头部的条目，自动忽略 `/new` 写入的普通摘要段落
+
 ## Environment Variables
 
 | 变量 | 默认值 | 说明 |
@@ -238,7 +258,10 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 | `LINGCLAW_FAST_MODEL` | 无 | 简单首轮查询使用的轻量模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_SUB_AGENT_MODEL` | 无 | 子代理委托任务使用的模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_MEMORY_MODEL` | 无 | structured memory 后台抽取优先使用的模型（如 `openai/gpt-4o-mini`） |
+| `LINGCLAW_REFLECTION_MODEL` | 无 | daily reflection 后台生成优先使用的模型（如 `openai/gpt-4o-mini`） |
+| `LINGCLAW_CONTEXT_MODEL` | 无 | 上下文自动压缩优先使用的模型（如 `openai/gpt-4o-mini`），未设置时回退到当前会话有效模型 |
 | `LINGCLAW_STRUCTURED_MEMORY` | `false` | 启用后台结构化记忆提取与 prompt 注入 |
+| `LINGCLAW_DAILY_REFLECTION` | `false` | 启用后台 daily reflection 生成与 `/reflection` 查看能力 |
 
 ## Slash Commands
 
@@ -262,7 +285,12 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 | `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；单会话模式下同时显示主会话今日总 token 估算，按 K/M 显示 |
 | `/clear` | 清空消息但保留系统提示 |
 | `/memory [stats\|debug]` | 查看当前 structured memory 摘要与 updater 状态；`stats` 仅显示运行状态，`debug` 额外显示最近审计记录 |
+| `/reflection [today\|yesterday\|list]` | 查看当前 daily reflection 状态与 reflection 条目；默认显示 feature 状态、冷却信息和今天的 reflection 预览，`list` 只列出实际包含 reflection 的日期文件 |
 | `/help` | 命令帮助 |
+
+聊天页里由斜杠命令生成的 `success`、`system`、`error` 卡片支持点击右上角关闭；`progress`、`context_pruned`、`context_compressed`、`context_compress_failed` 这类运行态通知不提供关闭按钮。
+
+Settings → Usage 页面除了现有今日/累计图表外，还会显示按 `Primary`、`Fast`、`Sub-Agent`、`Memory`、`Reflection`、`Context` 划分的 Token Breakdown。对于升级前已经存在的旧会话，角色级累计值会从 0.5.6 开始逐步建立；旧快照中仍保留的 provider 数据会继续在历史图表里展示。
 
 ## Tools
 
@@ -359,6 +387,7 @@ SKILL.md 的 YAML frontmatter 格式兼容 [Agent Skills 规范](https://agentsk
 | **explore** | 快速只读代码库探索和问答 |
 | **researcher** | 深度研究，综合多源信息 |
 | **coder** | 代码实现与修改 |
+| **reviewer** | 代码审查与质量检查 |
 
 ### AGENT.md 格式
 
@@ -408,12 +437,14 @@ tools:
 ```text
 ┌──────────────────────────────────────────────────────────────────┐
 │                         Browser (static/)                        │
-│   index.html  ·  app.js  ·  style.css                           │
+│   index.html  ·  js/ (ES modules)  ·  css/ (modular CSS)         │
 └────────────────────────┬─────────────────────────────────────────┘
                          │ WebSocket /ws
 ┌────────────────────────▼─────────────────────────────────────────┐
 │                     Axum HTTP Server                             │
 │   GET /api/health · GET /api/sessions · POST /api/shutdown       │
+│   GET/PUT /api/config · POST /api/config/test-model              │
+│   POST /api/config/test-mcp · GET /api/usage                     │
 │   GET /ws (WebSocket upgrade)                                    │
 └────────────────────────┬─────────────────────────────────────────┘
                          │
@@ -537,43 +568,59 @@ handle_socket()
 
 ```text
 src/
-├── main.rs            (~1290 行) — 共享类型, WebSocket/HTTP 处理, 系统提示构建, 安全检查
-├── runtime_loop.rs    (~790 行)  — 阶段执行循环, 工具进度, 运行取消, 干预持久化
-│   └── socket_input.rs (~185 行) — socket 空闲/忙碌输入辅助
-├── agent.rs           (~290 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
-├── commands.rs        (~1260 行) — 斜杠命令处理器 (handle_command, /skills-system install/uninstall 等)
-├── cli.rs             (~2020 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
-├── config.rs          (~550 行)  — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
-├── context.rs         (~210 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
-├── providers.rs       (~1200 行) — OpenAI/Anthropic/Ollama 调用, 流式解析, 推理模式, prompt caching
-├── prompts.rs         (~660 行)  — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
-├── hooks.rs           (~340 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
-├── memory.rs          (~460 行)  — structured_memory.json 读写, MemoryUpdateQueue, prompt 注入, /memory 状态
-├── session_admin.rs   (~240 行)  — 全局用量统计 (仅主会话)
-├── session_store.rs   (~340 行)  — 会话持久化, 迁移, 磁盘 I/O
-├── socket_sync.rs     (~140 行)  — WebSocket 会话声明, 断线监听, 重绑定
-├── socket_tasks.rs    (~120 行)  — WebSocket 读写任务
+├── main.rs            (~1750 行) — 共享类型, WebSocket/HTTP 处理, 系统提示构建, 安全检查
+├── runtime_loop.rs    (~1900 行) — 阶段执行循环, 工具进度, 运行取消, 干预持久化, orchestrate 执行
+│   └── socket_input.rs (~400 行) — socket 空闲/忙碌输入辅助
+├── agent.rs           (~420 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
+├── commands.rs        (~1460 行) — 斜杠命令处理器 (handle_command, /skills-system install/uninstall 等)
+├── cli.rs             (~2220 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
+├── config.rs          (~840 行)  — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
+├── context.rs         (~350 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
+├── providers.rs       (~1640 行) — OpenAI/Anthropic/Ollama 调用, 流式解析, 推理模式, prompt caching
+├── prompts.rs         (~870 行)  — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
+├── hooks.rs           (~660 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
+├── memory.rs          (~970 行)  — structured_memory.json 读写, MemoryUpdateQueue, prompt 注入, /memory 状态
+├── image_uploads.rs   (~670 行)  — S3 签名/上传, PNG/JPEG 校验, 生命周期管理, 附件令牌签发
+├── session_admin.rs   (~10 行)   — 全局用量统计 (仅主会话)
+├── session_store.rs   (~420 行)  — 会话持久化, 迁移, 磁盘 I/O
+├── socket_sync.rs     (~90 行)   — WebSocket 会话声明, 断线监听, 重绑定
+├── socket_tasks.rs    (~130 行)  — WebSocket 读写任务
 └── tools/
-    ├── mod.rs         (~450 行)  — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验
-    ├── fs.rs          (~320 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files + 虚拟 skill 路径
-    ├── net.rs         (~120 行)  — http_fetch, check_ssrf, is_private_ip
+    ├── mod.rs         (~870 行)  — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验, orchestrate/task 定义
+    ├── fs.rs          (~350 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files + 虚拟 skill 路径
+    ├── net.rs         (~190 行)  — http_fetch, check_ssrf, is_private_ip
     ├── exec.rs        (~60 行)   — exec (shell), think (scratchpad)
-    └── mcp.rs         (~1250 行) — stdio MCP 工具发现/执行桥接, 会话缓存, preflight
+    └── mcp.rs         (~1400 行) — stdio MCP 工具发现/执行桥接, 会话缓存, preflight
 ├── subagents/
-│   ├── mod.rs         (~220 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, 工具过滤（含 MCP）
-│   ├── executor.rs    (~400 行)  — 隔离 mini-ReAct 执行循环, Hook 集成, MCP 工具调度, 父级事件流
-│   └── discovery.rs   (~200 行)  — 三层发现 (system/global/session), YAML frontmatter 解析
+│   ├── mod.rs         (~260 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, 工具过滤（含 MCP）
+│   ├── executor.rs    (~890 行)  — 隔离 mini-ReAct 执行循环, Hook 集成, MCP 工具调度, 父级事件流
+│   ├── discovery.rs   (~320 行)  — 三层发现 (system/global/session), YAML frontmatter 解析
+│   └── orchestrator.rs (~770 行) — DAG 多代理编排引擎, 分层并行执行, 结果插值, 事件流
 
 static/
 ├── index.html                  — 主页面
-├── app.js                      — 前端逻辑（流式渲染、懒加载历史、智能滚动、版本 badge、输入历史导航）
-└── style.css                   — 样式
+├── css/                        — 模块化样式 (base, layout, chat, panels, pages, responsive)
+└── js/                         — 前端 ES Modules
+    ├── main.js                 — 入口模块（流式渲染、懒加载历史、智能滚动、版本 badge）
+    ├── constants.js            — 常量
+    ├── state.js                — 集中状态 + DOM refs
+    ├── utils.js                — 纯工具函数
+    ├── scroll.js               — 滚动/视口管理
+    ├── markdown.js             — Markdown/KaTeX 管线
+    ├── socket.js               — WebSocket 连接
+    ├── images.js               — 图片附件 + 上传
+    ├── input.js                — 输入处理 + 历史导航
+    ├── mobile.js               — 移动端菜单
+    ├── settings.js             — Settings 页面（配置编辑、Provider 测试、MCP 测试）
+    ├── usage.js                — Usage 页面（Token 用量统计 + 图表）
+    ├── handlers/stream.js      — 流式响应处理
+    └── renderers/              — UI 渲染模块 (chat, tools, react-status, timeline)
 
 docs/reference/templates/       — 7 个提示模板文件 (BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/TOOLS/MEMORY.md)
 docs/reference/skills/          — 17 个系统内置 Skills (安装时部署到 ~/.lingclaw/system-skills/)
-docs/reference/agents/          — 3 个内置子代理 (explore, researcher, coder)
+docs/reference/agents/          — 4 个内置子代理 (explore, researcher, coder, reviewer)
 
-src/tests/                      — 模块测试文件 (~5470 行)
+src/tests/                      — 模块测试文件 (~13600 行)
 ```
 
 ### 核心数据结构
@@ -728,7 +775,7 @@ think_level 映射：
 | 模式 | 条件 | 加载文件 |
 |---|---|---|
 | **Bootstrap** | `BOOTSTRAP.md` 存在 | `BOOTSTRAP.md + AGENTS.md` |
-| **Normal** | `BOOTSTRAP.md` 不存在 | `AGENTS.md + IDENTITY.md + USER.md + SOUL.md`，然后加载当前 session 的 `MEMORY.md` + 今日/昨日记忆 |
+| **Normal** | `BOOTSTRAP.md` 不存在 | `AGENTS.md + IDENTITY.md + USER.md + SOUL.md + TOOLS.md`，然后加载当前 session 的 `MEMORY.md` + 今日/昨日记忆 |
 
 关键不变式：
 - 当 `IDENTITY.md` 和 `USER.md` 中的关键字段已被有效填写后，后端会自动删除 `BOOTSTRAP.md` 并切换到 Normal 模式
@@ -782,6 +829,13 @@ think_level 映射：
 |---|---|---|
 | `/api/health` | GET | 健康检查（返回 `version`、`model`、`sessions`） |
 | `/api/sessions` | GET | 返回主会话信息 |
+| `/api/client-config` | GET | 返回前端配置（上传 token、S3 能力标记等） |
+| `/api/config` | GET | 读取原始 JSON 配置文件（含解析错误回退） |
+| `/api/config` | PUT | 校验并保存 JSON 配置文件（原子写入 + 备份恢复） |
+| `/api/config/test-model` | POST | 测试模型 Provider 连接（发送 "Hi" 并检查响应） |
+| `/api/config/test-mcp` | POST | 测试 MCP Server 连接（spawn + tools/list） |
+| `/api/usage` | GET | 返回 Token 用量统计（今日/累计/来源），并额外提供 `daily_roles`、`total_providers`、`total_roles`，以及按天拆分后的 `usage_history[].providers` / `usage_history[].roles` |
+| `/api/upload-images` | POST | 上传本地图片到 S3（需启用 S3 配置） |
 | `/api/shutdown` | POST | 认证的本地关停端点（CLI 使用） |
 | `/ws` | GET | WebSocket 升级端点 |
 

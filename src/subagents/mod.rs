@@ -17,11 +17,12 @@
 
 pub(crate) mod discovery;
 pub(crate) mod executor;
+pub(crate) mod orchestrator;
 
 use serde::{Deserialize, Serialize};
 
-/// Maximum number of concurrent sub-agent tasks in a single Act phase.
-#[allow(dead_code)] // Reserved for future parallel task execution
+/// Reserved for future task-level workspace isolation work.
+#[allow(dead_code)]
 pub(crate) const MAX_CONCURRENT_SUBAGENTS: usize = 3;
 
 /// Hard upper limit on sub-agent max_turns (prevents runaway custom agents).
@@ -85,10 +86,10 @@ pub(crate) struct ToolPermissions {
 
 impl ToolPermissions {
     /// Check if a tool name is permitted under this permission set.
-    /// `task` is always denied to prevent recursive sub-agent spawning.
+    /// `task` and `orchestrate` are always denied to prevent recursive sub-agent spawning.
     pub fn is_allowed(&self, tool_name: &str) -> bool {
-        // Never allow recursive task delegation
-        if tool_name == "task" {
+        // Never allow recursive task delegation or orchestration from sub-agents
+        if tool_name == "task" || tool_name == "orchestrate" {
             return false;
         }
         let in_allow = self.allow.is_empty() || self.allow.iter().any(|t| t == tool_name);
@@ -127,8 +128,10 @@ pub(crate) fn render_agents_catalog(agents: &[SubAgentSpec]) -> Option<String> {
     lines.push("## Sub-Agents".to_string());
     lines.push(String::new());
     lines.push(
-        "Use the `task` tool to delegate work to specialized sub-agents. \
-         Each sub-agent runs in an isolated context with its own tool set."
+        "Use the `task` tool to delegate work to a single sub-agent, or \
+         the `orchestrate` tool to coordinate a multi-agent workflow with \
+         serial and parallel execution. Each sub-agent runs in an isolated \
+         context with its own tool set."
             .to_string(),
     );
     lines.push(String::new());

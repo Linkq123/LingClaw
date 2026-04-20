@@ -21,6 +21,7 @@ pub(crate) struct CommandResult {
     pub(crate) response_type: &'static str,
     pub(crate) sessions_changed: bool,
     pub(crate) refresh_history: bool,
+    pub(crate) dismissible: bool,
 }
 
 pub(crate) fn command_result(
@@ -33,6 +34,7 @@ pub(crate) fn command_result(
         response_type,
         sessions_changed,
         refresh_history: false,
+        dismissible: true,
     }
 }
 
@@ -124,32 +126,33 @@ async fn status_effective_think_level(
 }
 
 async fn build_runtime_status(session: &Session, state: &AppState) -> String {
-    let model = session.effective_model(&state.config.model).to_string();
-    let resolved = state.config.resolve_model(&model);
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
+    let resolved = config.resolve_model(&model);
     let effective_think = status_effective_think_level(session, state, &resolved).await;
     let mut extra_tools = Vec::new();
     let mut cached_mcp_tools = match resolved.provider {
         crate::Provider::Anthropic => {
-            tools::mcp::cached_tool_definitions_anthropic(&state.config, &session.workspace)
+            tools::mcp::cached_tool_definitions_anthropic(&config, &session.workspace)
         }
         crate::Provider::OpenAI => {
-            tools::mcp::cached_tool_definitions_openai(&state.config, &session.workspace)
+            tools::mcp::cached_tool_definitions_openai(&config, &session.workspace)
         }
         crate::Provider::Ollama => {
-            tools::mcp::cached_tool_definitions_ollama(&state.config, &session.workspace)
+            tools::mcp::cached_tool_definitions_ollama(&config, &session.workspace)
         }
     };
     extra_tools.append(&mut cached_mcp_tools);
     let (cached_mcp_servers, enabled_mcp_servers) =
-        tools::mcp::cached_server_counts(&state.config, &session.workspace);
+        tools::mcp::cached_server_counts(&config, &session.workspace);
     let request_budget =
-        crate::context::context_input_budget_for_runtime(&state.config, &model, &effective_think);
+        crate::context::context_input_budget_for_runtime(&config, &model, &effective_think);
     let tool_estimate =
         crate::context::estimate_tool_schema_tokens_for_provider(resolved.provider, &extra_tools);
 
     let mut request_messages = session.messages.clone();
     let fresh_system = build_system_prompt(
-        &state.config,
+        &config,
         &session.workspace,
         &model,
         &session.disabled_system_skills,
@@ -184,7 +187,7 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
 
     format!(
         "{}\nrequest_est: {}/{} (tools {} think {})\nrequest_status: {}{}\nrequest_note: {}",
-        build_session_status(session, &state.config),
+        build_session_status(session, &config),
         crate::format_token_count(request_estimate as u64),
         crate::format_token_count(request_budget as u64),
         crate::format_token_count(tool_estimate as u64),
@@ -230,6 +233,7 @@ async fn reset_session_context_and_persist(
     state: &AppState,
     current_session_id: &str,
 ) -> Result<(), String> {
+    let config = state.config();
     persist_session_update(
         state,
         current_session_id,
@@ -241,9 +245,9 @@ async fn reset_session_context_and_persist(
             )
         },
         |session| {
-            let model = session.effective_model(&state.config.model).to_string();
+            let model = session.effective_model(&config.model).to_string();
             let sys = build_system_prompt(
-                &state.config,
+                &config,
                 &session.workspace,
                 &model,
                 &session.disabled_system_skills,
@@ -266,6 +270,7 @@ async fn handle_new_command(
     tx: &WsTx,
     cancel: &CancellationToken,
 ) -> Option<CommandResult> {
+    let config = state.config();
     let (conversation_text, workspace, model_str) = {
         let sessions = state.sessions.lock().await;
         let session = match sessions.get(current_session_id) {
@@ -293,7 +298,7 @@ async fn handle_new_command(
         (
             lines.join("\n"),
             session.workspace.clone(),
-            session.effective_model(&state.config.model).to_string(),
+            session.effective_model(&config.model).to_string(),
         )
     };
 
@@ -349,7 +354,7 @@ async fn handle_new_command(
             timestamp: Some(now_epoch()),
         },
     ];
-    let resolved = state.config.resolve_model(&model_str);
+    let resolved = config.resolve_model(&model_str);
     let summary = tokio::select! {
         biased;
         _ = cancel.cancelled() => {
@@ -359,7 +364,7 @@ async fn handle_new_command(
                 false,
             ));
         }
-        result = providers::call_llm_simple(&state.http, &resolved, &compress_prompt, &workspace, state.config.s3.as_ref(), state.config.max_llm_retries) => {
+        result = providers::call_llm_simple_with_usage(&state.http, &resolved, &compress_prompt, &workspace, config.s3.as_ref(), config.max_llm_retries) => {
             match result {
                 Ok(s) => s,
                 Err(e) => {
@@ -372,6 +377,47 @@ async fn handle_new_command(
             }
         }
     };
+
+    let provider_name = config.resolve_provider_name(&model_str);
+    let input_tokens = summary.input_tokens.unwrap_or_else(|| {
+        crate::estimate_tokens_for_provider(resolved.provider, &compress_prompt) as u64
+    });
+    let output_tokens = summary.output_tokens.unwrap_or_else(|| {
+        crate::message_token_len_for_provider(
+            resolved.provider,
+            &crate::ChatMessage {
+                role: "assistant".into(),
+                content: Some(summary.content.clone()),
+                images: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+        ) as u64
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(current_session_id) {
+            crate::update_session_token_usage_with_provider(
+                session,
+                input_tokens,
+                output_tokens,
+                if summary.input_tokens.is_some() {
+                    "provider"
+                } else {
+                    "estimated"
+                },
+                if summary.output_tokens.is_some() {
+                    "provider"
+                } else {
+                    "estimated"
+                },
+                Some(&provider_name),
+                Some(crate::context::USAGE_ROLE_CONTEXT),
+            );
+        }
+    }
+    let summary = summary.content;
 
     if !ws_send(
         tx,
@@ -441,18 +487,16 @@ async fn handle_model_command(
     current_session_id: &str,
     state: &AppState,
 ) -> CommandResult {
+    let config = state.config();
     if arg.is_empty() {
         let sessions = state.sessions.lock().await;
         let model = sessions
             .get(current_session_id)
-            .map(|s| s.effective_model(&state.config.model))
-            .unwrap_or(&state.config.model)
+            .map(|s| s.effective_model(&config.model))
+            .unwrap_or(&config.model)
             .to_string();
-        let current = state
-            .config
-            .canonical_model_ref(&model)
-            .unwrap_or(model.clone());
-        let available = state.config.available_models();
+        let current = config.canonical_model_ref(&model).unwrap_or(model.clone());
+        let available = config.available_models();
         let list = available
             .iter()
             .map(|m| {
@@ -471,7 +515,7 @@ async fn handle_model_command(
         );
     }
 
-    let canonical = match state.config.canonical_model_ref(arg) {
+    let canonical = match config.canonical_model_ref(arg) {
         Ok(value) => value,
         Err(err) => return command_result(err, "error", false),
     };
@@ -513,6 +557,7 @@ async fn handle_status_command(current_session_id: &str, state: &AppState) -> Co
 }
 
 async fn handle_system_prompt_command(current_session_id: &str, state: &AppState) -> CommandResult {
+    let config = state.config();
     let session = {
         let sessions = state.sessions.lock().await;
         sessions.get(current_session_id).cloned()
@@ -520,8 +565,8 @@ async fn handle_system_prompt_command(current_session_id: &str, state: &AppState
 
     match session {
         Some(session) => {
-            let model = session.effective_model(&state.config.model).to_string();
-            let resolved = state.config.resolve_model(&model);
+            let model = session.effective_model(&config.model).to_string();
+            let resolved = config.resolve_model(&model);
             let latest_query = session
                 .messages
                 .iter()
@@ -529,7 +574,7 @@ async fn handle_system_prompt_command(current_session_id: &str, state: &AppState
                 .find(|message| message.role == "user")
                 .and_then(|message| message.content.as_deref());
             let system_prompt = build_system_prompt_with_query(
-                &state.config,
+                &config,
                 &session.workspace,
                 &model,
                 &session.disabled_system_skills,
@@ -870,6 +915,7 @@ async fn toggle_system_skill(
     .await
     {
         Ok(()) => {
+            crate::prompts::invalidate_skills_cache();
             let verb = if disable { "Disabled" } else { "Enabled" };
             let names: Vec<_> = matched.iter().map(|s| s.name.as_str()).collect();
             command_result(
@@ -920,6 +966,7 @@ async fn handle_mcp_command_with_arg(
     current_session_id: &str,
     state: &AppState,
 ) -> CommandResult {
+    let config = state.config();
     let workspace = {
         let sessions = state.sessions.lock().await;
         match sessions.get(current_session_id) {
@@ -928,8 +975,7 @@ async fn handle_mcp_command_with_arg(
         }
     };
 
-    let enabled_servers = state
-        .config
+    let enabled_servers = config
         .mcp_servers
         .values()
         .filter(|server| server.enabled)
@@ -940,10 +986,10 @@ async fn handle_mcp_command_with_arg(
 
     match arg {
         "" => {
-            let reports = tools::mcp::inspect_servers(&state.config, &workspace).await;
+            let reports = tools::mcp::inspect_servers(&config, &workspace).await;
             command_result(format_mcp_reports(&reports), "system", false)
         }
-        "refresh" => match tools::mcp::refresh_servers(&state.config, &workspace).await {
+        "refresh" => match tools::mcp::refresh_servers(&config, &workspace).await {
             Ok(reports) => command_result(
                 format!("Refreshed MCP cache.\n\n{}", format_mcp_reports(&reports)),
                 "system",
@@ -1196,6 +1242,7 @@ Commands:
     /agents          List discovered sub-agents
     /clear           Clear messages (keep system prompt)
     /memory [stats|debug] Show structured memory status or updater diagnostics
+    /reflection [today|yesterday|list] Show daily reflection status and reflection entries
     /help            Show this help"
         .to_string();
     if current_session_id == MAIN_SESSION_ID {
@@ -1229,7 +1276,8 @@ async fn handle_memory_command(
     current_session_id: &str,
     state: &AppState,
 ) -> CommandResult {
-    if !state.config.structured_memory {
+    let config = state.config();
+    if !config.structured_memory {
         return command_result(
             "Structured memory is disabled. Enable with `\"structuredMemory\": true` in settings or `LINGCLAW_STRUCTURED_MEMORY=true`.",
             "system",
@@ -1262,8 +1310,190 @@ async fn handle_memory_command(
     command_result(response, "system", false)
 }
 
+async fn handle_reflection_command(
+    arg: &str,
+    current_session_id: &str,
+    state: &AppState,
+) -> CommandResult {
+    let config = state.config();
+    let workspace = {
+        let sessions = state.sessions.lock().await;
+        match sessions.get(current_session_id) {
+            Some(s) => s.workspace.clone(),
+            None => return command_result("Session not found", "error", false),
+        }
+    };
+    let memory_dir = workspace.join("memory");
+    let local = prompts::current_local_snapshot();
+    let today = local.today();
+    let yesterday = local.yesterday();
+    let enabled = config.daily_reflection;
+
+    let response = match arg {
+        "" => {
+            // Overview: config + runtime status + today preview.
+            let mut lines = vec![format!(
+                "Daily Reflection: {}",
+                if enabled {
+                    "**enabled**"
+                } else {
+                    "**disabled**"
+                }
+            )];
+            if enabled {
+                let runtime = crate::runtime_loop::reflection_runtime_status();
+                let model = config
+                    .reflection_model
+                    .as_deref()
+                    .unwrap_or("(inherits memory_model or primary)");
+                lines.push(format!("Model: {model}"));
+                lines.push("Min cycles: 3 | Cooldown: 10 min".to_string());
+                lines.push(runtime);
+            } else {
+                lines.push(
+                    "Enable with `\"dailyReflection\": true` in settings or `LINGCLAW_DAILY_REFLECTION=true`."
+                        .to_string(),
+                );
+            }
+            let today_preview = read_reflection_entries_preview(&memory_dir, &today, 500).await;
+            if let Some(preview) = today_preview {
+                lines.push(format!(
+                    "\n--- Today's reflections ({today}) ---\n{preview}"
+                ));
+            } else {
+                lines.push(format!("\nNo reflections today ({today})."));
+            }
+            lines.join("\n")
+        }
+        "today" => read_reflection_entries_full(&memory_dir, &today)
+            .await
+            .unwrap_or_else(|| format!("No reflections for {today}.")),
+        "yesterday" => read_reflection_entries_full(&memory_dir, &yesterday)
+            .await
+            .unwrap_or_else(|| format!("No reflections for {yesterday}.")),
+        "list" => list_daily_memory_files(&memory_dir).await,
+        _ => return command_result("Usage: /reflection [today|yesterday|list]", "system", false),
+    };
+
+    command_result(response, "system", false)
+}
+
+/// Extract only reflection sections from daily memory content.
+/// Entries are recognized by their `## HH:MM Local` header shape, which avoids
+/// mis-parsing Markdown horizontal rules inside the reflection body.
+fn is_daily_memory_entry_header(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("## ") else {
+        return false;
+    };
+    let bytes = rest.as_bytes();
+    if bytes.len() < 11 {
+        return false;
+    }
+    if !(bytes[0].is_ascii_digit()
+        && bytes[1].is_ascii_digit()
+        && bytes[2] == b':'
+        && bytes[3].is_ascii_digit()
+        && bytes[4].is_ascii_digit()
+        && &bytes[5..11] == b" Local")
+    {
+        return false;
+    }
+    bytes.len() == 11 || rest[11..].starts_with(" \u{2014} Reflection")
+}
+
+fn filter_reflection_sections(content: &str) -> Option<String> {
+    let lines: Vec<&str> = content.lines().collect();
+    let entry_starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| is_daily_memory_entry_header(line).then_some(idx))
+        .collect();
+    let mut sections: Vec<String> = Vec::new();
+    for (idx, start) in entry_starts.iter().copied().enumerate() {
+        if !lines[start].contains("\u{2014} Reflection") {
+            continue;
+        }
+        let mut end = entry_starts.get(idx + 1).copied().unwrap_or(lines.len());
+        if idx + 1 < entry_starts.len() {
+            while end > start {
+                let line = lines[end - 1].trim();
+                if line.is_empty() || line == "---" {
+                    end -= 1;
+                } else {
+                    break;
+                }
+            }
+        }
+        let section = lines[start..end].join("\n");
+        let trimmed = section.trim();
+        if !trimmed.is_empty() {
+            sections.push(trimmed.to_string());
+        }
+    }
+    if sections.is_empty() {
+        return None;
+    }
+    let joined = sections.join("\n\n---\n\n");
+    let trimmed = joined.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+/// Read reflection entries from a daily memory file, returning a truncated preview.
+async fn read_reflection_entries_preview(
+    memory_dir: &Path,
+    date: &str,
+    max_chars: usize,
+) -> Option<String> {
+    let path = memory_dir.join(format!("{date}.md"));
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+    let filtered = filter_reflection_sections(&content)?;
+    Some(truncate(&filtered, max_chars).to_string())
+}
+
+/// Read the full reflection entries from a daily memory file.
+async fn read_reflection_entries_full(memory_dir: &Path, date: &str) -> Option<String> {
+    let path = memory_dir.join(format!("{date}.md"));
+    let content = tokio::fs::read_to_string(path).await.ok()?;
+    filter_reflection_sections(&content)
+}
+
+/// List all daily memory files in the memory directory, newest first.
+async fn list_daily_memory_files(memory_dir: &Path) -> String {
+    let mut rd = match tokio::fs::read_dir(memory_dir).await {
+        Ok(rd) => rd,
+        Err(_) => return "No reflection files found.".to_string(),
+    };
+    let mut files: Vec<String> = Vec::new();
+    while let Ok(Some(entry)) = rd.next_entry().await {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".md") {
+            continue;
+        }
+        let Ok(content) = tokio::fs::read_to_string(entry.path()).await else {
+            continue;
+        };
+        if filter_reflection_sections(&content).is_some() {
+            files.push(name);
+        }
+    }
+    if files.is_empty() {
+        return "No reflection files found.".to_string();
+    }
+    files.sort();
+    files.reverse();
+    let mut lines = vec![format!("Reflection files ({} total):", files.len())];
+    for f in &files {
+        lines.push(format!("  {f}"));
+    }
+    lines.join("\n")
+}
+
 async fn handle_agents_command(current_session_id: &str, state: &AppState) -> CommandResult {
-    let config = &state.config;
+    let config = state.config();
     let workspace = {
         let sessions = state.sessions.lock().await;
         match sessions.get(current_session_id) {
@@ -1273,7 +1503,7 @@ async fn handle_agents_command(current_session_id: &str, state: &AppState) -> Co
     };
 
     // Ensure MCP tool cache is warm so the tool listing includes MCP tools.
-    crate::tools::mcp::ensure_tools_cached(config, &workspace).await;
+    crate::tools::mcp::ensure_tools_cached(&config, &workspace).await;
 
     let agents = crate::subagents::discovery::discover_all_agents(&workspace);
     if agents.is_empty() {
@@ -1291,7 +1521,7 @@ async fn handle_agents_command(current_session_id: &str, state: &AppState) -> Co
     let mut lines = Vec::with_capacity(agents.len() + 2);
     lines.push(format!("**{} sub-agent(s) available:**\n", agents.len()));
     for agent in &agents {
-        let tools = crate::subagents::filter_tools_for_agent_with_mcp(agent, config, &workspace);
+        let tools = crate::subagents::filter_tools_for_agent_with_mcp(agent, &config, &workspace);
         let tool_list = if tools.is_empty() {
             "(no tools)".to_string()
         } else {
@@ -1368,6 +1598,7 @@ pub(crate) async fn handle_command(
         "/sessions" => Some(handle_sessions_command(current_session_id, state).await),
         "/delete" => Some(handle_delete_command(arg, current_session_id, state).await),
         "/memory" => Some(handle_memory_command(arg, current_session_id, state).await),
+        "/reflection" => Some(handle_reflection_command(arg, current_session_id, state).await),
         "/agents" => Some(handle_agents_command(current_session_id, state).await),
 
         // /stop when not busy — the in-flight case is handled by the agent loop drain

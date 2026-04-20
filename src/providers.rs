@@ -47,6 +47,12 @@ pub(crate) struct LlmResponse {
     pub(crate) output_tokens: Option<u64>,
 }
 
+pub(crate) struct SimpleLlmResponse {
+    pub(crate) content: String,
+    pub(crate) input_tokens: Option<u64>,
+    pub(crate) output_tokens: Option<u64>,
+}
+
 struct OpenAiStreamState {
     content_buf: String,
     tool_calls: Vec<ToolCall>,
@@ -724,15 +730,15 @@ fn ollama_request_options(resolved: &ResolvedModel) -> serde_json::Value {
 //  LLM Streaming Client
 // ══════════════════════════════════════════════════════════════════════════════
 
-/// Non-streaming LLM call — returns plain text. Used for conversation compression.
-pub(crate) async fn call_llm_simple(
+/// Non-streaming LLM call — returns plain text plus optional usage counters.
+pub(crate) async fn call_llm_simple_with_usage(
     http: &Client,
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
     workspace: &Path,
     s3_cfg: Option<&crate::config::S3Config>,
     max_retries: usize,
-) -> Result<String, String> {
+) -> Result<SimpleLlmResponse, String> {
     match resolved.provider {
         Provider::OpenAI => {
             let url = format!("{}/chat/completions", resolved.api_base);
@@ -750,10 +756,14 @@ pub(crate) async fn call_llm_simple(
             })
             .await?;
             let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            Ok(data["choices"][0]["message"]["content"]
-                .as_str()
-                .unwrap_or("")
-                .to_string())
+            Ok(SimpleLlmResponse {
+                content: data["choices"][0]["message"]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+                input_tokens: data["usage"]["prompt_tokens"].as_u64(),
+                output_tokens: data["usage"]["completion_tokens"].as_u64(),
+            })
         }
         Provider::Anthropic => {
             let url = format!("{}/v1/messages", resolved.api_base);
@@ -783,7 +793,11 @@ pub(crate) async fn call_llm_simple(
                 .and_then(|b| b["text"].as_str())
                 .unwrap_or("")
                 .to_string();
-            Ok(content)
+            Ok(SimpleLlmResponse {
+                content,
+                input_tokens: data["usage"]["input_tokens"].as_u64(),
+                output_tokens: data["usage"]["output_tokens"].as_u64(),
+            })
         }
         Provider::Ollama => {
             let url = format!("{}/api/chat", resolved.api_base);
@@ -801,12 +815,30 @@ pub(crate) async fn call_llm_simple(
             })
             .await?;
             let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
-            Ok(data["message"]["content"]
-                .as_str()
-                .unwrap_or("")
-                .to_string())
+            Ok(SimpleLlmResponse {
+                content: data["message"]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+                input_tokens: data["prompt_eval_count"].as_u64(),
+                output_tokens: data["eval_count"].as_u64(),
+            })
         }
     }
+}
+
+/// Backward-compatible non-streaming helper when the caller only needs text.
+pub(crate) async fn call_llm_simple(
+    http: &Client,
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+    workspace: &Path,
+    s3_cfg: Option<&crate::config::S3Config>,
+    max_retries: usize,
+) -> Result<String, String> {
+    call_llm_simple_with_usage(http, resolved, messages, workspace, s3_cfg, max_retries)
+        .await
+        .map(|resp| resp.content)
 }
 
 /// Map think_level to OpenAI reasoning_effort string.
@@ -990,7 +1022,26 @@ async fn process_openai_data_line(data: &str, tx: &LiveTx, state: &mut OpenAiStr
                                 .await;
                     }
                 }
-                if let Some(text) = &choice.delta.content {
+                let has_content = choice
+                    .delta
+                    .content
+                    .as_ref()
+                    .is_some_and(|text| !text.is_empty());
+                let has_tool_calls = choice
+                    .delta
+                    .tool_calls
+                    .as_ref()
+                    .is_some_and(|calls| !calls.is_empty());
+
+                if (has_content || has_tool_calls) && state.reasoning_started && !state.client_gone
+                {
+                    state.reasoning_started = false;
+                    state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+                }
+
+                if let Some(text) = &choice.delta.content
+                    && !text.is_empty()
+                {
                     if state.reasoning_started && !state.client_gone {
                         state.reasoning_started = false;
                         state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;

@@ -1,4 +1,91 @@
+use std::collections::HashMap;
+
 use crate::{ChatMessage, Session, config::Config, config::Provider, prompts};
+
+pub(crate) const USAGE_ROLE_PRIMARY: &str = "Primary";
+pub(crate) const USAGE_ROLE_FAST: &str = "Fast";
+pub(crate) const USAGE_ROLE_SUB_AGENT: &str = "Sub-Agent";
+pub(crate) const USAGE_ROLE_MEMORY: &str = "Memory";
+pub(crate) const USAGE_ROLE_REFLECTION: &str = "Reflection";
+pub(crate) const USAGE_ROLE_CONTEXT: &str = "Context";
+
+const USAGE_PROVIDER_PREFIX: &str = "provider:";
+const USAGE_ROLE_PREFIX: &str = "role:";
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct UsageUpdate {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) input_source: String,
+    pub(crate) output_source: String,
+    pub(crate) labels: HashMap<String, [u64; 2]>,
+}
+
+pub(crate) fn usage_provider_label(label: &str) -> String {
+    format!("{USAGE_PROVIDER_PREFIX}{label}")
+}
+
+pub(crate) fn usage_role_label(label: &str) -> String {
+    format!("{USAGE_ROLE_PREFIX}{label}")
+}
+
+pub(crate) fn build_usage_labels(
+    input_tokens: u64,
+    output_tokens: u64,
+    provider_label: Option<&str>,
+    role_label: Option<&str>,
+) -> HashMap<String, [u64; 2]> {
+    let mut labels = HashMap::new();
+    if let Some(label) = provider_label.filter(|label| !label.is_empty()) {
+        labels.insert(usage_provider_label(label), [input_tokens, output_tokens]);
+    }
+    if let Some(label) = role_label.filter(|label| !label.is_empty()) {
+        labels.insert(usage_role_label(label), [input_tokens, output_tokens]);
+    }
+    labels
+}
+
+pub(crate) fn split_usage_labels(
+    labels: &HashMap<String, [u64; 2]>,
+) -> (HashMap<String, [u64; 2]>, HashMap<String, [u64; 2]>) {
+    let mut providers = HashMap::new();
+    let mut roles = HashMap::new();
+    for (label, pair) in labels {
+        if let Some(name) = label.strip_prefix(USAGE_PROVIDER_PREFIX) {
+            providers.insert(name.to_string(), *pair);
+        } else if let Some(name) = label.strip_prefix(USAGE_ROLE_PREFIX) {
+            roles.insert(name.to_string(), *pair);
+        } else {
+            // Backward compatibility: old snapshots stored raw provider names.
+            providers.insert(label.clone(), *pair);
+        }
+    }
+    (providers, roles)
+}
+
+fn merge_usage_labels(into: &mut HashMap<String, [u64; 2]>, labels: &HashMap<String, [u64; 2]>) {
+    for (label, [input_tokens, output_tokens]) in labels {
+        let entry = into.entry(label.clone()).or_insert([0, 0]);
+        entry[0] = entry[0].saturating_add(*input_tokens);
+        entry[1] = entry[1].saturating_add(*output_tokens);
+    }
+}
+
+pub(crate) fn apply_usage_update(session: &mut Session, update: &UsageUpdate) {
+    rollover_daily_usage_if_needed(session);
+    session.input_tokens = session.input_tokens.saturating_add(update.input_tokens);
+    session.output_tokens = session.output_tokens.saturating_add(update.output_tokens);
+    session.daily_input_tokens = session
+        .daily_input_tokens
+        .saturating_add(update.input_tokens);
+    session.daily_output_tokens = session
+        .daily_output_tokens
+        .saturating_add(update.output_tokens);
+    session.input_token_source = update.input_source.clone();
+    session.output_token_source = update.output_source.clone();
+    merge_usage_labels(&mut session.daily_provider_usage, &update.labels);
+    merge_usage_labels(&mut session.total_label_usage, &update.labels);
+}
 
 // ── Context Management ──────────────────────────────────────────────────────
 
@@ -242,35 +329,123 @@ pub(crate) fn format_usage_block(
     )
 }
 
-pub(crate) fn update_session_token_usage(
+pub(crate) fn rollover_daily_usage_if_needed(session: &mut Session) {
+    let today = prompts::current_local_snapshot().today();
+    if session.token_usage_day != today {
+        // Snapshot the previous day before resetting.
+        if (session.daily_input_tokens > 0 || session.daily_output_tokens > 0)
+            && !session.token_usage_day.is_empty()
+        {
+            let snapshot = crate::DailyUsageSnapshot {
+                date: session.token_usage_day.clone(),
+                input: session.daily_input_tokens,
+                output: session.daily_output_tokens,
+                providers: session.daily_provider_usage.clone(),
+            };
+            session.usage_history.push(snapshot);
+            if session.usage_history.len() > crate::USAGE_HISTORY_CAP {
+                let excess = session.usage_history.len() - crate::USAGE_HISTORY_CAP;
+                session.usage_history.drain(..excess);
+            }
+        }
+        session.daily_input_tokens = 0;
+        session.daily_output_tokens = 0;
+        session.daily_provider_usage.clear();
+        session.token_usage_day = today;
+    }
+}
+
+pub(crate) fn update_session_token_usage_with_provider(
     session: &mut Session,
     input_tokens: u64,
     output_tokens: u64,
     input_source: &str,
     output_source: &str,
+    provider_label: Option<&str>,
+    role_label: Option<&str>,
 ) {
-    let today = prompts::current_local_snapshot().today();
-    if session.token_usage_day != today {
-        session.daily_input_tokens = 0;
-        session.daily_output_tokens = 0;
-        session.token_usage_day = today;
+    update_session_token_usage_with_providers(
+        session,
+        input_tokens,
+        output_tokens,
+        input_source,
+        output_source,
+        &build_usage_labels(input_tokens, output_tokens, provider_label, role_label),
+    );
+}
+
+pub(crate) fn update_session_token_usage_with_providers(
+    session: &mut Session,
+    input_tokens: u64,
+    output_tokens: u64,
+    input_source: &str,
+    output_source: &str,
+    provider_usage: &HashMap<String, [u64; 2]>,
+) {
+    apply_usage_update(
+        session,
+        &UsageUpdate {
+            input_tokens,
+            output_tokens,
+            input_source: input_source.to_string(),
+            output_source: output_source.to_string(),
+            labels: provider_usage.clone(),
+        },
+    );
+}
+
+/// Estimate token count for a string with CJK awareness.
+///
+/// Latin/ASCII text averages ~4 bytes per token. CJK characters (Chinese,
+/// Japanese Kanji, Korean) average ~1.5 characters per token in typical
+/// tokenizers (cl100k, o200k). This function splits the estimation
+/// accordingly instead of a flat `len / 4`.
+fn estimate_text_tokens(text: &str) -> usize {
+    let mut cjk_chars: usize = 0;
+    let mut other_bytes: usize = 0;
+    for c in text.chars() {
+        if is_cjk_like(c) {
+            cjk_chars += 1;
+        } else {
+            other_bytes += c.len_utf8();
+        }
     }
-    session.input_tokens = session.input_tokens.saturating_add(input_tokens);
-    session.output_tokens = session.output_tokens.saturating_add(output_tokens);
-    session.daily_input_tokens = session.daily_input_tokens.saturating_add(input_tokens);
-    session.daily_output_tokens = session.daily_output_tokens.saturating_add(output_tokens);
-    session.input_token_source = input_source.to_string();
-    session.output_token_source = output_source.to_string();
+    // CJK: ~1-2 tokens per character in typical tokenizers; use 1 token/char
+    // as a conservative (slightly over-counting) estimate.
+    // Other: ~4 bytes per token.
+    let cjk_tokens = cjk_chars;
+    let other_tokens = other_bytes / 4;
+    cjk_tokens + other_tokens
+}
+
+/// Quick CJK character classifier for token estimation.
+fn is_cjk_like(c: char) -> bool {
+    matches!(
+        c,
+        '\u{4E00}'..='\u{9FFF}'
+            | '\u{3400}'..='\u{4DBF}'
+            | '\u{F900}'..='\u{FAFF}'
+            | '\u{3040}'..='\u{309F}'
+            | '\u{30A0}'..='\u{30FF}'
+            | '\u{AC00}'..='\u{D7AF}'
+    )
 }
 
 pub(crate) fn message_token_len(message: &ChatMessage) -> usize {
-    let content_len = message.content.as_ref().map(|c| c.len()).unwrap_or(0);
-    let tc_len = message
+    let content_tokens = message
+        .content
+        .as_ref()
+        .map(|c| estimate_text_tokens(c))
+        .unwrap_or(0);
+    let tc_tokens = message
         .tool_calls
         .as_ref()
         .map(|tcs| {
             tcs.iter()
-                .map(|tc| tc.function.name.len() + tc.function.arguments.len())
+                .map(|tc| {
+                    // Tool call JSON is typically ASCII, use simple /4.
+                    (tc.function.name.len() + tc.function.arguments.len()) / 4
+                })
                 .sum::<usize>()
         })
         .unwrap_or(0);
@@ -280,7 +455,7 @@ pub(crate) fn message_token_len(message: &ChatMessage) -> usize {
         .as_ref()
         .map(|imgs| imgs.len() * 85)
         .unwrap_or(0);
-    (content_len + tc_len + 10) / 4 + img_tokens
+    content_tokens + tc_tokens + 3 + img_tokens
 }
 
 /// Measure the size of the conversational "turn" starting at `start`.
@@ -331,15 +506,22 @@ pub(crate) fn prune_messages(messages: &mut Vec<ChatMessage>, max_tokens: usize)
     // Keep: system message (index 0) + as many recent messages as fit.
     // Remove oldest non-system messages in complete turns so we never
     // leave orphaned tool_calls or tool results.
-    let mut estimated = estimate_tokens(messages);
-    while estimated > max_tokens && messages.len() > 2 {
-        let count = turn_len(messages, 1);
-        let removed = messages[1..1 + count]
-            .iter()
-            .map(message_token_len)
-            .sum::<usize>();
-        messages.drain(1..1 + count);
+    //
+    // Pre-compute per-message costs in a single pass, then walk turns
+    // using cached values. ONE final drain avoids repeated O(n) shifts.
+    let costs: Vec<usize> = messages.iter().map(message_token_len).collect();
+    let mut estimated: usize = costs.iter().sum();
+    let mut total_remove = 0;
+    let mut pos = 1;
+    while estimated > max_tokens && messages.len() - total_remove > 2 && pos < messages.len() {
+        let count = turn_len(messages, pos);
+        let removed: usize = costs[pos..pos + count].iter().sum();
+        total_remove += count;
+        pos += count;
         estimated = estimated.saturating_sub(removed);
+    }
+    if total_remove > 0 {
+        messages.drain(1..1 + total_remove);
     }
 }
 
@@ -348,14 +530,21 @@ pub(crate) fn prune_messages_for_provider(
     provider: Provider,
     max_tokens: usize,
 ) {
-    let mut estimated = estimate_tokens_for_provider(provider, messages);
-    while estimated > max_tokens && messages.len() > 2 {
-        let count = turn_len(messages, 1);
-        let removed = messages[1..1 + count]
-            .iter()
-            .map(|message| message_token_len_for_provider(provider, message))
-            .sum::<usize>();
-        messages.drain(1..1 + count);
+    let costs: Vec<usize> = messages
+        .iter()
+        .map(|m| message_token_len_for_provider(provider, m))
+        .collect();
+    let mut estimated: usize = costs.iter().sum();
+    let mut total_remove = 0;
+    let mut pos = 1;
+    while estimated > max_tokens && messages.len() - total_remove > 2 && pos < messages.len() {
+        let count = turn_len(messages, pos);
+        let removed: usize = costs[pos..pos + count].iter().sum();
+        total_remove += count;
+        pos += count;
         estimated = estimated.saturating_sub(removed);
+    }
+    if total_remove > 0 {
+        messages.drain(1..1 + total_remove);
     }
 }

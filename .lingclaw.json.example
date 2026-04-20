@@ -39,6 +39,22 @@
           }
         ]
       },
+      "openai-2": {
+        "baseUrl": "https://openai-gateway.example/v1",
+        "apiKey": "sk-your-openai-compatible-key",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "gpt-4o-mini",
+            "name": "gpt-4o-mini",
+            "reasoning": false,
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 128000,
+            "maxTokens": 16384
+          }
+        ]
+      },
       "anthropic": {
         "baseUrl": "https://api.anthropic.com",
         "apiKey": "sk-ant-your-anthropic-key",
@@ -47,6 +63,31 @@
           {
             "id": "claude-sonnet-4-20250514",
             "name": "claude-sonnet-4-20250514",
+            "reasoning": false,
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 200000,
+            "maxTokens": 8192
+          }
+        ]
+      },
+      "anthropic-2": {
+        "baseUrl": "https://anthropic-gateway.example",
+        "apiKey": "sk-ant-your-anthropic-compatible-key",
+        "api": "anthropic",
+        "models": [
+          {
+            "id": "claude-sonnet-4-20250514",
+            "name": "claude-sonnet-4-20250514",
+            "reasoning": false,
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 200000,
+            "maxTokens": 8192
+          },
+          {
+            "id": "claude-haiku-3-20250306",
+            "name": "claude-haiku-3-20250306",
             "reasoning": false,
             "input": ["text", "image"],
             "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
@@ -71,6 +112,23 @@
             "compat": { "thinkingFormat": "ollama" }
           }
         ]
+      },
+      "ollama-2": {
+        "baseUrl": "http://10.0.0.25:11434",
+        "apiKey": "",
+        "api": "ollama",
+        "models": [
+          {
+            "id": "qwen3",
+            "name": "qwen3",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 128000,
+            "maxTokens": 8192,
+            "compat": { "thinkingFormat": "ollama" }
+          }
+        ]
       }
     }
   },
@@ -78,9 +136,11 @@
     "defaults": {
       "model": {
         "primary": "openai/gpt-4o-mini",
-        "sub-agent": "openai/gpt-4o-mini",
-        "memory": "openai/gpt-4o-mini",
-        "reflection": "openai/gpt-4o-mini"
+        "fast": "openai-2/gpt-4o-mini",
+        "sub-agent": "openai-2/gpt-4o-mini",
+        "memory": "openai-2/gpt-4o-mini",
+        "reflection": "anthropic/claude-sonnet-4-20250514",
+        "context": "anthropic-2/claude-haiku-3-20250306"
       }
     }
   },

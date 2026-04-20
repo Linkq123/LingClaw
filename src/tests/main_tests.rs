@@ -30,6 +30,7 @@ fn test_config() -> Config {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -162,9 +163,9 @@ fn memory_model_falls_back_when_unset() {
 
 fn test_app_state() -> AppState {
     AppState {
-        config: test_config(),
+        config: std::sync::Mutex::new(Arc::new(test_config())),
         http: reqwest::Client::new(),
-        sessions: Mutex::new(HashMap::new()),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
@@ -181,9 +182,9 @@ fn test_app_state() -> AppState {
 
 fn test_app_state_with_config(config: Config) -> AppState {
     AppState {
-        config,
+        config: std::sync::Mutex::new(Arc::new(config)),
         http: reqwest::Client::new(),
-        sessions: Mutex::new(HashMap::new()),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
@@ -220,12 +221,16 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: model_override.map(|value| value.to_string()),
         think_level: default_think_level(),
         show_react: false,
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 0,
         workspace: PathBuf::new(),
     }
@@ -287,6 +292,73 @@ fn build_compressed_messages_inserts_summary_and_keeps_recent_tail() {
 }
 
 #[test]
+fn compression_source_text_skips_auto_generated_summary() {
+    let summary_msg = build_auto_summary_message("Some previous summary");
+    let messages = vec![
+        make_message("system", "system"),
+        summary_msg,
+        make_message("user", "after-summary"),
+        make_message("assistant", "reply"),
+    ];
+    let source = build_compression_source_text(&messages);
+    assert!(
+        !source.contains("Context Summary (auto-generated)"),
+        "compression source should not include previous auto-summaries"
+    );
+    assert!(source.contains("after-summary"));
+    assert!(source.contains("reply"));
+}
+
+#[test]
+fn compression_source_text_includes_image_markers() {
+    let mut user_msg = make_message("user", "look at this");
+    user_msg.images = Some(vec![
+        ImageAttachment {
+            url: "https://example.com/a.png".to_string(),
+            s3_object_key: None,
+            cache_path: None,
+            data: None,
+        },
+        ImageAttachment {
+            url: "https://example.com/b.png".to_string(),
+            s3_object_key: None,
+            cache_path: None,
+            data: None,
+        },
+    ]);
+    let messages = vec![
+        make_message("system", "system"),
+        user_msg,
+        make_message("assistant", "I see"),
+    ];
+    let source = build_compression_source_text(&messages);
+    assert!(
+        source.contains("2 image(s)"),
+        "compression source should note image attachments"
+    );
+    assert!(source.contains("look at this"));
+}
+
+#[test]
+fn repeated_compression_excludes_previous_summary() {
+    let messages_after_first_compress = vec![
+        make_message("system", "system"),
+        build_auto_summary_message("summary of early conversation"),
+        make_message("user", "new question"),
+        make_message("assistant", "new answer"),
+        make_message("user", "follow up"),
+        make_message("assistant", "follow up answer"),
+    ];
+    let source = build_compression_source_text(&messages_after_first_compress);
+    assert!(
+        !source.contains("summary of early conversation"),
+        "second compression should not include the first summary text"
+    );
+    assert!(source.contains("new question"));
+    assert!(source.contains("follow up"));
+}
+
+#[test]
 fn resolve_model_uses_config_for_plain_model_id() {
     let mut providers = HashMap::new();
     providers.insert(
@@ -317,6 +389,7 @@ fn resolve_model_uses_config_for_plain_model_id() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -593,12 +666,16 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 0,
         workspace: PathBuf::new(),
     };
@@ -616,6 +693,57 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         tool_result["result"].as_str(),
         Some(long_raw_result.as_str())
     );
+    assert_eq!(tool_result["is_error"].as_bool(), Some(false));
+}
+
+#[test]
+fn build_history_payload_marks_failed_tool_result_with_is_error() {
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![ChatMessage {
+            role: "tool".into(),
+            content: Some("Sub-agent 'coder' timed out after 30s".into()),
+            images: None,
+            tool_calls: None,
+            tool_call_id: Some("task_1".into()),
+            timestamp: Some(123),
+        }],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: false,
+        show_tools: true,
+        show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: HashSet::from(["task_1".to_string()]),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let payload = build_history_payload(&session);
+    let messages = payload["messages"]
+        .as_array()
+        .expect("history payload should contain a messages array");
+    let tool_result = messages
+        .iter()
+        .find(|message| message["role"] == "tool_result")
+        .expect("history payload should contain a tool_result entry");
+
+    assert_eq!(tool_result["id"].as_str(), Some("task_1"));
+    assert_eq!(tool_result["is_error"].as_bool(), Some(true));
 }
 
 #[test]
@@ -646,12 +774,16 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
         show_react: default_show_react(),
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -694,12 +826,16 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
         show_react: default_show_react(),
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -780,6 +916,7 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::Ollama,
         anthropic_prompt_caching: false,
         providers,
@@ -858,6 +995,7 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -942,6 +1080,7 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1018,6 +1157,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1043,6 +1183,162 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
     assert_eq!(resolved.api_base, "https://api-b.example/v1");
     assert_eq!(resolved.api_key, "key-b");
     assert_eq!(resolved.max_tokens, Some(8192));
+}
+
+#[test]
+fn resolve_model_prefers_exact_runtime_match_for_same_anthropic_provider_type() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "anthropic-a".to_string(),
+        JsonProviderConfig {
+            base_url: "https://anthropic-a.example".to_string(),
+            api_key: "ant-key-a".to_string(),
+            api: "anthropic".to_string(),
+            models: vec![JsonModelEntry {
+                id: "shared-model".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(200000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+    providers.insert(
+        "anthropic-b".to_string(),
+        JsonProviderConfig {
+            base_url: "https://anthropic-b.example".to_string(),
+            api_key: "ant-key-b".to_string(),
+            api: "anthropic".to_string(),
+            models: vec![JsonModelEntry {
+                id: "shared-model".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(200000),
+                max_tokens: Some(12288),
+                compat: None,
+            }],
+        },
+    );
+
+    let config = Config {
+        api_key: "ant-key-b".to_string(),
+        api_base: "https://anthropic-b.example".to_string(),
+        model: "shared-model".to_string(),
+        fast_model: None,
+        sub_agent_model: None,
+        memory_model: None,
+
+        reflection_model: None,
+        context_model: None,
+        provider: Provider::Anthropic,
+        anthropic_prompt_caching: false,
+        providers,
+        mcp_servers: HashMap::new(),
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
+        structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
+    };
+
+    let resolved = config.resolve_model("shared-model");
+
+    assert_eq!(resolved.provider, Provider::Anthropic);
+    assert_eq!(resolved.api_base, "https://anthropic-b.example");
+    assert_eq!(resolved.api_key, "ant-key-b");
+    assert_eq!(resolved.max_tokens, Some(12288));
+}
+
+#[test]
+fn resolve_model_prefers_exact_runtime_match_for_same_ollama_provider_type() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "ollama-a".to_string(),
+        JsonProviderConfig {
+            base_url: "http://127.0.0.1:11434".to_string(),
+            api_key: "ollama-key-a".to_string(),
+            api: "ollama".to_string(),
+            models: vec![JsonModelEntry {
+                id: "qwen3".to_string(),
+                name: None,
+                reasoning: Some(true),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(8192),
+                compat: Some(json!({"thinkingFormat": "qwen"})),
+            }],
+        },
+    );
+    providers.insert(
+        "ollama-b".to_string(),
+        JsonProviderConfig {
+            base_url: "http://127.0.0.1:11435".to_string(),
+            api_key: "ollama-key-b".to_string(),
+            api: "ollama".to_string(),
+            models: vec![JsonModelEntry {
+                id: "qwen3".to_string(),
+                name: None,
+                reasoning: Some(true),
+                input: None,
+                cost: None,
+                context_window: Some(256000),
+                max_tokens: Some(16384),
+                compat: Some(json!({"thinkingFormat": "ollama"})),
+            }],
+        },
+    );
+
+    let config = Config {
+        api_key: "ollama-key-b".to_string(),
+        api_base: "http://127.0.0.1:11435".to_string(),
+        model: "qwen3".to_string(),
+        fast_model: None,
+        sub_agent_model: None,
+        memory_model: None,
+
+        reflection_model: None,
+        context_model: None,
+        provider: Provider::Ollama,
+        anthropic_prompt_caching: false,
+        providers,
+        mcp_servers: HashMap::new(),
+        port: 3000,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
+        structured_memory: false,
+
+        daily_reflection: false,
+        s3: None,
+    };
+
+    let resolved = config.resolve_model("qwen3");
+
+    assert_eq!(resolved.provider, Provider::Ollama);
+    assert_eq!(resolved.api_base, "http://127.0.0.1:11435");
+    assert_eq!(resolved.api_key, "ollama-key-b");
+    assert_eq!(resolved.max_tokens, Some(16384));
+    assert_eq!(resolved.context_window, 256000);
+    assert_eq!(resolved.thinking_format.as_deref(), Some("ollama"));
 }
 
 #[test]
@@ -1076,6 +1372,7 @@ fn canonical_model_ref_expands_unique_plain_id() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1151,6 +1448,7 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1228,6 +1526,7 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1285,6 +1584,7 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1342,6 +1642,7 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -1379,6 +1680,7 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -1416,6 +1718,7 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -1453,6 +1756,7 @@ fn resolve_model_accepts_ollama_prefix_without_provider_config() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::Ollama,
         anthropic_prompt_caching: false,
         providers: HashMap::new(),
@@ -1510,6 +1814,7 @@ fn build_session_status_reports_resolved_target() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -2011,12 +2316,16 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 0,
         workspace: workspace.clone(),
     };
@@ -2084,12 +2393,16 @@ fn save_session_to_disk_overwrites_existing_file() {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 1,
         workspace: workspace.clone(),
     };
@@ -2302,6 +2615,452 @@ async fn api_client_config_returns_upload_token() {
     assert_eq!(payload["upload_token"], state.upload_token);
 }
 
+#[tokio::test]
+async fn api_usage_returns_token_sources() {
+    let state = Arc::new(test_app_state());
+    let mut session = test_session(MAIN_SESSION_ID, "Main", None);
+    session.input_tokens = 123;
+    session.output_tokens = 45;
+    session.daily_input_tokens = 12;
+    session.daily_output_tokens = 3;
+    session.input_token_source = "provider".to_string();
+    session.output_token_source = "estimated".to_string();
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session.id.clone(), session);
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_usage(headers, State(state))
+        .await
+        .expect("local request should be accepted");
+
+    assert_eq!(payload["input_source"], "provider");
+    assert_eq!(payload["output_source"], "estimated");
+    assert_eq!(payload["source_scope"], "latest_update");
+    assert_eq!(payload["total"], 168);
+}
+
+#[tokio::test]
+async fn api_usage_rolls_over_stale_daily_usage_before_serializing() {
+    let state = Arc::new(test_app_state());
+    let mut session = test_session(MAIN_SESSION_ID, "Main", None);
+    let yesterday = (chrono::Local::now().date_naive() - chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let mut providers = HashMap::new();
+    providers.insert("openai".to_string(), [12, 3]);
+    session.token_usage_day = yesterday.clone();
+    session.daily_input_tokens = 12;
+    session.daily_output_tokens = 3;
+    session.daily_provider_usage = providers;
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session.id.clone(), session);
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_usage(headers, State(state.clone()))
+        .await
+        .expect("local request should be accepted");
+
+    assert_eq!(payload["daily_input"], 0);
+    assert_eq!(payload["daily_output"], 0);
+    assert_eq!(payload["daily_providers"], json!({}));
+    assert_eq!(payload["daily_roles"], json!({}));
+    assert_eq!(
+        payload["usage_history"],
+        json!([{
+            "date": yesterday,
+            "input": 12,
+            "output": 3,
+            "providers": {
+                "openai": [12, 3]
+            },
+            "roles": {}
+        }])
+    );
+
+    let persisted = state
+        .sessions
+        .lock()
+        .await
+        .get(MAIN_SESSION_ID)
+        .cloned()
+        .expect("session should still exist");
+    assert_eq!(persisted.daily_input_tokens, 0);
+    assert_eq!(persisted.daily_output_tokens, 0);
+    assert!(persisted.daily_provider_usage.is_empty());
+    assert_eq!(persisted.usage_history.len(), 1);
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_invalid_provider_names() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let state = Arc::new(test_app_state());
+    let result = api_put_config(
+        headers,
+        State(state),
+        Json(json!({
+            "config": {
+                "models": {
+                    "providers": {
+                        "openai/test": {
+                            "api": "openai-completions",
+                            "baseUrl": "https://api.openai.com/v1",
+                            "apiKey": "key",
+                            "models": []
+                        }
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("invalid provider names should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("cannot contain '/'"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_unknown_agent_provider_alias() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let state = Arc::new(test_app_state());
+    let result = api_put_config(
+        headers,
+        State(state),
+        Json(json!({
+            "config": {
+                "models": {
+                    "providers": {
+                        "openai-work": {
+                            "api": "openai-completions",
+                            "baseUrl": "https://gateway.example/v1",
+                            "apiKey": "key",
+                            "models": [
+                                {
+                                    "id": "gpt-4o-mini"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "agents": {
+                    "defaults": {
+                        "model": {
+                            "primary": "missing/gpt-4o-mini"
+                        }
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("unknown agent provider aliases should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("agents.defaults.model.primary"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_unknown_agent_provider_prefix_without_models_config() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let state = Arc::new(test_app_state());
+    let result = api_put_config(
+        headers,
+        State(state),
+        Json(json!({
+            "config": {
+                "agents": {
+                    "defaults": {
+                        "model": {
+                            "primary": "missing/gpt-4o-mini"
+                        }
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) =
+        result.expect_err("unknown provider prefixes should fail without models config");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("agents.defaults.model.primary"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_unknown_agent_model_id_for_configured_provider() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let state = Arc::new(test_app_state());
+    let result = api_put_config(
+        headers,
+        State(state),
+        Json(json!({
+            "config": {
+                "models": {
+                    "providers": {
+                        "openai-work": {
+                            "api": "openai-completions",
+                            "baseUrl": "https://gateway.example/v1",
+                            "apiKey": "key",
+                            "models": [
+                                {
+                                    "id": "gpt-4o-mini"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "agents": {
+                    "defaults": {
+                        "model": {
+                            "primary": "openai-work/typo-model"
+                        }
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("unknown configured model ids should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("unknown model 'typo-model'"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_empty_mcp_command() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let state = Arc::new(test_app_state());
+    let result = api_put_config(
+        headers,
+        State(state),
+        Json(json!({
+            "config": {
+                "mcpServers": {
+                    "empty-command": {
+                        "command": "",
+                        "args": []
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("empty MCP command should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("mcpServers.empty-command"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_invalid_provider_api_kind() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let state = Arc::new(test_app_state());
+    let result = api_put_config(
+        headers,
+        State(state),
+        Json(json!({
+            "config": {
+                "models": {
+                    "providers": {
+                        "openai-work": {
+                            "api": "anthorpic",
+                            "baseUrl": "https://gateway.example/v1",
+                            "apiKey": "key",
+                            "models": []
+                        }
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("invalid provider api kinds should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("unsupported api 'anthorpic'"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_zero_mcp_timeout() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let state = Arc::new(test_app_state());
+    let result = api_put_config(
+        headers,
+        State(state),
+        Json(json!({
+            "config": {
+                "mcpServers": {
+                    "zero-timeout": {
+                        "command": "uvx",
+                        "args": [],
+                        "timeoutSecs": 0
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("zero MCP timeout should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("greater than 0"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_mcp_cwd_outside_workspace() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let state = Arc::new(test_app_state());
+    let result = api_put_config(
+        headers,
+        State(state),
+        Json(json!({
+            "config": {
+                "mcpServers": {
+                    "outside-workspace": {
+                        "command": "uvx",
+                        "args": [],
+                        "cwd": "../outside"
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("MCP cwd escaping the workspace should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().is_some_and(|msg| {
+        msg.contains("mcpServers.outside-workspace.cwd")
+            && msg.contains("outside the session workspace")
+    }));
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_empty_provider_model_id() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let state = Arc::new(test_app_state());
+    let result = api_put_config(
+        headers,
+        State(state),
+        Json(json!({
+            "config": {
+                "models": {
+                    "providers": {
+                        "openai-work": {
+                            "api": "openai-completions",
+                            "baseUrl": "https://gateway.example/v1",
+                            "apiKey": "key",
+                            "models": [
+                                {
+                                    "id": ""
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("empty provider model ids should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("model id cannot be empty"))
+    );
+}
+
+#[tokio::test]
+async fn read_config_file_snapshot_waits_for_active_writer() {
+    let base = std::env::temp_dir().join(format!("lingclaw-config-read-{}", now_epoch()));
+    std::fs::create_dir_all(&base).expect("temp dir should be created");
+    let path = base.join("config.json");
+    std::fs::write(&path, "{\"ok\":true}").expect("config file should be written");
+
+    let write_guard = CONFIG_FILE_LOCK.write().await;
+    let task = tokio::spawn({
+        let path = path.clone();
+        async move {
+            read_config_file_snapshot(&path)
+                .await
+                .expect("config read should succeed")
+        }
+    });
+
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !task.is_finished(),
+        "reader should wait for active config writer"
+    );
+
+    drop(write_guard);
+
+    let content = task.await.expect("reader task should join");
+    assert_eq!(content, "{\"ok\":true}");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 fn validate_local_request_headers_accepts_loopback_host_and_origin() {
     let mut headers = HeaderMap::new();
@@ -2457,12 +3216,16 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         input_token_source: default_token_usage_source(),
         output_token_source: default_token_usage_source(),
         token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
         model_override: None,
         think_level: default_think_level(),
         show_react: false,
         show_tools: true,
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
         version: 0,
         workspace: PathBuf::new(),
     };
@@ -2472,7 +3235,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
     let tool_entry = msgs.iter().find(|m| m["role"] == "tool_result").unwrap();
     let result_str = tool_entry["result"].as_str().unwrap();
 
-    // Must be exact raw content — no "[Observation:" prefix
+    // Must be exact raw content —no "[Observation:" prefix
     assert_eq!(result_str, big_result.as_str());
     assert!(!result_str.starts_with("[Observation:"));
 }
@@ -2525,7 +3288,7 @@ fn system_prompt_with_observation_hint_preserves_original_content() {
         tool_name: "exec".into(),
         byte_size: 8000,
         line_count: 200,
-        hint: "exec returned 200 lines / 8000 bytes — focus on key findings".into(),
+        hint: "exec returned 200 lines / 8000 bytes —focus on key findings".into(),
     }];
     if let Some(hint) = agent::build_observation_context_hint(&summaries, 0)
         && let Some(ref mut content) = msg.content
@@ -2550,7 +3313,7 @@ fn finish_reason_label_appears_in_done_event_shape() {
 #[test]
 fn auto_think_adapts_in_agent_loop_context() {
     // Simulate the pattern used in the Analyze arm:
-    // auto mode + reasoning model — phase-adapted level
+    // auto mode + reasoning model —phase-adapted level
     let think_level = "auto";
     let model_supports_reasoning = true;
 
@@ -2578,7 +3341,7 @@ fn auto_think_adapts_in_agent_loop_context() {
     };
     assert_eq!(effective, "low");
 
-    // Explicit level — no adaptation
+    // Explicit level —no adaptation
     let think_level = "high";
     let effective = if think_level == "auto" && model_supports_reasoning {
         agent::auto_think_level(5, true, 0, 0).to_owned()
@@ -3370,7 +4133,8 @@ fn replay_live_round_rehydrates_inflight_round_state() {
 
     for _ in 0..7 {
         let _ = rt
-            .block_on(bound_rx.recv())
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), bound_rx.recv()).await })
+            .expect("bound replay event should arrive before timeout")
             .expect("bound client should receive live event");
     }
 
@@ -3380,7 +4144,10 @@ fn replay_live_round_rehydrates_inflight_round_state() {
     let replayed = (0..7)
         .map(|_| {
             let raw = rt
-                .block_on(replay_rx.recv())
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), replay_rx.recv()).await
+                })
+                .expect("replayed event should arrive before timeout")
                 .expect("replay should produce serialized event");
             serde_json::from_str::<serde_json::Value>(&raw)
                 .expect("replayed event should be valid json")
@@ -3414,6 +4181,1217 @@ fn replay_live_round_rehydrates_inflight_round_state() {
             .get(&session_id)
             .is_none()
     );
+}
+
+#[test]
+fn replay_live_round_rehydrates_active_task_with_task_id() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-task-replay-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 1,
+            "phase": "act",
+            "cycle": 1,
+            "react_visible": true,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_started",
+            "task_id": "task-123",
+            "agent": "coder",
+            "prompt": "Implement feature",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_progress",
+            "task_id": "task-123",
+            "agent": "coder",
+            "cycle": 2,
+            "phase": "analyze",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_tool",
+            "task_id": "task-123",
+            "agent": "coder",
+            "tool": "read_file",
+            "id": "tool-a",
+        }),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed = (0..4)
+        .map(|_| {
+            let raw = rt
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), replay_rx.recv()).await
+                })
+                .expect("replay event should arrive before timeout")
+                .expect("replay should produce serialized event");
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .expect("replayed event should be valid json")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "task_started");
+    assert_eq!(replayed[1]["task_id"], "task-123");
+    assert_eq!(replayed[1]["agent"], "coder");
+    assert_eq!(replayed[2]["type"], "task_progress");
+    assert_eq!(replayed[2]["task_id"], "task-123");
+    assert_eq!(replayed[3]["type"], "task_tool");
+    assert_eq!(replayed[3]["task_id"], "task-123");
+    assert_eq!(replayed[3]["id"], "tool-a");
+}
+
+#[test]
+fn replay_live_round_scopes_subagent_tool_results_to_task() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-task-tool-result-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 1,
+            "phase": "act",
+            "cycle": 1,
+            "react_visible": true,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_started",
+            "task_id": "task-123",
+            "agent": "coder",
+            "prompt": "Implement feature",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "thinking_start",
+            "task_id": "task-123",
+            "subagent": "coder",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "thinking_delta",
+            "task_id": "task-123",
+            "subagent": "coder",
+            "content": "internal reasoning",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "delta",
+            "task_id": "task-123",
+            "subagent": "coder",
+            "content": "subagent content",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_tool",
+            "task_id": "task-123",
+            "agent": "coder",
+            "tool": "read_file",
+            "id": "tool-a",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "tool_result",
+            "task_id": "task-123",
+            "subagent": "coder",
+            "id": "tool-a",
+            "name": "read_file",
+            "duration_ms": 42,
+            "is_error": false,
+        }),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed = (0..4)
+        .map(|_| {
+            let raw = rt
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), replay_rx.recv()).await
+                })
+                .expect("replay event should arrive before timeout")
+                .expect("replay should produce serialized event");
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .expect("replayed event should be valid json")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "task_started");
+    assert_eq!(replayed[2]["type"], "task_tool");
+    assert_eq!(replayed[2]["task_id"], "task-123");
+    assert_eq!(replayed[3]["type"], "tool_result");
+    assert_eq!(replayed[3]["task_id"], "task-123");
+    assert_eq!(replayed[3]["subagent"], "coder");
+    assert_eq!(replayed[3]["id"], "tool-a");
+    assert_eq!(replayed[3]["duration_ms"], 42);
+    assert!(matches!(
+        replay_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn replay_ignores_orphaned_tool_result_after_task_completed() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-orphan-tool-result-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"task_started","task_id":"t-1","agent":"coder","prompt":"Do stuff"}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"task_completed","task_id":"t-1","agent":"coder","cycles":1,"tool_calls":0,"duration_ms":100}),
+    ));
+    // Late tool_result arrives after terminal event —should be silently dropped.
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"tool_result","task_id":"t-1","subagent":"coder","id":"orphan","name":"read_file","result":"late","duration_ms":10,"is_error":false}),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed: Vec<serde_json::Value> = (0..3)
+        .map(|_| {
+            let raw = rt
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), replay_rx.recv()).await
+                })
+                .expect("replayed event should arrive before timeout")
+                .expect("replay should produce serialized event");
+            serde_json::from_str(&raw).expect("valid json")
+        })
+        .collect();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "task_started");
+    assert_eq!(replayed[2]["type"], "task_completed");
+    // No orphaned tool_result should be present.
+    assert!(matches!(
+        replay_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn malformed_orchestrate_terminal_does_not_remove_unrelated_task() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-malformed-orch-terminal-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"task_started",
+            "task_id":"coder",
+            "agent":"standalone",
+            "prompt":"Do stuff",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_started",
+            "orchestrate_id":"orch-1",
+            "task_count":1,
+            "layer_count":1,
+            "tasks":[
+                {"id":"a","agent":"explore","depends_on":[]}
+            ],
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_task_completed",
+            "orchestrate_id":"orch-1",
+            "agent":"coder",
+            "cycles":1,
+            "tool_calls":0,
+            "duration_ms":10,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"task_completed",
+            "task_id":"coder",
+            "agent":"standalone",
+            "cycles":1,
+            "tool_calls":0,
+            "duration_ms":20,
+        }),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed: Vec<serde_json::Value> = (0..4)
+        .map(|_| {
+            let raw = rt
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), replay_rx.recv()).await
+                })
+                .expect("replay event should arrive before timeout")
+                .expect("replay should produce event");
+            serde_json::from_str(&raw).expect("valid json")
+        })
+        .collect();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "task_started");
+    assert_eq!(replayed[1]["task_id"], "coder");
+    assert_eq!(replayed[2]["type"], "orchestrate_started");
+    assert_eq!(replayed[3]["type"], "task_completed");
+    assert_eq!(replayed[3]["task_id"], "coder");
+    assert!(matches!(
+        replay_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn delegated_events_cap_prevents_unbounded_growth() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-delegated-cap-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    // Dispatch more task_started events than the cap allows.
+    for i in 0..(DELEGATED_EVENTS_CAP + 500) {
+        rt.block_on(dispatch_live_event(
+            &state,
+            &session_id,
+            1,
+            json!({
+                "type":"task_started",
+                "task_id": format!("t-{i}"),
+                "agent":"coder",
+                "prompt":"overflow test",
+            }),
+        ));
+    }
+
+    {
+        let live_rounds = rt.block_on(state.live_rounds.lock());
+        let round = live_rounds.get(&session_id).expect("round should exist");
+        assert_eq!(
+            round.delegated_events.len(),
+            DELEGATED_EVENTS_CAP,
+            "non-terminal events should be capped at DELEGATED_EVENTS_CAP"
+        );
+    }
+
+    // Terminal events for tasks whose started event WAS stored (t-0..t-2)
+    // should bypass the cap so the frontend can close their panels.
+    let stored_terminal_count = 3;
+    for i in 0..stored_terminal_count {
+        rt.block_on(dispatch_live_event(
+            &state,
+            &session_id,
+            1,
+            json!({
+                "type":"task_completed",
+                "task_id": format!("t-{i}"),
+                "agent":"coder",
+                "cycles":1,"tool_calls":0,"duration_ms":10,
+            }),
+        ));
+    }
+
+    // Terminal events for tasks whose started event was NOT stored (past cap)
+    // should be dropped —no panel exists on the frontend to close.
+    for i in (DELEGATED_EVENTS_CAP)..(DELEGATED_EVENTS_CAP + 3) {
+        rt.block_on(dispatch_live_event(
+            &state,
+            &session_id,
+            1,
+            json!({
+                "type":"task_completed",
+                "task_id": format!("t-{i}"),
+                "agent":"coder",
+                "cycles":1,"tool_calls":0,"duration_ms":5,
+            }),
+        ));
+    }
+
+    let live_rounds = rt.block_on(state.live_rounds.lock());
+    let round = live_rounds.get(&session_id).expect("round should exist");
+    assert_eq!(
+        round.delegated_events.len(),
+        DELEGATED_EVENTS_CAP + stored_terminal_count,
+        "only terminal events with stored starts should bypass cap"
+    );
+    // Verify the bypass events are the stored-start terminals.
+    for i in 0..stored_terminal_count {
+        let event = &round.delegated_events[DELEGATED_EVENTS_CAP + i];
+        assert_eq!(event["type"], "task_completed");
+        assert_eq!(event["task_id"], format!("t-{i}"));
+    }
+}
+
+#[test]
+fn replay_live_round_preserves_subagent_tool_event_order() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-task-tool-order-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 1,
+            "phase": "act",
+            "cycle": 1,
+            "react_visible": true,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_started",
+            "task_id": "task-ordered",
+            "agent": "coder",
+            "prompt": "Implement feature",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_tool",
+            "task_id": "task-ordered",
+            "agent": "coder",
+            "tool": "read_file",
+            "id": "tool-a",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "tool_result",
+            "task_id": "task-ordered",
+            "subagent": "coder",
+            "id": "tool-a",
+            "name": "read_file",
+            "duration_ms": 11,
+            "is_error": false,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_tool",
+            "task_id": "task-ordered",
+            "agent": "coder",
+            "tool": "list_dir",
+            "id": "tool-b",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "tool_result",
+            "task_id": "task-ordered",
+            "subagent": "coder",
+            "id": "tool-b",
+            "name": "list_dir",
+            "duration_ms": 22,
+            "is_error": false,
+        }),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed = (0..6)
+        .map(|_| {
+            let raw = rt
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), replay_rx.recv()).await
+                })
+                .expect("replay event should arrive before timeout")
+                .expect("replay should produce serialized event");
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .expect("replayed event should be valid json")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "task_started");
+    assert_eq!(replayed[2]["type"], "task_tool");
+    assert_eq!(replayed[2]["id"], "tool-a");
+    assert_eq!(replayed[3]["type"], "tool_result");
+    assert_eq!(replayed[3]["id"], "tool-a");
+    assert_eq!(replayed[4]["type"], "task_tool");
+    assert_eq!(replayed[4]["id"], "tool-b");
+    assert_eq!(replayed[5]["type"], "tool_result");
+    assert_eq!(replayed[5]["id"], "tool-b");
+    assert!(matches!(
+        replay_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn replay_live_round_rehydrates_active_orchestration_state() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-orch-replay-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 1,
+            "phase": "act",
+            "cycle": 1,
+            "react_visible": true,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "orchestrate_started",
+            "orchestrate_id": "orch-1",
+            "task_count": 3,
+            "layer_count": 2,
+            "tasks": [
+                {"id": "code", "agent": "explore", "depends_on": [], "prompt_preview": "Analyze codebase structure"},
+                {"id": "docs", "agent": "researcher", "depends_on": [], "prompt_preview": "Read docs and changelog"},
+                {"id": "plan", "agent": "coder", "depends_on": ["code", "docs"], "prompt_preview": "Draft final plan"}
+            ],
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "orchestrate_layer",
+            "orchestrate_id": "orch-1",
+            "layer": 1,
+            "total_layers": 2,
+            "tasks": ["code", "docs"],
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "orchestrate_task_started",
+            "orchestrate_id": "orch-1",
+            "id": "code",
+            "agent": "explore",
+            "prompt": "Analyze code",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "orchestrate_task_started",
+            "orchestrate_id": "orch-1",
+            "id": "docs",
+            "agent": "researcher",
+            "prompt": "Read docs",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_progress",
+            "task_id": "orch-1:docs",
+            "agent": "researcher",
+            "cycle": 2,
+            "phase": "analyze",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_tool",
+            "task_id": "orch-1:docs",
+            "agent": "researcher",
+            "tool": "grep_search",
+            "id": "tool-docs",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "orchestrate_task_completed",
+            "orchestrate_id": "orch-1",
+            "id": "code",
+            "agent": "explore",
+            "cycles": 1,
+            "tool_calls": 1,
+            "input_tokens": 11,
+            "output_tokens": 7,
+            "duration_ms": 250,
+            "result_excerpt": "Code structure summarized",
+        }),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed = (0..8)
+        .map(|_| {
+            let raw = rt
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), replay_rx.recv()).await
+                })
+                .expect("replayed event should arrive before timeout")
+                .expect("replay should produce serialized event");
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .expect("replayed event should be valid json")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "orchestrate_started");
+    assert_eq!(replayed[1]["orchestrate_id"], "orch-1");
+    assert_eq!(
+        replayed[1]["tasks"][0]["prompt_preview"],
+        "Analyze codebase structure"
+    );
+    assert_eq!(replayed[2]["type"], "orchestrate_layer");
+    assert_eq!(replayed[2]["layer"], 1);
+    assert_eq!(replayed[3]["type"], "orchestrate_task_started");
+    assert_eq!(replayed[3]["id"], "code");
+    assert_eq!(replayed[4]["type"], "orchestrate_task_started");
+    assert_eq!(replayed[4]["orchestrate_id"], "orch-1");
+    assert_eq!(replayed[4]["id"], "docs");
+    assert_eq!(replayed[5]["type"], "task_progress");
+    assert_eq!(replayed[5]["task_id"], "orch-1:docs");
+    assert_eq!(replayed[6]["type"], "task_tool");
+    assert_eq!(replayed[6]["task_id"], "orch-1:docs");
+    assert_eq!(replayed[7]["type"], "orchestrate_task_completed");
+    assert_eq!(replayed[7]["id"], "code");
+    assert_eq!(replayed[7]["result_excerpt"], "Code structure summarized");
+}
+
+#[test]
+fn replay_preserves_completed_standalone_task_until_round_ends() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-task-done-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"task_started","task_id":"t-1","agent":"coder","prompt":"Do stuff"}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"task_tool",
+            "task_id":"t-1",
+            "agent":"coder",
+            "tool":"read_file",
+            "id":"tl-1",
+            "arguments":"{\"path\":\"README.md\"}"
+        }),
+    ));
+    // Task completes —should still be replayable until round "done"
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"task_completed","task_id":"t-1","agent":"coder",
+            "cycles":2,"tool_calls":1,"duration_ms":500,
+            "result_excerpt":"Delegated analysis complete"
+        }),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed: Vec<serde_json::Value> = (0..4)
+        .map(|_| {
+            let raw = rt
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), replay_rx.recv()).await
+                })
+                .expect("replay event should arrive before timeout")
+                .expect("replay should produce event");
+            serde_json::from_str(&raw).expect("valid json")
+        })
+        .collect();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "task_started");
+    assert_eq!(replayed[1]["task_id"], "t-1");
+    assert_eq!(replayed[2]["type"], "task_tool");
+    assert_eq!(replayed[2]["arguments"], "{\"path\":\"README.md\"}");
+    assert_eq!(replayed[3]["type"], "task_completed");
+    assert_eq!(replayed[3]["task_id"], "t-1");
+    assert_eq!(replayed[3]["result_excerpt"], "Delegated analysis complete");
+}
+
+#[test]
+fn replay_preserves_completed_orchestration_until_round_ends() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-orch-done-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_started",
+            "orchestrate_id":"orch-2",
+            "task_count":2,
+            "layer_count":1,
+            "tasks":[
+                {"id":"a","agent":"explore","depends_on":[]},
+                {"id":"b","agent":"coder","depends_on":[]}
+            ],
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_task_started",
+            "orchestrate_id":"orch-2","id":"a","agent":"explore",
+            "prompt":"Analyze",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_task_completed",
+            "orchestrate_id":"orch-2","id":"a","agent":"explore",
+            "cycles":1,"tool_calls":0,"duration_ms":100,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_task_started",
+            "orchestrate_id":"orch-2","id":"b","agent":"coder",
+            "prompt":"Code",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_task_completed",
+            "orchestrate_id":"orch-2","id":"b","agent":"coder",
+            "cycles":2,"tool_calls":3,"duration_ms":400,
+        }),
+    ));
+    // Orchestration completes —should still be replayable until round "done"
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_completed",
+            "orchestrate_id":"orch-2","task_count":2,"duration_ms":500,
+        }),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed: Vec<serde_json::Value> = (0..7)
+        .map(|_| {
+            let raw = rt
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), replay_rx.recv()).await
+                })
+                .expect("replay event should arrive before timeout")
+                .expect("replay should produce event");
+            serde_json::from_str(&raw).expect("valid json")
+        })
+        .collect();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "orchestrate_started");
+    assert_eq!(replayed[1]["orchestrate_id"], "orch-2");
+    assert_eq!(replayed[2]["type"], "orchestrate_task_started");
+    assert_eq!(replayed[2]["id"], "a");
+    assert_eq!(replayed[3]["type"], "orchestrate_task_completed");
+    assert_eq!(replayed[3]["id"], "a");
+    assert_eq!(replayed[4]["type"], "orchestrate_task_started");
+    assert_eq!(replayed[4]["id"], "b");
+    assert_eq!(replayed[5]["type"], "orchestrate_task_completed");
+    assert_eq!(replayed[5]["id"], "b");
+    assert_eq!(replayed[6]["type"], "orchestrate_completed");
+    assert_eq!(replayed[6]["orchestrate_id"], "orch-2");
+}
+
+#[test]
+fn replay_preserves_multiple_orchestrations_until_round_ends() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-orch-multi-done-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_started",
+            "orchestrate_id":"orch-1",
+            "task_count":1,
+            "layer_count":1,
+            "tasks":[
+                {"id":"a","agent":"explore","depends_on":[]}
+            ],
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_task_started",
+            "orchestrate_id":"orch-1",
+            "id":"a",
+            "agent":"explore",
+            "prompt":"Explore code",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_task_completed",
+            "orchestrate_id":"orch-1",
+            "id":"a",
+            "agent":"explore",
+            "cycles":1,
+            "tool_calls":0,
+            "duration_ms":100,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_completed",
+            "orchestrate_id":"orch-1",
+            "task_count":1,
+            "duration_ms":120,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_started",
+            "orchestrate_id":"orch-2",
+            "task_count":1,
+            "layer_count":1,
+            "tasks":[
+                {"id":"b","agent":"coder","depends_on":[]}
+            ],
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_task_started",
+            "orchestrate_id":"orch-2",
+            "id":"b",
+            "agent":"coder",
+            "prompt":"Write code",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_task_completed",
+            "orchestrate_id":"orch-2",
+            "id":"b",
+            "agent":"coder",
+            "cycles":2,
+            "tool_calls":1,
+            "duration_ms":200,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_completed",
+            "orchestrate_id":"orch-2",
+            "task_count":1,
+            "duration_ms":220,
+        }),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed: Vec<serde_json::Value> = (0..9)
+        .map(|_| {
+            let raw = rt
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), replay_rx.recv()).await
+                })
+                .expect("replay event should arrive before timeout")
+                .expect("replay should produce event");
+            serde_json::from_str(&raw).expect("valid json")
+        })
+        .collect();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "orchestrate_started");
+    assert_eq!(replayed[1]["orchestrate_id"], "orch-1");
+    assert_eq!(replayed[2]["type"], "orchestrate_task_started");
+    assert_eq!(replayed[2]["id"], "a");
+    assert_eq!(replayed[3]["type"], "orchestrate_task_completed");
+    assert_eq!(replayed[3]["id"], "a");
+    assert_eq!(replayed[4]["type"], "orchestrate_completed");
+    assert_eq!(replayed[4]["orchestrate_id"], "orch-1");
+    assert_eq!(replayed[5]["type"], "orchestrate_started");
+    assert_eq!(replayed[5]["orchestrate_id"], "orch-2");
+    assert_eq!(replayed[6]["type"], "orchestrate_task_started");
+    assert_eq!(replayed[6]["id"], "b");
+    assert_eq!(replayed[7]["type"], "orchestrate_task_completed");
+    assert_eq!(replayed[7]["id"], "b");
+    assert_eq!(replayed[8]["type"], "orchestrate_completed");
+    assert_eq!(replayed[8]["orchestrate_id"], "orch-2");
+    assert!(matches!(
+        replay_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn replay_preserves_task_and_orchestration_global_order() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-task-orch-order-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"task_started","task_id":"t-1","agent":"coder","prompt":"Do stuff"}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"task_tool","task_id":"t-1","agent":"coder","tool":"read_file","id":"tl-1"}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"task_completed",
+            "task_id":"t-1",
+            "agent":"coder",
+            "cycles":2,
+            "tool_calls":1,
+            "duration_ms":500,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_started",
+            "orchestrate_id":"orch-mixed",
+            "task_count":1,
+            "layer_count":1,
+            "tasks":[
+                {"id":"a","agent":"explore","depends_on":[]}
+            ],
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"orchestrate_task_started",
+            "orchestrate_id":"orch-mixed",
+            "id":"a",
+            "agent":"explore",
+            "prompt":"Analyze code",
+        }),
+    ));
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed: Vec<serde_json::Value> = (0..6)
+        .map(|_| {
+            let raw = rt
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), replay_rx.recv()).await
+                })
+                .expect("replay event should arrive before timeout")
+                .expect("replay should produce event");
+            serde_json::from_str(&raw).expect("valid json")
+        })
+        .collect();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "task_started");
+    assert_eq!(replayed[1]["task_id"], "t-1");
+    assert_eq!(replayed[2]["type"], "task_tool");
+    assert_eq!(replayed[2]["id"], "tl-1");
+    assert_eq!(replayed[3]["type"], "task_completed");
+    assert_eq!(replayed[3]["task_id"], "t-1");
+    assert_eq!(replayed[4]["type"], "orchestrate_started");
+    assert_eq!(replayed[4]["orchestrate_id"], "orch-mixed");
+    assert_eq!(replayed[5]["type"], "orchestrate_task_started");
+    assert_eq!(replayed[5]["id"], "a");
+    assert!(matches!(
+        replay_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
 }
 
 #[test]
@@ -3513,7 +5491,7 @@ fn session_version_is_preserved_in_serialization() {
 fn tool_outcome_error_detection_by_convention() {
     let rt = tokio::runtime::Runtime::new().unwrap();
 
-    // Unknown tool — is_error
+    // Unknown tool —is_error
     let outcome = rt.block_on(tools::execute_tool(
         "nonexistent",
         "{}",
@@ -3637,7 +5615,7 @@ fn prune_messages_tracks_removal_count() {
         },
     ];
     let before = messages.len();
-    prune_messages(&mut messages, 1000); // very small limit — must prune
+    prune_messages(&mut messages, 1000); // very small limit —must prune
     let pruned = before - messages.len();
     assert!(pruned > 0, "should have removed at least one turn");
     // System + latest user should remain
@@ -3734,6 +5712,24 @@ fn truncate_emoji_boundary() {
     assert!(result.contains("[truncated at 4 bytes"));
 }
 
+#[test]
+fn truncate_safe_preserves_char_boundary() {
+    // CJK: 3 bytes per char. Cutting at 7 must round down to 6.
+    let mut s = "\u{4f60}\u{597d}\u{4e16}".to_string(); // 9 bytes
+    truncate_safe(&mut s, 7);
+    assert_eq!(s, "\u{4f60}\u{597d}");
+
+    // Emoji: 4 bytes per char. Cutting at 5 must round down to 4.
+    let mut s = "\u{1F980}\u{1F980}".to_string(); // 8 bytes
+    truncate_safe(&mut s, 5);
+    assert_eq!(s, "\u{1F980}");
+
+    // Already within limit —unchanged.
+    let mut s = "hello".to_string();
+    truncate_safe(&mut s, 100);
+    assert_eq!(s, "hello");
+}
+
 // ───── Phase 5: format_size ─────
 
 #[test]
@@ -3788,8 +5784,8 @@ fn message_token_len_empty_message() {
         tool_call_id: None,
         timestamp: None,
     };
-    // (0 + 0 + 10) / 4 = 2
-    assert_eq!(message_token_len(&msg), 2);
+    // content=0 + tc=0 + overhead=3 = 3
+    assert_eq!(message_token_len(&msg), 3);
 }
 
 #[test]
@@ -3802,7 +5798,7 @@ fn message_token_len_content_only() {
         tool_call_id: None,
         timestamp: None,
     };
-    // (11 + 0 + 10) / 4 = 5
+    // content: 11 ASCII bytes / 4 = 2, + overhead 3 = 5
     assert_eq!(message_token_len(&msg), 5);
 }
 
@@ -3823,8 +5819,8 @@ fn message_token_len_with_tool_calls() {
         tool_call_id: None,
         timestamp: None,
     };
-    // (0 + (4+12) + 10) / 4 = 26/4 = 6
-    assert_eq!(message_token_len(&msg), 6);
+    // content=0, tc: (4+12)/4 = 4, + overhead 3 = 7
+    assert_eq!(message_token_len(&msg), 7);
 }
 
 #[test]
@@ -3847,8 +5843,40 @@ fn estimate_tokens_sums_messages() {
             timestamp: None,
         },
     ];
-    // (3+0+10)/4 + (5+0+10)/4 = 3 + 3 = 6
-    assert_eq!(estimate_tokens(&messages), 6);
+    // "sys": 3/4=0 + 3=3, "hello": 5/4=1 + 3=4, total=7
+    assert_eq!(estimate_tokens(&messages), 7);
+}
+
+#[test]
+fn message_token_len_cjk_aware() {
+    // CJK text: 6 Chinese characters = 18 UTF-8 bytes, but ~6 tokens (1 per char)
+    let msg = ChatMessage {
+        role: "user".into(),
+        content: Some("你好世界测试".into()),
+        images: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    let cjk_estimate = message_token_len(&msg);
+
+    // Same byte-length ASCII text
+    let ascii_msg = ChatMessage {
+        role: "user".into(),
+        content: Some("a".repeat(18)),
+        images: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    let ascii_estimate = message_token_len(&ascii_msg);
+
+    // CJK should yield more tokens than ASCII for the same byte length,
+    // because CJK characters are ~1 char/token vs ~4 bytes/token.
+    assert!(
+        cjk_estimate > ascii_estimate,
+        "CJK ({cjk_estimate}) should be > ASCII ({ascii_estimate}) for same byte length"
+    );
 }
 
 #[test]
@@ -3969,6 +5997,7 @@ fn context_input_budget_reserves_headroom() {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         providers,
@@ -4407,7 +6436,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
             tool_call_id: None,
             timestamp: None,
         },
-        // Only 1 of 2 tool results present — incomplete
+        // Only 1 of 2 tool results present —incomplete
         ChatMessage {
             role: "tool".into(),
             content: Some("result1".into()),
@@ -4437,4 +6466,39 @@ fn tool_think_records_thought() {
 fn tool_think_fallback_when_no_thought() {
     let result = tools::exec::tool_think(&json!({}));
     assert!(result.contains("(no thought provided)"));
+}
+
+// ───── parse_serde_error_position ─────
+
+#[test]
+fn parse_serde_error_position_extracts_line_and_column() {
+    let (line, col) =
+        parse_serde_error_position("invalid type: map, expected a string at line 5 column 10");
+    assert_eq!(line, Some(5));
+    assert_eq!(col, Some(10));
+}
+
+#[test]
+fn parse_serde_error_position_returns_none_for_no_match() {
+    let (line, col) = parse_serde_error_position("something went wrong");
+    assert_eq!(line, None);
+    assert_eq!(col, None);
+}
+
+#[test]
+fn replace_file_from_temp_replaces_existing_file_without_losing_data() {
+    let base = std::env::temp_dir().join(format!("lingclaw-config-replace-{}", now_epoch()));
+    let path = base.join(".lingclaw.json");
+    let tmp_path = base.join(".lingclaw.json.tmp");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(&path, "old-value").unwrap();
+    std::fs::write(&tmp_path, "new-value").unwrap();
+
+    replace_file_from_temp(&path, &tmp_path).unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new-value");
+    assert!(!tmp_path.exists());
+    assert!(!base.join(".lingclaw.json.lingclaw-save-backup").exists());
+
+    let _ = std::fs::remove_dir_all(&base);
 }

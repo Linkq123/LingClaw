@@ -1,6 +1,12 @@
 use crate::subagents::discovery::discover_all_agents;
+use crate::subagents::orchestrator::{
+    OrchestrationOutcome, OrchestrationPlan, OrchestrationTask, TaskResult, TaskStatus,
+    compute_execution_layers, execute_orchestration, format_orchestration_result, has_cycle,
+    interpolate_results, validate_plan,
+};
 use crate::subagents::{AgentSource, SubAgentSpec, ToolPermissions, render_agents_catalog};
 use crate::{ChatMessage, agent};
+use tokio_util::sync::CancellationToken;
 
 #[test]
 fn test_tool_permissions_basic() {
@@ -320,6 +326,40 @@ fn test_mcp_tool_classification_no_false_positives_from_substrings() {
     )));
 }
 
+#[tokio::test]
+async fn test_mcp_read_only_tools_remain_sequential_for_parallel_dispatch() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-parallel-readonly-mcp");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    let log_path = workspace.join("mock.log");
+
+    let config = base_config_with_mock_mcp_server("normal", &log_path);
+    crate::tools::mcp::ensure_tools_cached(&config, &workspace).await;
+    let reports = crate::tools::mcp::refresh_servers(&config, &workspace)
+        .await
+        .expect("mock MCP server should refresh");
+    assert_eq!(reports.len(), 1);
+    assert!(reports[0].error.is_none(), "{:?}", reports[0].error);
+    let tool_name = reports[0]
+        .tool_names
+        .first()
+        .cloned()
+        .expect("mock MCP server should expose a tool");
+
+    let descriptor = crate::tools::mcp::cached_list_tools(&config, &workspace)
+        .into_iter()
+        .find(|tool| tool.exposed_name == tool_name)
+        .expect("mock MCP tool should be cached");
+
+    assert!(is_mcp_tool_read_only(&descriptor));
+    assert!(crate::tools::is_read_only_tool("read_file"));
+    assert!(!crate::tools::is_read_only_tool(&tool_name));
+    assert!(!crate::tools::is_read_only_tool("exec"));
+
+    let _ = crate::tools::mcp::refresh_servers(&config, &workspace).await;
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 #[test]
 fn test_parse_agent_frontmatter_with_mcp_policy() {
     let content = r#"---
@@ -417,6 +457,7 @@ fn base_config() -> Config {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         anthropic_prompt_caching: false,
         openai_stream_include_usage: false,
@@ -592,12 +633,86 @@ fn build_openai_tool_call_stream(tool_name: &str, args: serde_json::Value) -> St
     format!("data: {}\n\ndata: [DONE]\n\n", chunk)
 }
 
+fn build_openai_multi_tool_call_stream(tool_calls: Vec<(&str, serde_json::Value)>) -> String {
+    let calls: Vec<_> = tool_calls
+        .into_iter()
+        .enumerate()
+        .map(|(index, (tool_name, args))| {
+            let args_json = serde_json::to_string(&args).expect("tool args should serialize");
+            serde_json::json!({
+                "index": index,
+                "id": format!("call_{}", index + 1),
+                "function": {
+                    "name": tool_name,
+                    "arguments": args_json
+                }
+            })
+        })
+        .collect();
+    let chunk = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": calls
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    format!("data: {}\n\ndata: [DONE]\n\n", chunk)
+}
+
 fn slow_tool_command() -> String {
     if cfg!(windows) {
         "timeout /T 2 /NOBREAK > NUL".to_string()
     } else {
         "while :; do :; done".to_string()
     }
+}
+
+#[tokio::test]
+async fn collect_parallel_tool_results_preserves_finished_results_on_deadline() {
+    let fast_future = Box::pin(async {
+        Some(crate::tools::ToolOutcome {
+            output: "fast result".to_string(),
+            is_error: false,
+            duration_ms: 1,
+        })
+    })
+        as std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Option<crate::tools::ToolOutcome>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+    let slow_future = Box::pin(async {
+        std::future::pending::<()>().await;
+        #[allow(unreachable_code)]
+        None
+    })
+        as std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Option<crate::tools::ToolOutcome>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+
+    let cancel = CancellationToken::new();
+    let batch = crate::subagents::executor::collect_parallel_tool_results(
+        vec![fast_future, slow_future],
+        &cancel,
+        Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+    )
+    .await;
+
+    assert!(batch.interrupted);
+    assert!(batch.timed_out);
+    assert_eq!(batch.results.len(), 2);
+    assert_eq!(
+        batch.results[0].as_ref().map(|o| o.output.as_str()),
+        Some("fast result")
+    );
+    assert!(batch.results[1].is_none());
 }
 
 /// Sub-agents use the configured delegated model when set.
@@ -651,6 +766,14 @@ struct TimeoutMarkerHook;
 
 struct ObservedTimeoutHook {
     expected_command: String,
+    called: Arc<AtomicBool>,
+}
+
+struct RecordingAfterToolHook {
+    seen_tools: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+struct GuardedAfterToolHook {
     called: Arc<AtomicBool>,
 }
 
@@ -751,6 +874,85 @@ impl AgentHook for ObservedTimeoutHook {
     }
 }
 
+impl AgentHook for RecordingAfterToolHook {
+    fn name(&self) -> &'static str {
+        "recording_after_tool"
+    }
+
+    fn point(&self) -> agent::HookPoint {
+        agent::HookPoint::AfterToolExec
+    }
+
+    fn should_run(&self, _: &[ChatMessage], _: Provider, _: usize, _: usize) -> bool {
+        false
+    }
+
+    fn run<'a>(
+        &'a self,
+        _: HookInput,
+        _: &'a Config,
+        _: &'a reqwest::Client,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async { HookOutput::NoOp })
+    }
+
+    fn should_run_tool(&self, _: &str, point: agent::HookPoint) -> bool {
+        point == agent::HookPoint::AfterToolExec
+    }
+
+    fn run_tool<'a>(
+        &'a self,
+        input: ToolHookInput,
+        _: &'a Config,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async move {
+            self.seen_tools
+                .lock()
+                .expect("after-tool hook state should lock")
+                .push(input.tool_name.clone());
+            HookOutput::NoOp
+        })
+    }
+}
+
+impl AgentHook for GuardedAfterToolHook {
+    fn name(&self) -> &'static str {
+        "guarded_after_tool"
+    }
+
+    fn point(&self) -> agent::HookPoint {
+        agent::HookPoint::AfterToolExec
+    }
+
+    fn should_run(&self, _: &[ChatMessage], _: Provider, _: usize, _: usize) -> bool {
+        false
+    }
+
+    fn run<'a>(
+        &'a self,
+        _: HookInput,
+        _: &'a Config,
+        _: &'a reqwest::Client,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async { HookOutput::NoOp })
+    }
+
+    fn should_run_tool(&self, _: &str, point: agent::HookPoint) -> bool {
+        point == agent::HookPoint::AfterToolExec
+    }
+
+    fn run_tool<'a>(
+        &'a self,
+        _: ToolHookInput,
+        _: &'a Config,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async move {
+            self.called.store(true, Ordering::SeqCst);
+            HookOutput::NoOp
+        })
+    }
+}
+
 #[tokio::test]
 async fn timeout_outcome_still_runs_after_tool_exec_hook() {
     let mut registry = HookRegistry::new();
@@ -778,6 +980,432 @@ async fn timeout_outcome_still_runs_after_tool_exec_hook() {
     assert_eq!(
         outcome.output,
         "Tool 'exec' aborted: sub-agent deadline exceeded [after-hook]"
+    );
+}
+
+#[tokio::test]
+async fn interrupted_parallel_batch_outcome_skips_after_tool_exec_hook_without_result() {
+    let called = Arc::new(AtomicBool::new(false));
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(GuardedAfterToolHook {
+        called: called.clone(),
+    }));
+
+    let workspace = std::env::temp_dir();
+    let outcome = crate::subagents::executor::finalize_parallel_batch_outcome(
+        &registry,
+        &base_config(),
+        &workspace,
+        1,
+        "read_file",
+        r#"{"path":"notes.txt"}"#,
+        "tc-interrupted",
+        None,
+        true,
+        true,
+        25,
+    )
+    .await;
+
+    assert!(!called.load(Ordering::SeqCst));
+    assert!(outcome.is_error);
+    assert_eq!(outcome.duration_ms, 25);
+    assert!(outcome.output.contains("deadline exceeded"));
+}
+
+#[tokio::test]
+async fn run_subagent_multi_read_only_batch_executes_after_tool_exec_hooks() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-readonly-batch");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")
+        .expect("fixture file should be written");
+
+    let response_body = build_openai_multi_tool_call_stream(vec![
+        (
+            "read_file",
+            serde_json::json!({
+                "path": "notes.txt"
+            }),
+        ),
+        (
+            "list_dir",
+            serde_json::json!({
+                "path": "."
+            }),
+        ),
+    ]);
+    let (api_base, handle) = spawn_one_shot_http_server("text/event-stream", response_body);
+
+    let mut config = base_config();
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+
+    let spec = SubAgentSpec {
+        name: "batch-agent".into(),
+        description: String::new(),
+        system_prompt: "Inspect the workspace with read-only tools.".into(),
+        max_turns: 1,
+        tools: ToolPermissions {
+            allow: vec!["read_file".into(), "list_dir".into()],
+            deny: vec![],
+        },
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let seen_tools = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut hooks = HookRegistry::new();
+    hooks.register(Box::new(RecordingAfterToolHook {
+        seen_tools: seen_tools.clone(),
+    }));
+
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(16);
+    let http = reqwest::Client::new();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Read the file and list the directory.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &hooks,
+        "test-task-1",
+    )
+    .await;
+
+    handle.join().expect("server thread should join");
+
+    let seen = seen_tools
+        .lock()
+        .expect("after-tool hook state should lock")
+        .clone();
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.cycles, 1);
+    assert_eq!(outcome.tool_calls, 2);
+    assert_eq!(seen.len(), 2);
+    assert!(seen.iter().any(|tool| tool == "read_file"));
+    assert!(seen.iter().any(|tool| tool == "list_dir"));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_subagent_emits_tool_result_event_for_completed_tool() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-tool-result-event");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")
+        .expect("fixture file should be written");
+
+    let response_body = build_openai_tool_call_stream(
+        "read_file",
+        serde_json::json!({
+            "path": "notes.txt"
+        }),
+    );
+    let (api_base, handle) = spawn_one_shot_http_server("text/event-stream", response_body);
+
+    let mut config = base_config();
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+
+    let spec = SubAgentSpec {
+        name: "tool-result-agent".into(),
+        description: String::new(),
+        system_prompt: "Read the delegated file.".into(),
+        max_turns: 1,
+        tools: ToolPermissions {
+            allow: vec!["read_file".into()],
+            deny: vec![],
+        },
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(16);
+    let http = reqwest::Client::new();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Read notes.txt.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &HookRegistry::new(),
+        "test-task-tool-result",
+    )
+    .await;
+
+    handle.join().expect("server thread should join");
+
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.cycles, 1);
+    assert_eq!(outcome.tool_calls, 1);
+
+    let mut saw_task_tool = false;
+    let mut saw_tool_result = false;
+    while let Ok(event) = live_rx.try_recv() {
+        match event["type"].as_str() {
+            Some("task_tool") => {
+                saw_task_tool = true;
+                assert_eq!(event["task_id"].as_str(), Some("test-task-tool-result"));
+                assert_eq!(event["agent"].as_str(), Some("tool-result-agent"));
+                assert_eq!(event["tool"].as_str(), Some("read_file"));
+                assert_eq!(event["id"].as_str(), Some("call_1"));
+                assert_eq!(
+                    event["arguments"].as_str(),
+                    Some("{\"path\":\"notes.txt\"}")
+                );
+            }
+            Some("tool_result") => {
+                saw_tool_result = true;
+                assert_eq!(event["task_id"].as_str(), Some("test-task-tool-result"));
+                assert_eq!(event["subagent"].as_str(), Some("tool-result-agent"));
+                assert_eq!(event["name"].as_str(), Some("read_file"));
+                assert_eq!(event["id"].as_str(), Some("call_1"));
+                assert_eq!(event["is_error"].as_bool(), Some(false));
+                assert!(
+                    event["result"]
+                        .as_str()
+                        .is_some_and(|result| result.contains("alpha"))
+                );
+                assert!(event["duration_ms"].as_u64().is_some());
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_task_tool);
+    assert!(saw_tool_result);
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_subagent_sequential_tools_emit_interleaved_tool_events() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-sequential-tool-events");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")
+        .expect("fixture file should be written");
+
+    let response_body = build_openai_multi_tool_call_stream(vec![
+        (
+            "read_file",
+            serde_json::json!({
+                "path": "notes.txt"
+            }),
+        ),
+        (
+            "exec",
+            serde_json::json!({
+                "command": "echo sequential"
+            }),
+        ),
+    ]);
+    let (api_base, handle) = spawn_one_shot_http_server("text/event-stream", response_body);
+
+    let mut config = base_config();
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+
+    let spec = SubAgentSpec {
+        name: "sequential-event-agent".into(),
+        description: String::new(),
+        system_prompt: "Read the file and run a harmless command.".into(),
+        max_turns: 1,
+        tools: ToolPermissions {
+            allow: vec!["read_file".into(), "exec".into()],
+            deny: vec![],
+        },
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(16);
+    let http = reqwest::Client::new();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Read notes.txt and echo sequential.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &HookRegistry::new(),
+        "test-task-sequential-events",
+    )
+    .await;
+
+    handle.join().expect("server thread should join");
+
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.cycles, 1);
+    assert_eq!(outcome.tool_calls, 2);
+
+    let mut tool_events = Vec::new();
+    while let Ok(event) = live_rx.try_recv() {
+        if matches!(event["type"].as_str(), Some("task_tool" | "tool_result")) {
+            tool_events.push(event);
+        }
+    }
+
+    assert_eq!(tool_events.len(), 4);
+    assert_eq!(tool_events[0]["type"], "task_tool");
+    assert_eq!(tool_events[0]["id"], "call_1");
+    assert_eq!(tool_events[0]["tool"], "read_file");
+    assert!(
+        tool_events[0]["arguments"]
+            .as_str()
+            .is_some_and(|args| args.contains("notes.txt"))
+    );
+    assert_eq!(tool_events[1]["type"], "tool_result");
+    assert_eq!(tool_events[1]["id"], "call_1");
+    assert_eq!(tool_events[1]["name"], "read_file");
+    assert!(
+        tool_events[1]["result"]
+            .as_str()
+            .is_some_and(|result| result.contains("alpha"))
+    );
+    assert_eq!(tool_events[2]["type"], "task_tool");
+    assert_eq!(tool_events[2]["id"], "call_2");
+    assert_eq!(tool_events[2]["tool"], "exec");
+    assert!(
+        tool_events[2]["arguments"]
+            .as_str()
+            .is_some_and(|args| args.contains("echo sequential"))
+    );
+    assert_eq!(tool_events[3]["type"], "tool_result");
+    assert_eq!(tool_events[3]["id"], "call_2");
+    assert_eq!(tool_events[3]["name"], "exec");
+    assert!(
+        tool_events[3]["result"]
+            .as_str()
+            .is_some_and(|result| result.contains("sequential"))
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+/// Integration test: chains Phase 3 (`collect_parallel_tool_results` with a deadline
+/// that interrupts one tool) into Phase 4 (`finalize_parallel_batch_outcome` for each
+/// slot). Verifies that `AfterToolExec` fires only for the tool whose future completed,
+/// and the interrupted slot receives a synthetic error without triggering the hook.
+#[tokio::test]
+async fn parallel_batch_interrupt_fires_hooks_only_for_completed_tools() {
+    // Phase 3: One fast future and one pending (never-completes) future.
+    let fast_future = Box::pin(async {
+        Some(crate::tools::ToolOutcome {
+            output: "file contents here".to_string(),
+            is_error: false,
+            duration_ms: 1,
+        })
+    })
+        as std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Option<crate::tools::ToolOutcome>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+    let slow_future = Box::pin(async {
+        std::future::pending::<()>().await;
+        #[allow(unreachable_code)]
+        None
+    })
+        as std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Option<crate::tools::ToolOutcome>>
+                    + Send
+                    + 'static,
+            >,
+        >;
+
+    let cancel = CancellationToken::new();
+    let batch = crate::subagents::executor::collect_parallel_tool_results(
+        vec![fast_future, slow_future],
+        &cancel,
+        Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+    )
+    .await;
+
+    assert!(batch.interrupted);
+    assert!(batch.timed_out);
+    assert_eq!(batch.results.len(), 2);
+    // Fast tool completed.
+    assert!(batch.results[0].is_some());
+    // Slow tool did not complete.
+    assert!(batch.results[1].is_none());
+
+    // Phase 4: Record results through finalize_parallel_batch_outcome.
+    let seen_tools = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut hooks = HookRegistry::new();
+    hooks.register(Box::new(RecordingAfterToolHook {
+        seen_tools: seen_tools.clone(),
+    }));
+    let config = base_config();
+    let workspace = std::env::temp_dir();
+    let elapsed_ms = 20_u64;
+
+    let mut results_iter = batch.results.into_iter();
+
+    // Slot 0: read_file (completed)
+    let outcome0 = crate::subagents::executor::finalize_parallel_batch_outcome(
+        &hooks,
+        &config,
+        &workspace,
+        1,
+        "read_file",
+        r#"{"path":"notes.txt"}"#,
+        "tc-0",
+        results_iter.next().unwrap(),
+        batch.interrupted,
+        batch.timed_out,
+        elapsed_ms,
+    )
+    .await;
+
+    // Slot 1: list_dir (interrupted — None)
+    let outcome1 = crate::subagents::executor::finalize_parallel_batch_outcome(
+        &hooks,
+        &config,
+        &workspace,
+        1,
+        "list_dir",
+        r#"{"path":"."}"#,
+        "tc-1",
+        results_iter.next().unwrap(),
+        batch.interrupted,
+        batch.timed_out,
+        elapsed_ms,
+    )
+    .await;
+
+    // AfterToolExec should fire only for the completed tool.
+    let seen = seen_tools.lock().expect("hook state should lock").clone();
+    assert_eq!(
+        seen.len(),
+        1,
+        "AfterToolExec should fire only for completed tools, got: {seen:?}"
+    );
+    assert_eq!(seen[0], "read_file");
+
+    // Completed tool gets its real result through the hook pipeline.
+    assert!(!outcome0.is_error);
+    assert_eq!(outcome0.output, "file contents here");
+
+    // Interrupted tool gets a synthetic error without touching the hook.
+    assert!(outcome1.is_error);
+    assert!(
+        outcome1.output.contains("deadline exceeded"),
+        "expected deadline exceeded message, got: {}",
+        outcome1.output
     );
 }
 
@@ -827,6 +1455,7 @@ async fn run_subagent_timeout_during_tool_exec_still_runs_after_tool_exec_hook()
         &live_tx,
         tokio_util::sync::CancellationToken::new(),
         &hooks,
+        "test-task-timeout",
     )
     .await;
 
@@ -891,6 +1520,7 @@ async fn run_subagent_executes_mcp_tool_allowed_by_policy() {
         &live_tx,
         tokio_util::sync::CancellationToken::new(),
         &HookRegistry::new(),
+        "test-task-mcp",
     )
     .await;
 
@@ -905,4 +1535,633 @@ async fn run_subagent_executes_mcp_tool_allowed_by_policy() {
     assert_eq!(outcome.tool_calls, 1);
     assert!(!outcome.aborted);
     assert_eq!(tools_call_count, 1);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  Orchestrator Tests
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_interpolate_results_basic() {
+    let mut completed = std::collections::HashMap::new();
+    completed.insert("explore".to_string(), "Found 3 files".to_string());
+    completed.insert("research".to_string(), "API docs summary".to_string());
+
+    let prompt = "Review the findings: {{results.explore}} and {{results.research}}";
+    let result = interpolate_results(prompt, &completed);
+    assert_eq!(
+        result,
+        "Review the findings: Found 3 files and API docs summary"
+    );
+}
+
+#[test]
+fn test_interpolate_results_no_placeholders() {
+    let completed = std::collections::HashMap::new();
+    let prompt = "Do something without dependencies";
+    let result = interpolate_results(prompt, &completed);
+    assert_eq!(result, "Do something without dependencies");
+}
+
+#[test]
+fn test_interpolate_results_missing_reference() {
+    let completed = std::collections::HashMap::new();
+    let prompt = "Use {{results.missing}} here";
+    let result = interpolate_results(prompt, &completed);
+    assert_eq!(result, "Use {{results.missing}} here");
+}
+
+#[test]
+fn test_interpolate_results_does_not_recurse_into_values() {
+    let mut completed = std::collections::HashMap::new();
+    completed.insert("a".to_string(), "{{results.b}}".to_string());
+    completed.insert("b".to_string(), "SHOULD_NOT_APPEAR".to_string());
+    let prompt = "See {{results.a}}";
+    let result = interpolate_results(prompt, &completed);
+    assert_eq!(result, "See {{results.b}}");
+    assert!(!result.contains("SHOULD_NOT_APPEAR"));
+}
+
+#[test]
+fn test_interpolate_results_malformed_placeholder() {
+    let mut completed = std::collections::HashMap::new();
+    completed.insert("ok".to_string(), "good".to_string());
+    let prompt = "unclosed {{results.ok and valid {{results.ok}}";
+    let result = interpolate_results(prompt, &completed);
+    assert!(result.contains("unclosed {{results.ok and valid {{results.ok}}"));
+}
+
+#[test]
+fn test_interpolate_results_unicode_in_value() {
+    let mut completed = std::collections::HashMap::new();
+    completed.insert("greet".to_string(), "你好 🌟".to_string());
+    let prompt = "Message: {{results.greet}}!";
+    let result = interpolate_results(prompt, &completed);
+    assert_eq!(result, "Message: 你好 🌟!");
+}
+
+#[test]
+fn test_has_cycle_no_cycle() {
+    let tasks = vec![
+        OrchestrationTask {
+            id: "a".into(),
+            agent: "coder".into(),
+            prompt: "".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "b".into(),
+            agent: "reviewer".into(),
+            prompt: "".into(),
+            depends_on: vec!["a".into()],
+        },
+        OrchestrationTask {
+            id: "c".into(),
+            agent: "coder".into(),
+            prompt: "".into(),
+            depends_on: vec!["b".into()],
+        },
+    ];
+    assert!(!has_cycle(&tasks));
+}
+
+#[test]
+fn test_has_cycle_with_cycle() {
+    let tasks = vec![
+        OrchestrationTask {
+            id: "a".into(),
+            agent: "coder".into(),
+            prompt: "".into(),
+            depends_on: vec!["c".into()],
+        },
+        OrchestrationTask {
+            id: "b".into(),
+            agent: "reviewer".into(),
+            prompt: "".into(),
+            depends_on: vec!["a".into()],
+        },
+        OrchestrationTask {
+            id: "c".into(),
+            agent: "coder".into(),
+            prompt: "".into(),
+            depends_on: vec!["b".into()],
+        },
+    ];
+    assert!(has_cycle(&tasks));
+}
+
+#[test]
+fn test_compute_layers_serial() {
+    let plan = OrchestrationPlan {
+        tasks: vec![
+            OrchestrationTask {
+                id: "a".into(),
+                agent: "coder".into(),
+                prompt: "".into(),
+                depends_on: vec![],
+            },
+            OrchestrationTask {
+                id: "b".into(),
+                agent: "reviewer".into(),
+                prompt: "".into(),
+                depends_on: vec!["a".into()],
+            },
+            OrchestrationTask {
+                id: "c".into(),
+                agent: "coder".into(),
+                prompt: "".into(),
+                depends_on: vec!["b".into()],
+            },
+        ],
+    };
+    let layers = compute_execution_layers(&plan);
+    assert_eq!(layers.len(), 3);
+    assert_eq!(layers[0], vec![0]);
+    assert_eq!(layers[1], vec![1]);
+    assert_eq!(layers[2], vec![2]);
+}
+
+#[test]
+fn test_compute_layers_parallel() {
+    let plan = OrchestrationPlan {
+        tasks: vec![
+            OrchestrationTask {
+                id: "explore".into(),
+                agent: "explore".into(),
+                prompt: "".into(),
+                depends_on: vec![],
+            },
+            OrchestrationTask {
+                id: "research".into(),
+                agent: "researcher".into(),
+                prompt: "".into(),
+                depends_on: vec![],
+            },
+            OrchestrationTask {
+                id: "implement".into(),
+                agent: "coder".into(),
+                prompt: "".into(),
+                depends_on: vec!["explore".into(), "research".into()],
+            },
+        ],
+    };
+    let layers = compute_execution_layers(&plan);
+    assert_eq!(layers.len(), 2);
+    assert_eq!(layers[0].len(), 2);
+    assert!(layers[0].contains(&0));
+    assert!(layers[0].contains(&1));
+    assert_eq!(layers[1], vec![2]);
+}
+
+#[test]
+fn test_compute_layers_diamond() {
+    let plan = OrchestrationPlan {
+        tasks: vec![
+            OrchestrationTask {
+                id: "a".into(),
+                agent: "explore".into(),
+                prompt: "".into(),
+                depends_on: vec![],
+            },
+            OrchestrationTask {
+                id: "b".into(),
+                agent: "coder".into(),
+                prompt: "".into(),
+                depends_on: vec!["a".into()],
+            },
+            OrchestrationTask {
+                id: "c".into(),
+                agent: "reviewer".into(),
+                prompt: "".into(),
+                depends_on: vec!["a".into()],
+            },
+            OrchestrationTask {
+                id: "d".into(),
+                agent: "coder".into(),
+                prompt: "".into(),
+                depends_on: vec!["b".into(), "c".into()],
+            },
+        ],
+    };
+    let layers = compute_execution_layers(&plan);
+    assert_eq!(layers.len(), 3);
+    assert_eq!(layers[0], vec![0]);
+    assert_eq!(layers[1].len(), 2);
+    assert!(layers[1].contains(&1));
+    assert!(layers[1].contains(&2));
+    assert_eq!(layers[2], vec![3]);
+}
+
+#[test]
+fn test_validate_plan_rejects_non_placeholder_compatible_task_id() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let agent_name = discover_all_agents(workspace)
+        .into_iter()
+        .next()
+        .expect("expected at least one built-in agent")
+        .name;
+    let tasks = vec![OrchestrationTask {
+        id: "bad id".into(),
+        agent: agent_name,
+        prompt: "Do work".into(),
+        depends_on: vec![],
+    }];
+
+    let err = validate_plan(tasks, workspace).expect_err("invalid task id should be rejected");
+    assert!(err.contains("must use only ASCII letters, digits, '_' or '-'"));
+}
+
+#[tokio::test]
+async fn test_execute_orchestration_cancelled_emits_skipped_events_for_remaining_tasks() {
+    let plan = OrchestrationPlan {
+        tasks: vec![
+            OrchestrationTask {
+                id: "first".into(),
+                agent: "coder".into(),
+                prompt: "noop".into(),
+                depends_on: vec![],
+            },
+            OrchestrationTask {
+                id: "second".into(),
+                agent: "reviewer".into(),
+                prompt: "noop".into(),
+                depends_on: vec!["first".into()],
+            },
+        ],
+    };
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(32);
+    let workspace = std::env::temp_dir();
+    let http = reqwest::Client::new();
+    let hooks = HookRegistry::new();
+
+    let outcome = execute_orchestration(
+        &plan,
+        &base_config(),
+        &http,
+        &workspace,
+        &live_tx,
+        cancel,
+        &hooks,
+    )
+    .await;
+
+    assert!(outcome.aborted);
+    assert_eq!(outcome.task_results.len(), 2);
+    assert!(
+        outcome
+            .task_results
+            .iter()
+            .all(|result| result.status == TaskStatus::Skipped)
+    );
+
+    let mut skipped_ids = Vec::new();
+    while let Ok(event) = live_rx.try_recv() {
+        if event["type"].as_str() == Some("orchestrate_task_skipped") {
+            skipped_ids.push(event["id"].as_str().unwrap_or_default().to_string());
+        }
+    }
+    assert_eq!(skipped_ids, vec!["first".to_string(), "second".to_string()]);
+}
+
+#[tokio::test]
+async fn test_execute_orchestration_failed_task_event_includes_error_text() {
+    let workspace = unique_temp_workspace("lingclaw-orchestrate-failed-event");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(workspace.join("agents/runner")).expect("agent dir should exist");
+    fs::write(
+        workspace.join("agents/runner/AGENT.md"),
+        r#"---
+name: runner
+description: "Runs commands"
+max_turns: 1
+tools:
+  allow: [exec]
+  deny: []
+---
+
+Run the requested command.
+"#,
+    )
+    .expect("agent file should be written");
+
+    let command = slow_tool_command();
+    let response_body =
+        build_openai_tool_call_stream("exec", serde_json::json!({ "command": command }));
+    let (api_base, handle) = spawn_one_shot_http_server("text/event-stream", response_body);
+
+    let mut config = base_config();
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+    config.exec_timeout = Duration::from_secs(5);
+    config.sub_agent_timeout = Duration::from_secs(1);
+
+    let plan = OrchestrationPlan {
+        tasks: vec![OrchestrationTask {
+            id: "run".into(),
+            agent: "runner".into(),
+            prompt: "Run the slow command".into(),
+            depends_on: vec![],
+        }],
+    };
+
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(64);
+    let http = reqwest::Client::new();
+    let hooks = HookRegistry::new();
+    let outcome = execute_orchestration(
+        &plan,
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        CancellationToken::new(),
+        &hooks,
+    )
+    .await;
+
+    handle.join().expect("server thread should join");
+
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.task_results.len(), 1);
+    assert_eq!(outcome.task_results[0].status, TaskStatus::Failed);
+
+    let mut failed_error = None;
+    while let Ok(event) = live_rx.try_recv() {
+        if event["type"].as_str() == Some("orchestrate_task_failed") {
+            failed_error = event["error"].as_str().map(|value| value.to_string());
+        }
+    }
+    let failed_error = failed_error.expect("expected orchestrate_task_failed event");
+    assert!(failed_error.contains("timed out after") || failed_error.contains("deadline exceeded"));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn test_format_result_basic() {
+    let outcome = OrchestrationOutcome {
+        task_results: vec![
+            TaskResult {
+                id: "explore".into(),
+                agent: "explore".into(),
+                status: TaskStatus::Completed,
+                result: "Found relevant files".into(),
+                cycles: 3,
+                tool_calls: 5,
+                duration_ms: 12000,
+                input_tokens: 0,
+                output_tokens: 0,
+                provider_usage: HashMap::new(),
+            },
+            TaskResult {
+                id: "implement".into(),
+                agent: "coder".into(),
+                status: TaskStatus::Completed,
+                result: "Code written".into(),
+                cycles: 8,
+                tool_calls: 15,
+                duration_ms: 45000,
+                input_tokens: 0,
+                output_tokens: 0,
+                provider_usage: HashMap::new(),
+            },
+        ],
+        aborted: false,
+    };
+    let report = format_orchestration_result(&outcome);
+    assert!(report.contains("Orchestration Complete"));
+    assert!(report.contains("2 tasks"));
+    assert!(report.contains("2 completed"));
+    assert!(report.contains("explore"));
+    assert!(report.contains("coder"));
+}
+
+#[test]
+fn test_format_result_with_failures() {
+    let outcome = OrchestrationOutcome {
+        task_results: vec![
+            TaskResult {
+                id: "impl".into(),
+                agent: "coder".into(),
+                status: TaskStatus::Completed,
+                result: "Done".into(),
+                cycles: 5,
+                tool_calls: 10,
+                duration_ms: 30000,
+                input_tokens: 0,
+                output_tokens: 0,
+                provider_usage: HashMap::new(),
+            },
+            TaskResult {
+                id: "review".into(),
+                agent: "reviewer".into(),
+                status: TaskStatus::Failed,
+                result: "LLM error".into(),
+                cycles: 1,
+                tool_calls: 0,
+                duration_ms: 5000,
+                input_tokens: 0,
+                output_tokens: 0,
+                provider_usage: HashMap::new(),
+            },
+            TaskResult {
+                id: "fix".into(),
+                agent: "coder".into(),
+                status: TaskStatus::Skipped,
+                result: "Skipped: dependency 'review' failed".into(),
+                cycles: 0,
+                tool_calls: 0,
+                duration_ms: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                provider_usage: HashMap::new(),
+            },
+        ],
+        aborted: false,
+    };
+    let report = format_orchestration_result(&outcome);
+    assert!(report.contains("1 completed"));
+    assert!(report.contains("1 failed"));
+    assert!(report.contains("1 skipped"));
+    assert!(report.contains("✅"));
+    assert!(report.contains("❌"));
+    assert!(report.contains("⏭️"));
+}
+
+#[test]
+fn test_tool_permissions_blocks_orchestrate() {
+    let perms = ToolPermissions {
+        allow: vec![],
+        deny: vec![],
+    };
+    assert!(!perms.is_allowed("orchestrate"));
+}
+
+#[test]
+fn test_tool_permissions_blocks_orchestrate_even_if_explicitly_allowed() {
+    let perms = ToolPermissions {
+        allow: vec!["orchestrate".into()],
+        deny: vec![],
+    };
+    assert!(!perms.is_allowed("orchestrate"));
+}
+
+#[test]
+fn test_orchestrate_format_result_all_completed() {
+    let outcome = OrchestrationOutcome {
+        task_results: vec![
+            TaskResult {
+                id: "explore".into(),
+                agent: "explore".into(),
+                status: TaskStatus::Completed,
+                result: "Found 5 relevant files".into(),
+                cycles: 3,
+                tool_calls: 5,
+                duration_ms: 12000,
+                input_tokens: 0,
+                output_tokens: 0,
+                provider_usage: HashMap::new(),
+            },
+            TaskResult {
+                id: "implement".into(),
+                agent: "coder".into(),
+                status: TaskStatus::Completed,
+                result: "Feature implemented".into(),
+                cycles: 8,
+                tool_calls: 15,
+                duration_ms: 45000,
+                input_tokens: 0,
+                output_tokens: 0,
+                provider_usage: HashMap::new(),
+            },
+        ],
+        aborted: false,
+    };
+    let report = format_orchestration_result(&outcome);
+    assert!(report.contains("Orchestration Complete"));
+    assert!(report.contains("2 tasks"));
+    assert!(report.contains("2 completed, 0 failed, 0 skipped"));
+    assert!(report.contains("explore"));
+    assert!(report.contains("coder"));
+    assert!(report.contains("Found 5 relevant files"));
+    assert!(report.contains("Feature implemented"));
+}
+
+#[test]
+fn test_orchestrate_format_result_with_skipped() {
+    let outcome = OrchestrationOutcome {
+        task_results: vec![
+            TaskResult {
+                id: "impl".into(),
+                agent: "coder".into(),
+                status: TaskStatus::Failed,
+                result: "LLM error".into(),
+                cycles: 1,
+                tool_calls: 0,
+                duration_ms: 5000,
+                input_tokens: 0,
+                output_tokens: 0,
+                provider_usage: HashMap::new(),
+            },
+            TaskResult {
+                id: "review".into(),
+                agent: "reviewer".into(),
+                status: TaskStatus::Skipped,
+                result: "Skipped: dependency 'impl' failed".into(),
+                cycles: 0,
+                tool_calls: 0,
+                duration_ms: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                provider_usage: HashMap::new(),
+            },
+        ],
+        aborted: false,
+    };
+    let report = format_orchestration_result(&outcome);
+    assert!(report.contains("0 completed, 1 failed, 1 skipped"));
+    assert!(report.contains("❌"));
+    assert!(report.contains("⏭️"));
+}
+
+#[test]
+fn test_orchestrate_format_result_aborted() {
+    let outcome = OrchestrationOutcome {
+        task_results: vec![TaskResult {
+            id: "task1".into(),
+            agent: "coder".into(),
+            status: TaskStatus::Completed,
+            result: "Done".into(),
+            cycles: 3,
+            tool_calls: 5,
+            duration_ms: 10000,
+            input_tokens: 0,
+            output_tokens: 0,
+            provider_usage: HashMap::new(),
+        }],
+        aborted: true,
+    };
+    let report = format_orchestration_result(&outcome);
+    assert!(report.contains("Orchestration Aborted"));
+}
+
+#[test]
+fn test_orchestrate_provider_usage_aggregates_tasks() {
+    let mut first_usage = HashMap::new();
+    first_usage.insert("openai".into(), [120, 30]);
+    let mut second_usage = HashMap::new();
+    second_usage.insert("openai".into(), [80, 20]);
+    second_usage.insert("anthropic".into(), [25, 5]);
+
+    let outcome = OrchestrationOutcome {
+        task_results: vec![
+            TaskResult {
+                id: "task-a".into(),
+                agent: "coder".into(),
+                status: TaskStatus::Completed,
+                result: "Done".into(),
+                cycles: 2,
+                tool_calls: 1,
+                duration_ms: 1000,
+                input_tokens: 120,
+                output_tokens: 30,
+                provider_usage: first_usage,
+            },
+            TaskResult {
+                id: "task-b".into(),
+                agent: "reviewer".into(),
+                status: TaskStatus::Completed,
+                result: "Reviewed".into(),
+                cycles: 1,
+                tool_calls: 0,
+                duration_ms: 800,
+                input_tokens: 105,
+                output_tokens: 25,
+                provider_usage: second_usage,
+            },
+        ],
+        aborted: false,
+    };
+
+    let usage = outcome.provider_usage();
+    assert_eq!(usage["openai"], [200, 50]);
+    assert_eq!(usage["anthropic"], [25, 5]);
+}
+
+#[test]
+fn test_render_agents_catalog_mentions_orchestrate() {
+    let agents = vec![SubAgentSpec {
+        name: "coder".into(),
+        description: "Code writer".into(),
+        system_prompt: String::new(),
+        max_turns: 15,
+        tools: ToolPermissions::default(),
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    }];
+    let catalog = render_agents_catalog(&agents).unwrap();
+    assert!(catalog.contains("orchestrate"));
+    assert!(catalog.contains("task"));
 }

@@ -73,13 +73,14 @@ async fn ensure_main_session_ready(state: &Arc<AppState>) {
         }
     }
 
+    let config = state.config();
     let (mut session, created_fresh) = match load_session_from_disk(MAIN_SESSION_ID) {
         Some(session) => (session, false),
         None => {
             let mut session = Session::new_with_id(MAIN_SESSION_ID, "Main");
-            let model = session.effective_model(&state.config.model).to_string();
+            let model = session.effective_model(&config.model).to_string();
             let sys = build_system_prompt(
-                &state.config,
+                &config,
                 &session.workspace,
                 &model,
                 &session.disabled_system_skills,
@@ -144,7 +145,8 @@ pub(crate) async fn handle_idle_socket_input(
             result_type,
             session_id: current_session_id.clone(),
         };
-        let hook_events = run_command_hooks(&state.hooks, &hook_input, &state.config).await;
+        let config = state.config();
+        let hook_events = run_command_hooks(&state.hooks, &hook_input, &config).await;
         for ev in hook_events {
             ws_send(tx, &ev).await;
         }
@@ -154,30 +156,38 @@ pub(crate) async fn handle_idle_socket_input(
 
             ws_send(
                 tx,
-                &json!({"type":result.response_type,"content":result.response}),
+                &json!({
+                    "type": result.response_type,
+                    "content": result.response,
+                    "dismissible": result.dismissible,
+                }),
             )
             .await;
 
             if result.sessions_changed {
+                let config = state.config();
                 let payload = {
                     let sessions = state.sessions.lock().await;
                     let (name, model) = sessions
                         .get(current_session_id.as_str())
-                        .map(|s| {
-                            (
-                                s.name.clone(),
-                                s.effective_model(&state.config.model).to_string(),
-                            )
-                        })
-                        .unwrap_or_else(|| ("Main".to_string(), state.config.model.clone()));
-                    build_session_info_payload(current_session_id, &name, state, &model)
+                        .map(|s| (s.name.clone(), s.effective_model(&config.model).to_string()))
+                        .unwrap_or_else(|| ("Main".to_string(), config.model.clone()));
+                    let usage = sessions
+                        .get(current_session_id.as_str())
+                        .map(crate::socket_sync::build_session_usage_payload)
+                        .unwrap_or_else(|| json!({}));
+                    build_session_info_payload(current_session_id, &name, state, &model, usage)
                 };
                 ws_send(tx, &payload).await;
             }
         } else {
             ws_send(
                 tx,
-                &json!({"type":"system","content":"Unknown command. Type /help."}),
+                &json!({
+                    "type":"system",
+                    "content":"Unknown command. Type /help.",
+                    "dismissible": true,
+                }),
             )
             .await;
         }
@@ -196,31 +206,30 @@ pub(crate) async fn handle_idle_socket_input(
                 }
                 // Server-side capability gate: reject images if model doesn't support them.
                 if !payload.images.is_empty() {
+                    let config = state.config();
                     let (model, workspace) = {
                         let sessions = state.sessions.lock().await;
                         sessions
                             .get(current_session_id.as_str())
                             .map(|s| {
                                 (
-                                    s.effective_model(&state.config.model).to_string(),
+                                    s.effective_model(&config.model).to_string(),
                                     s.workspace.clone(),
                                 )
                             })
                             .unwrap_or_else(|| {
                                 (
-                                    state.config.model.clone(),
+                                    config.model.clone(),
                                     crate::session_workspace_path(current_session_id),
                                 )
                             })
                     };
-                    if !state.config.model_supports_image(&model) {
+                    if !config.model_supports_image(&model) {
                         ws_send(tx, &json!({"type":"system","content":"Current model does not support image input."})).await;
                         return IdleSocketInputAction::Continue;
                     }
-                    let prefetch_for_ollama = matches!(
-                        state.config.resolve_model(&model).provider,
-                        Provider::Ollama
-                    );
+                    let prefetch_for_ollama =
+                        matches!(config.resolve_model(&model).provider, Provider::Ollama);
 
                     // Validate image URLs before accepting.
                     let mut validated = Vec::new();
@@ -240,7 +249,7 @@ pub(crate) async fn handle_idle_socket_input(
                             &img.url,
                             img.object_key.as_deref(),
                             img.attachment_token.as_deref(),
-                            state.config.s3.as_ref(),
+                            config.s3.as_ref(),
                         ) {
                             Ok(resolved) => resolved,
                             Err(message) => {

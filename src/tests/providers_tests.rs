@@ -485,6 +485,71 @@ fn process_openai_data_line_reports_done_marker() {
 }
 
 #[test]
+fn process_openai_data_line_keeps_reasoning_open_for_empty_content_delta() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let live_tx: LiveTx = tx;
+
+    rt.block_on(async {
+        let mut state = OpenAiStreamState {
+            content_buf: String::new(),
+            tool_calls: Vec::new(),
+            input_tokens: None,
+            output_tokens: None,
+            client_gone: false,
+            reasoning_started: false,
+        };
+
+        process_openai_data_line(
+            r#"{"choices":[{"delta":{"reasoning_content":"用户","content":""}}]}"#,
+            &live_tx,
+            &mut state,
+        )
+        .await;
+        process_openai_data_line(
+            r#"{"choices":[{"delta":{"reasoning_content":"现在","content":""}}]}"#,
+            &live_tx,
+            &mut state,
+        )
+        .await;
+
+        assert!(state.reasoning_started);
+        assert!(state.content_buf.is_empty());
+
+        process_openai_data_line(
+            r#"{"choices":[{"delta":{"content":"answer"}}]}"#,
+            &live_tx,
+            &mut state,
+        )
+        .await;
+
+        assert!(!state.reasoning_started);
+        assert_eq!(state.content_buf, "answer");
+    });
+
+    let mut event_types = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        event_types.push(
+            event["type"]
+                .as_str()
+                .expect("event type should be present")
+                .to_string(),
+        );
+    }
+
+    assert_eq!(
+        event_types,
+        vec![
+            "thinking_start".to_string(),
+            "thinking_delta".to_string(),
+            "thinking_delta".to_string(),
+            "thinking_done".to_string(),
+            "delta".to_string(),
+        ]
+    );
+}
+
+#[test]
 fn process_anthropic_sse_line_keeps_event_type_between_lines() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);

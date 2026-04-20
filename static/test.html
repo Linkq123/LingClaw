@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>LingClaw Frontend Unit Tests</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 20px; background: #fafbfc; }
+  .pass { color: #1fa85a; }
+  .fail { color: #dc4545; font-weight: bold; }
+  .group { margin: 16px 0 4px; font-weight: 700; font-size: 15px; }
+  .result { margin: 2px 0 2px 16px; font-size: 13px; font-family: monospace; }
+  .summary { margin-top: 24px; padding: 12px; border-radius: 8px; font-weight: 700; }
+  .summary.all-pass { background: #e6f9ee; color: #1fa85a; }
+  .summary.has-fail { background: #fde8e8; color: #dc4545; }
+</style>
+</head>
+<body>
+<h2>LingClaw Frontend Unit Tests</h2>
+<div id="results"></div>
+<script type="module">
+import { escHtml, formatToolDuration, canSendWhileBusy } from './js/utils.js';
+import { extractMath, findProgressiveSplitPoint, isSentenceSplitChar } from './js/markdown.js';
+
+const results = document.getElementById('results');
+let passed = 0;
+let failed = 0;
+
+function assert(name, actual, expected) {
+  const ok = JSON.stringify(actual) === JSON.stringify(expected);
+  const div = document.createElement('div');
+  div.className = 'result ' + (ok ? 'pass' : 'fail');
+  if (ok) {
+    div.textContent = `✓ ${name}`;
+    passed++;
+  } else {
+    div.textContent = `✗ ${name} — expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`;
+    failed++;
+  }
+  results.appendChild(div);
+}
+
+function group(name) {
+  const div = document.createElement('div');
+  div.className = 'group';
+  div.textContent = name;
+  results.appendChild(div);
+}
+
+// ── escHtml ──
+group('escHtml');
+assert('XSS vector', escHtml('<script>alert("xss")</script>'), '&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;');
+assert('null value', escHtml(null), '');
+assert('normal text', escHtml('Hello World'), 'Hello World');
+assert('ampersand and quotes', escHtml('a & b "c" \'d\''), 'a &amp; b &quot;c&quot; &#39;d&#39;');
+
+// ── formatToolDuration ──
+group('formatToolDuration');
+assert('milliseconds', formatToolDuration(42), '42ms');
+assert('seconds', formatToolDuration(3500), '3.5s');
+assert('large seconds', formatToolDuration(15000), '15s');
+assert('null input', formatToolDuration(null), '');
+assert('zero', formatToolDuration(0), '1ms');
+
+// ── canSendWhileBusy ──
+group('canSendWhileBusy');
+assert('/stop allowed', canSendWhileBusy('/stop'), true);
+assert('/tool on allowed', canSendWhileBusy('/tool on'), true);
+assert('/reasoning off allowed', canSendWhileBusy('/reasoning off'), true);
+assert('/clear blocked', canSendWhileBusy('/clear'), false);
+assert('/help blocked', canSendWhileBusy('/help'), false);
+
+// ── extractMath ──
+group('extractMath');
+{
+  const r1 = extractMath('Hello $x^2$ world');
+  assert('inline math extracted', r1.blocks.length, 1);
+  assert('inline math content', r1.blocks[0].formula, 'x^2');
+  assert('inline math is not display', r1.blocks[0].displayMode, false);
+
+  const r2 = extractMath('Price is $100');
+  assert('currency not extracted', r2.blocks.length, 0);
+
+  const r3 = extractMath('$$\\sum_{i=0}^n i$$');
+  assert('display math extracted', r3.blocks.length, 1);
+  assert('display math is display', r3.blocks[0].displayMode, true);
+
+  const r4 = extractMath('escaped \\$100');
+  assert('escaped dollar not extracted', r4.blocks.length, 0);
+
+  const r5 = extractMath('`$x$` is code');
+  assert('math in inline code not extracted', r5.blocks.length, 0);
+
+  const r6 = extractMath('```\n$x$\n```\nafter');
+  assert('math in fenced code not extracted', r6.blocks.length, 0);
+}
+
+// ── isSentenceSplitChar ──
+group('isSentenceSplitChar');
+assert('Chinese period', isSentenceSplitChar('你好。世界', 2), true);
+assert('English period with space', isSentenceSplitChar('Hello. World', 5), true);
+assert('Period in number', isSentenceSplitChar('3.14', 1), false);
+assert('Exclamation CJK', isSentenceSplitChar('好！', 1), true);
+
+// ── findProgressiveSplitPoint ──
+group('findProgressiveSplitPoint');
+{
+  const text1 = 'Short text';
+  assert('short text no split', findProgressiveSplitPoint(text1), -1);
+
+  const text2 = 'First paragraph.\n\nSecond paragraph.\n\nThird.';
+  assert('paragraph boundary split', findProgressiveSplitPoint(text2) > 0, true);
+
+  const text3 = '```js\nconsole.log("hi")\n```\nAfter code.';
+  assert('code fence split', findProgressiveSplitPoint(text3) > 0, true);
+}
+
+// ── Summary ──
+const summary = document.createElement('div');
+summary.className = 'summary ' + (failed === 0 ? 'all-pass' : 'has-fail');
+summary.textContent = `${passed} passed, ${failed} failed`;
+results.appendChild(summary);
+</script>
+</body>
+</html>

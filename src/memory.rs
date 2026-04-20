@@ -10,6 +10,7 @@
 // ══════════════════════════════════════════════════════════════════════════════
 
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -17,10 +18,15 @@ use std::{
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
-use crate::{config::Config, providers};
+use crate::{
+    Session,
+    config::Config,
+    context::{USAGE_ROLE_MEMORY, UsageUpdate, apply_usage_update, build_usage_labels},
+    providers,
+};
 
 // ── Schema ──────────────────────────────────────────────────────────────────
 
@@ -104,6 +110,7 @@ struct MemoryProcessStats {
     had_user_context_before: bool,
     had_user_context_after: bool,
     changed: bool,
+    usage: Option<UsageUpdate>,
 }
 
 type SharedMemoryQueueStatus = Arc<Mutex<MemoryQueueStatusSnapshot>>;
@@ -447,6 +454,7 @@ fn fact_relevance_score(fact: &MemoryFact, query_tokens: &[String]) -> usize {
 /// Payload sent to the background memory updater.
 #[derive(Clone)]
 struct MemoryUpdateRequest {
+    session_id: String,
     workspace: PathBuf,
     model: String,
     /// Only user messages + final assistant response (no tool noise).
@@ -466,13 +474,16 @@ pub(crate) struct MemoryUpdateQueue {
 
 impl MemoryUpdateQueue {
     /// Spawn the background updater task. Returns the queue handle.
-    pub(crate) fn spawn(config: Config) -> Self {
+    pub(crate) fn spawn(
+        config: Config,
+        sessions: Arc<AsyncMutex<HashMap<String, Session>>>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(MEMORY_QUEUE_CAPACITY);
         let status = Arc::new(Mutex::new(MemoryQueueStatusSnapshot {
             state: "idle".to_string(),
             ..Default::default()
         }));
-        tokio::spawn(memory_updater_loop(rx, config, status.clone()));
+        tokio::spawn(memory_updater_loop(rx, config, status.clone(), sessions));
         Self { tx, status }
     }
 
@@ -486,11 +497,13 @@ impl MemoryUpdateQueue {
     /// Enqueue a memory update request (non-blocking).
     pub(crate) fn enqueue(
         &self,
+        session_id: String,
         workspace: PathBuf,
         model: String,
         conversation_excerpt: Vec<crate::ChatMessage>,
     ) {
         let req = MemoryUpdateRequest {
+            session_id,
             workspace,
             model: model.clone(),
             conversation_excerpt,
@@ -516,6 +529,7 @@ async fn memory_updater_loop(
     mut rx: mpsc::Receiver<MemoryUpdateRequest>,
     config: Config,
     status: SharedMemoryQueueStatus,
+    sessions: Arc<AsyncMutex<HashMap<String, Session>>>,
 ) {
     let memory_timeout = config.tool_timeout.max(Duration::from_secs(30));
     let http = Client::builder()
@@ -627,6 +641,12 @@ async fn memory_updater_loop(
                     eprintln!("{error}");
                 }
                 Ok(Ok(stats)) => {
+                    if let Some(usage) = stats.usage.as_ref() {
+                        let mut sessions = sessions.lock().await;
+                        if let Some(session) = sessions.get_mut(&final_req.session_id) {
+                            apply_usage_update(session, usage);
+                        }
+                    }
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let now = now_epoch_secs();
                     with_queue_status(&status, |snapshot| {
@@ -789,6 +809,7 @@ async fn process_memory_update(
             had_user_context_before,
             had_user_context_after: had_user_context_before,
             changed: false,
+            usage: None,
         });
     }
 
@@ -838,7 +859,7 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
     ];
 
     let resolved = config.resolve_model(&req.model);
-    let response = providers::call_llm_simple(
+    let response = providers::call_llm_simple_with_usage(
         http,
         &resolved,
         &messages,
@@ -849,7 +870,45 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
     .await
     .map_err(|e| format!("LLM call failed: {e}"))?;
 
-    let response = response.trim();
+    let provider_name = config.resolve_provider_name(&req.model);
+    let input_tokens = response.input_tokens.unwrap_or_else(|| {
+        crate::estimate_tokens_for_provider(resolved.provider, &messages) as u64
+    });
+    let output_tokens = response.output_tokens.unwrap_or_else(|| {
+        crate::message_token_len_for_provider(
+            resolved.provider,
+            &crate::ChatMessage {
+                role: "assistant".into(),
+                content: Some(response.content.clone()),
+                images: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+        ) as u64
+    });
+    let usage = UsageUpdate {
+        input_tokens,
+        output_tokens,
+        input_source: if response.input_tokens.is_some() {
+            "provider".to_string()
+        } else {
+            "estimated".to_string()
+        },
+        output_source: if response.output_tokens.is_some() {
+            "provider".to_string()
+        } else {
+            "estimated".to_string()
+        },
+        labels: build_usage_labels(
+            input_tokens,
+            output_tokens,
+            Some(&provider_name),
+            Some(USAGE_ROLE_MEMORY),
+        ),
+    };
+
+    let response = response.content.trim().to_string();
     if response.is_empty() {
         return Ok(MemoryProcessStats {
             excerpt_chars,
@@ -858,11 +917,12 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
             had_user_context_before,
             had_user_context_after: had_user_context_before,
             changed: false,
+            usage: Some(usage),
         });
     }
 
     // Strip markdown fences if present
-    let json_str = strip_json_fences(response);
+    let json_str = strip_json_fences(&response);
 
     // Parse as raw Value first so we can distinguish "field absent" from
     // "field explicitly null" — prevents silent data loss when the LLM
@@ -904,6 +964,7 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
         had_user_context_before,
         had_user_context_after,
         changed,
+        usage: Some(usage),
     })
 }
 

@@ -1,12 +1,37 @@
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Local};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Instant, SystemTime};
 
 use crate::config_dir_path;
 
 // ── Skills ───────────────────────────────────────────────────────────────────────────────
 
 const SKILLS_DIR: &str = "skills";
+
+/// TTL for discovery caches — safety net for content-only changes to existing
+/// files (directory mtime doesn't change when a file inside a subdirectory is
+/// modified). Structural changes (new/removed skill or agent directories) are
+/// detected instantly via directory mtime comparison.
+pub(crate) const DISCOVERY_CACHE_TTL_SECS: u64 = 10;
+
+struct SkillsCacheEntry {
+    workspace: PathBuf,
+    dir_mtimes: Vec<Option<SystemTime>>,
+    cached_at: Instant,
+    items: Vec<SkillMeta>,
+}
+
+type SkillsCache = OnceLock<Mutex<Option<SkillsCacheEntry>>>;
+static SKILLS_CACHE: SkillsCache = OnceLock::new();
+
+/// Force-invalidate the skills discovery cache (e.g. after `/skills-system install|uninstall`).
+pub(crate) fn invalidate_skills_cache() {
+    if let Some(cache) = SKILLS_CACHE.get() {
+        *cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SkillSource {
@@ -148,7 +173,56 @@ fn discover_skills_in_dir(dir: &Path, source: SkillSource, path_prefix: &str) ->
 
 /// Discover skills from all three layers (system → global → session) and merge.
 /// Later sources can shadow earlier ones if names collide (session wins over global wins over system).
+/// Results are cached and invalidated when source directory mtimes change
+/// (immediate for structural changes) or after [`DISCOVERY_CACHE_TTL_SECS`]
+/// (safety net for in-place content edits).
 pub(crate) fn discover_all_skills(workspace: &Path) -> Vec<SkillMeta> {
+    let dir_mtimes = collect_skills_dir_mtimes(workspace);
+    let cache = SKILLS_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref c) = *guard
+            && c.workspace == workspace
+            && c.dir_mtimes == dir_mtimes
+            && c.cached_at.elapsed().as_secs() < DISCOVERY_CACHE_TTL_SECS
+        {
+            return c.items.clone();
+        }
+    }
+    let result = discover_all_skills_uncached(workspace);
+    {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(SkillsCacheEntry {
+            workspace: workspace.to_path_buf(),
+            dir_mtimes,
+            cached_at: Instant::now(),
+            items: result.clone(),
+        });
+    }
+    result
+}
+
+/// Collect mtimes of the three skills source directories (including immediate
+/// subdirectories) for cache invalidation.  Tracking one level of child dirs
+/// ensures that adding a skill/agent inside an existing org folder (e.g.
+/// `anthropics/new-skill/`) is detected immediately.
+fn collect_skills_dir_mtimes(workspace: &Path) -> Vec<Option<SystemTime>> {
+    let mut mtimes = Vec::new();
+    if let Some(p) = system_skills_dir() {
+        mtimes.extend(collect_dir_tree_mtimes(&p));
+    } else {
+        mtimes.push(None);
+    }
+    if let Some(p) = global_skills_dir() {
+        mtimes.extend(collect_dir_tree_mtimes(&p));
+    } else {
+        mtimes.push(None);
+    }
+    mtimes.extend(collect_dir_tree_mtimes(&workspace.join(SKILLS_DIR)));
+    mtimes
+}
+
+fn discover_all_skills_uncached(workspace: &Path) -> Vec<SkillMeta> {
     let mut all = Vec::new();
 
     // Layer 1: system (bundled with binary)
@@ -402,7 +476,7 @@ impl LocalTimeSnapshot {
         format_local_date(self.now)
     }
 
-    fn yesterday(self) -> String {
+    pub(crate) fn yesterday(self) -> String {
         format_local_date(self.now - ChronoDuration::days(1))
     }
 
@@ -715,11 +789,108 @@ pub(crate) fn ensure_session_workspace(workspace: &Path) {
     ensure_bootstrap_baselines(workspace);
 }
 
+// ── Prompt file mtime cache ──────────────────────────────────────────────────
+
+/// All prompt-relevant filenames (relative to workspace) that affect the output.
+const PROMPT_WATCH_FILES: &[&str] = &[
+    "BOOTSTRAP.md",
+    "AGENTS.md",
+    "AGENT.md",
+    "IDENTITY.md",
+    "USER.md",
+    "SOUL.md",
+    "TOOLS.md",
+    "MEMORY.md",
+];
+
+struct PromptCache {
+    workspace: PathBuf,
+    today: String,
+    mtimes: Vec<Option<SystemTime>>,
+    result: String,
+}
+
+type PromptCacheLock = OnceLock<Mutex<Option<PromptCache>>>;
+static PROMPT_FILE_CACHE: PromptCacheLock = OnceLock::new();
+
+pub(crate) fn file_mtime(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+/// Collect mtimes for a directory and its immediate subdirectories.
+/// Returns root mtime followed by sorted child-directory mtimes so that
+/// structural changes one level below the root (e.g. a new skill added
+/// inside an existing org folder) are detected immediately.
+pub(crate) fn collect_dir_tree_mtimes(dir: &Path) -> Vec<Option<SystemTime>> {
+    let root_mtime = file_mtime(dir);
+    if root_mtime.is_none() {
+        return vec![None];
+    }
+    let mut mtimes = vec![root_mtime];
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        let mut subdirs: Vec<_> = entries.flatten().filter(|e| e.path().is_dir()).collect();
+        subdirs.sort_by_key(|e| e.file_name());
+        for entry in subdirs {
+            mtimes.push(file_mtime(&entry.path()));
+        }
+    }
+    mtimes
+}
+
+fn collect_prompt_mtimes(
+    workspace: &Path,
+    today: &str,
+    yesterday: &str,
+) -> Vec<Option<SystemTime>> {
+    let mut mtimes = Vec::with_capacity(PROMPT_WATCH_FILES.len() + 2);
+    for name in PROMPT_WATCH_FILES {
+        mtimes.push(file_mtime(&workspace.join(name)));
+    }
+    mtimes.push(file_mtime(
+        &workspace.join("memory").join(format!("{today}.md")),
+    ));
+    mtimes.push(file_mtime(
+        &workspace.join("memory").join(format!("{yesterday}.md")),
+    ));
+    mtimes
+}
+
 pub(crate) fn load_session_prompt_files_with_snapshot(
     workspace: &Path,
     snapshot: LocalTimeSnapshot,
 ) -> String {
     maybe_complete_bootstrap(workspace);
+
+    let today = snapshot.today();
+    let yesterday = snapshot.yesterday();
+    let mtimes = collect_prompt_mtimes(workspace, &today, &yesterday);
+
+    let cache = PROMPT_FILE_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref c) = *guard
+            && c.workspace == workspace
+            && c.today == today
+            && c.mtimes == mtimes
+        {
+            return c.result.clone();
+        }
+    }
+
+    let result = load_prompt_files_uncached(workspace, &today, &yesterday);
+    {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(PromptCache {
+            workspace: workspace.to_path_buf(),
+            today,
+            mtimes,
+            result: result.clone(),
+        });
+    }
+    result
+}
+
+fn load_prompt_files_uncached(workspace: &Path, today: &str, yesterday: &str) -> String {
     let bootstrap = read_nonempty(workspace.join(BOOTSTRAP_FILE));
 
     if let Some(bs_content) = bootstrap {
@@ -737,7 +908,7 @@ pub(crate) fn load_session_prompt_files_with_snapshot(
         parts.push(format!("<!-- {name} -->\n{content}"));
     }
 
-    for name in &["IDENTITY.md", "USER.md", "SOUL.md"] {
+    for name in &["IDENTITY.md", "USER.md", "SOUL.md", "TOOLS.md"] {
         if let Some(content) = read_nonempty(workspace.join(name)) {
             parts.push(format!("<!-- {name} -->\n{content}"));
         }
@@ -751,8 +922,6 @@ pub(crate) fn load_session_prompt_files_with_snapshot(
     // (reflection entries accumulate over a busy day).
     const DAILY_MEMORY_CHAR_BUDGET: usize = 4000;
 
-    let today = snapshot.today();
-    let yesterday = snapshot.yesterday();
     for date_str in &[today, yesterday] {
         let path = workspace.join("memory").join(format!("{date_str}.md"));
         if let Some(content) = read_nonempty(&path) {

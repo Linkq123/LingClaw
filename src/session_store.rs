@@ -1,8 +1,6 @@
 use serde_json::json;
-#[cfg(test)]
-use std::collections::HashSet;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
 };
 
@@ -26,7 +24,8 @@ pub(crate) async fn save_session_to_disk(session: &Session) -> Result<(), String
     let tmp_path = sessions_dir().join(format!("{}.json.tmp", session.id));
     let mut session = session.clone();
     sanitize_session_messages(&mut session.messages);
-    let data = serde_json::to_string_pretty(&session).map_err(|e| e.to_string())?;
+    retain_failed_tool_results(&mut session);
+    let data = serde_json::to_string(&session).map_err(|e| e.to_string())?;
     tokio::fs::write(&tmp_path, data)
         .await
         .map_err(|e| e.to_string())?;
@@ -84,6 +83,19 @@ pub(crate) fn trim_incomplete_tool_calls(messages: &mut Vec<ChatMessage>) {
 pub(crate) fn normalize_session(session: &mut Session) {
     super::migrate_session(session);
     trim_incomplete_tool_calls(&mut session.messages);
+    retain_failed_tool_results(session);
+}
+
+fn retain_failed_tool_results(session: &mut Session) {
+    let valid_ids: HashSet<&str> = session
+        .messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .filter_map(|message| message.tool_call_id.as_deref())
+        .collect();
+    session
+        .failed_tool_results
+        .retain(|tool_id| valid_ids.contains(tool_id.as_str()));
 }
 
 pub(crate) fn load_session_snapshot_from_path(path: &Path) -> Option<Session> {
@@ -137,9 +149,10 @@ pub(crate) fn load_session_from_disk(id: &str) -> Option<Session> {
 }
 
 pub(crate) fn refresh_session_system_prompt(state: &AppState, session: &mut Session) {
-    let model = session.effective_model(&state.config.model).to_string();
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
     let sys = super::build_system_prompt(
-        &state.config,
+        &config,
         &session.workspace,
         &model,
         &session.disabled_system_skills,
@@ -284,7 +297,13 @@ pub(crate) fn build_history_payload_with_s3(
                 if session.show_tools
                     && let Some(c) = &msg.content
                 {
-                    msgs.push(json!({"role":"tool_result","result":c,"id":msg.tool_call_id.as_deref().unwrap_or("")}));
+                    let tool_call_id = msg.tool_call_id.as_deref().unwrap_or("");
+                    msgs.push(json!({
+                        "role":"tool_result",
+                        "result":c,
+                        "id":tool_call_id,
+                        "is_error": session.failed_tool_results.contains(tool_call_id),
+                    }));
                 }
             }
             _ => {}

@@ -7,7 +7,10 @@ use tokio::sync::Mutex;
 use crate::{
     ChatMessage, Session, agent,
     config::{Config, Provider},
-    context::{context_input_budget_for_model, estimate_tokens_for_provider, turn_len},
+    context::{
+        USAGE_ROLE_CONTEXT, UsageUpdate, apply_usage_update, build_usage_labels,
+        context_input_budget_for_model, estimate_tokens_for_provider, turn_len,
+    },
     providers, truncate,
 };
 
@@ -33,6 +36,7 @@ pub(crate) enum HookOutput {
     ReplaceMessages {
         messages: Vec<ChatMessage>,
         events: Vec<serde_json::Value>,
+        usage: Option<UsageUpdate>,
     },
     /// Modify tool arguments before execution (BeforeToolExec only).
     ModifyToolArgs { args: serde_json::Value },
@@ -215,6 +219,15 @@ pub(crate) fn find_auto_compress_cutoff(
     (keep_from > 1).then_some(keep_from)
 }
 
+/// Extract the existing auto-generated summary from messages, if any.
+fn extract_existing_summary(messages: &[ChatMessage]) -> Option<&str> {
+    messages.iter().find_map(|msg| {
+        msg.content
+            .as_deref()
+            .filter(|c| c.starts_with("## Context Summary (auto-generated)"))
+    })
+}
+
 pub(crate) fn build_compression_source_text(messages: &[ChatMessage]) -> String {
     let mut lines = Vec::new();
     for msg in messages {
@@ -225,10 +238,20 @@ pub(crate) fn build_compression_source_text(messages: &[ChatMessage]) -> String 
                 {
                     lines.push(format!("User: {content}"));
                 }
+                // Record image attachments so the summary preserves the fact
+                // that images were part of the conversation context.
+                if let Some(images) = msg.images.as_ref()
+                    && !images.is_empty()
+                {
+                    lines.push(format!("User attached {} image(s)", images.len()));
+                }
             }
             "assistant" => {
                 if let Some(content) = msg.content.as_deref()
                     && !content.is_empty()
+                    // Skip previous auto-generated compression summaries so
+                    // repeated compressions don't produce summary-of-summary drift.
+                    && !content.starts_with("## Context Summary (auto-generated)")
                 {
                     lines.push(format!("Assistant: {content}"));
                 }
@@ -288,12 +311,22 @@ pub(crate) fn build_context_compressed_event(
     removed_messages: usize,
     before_estimate: usize,
     after_estimate: usize,
+    summary_tokens: usize,
+    was_incremental: bool,
 ) -> serde_json::Value {
+    let compression_ratio = if before_estimate > 0 {
+        ((after_estimate as f64) / (before_estimate as f64) * 100.0).round() as usize
+    } else {
+        100
+    };
     json!({
         "type": "context_compressed",
         "messages_removed": removed_messages,
         "before_estimate": before_estimate,
         "after_estimate": after_estimate,
+        "summary_tokens": summary_tokens,
+        "compression_ratio": compression_ratio,
+        "incremental": was_incremental,
     })
 }
 
@@ -351,18 +384,34 @@ impl AgentHook for AutoCompressContextHook {
             };
 
             let before_estimate = estimate_tokens_for_provider(input.provider, &input.messages);
-            let source_text = build_compression_source_text(&input.messages[1..compress_end]);
+            let to_compress = &input.messages[1..compress_end];
+            let source_text = build_compression_source_text(to_compress);
             if source_text.trim().is_empty() {
                 return HookOutput::NoOp;
             }
 
+            // Incremental compression: if there's an existing summary in the
+            // messages being compressed, provide it as prior context so the LLM
+            // merges rather than starting from scratch.
+            let existing_summary = extract_existing_summary(to_compress);
+            let user_content = if let Some(prev) = existing_summary {
+                format!(
+                    "## Previous Summary\n{prev}\n\n## New Conversation To Merge\n{source_text}"
+                )
+            } else {
+                source_text.clone()
+            };
+
+            let system_content = if existing_summary.is_some() {
+                "You compress older conversation context for an AI coding assistant so the agent can keep working without losing actionable state.\n\nYou are given a previous summary and new conversation turns. Merge them into a single updated summary, preserving all still-relevant information from the previous summary and incorporating new details.\n\nProduce a single concise markdown summary with the following sections, in this order, omitting any section that has no content:\n- User goal & constraints: the user's current objective and any hard requirements, scope limits, language, or style rules they set.\n- Files & components touched: repository paths, functions, modules, or external systems involved. Preserve exact paths when mentioned.\n- Key findings: important facts surfaced by tools (search/read/run output) that the agent will need later. Prefer precise quotes or exact identifiers over paraphrase.\n- Decisions & rationale: design choices already made and why, including any approaches the user explicitly approved or rejected.\n- Failed attempts & blockers: what has been tried, why it failed, and any errors/warnings that remain unresolved.\n- Open issues / next steps: work still pending or the immediate next action the agent was about to take.\n\nHard rules:\n- Keep it factual and compact. No filler, no meta commentary (\"In summary...\"), no apologies.\n- Do not fabricate information that is not in the source text.\n- When merging, drop obsolete information from the previous summary that has been superseded by new conversation.\n- Preserve tool call IDs, error codes, and exact identifiers verbatim when they appear.\n- Do not wrap the output in code blocks.\n- Match the language of the source conversation."
+            } else {
+                "You compress older conversation context for an AI coding assistant so the agent can keep working without losing actionable state.\n\nProduce a single concise markdown summary with the following sections, in this order, omitting any section that has no content:\n- User goal & constraints: the user's current objective and any hard requirements, scope limits, language, or style rules they set.\n- Files & components touched: repository paths, functions, modules, or external systems involved. Preserve exact paths when mentioned.\n- Key findings: important facts surfaced by tools (search/read/run output) that the agent will need later. Prefer precise quotes or exact identifiers over paraphrase.\n- Decisions & rationale: design choices already made and why, including any approaches the user explicitly approved or rejected.\n- Failed attempts & blockers: what has been tried, why it failed, and any errors/warnings that remain unresolved.\n- Open issues / next steps: work still pending or the immediate next action the agent was about to take.\n\nHard rules:\n- Keep it factual and compact. No filler, no meta commentary (\"In summary...\"), no apologies.\n- Do not fabricate information that is not in the source text.\n- Preserve tool call IDs, error codes, and exact identifiers verbatim when they appear.\n- Do not wrap the output in code blocks.\n- Match the language of the source conversation."
+            };
+
             let prompt = vec![
                 ChatMessage {
                     role: "system".into(),
-                    content: Some(
-                        "You compress older conversation context for an AI coding assistant. Produce a concise markdown summary that preserves: user goal, important constraints, files or components touched, key tool findings, decisions made, failed attempts, and remaining open issues. Keep it factual and compact. Do not wrap in code blocks. Keep the same language as the source conversation."
-                            .into(),
-                    ),
+                    content: Some(system_content.into()),
                     images: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -370,7 +419,7 @@ impl AgentHook for AutoCompressContextHook {
                 },
                 ChatMessage {
                     role: "user".into(),
-                    content: Some(source_text),
+                    content: Some(user_content),
                     images: None,
                     tool_calls: None,
                     tool_call_id: None,
@@ -378,8 +427,10 @@ impl AgentHook for AutoCompressContextHook {
                 },
             ];
 
-            let resolved = config.resolve_model(&input.model);
-            let summary = match providers::call_llm_simple(
+            // Use context_model → primary fallback chain for compression.
+            let compress_model = config.context_model_or(&input.model);
+            let resolved = config.resolve_model(compress_model);
+            let summary = match providers::call_llm_simple_with_usage(
                 http,
                 &resolved,
                 &prompt,
@@ -389,13 +440,33 @@ impl AgentHook for AutoCompressContextHook {
             )
             .await
             {
-                Ok(summary) if !summary.trim().is_empty() => summary,
-                _ => return HookOutput::NoOp,
+                Ok(summary) if !summary.content.trim().is_empty() => summary,
+                Ok(_) => return HookOutput::NoOp,
+                Err(e) => {
+                    // Emit failure event so the frontend can inform the user.
+                    return HookOutput::ReplaceMessages {
+                        messages: input.messages,
+                        events: vec![json!({
+                            "type": "context_compress_failed",
+                            "error": e.to_string(),
+                        })],
+                        usage: None,
+                    };
+                }
             };
 
-            let messages = build_compressed_messages(&input.messages, compress_end, &summary);
+            let summary_text = summary.content;
+            let messages = build_compressed_messages(&input.messages, compress_end, &summary_text);
             let after_estimate = estimate_tokens_for_provider(input.provider, &messages);
             let removed_messages = compress_end.saturating_sub(1);
+            let summary_tokens = estimate_tokens_for_provider(input.provider, &messages[1..2]);
+            let provider_name = config.resolve_provider_name(compress_model);
+            let input_tokens = summary
+                .input_tokens
+                .unwrap_or_else(|| estimate_tokens_for_provider(resolved.provider, &prompt) as u64);
+            let output_tokens = summary.output_tokens.unwrap_or_else(|| {
+                estimate_tokens_for_provider(resolved.provider, &messages[1..2]) as u64
+            });
 
             HookOutput::ReplaceMessages {
                 messages,
@@ -403,7 +474,29 @@ impl AgentHook for AutoCompressContextHook {
                     removed_messages,
                     before_estimate,
                     after_estimate,
+                    summary_tokens,
+                    existing_summary.is_some(),
                 )],
+                usage: Some(UsageUpdate {
+                    input_tokens,
+                    output_tokens,
+                    input_source: if summary.input_tokens.is_some() {
+                        "provider".to_string()
+                    } else {
+                        "estimated".to_string()
+                    },
+                    output_source: if summary.output_tokens.is_some() {
+                        "provider".to_string()
+                    } else {
+                        "estimated".to_string()
+                    },
+                    labels: build_usage_labels(
+                        input_tokens,
+                        output_tokens,
+                        Some(&provider_name),
+                        Some(USAGE_ROLE_CONTEXT),
+                    ),
+                }),
             }
         })
     }
@@ -477,11 +570,15 @@ pub(crate) async fn run_hooks(
             HookOutput::ReplaceMessages {
                 messages: new_msgs,
                 events: hook_events,
+                usage,
             } => {
                 let mut sessions_guard = sessions.lock().await;
                 if let Some(session) = sessions_guard.get_mut(session_id) {
                     session.messages = new_msgs;
                     session.updated_at = crate::now_epoch();
+                    if let Some(usage) = usage.as_ref() {
+                        apply_usage_update(session, usage);
+                    }
                 }
                 events.extend(hook_events);
             }

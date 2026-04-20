@@ -3,6 +3,7 @@ use crate::{
     Provider,
     config::{JsonMcpServerConfig, S3Config},
 };
+use serde_json::json;
 use std::{collections::HashMap, time::Duration};
 
 fn test_config_with_broken_mcp() -> Config {
@@ -28,6 +29,7 @@ fn test_config_with_broken_mcp() -> Config {
         memory_model: None,
 
         reflection_model: None,
+        context_model: None,
         provider: Provider::OpenAI,
         openai_stream_include_usage: false,
         structured_memory: false,
@@ -269,4 +271,90 @@ fn build_systemd_service_unit_quotes_paths_with_spaces() {
     assert!(unit.contains("WorkingDirectory=\"/tmp/LingClaw Bin\""));
     assert!(unit.contains("Environment=\"HOME=/home/demo user\""));
     assert!(unit.contains("ExecStart=\"/tmp/LingClaw Bin/lingclaw\" --serve"));
+}
+
+#[test]
+fn wizard_next_provider_name_numbers_per_family() {
+    let mut providers = serde_json::Map::new();
+    providers.insert("openai".to_string(), json!({}));
+    providers.insert("openai-2".to_string(), json!({}));
+    providers.insert("anthropic".to_string(), json!({}));
+
+    assert_eq!(
+        wizard_next_provider_name(WizardProviderKind::OpenAI, &providers),
+        "openai-3"
+    );
+    assert_eq!(
+        wizard_next_provider_name(WizardProviderKind::Anthropic, &providers),
+        "anthropic-2"
+    );
+    assert_eq!(
+        wizard_next_provider_name(WizardProviderKind::Ollama, &providers),
+        "ollama"
+    );
+}
+
+#[test]
+fn wizard_validate_provider_name_rejects_duplicates_and_invalid_chars() {
+    let mut providers = serde_json::Map::new();
+    providers.insert("openai".to_string(), json!({}));
+
+    let duplicate_err = wizard_validate_provider_name("openai", &providers)
+        .expect_err("duplicate provider names should fail");
+    assert!(duplicate_err.contains("already exists"));
+
+    let slash_err = wizard_validate_provider_name("openai/test", &providers)
+        .expect_err("slashes should be rejected");
+    assert!(slash_err.contains("cannot contain '/'"));
+
+    let space_err = wizard_validate_provider_name("openai test", &providers)
+        .expect_err("whitespace should be rejected");
+    assert!(space_err.contains("whitespace"));
+
+    wizard_validate_provider_name("openai_compat.2", &providers)
+        .expect("letters, digits, dot, dash and underscore should be accepted");
+}
+
+#[test]
+fn wizard_suggested_fast_model_prefers_known_family_fast_model() {
+    let mut providers = serde_json::Map::new();
+    providers.insert(
+        "anthropic-2".to_string(),
+        json!({
+            "baseUrl": "https://anthropic-gateway.example",
+            "apiKey": "sk-ant-test",
+            "api": "anthropic",
+            "models": [
+                { "id": "claude-sonnet-4-20250514" },
+                { "id": "claude-haiku-3-20250306" }
+            ]
+        }),
+    );
+
+    let fast_model =
+        wizard_suggested_fast_model(&providers, Some("anthropic-2/claude-sonnet-4-20250514"))
+            .expect("fast model should be suggested");
+
+    assert_eq!(fast_model, "anthropic-2/claude-haiku-3-20250306");
+}
+
+#[test]
+fn wizard_suggested_fast_model_falls_back_to_primary_model() {
+    let mut providers = serde_json::Map::new();
+    providers.insert(
+        "openai-2".to_string(),
+        json!({
+            "baseUrl": "https://openai-gateway.example/v1",
+            "apiKey": "sk-test",
+            "api": "openai-completions",
+            "models": [
+                { "id": "gpt-4.1" }
+            ]
+        }),
+    );
+
+    let fast_model = wizard_suggested_fast_model(&providers, Some("openai-2/gpt-4.1"))
+        .expect("primary model should be used when no family fast model is configured");
+
+    assert_eq!(fast_model, "openai-2/gpt-4.1");
 }

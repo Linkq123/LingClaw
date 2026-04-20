@@ -1,7 +1,7 @@
 use super::*;
 
 use serde_json::json;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicI64, AtomicU64};
 use tokio::time::MissedTickBehavior;
 
 mod socket_input;
@@ -19,6 +19,10 @@ const REFLECTION_COOLDOWN_SECS: i64 = 600; // 10 minutes
 
 /// Epoch-seconds timestamp of the last reflection run (0 = never).
 static LAST_REFLECTION_EPOCH: AtomicI64 = AtomicI64::new(0);
+
+/// Monotonic counter used to make fallback task ids unique even if the system
+/// clock has coarse granularity or multiple tasks start within the same tick.
+static NEXT_FALLBACK_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
 fn epoch_secs_now() -> i64 {
     chrono::Local::now().timestamp()
@@ -67,6 +71,28 @@ fn rollback_reflection_claim(previous: i64, claimed: i64) {
     );
 }
 
+/// Return runtime reflection status for the `/reflection` command.
+pub(crate) fn reflection_runtime_status() -> String {
+    let last = LAST_REFLECTION_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    if last == 0 {
+        return "Last reflection: never (since server start)".to_string();
+    }
+    let now = epoch_secs_now();
+    let elapsed = now - last;
+    let remaining = REFLECTION_COOLDOWN_SECS - elapsed;
+    if remaining > 0 {
+        format!(
+            "Last reflection: {}s ago (cooldown: {}s remaining)",
+            elapsed, remaining
+        )
+    } else {
+        format!(
+            "Last reflection: {}s ago (cooldown elapsed, ready)",
+            elapsed
+        )
+    }
+}
+
 pub(crate) struct AgentRunOutcome {
     pub(crate) rerun_agent: bool,
     pub(crate) shutting_down: bool,
@@ -92,6 +118,9 @@ struct AgentPhaseState {
     run_stopped: bool,
     run_detached: bool,
     last_save_instant: Option<std::time::Instant>,
+    /// Token counters snapshotted at loop start for per-round delta calculation.
+    usage_snap_input: u64,
+    usage_snap_output: u64,
 }
 
 /// Minimum interval between observe-phase incremental saves.
@@ -104,6 +133,7 @@ enum AgentPhaseControl {
 
 struct AnalyzeSnapshot {
     model: String,
+    usage_role: &'static str,
     think_level: String,
     pruned_count: usize,
     /// Character count of latest user message, for complexity-aware think level.
@@ -121,14 +151,16 @@ enum ToolRunState {
 struct TaskEventGuard<'a> {
     live_tx: &'a LiveTx,
     agent_name: String,
+    task_id: String,
     finished: bool,
 }
 
 impl<'a> TaskEventGuard<'a> {
-    fn new(live_tx: &'a LiveTx, agent_name: &str) -> Self {
+    fn new(live_tx: &'a LiveTx, agent_name: &str, task_id: &str) -> Self {
         Self {
             live_tx,
             agent_name: agent_name.to_string(),
+            task_id: task_id.to_string(),
             finished: false,
         }
     }
@@ -147,6 +179,7 @@ impl Drop for TaskEventGuard<'_> {
             );
             let _ = self.live_tx.try_send(json!({
                 "type": "task_failed",
+                "task_id": self.task_id,
                 "agent": self.agent_name,
                 "error": "task aborted (timeout or cancellation)",
             }));
@@ -156,22 +189,40 @@ impl Drop for TaskEventGuard<'_> {
 
 const AGENT_HARD_CAP_ROUNDS: usize = 200;
 
+struct PostExecutionReflectionInput {
+    config: std::sync::Arc<Config>,
+    http: reqwest::Client,
+    sessions: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, Session>>>,
+    session_id: String,
+    workspace: std::path::PathBuf,
+    model: String,
+    messages: Vec<ChatMessage>,
+    cycles: usize,
+    tool_calls: usize,
+}
+
 /// Post-execution reflection: analyze what went well/poorly in a multi-step task.
 /// Writes a brief reflection to the session's daily memory file.
 /// Runs as a non-blocking background task — failures are non-critical.
 /// Returns `Ok(true)` when a reflection was actually written to disk,
 /// `Ok(false)` when the conversation was too trivial for a meaningful reflection.
 async fn run_post_execution_reflection(
-    config: &Config,
-    http: &reqwest::Client,
-    workspace: &std::path::Path,
-    model: &str,
-    messages: &[ChatMessage],
-    cycles: usize,
-    tool_calls: usize,
+    input: PostExecutionReflectionInput,
 ) -> Result<bool, String> {
+    let PostExecutionReflectionInput {
+        config,
+        http,
+        sessions,
+        session_id,
+        workspace,
+        model,
+        messages,
+        cycles,
+        tool_calls,
+    } = input;
+
     // Build a compact excerpt of the conversation for reflection.
-    let excerpt = crate::memory::build_conversation_excerpt(messages);
+    let excerpt = crate::memory::build_conversation_excerpt(&messages);
     if excerpt.trim().is_empty() {
         return Ok(false);
     }
@@ -208,19 +259,52 @@ async fn run_post_execution_reflection(
         },
     ];
 
-    let resolved = config.resolve_model(model);
-    let reflection = providers::call_llm_simple(
-        http,
+    let resolved = config.resolve_model(&model);
+    let reflection = providers::call_llm_simple_with_usage(
+        &http,
         &resolved,
         &prompt_messages,
-        workspace,
+        &workspace,
         config.s3.as_ref(),
         config.max_llm_retries,
     )
     .await
     .map_err(|e| format!("Reflection LLM call failed: {e}"))?;
 
-    let reflection = reflection.trim();
+    let provider_name = config.resolve_provider_name(&model);
+    let input_tokens = reflection.input_tokens.unwrap_or_else(|| {
+        crate::estimate_tokens_for_provider(resolved.provider, &prompt_messages) as u64
+    });
+    let output_tokens = reflection.output_tokens.unwrap_or_else(|| {
+        crate::message_token_len_for_provider(
+            resolved.provider,
+            &ChatMessage {
+                role: "assistant".into(),
+                content: Some(reflection.content.clone()),
+                images: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+        ) as u64
+    });
+
+    {
+        let mut sessions = sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            crate::update_session_token_usage_with_provider(
+                session,
+                input_tokens,
+                output_tokens,
+                token_usage_source(reflection.input_tokens),
+                token_usage_source(reflection.output_tokens),
+                Some(&provider_name),
+                Some(crate::context::USAGE_ROLE_REFLECTION),
+            );
+        }
+    }
+
+    let reflection = reflection.content.trim().to_string();
     if reflection.is_empty() {
         return Ok(false);
     }
@@ -280,9 +364,10 @@ async fn prepare_analyze_snapshot(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> Option<AnalyzeSnapshot> {
+    let config = ctx.state.config();
     let mut sessions = ctx.state.sessions.lock().await;
     let session = sessions.get_mut(ctx.current_session_id)?;
-    let base_model = session.effective_model(&ctx.state.config.model).to_string();
+    let base_model = session.effective_model(&config.model).to_string();
     let disabled = session.disabled_system_skills.clone();
 
     // Extract latest user message for query-aware memory retrieval and complexity sensing.
@@ -298,26 +383,27 @@ async fn prepare_analyze_snapshot(
         .unwrap_or(0);
 
     // On the first cycle, downgrade to fast model for simple queries when configured.
-    let model_str = if phase_state.react_ctx.cycles == 0 && session.model_override.is_none() {
-        if let Some(ref fast) = ctx.state.config.fast_model {
-            if latest_query
-                .as_deref()
-                .map(agent::is_simple_query)
-                .unwrap_or(false)
-            {
-                fast.clone()
+    let (model_str, usage_role) =
+        if phase_state.react_ctx.cycles == 0 && session.model_override.is_none() {
+            if let Some(ref fast) = config.fast_model {
+                if latest_query
+                    .as_deref()
+                    .map(agent::is_simple_query)
+                    .unwrap_or(false)
+                {
+                    (fast.clone(), crate::context::USAGE_ROLE_FAST)
+                } else {
+                    (base_model, crate::context::USAGE_ROLE_PRIMARY)
+                }
             } else {
-                base_model
+                (base_model, crate::context::USAGE_ROLE_PRIMARY)
             }
         } else {
-            base_model
-        }
-    } else {
-        base_model
-    };
+            (base_model, crate::context::USAGE_ROLE_PRIMARY)
+        };
 
     let mut fresh_system = build_system_prompt_with_query(
-        &ctx.state.config,
+        &config,
         &session.workspace,
         &model_str,
         &disabled,
@@ -355,8 +441,8 @@ async fn prepare_analyze_snapshot(
     let msg_count_before = session.messages.len();
     crate::context::prune_messages_for_provider(
         &mut session.messages,
-        ctx.state.config.resolve_model(&model_str).provider,
-        context_input_budget_for_model(&ctx.state.config, &model_str),
+        config.resolve_model(&model_str).provider,
+        context_input_budget_for_model(&config, &model_str),
     );
     let pruned_count = msg_count_before - session.messages.len();
 
@@ -364,6 +450,7 @@ async fn prepare_analyze_snapshot(
 
     Some(AnalyzeSnapshot {
         model: model_str,
+        usage_role,
         think_level: session.think_level.clone(),
         pruned_count,
         user_msg_chars,
@@ -376,11 +463,12 @@ async fn fit_messages_to_request_budget(
     think_level: &str,
     extra_tools: &[serde_json::Value],
 ) -> Option<(usize, usize)> {
-    let provider = ctx.state.config.resolve_model(model).provider;
+    let config = ctx.state.config();
+    let provider = config.resolve_model(model).provider;
     let request_budget =
-        crate::context::context_input_budget_for_runtime(&ctx.state.config, model, think_level);
+        crate::context::context_input_budget_for_runtime(&config, model, think_level);
     let message_budget = crate::context::request_message_budget_for_runtime(
-        &ctx.state.config,
+        &config,
         model,
         think_level,
         extra_tools,
@@ -407,21 +495,11 @@ async fn fit_messages_to_request_budget(
 
 async fn send_before_analyze_events(
     ctx: &AgentRunCtx<'_>,
-    react_ctx: &agent::AgentLoopCtx,
     model: &str,
+    mut hook_events: Vec<serde_json::Value>,
     pruned_count: usize,
 ) -> Option<Vec<ChatMessage>> {
-    let mut before_analyze_events = run_hooks(
-        &ctx.state.hooks,
-        agent::HookPoint::BeforeAnalyze,
-        &ctx.state.sessions,
-        ctx.current_session_id,
-        &ctx.state.config,
-        &ctx.state.http,
-        react_ctx.cycles,
-    )
-    .await;
-
+    let config = ctx.state.config();
     let final_messages = {
         let sessions = ctx.state.sessions.lock().await;
         sessions
@@ -429,17 +507,15 @@ async fn send_before_analyze_events(
             .map(|session| session.messages.clone())
             .unwrap_or_default()
     };
-    let final_context_estimate = estimate_tokens_for_provider(
-        ctx.state.config.resolve_model(model).provider,
-        &final_messages,
-    );
-    for event in &mut before_analyze_events {
+    let final_context_estimate =
+        estimate_tokens_for_provider(config.resolve_model(model).provider, &final_messages);
+    for event in &mut hook_events {
         if event["type"] == "context_compressed" {
             event["after_estimate"] = json!(final_context_estimate);
         }
     }
 
-    for event in before_analyze_events {
+    for event in hook_events {
         if !live_send(ctx.live_tx, event).await {
             return None;
         }
@@ -489,12 +565,8 @@ async fn build_cycle_tools(
     phase_state: &AgentPhaseState,
     resolved: &providers::ResolvedModel,
 ) -> Vec<serde_json::Value> {
-    build_runtime_tools(
-        &ctx.state.config,
-        resolved.provider,
-        &phase_state.cycle_workspace,
-    )
-    .await
+    let config = ctx.state.config();
+    build_runtime_tools(&config, resolved.provider, &phase_state.cycle_workspace).await
 }
 
 pub(crate) async fn build_runtime_tools(
@@ -504,7 +576,7 @@ pub(crate) async fn build_runtime_tools(
 ) -> Vec<serde_json::Value> {
     let mut extra_tools = Vec::new();
 
-    // Sub-agent task tool (only added when agents are discovered)
+    // Sub-agent task + orchestrate tools (only added when agents are discovered)
     let agents = crate::subagents::discovery::discover_all_agents(workspace);
     if !agents.is_empty() {
         let agent_names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
@@ -514,6 +586,13 @@ pub(crate) async fn build_runtime_tools(
             Provider::Ollama => tools::task_tool_definition_ollama(&agent_names),
         };
         extra_tools.push(task_def);
+
+        let orchestrate_def = match provider {
+            Provider::Anthropic => tools::orchestrate_tool_definition_anthropic(&agent_names),
+            Provider::OpenAI => tools::orchestrate_tool_definition_openai(&agent_names),
+            Provider::Ollama => tools::orchestrate_tool_definition_ollama(&agent_names),
+        };
+        extra_tools.push(orchestrate_def);
     }
 
     let mut mcp_tools = match provider {
@@ -536,6 +615,8 @@ fn token_usage_source(token_count: Option<u64>) -> &'static str {
 async fn update_llm_response_usage(
     ctx: &AgentRunCtx<'_>,
     resolved_provider: Provider,
+    provider_name: &str,
+    usage_role: &str,
     request_input_estimate: u64,
     resp: &providers::LlmResponse,
 ) {
@@ -546,12 +627,14 @@ async fn update_llm_response_usage(
 
     let mut sessions = ctx.state.sessions.lock().await;
     if let Some(session) = sessions.get_mut(ctx.current_session_id) {
-        update_session_token_usage(
+        crate::update_session_token_usage_with_provider(
             session,
             input_tokens,
             output_tokens,
             token_usage_source(resp.input_tokens),
             token_usage_source(resp.output_tokens),
+            Some(provider_name),
+            Some(usage_role),
         );
     }
 }
@@ -591,10 +674,20 @@ async fn apply_llm_response(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
     resolved_provider: Provider,
+    provider_name: String,
+    usage_role: &'static str,
     request_input_estimate: u64,
     resp: providers::LlmResponse,
 ) {
-    update_llm_response_usage(ctx, resolved_provider, request_input_estimate, &resp).await;
+    update_llm_response_usage(
+        ctx,
+        resolved_provider,
+        &provider_name,
+        usage_role,
+        request_input_estimate,
+        &resp,
+    )
+    .await;
     persist_assistant_message(ctx, &resp.message).await;
     advance_after_llm_response(ctx.live_tx, phase_state, &resp.message).await;
 }
@@ -615,7 +708,9 @@ async fn execute_tool(
 
 /// Execute a `task` tool call by delegating to a sub-agent.
 /// Returns the outcome as a standard ToolOutcome so it integrates with the
-/// existing record_tool_result flow.
+/// existing record_tool_result flow. Sub-agent token usage is accumulated into
+/// the parent session counters so global/daily stats remain accurate.
+#[allow(clippy::too_many_arguments)]
 async fn execute_task_tool(
     args_str: &str,
     config: &Config,
@@ -624,6 +719,8 @@ async fn execute_task_tool(
     live_tx: &LiveTx,
     cancel: CancellationToken,
     hooks: &HookRegistry,
+    state: &Arc<AppState>,
+    session_id: &str,
 ) -> tools::ToolOutcome {
     let start = std::time::Instant::now();
 
@@ -690,11 +787,28 @@ async fn execute_task_tool(
         }
     };
 
+    // Generate a unique task_id so the frontend can key parallel same-agent
+    // task panels independently. 8 bytes = 16 hex chars, ample for a session.
+    let task_id = {
+        let mut bytes = [0u8; 8];
+        if getrandom::getrandom(&mut bytes).is_ok() {
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        } else {
+            let seq = NEXT_FALLBACK_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(seq as u128);
+            format!("task-{nanos:x}-{seq:x}")
+        }
+    };
+
     // Send task_started event
     let _ = live_send(
         live_tx,
         json!({
             "type": "task_started",
+            "task_id": task_id,
             "agent": agent_name,
             "prompt": crate::truncate(prompt, 500),
         }),
@@ -703,32 +817,65 @@ async fn execute_task_tool(
 
     // Guard ensures task_failed is sent if we're dropped after task_started
     // (e.g. timeout or cancellation in run_tool_with_feedback).
-    let mut guard = TaskEventGuard::new(live_tx, agent_name);
+    let mut guard = TaskEventGuard::new(live_tx, agent_name, &task_id);
 
     let outcome = crate::subagents::executor::run_subagent(
-        &spec, prompt, config, http, workspace, live_tx, cancel, hooks,
+        &spec, prompt, config, http, workspace, live_tx, cancel, hooks, &task_id,
     )
     .await;
 
     let duration_ms = start.elapsed().as_millis() as u64;
 
+    // Propagate sub-agent token usage into the parent session so stats reflect
+    // the full cost of delegation.  The executor mixes provider-reported and
+    // locally-estimated counts (prefer provider, fall back to estimate), so
+    // the source label is conservatively "estimated".
+    if outcome.total_input_tokens > 0 || outcome.total_output_tokens > 0 {
+        let mut usage_labels = outcome.provider_usage.clone();
+        usage_labels.extend(crate::context::build_usage_labels(
+            outcome.total_input_tokens,
+            outcome.total_output_tokens,
+            None,
+            Some(crate::context::USAGE_ROLE_SUB_AGENT),
+        ));
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(session_id) {
+            crate::update_session_token_usage_with_providers(
+                session,
+                outcome.total_input_tokens,
+                outcome.total_output_tokens,
+                "estimated",
+                "estimated",
+                &usage_labels,
+            );
+        }
+    }
+
     // Send task_completed / task_failed event
     let terminal_event = if outcome.aborted {
         json!({
             "type": "task_failed",
+            "task_id": task_id,
             "agent": agent_name,
             "error": outcome.result,
             "cycles": outcome.cycles,
             "tool_calls": outcome.tool_calls,
+            "input_tokens": outcome.total_input_tokens,
+            "output_tokens": outcome.total_output_tokens,
             "duration_ms": duration_ms,
         })
     } else {
         json!({
             "type": "task_completed",
+            "task_id": task_id,
             "agent": agent_name,
             "cycles": outcome.cycles,
             "tool_calls": outcome.tool_calls,
+            "input_tokens": outcome.total_input_tokens,
+            "output_tokens": outcome.total_output_tokens,
             "duration_ms": duration_ms,
+            "result_preview": crate::truncate(&outcome.result, 400),
+            "result_excerpt": crate::truncate(&outcome.result, 4_000),
         })
     };
     let _ = live_send(live_tx, terminal_event).await;
@@ -737,6 +884,116 @@ async fn execute_task_tool(
     tools::ToolOutcome {
         output: outcome.result,
         is_error: outcome.aborted,
+        duration_ms,
+    }
+}
+
+/// Execute an `orchestrate` tool call by coordinating multiple sub-agents.
+/// Returns the outcome as a standard ToolOutcome so it integrates with the
+/// existing record_tool_result flow. Aggregated sub-agent token usage is
+/// written back to the parent session for accurate stats tracking.
+#[allow(clippy::too_many_arguments)]
+async fn execute_orchestrate_tool(
+    args_str: &str,
+    config: &Config,
+    http: &Client,
+    workspace: &Path,
+    live_tx: &LiveTx,
+    cancel: CancellationToken,
+    hooks: &HookRegistry,
+    state: &Arc<AppState>,
+    session_id: &str,
+) -> tools::ToolOutcome {
+    let start = std::time::Instant::now();
+
+    let args: serde_json::Value = match serde_json::from_str(args_str) {
+        Ok(v) => v,
+        Err(e) => {
+            return tools::ToolOutcome {
+                output: format!("orchestrate error: invalid arguments JSON: {e}"),
+                is_error: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    // Validate against schema
+    if let Some(err) =
+        tools::validate_tool_args("orchestrate", &args, &tools::orchestrate_tool_parameters())
+    {
+        return tools::ToolOutcome {
+            output: err,
+            is_error: true,
+            duration_ms: start.elapsed().as_millis() as u64,
+        };
+    }
+
+    // Parse tasks array
+    let tasks: Vec<crate::subagents::orchestrator::OrchestrationTask> = match args
+        .get("tasks")
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+    {
+        Some(t) => t,
+        None => {
+            return tools::ToolOutcome {
+                output: "orchestrate error: missing or invalid 'tasks' array".to_string(),
+                is_error: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    // Validate plan (IDs, agents, dependencies, cycles)
+    let plan = match crate::subagents::orchestrator::validate_plan(tasks, workspace) {
+        Ok(p) => p,
+        Err(e) => {
+            return tools::ToolOutcome {
+                output: e,
+                is_error: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+            };
+        }
+    };
+
+    let outcome = crate::subagents::orchestrator::execute_orchestration(
+        &plan, config, http, workspace, live_tx, cancel, hooks,
+    )
+    .await;
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let result = crate::subagents::orchestrator::format_orchestration_result(&outcome);
+
+    // Propagate aggregated sub-agent token usage into the parent session so
+    // the user-facing stats and daily totals include the cost of delegation.
+    // Inner executors mix provider-reported and estimated counts, so the
+    // source label is conservatively "estimated".
+    let input_tokens = outcome.total_input_tokens();
+    let output_tokens = outcome.total_output_tokens();
+    let provider_usage = outcome.provider_usage();
+    if input_tokens > 0 || output_tokens > 0 {
+        let mut usage_labels = provider_usage.clone();
+        usage_labels.extend(crate::context::build_usage_labels(
+            input_tokens,
+            output_tokens,
+            None,
+            Some(crate::context::USAGE_ROLE_SUB_AGENT),
+        ));
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(session_id) {
+            crate::update_session_token_usage_with_providers(
+                session,
+                input_tokens,
+                output_tokens,
+                "estimated",
+                "estimated",
+                &usage_labels,
+            );
+        }
+    }
+
+    tools::ToolOutcome {
+        output: result,
+        is_error: outcome.aborted || outcome.has_non_completed_tasks(),
         duration_ms,
     }
 }
@@ -762,6 +1019,29 @@ fn build_agent_hard_cap_events(
             "tool_calls": tool_calls,
         }),
     )
+}
+
+/// Read session token counters and compute round deltas for the `done` event.
+async fn build_done_usage(
+    state: &AppState,
+    session_id: &str,
+    snap_input: u64,
+    snap_output: u64,
+) -> serde_json::Value {
+    let sessions = state.sessions.lock().await;
+    if let Some(s) = sessions.get(session_id) {
+        let (daily_in, daily_out) = context::current_daily_token_usage(s);
+        json!({
+            "daily_input_tokens": daily_in,
+            "daily_output_tokens": daily_out,
+            "total_input_tokens": s.input_tokens,
+            "total_output_tokens": s.output_tokens,
+            "round_input_tokens": s.input_tokens.saturating_sub(snap_input),
+            "round_output_tokens": s.output_tokens.saturating_sub(snap_output),
+        })
+    } else {
+        json!({})
+    }
 }
 
 async fn run_tool_with_feedback<F>(
@@ -829,7 +1109,8 @@ async fn execute_tool_call(
     phase_state: &mut AgentPhaseState,
     tc: &ToolCall,
 ) -> Result<(tools::ToolOutcome, Option<String>), AgentPhaseControl> {
-    let tool_timeout = ctx.state.config.tool_timeout;
+    let config = ctx.state.config();
+    let tool_timeout = config.tool_timeout;
 
     // ── BeforeToolExec hook (evaluated before the WS event so the frontend
     //    always sees the arguments that will actually be executed) ─────────
@@ -848,7 +1129,7 @@ async fn execute_tool_call(
         &ctx.state.hooks,
         agent::HookPoint::BeforeToolExec,
         tool_hook_input,
-        &ctx.state.config,
+        &config,
     )
     .await;
 
@@ -910,12 +1191,37 @@ async fn execute_tool_call(
             None,
             execute_task_tool(
                 &effective_args,
-                &ctx.state.config,
+                &config,
                 &ctx.state.http,
                 &phase_state.cycle_workspace,
                 ctx.live_tx,
                 task_cancel,
                 &ctx.state.hooks,
+                ctx.state,
+                ctx.current_session_id,
+            ),
+        )
+        .await
+    } else if tools::is_orchestrate_tool(&tc.function.name) {
+        // Multi-agent orchestration: no outer timeout — individual sub-agents
+        // enforce their own deadlines via config.sub_agent_timeout.
+        let orch_cancel = ctx.run_cancel.child_token();
+        run_tool_with_feedback(
+            ctx.live_tx,
+            ctx.run_cancel,
+            &tc.id,
+            &tc.function.name,
+            None,
+            execute_orchestrate_tool(
+                &effective_args,
+                &config,
+                &ctx.state.http,
+                &phase_state.cycle_workspace,
+                ctx.live_tx,
+                orch_cancel,
+                &ctx.state.hooks,
+                ctx.state,
+                ctx.current_session_id,
             ),
         )
         .await
@@ -929,7 +1235,7 @@ async fn execute_tool_call(
             execute_tool(
                 &tc.function.name,
                 &effective_args,
-                &ctx.state.config,
+                &config,
                 &ctx.state.http,
                 &phase_state.cycle_workspace,
             ),
@@ -958,6 +1264,7 @@ async fn record_tool_result(
     effective_args: Option<&str>,
 ) -> AgentPhaseControl {
     // ── AfterToolExec hook (skipped when tool was rejected) ──────────────
+    let config = ctx.state.config();
     if let Some(eff_args) = effective_args {
         let after_input = ToolHookInput {
             tool_name: tc.function.name.clone(),
@@ -974,7 +1281,7 @@ async fn record_tool_result(
             &ctx.state.hooks,
             agent::HookPoint::AfterToolExec,
             after_input,
-            &ctx.state.config,
+            &config,
         )
         .await;
         if let hooks::HookOutput::ModifyToolResult { result: new_output } = hook_output {
@@ -1009,6 +1316,11 @@ async fn record_tool_result(
     {
         let mut sessions = ctx.state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(ctx.current_session_id) {
+            if result.is_error {
+                session.failed_tool_results.insert(tc.id.clone());
+            } else {
+                session.failed_tool_results.remove(&tc.id);
+            }
             session.messages.push(ChatMessage {
                 role: "tool".into(),
                 content: Some(result.output),
@@ -1033,12 +1345,23 @@ async fn run_analyze_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
+    let config = ctx.state.config();
     if phase_state.round >= AGENT_HARD_CAP_ROUNDS {
-        let (system_event, done_event) = build_agent_hard_cap_events(
+        let (system_event, mut done_event) = build_agent_hard_cap_events(
             AGENT_HARD_CAP_ROUNDS,
             phase_state.react_ctx.cycles,
             phase_state.react_ctx.tool_calls,
         );
+        let usage = build_done_usage(
+            ctx.state,
+            ctx.current_session_id,
+            phase_state.usage_snap_input,
+            phase_state.usage_snap_output,
+        )
+        .await;
+        if let (Some(done_obj), Some(usage_obj)) = (done_event.as_object_mut(), usage.as_object()) {
+            done_obj.extend(usage_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
         if !live_send(ctx.live_tx, system_event).await {
             return AgentPhaseControl::Break;
         }
@@ -1058,7 +1381,7 @@ async fn run_analyze_phase(
         None => return AgentPhaseControl::Break,
     };
 
-    let resolved = ctx.state.config.resolve_model(&snapshot.model);
+    let resolved = config.resolve_model(&snapshot.model);
 
     // Complexity signals for adaptive think level.
     let consecutive_errors = phase_state
@@ -1078,6 +1401,19 @@ async fn run_analyze_phase(
     );
     let extra_tools = build_cycle_tools(ctx, phase_state, &resolved).await;
 
+    // Run BeforeAnalyze hooks (including auto-compress) BEFORE the fine prune
+    // so compression can preserve context that would otherwise be hard-deleted.
+    let before_analyze_events = run_hooks(
+        &ctx.state.hooks,
+        agent::HookPoint::BeforeAnalyze,
+        &ctx.state.sessions,
+        ctx.current_session_id,
+        &config,
+        &ctx.state.http,
+        phase_state.react_ctx.cycles,
+    )
+    .await;
+
     let (extra_pruned_count, request_budget) =
         match fit_messages_to_request_budget(ctx, &snapshot.model, &effective_think, &extra_tools)
             .await
@@ -1089,8 +1425,8 @@ async fn run_analyze_phase(
 
     let final_msgs_snapshot = match send_before_analyze_events(
         ctx,
-        &phase_state.react_ctx,
         &snapshot.model,
+        before_analyze_events,
         total_pruned_count,
     )
     .await
@@ -1106,7 +1442,7 @@ async fn run_analyze_phase(
         cycle: phase_state.react_ctx.cycles,
         tool_count: extra_tools.len(),
     };
-    let llm_hook_output = run_llm_hooks(&ctx.state.hooks, &llm_hook_input, &ctx.state.config).await;
+    let llm_hook_output = run_llm_hooks(&ctx.state.hooks, &llm_hook_input, &config).await;
 
     let (effective_think, mut final_msgs_snapshot, request_budget) = match llm_hook_output {
         hooks::HookOutput::ModifyLlmParams {
@@ -1117,11 +1453,7 @@ async fn run_analyze_phase(
             let think = think_override.unwrap_or(effective_think);
             // Recalculate budget when think_level changed so the reserve matches.
             let budget = if has_think_override {
-                crate::context::context_input_budget_for_runtime(
-                    &ctx.state.config,
-                    &snapshot.model,
-                    &think,
-                )
+                crate::context::context_input_budget_for_runtime(&config, &snapshot.model, &think)
             } else {
                 request_budget
             };
@@ -1155,7 +1487,7 @@ async fn run_analyze_phase(
     // snapshot before erroring — the messages may still fit after trimming.
     if request_estimate > request_budget {
         let message_budget = crate::context::request_message_budget_for_runtime(
-            &ctx.state.config,
+            &config,
             &snapshot.model,
             &effective_think,
             &extra_tools,
@@ -1223,11 +1555,11 @@ async fn run_analyze_phase(
                 &resolved,
                 &final_msgs_snapshot,
                 &phase_state.cycle_workspace,
-                ctx.state.config.s3.as_ref(),
+                config.s3.as_ref(),
                 ctx.live_tx,
                 &effective_think,
                 &extra_tools,
-                ctx.state.config.max_llm_retries,
+                config.max_llm_retries,
             ) => result,
         };
 
@@ -1257,10 +1589,13 @@ async fn run_analyze_phase(
 
     match llm_result {
         Ok(resp) => {
+            let provider_name = config.resolve_provider_name(&snapshot.model);
             apply_llm_response(
                 ctx,
                 phase_state,
                 resolved.provider,
+                provider_name,
+                snapshot.usage_role,
                 request_estimate as u64,
                 resp,
             )
@@ -1278,15 +1613,16 @@ async fn run_act_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
+    let config = ctx.state.config();
     phase_state.collected_results.clear();
     let tool_calls = std::mem::take(&mut phase_state.pending_tool_calls);
 
-    let all_read_only = tool_calls.len() > 1
+    let all_parallelizable = tool_calls.len() > 1
         && tool_calls
             .iter()
-            .all(|tc| tools::is_read_only_tool(&tc.function.name));
+            .all(|tc| tools::is_parallelizable_tool(&tc.function.name));
 
-    if !all_read_only {
+    if !all_parallelizable {
         // Sequential path: single tool call or any mutating tool in the batch.
         for tc in &tool_calls {
             if ctx.run_cancel.is_cancelled() {
@@ -1308,7 +1644,9 @@ async fn run_act_phase(
             }
         }
     } else {
-        // Multiple read-only tool calls: parallel execution with ordered result recording.
+        // Multiple parallel-safe read-only tool calls: parallel execution with
+        // ordered result recording. Mutating tools and delegated `task` runs
+        // stay sequential because they share the parent workspace.
         // 1. Run BeforeToolExec hooks sequentially (may reject or modify args).
         struct HookEvalResult {
             effective_args: Option<String>,
@@ -1332,7 +1670,7 @@ async fn run_act_phase(
                 &ctx.state.hooks,
                 agent::HookPoint::BeforeToolExec,
                 hook_input,
-                &ctx.state.config,
+                &config,
             )
             .await;
             hook_results.push(match hook_output {
@@ -1397,7 +1735,7 @@ async fn run_act_phase(
         }
 
         // 3. Launch non-rejected tool futures concurrently.
-        let tool_timeout = ctx.state.config.tool_timeout;
+        let tool_timeout = config.tool_timeout;
         let futures: Vec<_> = tool_calls
             .iter()
             .zip(hook_results.iter())
@@ -1425,7 +1763,7 @@ async fn run_act_phase(
                     execute_tool(
                         &tc.function.name,
                         args,
-                        &ctx.state.config,
+                        &config,
                         &ctx.state.http,
                         &phase_state.cycle_workspace,
                     ),
@@ -1480,6 +1818,7 @@ async fn run_observe_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
+    let config = ctx.state.config();
     let summaries = agent::summarize_observations(&phase_state.collected_results);
     for summary in &summaries {
         let _ = live_send(
@@ -1529,7 +1868,7 @@ async fn run_observe_phase(
         agent::HookPoint::AfterObserve,
         &ctx.state.sessions,
         ctx.current_session_id,
-        &ctx.state.config,
+        &config,
         &ctx.state.http,
         phase_state.react_ctx.cycles,
     )
@@ -1548,6 +1887,7 @@ async fn run_finish_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
+    let config = ctx.state.config();
     let snapshot = {
         let sessions = ctx.state.sessions.lock().await;
         sessions.get(ctx.current_session_id).cloned()
@@ -1563,7 +1903,7 @@ async fn run_finish_phase(
         agent::HookPoint::OnFinish,
         &ctx.state.sessions,
         ctx.current_session_id,
-        &ctx.state.config,
+        &config,
         &ctx.state.http,
         phase_state.react_ctx.cycles,
     )
@@ -1576,10 +1916,15 @@ async fn run_finish_phase(
     // Enqueue structured memory update (async, non-blocking).
     // Pre-filter messages to avoid cloning the full session history.
     if let (Some(queue), Some(session)) = (&ctx.state.memory_queue, &snapshot) {
-        let fallback_model = session.effective_model(&ctx.state.config.model);
-        let model = ctx.state.config.memory_model_or(fallback_model).to_string();
+        let fallback_model = session.effective_model(&config.model);
+        let model = config.memory_model_or(fallback_model).to_string();
         let excerpt = crate::memory::prefilter_for_memory(&session.messages);
-        queue.enqueue(session.workspace.clone(), model, excerpt);
+        queue.enqueue(
+            session.id.clone(),
+            session.workspace.clone(),
+            model,
+            excerpt,
+        );
     }
 
     // Post-execution reflection for non-trivial multi-step tasks.
@@ -1588,15 +1933,17 @@ async fn run_finish_phase(
     // NOTE: snapshot check must precede try_claim_reflection() because the
     // CAS has a side-effect; if it fires but the session is gone, nobody
     // would roll back the cooldown slot.
-    if ctx.state.config.daily_reflection
+    if config.daily_reflection
         && let Some(ref session) = snapshot
         && let Some((previous_epoch, claimed_epoch)) = try_claim_reflection(
             phase_state.react_ctx.cycles,
             phase_state.react_ctx.tool_calls,
         )
     {
-        let config = ctx.state.config.clone();
+        let config = config.clone();
         let http = ctx.state.http.clone();
+        let sessions = ctx.state.sessions.clone();
+        let session_id = session.id.clone();
         let workspace = session.workspace.clone();
         let fallback_model = session.effective_model(&config.model).to_string();
         let model = config.reflection_model_or(&fallback_model).to_string();
@@ -1609,9 +1956,17 @@ async fn run_finish_phase(
         tokio::spawn(async move {
             match tokio::time::timeout(
                 reflection_timeout,
-                run_post_execution_reflection(
-                    &config, &http, &workspace, &model, &messages, cycles, tool_calls,
-                ),
+                run_post_execution_reflection(PostExecutionReflectionInput {
+                    config,
+                    http,
+                    sessions,
+                    session_id,
+                    workspace,
+                    model,
+                    messages,
+                    cycles,
+                    tool_calls,
+                }),
             )
             .await
             {
@@ -1642,17 +1997,25 @@ async fn run_finish_phase(
         .map(|reason| reason.label())
         .unwrap_or("complete");
 
-    let _ = live_send(
-        ctx.live_tx,
-        json!({
-            "type":"done",
-            "phase":"finish",
-            "reason": finish_label,
-            "cycles": phase_state.react_ctx.cycles,
-            "tool_calls": phase_state.react_ctx.tool_calls,
-        }),
+    let usage = build_done_usage(
+        ctx.state,
+        ctx.current_session_id,
+        phase_state.usage_snap_input,
+        phase_state.usage_snap_output,
     )
     .await;
+
+    let mut done_event = json!({
+        "type":"done",
+        "phase":"finish",
+        "reason": finish_label,
+        "cycles": phase_state.react_ctx.cycles,
+        "tool_calls": phase_state.react_ctx.tool_calls,
+    });
+    if let (Some(done_obj), Some(usage_obj)) = (done_event.as_object_mut(), usage.as_object()) {
+        done_obj.extend(usage_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+    }
+    let _ = live_send(ctx.live_tx, done_event).await;
     AgentPhaseControl::Break
 }
 
@@ -1663,13 +2026,14 @@ fn fire_stop_command_hook(state: &Arc<AppState>, session_id: &str, live_tx: &Liv
     let live_tx = live_tx.clone();
     let session_id = session_id.to_string();
     tokio::spawn(async move {
+        let config = state.config();
         let hook_input = CommandHookInput {
             command: "/stop".to_string(),
             args: String::new(),
             result_type: "system".to_string(),
             session_id,
         };
-        let hook_events = run_command_hooks(&state.hooks, &hook_input, &state.config).await;
+        let hook_events = run_command_hooks(&state.hooks, &hook_input, &config).await;
         for ev in hook_events {
             let _ = live_send(&live_tx, ev).await;
         }
@@ -1724,7 +2088,18 @@ pub(crate) async fn run_agent_session(
         run_stopped: false,
         run_detached: false,
         last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
     };
+
+    // Snapshot token counts at loop start so we can compute per-round delta.
+    {
+        let sessions = state.sessions.lock().await;
+        if let Some(s) = sessions.get(current_session_id) {
+            phase_state.usage_snap_input = s.input_tokens;
+            phase_state.usage_snap_output = s.output_tokens;
+        }
+    }
 
     'agent: loop {
         if cancel.is_cancelled() {
@@ -1809,17 +2184,24 @@ pub(crate) async fn run_agent_session(
                 session_store::trim_incomplete_tool_calls(&mut session.messages);
             }
         }
-        let _ = live_send(
-            live_tx,
-            json!({
-                "type":"done",
-                "phase":"stopped",
-                "reason":"user_stop",
-                "cycles":phase_state.react_ctx.cycles,
-                "tool_calls":phase_state.react_ctx.tool_calls
-            }),
+        let usage = build_done_usage(
+            state,
+            current_session_id,
+            phase_state.usage_snap_input,
+            phase_state.usage_snap_output,
         )
         .await;
+        let mut done_event = json!({
+            "type":"done",
+            "phase":"stopped",
+            "reason":"user_stop",
+            "cycles":phase_state.react_ctx.cycles,
+            "tool_calls":phase_state.react_ctx.tool_calls
+        });
+        if let (Some(done_obj), Some(usage_obj)) = (done_event.as_object_mut(), usage.as_object()) {
+            done_obj.extend(usage_obj.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        let _ = live_send(live_tx, done_event).await;
     }
 
     if phase_state.run_detached {

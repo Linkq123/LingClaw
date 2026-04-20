@@ -48,7 +48,8 @@ pub(crate) use config::{Config, DEFAULT_PORT, Provider, config_dir_path, config_
 pub(crate) use context::{
     accumulate_daily_token_usage, context_input_budget_for_model, current_daily_token_usage,
     estimate_tokens_for_provider, format_token_count, format_usage_block,
-    message_token_len_for_provider, update_session_token_usage,
+    message_token_len_for_provider, split_usage_labels, update_session_token_usage_with_provider,
+    update_session_token_usage_with_providers,
 };
 pub(crate) use hooks::{
     AutoCompressContextHook, CommandHookInput, HookRegistry, LlmHookInput, ToolHookInput,
@@ -75,7 +76,10 @@ use context::{
     turn_len,
 };
 #[cfg(test)]
-use hooks::{build_compressed_messages, find_auto_compress_cutoff};
+use hooks::{
+    build_auto_summary_message, build_compressed_messages, build_compression_source_text,
+    find_auto_compress_cutoff,
+};
 #[cfg(test)]
 use session_admin::gather_global_today_usage;
 #[cfg(test)]
@@ -90,6 +94,8 @@ use std::collections::HashSet;
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const MAIN_SESSION_ID: &str = "main";
 const INBOUND_BUFFER_CAPACITY: usize = 128;
+static CONFIG_FILE_LOCK: std::sync::LazyLock<tokio::sync::RwLock<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::RwLock::new(()));
 
 // ── Data Models ──────────────────────────────────────────────────────────────
 
@@ -194,6 +200,15 @@ struct Session {
     output_token_source: String,
     #[serde(default)]
     token_usage_day: String,
+    /// Per-day usage labels (provider:* / role:*) reset together with daily totals.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    daily_provider_usage: HashMap<String, [u64; 2]>,
+    /// Lifetime usage labels (provider:* / role:*), never reset unless the session is deleted.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    total_label_usage: HashMap<String, [u64; 2]>,
+    /// Historical daily usage snapshots (capped at USAGE_HISTORY_CAP days).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    usage_history: Vec<DailyUsageSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_override: Option<String>,
     #[serde(default = "default_think_level")]
@@ -207,11 +222,31 @@ struct Session {
     /// System skill paths disabled for this session (e.g. "anthropics", "anthropics/pdf").
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     disabled_system_skills: HashSet<String>,
+    /// Tool call ids whose persisted tool result ended in an error state.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    failed_tool_results: HashSet<String>,
     #[serde(default)]
     version: u32,
     #[serde(skip)]
     workspace: PathBuf,
 }
+
+/// One day's aggregated token usage (stored in `usage_history`).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct DailyUsageSnapshot {
+    #[serde(default)]
+    pub(crate) date: String,
+    #[serde(default)]
+    pub(crate) input: u64,
+    #[serde(default)]
+    pub(crate) output: u64,
+    /// Per-day usage labels (legacy raw provider names or provider:* / role:*).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) providers: HashMap<String, [u64; 2]>,
+}
+
+/// Maximum number of daily snapshots kept in usage_history.
+const USAGE_HISTORY_CAP: usize = 30;
 
 fn default_think_level() -> String {
     "auto".to_string()
@@ -275,12 +310,16 @@ impl Session {
             input_token_source: default_token_usage_source(),
             output_token_source: default_token_usage_source(),
             token_usage_day: prompts::current_local_snapshot().today(),
+            daily_provider_usage: HashMap::new(),
+            total_label_usage: HashMap::new(),
+            usage_history: Vec::new(),
             model_override: None,
             think_level: default_think_level(),
             show_react: default_show_react(),
             show_tools: default_show_tools(),
             show_reasoning: default_show_reasoning(),
             disabled_system_skills: HashSet::new(),
+            failed_tool_results: HashSet::new(),
             version: SESSION_VERSION,
             workspace,
         }
@@ -294,9 +333,9 @@ impl Session {
 const UPLOAD_TOKEN_HEADER: &str = "x-lingclaw-upload-token";
 
 struct AppState {
-    config: Config,
+    config: std::sync::Mutex<Arc<Config>>,
     http: Client,
-    sessions: Mutex<HashMap<String, Session>>,
+    sessions: Arc<Mutex<HashMap<String, Session>>>,
     /// Session IDs with the connection currently attached to live streaming output.
     active_connections: Mutex<HashMap<String, u64>>,
     session_clients: Mutex<HashMap<String, SessionClientBinding>>,
@@ -312,6 +351,18 @@ struct AppState {
     hooks: HookRegistry,
     /// Background structured memory updater (active when config.structured_memory is true).
     memory_queue: Option<MemoryUpdateQueue>,
+}
+
+impl AppState {
+    /// Return a snapshot of the current runtime config.
+    fn config(&self) -> Arc<Config> {
+        self.config.lock().expect("config lock poisoned").clone()
+    }
+
+    /// Hot-swap the runtime config (called after saving to disk).
+    fn replace_config(&self, new: Config) {
+        *self.config.lock().expect("config lock poisoned") = Arc::new(new);
+    }
 }
 
 #[derive(Clone)]
@@ -355,29 +406,68 @@ struct LiveRoundState {
     reasoning_text: String,
     reasoning_done: bool,
     tools: Vec<LiveToolState>,
-    /// Currently active sub-agent task (set on `task_started`, cleared on terminal).
-    active_task: Option<LiveTaskState>,
+    /// Ordered delegated-task/orchestration events for reconnect replay.
+    delegated_events: Vec<serde_json::Value>,
+    /// Currently active delegated tasks keyed by stable replay identifier.
+    active_tasks: HashSet<String>,
+    /// Active orchestrations keyed by `orchestrate_id`.
+    active_orchestrations: HashSet<String>,
 }
 
-#[derive(Clone)]
-struct LiveTaskState {
-    agent: String,
-    prompt: String,
-    /// Latest cycle/phase from `task_progress` events.
-    current_cycle: Option<usize>,
-    current_phase: Option<String>,
-    /// Tool calls reported via `task_tool` events (for replay on reconnect).
-    tools: Vec<LiveTaskToolState>,
+fn live_task_key_from_event(event: &serde_json::Value) -> Option<String> {
+    if let Some(task_id) = event["task_id"].as_str().filter(|value| !value.is_empty()) {
+        return Some(task_id.to_string());
+    }
+
+    let orchestrate_id = event["orchestrate_id"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    let task_id = event["id"].as_str().filter(|value| !value.is_empty());
+    if let (Some(orchestrate_id), Some(task_id)) = (orchestrate_id, task_id) {
+        return Some(format!("{orchestrate_id}:{task_id}"));
+    }
+
+    event["agent"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
-#[derive(Clone)]
-struct LiveTaskToolState {
-    tool: String,
-    id: String,
+fn is_subagent_live_event(event: &serde_json::Value) -> bool {
+    event["subagent"]
+        .as_str()
+        .is_some_and(|value| !value.is_empty())
+}
+
+fn truncated_live_tool_result_event(event: &serde_json::Value) -> serde_json::Value {
+    let mut truncated = event.clone();
+    if let Some(obj) = truncated.as_object_mut()
+        && let Some(result) = obj.get_mut("result")
+        && let Some(result_text) = result.as_str()
+    {
+        let mut capped = result_text.to_string();
+        truncate_safe(&mut capped, LIVE_REPLAY_CAP);
+        *result = serde_json::Value::String(capped);
+    }
+    truncated
+}
+
+/// Truncate `s` in place at the last valid UTF-8 char boundary ≤ `max`.
+fn truncate_safe(s: &mut String, max: usize) {
+    if s.len() > max {
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
 }
 
 /// Cap for replay buffer strings (128 KB). Keeps memory bounded for long outputs.
 const LIVE_REPLAY_CAP: usize = 128 * 1024;
+/// Max delegated events kept per round. Prevents unbounded memory growth for
+/// long-running rounds with many sub-agent / orchestration events.
+const DELEGATED_EVENTS_CAP: usize = 10_000;
 const TOOL_PROGRESS_HEARTBEAT_SECS: u64 = 1;
 
 // ── System Prompt ────────────────────────────────────────────────────────────
@@ -412,7 +502,7 @@ fn build_system_prompt_with_query(
     let persona = prompts::load_session_prompt_files_with_snapshot(workspace, local_snapshot);
     let prompt_file_note = "## Preloaded Prompt Files\n\
 These prompt-file contents were already loaded into this system prompt from the session workspace.\n\
-Do not call file tools just to verify or re-read BOOTSTRAP.md, AGENTS.md, AGENT.md, IDENTITY.md, USER.md, SOUL.md, or MEMORY.md when their content is already present below.\n\
+Do not call file tools just to verify or re-read BOOTSTRAP.md, AGENTS.md, AGENT.md, IDENTITY.md, USER.md, SOUL.md, TOOLS.md, or MEMORY.md when their content is already present below.\n\
 Only read those files if the user explicitly asks to inspect them, if you need to edit them, or if a task depends on checking whether the on-disk file has changed.";
     let mcp_note = tools::mcp::runtime_tool_note(config)
         .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
@@ -466,6 +556,15 @@ Only read those files if the user explicitly asks to inspect them, if you need t
 - Model: {model}
 
 {prompt_file_note}
+
+## Agent Behavior
+
+You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools, **Observe** the results, then either loop or **Finish**.
+
+- **Tool strategy:** Prefer calling tools to gather information over speculating. Batch independent read-only calls together. Run write operations one at a time.
+- **Error recovery:** When a tool fails, diagnose the cause and try a different approach — different arguments, a different tool, or an alternative path. Do not repeat the same failing call.
+- **Delegation:** For complex, self-contained subtasks, delegate to a sub-agent via the `task` tool. Handle simple, quick work yourself.
+- **Finishing:** When the task is complete, deliver your result. When you are genuinely stuck with no further options, say so honestly. Do not pad with speculative follow-ups.
 
 ## Available Tools
 {tool_lines}{mcp_note}{skills_section}{agents_section}"#,
@@ -933,6 +1032,7 @@ async fn dispatch_live_event(
     event: serde_json::Value,
 ) {
     let event_type = event["type"].as_str().unwrap_or_default();
+    let mut delegated_replay_event: Option<serde_json::Value> = None;
 
     // Validate connection ownership and update live replay state under a single
     // critical section. We hold session_clients for the entire block to prevent
@@ -967,23 +1067,27 @@ async fn dispatch_live_event(
                         reasoning_text: String::new(),
                         reasoning_done: false,
                         tools: Vec::new(),
-                        active_task: None,
+                        delegated_events: Vec::new(),
+                        active_tasks: HashSet::new(),
+                        active_orchestrations: HashSet::new(),
                     },
                 );
             }
             "delta" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
                     && let Some(content) = event["content"].as_str()
                     && round.assistant_text.len() < LIVE_REPLAY_CAP
                 {
                     round.assistant_text.push_str(content);
-                    round.assistant_text.truncate(LIVE_REPLAY_CAP);
+                    truncate_safe(&mut round.assistant_text, LIVE_REPLAY_CAP);
                 }
             }
             "thinking_start" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
                 {
                     round.reasoning_text.clear();
                     round.reasoning_done = false;
@@ -992,16 +1096,18 @@ async fn dispatch_live_event(
             "thinking_delta" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
                     && let Some(content) = event["content"].as_str()
                     && round.reasoning_text.len() < LIVE_REPLAY_CAP
                 {
                     round.reasoning_text.push_str(content);
-                    round.reasoning_text.truncate(LIVE_REPLAY_CAP);
+                    truncate_safe(&mut round.reasoning_text, LIVE_REPLAY_CAP);
                 }
             }
             "thinking_done" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
                 {
                     round.reasoning_done = true;
                 }
@@ -1009,6 +1115,7 @@ async fn dispatch_live_event(
             "tool_call" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
                 {
                     round.tools.push(LiveToolState {
                         id: event["id"].as_str().unwrap_or_default().to_string(),
@@ -1022,6 +1129,7 @@ async fn dispatch_live_event(
             "tool_progress" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
                 {
                     let tool_id = event["id"].as_str().unwrap_or_default();
                     let elapsed_ms = event["elapsed_ms"].as_u64().unwrap_or(0);
@@ -1042,20 +1150,29 @@ async fn dispatch_live_event(
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
                 {
-                    let tool_id = event["id"].as_str().unwrap_or_default();
-                    let mut result = event["result"].as_str().unwrap_or_default().to_string();
-                    result.truncate(LIVE_REPLAY_CAP);
-                    if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
-                        tool.result = Some(result);
-                        tool.elapsed_ms = event["duration_ms"].as_u64().unwrap_or(tool.elapsed_ms);
-                    } else {
-                        round.tools.push(LiveToolState {
-                            id: tool_id.to_string(),
-                            name: event["name"].as_str().unwrap_or_default().to_string(),
-                            arguments: String::new(),
-                            result: Some(result),
-                            elapsed_ms: event["duration_ms"].as_u64().unwrap_or(0),
-                        });
+                    if is_subagent_live_event(&event)
+                        && let Some(task_key) = live_task_key_from_event(&event)
+                        && round.active_tasks.contains(&task_key)
+                    {
+                        let replay_event = truncated_live_tool_result_event(&event);
+                        delegated_replay_event = Some(replay_event);
+                    } else if !is_subagent_live_event(&event) {
+                        let tool_id = event["id"].as_str().unwrap_or_default();
+                        let mut result = event["result"].as_str().unwrap_or_default().to_string();
+                        truncate_safe(&mut result, LIVE_REPLAY_CAP);
+                        if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
+                            tool.result = Some(result);
+                            tool.elapsed_ms =
+                                event["duration_ms"].as_u64().unwrap_or(tool.elapsed_ms);
+                        } else {
+                            round.tools.push(LiveToolState {
+                                id: tool_id.to_string(),
+                                name: event["name"].as_str().unwrap_or_default().to_string(),
+                                arguments: String::new(),
+                                result: Some(result),
+                                elapsed_ms: event["duration_ms"].as_u64().unwrap_or(0),
+                            });
+                        }
                     }
                 }
             }
@@ -1077,41 +1194,94 @@ async fn dispatch_live_event(
             "task_started" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && live_task_key_from_event(&event).is_some()
                 {
-                    round.active_task = Some(LiveTaskState {
-                        agent: event["agent"].as_str().unwrap_or_default().to_string(),
-                        prompt: event["prompt"].as_str().unwrap_or_default().to_string(),
-                        current_cycle: None,
-                        current_phase: None,
-                        tools: Vec::new(),
-                    });
+                    delegated_replay_event = Some(event.clone());
                 }
             }
             "task_progress" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
-                    && let Some(task) = round.active_task.as_mut()
+                    && let Some(task_key) = live_task_key_from_event(&event)
+                    && round.active_tasks.contains(&task_key)
                 {
-                    task.current_cycle = event["cycle"].as_u64().map(|v| v as usize);
-                    task.current_phase = event["phase"].as_str().map(str::to_string);
+                    delegated_replay_event = Some(event.clone());
                 }
             }
             "task_tool" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
-                    && let Some(task) = round.active_task.as_mut()
+                    && let Some(task_key) = live_task_key_from_event(&event)
+                    && round.active_tasks.contains(&task_key)
                 {
-                    task.tools.push(LiveTaskToolState {
-                        tool: event["tool"].as_str().unwrap_or_default().to_string(),
-                        id: event["id"].as_str().unwrap_or_default().to_string(),
-                    });
+                    delegated_replay_event = Some(event.clone());
                 }
             }
             "task_completed" | "task_failed" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && let Some(task_key) = live_task_key_from_event(&event)
+                    && round.active_tasks.remove(&task_key)
                 {
-                    round.active_task = None;
+                    delegated_replay_event = Some(event.clone());
+                }
+            }
+            "orchestrate_started" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && event["orchestrate_id"]
+                        .as_str()
+                        .is_some_and(|value| !value.is_empty())
+                {
+                    delegated_replay_event = Some(event.clone());
+                }
+            }
+            "orchestrate_layer" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && let Some(orchestrate_id) = event["orchestrate_id"].as_str()
+                    && round.active_orchestrations.contains(orchestrate_id)
+                {
+                    delegated_replay_event = Some(event.clone());
+                }
+            }
+            // Orchestration events: track per-task lifecycle for live replay
+            "orchestrate_task_started" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && let Some(orchestrate_id) = event["orchestrate_id"].as_str()
+                    && round.active_orchestrations.contains(orchestrate_id)
+                    && event["id"].as_str().is_some_and(|value| !value.is_empty())
+                {
+                    delegated_replay_event = Some(event.clone());
+                }
+            }
+            "orchestrate_task_completed"
+            | "orchestrate_task_failed"
+            | "orchestrate_task_skipped" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && let Some(orchestrate_id) = event["orchestrate_id"].as_str()
+                    && round.active_orchestrations.contains(orchestrate_id)
+                    && let Some(task_id) = event["id"].as_str().filter(|value| !value.is_empty())
+                {
+                    let task_key = format!("{orchestrate_id}:{task_id}");
+                    if round.active_tasks.remove(&task_key) {
+                        delegated_replay_event = Some(event.clone());
+                    }
+                }
+            }
+            "orchestrate_completed" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && let Some(orchestrate_id) = event["orchestrate_id"].as_str()
+                    && round.active_orchestrations.remove(orchestrate_id)
+                {
+                    let prefix = format!("{orchestrate_id}:");
+                    round
+                        .active_tasks
+                        .retain(|task_key| !task_key.starts_with(&prefix));
+                    delegated_replay_event = Some(event.clone());
                 }
             }
             "done" | "error" => {
@@ -1120,6 +1290,62 @@ async fn dispatch_live_event(
                 }
             }
             _ => {}
+        }
+
+        if let Some(replay_event) = delegated_replay_event
+            && let Some(round) = live_rounds.get_mut(session_id)
+            && round.connection_id == connection_id
+        {
+            if round.delegated_events.len() < DELEGATED_EVENTS_CAP {
+                // Under soft cap — store and register lifecycle opens so
+                // terminal events arriving after the cap can still close
+                // them. Total memory is bounded at ≤ 2 × DELEGATED_EVENTS_CAP.
+                match replay_event["type"].as_str().unwrap_or_default() {
+                    "task_started" => {
+                        if let Some(key) = live_task_key_from_event(&replay_event) {
+                            round.active_tasks.insert(key);
+                        }
+                    }
+                    "orchestrate_task_started" => {
+                        if let Some(orchestrate_id) = replay_event["orchestrate_id"]
+                            .as_str()
+                            .filter(|v| !v.is_empty())
+                            && let Some(task_id) =
+                                replay_event["id"].as_str().filter(|v| !v.is_empty())
+                        {
+                            round
+                                .active_tasks
+                                .insert(format!("{orchestrate_id}:{task_id}"));
+                        }
+                    }
+                    "orchestrate_started" => {
+                        if let Some(id) = replay_event["orchestrate_id"]
+                            .as_str()
+                            .filter(|v| !v.is_empty())
+                        {
+                            round.active_orchestrations.insert(id.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+                round.delegated_events.push(replay_event);
+            } else {
+                // Over soft cap — only store terminal events whose lifecycle
+                // open was recorded (active_tasks / active_orchestrations
+                // guards in the match arms above already ensure this).
+                let is_terminal = matches!(
+                    replay_event["type"].as_str().unwrap_or_default(),
+                    "task_completed"
+                        | "task_failed"
+                        | "orchestrate_completed"
+                        | "orchestrate_task_completed"
+                        | "orchestrate_task_failed"
+                        | "orchestrate_task_skipped"
+                );
+                if is_terminal {
+                    round.delegated_events.push(replay_event);
+                }
+            }
         }
     }
 
@@ -1222,45 +1448,8 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
         .await;
     }
 
-    // Replay active sub-agent task if one is running.
-    if let Some(task) = &live_round.active_task {
-        ws_send(
-            tx,
-            &json!({
-                "type": "task_started",
-                "agent": task.agent,
-                "prompt": task.prompt,
-            }),
-        )
-        .await;
-
-        // Replay latest progress (cycle/phase).
-        if let Some(cycle) = task.current_cycle {
-            ws_send(
-                tx,
-                &json!({
-                    "type": "task_progress",
-                    "agent": task.agent,
-                    "cycle": cycle,
-                    "phase": task.current_phase.as_deref().unwrap_or("analyze"),
-                }),
-            )
-            .await;
-        }
-
-        // Replay tool calls reported by the sub-agent.
-        for tool in &task.tools {
-            ws_send(
-                tx,
-                &json!({
-                    "type": "task_tool",
-                    "agent": task.agent,
-                    "tool": tool.tool,
-                    "id": tool.id,
-                }),
-            )
-            .await;
-        }
+    for event in &live_round.delegated_events {
+        ws_send(tx, event).await;
     }
 }
 
@@ -1452,16 +1641,18 @@ async fn api_shutdown(headers: HeaderMap, State(state): State<Arc<AppState>>) ->
 
 async fn api_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let sessions = state.sessions.lock().await;
+    let config = state.config();
     Json(json!({
         "status": "ok",
         "version": VERSION,
-        "model": state.config.model,
+        "model": config.model,
         "sessions": sessions.len(),
     }))
 }
 
 async fn api_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let sessions = state.sessions.lock().await;
+    let config = state.config();
     let list: Vec<serde_json::Value> = sessions
         .get(MAIN_SESSION_ID)
         .map(|s| {
@@ -1470,7 +1661,7 @@ async fn api_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
                 "name": s.name,
                 "messages": s.messages.len(),
                 "tool_calls": s.tool_calls_count,
-                "model": s.effective_model(&state.config.model),
+                "model": s.effective_model(&config.model),
                 "created_at": s.created_at,
                 "updated_at": s.updated_at,
             })
@@ -1513,7 +1704,8 @@ async fn api_upload_images(
         ));
     }
 
-    let s3_cfg = state.config.s3.as_ref().ok_or_else(|| {
+    let config = state.config();
+    let s3_cfg = config.s3.as_ref().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "S3 not configured"})),
@@ -1616,6 +1808,416 @@ async fn api_upload_images(
     Ok(Json(
         json!({ "images": uploaded_images, "urls": urls, "errors": errors }),
     ))
+}
+
+// ── Config & Usage API ───────────────────────────────────────────────────────
+
+/// GET /api/config — read the raw JSON config file.
+async fn api_get_config(
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+    let path = config_file_path().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Cannot determine config path"})),
+        )
+    })?;
+    let content = read_config_file_snapshot(&path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Cannot read config: {e}")})),
+        )
+    })?;
+    match serde_json::from_str::<serde_json::Value>(&content) {
+        Ok(value) => Ok(Json(json!({
+            "config": value,
+            "path": path.display().to_string(),
+        }))),
+        Err(e) => {
+            let msg = e.to_string();
+            let (line, column) = parse_serde_error_position(&msg);
+            Ok(Json(json!({
+                "config": null,
+                "raw": content,
+                "path": path.display().to_string(),
+                "parse_error": msg,
+                "line": line,
+                "column": column,
+            })))
+        }
+    }
+}
+
+/// PUT /api/config — validate and save the JSON config file.
+async fn api_put_config(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+    let config_value = body
+        .get("config")
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Missing 'config' field"})),
+            )
+        })?
+        .clone();
+
+    // Validate: must be a valid JSON object and deserializable as JsonConfig
+    if !config_value.is_object() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Config must be a JSON object"})),
+        ));
+    }
+    let parsed = match serde_json::from_value::<config::JsonConfig>(config_value.clone()) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            let msg = e.to_string();
+            // Extract line/column info from serde error when available
+            let (line, column) = parse_serde_error_position(&msg);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": msg, "line": line, "column": column})),
+            ));
+        }
+    };
+    if let Err(error) = config::validate_json_provider_names(&parsed) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": error}))));
+    }
+    if let Err(error) = config::validate_json_provider_models(&parsed) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": error}))));
+    }
+    if let Err(error) = config::validate_json_agent_model_refs(&parsed) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": error}))));
+    }
+    if let Err(error) = config::Config::validate_json_mcp_servers_for_workspace(
+        &parsed,
+        &session_workspace_path(MAIN_SESSION_ID),
+    ) {
+        return Err((StatusCode::BAD_REQUEST, Json(json!({"error": error}))));
+    }
+
+    let path = config_file_path().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "Cannot determine config path"})),
+        )
+    })?;
+
+    let pretty =
+        serde_json::to_string_pretty(&config_value).unwrap_or_else(|_| config_value.to_string());
+
+    let _save_guard = CONFIG_FILE_LOCK.write().await;
+
+    // Write to temp file then replace original without discarding the old file
+    // if the final swap fails on Windows.
+    let tmp_path = path.with_extension("tmp");
+    std::fs::write(&tmp_path, &pretty).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to write config: {e}")})),
+        )
+    })?;
+    replace_file_from_temp(&path, &tmp_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Failed to finalize config: {e}")})),
+        )
+    })?;
+
+    // Hot-reload: re-read the saved config into the runtime so that
+    // model/MCP changes take effect without a restart.
+    let new_config = Config::load();
+    state.replace_config(new_config);
+
+    // Release the config file lock before potentially slow MCP I/O.
+    drop(_save_guard);
+
+    // Invalidate cached MCP tool definitions so the next round picks up
+    // any server additions/removals.
+    let workspace = session_workspace_path(MAIN_SESSION_ID);
+    let _ = tools::mcp::refresh_servers(&state.config(), &workspace).await;
+
+    Ok(Json(json!({"ok": true})))
+}
+
+/// POST /api/config/test-model — test a model provider connection.
+async fn api_test_model(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let base_url = body["baseUrl"].as_str().unwrap_or_default().to_string();
+    let api_key = body["apiKey"].as_str().unwrap_or_default().to_string();
+    let api = body["api"]
+        .as_str()
+        .unwrap_or("openai-completions")
+        .to_string();
+    let model_id = body["modelId"].as_str().unwrap_or_default().to_string();
+
+    if base_url.is_empty() || model_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "baseUrl and modelId are required"})),
+        ));
+    }
+
+    let provider = Provider::from_api_kind(&api);
+    let resolved = providers::ResolvedModel {
+        provider,
+        api_base: base_url,
+        api_key,
+        model_id,
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(16),
+        context_window: 4096,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+
+    let messages = vec![ChatMessage {
+        role: "user".to_string(),
+        content: Some("Hi".to_string()),
+        images: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    match providers::call_llm_simple(&state.http, &resolved, &messages, &PathBuf::new(), None, 1)
+        .await
+    {
+        Ok(reply) => Ok(Json(json!({"ok": true, "reply": truncate(&reply, 200)}))),
+        Err(e) => {
+            eprintln!("Model test failed: {e}");
+            Ok(Json(json!({"ok": false, "error": truncate(&e, 200)})))
+        }
+    }
+}
+
+/// POST /api/config/test-mcp — test an MCP server connection.
+async fn api_test_mcp(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let command = body["command"].as_str().unwrap_or_default().to_string();
+    let args: Vec<String> = body["args"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let env: HashMap<String, String> = body["env"]
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    let timeout_secs = body["timeoutSecs"].as_u64();
+
+    let cwd = body["cwd"].as_str().map(|s| s.to_string());
+
+    if command.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "command is required"})),
+        ));
+    }
+
+    let workspace = session_workspace_path(MAIN_SESSION_ID);
+    let mcp_cfg = config::JsonMcpServerConfig {
+        command,
+        args,
+        env,
+        cwd,
+        enabled: true,
+        timeout_secs,
+    };
+
+    let config = state.config();
+    let timeout = Duration::from_secs(timeout_secs.unwrap_or(config.tool_timeout.as_secs()));
+    match tokio::time::timeout(
+        timeout,
+        tools::mcp::test_mcp_server(&mcp_cfg, &workspace, config.tool_timeout),
+    )
+    .await
+    {
+        Ok(Ok(tool_count)) => Ok(Json(json!({"ok": true, "tools": tool_count}))),
+        Ok(Err(e)) => Ok(Json(json!({"ok": false, "error": e}))),
+        Err(_) => Ok(Json(json!({"ok": false, "error": "Connection timed out"}))),
+    }
+}
+
+/// GET /api/usage — token usage statistics.
+async fn api_usage(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions.get_mut(MAIN_SESSION_ID);
+    let (
+        daily_input,
+        daily_output,
+        total_input,
+        total_output,
+        input_source,
+        output_source,
+        usage_history,
+        daily_providers,
+        daily_roles,
+        total_providers,
+        total_roles,
+    ) = if let Some(session) = session {
+        context::rollover_daily_usage_if_needed(session);
+        let (daily_providers, daily_roles) = split_usage_labels(&session.daily_provider_usage);
+        let (total_providers, total_roles) = split_usage_labels(&session.total_label_usage);
+        let usage_history = session
+            .usage_history
+            .iter()
+            .map(|snapshot| {
+                let (providers, roles) = split_usage_labels(&snapshot.providers);
+                json!({
+                    "date": snapshot.date,
+                    "input": snapshot.input,
+                    "output": snapshot.output,
+                    "providers": providers,
+                    "roles": roles,
+                })
+            })
+            .collect::<Vec<_>>();
+        (
+            session.daily_input_tokens,
+            session.daily_output_tokens,
+            session.input_tokens,
+            session.output_tokens,
+            session.input_token_source.clone(),
+            session.output_token_source.clone(),
+            serde_json::to_value(usage_history).unwrap_or_else(|_| json!([])),
+            serde_json::to_value(daily_providers).unwrap_or_else(|_| json!({})),
+            serde_json::to_value(daily_roles).unwrap_or_else(|_| json!({})),
+            serde_json::to_value(total_providers).unwrap_or_else(|_| json!({})),
+            serde_json::to_value(total_roles).unwrap_or_else(|_| json!({})),
+        )
+    } else {
+        (
+            0,
+            0,
+            0,
+            0,
+            default_token_usage_source(),
+            default_token_usage_source(),
+            json!([]),
+            json!({}),
+            json!({}),
+            json!({}),
+            json!({}),
+        )
+    };
+
+    Ok(Json(json!({
+        "daily_input": daily_input,
+        "daily_output": daily_output,
+        "total_input": total_input,
+        "total_output": total_output,
+        "total": total_input.saturating_add(total_output),
+        "input_source": input_source,
+        "output_source": output_source,
+        "source_scope": "latest_update",
+        "usage_history": usage_history,
+        "daily_providers": daily_providers,
+        "daily_roles": daily_roles,
+        "total_providers": total_providers,
+        "total_roles": total_roles,
+    })))
+}
+
+async fn read_config_file_snapshot(path: &Path) -> std::io::Result<String> {
+    let _read_guard = CONFIG_FILE_LOCK.read().await;
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(content),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok("{}".to_string()),
+        Err(err) => Err(err),
+    }
+}
+
+fn parse_serde_error_position(msg: &str) -> (Option<u64>, Option<u64>) {
+    // serde_json errors: "... at line X column Y"
+    static RE: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"line (\d+) column (\d+)").unwrap());
+    if let Some(caps) = RE.captures(msg) {
+        let line = caps.get(1).and_then(|m| m.as_str().parse().ok());
+        let col = caps.get(2).and_then(|m| m.as_str().parse().ok());
+        return (line, col);
+    }
+    (None, None)
+}
+
+fn replace_file_from_temp(path: &Path, tmp_path: &Path) -> std::io::Result<()> {
+    match std::fs::rename(tmp_path, path) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            if !path.exists() {
+                return Err(rename_err);
+            }
+
+            let mut backup_name = path
+                .file_name()
+                .map(|name| name.to_os_string())
+                .unwrap_or_else(|| std::ffi::OsString::from("config"));
+            backup_name.push(".lingclaw-save-backup");
+            let backup_path = path.with_file_name(backup_name);
+
+            match std::fs::remove_file(&backup_path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+
+            std::fs::rename(path, &backup_path)?;
+
+            match std::fs::rename(tmp_path, path) {
+                Ok(()) => {
+                    if let Err(err) = std::fs::remove_file(&backup_path)
+                        && err.kind() != std::io::ErrorKind::NotFound
+                    {
+                        eprintln!(
+                            "Warning: failed to remove temporary config backup {}: {err}",
+                            backup_path.display()
+                        );
+                    }
+                    Ok(())
+                }
+                Err(finalize_err) => {
+                    if let Err(restore_err) = std::fs::rename(&backup_path, path) {
+                        return Err(std::io::Error::new(
+                            finalize_err.kind(),
+                            format!(
+                                "{finalize_err}; failed to restore previous config: {restore_err}"
+                            ),
+                        ));
+                    }
+                    Err(finalize_err)
+                }
+            }
+        }
+    }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -1728,8 +2330,10 @@ async fn main() {
     let mut hooks = HookRegistry::new();
     hooks.register(Box::new(AutoCompressContextHook::new()));
 
+    let sessions = Arc::new(Mutex::new(HashMap::new()));
+
     let memory_queue = if config.structured_memory {
-        Some(MemoryUpdateQueue::spawn(config.clone()))
+        Some(MemoryUpdateQueue::spawn(config.clone(), sessions.clone()))
     } else {
         None
     };
@@ -1766,9 +2370,9 @@ async fn main() {
     }
 
     let state = Arc::new(AppState {
-        config,
+        config: std::sync::Mutex::new(Arc::new(config)),
         http,
-        sessions: Mutex::new(HashMap::new()),
+        sessions,
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
@@ -1786,13 +2390,9 @@ async fn main() {
     {
         let main_session = load_session_from_disk(MAIN_SESSION_ID).unwrap_or_else(|| {
             let mut s = Session::new_with_id(MAIN_SESSION_ID, "Main");
-            let model = s.effective_model(&state.config.model).to_string();
-            let sys = build_system_prompt(
-                &state.config,
-                &s.workspace,
-                &model,
-                &s.disabled_system_skills,
-            );
+            let config = state.config();
+            let model = s.effective_model(&config.model).to_string();
+            let sys = build_system_prompt(&config, &s.workspace, &model, &s.disabled_system_skills);
             s.messages.push(sys);
             s
         });
@@ -1812,6 +2412,10 @@ async fn main() {
         .route("/api/health", get(api_health))
         .route("/api/client-config", get(api_client_config))
         .route("/api/sessions", get(api_sessions))
+        .route("/api/config", get(api_get_config).put(api_put_config))
+        .route("/api/config/test-model", post(api_test_model))
+        .route("/api/config/test-mcp", post(api_test_mcp))
+        .route("/api/usage", get(api_usage))
         .route(
             "/api/upload-images",
             post(api_upload_images).layer(DefaultBodyLimit::max(
