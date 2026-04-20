@@ -65,6 +65,7 @@
   border-radius: 0;
   box-shadow: none;
   padding: 8px 4px 4px 4px;
+  font-size: var(--assistant-body-font-size);
   width: 100%;
   box-sizing: border-box;
   transition: opacity .18s ease;
