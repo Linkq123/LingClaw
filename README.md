@@ -306,6 +306,7 @@ Settings → Usage 页面除了现有今日/累计图表外，还会显示按 `P
 | `search_files` | 正则搜索工作区文件 |
 | `http_fetch` | HTTP GET，带 SSRF 防护和重定向阻断 |
 | `task` | 委托任务给子代理（当发现代理时动态注册）|
+| `orchestrate` | 按 DAG 计划编排多个子代理任务（当发现多个代理时动态注册）|
 
 ## Skills
 
@@ -798,7 +799,7 @@ think_level 映射：
 
 | type | 用途 |
 |---|---|
-| `session` | 首次连接时的当前会话信息 |
+| `session` | 首次连接或主会话刷新时的当前会话信息 |
 | `history` | 当前会话历史消息 |
 | `view_state` | `show_tools` / `show_reasoning` / `show_react` 状态同步 |
 | `start` | 新一轮回复开始 |
@@ -807,6 +808,7 @@ think_level 映射：
 | `thinking_delta` | 思维流式片段 |
 | `thinking_done` | 思维模式结束 |
 | `tool_call` | 工具调用开始 |
+| `tool_progress` | 长耗时工具执行中的进度心跳（含 `elapsed_ms`） |
 | `tool_result` | 工具执行结果（含 `duration_ms`、`is_error`） |
 | `done` | 响应完成 |
 | `react_phase` | ReAct 阶段转换（默认启用，可通过 `/react off` 关闭） |
@@ -815,13 +817,21 @@ think_level 映射：
 | `task_tool` | 子代理工具调用（含 `agent`、`tool`、`id`） |
 | `task_completed` | 子代理完成（含 `cycles`、`tool_calls`、`duration_ms`） |
 | `task_failed` | 子代理失败（含 `error`、`cycles`、`tool_calls`、`duration_ms`） |
+| `orchestrate_started` | 多代理编排开始（含编排 id、任务总数与计划摘要） |
+| `orchestrate_layer` | 当前 DAG 层开始执行（含 layer 序号与任务列表） |
+| `orchestrate_task_started` | 编排中的单个任务开始执行 |
+| `orchestrate_task_completed` | 编排中的单个任务完成 |
+| `orchestrate_task_failed` | 编排中的单个任务失败 |
+| `orchestrate_task_skipped` | 编排中的单个任务因依赖失败或条件不满足被跳过 |
+| `orchestrate_completed` | 多代理编排完成（含总耗时与结果摘要） |
 | `observation` | 非破坏性工具结果摘要 |
 | `context_pruned` | 上下文裁剪通知（含 `removed_count`） |
+| `context_compressed` | 自动上下文压缩成功通知 |
+| `context_compress_failed` | 自动上下文压缩失败通知 |
 | `progress` | 命令处理中（不清除忙碌状态） |
 | `success` | 命令成功（成功样式） |
 | `system` | 中性系统消息 |
 | `error` | 错误消息 |
-| `session` | 当前主会话已初始化或刷新 |
 
 ## HTTP API
 

@@ -252,7 +252,7 @@ docker run -d \
 
 | 挂载卷 | 用途 |
 |--------|------|
-| `lingclaw-data` | 持久化会话数据和 workspace（`~/.lingclaw/sessions/`、`~/.lingclaw/{sessionId}/workspace/`） |
+| `lingclaw-data` | 持久化主会话数据和工作区（`~/.lingclaw/sessions/main.json`、`~/.lingclaw/main/workspace/`） |
 | `.lingclaw.json` | 配置文件（必须，容器不支持 Setup Wizard；bind mount 覆盖卷内同路径） |
 
 ### 3.4 Docker Compose
@@ -316,13 +316,37 @@ volumes:
 | `apiKey` | — | 遗留兼容字段；新配置应优先写入 `models.providers.*.apiKey` | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `OLLAMA_API_KEY` |
 | `apiBase` | 按 provider 默认 | 遗留兼容字段；新配置应优先写入 `models.providers.*.baseUrl` | `OPENAI_API_BASE` / `OLLAMA_API_BASE` |
 | `execTimeout` | `30` | Shell 命令超时（秒） | `LINGCLAW_EXEC_TIMEOUT` |
+| `toolTimeout` | `30` | 非 shell 的 Act 阶段工具预算；MCP 默认也继承这个超时 | `LINGCLAW_TOOL_TIMEOUT` |
+| `subAgentTimeout` | `300` | 子代理总执行超时（秒，`0` 表示不限时） | `LINGCLAW_SUB_AGENT_TIMEOUT` |
+| `maxLlmRetries` | `2` | LLM HTTP 层瞬态错误重试次数（429/5xx/连接/超时） | `LINGCLAW_MAX_LLM_RETRIES` |
 | `maxContextTokens` | `32000` | 上下文窗口 Token 预算 | `LINGCLAW_MAX_CONTEXT_TOKENS` |
 | `maxOutputBytes` | `51200` | 工具输出截断阈值 | — |
 | `maxFileBytes` | `204800` | 文件读取大小上限 | — |
+| `structuredMemory` | `false` | 启用 Finish 后台结构化记忆抽取与后续 prompt 注入 | `LINGCLAW_STRUCTURED_MEMORY` |
+| `dailyReflection` | `false` | 启用多步任务完成后的后台 reflection 写入 | `LINGCLAW_DAILY_REFLECTION` |
+| `enableS3` | `true` | 开启本地图片上传能力；仍需顶层 `s3` 配置完整可用 | `LINGCLAW_ENABLE_S3` |
 
 > 优先级：JSON 配置文件 > 环境变量 > 内置默认值
 
 > 新配置建议：用 `models.providers` 定义 provider 实例，用 `agents.defaults.model.primary` 选择默认模型。Setup Wizard 已不再写入 `settings.provider`、`settings.apiKey`、`settings.apiBase`。
+
+### agents.defaults.model 字段
+
+| JSON 字段 | 说明 | 环境变量覆盖 |
+|-----------|------|--------------|
+| `primary` | 主 Agent 默认模型 | `LINGCLAW_MODEL` |
+| `fast` | 简单首轮查询优先使用的轻量模型 | `LINGCLAW_FAST_MODEL` |
+| `sub-agent` | 子代理执行模型 | `LINGCLAW_SUB_AGENT_MODEL` |
+| `memory` | structured memory 后台抽取模型 | `LINGCLAW_MEMORY_MODEL` |
+| `reflection` | daily reflection 后台模型 | `LINGCLAW_REFLECTION_MODEL` |
+| `context` | 自动上下文压缩优先模型 | `LINGCLAW_CONTEXT_MODEL` |
+
+### mcpServers 与 s3
+
+- `mcpServers` 是顶层对象，每个 server 可配置 `command`、`args`、`env`、`cwd`、`timeoutSecs`
+- `mcpServers.*.cwd` 必须位于当前主会话工作区 `~/.lingclaw/main/workspace/` 内，否则会被拒绝启动
+- `mcpServers.*.timeoutSecs` 未设置时继承 `toolTimeout`
+- 顶层 `s3` 用于本地 JPEG/PNG 上传；OpenAI/Anthropic 需要可被远端 provider 访问的现签 URL，私网 endpoint 仅推荐配合 Ollama 使用
 
 ## 文件结构
 
@@ -336,7 +360,8 @@ docs/reference/agents/          # 内置 system sub-agents（运行时磁盘发�
 ~/.lingclaw/
   .lingclaw.json                # 配置文件（Setup Wizard 自动创建）
   sessions/                     # 磁盘持久化的会话 JSON
-  {sessionId}/workspace/        # 每会话隔离工作区（含 7 个 prompt 文件 + memory/ 日志）
+    main.json                   # 单主会话存档
+  main/workspace/               # 主会话工作区（含 7 个 prompt 文件 + memory/ 日志）
 ```
 
 其中 `docs/reference/templates/` 是可选的磁盘覆盖目录：
@@ -351,7 +376,7 @@ docs/reference/agents/          # 内置 system sub-agents（运行时磁盘发�
 curl http://127.0.0.1:18989/api/health
 
 # 预期返回
-# {"status":"ok","model":"gpt-4o-mini","sessions":0}
+# {"status":"ok","version":"0.5.6","model":"gpt-4o-mini","sessions":1}
 ```
 
 浏览器打开 `http://<host>:18989` 即可使用。
@@ -361,3 +386,6 @@ curl http://127.0.0.1:18989/api/health
 - Agent 运行时，输入框里发送普通文本会作为“延迟干预”排队，不会打断当前 ReAct 周期；这些输入会在下一轮 Analyze 前送入模型
 - Agent 运行时，发送按钮会切换为停止按钮，点击后等价于发送 `/stop`
 - Agent 运行时，只允许 `/stop`、`/tool`、`/reasoning` 这类运行期控制命令立即执行；其余斜杠命令需要等当前轮次结束后再发送
+- Usage 页会同时展示 Provider 维度和 Model Role 维度的 Token Breakdown；`/api/usage` 也会返回 `daily_roles`、`total_roles` 以及 `usage_history[].roles`
+- 聊天页中由斜杠命令返回的 `success`、`system`、`error` 卡片支持手动关闭；运行中通知（如 `progress`、`context_pruned`、`context_compressed`）不会提供关闭按钮
+- 当已发现多个子代理时，模型可调用 `orchestrate` 工具进行 DAG 编排；前端会收到 `orchestrate_started`、`orchestrate_layer`、`orchestrate_task_*`、`orchestrate_completed` 事件用于展示执行进度
