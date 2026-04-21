@@ -779,6 +779,136 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FrontendPrepareResult {
+    BuiltFromSource,
+    UsedPrebuiltStatic,
+    UsedPrebuiltStaticWithoutNpm,
+}
+
+fn frontend_npm_program() -> &'static str {
+    if cfg!(windows) { "npm.cmd" } else { "npm" }
+}
+
+fn run_install_command_step(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    label: &str,
+) -> io::Result<()> {
+    let status = std::process::Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .status()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("failed to run {label} via `{program}`: {error}"),
+            )
+        })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "{label} failed with status {status}"
+        )))
+    }
+}
+
+fn prepare_frontend_assets_with(
+    source_dir: &Path,
+    npm_program: &str,
+) -> io::Result<FrontendPrepareResult> {
+    let frontend_dir = source_dir.join("frontend");
+    let package_json = frontend_dir.join("package.json");
+    let static_index = source_dir.join("static").join("index.html");
+
+    if !package_json.is_file() {
+        if static_index.is_file() {
+            return Ok(FrontendPrepareResult::UsedPrebuiltStatic);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "frontend source ({}) and static bundle ({}) are both missing",
+                package_json.display(),
+                static_index.display()
+            ),
+        ));
+    }
+
+    let npm_available = std::process::Command::new(npm_program)
+        .arg("--version")
+        .current_dir(&frontend_dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    match npm_available {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            if static_index.is_file() {
+                return Ok(FrontendPrepareResult::UsedPrebuiltStaticWithoutNpm);
+            }
+            return Err(io::Error::other(format!(
+                "frontend source exists but `{npm_program} --version` failed with status {status}"
+            )));
+        }
+        Err(error) => {
+            if static_index.is_file() {
+                return Ok(FrontendPrepareResult::UsedPrebuiltStaticWithoutNpm);
+            }
+            return Err(io::Error::new(
+                error.kind(),
+                format!("frontend source exists but `{npm_program}` is unavailable: {error}"),
+            ));
+        }
+    }
+
+    if !frontend_dir.join("node_modules").is_dir() {
+        run_install_command_step(
+            npm_program,
+            &["ci"],
+            &frontend_dir,
+            "frontend dependency install",
+        )?;
+    }
+
+    run_install_command_step(
+        npm_program,
+        &["run", "build"],
+        &frontend_dir,
+        "frontend build",
+    )?;
+
+    if static_index.is_file() {
+        Ok(FrontendPrepareResult::BuiltFromSource)
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!(
+                "frontend build finished but {} was not generated",
+                static_index.display()
+            ),
+        ))
+    }
+}
+
+fn prepare_frontend_assets(source_dir: &Path) -> io::Result<FrontendPrepareResult> {
+    prepare_frontend_assets_with(source_dir, frontend_npm_program())
+}
+
+fn release_binary_path(source_dir: &Path) -> PathBuf {
+    source_dir
+        .join("target")
+        .join("release")
+        .join(if cfg!(windows) {
+            "lingclaw.exe"
+        } else {
+            "lingclaw"
+        })
+}
+
 fn install_frontend_assets(source_dir: &Path, install_dir: &Path) -> io::Result<()> {
     let source_static = source_dir.join("static");
     if !source_static.is_dir() {
@@ -795,7 +925,27 @@ fn install_frontend_assets(source_dir: &Path, install_dir: &Path) -> io::Result<
         return Ok(());
     }
 
+    if target_static.is_dir() {
+        std::fs::remove_dir_all(&target_static)?;
+    }
+
     copy_dir_recursive(&source_static, &target_static)
+}
+
+fn install_release_artifacts(
+    source_dir: &Path,
+    built_exe: &Path,
+    current_exe: &Path,
+) -> io::Result<()> {
+    if built_exe == current_exe {
+        return Ok(());
+    }
+
+    install_built_binary(built_exe, current_exe)?;
+    if let Some(install_dir) = current_exe.parent() {
+        install_frontend_assets(source_dir, install_dir)?;
+    }
+    Ok(())
 }
 
 /// Copy system skills from source `docs/reference/skills/` to `~/.lingclaw/system-skills/`.
@@ -1183,7 +1333,7 @@ fn handle_update_command(port_override: Option<u16>) -> bool {
     }
 
     println!("Building...");
-    let old_exe = rename_target_exe_for_build(&std::env::current_dir().unwrap_or_default());
+    let old_exe = rename_target_exe_for_build(&workspace);
     let build = std::process::Command::new("cargo")
         .args(["build", "--release"])
         .status();
@@ -1192,7 +1342,61 @@ fn handle_update_command(port_override: Option<u16>) -> bool {
             if let Some(ref p) = old_exe {
                 let _ = std::fs::remove_file(p);
             }
-            println!("   ✅ Build complete (v{new_version})");
+            match prepare_frontend_assets(&workspace) {
+                Ok(FrontendPrepareResult::BuiltFromSource) => {
+                    println!("   ✅ Frontend rebuilt from source");
+                }
+                Ok(FrontendPrepareResult::UsedPrebuiltStatic) => {
+                    println!(
+                        "   ✅ Using existing frontend assets → {}",
+                        workspace.join("static").display()
+                    );
+                }
+                Ok(FrontendPrepareResult::UsedPrebuiltStaticWithoutNpm) => {
+                    println!(
+                        "   ⚠ npm unavailable; using existing frontend assets → {}",
+                        workspace.join("static").display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("   ❌ Failed to prepare frontend assets: {e}");
+                    if was_running {
+                        println!("Restarting previous version...");
+                        handle_start_command(port_override);
+                    }
+                    return true;
+                }
+            }
+
+            let built_exe = release_binary_path(&workspace);
+            if let Ok(current_exe) = std::env::current_exe() {
+                let installs_release = built_exe != current_exe;
+                match install_release_artifacts(&workspace, &built_exe, &current_exe) {
+                    Ok(()) => {
+                        if installs_release {
+                            println!("   ✅ Installed v{new_version} → {}", current_exe.display());
+                            if let Some(install_dir) = current_exe.parent() {
+                                println!(
+                                    "   ✅ Frontend assets installed → {}",
+                                    install_dir.join("static").display()
+                                );
+                            }
+                        } else {
+                            println!("   ✅ Build complete (v{new_version})");
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("   ❌ Failed to install release artifacts: {e}");
+                        if was_running {
+                            println!("Restarting service...");
+                            handle_start_command(port_override);
+                        }
+                        return true;
+                    }
+                }
+            } else {
+                println!("   ✅ Build complete (v{new_version})");
+            }
             match install_system_skills(&workspace) {
                 Ok(()) => println!("   ✅ System skills updated"),
                 Err(e) => eprintln!("   ⚠ Failed to update system skills: {e}"),
@@ -1503,6 +1707,31 @@ fn detect_git_version() -> Option<String> {
     text.split_whitespace().nth(2).map(|v| v.to_string())
 }
 
+fn detect_npm_version() -> Option<String> {
+    let output = std::process::Command::new(frontend_npm_program())
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    Some(text.trim().to_string())
+}
+
+fn detect_node_version() -> Option<String> {
+    let output = std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // "v22.14.0" → "22.14.0"
+    Some(text.trim().trim_start_matches('v').to_string())
+}
+
 #[cfg(not(target_os = "windows"))]
 fn command_exists(name: &str) -> bool {
     std::process::Command::new(name)
@@ -1627,7 +1856,41 @@ fn handle_doctor_command() -> bool {
         }
     }
 
-    // ── 5. Source vs installed ────────────────────────────────────────────
+    // ── 5. Frontend tooling ──────────────────────────────────────────────
+    let cur_dir = std::env::current_dir().ok();
+    let has_frontend_source = cur_dir
+        .as_ref()
+        .map(|d| d.join("frontend").join("package.json").is_file())
+        .unwrap_or(false);
+    let has_static_bundle = cur_dir
+        .as_ref()
+        .map(|d| d.join("static").join("index.html").is_file())
+        .unwrap_or(false);
+    print!("  npm ........................ ");
+    let npm_ok = if let Some(ver_str) = detect_npm_version() {
+        println!("✅ npm {ver_str}");
+        true
+    } else if !has_frontend_source {
+        println!("⚠ not found (not in a source directory)");
+        true // not a blocker outside a source tree
+    } else if has_static_bundle {
+        println!("⚠ not found (will use prebuilt static/)");
+        true // prebuilt bundle is a valid fallback
+    } else {
+        println!("❌ not found (required to build frontend — install Node.js)");
+        all_ok = false;
+        false
+    };
+    print!("  Node.js .................... ");
+    if let Some(ver_str) = detect_node_version() {
+        println!("✅ node {ver_str}");
+    } else if !has_frontend_source || has_static_bundle {
+        println!("⚠ not found (not required in current context)");
+    } else {
+        println!("⚠ not found (needed by npm to run build scripts)");
+    }
+
+    // ── 6. Source vs installed ────────────────────────────────────────────
     print!("  Source vs installed ......... ");
     let (source_ok, source_ver) = if let Some(src_ver) = read_local_source_version() {
         let src_parts: Vec<u32> = src_ver.split('.').filter_map(|s| s.parse().ok()).collect();
@@ -1652,7 +1915,7 @@ fn handle_doctor_command() -> bool {
         (true, None) // not a blocker when run outside source tree
     };
 
-    // ── 6. Source vs remote ──────────────────────────────────────────────
+    // ── 7. Source vs remote ──────────────────────────────────────────────
     print!("  Source vs remote ........... ");
     let remote_ok = {
         // Try git fetch first so remote refs are fresh.
@@ -1723,6 +1986,10 @@ fn handle_doctor_command() -> bool {
         println!("  • Git not found — install git from https://git-scm.com");
         // Cannot auto-fix git installation portably.
     }
+    if !npm_ok {
+        println!("  • npm not found — install Node.js (includes npm) from https://nodejs.org");
+        // Cannot auto-fix npm installation portably.
+    }
     #[cfg(not(target_os = "windows"))]
     if !has_systemd && !command_exists("nohup") {
         println!("  • No background execution tool (systemd or nohup)");
@@ -1789,7 +2056,9 @@ fn handle_help_command() -> bool {
     println!("  status             Show detailed service status");
     println!("  update             Check for updates, rebuild if newer");
     println!("  doctor             Check install readiness (Rust, versions)");
-    println!("  install [-d DIR]   Install from local source directory");
+    println!(
+        "  install [-d DIR]   Install from local source directory (builds frontend when available)"
+    );
     #[cfg(not(target_os = "windows"))]
     println!("  systemd-install    Install and enable lingclaw.service");
     println!("  help               Show this help message");
@@ -1911,14 +2180,31 @@ fn handle_install_command(port_override: Option<u16>) -> bool {
             if let Some(ref p) = old_exe {
                 let _ = std::fs::remove_file(p);
             }
-            let built_exe = source_dir
-                .join("target")
-                .join("release")
-                .join(if cfg!(windows) {
-                    "lingclaw.exe"
-                } else {
-                    "lingclaw"
-                });
+            match prepare_frontend_assets(&source_dir) {
+                Ok(FrontendPrepareResult::BuiltFromSource) => {
+                    println!("   ✅ Frontend rebuilt from source");
+                }
+                Ok(FrontendPrepareResult::UsedPrebuiltStatic) => {
+                    println!(
+                        "   ✅ Using existing frontend assets → {}",
+                        source_dir.join("static").display()
+                    );
+                }
+                Ok(FrontendPrepareResult::UsedPrebuiltStaticWithoutNpm) => {
+                    println!(
+                        "   ⚠ npm unavailable; using existing frontend assets → {}",
+                        source_dir.join("static").display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("   ❌ Failed to prepare frontend assets: {e}");
+                    if was_running {
+                        handle_start_command(port_override);
+                    }
+                    return true;
+                }
+            }
+            let built_exe = release_binary_path(&source_dir);
             if let Ok(current_exe) = std::env::current_exe() {
                 if built_exe != current_exe {
                     match install_built_binary(&built_exe, &current_exe) {
