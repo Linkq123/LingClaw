@@ -114,8 +114,15 @@ export function validateModelsConfigDraftShape(parsed: unknown): void {
         `Models JSON field "providers.${name}.api" must be one of: openai-completions, anthropic, ollama.`,
       );
     }
-    ensureOptionalString(p['baseUrl'], `Models JSON field "providers.${name}.baseUrl"`);
-    ensureOptionalString(p['apiKey'], `Models JSON field "providers.${name}.apiKey"`);
+    if (typeof p['baseUrl'] !== 'string') {
+      throw new Error(`Models JSON field "providers.${name}.baseUrl" must be a string.`);
+    }
+    if ((p['baseUrl'] as string).trim() === '') {
+      throw new Error(`Models JSON field "providers.${name}.baseUrl" cannot be empty.`);
+    }
+    if (typeof p['apiKey'] !== 'string') {
+      throw new Error(`Models JSON field "providers.${name}.apiKey" must be a string.`);
+    }
     if (p['models'] !== undefined && !Array.isArray(p['models'])) {
       throw new Error(`Models JSON field "providers.${name}.models" must be an array.`);
     }

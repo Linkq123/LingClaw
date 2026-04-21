@@ -13,6 +13,7 @@ import {
   buildProviderForms,
   createModelFormEntry,
   createProviderForm,
+  normalizeModelsConfig,
   serializeProviderForms,
 } from './settingsModels.js';
 import type { ModelFormEntry, ProviderFormData } from './settingsModels.js';
@@ -572,7 +573,10 @@ function ModelsTab({
     try {
       const parsed = JSON.parse(jsonText.trim() || '{}');
       validateModelsConfigDraftShape(parsed);
-      const newConfig = { ...config, models: parsed };
+      const newConfig = {
+        ...config,
+        models: normalizeModelsConfig(parsed as AppConfig['models']),
+      };
       onChange(newConfig);
       setJsonError('');
       onStatus('Applied Models JSON', 'success');
@@ -1312,16 +1316,20 @@ export function SettingsPage() {
   };
 
   const saveConfig = async () => {
+    const finalConfig: AppConfig = {
+      ...config,
+      models: normalizeModelsConfig(config.models),
+    };
+
     try {
-      validateAgentModels(config);
+      validateAgentModels(finalConfig);
     } catch (e: unknown) {
       setStatus({ message: (e as Error).message, type: 'error' });
       return;
     }
 
     // Clean up s3 if empty
-    const s3 = config.s3;
-    const finalConfig = { ...config };
+    const s3 = finalConfig.s3;
     if (!s3?.bucket && !s3?.endpoint) delete finalConfig.s3;
 
     setStatus({ message: 'Saving...', type: 'loading' });

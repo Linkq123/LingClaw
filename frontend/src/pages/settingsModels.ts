@@ -2,6 +2,7 @@ import type { AppConfig, ModelEntry, ProviderConfig } from '../types/config.js';
 
 export interface ModelFormEntry extends ModelEntry {
   _key: string;
+  [key: string]: unknown;
 }
 
 export interface ProviderFormData {
@@ -13,6 +14,7 @@ export interface ProviderFormData {
   testState: 'idle' | 'testing' | 'ok' | 'fail';
   testLabel: string;
   selectedTestModel: string;
+  [key: string]: unknown;
 }
 
 let modelFormKeyCounter = 0;
@@ -52,10 +54,11 @@ export function createProviderForm(
       : models[0]?.id || '';
 
   return {
+    ...(provider as Record<string, unknown>),
     name,
     api: provider.api || 'openai-completions',
-    baseUrl: provider.baseUrl || '',
-    apiKey: provider.apiKey || '',
+    baseUrl: provider.baseUrl ?? '',
+    apiKey: provider.apiKey ?? '',
     models,
     testState: previous?.testState || 'idle',
     testLabel: previous?.testLabel || 'Test',
@@ -77,23 +80,47 @@ export function buildProviderForms(
 export function serializeProviderForms(providers: ProviderFormData[]): AppConfig['models'] {
   const nextProviders: Record<string, ProviderConfig> = {};
   for (const provider of providers) {
-    const models = provider.models
+    const {
+      name,
+      models: providerModels,
+      testState,
+      testLabel,
+      selectedTestModel,
+      ...rest
+    } = provider;
+    void testState;
+    void testLabel;
+    void selectedTestModel;
+
+    const models = providerModels
       .filter((model) => model.id.trim() !== '')
       .map((model) => {
-        const entry: ModelEntry = { id: model.id.trim() };
-        if (model.reasoning) entry.reasoning = true;
-        if (model.contextWindow != null) entry.contextWindow = model.contextWindow;
-        if (model.maxTokens != null) entry.maxTokens = model.maxTokens;
-        if (model.input && model.input.length > 0) entry.input = model.input;
+        const { _key, ...modelFields } = model;
+        void _key;
+        const entry: ModelEntry = {
+          ...(modelFields as ModelEntry),
+          id: model.id.trim(),
+        };
+
+        if (!model.reasoning) delete entry.reasoning;
+        if (model.contextWindow == null) delete entry.contextWindow;
+        if (model.maxTokens == null) delete entry.maxTokens;
+        if (!model.input || model.input.length === 0) delete entry.input;
         return entry;
       });
-    nextProviders[provider.name] = {
+
+    nextProviders[name] = {
+      ...(rest as ProviderConfig),
       api: provider.api as ProviderConfig['api'],
-      baseUrl: provider.baseUrl || undefined,
-      apiKey: provider.apiKey || undefined,
+      baseUrl: provider.baseUrl,
+      apiKey: provider.apiKey,
       models,
     };
   }
 
   return Object.keys(nextProviders).length > 0 ? { providers: nextProviders } : undefined;
+}
+
+export function normalizeModelsConfig(models: AppConfig['models']): AppConfig['models'] {
+  return serializeProviderForms(buildProviderForms(models?.providers));
 }

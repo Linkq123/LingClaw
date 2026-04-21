@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildProviderForms,
   createProviderForm,
+  normalizeModelsConfig,
   serializeProviderForms,
 } from '../src/pages/settingsModels.js';
 
@@ -79,9 +80,76 @@ describe('settings model helpers', () => {
       providers: {
         openai: {
           api: 'openai-completions',
-          baseUrl: undefined,
-          apiKey: undefined,
+          baseUrl: '',
+          apiKey: '',
           models: [{ id: 'gpt-4o-mini', input: ['text'] }],
+        },
+      },
+    });
+  });
+
+  it('preserves empty apiKey strings and unknown provider metadata when serializing', () => {
+    const providers = buildProviderForms({
+      ollama: {
+        api: 'ollama',
+        baseUrl: 'http://127.0.0.1:11434',
+        apiKey: '',
+        models: [
+          {
+            id: 'gemma4:e4b',
+            input: ['text', 'image'],
+            maxTokens: 12800,
+            reasoning: true,
+            name: 'gemma4:e4b',
+            compat: { thinkingFormat: 'ollama' },
+            cost: { input: 0, output: 0 },
+          },
+        ],
+      },
+    });
+
+    const serialized = serializeProviderForms(providers);
+
+    expect(serialized).toEqual({
+      providers: {
+        ollama: {
+          api: 'ollama',
+          baseUrl: 'http://127.0.0.1:11434',
+          apiKey: '',
+          models: [
+            {
+              id: 'gemma4:e4b',
+              input: ['text', 'image'],
+              maxTokens: 12800,
+              reasoning: true,
+              name: 'gemma4:e4b',
+              compat: { thinkingFormat: 'ollama' },
+              cost: { input: 0, output: 0 },
+            },
+          ],
+        },
+      },
+    });
+  });
+
+  it('normalizes missing provider auth fields to backend-compatible empty strings', () => {
+    const normalized = normalizeModelsConfig({
+      providers: {
+        ollama: {
+          api: 'ollama',
+          baseUrl: 'http://127.0.0.1:11434',
+          models: [{ id: 'gemma4:e4b', input: ['text'] }],
+        },
+      },
+    });
+
+    expect(normalized).toEqual({
+      providers: {
+        ollama: {
+          api: 'ollama',
+          baseUrl: 'http://127.0.0.1:11434',
+          apiKey: '',
+          models: [{ id: 'gemma4:e4b', input: ['text'] }],
         },
       },
     });

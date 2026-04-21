@@ -77,7 +77,7 @@ function UsageSummary({ data }: { data: UsageData }) {
   ];
 
   return (
-    <div id="usage-summary">
+    <div className="usage-summary">
       {stats.map((s) => (
         <div key={s.label} className="usage-stat-card">
           <div className="usage-stat-value">{formatTokenCount(s.value)}</div>
@@ -105,14 +105,14 @@ function RoleBreakdown({ data }: { data: UsageData }) {
 
   if (names.length === 0) {
     return (
-      <div id="usage-role-breakdown">
+      <div className="usage-role-breakdown">
         <p className="usage-empty-note">No role usage data yet.</p>
       </div>
     );
   }
 
   return (
-    <div id="usage-role-breakdown">
+    <div className="usage-role-breakdown">
       {names.map((name) => {
         const today = normalizeUsagePair(dailyRoles[name] as [number, number]);
         const tot = normalizeUsagePair(totalRoles[name] as [number, number]);
@@ -123,14 +123,14 @@ function RoleBreakdown({ data }: { data: UsageData }) {
               <span className="usage-role-chip">{formatTokenCount(tot.input + tot.output)}</span>
             </div>
             <div className="usage-role-metrics">
-              <div>
+              <div className="usage-role-metric">
                 <span className="usage-role-kicker">Today</span>
                 <strong>{formatTokenCount(today.input + today.output)}</strong>
                 <span>
                   {formatTokenCount(today.input)} in / {formatTokenCount(today.output)} out
                 </span>
               </div>
-              <div>
+              <div className="usage-role-metric">
                 <span className="usage-role-kicker">All-Time</span>
                 <strong>{formatTokenCount(tot.input + tot.output)}</strong>
                 <span>
@@ -567,7 +567,7 @@ export function UsagePage() {
 
   // Render inside #usage-page overlay (panel content only)
   return (
-    <div className="page-panel page-panel-wide">
+    <div className="page-panel page-panel-wide usage-panel">
       <div className="page-header">
         <h2>Token Usage</h2>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
@@ -585,7 +585,7 @@ export function UsagePage() {
         </div>
       </div>
 
-      <div className="page-body" id="usage-body">
+      <div className="page-body usage-page-body" id="usage-body">
         {error && <p style={{ color: 'var(--accent-error)' }}>{error}</p>}
         {!usageData && !error && loading && <p style={{ color: 'var(--dim)' }}>Loading...</p>}
         {usageData && (

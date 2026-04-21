@@ -305,63 +305,99 @@
 }
 
 /* ── Usage page ── */
+.usage-panel {
+  width: min(1080px, 96vw);
+}
+.usage-page-body {
+  display: grid;
+  gap: 28px;
+  padding: 18px 22px 24px;
+}
 .usage-summary {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 12px;
-  margin-bottom: 24px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+  margin-bottom: 0;
 }
 .usage-stat-card {
-  background: var(--bg);
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 78%, white), var(--bg));
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 16px;
-  text-align: center;
+  border-radius: 14px;
+  padding: 18px 18px 16px;
+  text-align: left;
+  min-height: 116px;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  position: relative;
+  overflow: hidden;
+  box-shadow: 0 10px 28px rgba(44,46,62,.05);
+}
+.usage-stat-card::before {
+  content: '';
+  position: absolute;
+  inset: 0 auto auto 0;
+  width: 100%;
+  height: 3px;
+  background: linear-gradient(90deg, var(--accent2), color-mix(in srgb, var(--accent2) 36%, transparent));
+  opacity: .8;
 }
 .usage-stat-value {
-  font-size: 24px;
+  font-size: clamp(30px, 3vw, 36px);
   font-weight: 700;
   color: var(--accent2);
   font-family: var(--font-mono);
+  letter-spacing: -.04em;
+  line-height: 1;
 }
 .usage-stat-label {
-  font-size: 12px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
   color: var(--dim);
-  margin-top: 4px;
+  margin-top: 10px;
 }
 .usage-summary-note {
   grid-column: 1 / -1;
   font-size: 12px;
   color: var(--dim);
   line-height: 1.6;
-  padding: 0 4px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--bg) 88%, white);
 }
 .usage-role-section {
-  margin-bottom: 28px;
+  margin-bottom: 0;
+  display: grid;
+  gap: 14px;
 }
 .usage-role-breakdown {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px;
 }
 .usage-empty-note {
-  color: var(--muted);
+  color: var(--dim);
   font-size: 0.9rem;
-  padding: 8px 0;
+  padding: 18px;
+  border: 1px dashed var(--border);
+  border-radius: 12px;
 }
 .usage-role-card {
   background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 84%, white), var(--bg));
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 16px;
-  box-shadow: 0 8px 24px rgba(44,46,62,.04);
+  border-radius: 14px;
+  padding: 18px;
+  box-shadow: 0 10px 28px rgba(44,46,62,.04);
 }
 .usage-role-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
-  margin-bottom: 14px;
+  margin-bottom: 16px;
 }
 .usage-role-header h3 {
   font-size: 14px;
@@ -380,10 +416,15 @@
 .usage-role-metrics {
   display: grid;
   gap: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
 }
-.usage-role-metrics div {
+.usage-role-metric {
   display: grid;
   gap: 4px;
+  padding: 12px 13px;
+  border-radius: 10px;
+  border: 1px solid color-mix(in srgb, var(--border) 92%, transparent);
+  background: color-mix(in srgb, var(--bg) 92%, white);
 }
 .usage-role-kicker {
   font-size: 10px;
@@ -404,16 +445,44 @@
 .usage-chart-section {
   margin-bottom: 28px;
 }
+.usage-charts-section {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 18px;
+}
+.usage-chart-wrap {
+  min-width: 0;
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 84%, white), var(--bg));
+  box-shadow: 0 10px 28px rgba(44,46,62,.04);
+}
 .usage-chart-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 12px;
+  gap: 12px;
+  margin-bottom: 0;
 }
 .usage-chart-header h3 {
   font-size: 15px;
   font-weight: 600;
   color: var(--text);
+}
+.usage-chart-header select {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 6px 10px;
+  font: inherit;
+}
+.usage-chart-header select:focus {
+  outline: none;
+  border-color: var(--accent2);
 }
 .usage-range-picker {
   display: flex;
@@ -436,9 +505,9 @@
   border-color: var(--accent2);
 }
 .usage-chart-container {
-  background: var(--bg);
+  background: color-mix(in srgb, var(--bg) 90%, white);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 12px;
   padding: 16px;
   height: 260px;
   position: relative;
@@ -467,5 +536,15 @@
   }
   .settings-row label { min-width: auto; }
   .usage-summary { grid-template-columns: repeat(2, 1fr); }
+  .usage-role-metrics { grid-template-columns: 1fr; }
   .usage-role-breakdown { grid-template-columns: 1fr; }
+  .usage-charts-section { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 560px) {
+  .usage-page-body {
+    padding: 16px 16px 22px;
+    gap: 22px;
+  }
+  .usage-summary { grid-template-columns: 1fr; }
 }
