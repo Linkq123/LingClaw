@@ -157,14 +157,16 @@ impl<'a> OrchestrateTaskEventGuard<'a> {
 
 impl Drop for OrchestrateTaskEventGuard<'_> {
     fn drop(&mut self) {
-        if !self.finished {
-            let _ = self.live_tx.try_send(json!({
+        if !self.finished
+            && let Err(err) = self.live_tx.try_send(json!({
                 "type": "orchestrate_task_failed",
                 "orchestrate_id": self.orchestrate_id,
                 "id": self.task_id,
                 "agent": self.agent,
                 "error": "task aborted (timeout or cancellation)",
-            }));
+            }))
+        {
+            eprintln!("[orchestrate-guard] failed to emit fallback task_failed event: {err}");
         }
     }
 }

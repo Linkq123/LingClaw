@@ -23,7 +23,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
 - **持久化主会话**：固定保存 `main` 工作区和磁盘存档
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
-- **流式浏览器 UI**：Axum WebSocket 后端 + `static/` 前端，增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、输入框上下键历史导航（最多 10 条）；Settings 页面支持在线编辑配置、Provider 连接测试、MCP Server 连接测试；Usage 页面显示 Token 用量统计、按 Model Role 拆分的明细卡片与图表
+- **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、输入框上下键历史导航（最多 10 条）；Settings 页面（React 岛屿）支持在线编辑配置、Provider 连接测试、MCP Server 连接测试；Usage 页面（React 岛屿）显示 Token 用量统计、按 Model Role 拆分的明细卡片与 Canvas 图表
 - **图片附件**：支持通过 URL 或本地 JPEG/PNG 上传附加图片到用户消息；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；私网、localhost 或仅局域网可达的网关仅保证 Ollama 可用，因为 LingClaw 会本地预取为 base64 并持久化缓存到会话工作区；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
@@ -73,6 +73,8 @@ lingclaw --version
 ```
 
 手动执行 `cargo install --path .` 时，必须同步部署 `static/`、`docs/reference/skills/` 和 `docs/reference/agents/`；否则首页可能返回 404，且内置 Skills / Sub-Agents 不可用。优先推荐直接使用 `bash scripts/install-linux.sh`。
+
+如果你使用的是手动 `cargo install --path .` 路径，并且修改了 `frontend/`，在复制 `static/` 之前先执行 `cd frontend && npm ci && npm run build`，把最新前端产物重新生成到 `static/`。如果改用 `lingclaw install -d /path/to/source`，命令会在检测到 `frontend/package.json` 且 `npm` 可用时自动构建前端；若 `npm` 不可用但仓库里已有可用的 `static/`，则回退为安装现有静态产物。`lingclaw update` 在源码目录内升级时也会沿用同一套前端准备与安装逻辑。
 
 服务启动后访问 http://127.0.0.1:18989 。
 
@@ -290,7 +292,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 
 聊天页里由斜杠命令生成的 `success`、`system`、`error` 卡片支持点击右上角关闭；`progress`、`context_pruned`、`context_compressed`、`context_compress_failed` 这类运行态通知不提供关闭按钮。
 
-Settings → Usage 页面除了现有今日/累计图表外，还会显示按 `Primary`、`Fast`、`Sub-Agent`、`Memory`、`Reflection`、`Context` 划分的 Token Breakdown。对于升级前已经存在的旧会话，角色级累计值会从 0.5.6 开始逐步建立；旧快照中仍保留的 provider 数据会继续在历史图表里展示。
+Settings → Usage 页面除了现有今日/累计图表外，还会显示按 `Primary`、`Fast`、`Sub-Agent`、`Memory`、`Reflection`、`Context` 划分的 Token Breakdown。对于升级前已经存在的旧会话，角色级累计值会从 0.6.1 开始逐步建立；旧快照中仍保留的 provider 数据会继续在历史图表里展示。
 
 ## Tools
 
@@ -437,8 +439,8 @@ tools:
 
 ```text
 ┌──────────────────────────────────────────────────────────────────┐
-│                         Browser (static/)                        │
-│   index.html  ·  js/ (ES modules)  ·  css/ (modular CSS)         │
+│                   Browser (static/ ← Vite build)                 │
+│   index.html · TypeScript modules · React islands (Settings/Usage)│
 └────────────────────────┬─────────────────────────────────────────┘
                          │ WebSocket /ws
 ┌────────────────────────▼─────────────────────────────────────────┐
@@ -598,24 +600,44 @@ src/
 │   ├── discovery.rs   (~320 行)  — 三层发现 (system/global/session), YAML frontmatter 解析
 │   └── orchestrator.rs (~770 行) — DAG 多代理编排引擎, 分层并行执行, 结果插值, 事件流
 
-static/
-├── index.html                  — 主页面
-├── css/                        — 模块化样式 (base, layout, chat, panels, pages, responsive)
-└── js/                         — 前端 ES Modules
-    ├── main.js                 — 入口模块（流式渲染、懒加载历史、智能滚动、版本 badge）
-    ├── constants.js            — 常量
-    ├── state.js                — 集中状态 + DOM refs
-    ├── utils.js                — 纯工具函数
-    ├── scroll.js               — 滚动/视口管理
-    ├── markdown.js             — Markdown/KaTeX 管线
-    ├── socket.js               — WebSocket 连接
-    ├── images.js               — 图片附件 + 上传
-    ├── input.js                — 输入处理 + 历史导航
-    ├── mobile.js               — 移动端菜单
-    ├── settings.js             — Settings 页面（配置编辑、Provider 测试、MCP 测试）
-    ├── usage.js                — Usage 页面（Token 用量统计 + 图表）
-    ├── handlers/stream.js      — 流式响应处理
-    └── renderers/              — UI 渲染模块 (chat, tools, react-status, timeline)
+frontend/                         — 前端源码 (TypeScript + React, Vite 构建输出到 static/)
+├── src/
+│   ├── main.ts                   — 入口模块（React 挂载、流式渲染、懒加载历史、智能滚动）
+│   ├── constants.ts              — 常量
+│   ├── state.ts                  — 集中状态 + 类型化 DOM refs
+│   ├── types.ts                  — WS 事件类型、HistoryMessage、AppState 接口
+│   ├── types/config.ts           — Settings/Usage 配置类型接口
+│   ├── utils.ts                  — 纯工具函数
+│   ├── scroll.ts                 — 滚动/视口管理
+│   ├── markdown.ts               — Markdown/DOMPurify/KaTeX 管线
+│   ├── socket.ts                 — WebSocket 连接
+│   ├── images.ts                 — 图片附件 + S3 上传
+│   ├── input.ts                  — 输入处理 + 历史导航
+│   ├── mobile.ts                 — 移动端菜单
+│   ├── eventBus.ts               — 泛型事件总线（subagent/orchestrate 面板用）
+│   ├── settingsValidation.ts     — Settings 表单纯验证逻辑
+│   ├── pages/
+│   │   ├── SettingsPage.tsx      — Settings 页面 React 岛屿（配置编辑、Provider 测试、MCP 测试）
+│   │   └── UsagePage.tsx         — Usage 页面 React 岛屿（Token 用量统计 + Canvas 图表）
+│   ├── handlers/stream.ts        — 流式响应处理
+│   ├── renderers/                — UI 渲染模块
+│   │   ├── chat.ts               — 聊天消息渲染
+│   │   ├── tools.ts              — 工具面板
+│   │   ├── subagent.ts           — 子代理面板
+│   │   ├── orchestrate.ts        — DAG 编排面板
+│   │   ├── react-status.ts       — ReAct 状态指示器
+│   │   └── timeline.ts           — 时间线动画
+│   └── css/                      — 模块化样式 (base, layout, chat, panels, pages, responsive)
+├── tests/                        — Vitest 单元测试 (27 tests: utils + markdown)
+├── tsconfig.json                 — TypeScript 配置
+├── vite.config.ts                — Vite 构建配置 (输出到 ../static/)
+├── eslint.config.js              — ESLint flat config + Prettier
+└── .prettierrc                   — 代码格式化规则
+
+static/                           — Vite 构建输出 (由 frontend/ 生成, 不要手动编辑)
+├── index.html                    — 主页面
+├── assets/                       — 构建产物 (JS chunks, CSS, 字体)
+└── branding/                     — Logo 和品牌资源
 
 docs/reference/templates/       — 7 个提示模板文件 (BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/TOOLS/MEMORY.md)
 docs/reference/skills/          — 17 个系统内置 Skills (安装时部署到 ~/.lingclaw/system-skills/)

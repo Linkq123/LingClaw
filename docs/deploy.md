@@ -1,6 +1,6 @@
 # LingClaw 部署指南
 
-LingClaw 是单二进制 + 单静态文件的架构，部署极其简单。首次启动时会进入交互式 Setup Wizard，引导你配置 API Provider、Key 和默认模型，配置保存在 `~/.lingclaw/.lingclaw.json`。
+LingClaw 是单二进制 + 一组静态前端资源的架构，部署仍然很简单。前端源码位于 `frontend/`，通过 Vite 构建输出到 `static/`；运行时实际读取的是 `static/` 目录。普通源码包可直接使用仓库内已有的 `static/`，如果你改动了 `frontend/`，部署前需要先重新生成 `static/`。只有在你需要重建前端时，才需要额外安装 Node.js（建议当前 LTS 版本）。首次启动时会进入交互式 Setup Wizard，引导你配置 API Provider、Key 和默认模型，配置保存在 `~/.lingclaw/.lingclaw.json`。
 
 默认 Web 端口为 `18989`。
 
@@ -20,7 +20,20 @@ cd LingClaw
 cargo build --release
 ```
 
+如果你修改过 `frontend/`，或需要确保 Web UI 使用的是最新前端产物，再额外执行：
+
+```powershell
+cd frontend
+npm ci
+npm run build
+cd ..
+```
+
 产物位于 `target\release\lingclaw.exe`。
+
+直接从源码目录运行 `target\release\lingclaw.exe` 时，程序会自动从项目根目录发现 `static/`。如果你只把 `lingclaw.exe` 单独复制到别处运行，需要同时复制 `static/` 目录；若还要保留内置 Skills / Sub-Agents，则还需一并部署 `docs/reference/skills/` 和 `docs/reference/agents/`，或直接使用 `lingclaw install`。
+
+`lingclaw install -d <source-dir>` 会先构建 Rust 二进制；若检测到 `frontend/package.json` 且 `npm` 可用，还会自动执行前端构建并安装最新 `static/`。如果 `npm` 不可用但源码目录里已有可用的 `static/index.html`，则会回退到安装现有静态产物。`lingclaw update` 在源码目录内升级时，前端处理逻辑与这里保持一致。
 
 ### 1.2 运行
 
@@ -82,6 +95,8 @@ bash scripts/install-linux.sh
 - 最后让你选择 `Install`、`Install-daemon` 或 `Skip for now`
 - `Install` 路径会继续询问是否持久化 PATH、是否添加 systemd 服务
 
+说明：安装脚本会部署当前仓库里的 `static/`。如果你先改过 `frontend/`，请在运行脚本前手动执行 `cd frontend && npm ci && npm run build`，把新的前端产物刷新到 `static/`。
+
 手动构建流程如下：
 
 ```bash
@@ -92,6 +107,13 @@ source "$HOME/.cargo/env"
 # 克隆并构建
 git clone <repo-url> LingClaw
 cd LingClaw
+
+# 若修改了 frontend/ 或需要重建 Web UI，再额外执行
+cd frontend
+npm ci
+npm run build
+cd ..
+
 cargo build --release
 cargo install --path .
 mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin/static"
@@ -100,7 +122,7 @@ mkdir -p "$HOME/.lingclaw/system-skills" "$HOME/.lingclaw/system-agents"
 cp -R docs/reference/skills/. "$HOME/.lingclaw/system-skills/"
 cp -R docs/reference/agents/. "$HOME/.lingclaw/system-agents/"
 ```
-如果只执行 `cargo install --path .` 而没有同步部署 `static/`、`docs/reference/skills/`、`docs/reference/agents/`，`/api/health` 仍可能正常，但访问首页 `http://127.0.0.1:18989/` 会返回 404，且内置 Skills / Sub-Agents 不可用。
+如果只执行 `cargo install --path .` 而没有同步部署 `static/`、`docs/reference/skills/`、`docs/reference/agents/`，`/api/health` 仍可能正常，但访问首页 `http://127.0.0.1:18989/` 会返回 404，且内置 Skills / Sub-Agents 不可用。如果你改动过 `frontend/` 却没有重新执行 Vite 构建，服务虽然能启动，但页面仍会停留在旧版静态资源。
 
 如果安装报错 `error: failed to run custom build command for openssl-sys`：
 - Ubuntu / Debian / Kali Linux
@@ -146,6 +168,8 @@ lingclaw systemd-install    # 安装并启用 lingclaw.service
 lingclaw help       # 查看帮助信息
 lingclaw --version  # 显示版本号
 ```
+
+`lingclaw install -d /path/to/src` 的前端行为与 Windows 相同：优先自动构建 `frontend/`，无法构建时再回退到现有 `static/`。
 
 说明：
 
@@ -203,7 +227,15 @@ server {
 在项目根目录创建 `Dockerfile`：
 
 ```dockerfile
-# ── 构建阶段 ──
+# ── 前端构建阶段 ──
+FROM node:20-bookworm-slim AS frontend-builder
+WORKDIR /build/frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+# ── Rust 构建阶段 ──
 FROM rust:1.85-slim AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
@@ -218,7 +250,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/lingclaw /usr/local/bin/
-COPY static/ /app/static/
+COPY --from=frontend-builder /build/static/ /app/static/
 COPY docs/reference/skills/ /app/docs/reference/skills/
 COPY docs/reference/agents/ /app/docs/reference/agents/
 
@@ -229,7 +261,7 @@ ENV LINGCLAW_PORT=18989
 ENTRYPOINT ["lingclaw", "--serve"]
 ```
 
-> Docker 场景下可通过挂载 `~/.lingclaw/.lingclaw.json` 配置文件，也可通过 `-e` 传入环境变量作为覆盖。Prompt 模板已在编译期内嵌，运行时不要求容器内存在 `docs/reference/templates/`；但内置 Skills / Sub-Agents 依赖运行时磁盘目录发现，因此镜像中需要保留 `docs/reference/skills/` 和 `docs/reference/agents/`，否则它们不会被加载。
+> 这个 Dockerfile 会直接从 `frontend/` 重新构建最新的 `static/`，不依赖仓库里已有的前端产物。Docker 场景下可通过挂载 `~/.lingclaw/.lingclaw.json` 配置文件，也可通过 `-e` 传入环境变量作为覆盖。Prompt 模板已在编译期内嵌，运行时不要求容器内存在 `docs/reference/templates/`；但内置 Skills / Sub-Agents 依赖运行时磁盘目录发现，因此镜像中需要保留 `docs/reference/skills/` 和 `docs/reference/agents/`，否则它们不会被加载。
 
 ### 3.2 构建镜像
 
@@ -352,8 +384,14 @@ volumes:
 
 ```
 lingclaw                        # 二进制
-static/
-  index.html                    # WebChat 前端
+frontend/                       # 前端源码（TypeScript + React + Vite）
+  src/                          # 应用源码
+  package.json                  # 前端依赖与脚本
+  vite.config.ts                # Vite 构建配置（输出到 ../static/）
+static/                         # 运行时前端产物（由 frontend/ 构建生成）
+  index.html                    # WebChat 入口
+  assets/                       # 打包后的 JS/CSS/字体等资源
+  branding/                     # 品牌资源
 docs/reference/templates/       # 7 个 Prompt 模板（BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/TOOLS/MEMORY.md）
 docs/reference/skills/          # 内置 system skills（运行时磁盘发现）
 docs/reference/agents/          # 内置 system sub-agents（运行时磁盘发现）
@@ -376,7 +414,7 @@ docs/reference/agents/          # 内置 system sub-agents（运行时磁盘发�
 curl http://127.0.0.1:18989/api/health
 
 # 预期返回
-# {"status":"ok","version":"0.5.6","model":"gpt-4o-mini","sessions":1}
+# {"status":"ok","version":"0.6.1","model":"gpt-4o-mini","sessions":1}
 ```
 
 浏览器打开 `http://<host>:18989` 即可使用。

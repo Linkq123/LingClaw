@@ -177,12 +177,14 @@ impl Drop for TaskEventGuard<'_> {
                 "[task-guard] sub-agent '{}' dropped before terminal event — sending task_failed",
                 self.agent_name
             );
-            let _ = self.live_tx.try_send(json!({
+            if let Err(err) = self.live_tx.try_send(json!({
                 "type": "task_failed",
                 "task_id": self.task_id,
                 "agent": self.agent_name,
                 "error": "task aborted (timeout or cancellation)",
-            }));
+            })) {
+                eprintln!("[task-guard] failed to emit fallback task_failed event: {err}");
+            }
         }
     }
 }

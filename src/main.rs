@@ -356,12 +356,27 @@ struct AppState {
 impl AppState {
     /// Return a snapshot of the current runtime config.
     fn config(&self) -> Arc<Config> {
-        self.config.lock().expect("config lock poisoned").clone()
+        match self.config.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                eprintln!("Warning: config lock poisoned; recovering with inner value");
+                poisoned.into_inner().clone()
+            }
+        }
     }
 
     /// Hot-swap the runtime config (called after saving to disk).
     fn replace_config(&self, new: Config) {
-        *self.config.lock().expect("config lock poisoned") = Arc::new(new);
+        match self.config.lock() {
+            Ok(mut guard) => {
+                *guard = Arc::new(new);
+            }
+            Err(poisoned) => {
+                eprintln!("Warning: config lock poisoned during replace; recovering");
+                let mut guard = poisoned.into_inner();
+                *guard = Arc::new(new);
+            }
+        }
     }
 }
 
@@ -650,17 +665,37 @@ fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
                 resolved.pop();
             }
             std::path::Component::Normal(part) => {
-                resolved.push(part);
-                if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+                let candidate = resolved.join(part);
+                if let Ok(meta) = std::fs::symlink_metadata(&candidate)
                     && meta.file_type().is_symlink()
                 {
+                    let escaped_workspace = candidate
+                        .canonicalize()
+                        .ok()
+                        .is_some_and(|target| !target.starts_with(&ws_canonical));
                     eprintln!(
-                        "SECURITY: path '{}' traverses symlink '{}', clamped",
+                        "SECURITY: path '{}' traverses symlink '{}'{}clamped",
                         path_str,
-                        resolved.display()
+                        candidate.display(),
+                        if escaped_workspace {
+                            " that escapes workspace, "
+                        } else {
+                            ", "
+                        }
                     );
                     return ws_canonical;
                 }
+                if let Ok(canon) = candidate.canonicalize()
+                    && !canon.starts_with(&ws_canonical)
+                {
+                    eprintln!(
+                        "SECURITY: path '{}' resolves outside workspace via '{}', clamped",
+                        path_str,
+                        candidate.display()
+                    );
+                    return ws_canonical;
+                }
+                resolved = candidate;
             }
             std::path::Component::Prefix(_) | std::path::Component::RootDir => {
                 eprintln!(
@@ -731,17 +766,37 @@ fn resolve_path_checked(path_str: &str, workspace: &Path) -> Result<PathBuf, Str
                 resolved.pop();
             }
             std::path::Component::Normal(part) => {
-                resolved.push(part);
-                if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+                let candidate = resolved.join(part);
+                if let Ok(meta) = std::fs::symlink_metadata(&candidate)
                     && meta.file_type().is_symlink()
                 {
+                    let escaped_workspace = candidate
+                        .canonicalize()
+                        .ok()
+                        .is_some_and(|target| !target.starts_with(&workspace_root));
                     return Err(format!(
-                        "path '{}' traverses symlink '{}' outside the session workspace '{}'",
+                        "path '{}' traverses symlink '{}'{}outside the session workspace '{}'",
                         path_str,
-                        resolved.display(),
+                        candidate.display(),
+                        if escaped_workspace {
+                            " that resolves "
+                        } else {
+                            " "
+                        },
                         workspace_root.display()
                     ));
                 }
+                if let Ok(canon) = candidate.canonicalize()
+                    && !canon.starts_with(&workspace_root)
+                {
+                    return Err(format!(
+                        "path '{}' resolves outside the session workspace '{}' via '{}'",
+                        path_str,
+                        workspace_root.display(),
+                        candidate.display()
+                    ));
+                }
+                resolved = candidate;
             }
             std::path::Component::Prefix(_) | std::path::Component::RootDir => {
                 return Err(format!(
@@ -2159,9 +2214,11 @@ async fn read_config_file_snapshot(path: &Path) -> std::io::Result<String> {
 
 fn parse_serde_error_position(msg: &str) -> (Option<u64>, Option<u64>) {
     // serde_json errors: "... at line X column Y"
-    static RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"line (\d+) column (\d+)").unwrap());
-    if let Some(caps) = RE.captures(msg) {
+    static RE: std::sync::LazyLock<Option<regex::Regex>> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"line (\d+) column (\d+)").ok());
+    if let Some(re) = RE.as_ref()
+        && let Some(caps) = re.captures(msg)
+    {
         let line = caps.get(1).and_then(|m| m.as_str().parse().ok());
         let col = caps.get(2).and_then(|m| m.as_str().parse().ok());
         return (line, col);
