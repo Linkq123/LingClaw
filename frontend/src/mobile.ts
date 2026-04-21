@@ -21,7 +21,9 @@ export function initMobileListeners() {
   document.addEventListener('click', (e) => {
     const toggle = document.getElementById('mobile-menu-toggle');
     const menu = document.getElementById('mobile-menu');
-    if (menu && toggle && !toggle.contains(e.target) && !menu.contains(e.target)) {
+    const target = e.target;
+    if (!(target instanceof Node)) return;
+    if (menu && toggle && !toggle.contains(target) && !menu.contains(target)) {
       closeMobileMenu();
     }
   });

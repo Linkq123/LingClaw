@@ -54,7 +54,7 @@ function setAssistantAvatar(node) {
   node.appendChild(img);
 }
 
-export function addMsg(cls, text, timestamp, options = {}) {
+export function addMsg(cls, text, timestamp = undefined, options: { trackUnread?: boolean } = {}) {
   const { trackUnread = cls === 'assistant' } = options;
   const isChat = cls === 'user' || cls === 'assistant';
   const hasAvatar = cls === 'assistant';
@@ -127,7 +127,7 @@ function buildDismissButton() {
   return '<button class="system-dismiss" type="button" data-action="dismiss-system-card" aria-label="Dismiss">×</button>';
 }
 
-export function addSystem(t, kind = 'info', options = {}) {
+export function addSystem(t, kind = 'info', options: { dismissible?: boolean } = {}) {
   const { dismissible = false } = options;
   const row = document.createElement('div');
   row.className = 'msg-row system';
@@ -150,7 +150,7 @@ export function addSystem(t, kind = 'info', options = {}) {
   scrollDown();
 }
 
-export function addError(t, options = {}) {
+export function addError(t, options: { dismissible?: boolean } = {}) {
   const { dismissible = false } = options;
   const row = document.createElement('div');
   row.className = 'msg-row error';

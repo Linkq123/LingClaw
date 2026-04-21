@@ -62,7 +62,7 @@ export function scheduleCodeHighlight(blocks) {
   }
 }
 
-export function scheduleMarkdownRender(el, options = {}) {
+export function scheduleMarkdownRender(el, options: { followScroll?: boolean } = {}) {
   if (!el) return;
   const { followScroll } = options;
   cancelScheduledMarkdownRender(el);
@@ -311,7 +311,7 @@ export function decorateCodeBlocks(container) {
 
 export function appendRenderedSegment(el, markdownText) {
   const { text: preprocessed, blocks: mathBlocks } = extractMath(markdownText);
-  const html = marked.parse(preprocessed);
+  const html = marked.parse(preprocessed) as string;
   const sanitized = DOMPurify.sanitize(html, { ADD_ATTR: ['target'] });
   const temp = document.createElement('div');
   temp.innerHTML = renderMathPlaceholders(sanitized, mathBlocks);
@@ -416,7 +416,7 @@ export function removeLiveTail(el) {
 export function renderMarkdown(el) {
   const raw = el._rawText || el.textContent;
   const { text: preprocessed, blocks: mathBlocks } = extractMath(raw);
-  const html = marked.parse(preprocessed);
+  const html = marked.parse(preprocessed) as string;
   const sanitized = DOMPurify.sanitize(html, { ADD_ATTR: ['target'] });
   el.innerHTML = renderMathPlaceholders(sanitized, mathBlocks);
   el.querySelectorAll('a[href]').forEach((a) => {

@@ -109,6 +109,7 @@ import {
   SettingsPage,
 } from './pages/SettingsPage.js';
 import { openUsagePage, closeUsagePage, initUsageListeners, UsagePage } from './pages/UsagePage.js';
+import { closeOverlayById } from './pages/overlay.js';
 import { createRoot } from 'react-dom/client';
 import React from 'react';
 
@@ -274,7 +275,7 @@ function parseOrchestrationHistoryResult(resultText) {
   };
 }
 
-function renderHistoryMessage(m, options = {}) {
+function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
   const { followMarkdown = true } = options;
   switch (m.role) {
     case 'user': {
@@ -624,9 +625,9 @@ function handleMessage(data) {
       if (state.reasoningPanel) {
         finishReasoningStream();
         state.reasoningPanel.classList.remove('reasoning-active');
-        const status = state.reasoningPanel.querySelector('.reasoning-status');
-        const body = state.reasoningPanel.querySelector('.reasoning-body');
-        const chevron = state.reasoningPanel.querySelector('.chevron');
+        const status = state.reasoningPanel.querySelector<HTMLElement>('.reasoning-status');
+        const body = state.reasoningPanel.querySelector<HTMLElement>('.reasoning-body');
+        const chevron = state.reasoningPanel.querySelector<HTMLElement>('.chevron');
         const rawText = body?._textNode?.nodeValue || body?.textContent || '';
         const summaryText = rawText.trim().replace(/\n+/g, ' ');
         const preview = summaryText.substring(0, 60);
@@ -810,7 +811,10 @@ const actionHandlers = {
   },
   'close-page': (el) => {
     const overlay = el.closest('.page-overlay');
-    if (overlay) overlay.hidden = true;
+    if (!(overlay instanceof HTMLElement)) return;
+    if (!closeOverlayById(overlay.id, closeSettingsPage, closeUsagePage)) {
+      overlay.hidden = true;
+    }
   },
   cmd: (el) => {
     const cmd = el.dataset.cmd;
@@ -842,15 +846,21 @@ const actionHandlers = {
 };
 
 document.addEventListener('click', (e) => {
-  const el = e.target.closest('[data-action]');
+  const target = e.target;
+  if (!(target instanceof Element)) return;
+
+  const el = target.closest('[data-action]');
   if (!el) {
     // Click on overlay backdrop to close
-    if (e.target.classList.contains('page-overlay')) {
-      e.target.hidden = true;
+    if (target instanceof HTMLElement && target.classList.contains('page-overlay')) {
+      if (!closeOverlayById(target.id, closeSettingsPage, closeUsagePage)) {
+        target.hidden = true;
+      }
     }
     return;
   }
-  const handler = actionHandlers[el.dataset.action];
+  const action = (el as HTMLElement).dataset.action;
+  const handler = action ? actionHandlers[action] : null;
   if (handler) handler(el);
 });
 

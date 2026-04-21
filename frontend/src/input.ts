@@ -29,7 +29,7 @@ export function send() {
   const hasImages = state.pendingImages.length > 0;
   const effectiveImages = state.busy ? [] : state.pendingImages.slice();
 
-  const el = addMsg('user', text || '(image)');
+  const el = addMsg('user', text || '(image)', undefined);
   if (effectiveImages.length > 0) {
     renderUserImageThumbnails(el, effectiveImages);
   }

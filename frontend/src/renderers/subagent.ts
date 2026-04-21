@@ -12,28 +12,28 @@ import { scrollDown } from '../scroll.js';
 import { wrapInTimeline, animatePanelIn, animateCollapsibleSection } from './timeline.js';
 import { pinReactStatusToBottom } from './react-status.js';
 
-function getToolTrail(panel) {
-  return panel.querySelector('[data-subagent-tool-trail]');
+function getToolTrail(panel): HTMLElement | null {
+  return (panel as Element).querySelector('[data-subagent-tool-trail]') as HTMLElement | null;
 }
 
-function getToolTrailMeta(panel) {
-  return panel.querySelector('[data-subagent-tools-meta]');
+function getToolTrailMeta(panel): HTMLElement | null {
+  return (panel as Element).querySelector('[data-subagent-tools-meta]') as HTMLElement | null;
 }
 
-function getToolTrailEmpty(panel) {
-  return panel.querySelector('[data-subagent-tool-empty]');
+function getToolTrailEmpty(panel): HTMLElement | null {
+  return (panel as Element).querySelector('[data-subagent-tool-empty]') as HTMLElement | null;
 }
 
-function getReasoningCard(panel) {
-  return panel.querySelector('[data-subagent-reasoning]');
+function getReasoningCard(panel): HTMLElement | null {
+  return (panel as Element).querySelector('[data-subagent-reasoning]') as HTMLElement | null;
 }
 
-function getReasoningMeta(panel) {
-  return panel.querySelector('[data-subagent-reasoning-meta]');
+function getReasoningMeta(panel): HTMLElement | null {
+  return (panel as Element).querySelector('[data-subagent-reasoning-meta]') as HTMLElement | null;
 }
 
-function getReasoningBody(panel) {
-  return panel.querySelector('[data-subagent-reasoning-body]');
+function getReasoningBody(panel): HTMLElement | null {
+  return (panel as Element).querySelector('[data-subagent-reasoning-body]') as HTMLElement | null;
 }
 
 function ensureReasoningCard(panel) {
@@ -76,8 +76,8 @@ function setChipText(panel, key, value, extraClass = '') {
   if (extraClass) chip.classList.add(extraClass);
 }
 
-function getToolRows(panel) {
-  return Array.from(panel.querySelectorAll('.subagent-tool-row'));
+function getToolRows(panel): HTMLElement[] {
+  return Array.from((panel as Element).querySelectorAll('.subagent-tool-row')) as HTMLElement[];
 }
 
 function findToolRowById(panel, toolId) {
@@ -88,13 +88,13 @@ function findToolRowById(panel, toolId) {
   return null;
 }
 
-function getToolBadges(panel) {
+function getToolBadges(panel): HTMLButtonElement[] {
   const trail = getToolTrail(panel);
   if (!trail) return [];
-  return Array.from(trail.querySelectorAll('.subagent-tool-pill'));
+  return Array.from(trail.querySelectorAll<HTMLButtonElement>('.subagent-tool-pill'));
 }
 
-function findToolBadge(panel, toolId) {
+function findToolBadge(panel, toolId): HTMLButtonElement | null {
   if (!panel || !toolId) return null;
   return getToolBadges(panel).find((badge) => badge.dataset.toolId === toolId) || null;
 }
@@ -208,8 +208,10 @@ function summaryCopyText(panel) {
   const label = panel.querySelector('.subagent-label')?.textContent?.trim();
   const status = panel.querySelector('.subagent-status')?.textContent?.trim();
   const prompt = panel.querySelector('.subagent-prompt')?.textContent?.trim();
-  const metrics = Array.from(panel.querySelectorAll('.subagent-summary-chip'))
-    .map((chip) => chip.textContent.trim())
+  const metrics = (
+    Array.from((panel as Element).querySelectorAll('.subagent-summary-chip')) as HTMLElement[]
+  )
+    .map((chip) => chip.textContent?.trim() || '')
     .filter(Boolean)
     .join(' · ');
   const summaryBody = panel
@@ -217,8 +219,10 @@ function summaryCopyText(panel) {
       '.subagent-summary:not(.hidden) .subagent-preview, .subagent-summary:not(.hidden) .subagent-error',
     )
     ?.textContent?.trim();
-  const latestOutput = Array.from(panel.querySelectorAll('.subagent-tool-output-code'))
-    .map((node) => node.textContent.trim())
+  const latestOutput = (
+    Array.from((panel as Element).querySelectorAll('.subagent-tool-output-code')) as HTMLElement[]
+  )
+    .map((node) => node.textContent?.trim() || '')
     .filter(Boolean)
     .slice(-1)[0];
   const toolsUsed = getToolBadges(panel)
@@ -279,7 +283,20 @@ function syncToolCount(panel, fallbackTotal = null) {
   syncToolOverview(panel, fallbackTotal, { total, settled, failed, running });
 }
 
-function renderSummary(panel, success, stats = {}) {
+function renderSummary(
+  panel,
+  success,
+  stats: {
+    cycles?: number;
+    tool_calls?: number;
+    duration_ms?: number;
+    input_tokens?: number;
+    output_tokens?: number;
+    result_excerpt?: string;
+    result_preview?: string;
+    error?: string;
+  } = {},
+) {
   const summary = panel.querySelector('.subagent-summary');
   if (!summary) return;
 

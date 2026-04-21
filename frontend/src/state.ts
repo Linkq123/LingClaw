@@ -36,6 +36,7 @@ export interface DomRefs {
   imageUrlField: HTMLInputElement | null;
   imageUrlAddBtn: HTMLButtonElement | null;
   attachUploadStatus: HTMLElement | null;
+  imageFileInput: HTMLInputElement | null;
   [key: string]: HTMLElement | null;
 }
 
@@ -76,7 +77,8 @@ export interface AppState {
   imageCapable: boolean;
   s3Capable: boolean;
   uploadToken: string;
-  uploadTokenPromise: Promise<void> | null;
+  uploadTokenPromise: Promise<string> | null;
+  uploadTokenRequestSeq: number;
   pendingImages: ImageAttachment[];
   inputHistory: string[];
   inputHistoryIndex: number;
@@ -84,11 +86,21 @@ export interface AppState {
   markdownRenderQueue: HTMLElement[];
   markdownQueueHandle: number;
   activeSubagentPanels: Map<string, HTMLElement>;
-  activeOrchestrations: Map<string, HTMLElement>;
+  activeOrchestrations: Map<
+    string,
+    {
+      panel: HTMLElement;
+      taskRows: Map<string, HTMLElement>;
+      taskLayer: Map<string, number>;
+      layerCount: number;
+    }
+  >;
   dailyInputTokens: number;
   dailyOutputTokens: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  _historyTaskIds: Map<string, { task_id: string; agent: string }> | null;
+  _historyOrchestrateIds: Map<string, string> | null;
 }
 
 export const state: AppState = {
@@ -125,6 +137,7 @@ export const state: AppState = {
   s3Capable: false,
   uploadToken: '',
   uploadTokenPromise: null,
+  uploadTokenRequestSeq: 0,
   pendingImages: [],
   inputHistory: [],
   inputHistoryIndex: -1,
@@ -137,6 +150,8 @@ export const state: AppState = {
   dailyOutputTokens: 0,
   totalInputTokens: 0,
   totalOutputTokens: 0,
+  _historyTaskIds: null,
+  _historyOrchestrateIds: null,
 };
 
 /** Populate dom refs from the live document. Call once after DOMContentLoaded. */
@@ -176,5 +191,5 @@ export function initDomRefs() {
   dom.imageUrlField = document.getElementById('image-url-field') as HTMLInputElement | null;
   dom.imageUrlAddBtn = document.getElementById('image-url-add') as HTMLButtonElement | null;
   dom.attachUploadStatus = document.getElementById('attach-upload-status');
-  dom.imageFileInput = document.getElementById('image-file-input');
+  dom.imageFileInput = document.getElementById('image-file-input') as HTMLInputElement | null;
 }

@@ -7,12 +7,15 @@ export async function ensureUploadToken() {
   return ensureUploadTokenInternal(false);
 }
 
-export async function ensureUploadTokenInternal(forceRefresh) {
+export async function ensureUploadTokenInternal(forceRefresh: boolean): Promise<string> {
   if (forceRefresh) {
     state.uploadToken = '';
+    state.uploadTokenPromise = null;
   }
   if (state.uploadToken) return state.uploadToken;
   if (!state.uploadTokenPromise) {
+    const requestSeq = state.uploadTokenRequestSeq + 1;
+    state.uploadTokenRequestSeq = requestSeq;
     state.uploadTokenPromise = fetch('/api/client-config', { cache: 'no-store' })
       .then(async (response) => {
         if (!response.ok) {
@@ -22,11 +25,15 @@ export async function ensureUploadTokenInternal(forceRefresh) {
         if (typeof data.upload_token !== 'string' || !data.upload_token) {
           throw new Error('upload token missing');
         }
-        state.uploadToken = data.upload_token;
-        return state.uploadToken;
+        if (requestSeq === state.uploadTokenRequestSeq) {
+          state.uploadToken = data.upload_token;
+        }
+        return data.upload_token;
       })
       .finally(() => {
-        state.uploadTokenPromise = null;
+        if (requestSeq === state.uploadTokenRequestSeq) {
+          state.uploadTokenPromise = null;
+        }
       });
   }
   return state.uploadTokenPromise;
@@ -71,13 +78,13 @@ export function closeAttachPopup() {
 export function openAttachPopup() {
   if (!dom.attachPopup) return;
   if (!state.s3Capable) {
-    dom.attachMenu.style.display = 'none';
-    dom.attachUrlInput.style.display = 'flex';
-    dom.attachUploadStatus.style.display = 'none';
+    if (dom.attachMenu) dom.attachMenu.style.display = 'none';
+    if (dom.attachUrlInput) dom.attachUrlInput.style.display = 'flex';
+    if (dom.attachUploadStatus) dom.attachUploadStatus.style.display = 'none';
   } else {
-    dom.attachMenu.style.display = 'flex';
-    dom.attachUrlInput.style.display = 'none';
-    dom.attachUploadStatus.style.display = 'none';
+    if (dom.attachMenu) dom.attachMenu.style.display = 'flex';
+    if (dom.attachUrlInput) dom.attachUrlInput.style.display = 'none';
+    if (dom.attachUploadStatus) dom.attachUploadStatus.style.display = 'none';
   }
   dom.attachPopup.style.display = 'block';
   if (!state.s3Capable && dom.imageUrlField) {
@@ -138,8 +145,8 @@ export function addImageUrl(url) {
 export async function uploadLocalImages(files) {
   if (!files || files.length === 0) return;
   if (dom.attachUploadStatus) {
-    dom.attachMenu.style.display = 'none';
-    dom.attachUrlInput.style.display = 'none';
+    if (dom.attachMenu) dom.attachMenu.style.display = 'none';
+    if (dom.attachUrlInput) dom.attachUrlInput.style.display = 'none';
     dom.attachUploadStatus.style.display = 'flex';
   }
   let token;
@@ -286,9 +293,11 @@ export function initImageListeners() {
       }
     });
   document.addEventListener('click', (e) => {
+    const target = e.target;
+    if (!(target instanceof Node)) return;
     if (dom.attachPopup && dom.attachPopup.style.display !== 'none') {
       const wrapper = dom.attachBtn ? dom.attachBtn.closest('.attach-wrapper') : null;
-      if (wrapper && !wrapper.contains(e.target)) {
+      if (wrapper && !wrapper.contains(target)) {
         closeAttachPopup();
       }
     }

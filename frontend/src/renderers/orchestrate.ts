@@ -31,8 +31,8 @@ export function parseOrchestrateCompositeTaskId(compositeId) {
   return { orchestrateId, taskId };
 }
 
-function getTaskRows(panel) {
-  return Array.from(panel.querySelectorAll('.orchestrate-task'));
+function getTaskRows(panel): HTMLElement[] {
+  return Array.from((panel as Element).querySelectorAll('.orchestrate-task')) as HTMLElement[];
 }
 
 function summarizeTaskCounts(rows) {
@@ -245,12 +245,16 @@ function maybeOpenTaskDetails(row, shouldOpen) {
   setTaskExpanded(row, shouldOpen);
 }
 
-function getTaskReasoningBody(row) {
-  return row?.querySelector('[data-orchestrate-reasoning-body]') || null;
+function getTaskReasoningBody(row): HTMLElement | null {
+  return (row as Element | null)?.querySelector(
+    '[data-orchestrate-reasoning-body]',
+  ) as HTMLElement | null;
 }
 
-function getTaskReasoningLabel(row) {
-  return row?.querySelector('[data-orchestrate-reasoning-label]') || null;
+function getTaskReasoningLabel(row): HTMLElement | null {
+  return (row as Element | null)?.querySelector(
+    '[data-orchestrate-reasoning-label]',
+  ) as HTMLElement | null;
 }
 
 function ensureTaskReasoningSection(row) {

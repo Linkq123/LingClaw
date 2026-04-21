@@ -3,7 +3,7 @@
 
 type Listener<T> = (data: T) => void;
 
-class EventBus<EventMap extends Record<string, unknown>> {
+class EventBus<EventMap extends object> {
   private listeners: { [K in keyof EventMap]?: Array<Listener<EventMap[K]>> } = {};
 
   on<K extends keyof EventMap>(event: K, listener: Listener<EventMap[K]>): () => void {

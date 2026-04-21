@@ -1,11 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import type {
-  AppConfig,
-  ProviderConfig,
-  ModelEntry,
-  McpServerConfig,
-  S3Config,
-} from '../types/config.js';
+import type { AppConfig, McpServerConfig, S3Config } from '../types/config.js';
 import type { ConfigApiResponse } from '../types/config.js';
 import {
   validateProviderName,
@@ -15,6 +9,13 @@ import {
   buildModelOptions,
   isBuiltinProviderName,
 } from '../settingsValidation.js';
+import {
+  buildProviderForms,
+  createModelFormEntry,
+  createProviderForm,
+  serializeProviderForms,
+} from './settingsModels.js';
+import type { ModelFormEntry, ProviderFormData } from './settingsModels.js';
 
 // ── Module-level bridge (imperative open/close from main.ts) ──────────────────
 
@@ -258,38 +259,6 @@ function AgentsTab({ config, onChange }: { config: AppConfig; onChange: (c: AppC
 
 // ── Models Tab ────────────────────────────────────────────────────────────────
 
-interface ModelFormEntry extends ModelEntry {
-  _key: string; // unique render key
-}
-
-interface ProviderFormData {
-  name: string;
-  api: string;
-  baseUrl: string;
-  apiKey: string;
-  models: ModelFormEntry[];
-  testState: 'idle' | 'testing' | 'ok' | 'fail';
-  testLabel: string;
-  selectedTestModel: string;
-}
-
-function newProviderForm(name: string, p: ProviderConfig = {}): ProviderFormData {
-  const models: ModelFormEntry[] = (p.models || []).map((m, i) => ({
-    ...m,
-    _key: `${name}-${i}-${Date.now()}`,
-  }));
-  return {
-    name,
-    api: p.api || 'openai-completions',
-    baseUrl: p.baseUrl || '',
-    apiKey: p.apiKey || '',
-    models,
-    testState: 'idle',
-    testLabel: 'Test',
-    selectedTestModel: models[0]?.id || '',
-  };
-}
-
 function ModelEntryRow({
   model,
   onChange,
@@ -433,8 +402,10 @@ function ProviderCard({
   onTest: (p: ProviderFormData, modelId: string) => void;
 }) {
   const addModel = () => {
-    const key = `new-${Date.now()}`;
-    onChange({ ...prov, models: [...prov.models, { id: '', input: ['text'], _key: key }] });
+    onChange({
+      ...prov,
+      models: [...prov.models, createModelFormEntry(prov.name, { id: '', input: ['text'] })],
+    });
   };
   const updateModel = (i: number, m: ModelFormEntry) => {
     const models = [...prov.models];
@@ -546,9 +517,7 @@ function ModelsTab({
 }) {
   const initialProviders = config.models?.providers || {};
   const [providers, setProviders] = useState<ProviderFormData[]>(() =>
-    Object.entries(initialProviders)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([n, p]) => newProviderForm(n, p)),
+    buildProviderForms(initialProviders),
   );
   const [jsonText, setJsonText] = useState<string>(() =>
     JSON.stringify(config.models || { providers: {} }, null, 2),
@@ -560,11 +529,7 @@ function ModelsTab({
   // When external config changes (e.g. JSON apply), re-sync form state
   useEffect(() => {
     const p = config.models?.providers || {};
-    setProviders(
-      Object.entries(p)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([n, pv]) => newProviderForm(n, pv)),
-    );
+    setProviders((previousProviders) => buildProviderForms(p, previousProviders));
     setJsonText(JSON.stringify(config.models || { providers: {} }, null, 2));
     setJsonError('');
     setJsonDirty(false);
@@ -589,7 +554,7 @@ function ModelsTab({
     try {
       const existing = Object.fromEntries(providers.map((p) => [p.name, true]));
       const trimmed = validateProviderName(name, existing);
-      setProviders([...providers, newProviderForm(trimmed)]);
+      setProviders([...providers, createProviderForm(trimmed)]);
       setFormDirty(true);
     } catch (e: unknown) {
       onStatus((e as Error).message, 'error');
@@ -659,26 +624,7 @@ function ModelsTab({
   // Expose providers → parent config on mount and whenever providers change
   // (parent calls collectModels on save)
   useEffect(() => {
-    const p: Record<string, ProviderConfig> = {};
-    for (const prov of providers) {
-      const models = prov.models
-        .filter((m) => m.id.trim() !== '')
-        .map((m) => {
-          const entry: ModelEntry = { id: m.id.trim() };
-          if (m.reasoning) entry.reasoning = true;
-          if (m.contextWindow != null) entry.contextWindow = m.contextWindow;
-          if (m.maxTokens != null) entry.maxTokens = m.maxTokens;
-          if (m.input && m.input.length > 0) entry.input = m.input;
-          return entry;
-        });
-      p[prov.name] = {
-        api: prov.api as ProviderConfig['api'],
-        baseUrl: prov.baseUrl || undefined,
-        apiKey: prov.apiKey || undefined,
-        models,
-      };
-    }
-    const newModels = Object.keys(p).length > 0 ? { providers: p } : undefined;
+    const newModels = serializeProviderForms(providers);
     // Only propagate if we actually changed (avoid loops)
     if (JSON.stringify(newModels) !== JSON.stringify(config.models)) {
       onChange({ ...config, models: newModels });

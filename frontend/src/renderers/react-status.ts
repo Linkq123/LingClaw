@@ -16,12 +16,12 @@ export function pinReactStatusToBottom() {
 
 export function renderReactStatus() {
   if (!state.reactStatusRow) return;
-  const card = state.reactStatusRow.querySelector('.react-status-card');
-  const phase = state.reactStatusRow.querySelector('.react-status-phase');
-  const cycle = state.reactStatusRow.querySelector('.react-status-cycle');
-  const detail = state.reactStatusRow.querySelector('.react-status-detail');
-  const detailTool = state.reactStatusRow.querySelector('.react-status-tool');
-  const detailTime = state.reactStatusRow.querySelector('.react-status-time');
+  const card = state.reactStatusRow.querySelector<HTMLElement>('.react-status-card');
+  const phase = state.reactStatusRow.querySelector<HTMLElement>('.react-status-phase');
+  const cycle = state.reactStatusRow.querySelector<HTMLElement>('.react-status-cycle');
+  const detail = state.reactStatusRow.querySelector<HTMLElement>('.react-status-detail');
+  const detailTool = state.reactStatusRow.querySelector<HTMLElement>('.react-status-tool');
+  const detailTime = state.reactStatusRow.querySelector<HTMLElement>('.react-status-time');
   if (!card || !phase || !cycle || !detail || !detailTool || !detailTime) return;
   card.dataset.phase = state.reactStatusPhase || 'analyze';
   phase.textContent = reactPhaseLabel(state.reactStatusPhase);
