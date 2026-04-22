@@ -1996,31 +1996,29 @@ async fn api_put_config(
     // Push a refreshed `session` event so that capability flags (e.g. image
     // support) are reflected in the frontend immediately — without requiring
     // a page reload.
-    {
-        let (tx_opt, payload) = {
-            let sessions = state.sessions.lock().await;
-            let config = state.config();
-            let (name, model, usage) = sessions
-                .get(MAIN_SESSION_ID)
-                .map(|s| {
-                    let m = s.effective_model(&config.model).to_string();
-                    let u = socket_sync::build_session_usage_payload(s);
-                    (s.name.clone(), m, u)
-                })
-                .unwrap_or_else(|| ("Main".to_string(), config.model.clone(), json!({})));
-            let payload =
-                socket_sync::build_session_info_payload(MAIN_SESSION_ID, &name, &state, &model, usage);
-            let tx_opt = state
-                .session_clients
-                .lock()
-                .await
-                .get(MAIN_SESSION_ID)
-                .map(|b| b.tx.clone());
-            (tx_opt, payload)
-        };
-        if let Some(tx) = tx_opt {
-            ws_send(&tx, &payload).await;
-        }
+    // Acquire each lock separately so we never hold `sessions` while waiting
+    // on `session_clients` (consistent with send_existing_session_payloads).
+    let session_payload = {
+        let sessions = state.sessions.lock().await;
+        let config = state.config();
+        let (name, model, usage) = sessions
+            .get(MAIN_SESSION_ID)
+            .map(|s| {
+                let m = s.effective_model(&config.model).to_string();
+                let u = socket_sync::build_session_usage_payload(s);
+                (s.name.clone(), m, u)
+            })
+            .unwrap_or_else(|| ("Main".to_string(), config.model.clone(), json!({})));
+        socket_sync::build_session_info_payload(MAIN_SESSION_ID, &name, &state, &model, usage)
+    };
+    let tx_opt = state
+        .session_clients
+        .lock()
+        .await
+        .get(MAIN_SESSION_ID)
+        .map(|b| b.tx.clone());
+    if let Some(tx) = tx_opt {
+        ws_send(&tx, &session_payload).await;
     }
 
     // Invalidate cached MCP tool definitions so the next round picks up
