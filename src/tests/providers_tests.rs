@@ -1,4 +1,4 @@
-use super::*;
+﻿use super::*;
 use crate::ImageAttachment;
 use crate::config::S3Config;
 use std::{
@@ -165,6 +165,7 @@ fn convert_messages_to_openai_all_roles() {
             role: "system".into(),
             content: Some("you are helpful".into()),
             images: None,
+            thinking: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -173,6 +174,7 @@ fn convert_messages_to_openai_all_roles() {
             role: "user".into(),
             content: Some("hello".into()),
             images: None,
+            thinking: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -181,6 +183,7 @@ fn convert_messages_to_openai_all_roles() {
             role: "assistant".into(),
             content: Some("hi".into()),
             images: None,
+            thinking: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -189,6 +192,7 @@ fn convert_messages_to_openai_all_roles() {
             role: "tool".into(),
             content: Some("result".into()),
             images: None,
+            thinking: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -197,6 +201,7 @@ fn convert_messages_to_openai_all_roles() {
             role: "unknown_role".into(),
             content: Some("skip me".into()),
             images: None,
+            thinking: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -217,6 +222,7 @@ fn convert_messages_to_openai_assistant_with_tool_calls() {
         role: "assistant".into(),
         content: None,
         images: None,
+        thinking: None,
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
@@ -241,6 +247,7 @@ fn convert_messages_to_anthropic_system_extraction() {
             role: "system".into(),
             content: Some("system prompt".into()),
             images: None,
+            thinking: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -249,6 +256,7 @@ fn convert_messages_to_anthropic_system_extraction() {
             role: "user".into(),
             content: Some("hello".into()),
             images: None,
+            thinking: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -266,6 +274,7 @@ fn convert_messages_to_anthropic_tool_as_user_message() {
         role: "tool".into(),
         content: Some("file contents".into()),
         images: None,
+        thinking: None,
         tool_calls: None,
         tool_call_id: Some("tc1".into()),
         timestamp: None,
@@ -283,6 +292,7 @@ fn convert_messages_to_anthropic_assistant_with_tool_use() {
         role: "assistant".into(),
         content: Some("let me check".into()),
         images: None,
+        thinking: None,
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
@@ -309,6 +319,7 @@ fn convert_messages_to_anthropic_empty_assistant_gets_placeholder() {
         role: "assistant".into(),
         content: None,
         images: None,
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -327,6 +338,7 @@ fn convert_messages_to_ollama_all_roles() {
             role: "system".into(),
             content: Some("system prompt".into()),
             images: None,
+            thinking: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -335,6 +347,7 @@ fn convert_messages_to_ollama_all_roles() {
             role: "user".into(),
             content: Some("hello".into()),
             images: None,
+            thinking: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -343,6 +356,7 @@ fn convert_messages_to_ollama_all_roles() {
             role: "assistant".into(),
             content: Some("checking".into()),
             images: None,
+            thinking: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -358,6 +372,7 @@ fn convert_messages_to_ollama_all_roles() {
             role: "tool".into(),
             content: Some("done".into()),
             images: None,
+            thinking: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -383,7 +398,7 @@ fn convert_messages_to_ollama_all_roles() {
 
 #[test]
 fn build_llm_response_empty_content_and_no_tools() {
-    let resp = build_llm_response(String::new(), vec![], None, None).unwrap();
+    let resp = build_llm_response(String::new(), String::new(), vec![], None, None).unwrap();
     assert!(resp.message.content.is_none());
     assert!(resp.message.tool_calls.is_none());
     assert_eq!(resp.message.role, "assistant");
@@ -393,6 +408,7 @@ fn build_llm_response_empty_content_and_no_tools() {
 fn build_llm_response_with_content_and_tools() {
     let resp = build_llm_response(
         "thinking...".into(),
+        String::new(),
         vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
@@ -414,6 +430,7 @@ fn build_llm_response_with_content_and_tools() {
 #[test]
 fn normalize_tool_call_ids_whitespace_only_id_gets_fallback() {
     let resp = build_llm_response(
+        String::new(),
         String::new(),
         vec![ToolCall {
             id: "   ".into(),
@@ -438,6 +455,7 @@ fn normalize_tool_call_ids_whitespace_only_id_gets_fallback() {
 #[test]
 fn build_llm_response_assigns_unique_fallback_tool_ids() {
     let resp = build_llm_response(
+        String::new(),
         String::new(),
         vec![
             ToolCall {
@@ -552,6 +570,7 @@ fn anthropic_thinking_does_not_inflate_max_tokens() {
             role: "system".into(),
             content: Some("You are helpful.".into()),
             images: None,
+            thinking: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -560,6 +579,7 @@ fn anthropic_thinking_does_not_inflate_max_tokens() {
             role: "user".into(),
             content: Some("hello".into()),
             images: None,
+            thinking: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -593,6 +613,7 @@ fn anthropic_thinking_clamps_budget_when_max_tokens_is_small() {
         role: "user".into(),
         content: Some("hello".into()),
         images: None,
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -626,6 +647,7 @@ fn anthropic_thinking_disabled_when_max_tokens_too_small() {
         role: "user".into(),
         content: Some("hello".into()),
         images: None,
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -648,6 +670,7 @@ fn process_openai_data_line_reports_done_marker() {
     let done = rt.block_on(async {
         let mut state = OpenAiStreamState {
             content_buf: String::new(),
+            thinking_buf: String::new(),
             tool_calls: Vec::new(),
             input_tokens: None,
             output_tokens: None,
@@ -670,6 +693,7 @@ fn process_openai_data_line_keeps_reasoning_open_for_empty_content_delta() {
     rt.block_on(async {
         let mut state = OpenAiStreamState {
             content_buf: String::new(),
+            thinking_buf: String::new(),
             tool_calls: Vec::new(),
             input_tokens: None,
             output_tokens: None,
@@ -736,6 +760,7 @@ fn process_anthropic_sse_line_keeps_event_type_between_lines() {
         let mut state = AnthropicStreamState {
             current_event_type: String::new(),
             content_buf: String::new(),
+            thinking_buf: String::new(),
             tool_calls: Vec::new(),
             input_tokens: None,
             output_tokens: None,
@@ -779,6 +804,7 @@ async fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
         role: "user".into(),
         content: Some("hello".into()),
         images: None,
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -871,6 +897,7 @@ fn call_llm_simple_ollama_sends_auth_and_expected_body() {
         role: "user".into(),
         content: Some("hi".into()),
         images: None,
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -930,6 +957,7 @@ fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
         role: "user".into(),
         content: Some("inspect readme".into()),
         images: None,
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1005,6 +1033,7 @@ fn process_ollama_json_line_streams_thinking_content_and_tool_calls() {
     let done = rt.block_on(async {
         let mut state = OpenAiStreamState {
             content_buf: String::new(),
+            thinking_buf: String::new(),
             tool_calls: Vec::new(),
             input_tokens: None,
             output_tokens: None,
@@ -1182,6 +1211,7 @@ fn convert_messages_to_openai_user_with_images() {
                 data: None,
             },
         ]),
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1211,6 +1241,7 @@ fn convert_messages_to_anthropic_user_with_images() {
             cache_path: None,
             data: None,
         }]),
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1247,6 +1278,7 @@ fn convert_messages_to_ollama_user_with_images() {
                 data: Some("aW1hZ2VfZGF0YV95".into()),
             },
         ]),
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1283,6 +1315,7 @@ fn convert_messages_to_ollama_user_with_images_missing_b64() {
             cache_path: None,
             data: None,
         }]),
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1312,6 +1345,7 @@ async fn fetch_images_base64_reads_persisted_cache_without_refetch() {
             cache_path: Some(cache_path),
             data: None,
         }]),
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1341,6 +1375,7 @@ async fn fetch_images_base64_skips_uncached_historical_fetch_failures() {
             cache_path: None,
             data: None,
         }]),
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1376,6 +1411,7 @@ async fn fetch_images_base64_trusted_uploaded_urls_bypass_ssrf_on_cache_miss() {
             cache_path: None,
             data: None,
         }]),
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1442,6 +1478,7 @@ fn materialize_image_urls_refreshes_uploaded_s3_urls() {
             cache_path: None,
             data: None,
         }]),
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,

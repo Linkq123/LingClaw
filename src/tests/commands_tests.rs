@@ -1,4 +1,4 @@
-use super::*;
+﻿use super::*;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, atomic::AtomicU64},
@@ -183,6 +183,7 @@ async fn status_command_reports_runtime_request_estimate() {
         role: "user".into(),
         content: Some("Summarize the current backend architecture.".into()),
         images: None,
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -429,6 +430,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
         role: "user".into(),
         content: Some("Explain the current runtime architecture.".into()),
         images: None,
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,

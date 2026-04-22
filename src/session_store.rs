@@ -283,7 +283,14 @@ pub(crate) fn build_history_payload_with_s3(
                 if let Some(c) = &msg.content
                     && !c.is_empty()
                 {
-                    msgs.push(json!({"role":"assistant","content":c,"timestamp":msg.timestamp}));
+                    let mut entry =
+                        json!({"role":"assistant","content":c,"timestamp":msg.timestamp});
+                    if let Some(thinking) = &msg.thinking
+                        && !thinking.is_empty()
+                    {
+                        entry["thinking"] = json!(thinking);
+                    }
+                    msgs.push(entry);
                 }
                 if let Some(tcs) = &msg.tool_calls
                     && session.show_tools

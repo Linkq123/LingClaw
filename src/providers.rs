@@ -54,6 +54,7 @@ pub(crate) struct SimpleLlmResponse {
 
 struct OpenAiStreamState {
     content_buf: String,
+    thinking_buf: String,
     tool_calls: Vec<ToolCall>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -64,6 +65,7 @@ struct OpenAiStreamState {
 struct AnthropicStreamState {
     current_event_type: String,
     content_buf: String,
+    thinking_buf: String,
     tool_calls: Vec<ToolCall>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -1016,6 +1018,7 @@ async fn process_openai_data_line(data: &str, tx: &LiveTx, state: &mut OpenAiStr
                         state.client_gone = !live_send(tx, json!({"type":"thinking_start"})).await;
                     }
                     if !state.client_gone {
+                        state.thinking_buf.push_str(think_text);
                         state.client_gone =
                             !live_send(tx, json!({"type":"thinking_delta","content":think_text}))
                                 .await;
@@ -1160,6 +1163,7 @@ async fn process_anthropic_sse_line(line: &str, tx: &LiveTx, state: &mut Anthrop
                                 && !text.is_empty()
                                 && !state.client_gone
                             {
+                                state.thinking_buf.push_str(text);
                                 state.client_gone =
                                     !live_send(tx, json!({"type":"thinking_delta","content":text}))
                                         .await;
@@ -1232,6 +1236,7 @@ async fn process_ollama_json_line(data: &str, tx: &LiveTx, state: &mut OpenAiStr
             state.client_gone = !live_send(tx, json!({"type":"thinking_start"})).await;
         }
         if !state.client_gone {
+            state.thinking_buf.push_str(thinking);
             state.client_gone =
                 !live_send(tx, json!({"type":"thinking_delta","content":thinking})).await;
         }
@@ -1632,6 +1637,7 @@ async fn call_llm_stream_openai(
     let mut stream = resp.bytes_stream();
     let mut stream_state = OpenAiStreamState {
         content_buf: String::new(),
+        thinking_buf: String::new(),
         tool_calls: Vec::new(),
         input_tokens: None,
         output_tokens: None,
@@ -1649,6 +1655,7 @@ async fn call_llm_stream_openai(
 
     build_llm_response(
         stream_state.content_buf,
+        stream_state.thinking_buf,
         stream_state.tool_calls,
         stream_state.input_tokens,
         stream_state.output_tokens,
@@ -1682,6 +1689,7 @@ async fn call_llm_stream_anthropic(
     let mut stream_state = AnthropicStreamState {
         current_event_type: String::new(),
         content_buf: String::new(),
+        thinking_buf: String::new(),
         tool_calls: Vec::new(),
         input_tokens: None,
         output_tokens: None,
@@ -1701,6 +1709,7 @@ async fn call_llm_stream_anthropic(
 
     build_llm_response(
         stream_state.content_buf,
+        stream_state.thinking_buf,
         stream_state.tool_calls,
         stream_state.input_tokens,
         stream_state.output_tokens,
@@ -1738,6 +1747,7 @@ async fn call_llm_stream_ollama(
     let mut stream = resp.bytes_stream();
     let mut stream_state = OpenAiStreamState {
         content_buf: String::new(),
+        thinking_buf: String::new(),
         tool_calls: Vec::new(),
         input_tokens: None,
         output_tokens: None,
@@ -1755,6 +1765,7 @@ async fn call_llm_stream_ollama(
 
     build_llm_response(
         stream_state.content_buf,
+        stream_state.thinking_buf,
         stream_state.tool_calls,
         stream_state.input_tokens,
         stream_state.output_tokens,
@@ -1763,6 +1774,7 @@ async fn call_llm_stream_ollama(
 
 fn build_llm_response(
     content_buf: String,
+    thinking_buf: String,
     tool_calls: Vec<ToolCall>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -1780,12 +1792,18 @@ fn build_llm_response(
     } else {
         Some(content_buf)
     };
+    let thinking = if thinking_buf.is_empty() {
+        None
+    } else {
+        Some(thinking_buf)
+    };
 
     Ok(LlmResponse {
         message: ChatMessage {
             role: "assistant".into(),
             content,
             images: None,
+            thinking,
             tool_calls: tc,
             tool_call_id: None,
             timestamp: Some(now.as_secs()),

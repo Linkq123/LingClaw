@@ -15,6 +15,7 @@ export interface HistoryMessage {
   name?: string;
   arguments?: string;
   result?: string;
+  thinking?: string;
 }
 
 export type ReactPhase = 'analyze' | 'act' | 'observe' | 'finish' | '';

@@ -1,4 +1,4 @@
-use super::*;
+﻿use super::*;
 
 use std::{collections::HashMap, sync::atomic::AtomicU64};
 
@@ -81,6 +81,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
             role: "system".into(),
             content: Some("system".into()),
             images: None,
+            thinking: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -254,6 +255,7 @@ fn update_llm_response_usage_uses_request_estimate_when_provider_usage_missing()
                 role: "assistant".into(),
                 content: Some("done".into()),
                 images: None,
+                thinking: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -423,6 +425,7 @@ fn update_llm_response_usage_uses_configured_provider_name() {
                 role: "assistant".into(),
                 content: Some("done".into()),
                 images: None,
+                thinking: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,

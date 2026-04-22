@@ -127,6 +127,8 @@ struct ChatMessage {
     content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     images: Option<Vec<ImageAttachment>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -598,6 +600,7 @@ You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools
         role: "system".into(),
         content: Some(prompt),
         images: None,
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -2070,6 +2073,7 @@ async fn api_test_model(
         role: "user".to_string(),
         content: Some("Hi".to_string()),
         images: None,
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,

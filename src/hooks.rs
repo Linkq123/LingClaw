@@ -289,6 +289,7 @@ pub(crate) fn build_auto_summary_message(summary: &str) -> ChatMessage {
             truncate(summary.trim(), AUTO_COMPRESS_SUMMARY_CHAR_LIMIT)
         )),
         images: None,
+        thinking: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: Some(crate::now_epoch()),
@@ -413,6 +414,7 @@ impl AgentHook for AutoCompressContextHook {
                     role: "system".into(),
                     content: Some(system_content.into()),
                     images: None,
+                    thinking: None,
                     tool_calls: None,
                     tool_call_id: None,
                     timestamp: None,
@@ -421,6 +423,7 @@ impl AgentHook for AutoCompressContextHook {
                     role: "user".into(),
                     content: Some(user_content),
                     images: None,
+                    thinking: None,
                     tool_calls: None,
                     tool_call_id: None,
                     timestamp: Some(crate::now_epoch()),
