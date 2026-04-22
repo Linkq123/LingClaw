@@ -1,16 +1,8 @@
 import { dom, state } from '../state.js';
 import { DEFAULT_BRAND_AVATAR, DEFAULT_WELCOME_LOGO } from '../constants.js';
-import { escHtml, formatTime, hideWelcome } from '../utils.js';
+import { formatTime, hideWelcome } from '../utils.js';
 import { scrollDown, queueUnreadContent } from '../scroll.js';
 import { pinReactStatusToBottom } from './react-status.js';
-
-function versionBadgeMarkup(id, extraClass = '') {
-  const className = ['app-version-badge', extraClass].filter(Boolean).join(' ');
-  if (!state.currentAppVersion) {
-    return `<div class="${className}" id="${id}" hidden></div>`;
-  }
-  return `<div class="${className}" id="${id}">v${state.currentAppVersion}</div>`;
-}
 
 function setVersionBadge(el, version) {
   if (!el) return;
@@ -123,8 +115,28 @@ export function renderUserImageThumbnails(msgEl, images) {
   }
 }
 
-function buildDismissButton() {
-  return '<button class="system-dismiss" type="button" data-action="dismiss-system-card" aria-label="Dismiss">×</button>';
+function buildDismissButton(): HTMLButtonElement {
+  const btn = document.createElement('button');
+  btn.className = 'system-dismiss';
+  btn.type = 'button';
+  btn.dataset.action = 'dismiss-system-card';
+  btn.setAttribute('aria-label', 'Dismiss');
+  btn.textContent = '×';
+  return btn;
+}
+
+function buildIconSpan(icon: string): HTMLSpanElement {
+  const span = document.createElement('span');
+  span.className = 'system-icon';
+  span.textContent = icon;
+  return span;
+}
+
+function buildInlineText(text: string): HTMLSpanElement {
+  const span = document.createElement('span');
+  span.className = 'system-inline-text';
+  span.textContent = text;
+  return span;
 }
 
 export function addSystem(t, kind = 'info', options: { dismissible?: boolean } = {}) {
@@ -134,14 +146,27 @@ export function addSystem(t, kind = 'info', options: { dismissible?: boolean } =
   const card = document.createElement('div');
   card.className = 'system-card';
   if (dismissible) card.classList.add('is-dismissible');
-  const icon = kind === 'success' ? '✅' : 'ℹ️';
   if (kind === 'success') card.classList.add('success-card');
+  const icon = kind === 'success' ? '✅' : 'ℹ️';
   const isBlock = t.includes('\n') || t.length > 80;
   if (isBlock) {
-    card.innerHTML = `<div class="system-header"><span class="system-icon">📋</span><span>System</span>${dismissible ? buildDismissButton() : ''}</div><pre class="system-body">${escHtml(t)}</pre>`;
+    const header = document.createElement('div');
+    header.className = 'system-header';
+    header.appendChild(buildIconSpan('📋'));
+    const label = document.createElement('span');
+    label.textContent = 'System';
+    header.appendChild(label);
+    if (dismissible) header.appendChild(buildDismissButton());
+    const body = document.createElement('pre');
+    body.className = 'system-body';
+    body.textContent = t;
+    card.appendChild(header);
+    card.appendChild(body);
   } else {
     card.classList.add('system-inline');
-    card.innerHTML = `<span class="system-icon">${icon}</span><span class="system-inline-text">${escHtml(t)}</span>${dismissible ? buildDismissButton() : ''}`;
+    card.appendChild(buildIconSpan(icon));
+    card.appendChild(buildInlineText(t));
+    if (dismissible) card.appendChild(buildDismissButton());
   }
   row.appendChild(card);
   dom.chat.appendChild(row);
@@ -157,7 +182,9 @@ export function addError(t, options: { dismissible?: boolean } = {}) {
   const card = document.createElement('div');
   card.className = 'system-card system-inline error-card';
   if (dismissible) card.classList.add('is-dismissible');
-  card.innerHTML = `<span class="system-icon">⚠️</span><span class="system-inline-text">${escHtml(t)}</span>${dismissible ? buildDismissButton() : ''}`;
+  card.appendChild(buildIconSpan('⚠️'));
+  card.appendChild(buildInlineText(t));
+  if (dismissible) card.appendChild(buildDismissButton());
   row.appendChild(card);
   dom.chat.appendChild(row);
   queueUnreadContent({ countable: true });
@@ -170,19 +197,58 @@ export function showWelcome() {
   const w = document.createElement('div');
   w.className = 'welcome';
   w.id = 'welcome';
-  w.innerHTML = `
-    <div class="welcome-logo"><img src="${DEFAULT_WELCOME_LOGO}" alt="LingClaw"></div>
-    ${versionBadgeMarkup('app-version-welcome', 'welcome-version')}
-    <div class="welcome-hint">
-      你的私人 AI 助手已就绪<br>
-      输入消息开始对话，或使用 <strong>/</strong> 命令
-    </div>
-    <div class="welcome-shortcuts">
-      <button data-action="cmd" data-cmd="/clear">New Conversation</button>
-      <button data-action="cmd" data-cmd="/status">Status</button>
-      <button data-action="cmd" data-cmd="/help">Help</button>
-    </div>
-  `;
+
+  // welcome-logo
+  const logoDiv = document.createElement('div');
+  logoDiv.className = 'welcome-logo';
+  const logoImg = document.createElement('img');
+  logoImg.src = DEFAULT_WELCOME_LOGO;
+  logoImg.alt = 'LingClaw';
+  logoDiv.appendChild(logoImg);
+
+  // version badge (dynamic — uses textContent, no innerHTML)
+  const versionBadgeClass = ['app-version-badge', 'welcome-version'].join(' ');
+  const versionBadge = document.createElement('div');
+  versionBadge.className = versionBadgeClass;
+  versionBadge.id = 'app-version-welcome';
+  if (state.currentAppVersion) {
+    versionBadge.textContent = `v${state.currentAppVersion}`;
+  } else {
+    versionBadge.hidden = true;
+  }
+
+  // welcome-hint
+  const hint = document.createElement('div');
+  hint.className = 'welcome-hint';
+  hint.appendChild(document.createTextNode('你的私人 AI 助手已就绪'));
+  hint.appendChild(document.createElement('br'));
+  hint.appendChild(document.createTextNode('输入消息开始对话，或使用 '));
+  const slash = document.createElement('strong');
+  slash.textContent = '/';
+  hint.appendChild(slash);
+  hint.appendChild(document.createTextNode(' 命令'));
+
+  // welcome-shortcuts
+  const shortcuts = document.createElement('div');
+  shortcuts.className = 'welcome-shortcuts';
+  const shortcutDefs: Array<[string, string]> = [
+    ['/clear', 'New Conversation'],
+    ['/status', 'Status'],
+    ['/help', 'Help'],
+  ];
+  for (const [cmd, label] of shortcutDefs) {
+    const btn = document.createElement('button');
+    btn.dataset.action = 'cmd';
+    btn.dataset.cmd = cmd;
+    btn.textContent = label;
+    shortcuts.appendChild(btn);
+  }
+
+  w.appendChild(logoDiv);
+  w.appendChild(versionBadge);
+  w.appendChild(hint);
+  w.appendChild(shortcuts);
+
   dom.chat.appendChild(w);
   syncVersionBadges();
 }

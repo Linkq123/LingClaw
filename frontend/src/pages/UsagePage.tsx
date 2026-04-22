@@ -1,24 +1,29 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { UsageData } from '../types/config.js';
 
 // ── Module-level bridge ───────────────────────────────────────────────────────
 
 let _open: (() => void) | null = null;
 let _close: (() => void) | null = null;
+// See note on the same flag in SettingsPage.tsx.
+let pendingOpen = false;
 
 export function openUsagePage(): void {
-  _open?.();
+  if (_open) _open();
+  else pendingOpen = true;
 }
 export function closeUsagePage(): void {
+  pendingOpen = false;
   _close?.();
 }
-export function initUsageListeners(): void {
-  /* no-op: React handles all listeners */
-}
-
 // ── Format helpers ────────────────────────────────────────────────────────────
 
 const ROLE_ORDER = ['Primary', 'Fast', 'Sub-Agent', 'Memory', 'Reflection', 'Context'];
+const RANGE_OPTIONS: ReadonlyArray<{ value: number; label: string }> = [
+  { value: 7, label: '7 days' },
+  { value: 14, label: '14 days' },
+  { value: 30, label: '30 days' },
+];
 const PROVIDER_COLORS = [
   '#2d8bcf',
   '#c06b9e',
@@ -229,6 +234,12 @@ function drawDataLine(
 function DailyChart({ data, days }: { data: UsageData; days: number }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
+  // Memoize the timeline so that unrelated parent re-renders (e.g. range
+  // selector on the sibling chart, loading flag flips) don't force us to
+  // recompute O(days) history lookups. `data` identity is stable between
+  // fetches so depending on the whole object here is correct.
+  const timeline = useMemo(() => buildDailyTimeline(data, days), [data, days]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -249,7 +260,6 @@ function DailyChart({ data, days }: { data: UsageData; days: number }) {
     canvas.style.height = h + 'px';
     ctx.scale(dpr, dpr);
 
-    const timeline = buildDailyTimeline(data, days);
     const padding = { top: 24, right: 20, bottom: 44, left: 60 };
     const chartW = w - padding.left - padding.right;
     const chartH = h - padding.top - padding.bottom;
@@ -325,12 +335,12 @@ function DailyChart({ data, days }: { data: UsageData; days: number }) {
     ctx.fillRect(padding.left + 60, legendY - 6, 10, 3);
     ctx.fillStyle = textColor;
     ctx.fillText('Output', padding.left + 74, legendY);
-  }, [data, days]);
+  }, [timeline]);
 
   return <canvas ref={canvasRef} />;
 }
 
-// ── Provider bar chart ────────────────────────────────────────────────────────
+// ── Provider bar chart ────────────────────────────────────────────
 
 interface ProviderTotals {
   input: number;
@@ -377,6 +387,11 @@ function truncateLabel(name: string, maxChars: number): string {
 function ProviderChart({ data, days }: { data: UsageData; days: number }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
+  // Memoize the aggregated provider totals so the effect only re-runs when
+  // the underlying data actually changes. `data` identity is stable between
+  // fetches so depending on the whole object here is correct.
+  const providerTotals = useMemo(() => buildProviderTotals(data, days), [data, days]);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -397,7 +412,6 @@ function ProviderChart({ data, days }: { data: UsageData; days: number }) {
     canvas.style.height = h + 'px';
     ctx.scale(dpr, dpr);
 
-    const providerTotals = buildProviderTotals(data, days);
     const providers = Object.keys(providerTotals).sort();
 
     const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
@@ -491,7 +505,7 @@ function ProviderChart({ data, days }: { data: UsageData; days: number }) {
     ctx.globalAlpha = 1;
     ctx.fillStyle = textColor;
     ctx.fillText('Output', padding.left + 74, legendY);
-  }, [data, days]);
+  }, [providerTotals]);
 
   return <canvas ref={canvasRef} />;
 }
@@ -509,6 +523,10 @@ export function UsagePage() {
   useEffect(() => {
     _open = () => setVisible(true);
     _close = () => setVisible(false);
+    if (pendingOpen) {
+      pendingOpen = false;
+      setVisible(true);
+    }
     return () => {
       _open = null;
       _close = null;
@@ -521,49 +539,40 @@ export function UsagePage() {
     if (el) el.hidden = !visible;
   }, [visible]);
 
-  useEffect(() => {
-    if (!visible) return;
-    const controller = new AbortController();
-    (async () => {
-      setLoading(true);
-      setError('');
-      try {
-        const resp = await fetch('/api/usage', { signal: controller.signal });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const data: UsageData = await resp.json();
-        setUsageData(data);
-      } catch (e: unknown) {
-        if ((e as Error).name === 'AbortError') return;
-        setError(`Failed to load usage data: ${(e as Error).message}`);
-      } finally {
-        if (!controller.signal.aborted) setLoading(false);
-      }
-    })();
-    return () => controller.abort();
-  }, [visible]);
-
-  const refreshUsage = useCallback(async () => {
+  // Shared loader: used by both the visibility effect and the manual refresh
+  // button. Accepts an optional AbortSignal so the visibility effect can cancel
+  // in-flight requests when the overlay closes mid-load.
+  const loadUsage = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
     setError('');
     try {
-      const resp = await fetch('/api/usage');
+      const resp = await fetch('/api/usage', signal ? { signal } : undefined);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data: UsageData = await resp.json();
       setUsageData(data);
     } catch (e: unknown) {
+      if ((e as Error).name === 'AbortError') return;
       setError(`Failed to load usage data: ${(e as Error).message}`);
     } finally {
-      setLoading(false);
+      if (!signal || !signal.aborted) setLoading(false);
     }
   }, []);
 
+  useEffect(() => {
+    if (!visible) return;
+    const controller = new AbortController();
+    void loadUsage(controller.signal);
+    return () => controller.abort();
+  }, [visible, loadUsage]);
+
+  const refreshUsage = useCallback(() => {
+    void loadUsage();
+  }, [loadUsage]);
+
   if (!visible) return null;
 
-  const rangeOptions = [
-    { value: 7, label: '7 days' },
-    { value: 14, label: '14 days' },
-    { value: 30, label: '30 days' },
-  ];
+  // Note: RANGE_OPTIONS lives at module scope to keep a stable reference
+  // across renders.
 
   // Render inside #usage-page overlay (panel content only)
   return (
@@ -607,7 +616,7 @@ export function UsagePage() {
                     value={dailyRange}
                     onChange={(e) => setDailyRange(Number(e.target.value))}
                   >
-                    {rangeOptions.map((o) => (
+                    {RANGE_OPTIONS.map((o) => (
                       <option key={o.value} value={o.value}>
                         {o.label}
                       </option>
@@ -626,7 +635,7 @@ export function UsagePage() {
                     value={providerRange}
                     onChange={(e) => setProviderRange(Number(e.target.value))}
                   >
-                    {rangeOptions.map((o) => (
+                    {RANGE_OPTIONS.map((o) => (
                       <option key={o.value} value={o.value}>
                         {o.label}
                       </option>

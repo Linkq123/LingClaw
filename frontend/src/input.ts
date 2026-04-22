@@ -5,6 +5,9 @@ import { syncToolDrawerBounds, scrollDown } from './scroll.js';
 import { addMsg, addSystem, setBusy, renderUserImageThumbnails } from './renderers/chat.js';
 import { renderImagePreviews } from './images.js';
 
+// Guard: prevent double-registration on Vite HMR re-execution of main.ts.
+let _listenerInit = false;
+
 export function send() {
   if (!state.ws || state.ws.readyState !== 1) return;
 
@@ -75,6 +78,8 @@ export function sendCmd(cmd) {
 }
 
 export function initInputListeners() {
+  if (_listenerInit) return;
+  _listenerInit = true;
   dom.input.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();

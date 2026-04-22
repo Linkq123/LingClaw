@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import type { AppConfig, McpServerConfig, S3Config } from '../types/config.js';
 import type { ConfigApiResponse } from '../types/config.js';
 import {
@@ -22,17 +22,19 @@ import type { ModelFormEntry, ProviderFormData } from './settingsModels.js';
 
 let _open: (() => void) | null = null;
 let _close: (() => void) | null = null;
+// When the module is loaded lazily, the React component hasn't mounted yet
+// the first time `openSettingsPage` is called. Remember the intent so the
+// component can honour it as soon as its mount effect runs.
+let pendingOpen = false;
 
 export function openSettingsPage(): void {
-  _open?.();
+  if (_open) _open();
+  else pendingOpen = true;
 }
 export function closeSettingsPage(): void {
+  pendingOpen = false;
   _close?.();
 }
-export function initSettingsListeners(): void {
-  /* no-op: React handles all listeners */
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 type TriBool = boolean | undefined;
@@ -56,6 +58,17 @@ function numInputToValue(s: string): number | undefined {
   return isNaN(n) ? undefined : n;
 }
 
+// Stable role list — extracted to module scope to preserve referential identity
+// across AgentsTab renders (prevents unnecessary ModelSelect re-renders).
+const AGENT_ROLES: ReadonlyArray<{ key: string; label: string }> = [
+  { key: 'primary', label: 'Primary' },
+  { key: 'fast', label: 'Fast' },
+  { key: 'sub-agent', label: 'Sub-Agent' },
+  { key: 'memory', label: 'Memory' },
+  { key: 'reflection', label: 'Reflection' },
+  { key: 'context', label: 'Context' },
+];
+
 function SettingsRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div className="settings-row">
@@ -78,7 +91,7 @@ function TriSelect({ value, onChange }: { value: TriBool; onChange: (v: TriBool)
   );
 }
 
-function ModelSelect({
+const ModelSelect = React.memo(function ModelSelect({
   value,
   options,
   onChange,
@@ -100,7 +113,35 @@ function ModelSelect({
       {v && !includesValue && <option value={v}>{v} (custom)</option>}
     </select>
   );
+});
+
+// Per-role row wrapping ModelSelect. Memoized so editing one agent-model field
+// doesn't force the other five rows to re-render. `handleChange` is stabilised
+// via useCallback so ModelSelect's own memo can also bail out.
+function AgentRoleRowInner({
+  roleKey,
+  label,
+  value,
+  options,
+  onSetModel,
+}: {
+  roleKey: string;
+  label: string;
+  value: string | undefined;
+  options: string[];
+  onSetModel: (key: string, val: string) => void;
+}) {
+  const handleChange = useCallback(
+    (val: string) => onSetModel(roleKey, val),
+    [onSetModel, roleKey],
+  );
+  return (
+    <SettingsRow label={label}>
+      <ModelSelect value={value} options={options} onChange={handleChange} />
+    </SettingsRow>
+  );
 }
+const AgentRoleRow = React.memo(AgentRoleRowInner);
 
 // ── General Tab ───────────────────────────────────────────────────────────────
 
@@ -215,28 +256,29 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
 
 function AgentsTab({ config, onChange }: { config: AppConfig; onChange: (c: AppConfig) => void }) {
   const model = config.agents?.defaults?.model || {};
-  const providers = config.models?.providers || {};
-  const allModels = buildModelOptions(providers);
+  const providersRaw = config.models?.providers;
+  // Stabilise the providers reference so downstream memoization deps are stable.
+  const providers = useMemo(() => providersRaw || {}, [providersRaw]);
+  // Memoize the flattened provider/model list so that typing into other
+  // fields doesn't recompute this on every keystroke.
+  const allModels = useMemo(() => buildModelOptions(providers), [providers]);
 
-  const setModel = (key: string, val: string) => {
-    const newModel = { ...model, [key]: val || undefined };
-    onChange({
-      ...config,
-      agents: {
-        ...config.agents,
-        defaults: { ...(config.agents?.defaults || {}), model: newModel },
-      },
-    });
-  };
-
-  const roles: Array<{ key: string; label: string }> = [
-    { key: 'primary', label: 'Primary' },
-    { key: 'fast', label: 'Fast' },
-    { key: 'sub-agent', label: 'Sub-Agent' },
-    { key: 'memory', label: 'Memory' },
-    { key: 'reflection', label: 'Reflection' },
-    { key: 'context', label: 'Context' },
-  ];
+  // Stable callback so AgentRoleRow.memo can bail out when the config hasn't
+  // changed. Reads model from config at call time to avoid stale captures.
+  const setModel = useCallback(
+    (key: string, val: string) => {
+      const m = (config.agents?.defaults?.model || {}) as Record<string, string | undefined>;
+      const newModel = { ...m, [key]: val || undefined };
+      onChange({
+        ...config,
+        agents: {
+          ...config.agents,
+          defaults: { ...(config.agents?.defaults || {}), model: newModel },
+        },
+      });
+    },
+    [config, onChange],
+  );
 
   return (
     <div className="settings-group">
@@ -245,14 +287,15 @@ function AgentsTab({ config, onChange }: { config: AppConfig; onChange: (c: AppC
         Models must reference a provider configured in the Models tab (format:{' '}
         <code>provider/model-id</code>).
       </p>
-      {roles.map(({ key, label }) => (
-        <SettingsRow key={key} label={label}>
-          <ModelSelect
-            value={(model as Record<string, string | undefined>)[key]}
-            options={allModels}
-            onChange={(val) => setModel(key, val)}
-          />
-        </SettingsRow>
+      {AGENT_ROLES.map(({ key, label }) => (
+        <AgentRoleRow
+          key={key}
+          roleKey={key}
+          label={label}
+          value={(model as Record<string, string | undefined>)[key]}
+          options={allModels}
+          onSetModel={setModel}
+        />
       ))}
     </div>
   );
@@ -391,7 +434,7 @@ function ModelEntryRow({
   );
 }
 
-function ProviderCard({
+function ProviderCardInner({
   prov,
   onChange,
   onDelete,
@@ -399,7 +442,7 @@ function ProviderCard({
 }: {
   prov: ProviderFormData;
   onChange: (p: ProviderFormData) => void;
-  onDelete: () => void;
+  onDelete: (rowKey: string) => void;
   onTest: (p: ProviderFormData, modelId: string) => void;
 }) {
   const addModel = () => {
@@ -458,7 +501,11 @@ function ProviderCard({
           <button className={testBtnClass} onClick={() => onTest(prov, prov.selectedTestModel)}>
             {prov.testLabel}
           </button>
-          <button className="btn-danger-sm" title="Delete provider" onClick={onDelete}>
+          <button
+            className="btn-danger-sm"
+            title="Delete provider"
+            onClick={() => onDelete(prov._key)}
+          >
             ✕
           </button>
         </div>
@@ -507,6 +554,11 @@ function ProviderCard({
   );
 }
 
+// Memoize so that editing a different provider doesn't re-render this card.
+// The `onChange`/`onDelete`/`onTest` props are held stable by the parent via
+// `useCallback`, so a default shallow compare is sufficient.
+const ProviderCard = React.memo(ProviderCardInner);
+
 function ModelsTab({
   config,
   onChange,
@@ -526,6 +578,7 @@ function ModelsTab({
   const [jsonError, setJsonError] = useState('');
   const [jsonDirty, setJsonDirty] = useState(false);
   const [formDirty, setFormDirty] = useState(false);
+  const providerResetTimersRef = useRef<Map<string, number>>(new Map());
 
   // When external config changes (e.g. JSON apply), re-sync form state
   useEffect(() => {
@@ -537,17 +590,51 @@ function ModelsTab({
     setFormDirty(false);
   }, [config.models]);
 
-  const updateProvider = (i: number, p: ProviderFormData) => {
-    const next = [...providers];
-    next[i] = p;
-    setProviders(next);
-    setFormDirty(true);
-  };
+  useEffect(() => {
+    const resetTimers = providerResetTimersRef.current;
+    return () => {
+      for (const timeoutId of resetTimers.values()) {
+        window.clearTimeout(timeoutId);
+      }
+      resetTimers.clear();
+    };
+  }, []);
 
-  const deleteProvider = (i: number) => {
-    setProviders(providers.filter((_, j) => j !== i));
+  const clearProviderReset = useCallback((rowKey: string) => {
+    const timeoutId = providerResetTimersRef.current.get(rowKey);
+    if (timeoutId !== undefined) {
+      window.clearTimeout(timeoutId);
+      providerResetTimersRef.current.delete(rowKey);
+    }
+  }, []);
+
+  const scheduleProviderReset = useCallback(
+    (rowKey: string) => {
+      clearProviderReset(rowKey);
+      const timeoutId = window.setTimeout(() => {
+        providerResetTimersRef.current.delete(rowKey);
+        setProviders((prev) =>
+          prev.map((p) => (p._key === rowKey ? { ...p, testState: 'idle', testLabel: 'Test' } : p)),
+        );
+      }, 4000);
+      providerResetTimersRef.current.set(rowKey, timeoutId);
+    },
+    [clearProviderReset],
+  );
+
+  const updateProvider = useCallback((p: ProviderFormData) => {
+    setProviders((prev) => prev.map((old) => (old._key === p._key ? p : old)));
     setFormDirty(true);
-  };
+  }, []);
+
+  const deleteProvider = useCallback(
+    (rowKey: string) => {
+      clearProviderReset(rowKey);
+      setProviders((prev) => prev.filter((p) => p._key !== rowKey));
+      setFormDirty(true);
+    },
+    [clearProviderReset],
+  );
 
   const addProvider = () => {
     const name = prompt('Enter provider name:');
@@ -585,45 +672,48 @@ function ModelsTab({
     }
   };
 
-  const testProvider = async (prov: ProviderFormData, modelId: string) => {
-    if (!modelId) {
-      onStatus('No model selected', 'error');
-      return;
-    }
-    const i = providers.indexOf(prov);
-    const setTest = (state: string, label: string) => {
-      const next = [...providers];
-      next[i] = { ...prov, testState: state as ProviderFormData['testState'], testLabel: label };
-      setProviders(next);
-    };
-    setTest('testing', 'Testing...');
-    try {
-      const resp = await fetch('/api/config/test-model', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          baseUrl: prov.baseUrl,
-          apiKey: prov.apiKey,
-          api: prov.api || 'openai-completions',
-          modelId,
-        }),
-      });
-      const data = await resp.json();
-      if (data.ok) setTest('ok', '✓ Connected');
-      else {
-        setTest('fail', '✗ Failed');
-        onStatus(data.error || 'Connection failed', 'error');
+  const testProvider = useCallback(
+    async (prov: ProviderFormData, modelId: string) => {
+      if (!modelId) {
+        onStatus('No model selected', 'error');
+        return;
       }
-    } catch (e: unknown) {
-      setTest('fail', '✗ Error');
-      onStatus((e as Error).message, 'error');
-    }
-    setTimeout(() => {
-      setProviders((prev) =>
-        prev.map((p, j) => (j === i ? { ...p, testState: 'idle', testLabel: 'Test' } : p)),
-      );
-    }, 4000);
-  };
+      // Match by stable row key so delayed resets cannot hit a newly recreated
+      // provider with the same name.
+      const applyResult = (state: ProviderFormData['testState'], label: string) => {
+        setProviders((prev) =>
+          prev.map((p) =>
+            p._key === prov._key ? { ...p, testState: state, testLabel: label } : p,
+          ),
+        );
+      };
+      clearProviderReset(prov._key);
+      applyResult('testing', 'Testing...');
+      try {
+        const resp = await fetch('/api/config/test-model', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            baseUrl: prov.baseUrl,
+            apiKey: prov.apiKey,
+            api: prov.api || 'openai-completions',
+            modelId,
+          }),
+        });
+        const data = await resp.json();
+        if (data.ok) applyResult('ok', '✓ Connected');
+        else {
+          applyResult('fail', '✗ Failed');
+          onStatus(data.error || 'Connection failed', 'error');
+        }
+      } catch (e: unknown) {
+        applyResult('fail', '✗ Error');
+        onStatus((e as Error).message, 'error');
+      }
+      scheduleProviderReset(prov._key);
+    },
+    [clearProviderReset, onStatus, scheduleProviderReset],
+  );
 
   // Expose providers → parent config on mount and whenever providers change
   // (parent calls collectModels on save)
@@ -638,12 +728,12 @@ function ModelsTab({
 
   return (
     <>
-      {providers.map((prov, i) => (
+      {providers.map((prov) => (
         <ProviderCard
-          key={prov.name}
+          key={prov._key}
           prov={prov}
-          onChange={(p) => updateProvider(i, p)}
-          onDelete={() => deleteProvider(i)}
+          onChange={updateProvider}
+          onDelete={deleteProvider}
           onTest={testProvider}
         />
       ))}
@@ -678,14 +768,23 @@ function ModelsTab({
 // ── MCP Tab ───────────────────────────────────────────────────────────────────
 
 interface McpFormEntry extends McpServerConfig {
+  _key: string;
   name: string;
   _argsText: string; // textarea, one per line
   testState: 'idle' | 'testing' | 'ok' | 'fail';
   testLabel: string;
 }
 
-function newMcpForm(name: string, s: McpServerConfig = {}): McpFormEntry {
+let mcpFormKeyCounter = 0;
+
+function nextMcpFormKey(name: string): string {
+  mcpFormKeyCounter += 1;
+  return `${name}-${mcpFormKeyCounter}`;
+}
+
+function newMcpForm(name: string, s: McpServerConfig = {}, previous?: McpFormEntry): McpFormEntry {
   return {
+    _key: previous?._key || nextMcpFormKey(name),
     name,
     command: s.command || '',
     _argsText: (s.args || []).join('\n'),
@@ -693,12 +792,23 @@ function newMcpForm(name: string, s: McpServerConfig = {}): McpFormEntry {
     timeoutSecs: s.timeoutSecs,
     enabled: s.enabled !== false,
     env: { ...(s.env || {}) },
-    testState: 'idle',
-    testLabel: 'Test',
+    testState: previous?.testState || 'idle',
+    testLabel: previous?.testLabel || 'Test',
   };
 }
 
-function McpServerCard({
+function buildMcpForms(
+  servers: Record<string, McpServerConfig> | undefined,
+  previousForms: McpFormEntry[] = [],
+): McpFormEntry[] {
+  const previousByName = new Map(previousForms.map((server) => [server.name, server]));
+
+  return Object.entries(servers || {})
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([name, server]) => newMcpForm(name, server, previousByName.get(name)));
+}
+
+function McpServerCardInner({
   server,
   onChange,
   onDelete,
@@ -706,7 +816,7 @@ function McpServerCard({
 }: {
   server: McpFormEntry;
   onChange: (s: McpFormEntry) => void;
-  onDelete: () => void;
+  onDelete: (rowKey: string) => void;
   onTest: (s: McpFormEntry) => void;
 }) {
   const [newEnvKey, setNewEnvKey] = useState('');
@@ -758,7 +868,11 @@ function McpServerCard({
           <button className={testBtnClass} onClick={() => onTest(server)}>
             {server.testLabel}
           </button>
-          <button className="btn-danger-sm" title="Delete server" onClick={onDelete}>
+          <button
+            className="btn-danger-sm"
+            title="Delete server"
+            onClick={() => onDelete(server._key)}
+          >
             ✕
           </button>
         </div>
@@ -857,6 +971,9 @@ function McpServerCard({
   );
 }
 
+// Memoize so that editing one MCP card doesn't re-render all the others.
+const McpServerCard = React.memo(McpServerCardInner);
+
 function McpTab({
   config,
   onChange,
@@ -866,29 +983,53 @@ function McpTab({
   onChange: (c: AppConfig) => void;
   onStatus: (msg: string, type?: string) => void;
 }) {
-  const [servers, setServers] = useState<McpFormEntry[]>(() => {
-    const s = config.mcpServers || {};
-    return Object.entries(s)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([n, sv]) => newMcpForm(n, sv));
-  });
+  const [servers, setServers] = useState<McpFormEntry[]>(() => buildMcpForms(config.mcpServers));
   const [jsonText, setJsonText] = useState(() => JSON.stringify(config.mcpServers || {}, null, 2));
   const [jsonError, setJsonError] = useState('');
   const [jsonDirty, setJsonDirty] = useState(false);
   const [formDirty, setFormDirty] = useState(false);
+  const mcpResetTimersRef = useRef<Map<string, number>>(new Map());
 
   useEffect(() => {
     const s = config.mcpServers || {};
-    setServers(
-      Object.entries(s)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([n, sv]) => newMcpForm(n, sv)),
-    );
+    setServers((previousServers) => buildMcpForms(s, previousServers));
     setJsonText(JSON.stringify(config.mcpServers || {}, null, 2));
     setJsonError('');
     setJsonDirty(false);
     setFormDirty(false);
   }, [config.mcpServers]);
+
+  useEffect(() => {
+    const resetTimers = mcpResetTimersRef.current;
+    return () => {
+      for (const timeoutId of resetTimers.values()) {
+        window.clearTimeout(timeoutId);
+      }
+      resetTimers.clear();
+    };
+  }, []);
+
+  const clearMcpReset = useCallback((rowKey: string) => {
+    const timeoutId = mcpResetTimersRef.current.get(rowKey);
+    if (timeoutId !== undefined) {
+      window.clearTimeout(timeoutId);
+      mcpResetTimersRef.current.delete(rowKey);
+    }
+  }, []);
+
+  const scheduleMcpReset = useCallback(
+    (rowKey: string) => {
+      clearMcpReset(rowKey);
+      const timeoutId = window.setTimeout(() => {
+        mcpResetTimersRef.current.delete(rowKey);
+        setServers((prev) =>
+          prev.map((s) => (s._key === rowKey ? { ...s, testState: 'idle', testLabel: 'Test' } : s)),
+        );
+      }, 4000);
+      mcpResetTimersRef.current.set(rowKey, timeoutId);
+    },
+    [clearMcpReset],
+  );
 
   const addServer = () => {
     const name = prompt('Enter MCP server name:');
@@ -913,17 +1054,19 @@ function McpTab({
     setFormDirty(true);
   };
 
-  const updateServer = (i: number, s: McpFormEntry) => {
-    const next = [...servers];
-    next[i] = s;
-    setServers(next);
+  const updateServer = useCallback((s: McpFormEntry) => {
+    setServers((prev) => prev.map((old) => (old._key === s._key ? s : old)));
     setFormDirty(true);
-  };
+  }, []);
 
-  const deleteServer = (i: number) => {
-    setServers(servers.filter((_, j) => j !== i));
-    setFormDirty(true);
-  };
+  const deleteServer = useCallback(
+    (rowKey: string) => {
+      clearMcpReset(rowKey);
+      setServers((prev) => prev.filter((s) => s._key !== rowKey));
+      setFormDirty(true);
+    },
+    [clearMcpReset],
+  );
 
   const applyJson = () => {
     if (formDirty) {
@@ -949,55 +1092,56 @@ function McpTab({
     }
   };
 
-  const testServer = async (sv: McpFormEntry) => {
-    const i = servers.indexOf(sv);
-    const setTest = (state: string, label: string) => {
-      const next = [...servers];
-      next[i] = { ...sv, testState: state as McpFormEntry['testState'], testLabel: label };
-      setServers(next);
-    };
-    setTest('testing', 'Testing...');
-    try {
-      const args = sv._argsText
-        .split('\n')
-        .map((a) => a.trim())
-        .filter(Boolean);
-      if (sv.cwd) {
-        try {
-          validateMcpCwdValue(sv.cwd);
-        } catch (e: unknown) {
-          onStatus((e as Error).message, 'error');
-          setTest('idle', 'Test');
-          return;
+  const testServer = useCallback(
+    async (sv: McpFormEntry) => {
+      // Update by stable row key so delayed resets cannot hit a newly recreated
+      // server with the same name.
+      const applyState = (state: McpFormEntry['testState'], label: string) => {
+        setServers((prev) =>
+          prev.map((s) => (s._key === sv._key ? { ...s, testState: state, testLabel: label } : s)),
+        );
+      };
+      clearMcpReset(sv._key);
+      applyState('testing', 'Testing...');
+      try {
+        const args = sv._argsText
+          .split('\n')
+          .map((a) => a.trim())
+          .filter(Boolean);
+        if (sv.cwd) {
+          try {
+            validateMcpCwdValue(sv.cwd);
+          } catch (e: unknown) {
+            onStatus((e as Error).message, 'error');
+            applyState('idle', 'Test');
+            return;
+          }
         }
+        const resp = await fetch('/api/config/test-mcp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            command: sv.command,
+            args,
+            env: sv.env,
+            cwd: sv.cwd || undefined,
+            timeoutSecs: sv.timeoutSecs,
+          }),
+        });
+        const data = await resp.json();
+        if (data.ok) applyState('ok', `✓ ${data.tools} tools`);
+        else {
+          applyState('fail', '✗ Failed');
+          if (data.error) onStatus(data.error, 'error');
+        }
+      } catch (e: unknown) {
+        applyState('fail', '✗ Error');
+        onStatus((e as Error).message, 'error');
       }
-      const resp = await fetch('/api/config/test-mcp', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          command: sv.command,
-          args,
-          env: sv.env,
-          cwd: sv.cwd || undefined,
-          timeoutSecs: sv.timeoutSecs,
-        }),
-      });
-      const data = await resp.json();
-      if (data.ok) setTest('ok', `✓ ${data.tools} tools`);
-      else {
-        setTest('fail', '✗ Failed');
-        if (data.error) onStatus(data.error, 'error');
-      }
-    } catch (e: unknown) {
-      setTest('fail', '✗ Error');
-      onStatus((e as Error).message, 'error');
-    }
-    setTimeout(() => {
-      setServers((prev) =>
-        prev.map((s, j) => (j === i ? { ...s, testState: 'idle', testLabel: 'Test' } : s)),
-      );
-    }, 4000);
-  };
+      scheduleMcpReset(sv._key);
+    },
+    [clearMcpReset, onStatus, scheduleMcpReset],
+  );
 
   // Propagate form state to parent config
   useEffect(() => {
@@ -1026,12 +1170,12 @@ function McpTab({
 
   return (
     <>
-      {servers.map((sv, i) => (
+      {servers.map((sv) => (
         <McpServerCard
-          key={sv.name}
+          key={sv._key}
           server={sv}
-          onChange={(s) => updateServer(i, s)}
-          onDelete={() => deleteServer(i)}
+          onChange={updateServer}
+          onDelete={deleteServer}
           onTest={testServer}
         />
       ))}
@@ -1181,9 +1325,18 @@ function CorruptConfigView({
         return;
       }
       onStatus('Saved! Reloading...', 'success');
-      setTimeout(async () => {
-        const r2 = await fetch('/api/config');
-        onReloaded(await r2.json());
+      setTimeout(() => {
+        fetch('/api/config')
+          .then((r2) => {
+            if (!r2.ok) throw new Error(`HTTP ${r2.status}`);
+            return r2.json();
+          })
+          .then((reloaded: ConfigApiResponse) => onReloaded(reloaded))
+          .catch(() => {
+            // Reload failed (network error or non-2xx response); config was
+            // saved but the UI may be stale.
+            onStatus('Save succeeded but reload failed. Close and reopen Settings.', 'error');
+          });
       }, 600);
     } catch (e: unknown) {
       onStatus(`Save failed: ${(e as Error).message}`, 'error');
@@ -1238,6 +1391,11 @@ export function SettingsPage() {
   useEffect(() => {
     _open = () => setVisible(true);
     _close = () => setVisible(false);
+    // Honour any open request that arrived before the lazy chunk finished loading.
+    if (pendingOpen) {
+      pendingOpen = false;
+      setVisible(true);
+    }
     return () => {
       _open = null;
       _close = null;

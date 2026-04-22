@@ -1,6 +1,9 @@
 import { dom, state } from './state.js';
 import { addSystem } from './renderers/chat.js';
 
+// Guard: prevent double-registration on Vite HMR re-execution of main.ts.
+let _listenerInit = false;
+
 // ── Upload token ──
 
 export async function ensureUploadToken() {
@@ -255,6 +258,8 @@ export function renderImagePreviews() {
 }
 
 export function initImageListeners() {
+  if (_listenerInit) return;
+  _listenerInit = true;
   if (dom.attachBtn)
     dom.attachBtn.addEventListener('click', (e) => {
       e.stopPropagation();

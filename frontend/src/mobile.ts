@@ -17,7 +17,12 @@ export function closeMobileMenu() {
   syncMobileMenuAria(false);
 }
 
+// Guard: prevent double-registration on Vite HMR re-execution of main.ts.
+let _listenerInit = false;
+
 export function initMobileListeners() {
+  if (_listenerInit) return;
+  _listenerInit = true;
   document.addEventListener('click', (e) => {
     const toggle = document.getElementById('mobile-menu-toggle');
     const menu = document.getElementById('mobile-menu');

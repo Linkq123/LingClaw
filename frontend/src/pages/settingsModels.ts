@@ -6,6 +6,7 @@ export interface ModelFormEntry extends ModelEntry {
 }
 
 export interface ProviderFormData {
+  _key: string;
   name: string;
   api: string;
   baseUrl: string;
@@ -17,7 +18,13 @@ export interface ProviderFormData {
   [key: string]: unknown;
 }
 
+let providerFormKeyCounter = 0;
 let modelFormKeyCounter = 0;
+
+function nextProviderFormKey(name: string): string {
+  providerFormKeyCounter += 1;
+  return `${name}-${providerFormKeyCounter}`;
+}
 
 function nextModelFormKey(providerName: string): string {
   modelFormKeyCounter += 1;
@@ -55,6 +62,7 @@ export function createProviderForm(
 
   return {
     ...(provider as Record<string, unknown>),
+    _key: previous?._key || nextProviderFormKey(name),
     name,
     api: provider.api || 'openai-completions',
     baseUrl: provider.baseUrl ?? '',
@@ -81,6 +89,7 @@ export function serializeProviderForms(providers: ProviderFormData[]): AppConfig
   const nextProviders: Record<string, ProviderConfig> = {};
   for (const provider of providers) {
     const {
+      _key,
       name,
       models: providerModels,
       testState,
@@ -88,6 +97,7 @@ export function serializeProviderForms(providers: ProviderFormData[]): AppConfig
       selectedTestModel,
       ...rest
     } = provider;
+    void _key;
     void testState;
     void testLabel;
     void selectedTestModel;

@@ -105,23 +105,19 @@ import {
 import {
   openSettingsPage,
   closeSettingsPage,
-  initSettingsListeners,
-  SettingsPage,
-} from './pages/SettingsPage.js';
-import { openUsagePage, closeUsagePage, initUsageListeners, UsagePage } from './pages/UsagePage.js';
+  openUsagePage,
+  closeUsagePage,
+  prefetchPageChunks,
+} from './pages/lazy.js';
 import { closeOverlayById } from './pages/overlay.js';
 import { buildHistoryReasoningPanel } from './renderers/reasoning.js';
-import { createRoot } from 'react-dom/client';
-import React from 'react';
 
 // ── Initialize DOM ──
 initDomRefs();
 
-// ── Mount React islands ──
-const settingsEl = document.getElementById('settings-page');
-if (settingsEl) createRoot(settingsEl).render(React.createElement(SettingsPage));
-const usageEl = document.getElementById('usage-page');
-if (usageEl) createRoot(usageEl).render(React.createElement(UsagePage));
+// React islands (Settings & Usage) are now code-split and mounted lazily on
+// first `openSettingsPage()` / `openUsagePage()` call. We also prefetch them
+// during idle time so the first open is instant.
 
 // ── Markdown setup ──
 marked.use(
@@ -448,7 +444,9 @@ function handleMessage(data) {
       clearReactStatus();
       clearBufferedChatUpdates();
       setAutoFollowChat(true);
-      dom.chat.innerHTML = '';
+      // replaceChildren() avoids the extra HTML parser invocation of
+      // `innerHTML = ''` and is slightly friendlier to GC on large chats.
+      dom.chat.replaceChildren();
       state.deferredHistory = [];
       state.activeSubagentPanels.clear();
       state.activeOrchestrations.clear();
@@ -850,7 +848,12 @@ const actionHandlers = {
   'orchestrate-copy-summary': (el) => copyOrchestrateSummary(el),
 };
 
-document.addEventListener('click', (e) => {
+// ── Named global listeners ───────────────────────────────────────────────────
+// Named so we can remove them in HMR `dispose` hooks and keep the set of
+// active listeners bounded across hot reloads. (In production the page owns
+// them for its entire lifetime.)
+
+function handleDocumentClick(e: MouseEvent) {
   const target = e.target;
   if (!(target instanceof Element)) return;
 
@@ -867,7 +870,40 @@ document.addEventListener('click', (e) => {
   const action = (el as HTMLElement).dataset.action;
   const handler = action ? actionHandlers[action] : null;
   if (handler) handler(el);
-});
+}
+
+function handleDocumentKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape') {
+    closeToolDrawer();
+    closeMobileMenu();
+    closeSettingsPage();
+    closeUsagePage();
+  }
+}
+
+function handleWindowResizeMenu() {
+  if (window.innerWidth > 768) closeMobileMenu();
+}
+
+function handleJumpToLatestClick() {
+  jumpToLatest();
+}
+
+// Throttle the chat scroll handler to one invocation per animation frame.
+// `scroll` fires at device refresh rate on fast wheels/touchpads; running
+// `syncChatScrollState` every single event produced redundant state writes
+// and jump-to-latest button re-renders. rAF collapses bursts into a single
+// update per frame without adding perceptible latency.
+let scrollSyncRafId = 0;
+function handleChatScroll() {
+  if (scrollSyncRafId) return;
+  scrollSyncRafId = requestAnimationFrame(() => {
+    scrollSyncRafId = 0;
+    syncChatScrollState();
+  });
+}
+
+document.addEventListener('click', handleDocumentClick);
 
 // ── Init ──
 updateViewToggleButtons();
@@ -877,37 +913,42 @@ updateJumpToLatestVisibility();
 initImageListeners();
 initInputListeners();
 initMobileListeners();
-initSettingsListeners();
-initUsageListeners();
 
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    closeToolDrawer();
-    closeMobileMenu();
-    closeSettingsPage();
-    closeUsagePage();
-  }
-});
-dom.chat.addEventListener(
-  'scroll',
-  () => {
-    syncChatScrollState();
-  },
-  { passive: true },
-);
+document.addEventListener('keydown', handleDocumentKeydown);
+dom.chat.addEventListener('scroll', handleChatScroll, { passive: true });
 window.addEventListener('resize', syncToolDrawerBounds);
-window.addEventListener('resize', () => {
-  if (window.innerWidth > 768) closeMobileMenu();
-});
+window.addEventListener('resize', handleWindowResizeMenu);
 if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', syncToolDrawerBounds);
   window.visualViewport.addEventListener('scroll', syncToolDrawerBounds);
 }
 if (dom.jumpToLatestBtn) {
-  dom.jumpToLatestBtn.addEventListener('click', () => {
-    jumpToLatest();
+  dom.jumpToLatestBtn.addEventListener('click', handleJumpToLatestClick);
+}
+
+// Vite HMR: remove global listeners on module dispose so hot reloads don't
+// accumulate duplicate handlers in the dev build. No-op in production.
+if (import.meta.hot) {
+  import.meta.hot.dispose(() => {
+    if (scrollSyncRafId) {
+      cancelAnimationFrame(scrollSyncRafId);
+      scrollSyncRafId = 0;
+    }
+    document.removeEventListener('click', handleDocumentClick);
+    document.removeEventListener('keydown', handleDocumentKeydown);
+    dom.chat.removeEventListener('scroll', handleChatScroll);
+    window.removeEventListener('resize', syncToolDrawerBounds);
+    window.removeEventListener('resize', handleWindowResizeMenu);
+    if (window.visualViewport) {
+      window.visualViewport.removeEventListener('resize', syncToolDrawerBounds);
+      window.visualViewport.removeEventListener('scroll', syncToolDrawerBounds);
+    }
+    if (dom.jumpToLatestBtn) {
+      dom.jumpToLatestBtn.removeEventListener('click', handleJumpToLatestClick);
+    }
   });
 }
 
 void loadAppVersion();
 connect(handleMessage);
+prefetchPageChunks();

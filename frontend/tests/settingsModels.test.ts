@@ -8,6 +8,53 @@ import {
 } from '../src/pages/settingsModels.js';
 
 describe('settings model helpers', () => {
+  it('preserves provider row keys when provider forms are rehydrated', () => {
+    const initial = buildProviderForms({
+      openai: {
+        api: 'openai-completions',
+        baseUrl: 'https://api.openai.com/v1',
+        apiKey: 'sk-test',
+        models: [{ id: 'gpt-4o-mini', input: ['text'] }],
+      },
+    });
+
+    const originalKey = initial[0]._key;
+    const updated = buildProviderForms(
+      {
+        openai: {
+          api: 'openai-completions',
+          baseUrl: 'https://api.openai.com/v1',
+          apiKey: 'sk-test',
+          models: [{ id: 'gpt-4.1-mini', input: ['text'] }],
+        },
+      },
+      initial,
+    );
+
+    expect(updated[0]._key).toBe(originalKey);
+  });
+
+  it('creates a new provider row key when the same name is removed and re-added', () => {
+    const initial = buildProviderForms({
+      openai: {
+        api: 'openai-completions',
+        models: [{ id: 'gpt-4o-mini', input: ['text'] }],
+      },
+    });
+
+    const recreated = buildProviderForms(
+      {
+        openai: {
+          api: 'openai-completions',
+          models: [{ id: 'gpt-4o-mini', input: ['text'] }],
+        },
+      },
+      [],
+    );
+
+    expect(recreated[0]._key).not.toBe(initial[0]._key);
+  });
+
   it('preserves model row keys when provider models are rehydrated', () => {
     const initial = buildProviderForms({
       openai: {
