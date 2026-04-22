@@ -4,6 +4,26 @@ import { scrollDown, syncToolDrawerBounds } from '../scroll.js';
 import { wrapInTimeline, animatePanelIn, animateCollapsibleSection } from './timeline.js';
 import { pinReactStatusToBottom } from './react-status.js';
 
+function findToolPanel(id) {
+  const panels = Array.from(dom.chat.querySelectorAll('.tool-panel'));
+  let fallback = null;
+
+  for (let idx = panels.length - 1; idx >= 0; idx -= 1) {
+    const panel = panels[idx];
+    if (id && panel.dataset.toolId !== id) {
+      continue;
+    }
+    if (!fallback) {
+      fallback = panel;
+    }
+    if (panel.dataset.toolHasResult !== 'true') {
+      return panel;
+    }
+  }
+
+  return fallback;
+}
+
 export function addToolCall(name, args, id) {
   const panel = document.createElement('div');
   panel.className = 'tool-panel';
@@ -41,43 +61,36 @@ export function addToolCall(name, args, id) {
 }
 
 export function updateToolProgress(id, elapsedMs) {
-  if (!id) return;
+  const panel = findToolPanel(id);
+  if (!panel || panel.dataset.toolHasResult === 'true') return;
   const seconds = Math.max(1, Math.floor((elapsedMs || 0) / 1000));
-  for (const panel of dom.chat.querySelectorAll('.tool-panel')) {
-    if (panel.dataset.toolId !== id || panel.dataset.toolHasResult === 'true') {
-      continue;
-    }
-    const statusText = `执行中 ${seconds}s`;
-    panel.dataset.toolStatus = statusText;
-    const statusEl = panel.querySelector('.tool-status');
-    if (statusEl) {
-      statusEl.textContent = statusText;
-    }
-    if (state.activeToolPanel === panel) {
-      syncToolDrawer(panel);
-    }
-    return;
+  const statusText = `执行中 ${seconds}s`;
+  panel.dataset.toolStatus = statusText;
+  const statusEl = panel.querySelector('.tool-status');
+  if (statusEl) {
+    statusEl.textContent = statusText;
+  }
+  if (state.activeToolPanel === panel) {
+    syncToolDrawer(panel);
   }
 }
 
 export function addToolResult(name, result, id, durationMs = null) {
-  const panels = dom.chat.querySelectorAll('.tool-panel');
-  for (const p of panels) {
-    if (p.dataset.toolId === id) {
-      p.dataset.toolResult = result;
-      p.dataset.toolHasResult = 'true';
-      const durationLabel = formatToolDuration(durationMs);
-      p.dataset.toolStatus = durationLabel ? `已返回结果 (${durationLabel})` : '已返回结果';
-      const statusEl = p.querySelector('.tool-status');
-      if (statusEl) {
-        statusEl.textContent = p.dataset.toolStatus;
-      }
-      p.classList.add('tool-panel-ready');
-      if (state.activeToolPanel === p) {
-        syncToolDrawer(p);
-      }
-      return;
+  const panel = findToolPanel(id);
+  if (panel) {
+    panel.dataset.toolResult = result;
+    panel.dataset.toolHasResult = 'true';
+    const durationLabel = formatToolDuration(durationMs);
+    panel.dataset.toolStatus = durationLabel ? `已返回结果 (${durationLabel})` : '已返回结果';
+    const statusEl = panel.querySelector('.tool-status');
+    if (statusEl) {
+      statusEl.textContent = panel.dataset.toolStatus;
     }
+    panel.classList.add('tool-panel-ready');
+    if (state.activeToolPanel === panel) {
+      syncToolDrawer(panel);
+    }
+    return;
   }
   // Fallback: standalone result
   const el = document.createElement('div');

@@ -1,6 +1,5 @@
 use std::{
-    collections::HashMap,
-    collections::hash_map::DefaultHasher,
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -1768,10 +1767,13 @@ fn build_llm_response(
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
 ) -> Result<LlmResponse, String> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let tc = if tool_calls.is_empty() {
         None
     } else {
-        Some(tool_calls)
+        Some(normalize_tool_call_ids(tool_calls, now.as_nanos()))
     };
     let content = if content_buf.is_empty() {
         None
@@ -1786,16 +1788,25 @@ fn build_llm_response(
             images: None,
             tool_calls: tc,
             tool_call_id: None,
-            timestamp: Some(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            ),
+            timestamp: Some(now.as_secs()),
         },
         input_tokens,
         output_tokens,
     })
+}
+
+fn normalize_tool_call_ids(mut tool_calls: Vec<ToolCall>, seed: u128) -> Vec<ToolCall> {
+    let mut seen = HashSet::new();
+
+    for (idx, tool_call) in tool_calls.iter_mut().enumerate() {
+        let needs_fallback = tool_call.id.trim().is_empty() || seen.contains(&tool_call.id);
+        if needs_fallback {
+            tool_call.id = format!("tool_call_{seed}_{}", idx + 1);
+        }
+        seen.insert(tool_call.id.clone());
+    }
+
+    tool_calls
 }
 
 fn total_anthropic_input_tokens(usage: &AnthropicUsage) -> u64 {

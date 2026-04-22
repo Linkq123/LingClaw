@@ -412,6 +412,72 @@ fn build_llm_response_with_content_and_tools() {
 }
 
 #[test]
+fn normalize_tool_call_ids_whitespace_only_id_gets_fallback() {
+    let resp = build_llm_response(
+        String::new(),
+        vec![ToolCall {
+            id: "   ".into(),
+            call_type: "function".into(),
+            function: FunctionCall {
+                name: "search".into(),
+                arguments: "{}".into(),
+            },
+        }],
+        None,
+        None,
+    )
+    .unwrap();
+    let tool_calls = resp.message.tool_calls.expect("tool calls should exist");
+    assert!(tool_calls[0].id.starts_with("tool_call_"),
+        "whitespace-only id should get fallback, got: {}", tool_calls[0].id);
+}
+
+#[test]
+fn build_llm_response_assigns_unique_fallback_tool_ids() {
+    let resp = build_llm_response(
+        String::new(),
+        vec![
+            ToolCall {
+                id: String::new(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "mcp__search".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            ToolCall {
+                id: "dup".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+            },
+            ToolCall {
+                id: "dup".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "grep_search".into(),
+                    arguments: "{}".into(),
+                },
+            },
+        ],
+        None,
+        None,
+    )
+    .unwrap();
+
+    let tool_calls = resp.message.tool_calls.expect("tool calls should exist");
+    let ids: std::collections::HashSet<&str> =
+        tool_calls.iter().map(|tool_call| tool_call.id.as_str()).collect();
+
+    assert_eq!(tool_calls[1].id, "dup");
+    assert_eq!(ids.len(), tool_calls.len());
+    assert!(tool_calls[0].id.starts_with("tool_call_"));
+    assert!(tool_calls[2].id.starts_with("tool_call_"));
+}
+
+#[test]
 fn total_anthropic_input_tokens_sums_cache_components() {
     let usage = AnthropicUsage {
         input_tokens: Some(100),
