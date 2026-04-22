@@ -19,7 +19,7 @@
   --tool-border: #dde1ec;
   --tool-drawer-bottom: 88px;
   --jump-to-latest-bottom: 104px;
-  --chat-output-width: min(1080px, 76vw);
+  --chat-output-width: min(1280px, 84vw);
   --assistant-body-font-size: 15px;
   --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
 }

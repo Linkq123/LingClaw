@@ -428,8 +428,11 @@ fn normalize_tool_call_ids_whitespace_only_id_gets_fallback() {
     )
     .unwrap();
     let tool_calls = resp.message.tool_calls.expect("tool calls should exist");
-    assert!(tool_calls[0].id.starts_with("tool_call_"),
-        "whitespace-only id should get fallback, got: {}", tool_calls[0].id);
+    assert!(
+        tool_calls[0].id.starts_with("tool_call_"),
+        "whitespace-only id should get fallback, got: {}",
+        tool_calls[0].id
+    );
 }
 
 #[test]
@@ -468,8 +471,10 @@ fn build_llm_response_assigns_unique_fallback_tool_ids() {
     .unwrap();
 
     let tool_calls = resp.message.tool_calls.expect("tool calls should exist");
-    let ids: std::collections::HashSet<&str> =
-        tool_calls.iter().map(|tool_call| tool_call.id.as_str()).collect();
+    let ids: std::collections::HashSet<&str> = tool_calls
+        .iter()
+        .map(|tool_call| tool_call.id.as_str())
+        .collect();
 
     assert_eq!(tool_calls[1].id, "dup");
     assert_eq!(ids.len(), tool_calls.len());
