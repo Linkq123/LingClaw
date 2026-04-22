@@ -50,7 +50,9 @@ export function addToolCall(name, args, id) {
   const wrapper = wrapInTimeline(panel, 'tool');
   const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
   if (currentRow) {
-    dom.chat.insertBefore(wrapper, currentRow);
+    // Tool calls are emitted after the assistant has finished streaming its text;
+    // insert the card AFTER the current assistant row, not before it.
+    currentRow.after(wrapper);
   } else {
     dom.chat.appendChild(wrapper);
   }
@@ -113,7 +115,7 @@ export function addToolResult(name, result, id, durationMs = null) {
   const wrapper = wrapInTimeline(el, 'result');
   const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
   if (currentRow) {
-    dom.chat.insertBefore(wrapper, currentRow);
+    currentRow.after(wrapper);
   } else {
     dom.chat.appendChild(wrapper);
   }
