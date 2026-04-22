@@ -173,9 +173,21 @@ run_install_choice() {
   esac
 }
 
+build_frontend() {
+  if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+    warn 'Node.js / npm not found. Skipping frontend build; web UI may be outdated or missing.'
+    warn 'Install Node.js (https://nodejs.org) and re-run the installer to build the frontend.'
+    return
+  fi
+  info "Building frontend assets (Node.js $(node --version), npm $(npm --version))."
+  (cd "$ROOT_DIR/frontend" && npm ci --silent && npm run build)
+  info 'Frontend build complete: static/'
+}
+
 main() {
   ensure_rust
   install_build_deps
+  build_frontend
 
   info 'Building LingClaw release binary.'
   cargo build --release
