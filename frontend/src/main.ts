@@ -303,12 +303,11 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
           statusEl.textContent = preview
             ? preview + (summaryText.length > 60 ? '\u2026' : '')
             : '\u5b8c\u6210';
-          statusEl.title = summaryText;
+          statusEl.title = summaryText || '\u5b8c\u6210';
         }
         const body = document.createElement('div');
         body.className = 'reasoning-body';
-        (body as any)._textNode = document.createTextNode(m.thinking);
-        body.appendChild((body as any)._textNode);
+        body.textContent = m.thinking;
         panel.appendChild(header);
         panel.appendChild(body);
         dom.chat.appendChild(wrapInTimeline(panel, 'reasoning'));

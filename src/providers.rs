@@ -284,6 +284,13 @@ fn convert_messages_to_anthropic(messages: &[ChatMessage]) -> (String, Vec<serde
                 }
             }
             "assistant" => {
+                // NOTE: msg.thinking is intentionally excluded here.
+                // Anthropic requires thinking blocks to be sent back with their
+                // cryptographic `signature` field (from content_block_start events),
+                // but LingClaw only stores the thinking text (for UI replay), not
+                // the signature. Sending thinking blocks without a valid signature
+                // would cause a 400 error. Omitting them is safe — the model will
+                // re-generate its own reasoning for subsequent turns.
                 let mut content_blocks: Vec<serde_json::Value> = Vec::new();
                 if let Some(text) = &msg.content
                     && !text.is_empty()

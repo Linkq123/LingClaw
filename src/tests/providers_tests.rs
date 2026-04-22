@@ -401,7 +401,36 @@ fn build_llm_response_empty_content_and_no_tools() {
     let resp = build_llm_response(String::new(), String::new(), vec![], None, None).unwrap();
     assert!(resp.message.content.is_none());
     assert!(resp.message.tool_calls.is_none());
+    assert!(resp.message.thinking.is_none());
     assert_eq!(resp.message.role, "assistant");
+}
+
+#[test]
+fn build_llm_response_thinking_buf_stored() {
+    let resp = build_llm_response(
+        "reply".into(),
+        "deep reasoning".into(),
+        vec![],
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(resp.message.content.as_deref(), Some("reply"));
+    assert_eq!(resp.message.thinking.as_deref(), Some("deep reasoning"));
+}
+
+#[test]
+fn build_llm_response_empty_thinking_buf_is_none() {
+    let resp = build_llm_response(
+        "reply".into(),
+        String::new(),
+        vec![],
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(resp.message.content.as_deref(), Some("reply"));
+    assert!(resp.message.thinking.is_none());
 }
 
 #[test]
