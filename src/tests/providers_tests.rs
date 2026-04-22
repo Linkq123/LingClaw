@@ -463,6 +463,112 @@ fn anthropic_tools_do_not_add_cache_control_when_disabled() {
 }
 
 #[test]
+fn anthropic_thinking_does_not_inflate_max_tokens() {
+    let resolved = ResolvedModel {
+        provider: Provider::Anthropic,
+        api_base: "https://api.anthropic.com".into(),
+        api_key: "test-key".into(),
+        model_id: "claude-sonnet-test".into(),
+        reasoning: true,
+        thinking_format: None,
+        max_tokens: Some(128_000),
+        context_window: 200_000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("You are helpful.".into()),
+            images: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("hello".into()),
+            images: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    ];
+
+    let body = build_anthropic_stream_body(&resolved, &messages, None, "medium", &[])
+        .expect("body should build");
+
+    assert_eq!(body["max_tokens"].as_u64(), Some(128_000));
+    assert_eq!(body["thinking"]["budget_tokens"].as_u64(), Some(10_240));
+}
+
+/// When max_tokens is smaller than the raw thinking budget, budget_tokens must be
+/// clamped to (max_tokens - 1024) so that max_tokens > budget_tokens holds.
+#[test]
+fn anthropic_thinking_clamps_budget_when_max_tokens_is_small() {
+    let resolved = ResolvedModel {
+        provider: Provider::Anthropic,
+        api_base: "https://api.anthropic.com".into(),
+        api_key: "test-key".into(),
+        model_id: "claude-sonnet-test".into(),
+        reasoning: true,
+        thinking_format: None,
+        max_tokens: Some(4_096), // smaller than medium budget (10240)
+        context_window: 200_000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hello".into()),
+        images: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let body = build_anthropic_stream_body(&resolved, &messages, None, "medium", &[])
+        .expect("body should build");
+
+    assert_eq!(body["max_tokens"].as_u64(), Some(4_096));
+    // budget clamped to 4096 - 1024 = 3072, which is >= 1024 so thinking stays enabled
+    assert_eq!(body["thinking"]["budget_tokens"].as_u64(), Some(3_072));
+}
+
+/// When max_tokens is too small to accommodate even the minimum 1024-token thinking
+/// budget, the thinking block must be omitted entirely to avoid an Anthropic 400.
+#[test]
+fn anthropic_thinking_disabled_when_max_tokens_too_small() {
+    let resolved = ResolvedModel {
+        provider: Provider::Anthropic,
+        api_base: "https://api.anthropic.com".into(),
+        api_key: "test-key".into(),
+        model_id: "claude-sonnet-test".into(),
+        reasoning: true,
+        thinking_format: None,
+        max_tokens: Some(1_024), // 1024 - 1024 = 0 < 1024 minimum
+        context_window: 200_000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hello".into()),
+        images: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let body = build_anthropic_stream_body(&resolved, &messages, None, "medium", &[])
+        .expect("body should build");
+
+    assert_eq!(body["max_tokens"].as_u64(), Some(1_024));
+    // thinking block must be absent — budget would be 0 which violates the >=1024 minimum
+    assert!(body["thinking"].is_null());
+}
+
+#[test]
 fn process_openai_data_line_reports_done_marker() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);

@@ -104,17 +104,6 @@ const CONTEXT_REPLY_RESERVE_RATIO_DIVISOR: usize = 10;
 const CONTEXT_REPLY_RESERVE_CAP_DIVISOR: usize = 5;
 const REQUEST_STRUCTURAL_OVERHEAD_TOKENS: usize = 256;
 
-fn anthropic_thinking_budget_tokens(level: &str) -> usize {
-    match level {
-        "minimal" => 1_024,
-        "low" => 4_096,
-        "medium" => 10_240,
-        "high" => 16_384,
-        "xhigh" => 32_768,
-        _ => 10_240,
-    }
-}
-
 pub(crate) fn message_token_len_for_provider(provider: Provider, message: &ChatMessage) -> usize {
     let base = message_token_len(message);
     match provider {
@@ -175,7 +164,7 @@ pub(crate) fn context_input_budget_for_model(config: &Config, model_ref: &str) -
 pub(crate) fn context_input_budget_for_runtime(
     config: &Config,
     model_ref: &str,
-    think_level: &str,
+    _think_level: &str,
 ) -> usize {
     let ctx_limit = config.context_limit_for_model(model_ref);
     let resolved = config.resolve_model(model_ref);
@@ -184,15 +173,11 @@ pub(crate) fn context_input_budget_for_runtime(
         Provider::Anthropic => ANTHROPIC_MIN_REPLY_RESERVE_TOKENS,
     };
     let ratio_reserve = ctx_limit / CONTEXT_REPLY_RESERVE_RATIO_DIVISOR;
-    let mut model_reserve = resolved
+    let model_reserve = resolved
         .max_tokens
         .map(|value| value as usize)
         .unwrap_or(provider_floor)
         .min(ctx_limit / CONTEXT_REPLY_RESERVE_CAP_DIVISOR);
-
-    if resolved.provider == Provider::Anthropic && think_level != "off" {
-        model_reserve = model_reserve.saturating_add(anthropic_thinking_budget_tokens(think_level));
-    }
 
     let reserve = provider_floor.max(ratio_reserve).max(model_reserve);
     let minimum_budget = ctx_limit.min(1_024);

@@ -1422,11 +1422,6 @@ fn build_anthropic_stream_body(
     let messages = materialize_image_urls(messages, s3_cfg)?;
     let (system_prompt, anthropic_msgs) = convert_messages_to_anthropic(&messages);
     let base_max = resolved.max_tokens.unwrap_or(8192);
-    let effective_max = if thinking_on {
-        base_max.saturating_add(think_level_to_budget(think_level))
-    } else {
-        base_max
-    };
     let mut all_tools: Vec<serde_json::Value> =
         serde_json::from_value(tools::tool_definitions_anthropic()).unwrap_or_default();
     all_tools.extend_from_slice(extra_tools);
@@ -1436,14 +1431,20 @@ fn build_anthropic_stream_body(
         "model": resolved.model_id,
         "messages": anthropic_msgs,
         "tools": all_tools,
-        "max_tokens": effective_max,
+        "max_tokens": base_max,
         "stream": true,
     });
     if thinking_on {
-        body["thinking"] = json!({
-            "type": "enabled",
-            "budget_tokens": think_level_to_budget(think_level),
-        });
+        // Anthropic requires: 1024 <= budget_tokens < max_tokens.
+        // Clamp to leave at least 1024 tokens for actual text output.
+        let raw_budget = think_level_to_budget(think_level);
+        let budget_tokens = raw_budget.min(base_max.saturating_sub(1024));
+        if budget_tokens >= 1024 {
+            body["thinking"] = json!({
+                "type": "enabled",
+                "budget_tokens": budget_tokens,
+            });
+        }
     }
     if !system_prompt.is_empty() {
         body["system"] = anthropic_system_payload(&system_prompt, cache_enabled);
