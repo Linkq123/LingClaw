@@ -110,6 +110,7 @@ import {
 } from './pages/SettingsPage.js';
 import { openUsagePage, closeUsagePage, initUsageListeners, UsagePage } from './pages/UsagePage.js';
 import { closeOverlayById } from './pages/overlay.js';
+import { buildHistoryReasoningPanel } from './renderers/reasoning.js';
 import { createRoot } from 'react-dom/client';
 import React from 'react';
 
@@ -285,31 +286,7 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
     }
     case 'assistant': {
       if (m.thinking && m.thinking.trim() && state.showReasoning) {
-        const panel = document.createElement('div');
-        panel.className = 'reasoning-panel';
-        const header = document.createElement('div');
-        header.className = 'reasoning-header';
-        header.dataset.action = 'toggle-tool';
-        header.innerHTML = `
-          <span class="reasoning-icon">\ud83d\udcad</span>
-          <span class="reasoning-label">Reasoning</span>
-          <span class="reasoning-status"></span>
-          <span class="chevron">\u25b8</span>
-        `;
-        const statusEl = header.querySelector<HTMLElement>('.reasoning-status');
-        if (statusEl) {
-          const summaryText = m.thinking.trim().replace(/\n+/g, ' ');
-          const preview = summaryText.substring(0, 60);
-          statusEl.textContent = preview
-            ? preview + (summaryText.length > 60 ? '\u2026' : '')
-            : '\u5b8c\u6210';
-          statusEl.title = summaryText || '\u5b8c\u6210';
-        }
-        const body = document.createElement('div');
-        body.className = 'reasoning-body';
-        body.textContent = m.thinking;
-        panel.appendChild(header);
-        panel.appendChild(body);
+        const panel = buildHistoryReasoningPanel(m.thinking);
         dom.chat.appendChild(wrapInTimeline(panel, 'reasoning'));
       }
       const el = addMsg('assistant', m.content, m.timestamp);
