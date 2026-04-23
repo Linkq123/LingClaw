@@ -122,7 +122,7 @@ pub(crate) fn refresh_reflection_runtime(enabled: bool) -> u64 {
     REFLECTION_RUNTIME_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
 }
 
-fn reflection_runtime_enabled() -> bool {
+pub(crate) fn reflection_runtime_enabled() -> bool {
     REFLECTION_RUNTIME_ENABLED.load(std::sync::atomic::Ordering::Acquire)
 }
 

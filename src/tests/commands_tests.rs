@@ -758,6 +758,7 @@ async fn memory_command_rejects_unknown_subcommand() {
 
 #[tokio::test]
 async fn reflection_command_disabled_shows_hint() {
+    let _guard = crate::runtime_loop::reflection_test_guard().lock().await;
     let workspace = unique_temp_workspace("lingclaw-cmd-reflect-disabled");
     let _ = tokio::fs::remove_dir_all(&workspace).await;
     tokio::fs::create_dir_all(&workspace)
@@ -865,6 +866,7 @@ async fn reflection_command_disabled_shows_hint() {
         .lock()
         .await
         .insert(MAIN_SESSION_ID.to_string(), session);
+    state.apply_runtime_config(config.as_ref().clone());
 
     let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
     let result = handle_command(
@@ -996,6 +998,7 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
         .lock()
         .await
         .insert(MAIN_SESSION_ID.to_string(), session);
+    state.apply_runtime_config(base_config.clone());
 
     let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
     let disabled = handle_command(
@@ -1012,6 +1015,20 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
 
     let mut enabled_config = base_config;
     enabled_config.daily_reflection = true;
+    state.replace_config(enabled_config.clone());
+
+    let config_only = handle_command(
+        "/reflection",
+        MAIN_SESSION_ID,
+        1,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("config-only reflection command should resolve");
+    assert!(config_only.response.contains("disabled"));
+
     state.apply_runtime_config(enabled_config);
 
     let enabled = handle_command(
@@ -1174,6 +1191,7 @@ async fn reflection_command_disabled_allows_read_today() {
 
 #[tokio::test]
 async fn reflection_command_enabled_shows_status() {
+    let _guard = crate::runtime_loop::reflection_test_guard().lock().await;
     let workspace = unique_temp_workspace("lingclaw-cmd-reflect-enabled");
     let _ = tokio::fs::remove_dir_all(&workspace).await;
     tokio::fs::create_dir_all(&workspace)
@@ -1281,6 +1299,7 @@ async fn reflection_command_enabled_shows_status() {
         .lock()
         .await
         .insert(MAIN_SESSION_ID.to_string(), session);
+    state.apply_runtime_config(config.as_ref().clone());
 
     let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
     let result = handle_command(

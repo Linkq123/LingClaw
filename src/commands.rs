@@ -1331,7 +1331,7 @@ async fn handle_reflection_command(
     let local = prompts::current_local_snapshot();
     let today = local.today();
     let yesterday = local.yesterday();
-    let enabled = config.daily_reflection;
+    let enabled = crate::runtime_loop::reflection_runtime_enabled();
 
     let response = match arg {
         "" => {
