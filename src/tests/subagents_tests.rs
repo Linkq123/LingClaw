@@ -1753,22 +1753,164 @@ fn test_compute_layers_diamond() {
 }
 
 #[test]
+fn test_validate_plan_infers_dependencies_from_prompt_placeholders() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Use a deterministic built-in agent name rather than relying on
+    // discover_all_agents() ordering, which is filesystem-dependent.
+    let agent_name = "explore".to_string();
+    let tasks = vec![
+        OrchestrationTask {
+            id: "project_spec".into(),
+            agent: agent_name.clone(),
+            prompt: "Write the project specification".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "frontend_dev".into(),
+            agent: agent_name.clone(),
+            prompt: "Build the frontend from {{results.project_spec}}".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "backend_dev".into(),
+            agent: agent_name.clone(),
+            prompt: "Build the backend from {{results.project_spec}}".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "frontend_review".into(),
+            agent: agent_name.clone(),
+            prompt: "Review {{results.frontend_dev}}".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "backend_review".into(),
+            agent: agent_name.clone(),
+            prompt: "Review {{results.backend_dev}}".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "integration_review".into(),
+            agent: agent_name,
+            prompt: "Integrate {{results.frontend_review}} with {{results.backend_review}}".into(),
+            depends_on: vec![],
+        },
+    ];
+
+    let plan = validate_plan(tasks, workspace).expect("placeholder references should infer dependencies");
+    let layers = compute_execution_layers(&plan);
+
+    assert_eq!(plan.tasks[1].depends_on, vec!["project_spec"]);
+    assert_eq!(plan.tasks[2].depends_on, vec!["project_spec"]);
+    assert_eq!(plan.tasks[3].depends_on, vec!["frontend_dev"]);
+    assert_eq!(plan.tasks[4].depends_on, vec!["backend_dev"]);
+    assert_eq!(
+        plan.tasks[5].depends_on,
+        vec!["frontend_review", "backend_review"]
+    );
+    assert_eq!(layers.len(), 4);
+    assert_eq!(layers[0], vec![0]);
+    assert_eq!(layers[1].len(), 2);
+    assert!(layers[1].contains(&1));
+    assert!(layers[1].contains(&2));
+    assert_eq!(layers[2].len(), 2);
+    assert!(layers[2].contains(&3));
+    assert!(layers[2].contains(&4));
+    assert_eq!(layers[3], vec![5]);
+}
+
+#[test]
+fn test_validate_plan_merges_explicit_and_prompt_dependencies_without_duplicates() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let agent_name = "explore".to_string();
+    let tasks = vec![
+        OrchestrationTask {
+            id: "explore".into(),
+            agent: agent_name.clone(),
+            prompt: "Explore the codebase".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "research".into(),
+            agent: agent_name.clone(),
+            prompt: "Research the API".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "implement".into(),
+            agent: agent_name,
+            prompt: "Implement using {{results.explore}} and {{results.research}} and {{results.explore}} again".into(),
+            depends_on: vec!["explore".into()],
+        },
+    ];
+
+    let plan = validate_plan(tasks, workspace).expect("explicit and inferred dependencies should merge");
+
+    assert_eq!(plan.tasks[2].depends_on, vec!["explore", "research"]);
+}
+
+#[test]
+fn test_validate_plan_ignores_unknown_prompt_placeholders() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let agent_name = "explore".to_string();
+    let tasks = vec![
+        OrchestrationTask {
+            id: "spec".into(),
+            agent: agent_name.clone(),
+            prompt: "Write the specification".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "implement".into(),
+            agent: agent_name,
+            prompt: "Use {{results.spec}} and keep {{results.literal_example}} verbatim".into(),
+            depends_on: vec![],
+        },
+    ];
+
+    let plan = validate_plan(tasks, workspace)
+        .expect("unknown prompt placeholders should not invalidate the plan");
+
+    assert_eq!(plan.tasks[1].depends_on, vec!["spec"]);
+}
+
+#[test]
 fn test_validate_plan_rejects_non_placeholder_compatible_task_id() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let agent_name = discover_all_agents(workspace)
-        .into_iter()
-        .next()
-        .expect("expected at least one built-in agent")
-        .name;
     let tasks = vec![OrchestrationTask {
         id: "bad id".into(),
-        agent: agent_name,
+        agent: "explore".into(),
         prompt: "Do work".into(),
         depends_on: vec![],
     }];
 
     let err = validate_plan(tasks, workspace).expect_err("invalid task id should be rejected");
     assert!(err.contains("must use only ASCII letters, digits, '_' or '-'"));
+}
+
+#[test]
+fn test_validate_plan_rejects_cycle_introduced_by_prompt_placeholders() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // task_a implicitly depends on task_b via placeholder,
+    // and task_b implicitly depends on task_a — a cycle.
+    let tasks = vec![
+        OrchestrationTask {
+            id: "task_a".into(),
+            agent: "explore".into(),
+            prompt: "Do work with {{results.task_b}}".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "task_b".into(),
+            agent: "explore".into(),
+            prompt: "Do work with {{results.task_a}}".into(),
+            depends_on: vec![],
+        },
+    ];
+
+    let err = validate_plan(tasks, workspace)
+        .expect_err("cycle via inferred prompt placeholders should be rejected");
+    assert!(err.contains("cycle"), "error should mention cycle: {err}");
 }
 
 #[tokio::test]
