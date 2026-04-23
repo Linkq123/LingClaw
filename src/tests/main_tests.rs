@@ -176,7 +176,7 @@ fn test_app_state() -> AppState {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     }
 }
 
@@ -195,8 +195,31 @@ fn test_app_state_with_config(config: Config) -> AppState {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     }
+}
+
+#[tokio::test]
+async fn sync_memory_queue_hot_toggles_structured_memory_runtime() {
+    let state = test_app_state();
+    assert!(state.memory_queue().is_none());
+
+    let mut enabled = test_config();
+    enabled.structured_memory = true;
+    state.sync_memory_queue(&enabled);
+
+    let queue = state
+        .memory_queue()
+        .expect("structured memory should create a runtime queue");
+    let status = crate::memory::memory_runtime_status(Some(&queue));
+    assert!(status.contains("Memory Updater"));
+    assert!(!status.contains("unavailable"));
+
+    let mut disabled = enabled;
+    disabled.structured_memory = false;
+    state.sync_memory_queue(&disabled);
+
+    assert!(state.memory_queue().is_none());
 }
 
 fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {

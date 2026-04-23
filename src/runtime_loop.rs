@@ -1,7 +1,7 @@
 use super::*;
 
 use serde_json::json;
-use std::sync::atomic::{AtomicI64, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use tokio::time::MissedTickBehavior;
 
 mod socket_input;
@@ -20,9 +20,30 @@ const REFLECTION_COOLDOWN_SECS: i64 = 600; // 10 minutes
 /// Epoch-seconds timestamp of the last reflection run (0 = never).
 static LAST_REFLECTION_EPOCH: AtomicI64 = AtomicI64::new(0);
 
+/// Runtime switch for whether post-execution reflection is currently enabled.
+static REFLECTION_RUNTIME_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Generation counter for reflection runtime policy updates.
+static REFLECTION_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Active background reflection cancellations keyed by an internal task id.
+static ACTIVE_REFLECTION_CANCELS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<u64, CancellationToken>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Monotonic ids for background reflection tasks.
+static NEXT_REFLECTION_TASK_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Monotonic counter used to make fallback task ids unique even if the system
 /// clock has coarse granularity or multiple tasks start within the same tick.
 static NEXT_FALLBACK_TASK_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+pub(crate) fn reflection_test_guard() -> &'static tokio::sync::Mutex<()> {
+    static REFLECTION_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    &REFLECTION_TEST_LOCK
+}
 
 fn epoch_secs_now() -> i64 {
     chrono::Local::now().timestamp()
@@ -90,6 +111,70 @@ pub(crate) fn reflection_runtime_status() -> String {
             "Last reflection: {}s ago (cooldown elapsed, ready)",
             elapsed
         )
+    }
+}
+
+pub(crate) fn refresh_reflection_runtime(enabled: bool) -> u64 {
+    let previous = REFLECTION_RUNTIME_ENABLED.swap(enabled, std::sync::atomic::Ordering::AcqRel);
+    if previous == enabled {
+        return REFLECTION_RUNTIME_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    }
+    REFLECTION_RUNTIME_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+}
+
+fn reflection_runtime_enabled() -> bool {
+    REFLECTION_RUNTIME_ENABLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn reflection_runtime_generation() -> u64 {
+    REFLECTION_RUNTIME_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn reflection_runtime_matches(generation: u64) -> bool {
+    REFLECTION_RUNTIME_ENABLED.load(std::sync::atomic::Ordering::Acquire)
+        && REFLECTION_RUNTIME_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation
+}
+
+fn register_active_reflection(cancel: CancellationToken) -> u64 {
+    let task_id = NEXT_REFLECTION_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    match ACTIVE_REFLECTION_CANCELS.lock() {
+        Ok(mut guard) => {
+            guard.insert(task_id, cancel);
+        }
+        Err(poisoned) => {
+            eprintln!("Warning: reflection cancel registry poisoned during register; recovering");
+            let mut guard = poisoned.into_inner();
+            guard.insert(task_id, cancel);
+        }
+    }
+    task_id
+}
+
+fn finish_active_reflection(task_id: u64) {
+    match ACTIVE_REFLECTION_CANCELS.lock() {
+        Ok(mut guard) => {
+            guard.remove(&task_id);
+        }
+        Err(poisoned) => {
+            eprintln!("Warning: reflection cancel registry poisoned during cleanup; recovering");
+            let mut guard = poisoned.into_inner();
+            guard.remove(&task_id);
+        }
+    }
+}
+
+pub(crate) fn cancel_active_reflections() {
+    let cancels = match ACTIVE_REFLECTION_CANCELS.lock() {
+        Ok(mut guard) => guard.drain().map(|(_, cancel)| cancel).collect::<Vec<_>>(),
+        Err(poisoned) => {
+            eprintln!("Warning: reflection cancel registry poisoned during cancel; recovering");
+            let mut guard = poisoned.into_inner();
+            guard.drain().map(|(_, cancel)| cancel).collect::<Vec<_>>()
+        }
+    };
+
+    for cancel in cancels {
+        cancel.cancel();
     }
 }
 
@@ -199,6 +284,7 @@ struct PostExecutionReflectionInput {
     workspace: std::path::PathBuf,
     model: String,
     messages: Vec<ChatMessage>,
+    policy_generation: u64,
     cycles: usize,
     tool_calls: usize,
 }
@@ -219,9 +305,14 @@ async fn run_post_execution_reflection(
         workspace,
         model,
         messages,
+        policy_generation,
         cycles,
         tool_calls,
     } = input;
+
+    if !reflection_runtime_matches(policy_generation) {
+        return Ok(false);
+    }
 
     // Build a compact excerpt of the conversation for reflection.
     let excerpt = crate::memory::build_conversation_excerpt(&messages);
@@ -311,6 +402,10 @@ async fn run_post_execution_reflection(
 
     let reflection = reflection.content.trim().to_string();
     if reflection.is_empty() {
+        return Ok(false);
+    }
+
+    if !reflection_runtime_matches(policy_generation) {
         return Ok(false);
     }
 
@@ -1921,7 +2016,10 @@ async fn run_finish_phase(
 
     // Enqueue structured memory update (async, non-blocking).
     // Pre-filter messages to avoid cloning the full session history.
-    if let (Some(queue), Some(session)) = (&ctx.state.memory_queue, &snapshot) {
+    let memory_queue = ctx.state.memory_queue();
+    if config.structured_memory
+        && let (Some(queue), Some(session)) = (memory_queue.as_ref(), &snapshot)
+    {
         let fallback_model = session.effective_model(&config.model);
         let model = config.memory_model_or(fallback_model).to_string();
         let excerpt = crate::memory::prefilter_for_memory(&session.messages);
@@ -1939,62 +2037,77 @@ async fn run_finish_phase(
     // NOTE: snapshot check must precede try_claim_reflection() because the
     // CAS has a side-effect; if it fires but the session is gone, nobody
     // would roll back the cooldown slot.
-    if config.daily_reflection
+    if reflection_runtime_enabled()
         && let Some(ref session) = snapshot
         && let Some((previous_epoch, claimed_epoch)) = try_claim_reflection(
             phase_state.react_ctx.cycles,
             phase_state.react_ctx.tool_calls,
         )
     {
-        let config = config.clone();
-        let http = ctx.state.http.clone();
-        let sessions = ctx.state.sessions.clone();
-        let session_id = session.id.clone();
-        let workspace = session.workspace.clone();
-        let fallback_model = session.effective_model(&config.model).to_string();
-        let model = config.reflection_model_or(&fallback_model).to_string();
-        let messages = crate::memory::prefilter_for_memory(&session.messages);
-        let cycles = phase_state.react_ctx.cycles;
-        let tool_calls = phase_state.react_ctx.tool_calls;
-        // Match structured memory: floor at 30s so a low toolTimeout doesn't
-        // cause reflections to time out systematically.
-        let reflection_timeout = config.tool_timeout.max(std::time::Duration::from_secs(30));
-        tokio::spawn(async move {
-            match tokio::time::timeout(
-                reflection_timeout,
-                run_post_execution_reflection(PostExecutionReflectionInput {
-                    config,
-                    http,
-                    sessions,
-                    session_id,
-                    workspace,
-                    model,
-                    messages,
-                    cycles,
-                    tool_calls,
-                }),
-            )
-            .await
-            {
-                Ok(Err(e)) => {
-                    eprintln!("Reflection failed (non-critical): {e}");
-                    // Roll back so the next non-trivial run can try again.
-                    rollback_reflection_claim(previous_epoch, claimed_epoch);
+        let reflection_generation = reflection_runtime_generation();
+        if !reflection_runtime_matches(reflection_generation) {
+            rollback_reflection_claim(previous_epoch, claimed_epoch);
+        } else {
+            let config = ctx.state.config();
+            let http = ctx.state.http.clone();
+            let sessions = ctx.state.sessions.clone();
+            let session_id = session.id.clone();
+            let workspace = session.workspace.clone();
+            let fallback_model = session.effective_model(&config.model).to_string();
+            let model = config.reflection_model_or(&fallback_model).to_string();
+            let messages = crate::memory::prefilter_for_memory(&session.messages);
+            let cycles = phase_state.react_ctx.cycles;
+            let tool_calls = phase_state.react_ctx.tool_calls;
+            // Match structured memory: floor at 30s so a low toolTimeout doesn't
+            // cause reflections to time out systematically.
+            let reflection_timeout = config.tool_timeout.max(std::time::Duration::from_secs(30));
+            let reflection_cancel = CancellationToken::new();
+            let reflection_task_id = register_active_reflection(reflection_cancel.clone());
+            tokio::spawn(async move {
+                let outcome = tokio::select! {
+                    _ = reflection_cancel.cancelled() => None,
+                    outcome = tokio::time::timeout(
+                        reflection_timeout,
+                        run_post_execution_reflection(PostExecutionReflectionInput {
+                            config,
+                            http,
+                            sessions,
+                            session_id,
+                            workspace,
+                            model,
+                            messages,
+                            policy_generation: reflection_generation,
+                            cycles,
+                            tool_calls,
+                        }),
+                    ) => Some(outcome),
+                };
+                finish_active_reflection(reflection_task_id);
+
+                match outcome {
+                    None => {
+                        rollback_reflection_claim(previous_epoch, claimed_epoch);
+                    }
+                    Some(Ok(Err(e))) => {
+                        eprintln!("Reflection failed (non-critical): {e}");
+                        // Roll back so the next non-trivial run can try again.
+                        rollback_reflection_claim(previous_epoch, claimed_epoch);
+                    }
+                    Some(Err(_elapsed)) => {
+                        eprintln!("Reflection timed out (non-critical)");
+                        rollback_reflection_claim(previous_epoch, claimed_epoch);
+                    }
+                    Some(Ok(Ok(true))) => {
+                        // CAS already claimed the slot — nothing more to do.
+                    }
+                    Some(Ok(Ok(false))) => {
+                        // Conversation was too trivial — no reflection written.
+                        // Roll back so the next non-trivial run can reflect.
+                        rollback_reflection_claim(previous_epoch, claimed_epoch);
+                    }
                 }
-                Err(_elapsed) => {
-                    eprintln!("Reflection timed out (non-critical)");
-                    rollback_reflection_claim(previous_epoch, claimed_epoch);
-                }
-                Ok(Ok(true)) => {
-                    // CAS already claimed the slot — nothing more to do.
-                }
-                Ok(Ok(false)) => {
-                    // Conversation was too trivial — no reflection written.
-                    // Roll back so the next non-trivial run can reflect.
-                    rollback_reflection_claim(previous_epoch, claimed_epoch);
-                }
-            }
-        });
+            });
+        }
     }
 
     let finish_label = phase_state

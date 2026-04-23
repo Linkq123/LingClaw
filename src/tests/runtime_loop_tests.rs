@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 
 use std::{collections::HashMap, sync::atomic::AtomicU64};
 
@@ -50,7 +50,7 @@ fn test_app_state() -> AppState {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     }
 }
 
@@ -69,7 +69,7 @@ fn test_app_state_with_config(config: Config) -> AppState {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     }
 }
 
@@ -498,13 +498,9 @@ fn resolve_input_image_url_rejects_incomplete_uploaded_metadata() {
     );
 }
 
-/// Serialize tests that mutate the process-global `LAST_REFLECTION_EPOCH`
-/// so parallel cargo-test threads cannot interfere with each other.
-static REFLECTION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[test]
 fn try_claim_reflection_requires_minimum_cycles() {
-    let _guard = REFLECTION_TEST_LOCK.lock().unwrap();
+    let _guard = reflection_test_guard().blocking_lock();
     // Reset cooldown so it doesn't interfere.
     LAST_REFLECTION_EPOCH.store(0, std::sync::atomic::Ordering::Relaxed);
 
@@ -525,8 +521,97 @@ fn try_claim_reflection_requires_minimum_cycles() {
 }
 
 #[test]
+fn cancel_active_reflections_cancels_registered_tasks() {
+    let _guard = reflection_test_guard().blocking_lock();
+    cancel_active_reflections();
+
+    let cancel = CancellationToken::new();
+    let _task_id = register_active_reflection(cancel.clone());
+    assert!(!cancel.is_cancelled());
+
+    cancel_active_reflections();
+
+    assert!(cancel.is_cancelled());
+}
+
+#[test]
+fn reflection_runtime_generation_invalidates_stale_tasks_after_disable() {
+    let _guard = reflection_test_guard().blocking_lock();
+
+    refresh_reflection_runtime(true);
+    let generation = reflection_runtime_generation();
+    assert!(reflection_runtime_enabled());
+    assert!(reflection_runtime_matches(generation));
+
+    let stable_generation = refresh_reflection_runtime(true);
+    assert_eq!(stable_generation, generation);
+    assert!(reflection_runtime_matches(stable_generation));
+
+    refresh_reflection_runtime(false);
+    assert!(!reflection_runtime_enabled());
+    assert!(!reflection_runtime_matches(generation));
+
+    refresh_reflection_runtime(true);
+    let new_generation = reflection_runtime_generation();
+    assert!(reflection_runtime_enabled());
+    assert!(reflection_runtime_matches(new_generation));
+}
+
+#[tokio::test]
+async fn stale_reflection_generation_returns_before_work_or_write() {
+    let stale_generation = {
+        let _guard = reflection_test_guard().lock().await;
+        refresh_reflection_runtime(true);
+        let stale_generation = reflection_runtime_generation();
+        refresh_reflection_runtime(false);
+        stale_generation
+    };
+
+    let workspace =
+        std::env::temp_dir().join(format!("lingclaw-reflection-stale-{}", crate::now_epoch()));
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let outcome = run_post_execution_reflection(PostExecutionReflectionInput {
+        config: Arc::new(test_config()),
+        http: reqwest::Client::new(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        session_id: "main".to_string(),
+        workspace: workspace.clone(),
+        model: "gpt-4o-mini".to_string(),
+        messages: vec![ChatMessage {
+            role: "user".into(),
+            content: Some("hello".into()),
+            images: None,
+            thinking: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        }],
+        policy_generation: stale_generation,
+        cycles: 3,
+        tool_calls: 1,
+    })
+    .await
+    .expect("stale reflection should short-circuit successfully");
+
+    assert!(!outcome);
+    let today = prompts::current_local_snapshot().today();
+    assert!(
+        !workspace
+            .join("memory")
+            .join(format!("{today}.md"))
+            .exists()
+    );
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[test]
 fn try_claim_reflection_respects_cooldown() {
-    let _guard = REFLECTION_TEST_LOCK.lock().unwrap();
+    let _guard = reflection_test_guard().blocking_lock();
     let now = epoch_secs_now();
 
     // Last reflection was just now — should be blocked.
@@ -556,7 +641,7 @@ fn try_claim_reflection_respects_cooldown() {
 
 #[test]
 fn try_claim_reflection_prevents_concurrent_claims() {
-    let _guard = REFLECTION_TEST_LOCK.lock().unwrap();
+    let _guard = reflection_test_guard().blocking_lock();
     // Ensure cooldown is clear.
     LAST_REFLECTION_EPOCH.store(0, std::sync::atomic::Ordering::Relaxed);
 
@@ -574,7 +659,7 @@ fn try_claim_reflection_prevents_concurrent_claims() {
 
 #[test]
 fn rollback_reflection_claim_is_noop_when_slot_already_reclaimed() {
-    let _guard = REFLECTION_TEST_LOCK.lock().unwrap();
+    let _guard = reflection_test_guard().blocking_lock();
     // Clear cooldown.
     LAST_REFLECTION_EPOCH.store(0, std::sync::atomic::Ordering::Relaxed);
 

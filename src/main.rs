@@ -352,7 +352,7 @@ struct AppState {
     upload_token: String,
     hooks: HookRegistry,
     /// Background structured memory updater (active when config.structured_memory is true).
-    memory_queue: Option<MemoryUpdateQueue>,
+    memory_queue: std::sync::Mutex<Option<MemoryUpdateQueue>>,
 }
 
 impl AppState {
@@ -377,6 +377,51 @@ impl AppState {
                 eprintln!("Warning: config lock poisoned during replace; recovering");
                 let mut guard = poisoned.into_inner();
                 *guard = Arc::new(new);
+            }
+        }
+    }
+
+    fn apply_runtime_config(&self, new: Config) {
+        self.sync_memory_queue(&new);
+        runtime_loop::refresh_reflection_runtime(new.daily_reflection);
+        if !new.daily_reflection {
+            runtime_loop::cancel_active_reflections();
+        }
+        self.replace_config(new);
+    }
+
+    fn memory_queue(&self) -> Option<MemoryUpdateQueue> {
+        match self.memory_queue.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                eprintln!("Warning: memory queue lock poisoned; recovering with inner value");
+                poisoned.into_inner().clone()
+            }
+        }
+    }
+
+    fn sync_memory_queue(&self, config: &Config) {
+        let sessions = self.sessions.clone();
+        let apply = |guard: &mut Option<MemoryUpdateQueue>| match (
+            guard.as_ref(),
+            config.structured_memory,
+        ) {
+            (Some(queue), true) => queue.replace_config(config.clone()),
+            (None, true) => {
+                *guard = Some(MemoryUpdateQueue::spawn(config.clone(), sessions.clone()));
+            }
+            (_, false) => {
+                if let Some(queue) = guard.as_ref() {
+                    queue.shutdown();
+                }
+                *guard = None;
+            }
+        };
+        match self.memory_queue.lock() {
+            Ok(mut guard) => apply(&mut guard),
+            Err(poisoned) => {
+                eprintln!("Warning: memory queue lock poisoned during sync; recovering");
+                apply(&mut poisoned.into_inner());
             }
         }
     }
@@ -1991,7 +2036,7 @@ async fn api_put_config(
     // Hot-reload: re-read the saved config into the runtime so that
     // model/MCP changes take effect without a restart.
     let new_config = Config::load();
-    state.replace_config(new_config);
+    state.apply_runtime_config(new_config);
 
     // Release the config file lock before potentially slow MCP I/O.
     drop(_save_guard);
@@ -2350,6 +2395,7 @@ async fn main() {
     }
 
     let config = Config::load();
+    runtime_loop::refresh_reflection_runtime(config.daily_reflection);
     let port = port_override.unwrap_or(config.port);
 
     if config.api_key.is_empty()
@@ -2472,7 +2518,7 @@ async fn main() {
         shutdown_token,
         upload_token,
         hooks,
-        memory_queue,
+        memory_queue: std::sync::Mutex::new(memory_queue),
     });
 
     // Ensure main session exists (load from disk or create fresh)

@@ -1295,17 +1295,18 @@ async fn handle_memory_command(
         }
     };
 
+    let memory_queue = state.memory_queue();
     let response = match arg {
         "" => format!(
             "{}\n\n{}",
             memory::memory_status(&workspace),
-            memory::memory_runtime_status(state.memory_queue.as_ref())
+            memory::memory_runtime_status(memory_queue.as_ref())
         ),
-        "stats" => memory::memory_runtime_status(state.memory_queue.as_ref()),
+        "stats" => memory::memory_runtime_status(memory_queue.as_ref()),
         "debug" => format!(
             "{}\n\n{}",
             memory::memory_status(&workspace),
-            memory::memory_debug_status(&workspace, state.memory_queue.as_ref())
+            memory::memory_debug_status(&workspace, memory_queue.as_ref())
         ),
         _ => return command_result("Usage: /memory [stats|debug]", "system", false),
     };

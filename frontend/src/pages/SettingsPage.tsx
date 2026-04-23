@@ -1503,7 +1503,8 @@ export function SettingsPage() {
         return;
       }
       setStatus({
-        message: 'Saved successfully! Restart LingClaw to apply changes.',
+        message:
+          'Saved successfully! Most changes apply immediately. Restart LingClaw only for port changes.',
         type: 'success',
       });
     } catch (e: unknown) {
