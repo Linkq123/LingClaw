@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 use crate::config::JsonMcpServerConfig;
 use axum::http::{HeaderMap, HeaderValue};
 use serde_json::json;
@@ -231,6 +231,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
             content: Some("system".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -266,6 +267,7 @@ fn make_message(role: &str, content: &str) -> ChatMessage {
         content: Some(content.to_string()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -669,6 +671,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
                 content: Some("system".into()),
                 images: None,
                 thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -678,6 +681,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
                 content: Some(long_raw_result.clone()),
                 images: None,
                 thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
                 timestamp: Some(123),
@@ -733,6 +737,7 @@ fn build_history_payload_marks_failed_tool_result_with_is_error() {
             content: Some("Sub-agent 'coder' timed out after 30s".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("task_1".into()),
             timestamp: Some(123),
@@ -789,6 +794,7 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
                 data: Some("aW1hZ2U=".into()),
             }]),
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: Some(123),
@@ -842,6 +848,7 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
                 data: None,
             }]),
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: Some(123),
@@ -2171,6 +2178,7 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
             content: Some("system".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -2180,6 +2188,7 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
             content: Some("a".repeat(500)),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -2189,6 +2198,7 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
             content: Some("b".repeat(500)),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -2198,6 +2208,7 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
             content: Some("keep".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -2219,6 +2230,7 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
             content: Some("system".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -2228,6 +2240,7 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
             content: None,
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: Some(1),
@@ -2237,6 +2250,7 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
             content: Some(String::new()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call-1".into(),
                 call_type: "function".into(),
@@ -2256,6 +2270,43 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
     assert_eq!(messages[0].role, "system");
     assert_eq!(messages[1].role, "assistant");
     assert!(messages[1].has_tool_calls());
+}
+
+#[test]
+fn sanitize_session_messages_keeps_assistant_with_anthropic_thinking_blocks() {
+    let mut messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("system".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: Some(vec![AnthropicThinkingBlock {
+                block_type: "thinking".into(),
+                thinking: Some("reasoning".into()),
+                signature: Some("sig_123".into()),
+                data: None,
+            }]),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(1),
+        },
+    ];
+
+    sanitize_session_messages(&mut messages);
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1].role, "assistant");
+    assert!(messages[1].anthropic_thinking_blocks.is_some());
 }
 
 #[test]
@@ -2323,6 +2374,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
                 content: Some("system".into()),
                 images: None,
                 thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -2332,6 +2384,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
                 content: None,
                 images: None,
                 thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: Some(1773669433),
@@ -2341,6 +2394,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
                 content: Some("next".into()),
                 images: None,
                 thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -2420,6 +2474,7 @@ fn save_session_to_disk_overwrites_existing_file() {
             content: Some("first".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -3220,6 +3275,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
                 content: Some("system".into()),
                 images: None,
                 thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -3229,6 +3285,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
                 content: Some(String::new()),
                 images: None,
                 thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_obs".into(),
                     call_type: "function".into(),
@@ -3245,6 +3302,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
                 content: Some(big_result.clone()),
                 images: None,
                 thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: Some("call_obs".into()),
                 timestamp: Some(101),
@@ -3323,6 +3381,7 @@ fn system_prompt_with_observation_hint_preserves_original_content() {
         content: Some("You are an assistant.".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -5631,6 +5690,7 @@ fn prune_messages_tracks_removal_count() {
             content: Some("sys".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -5640,6 +5700,7 @@ fn prune_messages_tracks_removal_count() {
             content: Some("a".repeat(200_000)),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -5649,6 +5710,7 @@ fn prune_messages_tracks_removal_count() {
             content: Some("b".repeat(200_000)),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -5658,6 +5720,7 @@ fn prune_messages_tracks_removal_count() {
             content: Some("latest".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -5830,6 +5893,7 @@ fn message_token_len_empty_message() {
         content: None,
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -5845,6 +5909,7 @@ fn message_token_len_content_only() {
         content: Some("hello world".into()), // 11 chars
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -5860,6 +5925,7 @@ fn message_token_len_with_tool_calls() {
         content: None,
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
@@ -5883,6 +5949,7 @@ fn estimate_tokens_sums_messages() {
             content: Some("sys".into()), // 3
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -5892,6 +5959,7 @@ fn estimate_tokens_sums_messages() {
             content: Some("hello".into()), // 5
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -5909,6 +5977,7 @@ fn message_token_len_cjk_aware() {
         content: Some("你好世界测试".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -5921,6 +5990,7 @@ fn message_token_len_cjk_aware() {
         content: Some("a".repeat(18)),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -5943,6 +6013,7 @@ fn provider_aware_estimate_adds_tool_protocol_overhead() {
             content: None,
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -5959,6 +6030,7 @@ fn provider_aware_estimate_adds_tool_protocol_overhead() {
             content: Some("file-a\nfile-b".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -5974,12 +6046,47 @@ fn provider_aware_estimate_adds_tool_protocol_overhead() {
 }
 
 #[test]
+fn anthropic_provider_estimate_counts_structured_thinking_blocks() {
+    let msg = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: Some(vec![
+            AnthropicThinkingBlock {
+                block_type: "thinking".into(),
+                thinking: Some("hidden reasoning".into()),
+                signature: Some("sig_123".into()),
+                data: None,
+            },
+            AnthropicThinkingBlock {
+                block_type: "redacted_thinking".into(),
+                thinking: None,
+                signature: None,
+                data: Some("opaque_blob".into()),
+            },
+        ]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+
+    let base = message_token_len(&msg);
+    let openai = message_token_len_for_provider(Provider::OpenAI, &msg);
+    let anthropic = message_token_len_for_provider(Provider::Anthropic, &msg);
+
+    assert_eq!(openai, base);
+    assert!(anthropic > openai);
+}
+
+#[test]
 fn request_estimate_includes_tool_schema_overhead() {
     let messages = vec![ChatMessage {
         role: "system".into(),
         content: Some("system prompt".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6015,6 +6122,7 @@ fn openai_request_estimate_includes_builtin_tool_schemas() {
         content: Some("system prompt".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6091,6 +6199,7 @@ fn turn_len_standalone_user() {
         content: Some("hi".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6106,6 +6215,7 @@ fn turn_len_user_plus_assistant() {
             content: Some("hi".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6115,6 +6225,7 @@ fn turn_len_user_plus_assistant() {
             content: Some("hello".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6131,6 +6242,7 @@ fn turn_len_user_assistant_with_tool_calls_and_results() {
             content: Some("list files".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6140,6 +6252,7 @@ fn turn_len_user_assistant_with_tool_calls_and_results() {
             content: None,
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -6156,6 +6269,7 @@ fn turn_len_user_assistant_with_tool_calls_and_results() {
             content: Some("file1.txt\nfile2.txt".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -6173,6 +6287,7 @@ fn turn_len_orphan_assistant_with_tool_results() {
             content: None,
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -6189,6 +6304,7 @@ fn turn_len_orphan_assistant_with_tool_results() {
             content: Some("ok".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -6198,6 +6314,7 @@ fn turn_len_orphan_assistant_with_tool_results() {
             content: Some("ok2".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc2".into()),
             timestamp: None,
@@ -6214,6 +6331,7 @@ fn turn_len_standalone_assistant_text() {
         content: Some("just text".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6230,6 +6348,7 @@ fn chat_message_has_nonempty_content() {
         content: None,
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6241,6 +6360,7 @@ fn chat_message_has_nonempty_content() {
         content: Some(String::new()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6252,6 +6372,7 @@ fn chat_message_has_nonempty_content() {
         content: Some("hello".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6266,6 +6387,7 @@ fn chat_message_has_tool_calls() {
         content: None,
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6277,6 +6399,7 @@ fn chat_message_has_tool_calls() {
         content: None,
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: Some(vec![]),
         tool_call_id: None,
         timestamp: None,
@@ -6288,6 +6411,7 @@ fn chat_message_has_tool_calls() {
         content: None,
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
@@ -6309,6 +6433,7 @@ fn chat_message_is_empty_assistant_message() {
         content: None,
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6320,17 +6445,36 @@ fn chat_message_is_empty_assistant_message() {
         content: Some("reply".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
     };
     assert!(!with_content.is_empty_assistant_message());
 
+    let with_thinking_blocks = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: Some(vec![AnthropicThinkingBlock {
+            block_type: "thinking".into(),
+            thinking: Some("reasoning".into()),
+            signature: Some("sig_123".into()),
+            data: None,
+        }]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    assert!(!with_thinking_blocks.is_empty_assistant_message());
+
     let user_msg = ChatMessage {
         role: "user".into(),
         content: None,
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6349,6 +6493,7 @@ fn prune_messages_removes_complete_tool_turn() {
             content: Some("sys".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6358,6 +6503,7 @@ fn prune_messages_removes_complete_tool_turn() {
             content: Some(big.clone()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6367,6 +6513,7 @@ fn prune_messages_removes_complete_tool_turn() {
             content: None,
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -6383,6 +6530,7 @@ fn prune_messages_removes_complete_tool_turn() {
             content: Some(big.clone()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -6392,6 +6540,7 @@ fn prune_messages_removes_complete_tool_turn() {
             content: Some("latest".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6418,6 +6567,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
             content: Some("sys".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6427,6 +6577,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
             content: Some("do something".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6436,6 +6587,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
             content: None,
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![
                 ToolCall {
                     id: "tc1".into(),
@@ -6462,6 +6614,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
             content: Some("result1".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -6471,6 +6624,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
             content: Some("result2".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc2".into()),
             timestamp: None,
@@ -6489,6 +6643,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
             content: Some("sys".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6498,6 +6653,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
             content: Some("do something".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6507,6 +6663,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
             content: None,
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![
                 ToolCall {
                     id: "tc1".into(),
@@ -6534,6 +6691,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
             content: Some("result1".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,

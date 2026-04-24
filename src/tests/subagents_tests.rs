@@ -1797,7 +1797,8 @@ fn test_validate_plan_infers_dependencies_from_prompt_placeholders() {
         },
     ];
 
-    let plan = validate_plan(tasks, workspace).expect("placeholder references should infer dependencies");
+    let plan =
+        validate_plan(tasks, workspace).expect("placeholder references should infer dependencies");
     let layers = compute_execution_layers(&plan);
 
     assert_eq!(plan.tasks[1].depends_on, vec!["project_spec"]);
@@ -1844,7 +1845,8 @@ fn test_validate_plan_merges_explicit_and_prompt_dependencies_without_duplicates
         },
     ];
 
-    let plan = validate_plan(tasks, workspace).expect("explicit and inferred dependencies should merge");
+    let plan =
+        validate_plan(tasks, workspace).expect("explicit and inferred dependencies should merge");
 
     assert_eq!(plan.tasks[2].depends_on, vec!["explore", "research"]);
 }

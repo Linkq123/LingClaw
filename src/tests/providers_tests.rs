@@ -166,6 +166,7 @@ fn convert_messages_to_openai_all_roles() {
             content: Some("you are helpful".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -175,6 +176,7 @@ fn convert_messages_to_openai_all_roles() {
             content: Some("hello".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -184,6 +186,7 @@ fn convert_messages_to_openai_all_roles() {
             content: Some("hi".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -193,6 +196,7 @@ fn convert_messages_to_openai_all_roles() {
             content: Some("result".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -202,6 +206,7 @@ fn convert_messages_to_openai_all_roles() {
             content: Some("skip me".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -223,6 +228,7 @@ fn convert_messages_to_openai_assistant_with_tool_calls() {
         content: None,
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
@@ -248,6 +254,7 @@ fn convert_messages_to_anthropic_system_extraction() {
             content: Some("system prompt".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -257,6 +264,7 @@ fn convert_messages_to_anthropic_system_extraction() {
             content: Some("hello".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -275,6 +283,7 @@ fn convert_messages_to_anthropic_tool_as_user_message() {
         content: Some("file contents".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: Some("tc1".into()),
         timestamp: None,
@@ -293,6 +302,7 @@ fn convert_messages_to_anthropic_assistant_with_tool_use() {
         content: Some("let me check".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
@@ -314,12 +324,51 @@ fn convert_messages_to_anthropic_assistant_with_tool_use() {
 }
 
 #[test]
+fn convert_messages_to_anthropic_roundtrips_structured_thinking_blocks() {
+    let messages = vec![ChatMessage {
+        role: "assistant".into(),
+        content: Some("answer".into()),
+        images: None,
+        thinking: Some("visible thinking".into()),
+        anthropic_thinking_blocks: Some(vec![
+            crate::AnthropicThinkingBlock {
+                block_type: "thinking".into(),
+                thinking: Some("hidden reasoning".into()),
+                signature: Some("sig_123".into()),
+                data: None,
+            },
+            crate::AnthropicThinkingBlock {
+                block_type: "redacted_thinking".into(),
+                thinking: None,
+                signature: None,
+                data: Some("opaque_blob".into()),
+            },
+        ]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let (_, out) = convert_messages_to_anthropic(&messages);
+    let content = out[0]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 3);
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], "hidden reasoning");
+    assert_eq!(content[0]["signature"], "sig_123");
+    assert_eq!(content[1]["type"], "redacted_thinking");
+    assert_eq!(content[1]["data"], "opaque_blob");
+    assert_eq!(content[2]["type"], "text");
+    assert_eq!(content[2]["text"], "answer");
+}
+
+#[test]
 fn convert_messages_to_anthropic_empty_assistant_gets_placeholder() {
     let messages = vec![ChatMessage {
         role: "assistant".into(),
         content: None,
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -339,6 +388,7 @@ fn convert_messages_to_ollama_all_roles() {
             content: Some("system prompt".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -348,6 +398,7 @@ fn convert_messages_to_ollama_all_roles() {
             content: Some("hello".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -357,6 +408,7 @@ fn convert_messages_to_ollama_all_roles() {
             content: Some("checking".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -373,6 +425,7 @@ fn convert_messages_to_ollama_all_roles() {
             content: Some("done".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -411,6 +464,40 @@ fn build_llm_response_thinking_buf_stored() {
         build_llm_response("reply".into(), "deep reasoning".into(), vec![], None, None).unwrap();
     assert_eq!(resp.message.content.as_deref(), Some("reply"));
     assert_eq!(resp.message.thinking.as_deref(), Some("deep reasoning"));
+}
+
+#[test]
+fn build_anthropic_llm_response_stores_roundtrip_blocks() {
+    let resp = build_anthropic_llm_response(
+        "reply".into(),
+        "deep reasoning".into(),
+        vec![
+            crate::AnthropicThinkingBlock {
+                block_type: "thinking".into(),
+                thinking: Some("deep reasoning".into()),
+                signature: Some("sig_abc".into()),
+                data: None,
+            },
+            crate::AnthropicThinkingBlock {
+                block_type: "redacted_thinking".into(),
+                thinking: None,
+                signature: None,
+                data: Some("opaque".into()),
+            },
+        ],
+        vec![],
+        None,
+        None,
+    )
+    .unwrap();
+
+    let blocks = resp.message.anthropic_thinking_blocks.unwrap();
+    assert_eq!(resp.message.thinking.as_deref(), Some("deep reasoning"));
+    assert_eq!(blocks.len(), 2);
+    assert_eq!(blocks[0].block_type, "thinking");
+    assert_eq!(blocks[0].signature.as_deref(), Some("sig_abc"));
+    assert_eq!(blocks[1].block_type, "redacted_thinking");
+    assert_eq!(blocks[1].data.as_deref(), Some("opaque"));
 }
 
 #[test]
@@ -587,6 +674,7 @@ fn anthropic_thinking_does_not_inflate_max_tokens() {
             content: Some("You are helpful.".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -596,6 +684,7 @@ fn anthropic_thinking_does_not_inflate_max_tokens() {
             content: Some("hello".into()),
             images: None,
             thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -630,6 +719,7 @@ fn anthropic_thinking_clamps_budget_when_max_tokens_is_small() {
         content: Some("hello".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -664,6 +754,7 @@ fn anthropic_thinking_disabled_when_max_tokens_too_small() {
         content: Some("hello".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -777,10 +868,12 @@ fn process_anthropic_sse_line_keeps_event_type_between_lines() {
             current_event_type: String::new(),
             content_buf: String::new(),
             thinking_buf: String::new(),
+            thinking_blocks: Vec::new(),
             tool_calls: Vec::new(),
             input_tokens: None,
             output_tokens: None,
             block_tool_idx: HashMap::new(),
+            block_thinking_idx: HashMap::new(),
             client_gone: false,
             reasoning_started: false,
             thinking_block_idx: None,
@@ -802,6 +895,80 @@ fn process_anthropic_sse_line_keeps_event_type_between_lines() {
     assert!(rx.try_recv().is_ok());
 }
 
+#[test]
+fn process_anthropic_sse_line_captures_signature_and_redacted_blocks() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let live_tx: LiveTx = tx;
+
+    let state = rt.block_on(async {
+        let mut state = AnthropicStreamState {
+            current_event_type: String::new(),
+            content_buf: String::new(),
+            thinking_buf: String::new(),
+            thinking_blocks: Vec::new(),
+            tool_calls: Vec::new(),
+            input_tokens: None,
+            output_tokens: None,
+            block_tool_idx: HashMap::new(),
+            block_thinking_idx: HashMap::new(),
+            client_gone: false,
+            reasoning_started: false,
+            thinking_block_idx: None,
+        };
+
+        process_anthropic_sse_line(
+            r#"event: content_block_start"#,
+            &live_tx,
+            &mut state,
+        )
+        .await;
+        process_anthropic_sse_line(
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            &live_tx,
+            &mut state,
+        )
+        .await;
+        process_anthropic_sse_line(r#"event: content_block_delta"#, &live_tx, &mut state).await;
+        process_anthropic_sse_line(
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}}"#,
+            &live_tx,
+            &mut state,
+        )
+        .await;
+        process_anthropic_sse_line(r#"event: content_block_delta"#, &live_tx, &mut state).await;
+        process_anthropic_sse_line(
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig_123"}}"#,
+            &live_tx,
+            &mut state,
+        )
+        .await;
+        process_anthropic_sse_line(r#"event: content_block_start"#, &live_tx, &mut state).await;
+        process_anthropic_sse_line(
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"opaque_blob"}}"#,
+            &live_tx,
+            &mut state,
+        )
+        .await;
+
+        state
+    });
+
+    assert_eq!(state.thinking_buf, "plan");
+    assert_eq!(state.thinking_blocks.len(), 2);
+    assert_eq!(state.thinking_blocks[0].block_type, "thinking");
+    assert_eq!(state.thinking_blocks[0].thinking.as_deref(), Some("plan"));
+    assert_eq!(
+        state.thinking_blocks[0].signature.as_deref(),
+        Some("sig_123")
+    );
+    assert_eq!(state.thinking_blocks[1].block_type, "redacted_thinking");
+    assert_eq!(
+        state.thinking_blocks[1].data.as_deref(),
+        Some("opaque_blob")
+    );
+}
+
 #[tokio::test]
 async fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
     let resolved = ResolvedModel {
@@ -821,6 +988,7 @@ async fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
         content: Some("hello".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -914,6 +1082,7 @@ fn call_llm_simple_ollama_sends_auth_and_expected_body() {
         content: Some("hi".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -974,6 +1143,7 @@ fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
         content: Some("inspect readme".into()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1228,6 +1398,7 @@ fn convert_messages_to_openai_user_with_images() {
             },
         ]),
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1258,6 +1429,7 @@ fn convert_messages_to_anthropic_user_with_images() {
             data: None,
         }]),
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1295,6 +1467,7 @@ fn convert_messages_to_ollama_user_with_images() {
             },
         ]),
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1332,6 +1505,7 @@ fn convert_messages_to_ollama_user_with_images_missing_b64() {
             data: None,
         }]),
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1362,6 +1536,7 @@ async fn fetch_images_base64_reads_persisted_cache_without_refetch() {
             data: None,
         }]),
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1392,6 +1567,7 @@ async fn fetch_images_base64_skips_uncached_historical_fetch_failures() {
             data: None,
         }]),
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1428,6 +1604,7 @@ async fn fetch_images_base64_trusted_uploaded_urls_bypass_ssrf_on_cache_miss() {
             data: None,
         }]),
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -1495,6 +1672,7 @@ fn materialize_image_urls_refreshes_uploaded_s3_urls() {
             data: None,
         }]),
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,

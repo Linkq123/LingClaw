@@ -13,7 +13,8 @@ use serde_json::{Value, json};
 use base64::Engine;
 
 use crate::{
-    ChatMessage, FunctionCall, LiveTx, Provider, ToolCall, image_uploads, live_send, tools,
+    AnthropicThinkingBlock, ChatMessage, FunctionCall, LiveTx, Provider, ToolCall, image_uploads,
+    live_send, tools,
 };
 
 /// Maximum size for a single image fetched for Ollama base64 encoding (10 MB).
@@ -66,10 +67,12 @@ struct AnthropicStreamState {
     current_event_type: String,
     content_buf: String,
     thinking_buf: String,
+    thinking_blocks: Vec<AnthropicThinkingBlock>,
     tool_calls: Vec<ToolCall>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     block_tool_idx: HashMap<usize, usize>,
+    block_thinking_idx: HashMap<usize, usize>,
     client_gone: bool,
     reasoning_started: bool,
     thinking_block_idx: Option<usize>,
@@ -176,6 +179,7 @@ struct AnthropicDelta {
     delta_type: Option<String>,
     text: Option<String>,
     thinking: Option<String>,
+    signature: Option<String>,
     partial_json: Option<String>,
 }
 
@@ -185,6 +189,9 @@ struct AnthropicContentBlock {
     block_type: String,
     id: Option<String>,
     name: Option<String>,
+    thinking: Option<String>,
+    signature: Option<String>,
+    data: Option<String>,
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -252,6 +259,43 @@ fn convert_messages_to_openai(messages: &[ChatMessage]) -> Vec<serde_json::Value
 
 /// Convert internal messages to Anthropic API format.
 /// Returns (system_prompt, messages_array).
+fn append_anthropic_thinking_blocks(
+    content_blocks: &mut Vec<serde_json::Value>,
+    msg: &ChatMessage,
+) {
+    let Some(blocks) = &msg.anthropic_thinking_blocks else {
+        return;
+    };
+
+    for block in blocks {
+        match block.block_type.as_str() {
+            "thinking" => {
+                if let (Some(thinking), Some(signature)) =
+                    (block.thinking.as_deref(), block.signature.as_deref())
+                    && !signature.is_empty()
+                {
+                    content_blocks.push(json!({
+                        "type": "thinking",
+                        "thinking": thinking,
+                        "signature": signature,
+                    }));
+                }
+            }
+            "redacted_thinking" => {
+                if let Some(data) = block.data.as_deref()
+                    && !data.is_empty()
+                {
+                    content_blocks.push(json!({
+                        "type": "redacted_thinking",
+                        "data": data,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn convert_messages_to_anthropic(messages: &[ChatMessage]) -> (String, Vec<serde_json::Value>) {
     let mut system = String::new();
     let mut out: Vec<serde_json::Value> = Vec::new();
@@ -284,14 +328,11 @@ fn convert_messages_to_anthropic(messages: &[ChatMessage]) -> (String, Vec<serde
                 }
             }
             "assistant" => {
-                // NOTE: msg.thinking is intentionally excluded here.
-                // Anthropic requires thinking blocks to be sent back with their
-                // cryptographic `signature` field (from content_block_start events),
-                // but LingClaw only stores the thinking text (for UI replay), not
-                // the signature. Sending thinking blocks without a valid signature
-                // would cause a 400 error. Omitting them is safe — the model will
-                // re-generate its own reasoning for subsequent turns.
                 let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+                // Structured Anthropic thinking blocks can be round-tripped.
+                // Legacy flat `msg.thinking` text remains UI-only because it
+                // has no signature and would be rejected by the API.
+                append_anthropic_thinking_blocks(&mut content_blocks, msg);
                 if let Some(text) = &msg.content
                     && !text.is_empty()
                 {
@@ -1135,12 +1176,39 @@ async fn process_anthropic_sse_line(line: &str, tx: &LiveTx, state: &mut Anthrop
                 {
                     match block.block_type.as_str() {
                         "thinking" => {
-                            state.thinking_block_idx = evt.index;
+                            let thinking_idx = state.thinking_blocks.len();
+                            let initial_thinking = block.thinking.clone().unwrap_or_default();
+                            state.thinking_blocks.push(AnthropicThinkingBlock {
+                                block_type: "thinking".into(),
+                                thinking: Some(initial_thinking.clone()),
+                                signature: block.signature.clone(),
+                                data: None,
+                            });
+                            if let Some(block_idx) = evt.index {
+                                state.block_thinking_idx.insert(block_idx, thinking_idx);
+                                state.thinking_block_idx = Some(block_idx);
+                            }
                             if !state.client_gone {
                                 state.reasoning_started = true;
                                 state.client_gone =
                                     !live_send(tx, json!({"type":"thinking_start"})).await;
+                                if !state.client_gone && !initial_thinking.is_empty() {
+                                    state.thinking_buf.push_str(&initial_thinking);
+                                    state.client_gone = !live_send(
+                                        tx,
+                                        json!({"type":"thinking_delta","content":initial_thinking}),
+                                    )
+                                    .await;
+                                }
                             }
+                        }
+                        "redacted_thinking" => {
+                            state.thinking_blocks.push(AnthropicThinkingBlock {
+                                block_type: "redacted_thinking".into(),
+                                thinking: None,
+                                signature: None,
+                                data: block.data.clone(),
+                            });
                         }
                         "tool_use" => {
                             let idx = state.tool_calls.len();
@@ -1166,14 +1234,37 @@ async fn process_anthropic_sse_line(line: &str, tx: &LiveTx, state: &mut Anthrop
                 {
                     match delta.delta_type.as_deref() {
                         Some("thinking_delta") => {
-                            if let Some(text) = &delta.thinking
-                                && !text.is_empty()
-                                && !state.client_gone
-                            {
-                                state.thinking_buf.push_str(text);
-                                state.client_gone =
-                                    !live_send(tx, json!({"type":"thinking_delta","content":text}))
+                            if let Some(text) = &delta.thinking {
+                                if let Some(block_idx) = evt.index
+                                    && let Some(&thinking_idx) =
+                                        state.block_thinking_idx.get(&block_idx)
+                                    && let Some(block) = state.thinking_blocks.get_mut(thinking_idx)
+                                {
+                                    block
+                                        .thinking
+                                        .get_or_insert_with(String::new)
+                                        .push_str(text);
+                                }
+                                if !text.is_empty() {
+                                    state.thinking_buf.push_str(text);
+                                    if !state.client_gone {
+                                        state.client_gone = !live_send(
+                                            tx,
+                                            json!({"type":"thinking_delta","content":text}),
+                                        )
                                         .await;
+                                    }
+                                }
+                            }
+                        }
+                        Some("signature_delta") => {
+                            if let Some(signature) = &delta.signature
+                                && let Some(block_idx) = evt.index
+                                && let Some(&thinking_idx) =
+                                    state.block_thinking_idx.get(&block_idx)
+                                && let Some(block) = state.thinking_blocks.get_mut(thinking_idx)
+                            {
+                                block.signature = Some(signature.clone());
                             }
                         }
                         Some("text_delta") => {
@@ -1697,10 +1788,12 @@ async fn call_llm_stream_anthropic(
         current_event_type: String::new(),
         content_buf: String::new(),
         thinking_buf: String::new(),
+        thinking_blocks: Vec::new(),
         tool_calls: Vec::new(),
         input_tokens: None,
         output_tokens: None,
         block_tool_idx: HashMap::new(),
+        block_thinking_idx: HashMap::new(),
         client_gone: false,
         reasoning_started: false,
         thinking_block_idx: None,
@@ -1714,9 +1807,10 @@ async fn call_llm_stream_anthropic(
         return Err("Client disconnected".into());
     }
 
-    build_llm_response(
+    build_anthropic_llm_response(
         stream_state.content_buf,
         stream_state.thinking_buf,
+        stream_state.thinking_blocks,
         stream_state.tool_calls,
         stream_state.input_tokens,
         stream_state.output_tokens,
@@ -1779,6 +1873,47 @@ async fn call_llm_stream_ollama(
     )
 }
 
+fn normalized_anthropic_thinking_blocks(
+    blocks: Vec<AnthropicThinkingBlock>,
+) -> Option<Vec<AnthropicThinkingBlock>> {
+    let blocks = blocks
+        .into_iter()
+        .filter(|block| match block.block_type.as_str() {
+            "thinking" => block
+                .signature
+                .as_deref()
+                .is_some_and(|signature| !signature.is_empty()),
+            "redacted_thinking" => block.data.as_deref().is_some_and(|data| !data.is_empty()),
+            _ => false,
+        })
+        .collect::<Vec<_>>();
+    if blocks.is_empty() {
+        None
+    } else {
+        Some(blocks)
+    }
+}
+
+fn build_anthropic_llm_response(
+    content_buf: String,
+    thinking_buf: String,
+    thinking_blocks: Vec<AnthropicThinkingBlock>,
+    tool_calls: Vec<ToolCall>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+) -> Result<LlmResponse, String> {
+    let mut response = build_llm_response(
+        content_buf,
+        thinking_buf,
+        tool_calls,
+        input_tokens,
+        output_tokens,
+    )?;
+    response.message.anthropic_thinking_blocks =
+        normalized_anthropic_thinking_blocks(thinking_blocks);
+    Ok(response)
+}
+
 fn build_llm_response(
     content_buf: String,
     thinking_buf: String,
@@ -1811,6 +1946,7 @@ fn build_llm_response(
             content,
             images: None,
             thinking,
+            anthropic_thinking_blocks: None,
             tool_calls: tc,
             tool_call_id: None,
             timestamp: Some(now.as_secs()),

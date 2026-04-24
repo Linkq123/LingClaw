@@ -126,12 +126,13 @@ pub(crate) fn message_token_len_for_provider(provider: Provider, message: &ChatM
                 .as_ref()
                 .map(|calls| calls.len() * ANTHROPIC_TOOL_USE_OVERHEAD_TOKENS)
                 .unwrap_or(0);
+            let thinking_block_tokens = anthropic_thinking_block_tokens(message);
             let tool_result_overhead = if message.role == "tool" {
                 ANTHROPIC_TOOL_RESULT_OVERHEAD_TOKENS
             } else {
                 0
             };
-            base + tool_use_overhead + tool_result_overhead
+            base + tool_use_overhead + tool_result_overhead + thinking_block_tokens
         }
     }
 }
@@ -414,6 +415,36 @@ fn is_cjk_like(c: char) -> bool {
             | '\u{30A0}'..='\u{30FF}'
             | '\u{AC00}'..='\u{D7AF}'
     )
+}
+
+fn anthropic_thinking_block_tokens(message: &ChatMessage) -> usize {
+    message
+        .anthropic_thinking_blocks
+        .as_ref()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .map(|block| {
+                    let payload_tokens = block
+                        .thinking
+                        .as_deref()
+                        .map(estimate_text_tokens)
+                        .unwrap_or(0)
+                        + block
+                            .signature
+                            .as_deref()
+                            .map(estimate_text_tokens)
+                            .unwrap_or(0)
+                        + block.data.as_deref().map(estimate_text_tokens).unwrap_or(0);
+                    if payload_tokens == 0 {
+                        0
+                    } else {
+                        payload_tokens + 4
+                    }
+                })
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 pub(crate) fn message_token_len(message: &ChatMessage) -> usize {

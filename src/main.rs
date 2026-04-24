@@ -121,6 +121,18 @@ struct ImageAttachment {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
+struct AnthropicThinkingBlock {
+    #[serde(rename = "type")]
+    block_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct ChatMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -129,6 +141,8 @@ struct ChatMessage {
     images: Option<Vec<ImageAttachment>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anthropic_thinking_blocks: Option<Vec<AnthropicThinkingBlock>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -150,8 +164,17 @@ impl ChatMessage {
             .is_some_and(|calls| !calls.is_empty())
     }
 
+    fn has_anthropic_thinking_blocks(&self) -> bool {
+        self.anthropic_thinking_blocks
+            .as_ref()
+            .is_some_and(|blocks| !blocks.is_empty())
+    }
+
     fn is_empty_assistant_message(&self) -> bool {
-        self.role == "assistant" && !self.has_nonempty_content() && !self.has_tool_calls()
+        self.role == "assistant"
+            && !self.has_nonempty_content()
+            && !self.has_tool_calls()
+            && !self.has_anthropic_thinking_blocks()
     }
 }
 
@@ -646,6 +669,7 @@ You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools
         content: Some(prompt),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -2119,6 +2143,7 @@ async fn api_test_model(
         content: Some("Hi".to_string()),
         images: None,
         thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,

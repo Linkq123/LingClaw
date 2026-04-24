@@ -1,6 +1,6 @@
 [package]
 name = "lingclaw"
-version = "0.6.3"
+version = "0.6.4"
 edition = "2024"
 description = "A Rust personal AI assistant"
 license = "MIT"
