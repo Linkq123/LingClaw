@@ -463,6 +463,41 @@ async fn send_react_phase_event(live_tx: &LiveTx, react_ctx: &agent::AgentLoopCt
     }
 }
 
+fn select_analyze_model(
+    config: &Config,
+    base_model: &str,
+    fast_model: Option<&str>,
+    cycles: usize,
+    has_model_override: bool,
+    latest_query: Option<&str>,
+    context_has_images: bool,
+) -> (String, &'static str) {
+    if cycles != 0 || has_model_override {
+        return (base_model.to_string(), crate::context::USAGE_ROLE_PRIMARY);
+    }
+
+    let Some(fast_model) = fast_model else {
+        return (base_model.to_string(), crate::context::USAGE_ROLE_PRIMARY);
+    };
+
+    let simple_query = latest_query.map(agent::is_simple_query).unwrap_or(false);
+    let fast_supports_images = !context_has_images || config.model_supports_image(fast_model);
+    if simple_query && fast_supports_images {
+        (fast_model.to_string(), crate::context::USAGE_ROLE_FAST)
+    } else {
+        (base_model.to_string(), crate::context::USAGE_ROLE_PRIMARY)
+    }
+}
+
+fn messages_have_images(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .images
+            .as_ref()
+            .is_some_and(|images| !images.is_empty())
+    })
+}
+
 async fn prepare_analyze_snapshot(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
@@ -480,30 +515,21 @@ async fn prepare_analyze_snapshot(
         .rev()
         .find(|m| m.role == "user")
         .and_then(|m| m.content.clone());
+    let context_has_images = messages_have_images(&session.messages);
     let user_msg_chars = latest_query
         .as_ref()
         .map(|q| q.chars().count())
         .unwrap_or(0);
 
-    // On the first cycle, downgrade to fast model for simple queries when configured.
-    let (model_str, usage_role) =
-        if phase_state.react_ctx.cycles == 0 && session.model_override.is_none() {
-            if let Some(ref fast) = config.fast_model {
-                if latest_query
-                    .as_deref()
-                    .map(agent::is_simple_query)
-                    .unwrap_or(false)
-                {
-                    (fast.clone(), crate::context::USAGE_ROLE_FAST)
-                } else {
-                    (base_model, crate::context::USAGE_ROLE_PRIMARY)
-                }
-            } else {
-                (base_model, crate::context::USAGE_ROLE_PRIMARY)
-            }
-        } else {
-            (base_model, crate::context::USAGE_ROLE_PRIMARY)
-        };
+    let (model_str, usage_role) = select_analyze_model(
+        &config,
+        &base_model,
+        config.fast_model.as_deref(),
+        phase_state.react_ctx.cycles,
+        session.model_override.is_some(),
+        latest_query.as_deref(),
+        context_has_images,
+    );
 
     let mut fresh_system = build_system_prompt_with_query(
         &config,

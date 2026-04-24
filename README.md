@@ -257,7 +257,7 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 | `LINGCLAW_SUB_AGENT_TIMEOUT` | `300` | 子代理总执行超时（秒，0=无限，仅 max_turns 和 /stop 限制） |
 | `LINGCLAW_MAX_LLM_RETRIES` | `2` | LLM API 瞬态错误（429/5xx/连接/超时）的 HTTP 级重试次数 |
 | `LINGCLAW_MAX_CONTEXT_TOKENS` | `32000` | 默认上下文 token 预算 |
-| `LINGCLAW_FAST_MODEL` | 无 | 简单首轮查询使用的轻量模型（如 `openai/gpt-4o-mini`） |
+| `LINGCLAW_FAST_MODEL` | 无 | 简单首轮查询优先使用的轻量模型；若当前上下文含图片，则仅在该模型声明支持图片输入时使用（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_SUB_AGENT_MODEL` | 无 | 子代理委托任务使用的模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_MEMORY_MODEL` | 无 | structured memory 后台抽取优先使用的模型（如 `openai/gpt-4o-mini`） |
 | `LINGCLAW_REFLECTION_MODEL` | 无 | daily reflection 后台生成优先使用的模型（如 `openai/gpt-4o-mini`） |

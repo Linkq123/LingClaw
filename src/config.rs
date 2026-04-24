@@ -941,12 +941,14 @@ impl Config {
         {
             return pc.models.iter().find(|m| m.id == model_id);
         }
-        // Fallback: search all providers by plain id
-        for pc in self.providers.values() {
-            if let Some(entry) = pc.models.iter().find(|m| m.id == model_ref) {
-                return Some(entry);
-            }
+
+        let resolved_ref = self.resolved_model_ref(model_ref);
+        if let Some((prov_name, model_id)) = resolved_ref.split_once('/')
+            && let Some(pc) = self.providers.get(prov_name)
+        {
+            return pc.models.iter().find(|m| m.id == model_id);
         }
+
         None
     }
 

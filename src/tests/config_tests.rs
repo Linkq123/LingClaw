@@ -180,6 +180,61 @@ fn resolve_provider_name_prefers_configured_provider_alias() {
 }
 
 #[test]
+fn model_supports_image_prefers_runtime_aligned_provider_for_plain_ids() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-a".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api-a.example/v1".to_string(),
+            api_key: "key-a".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "shared-model".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: Some(vec!["text".to_string()]),
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(4096),
+                compat: None,
+            }],
+        },
+    );
+    providers.insert(
+        "openai-b".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api-b.example/v1".to_string(),
+            api_key: "key-b".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "shared-model".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: Some(vec!["text".to_string(), "image".to_string()]),
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+
+    let config = runtime_alignment_config(
+        Provider::OpenAI,
+        "https://api-b.example/v1",
+        "key-b",
+        "shared-model",
+        providers,
+    );
+
+    assert_eq!(
+        config.resolved_model_ref("shared-model"),
+        "openai-b/shared-model"
+    );
+    assert!(config.model_supports_image("shared-model"));
+}
+
+#[test]
 fn validate_json_provider_names_rejects_invalid_provider_keys() {
     let mut providers = HashMap::new();
     providers.insert(

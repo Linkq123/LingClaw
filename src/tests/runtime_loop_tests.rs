@@ -2,7 +2,7 @@ use super::*;
 
 use std::{collections::HashMap, sync::atomic::AtomicU64};
 
-use crate::config::S3Config;
+use crate::config::{JsonModelEntry, JsonProviderConfig, S3Config};
 
 fn test_config() -> Config {
     Config {
@@ -123,6 +123,153 @@ fn test_s3_config() -> S3Config {
         url_expiry_secs: 3600,
         lifecycle_days: 14,
     }
+}
+
+fn test_image_attachment() -> ImageAttachment {
+    ImageAttachment {
+        url: "https://example.test/image.png".to_string(),
+        s3_object_key: None,
+        cache_path: None,
+        data: None,
+    }
+}
+
+#[test]
+fn select_analyze_model_keeps_primary_for_image_turn_when_fast_lacks_image_support() {
+    let mut config = test_config();
+    config.model = "openai/gpt-4o".to_string();
+    config.fast_model = Some("openai/gpt-4o-mini".to_string());
+    config.providers.insert(
+        "openai".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "test-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![
+                JsonModelEntry {
+                    id: "gpt-4o".to_string(),
+                    input: Some(vec!["text".to_string(), "image".to_string()]),
+                    ..Default::default()
+                },
+                JsonModelEntry {
+                    id: "gpt-4o-mini".to_string(),
+                    input: Some(vec!["text".to_string()]),
+                    ..Default::default()
+                },
+            ],
+        },
+    );
+
+    let (model, role) = select_analyze_model(
+        &config,
+        &config.model,
+        config.fast_model.as_deref(),
+        0,
+        false,
+        Some("这张图里是什么？"),
+        true,
+    );
+
+    assert_eq!(model, "openai/gpt-4o");
+    assert_eq!(role, crate::context::USAGE_ROLE_PRIMARY);
+}
+
+#[test]
+fn select_analyze_model_uses_fast_for_simple_text_turn() {
+    let mut config = test_config();
+    config.model = "openai/gpt-4o".to_string();
+    config.fast_model = Some("openai/gpt-4o-mini".to_string());
+
+    let (model, role) = select_analyze_model(
+        &config,
+        &config.model,
+        config.fast_model.as_deref(),
+        0,
+        false,
+        Some("hello"),
+        false,
+    );
+
+    assert_eq!(model, "openai/gpt-4o-mini");
+    assert_eq!(role, crate::context::USAGE_ROLE_FAST);
+}
+
+#[test]
+fn select_analyze_model_uses_fast_for_image_turn_when_fast_supports_images() {
+    let mut config = test_config();
+    config.model = "openai/gpt-4o".to_string();
+    config.fast_model = Some("openai/gpt-4o-mini".to_string());
+    config.providers.insert(
+        "openai".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "test-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![
+                JsonModelEntry {
+                    id: "gpt-4o".to_string(),
+                    input: Some(vec!["text".to_string(), "image".to_string()]),
+                    ..Default::default()
+                },
+                JsonModelEntry {
+                    id: "gpt-4o-mini".to_string(),
+                    input: Some(vec!["text".to_string(), "image".to_string()]),
+                    ..Default::default()
+                },
+            ],
+        },
+    );
+
+    let (model, role) = select_analyze_model(
+        &config,
+        &config.model,
+        config.fast_model.as_deref(),
+        0,
+        false,
+        Some("what is in this image"),
+        true,
+    );
+
+    assert_eq!(model, "openai/gpt-4o-mini");
+    assert_eq!(role, crate::context::USAGE_ROLE_FAST);
+}
+
+#[test]
+fn messages_have_images_detects_historical_image_context() {
+    let messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("system".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("previous image".into()),
+            images: Some(vec![test_image_attachment()]),
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("hello".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    ];
+
+    assert!(messages_have_images(&messages));
 }
 
 #[test]

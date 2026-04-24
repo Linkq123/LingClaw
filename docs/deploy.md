@@ -367,7 +367,7 @@ volumes:
 | JSON 字段 | 说明 | 环境变量覆盖 |
 |-----------|------|--------------|
 | `primary` | 主 Agent 默认模型 | `LINGCLAW_MODEL` |
-| `fast` | 简单首轮查询优先使用的轻量模型 | `LINGCLAW_FAST_MODEL` |
+| `fast` | 简单首轮查询优先使用的轻量模型；若当前上下文含图片，则仅在该模型支持图片输入时启用 | `LINGCLAW_FAST_MODEL` |
 | `sub-agent` | 子代理执行模型 | `LINGCLAW_SUB_AGENT_MODEL` |
 | `memory` | structured memory 后台抽取模型 | `LINGCLAW_MEMORY_MODEL` |
 | `reflection` | daily reflection 后台模型 | `LINGCLAW_REFLECTION_MODEL` |
