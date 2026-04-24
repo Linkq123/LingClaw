@@ -74,6 +74,13 @@ header .actions button.is-active {
   color: var(--text);
   background: rgba(45,139,207,.12);
 }
+.theme-toggle-btn {
+  /* Stable width so cycling between Auto / Light / Dark doesn't shift the
+     neighbouring action buttons. */
+  min-width: 78px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: .02em;
+}
 .usage-badge {
   font-size: 11px;
   color: var(--dim);
@@ -90,6 +97,7 @@ header .actions button.is-active {
 .conn-badge { display: flex; align-items: center; gap: 6px; font-size: 11px; color: var(--dim); flex-shrink: 0; }
 .conn-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; transition: background .3s, box-shadow .3s; }
 .conn-dot.connected { background: var(--accent-success); box-shadow: 0 0 6px rgba(31,168,90,.35); }
+.conn-dot.connecting { background: #f0b43a; animation: pulse 1.2s infinite; box-shadow: 0 0 6px rgba(240,180,58,.35); }
 .conn-dot.disconnected { background: var(--accent-error); animation: pulse 1.5s infinite; }
 .conn-label { letter-spacing: .3px; }
 

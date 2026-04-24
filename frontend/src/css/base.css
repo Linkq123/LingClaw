@@ -13,7 +13,7 @@
   --accent-success: #1fa85a;
   --accent-warn: #d4960a;
   --text: #2c2e3e;
-  --dim: #7e8699;
+  --dim: #626a7f;
   --border: #e2e5ee;
   --tool-bg: #f4f6fa;
   --tool-border: #dde1ec;
@@ -28,9 +28,61 @@ body {
   font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
   background: var(--bg);
   color: var(--text);
+  /* `100vh` leaves whitespace below the composer on iOS Safari when the URL
+     bar collapses; `100dvh` tracks the real viewport. Keep `100vh` as the
+     fallback for engines without `dvh` support. */
   height: 100vh;
+  height: 100dvh;
   display: flex;
   overflow: hidden;
+}
+
+/* ── Accessibility helpers ── */
+/* Skip link kept off-screen until focused, then pinned to the top-left.
+   Gives keyboard users a one-tab path past the header to the composer. */
+.skip-link {
+  position: absolute;
+  top: 0;
+  left: 0;
+  padding: 8px 14px;
+  background: var(--accent);
+  color: #fff;
+  text-decoration: none;
+  border-radius: 0 0 8px 0;
+  transform: translateY(-100%);
+  transition: transform 0.15s ease;
+  z-index: 1000;
+}
+.skip-link:focus {
+  transform: translateY(0);
+  outline: 2px solid var(--accent2);
+  outline-offset: 2px;
+}
+
+/* Only show focus rings for keyboard navigation; click/tap users shouldn't
+   see persistent outlines on buttons. `:focus-visible` handles the
+   differentiation natively. */
+:focus:not(:focus-visible) {
+  outline: none;
+}
+:focus-visible {
+  outline: 2px solid var(--accent2);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Respect the OS reduced-motion preference. We strip animations and
+   transitions globally so anything missed by module-level rules still
+   calms down. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 /* ── Animations ── */

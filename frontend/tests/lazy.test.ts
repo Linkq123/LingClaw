@@ -45,8 +45,12 @@ async function makeLazy({
   return { lazy, createRoot, renderFn };
 }
 
-/** Flush all pending microtasks + one macro-task tick. */
-const flush = () => new Promise((r) => setTimeout(r, 0));
+/** Flush pending dynamic imports, microtasks, and one macro-task tick. */
+async function flush(): Promise<void> {
+  await vi.dynamicImportSettled();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  await Promise.resolve();
+}
 
 // ── Tests ──────────────────────────────────────────────────────────────────
 

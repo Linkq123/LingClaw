@@ -21,6 +21,7 @@ export const MAX_REACT_QUEUED_PHASES = 2;
 
 // ── History ──
 export const HISTORY_RENDER_LIMIT = 50;
+export const HISTORY_LOAD_CHUNK_SIZE = 50;
 
 // ── Input ──
 export const INPUT_HISTORY_MAX = 10;

@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { extractMath, findProgressiveSplitPoint, isSentenceSplitChar } from '../src/markdown.js';
+import {
+  extractMath,
+  findProgressiveSplitPoint,
+  isSentenceSplitChar,
+  renderMarkdown,
+} from '../src/markdown.js';
 
 describe('extractMath', () => {
   it('extracts inline math', () => {
@@ -67,5 +72,33 @@ describe('findProgressiveSplitPoint', () => {
   it('splits at code fence boundary', () => {
     const text = '```js\nconsole.log("hi")\n```\nAfter code.';
     expect(findProgressiveSplitPoint(text)).toBeGreaterThan(0);
+  });
+});
+
+describe('renderMarkdown memoization', () => {
+  it('skips unchanged raw content', async () => {
+    const el = document.createElement('div');
+    el._rawText = '**bold**';
+
+    await renderMarkdown(el);
+    expect(el.querySelector('strong')?.textContent).toBe('bold');
+
+    const marker = document.createElement('span');
+    marker.dataset.testMarker = 'preserved';
+    el.appendChild(marker);
+
+    await renderMarkdown(el);
+    expect(el.querySelector('[data-test-marker="preserved"]')).not.toBeNull();
+  });
+
+  it('re-renders when raw content changes', async () => {
+    const el = document.createElement('div');
+    el._rawText = '**first**';
+    await renderMarkdown(el);
+
+    el._rawText = '**second**';
+    await renderMarkdown(el);
+
+    expect(el.querySelector('strong')?.textContent).toBe('second');
   });
 });

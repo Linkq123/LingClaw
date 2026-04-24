@@ -1,11 +1,6 @@
-﻿// Library imports
-import hljs from 'highlight.js';
-import { marked } from 'marked';
-import { markedHighlight } from 'marked-highlight';
-
-// CSS imports
-import 'katex/dist/katex.min.css';
-import './css/hljs-themes.css';
+﻿// CSS imports. The highlight.js stylesheet is injected dynamically by
+// `theme.ts` so that an explicit user theme choice overrides the system
+// setting; we no longer import it statically here.
 import './css/base.css';
 import './css/layout.css';
 import './css/chat.css';
@@ -13,11 +8,15 @@ import './css/panels.css';
 import './css/pages.css';
 import './css/responsive.css';
 
-import { dom, state, initDomRefs } from './state.js';
-import { HISTORY_RENDER_LIMIT } from './constants.js';
-import { formatTokenCount, hideWelcome } from './utils.js';
+import { initTheme, cycleTheme, disposeTheme } from './theme.js';
+import { dom, initDomRefs, state } from './state.js';
+import { HISTORY_LOAD_CHUNK_SIZE, HISTORY_RENDER_LIMIT } from './constants.js';
+import { findHistoryRenderStart, splitHistoryLoadChunk } from './historyWindow.js';
+import { formatTokenCount, hideWelcome, scheduleBackgroundTask } from './utils.js';
 import {
   syncToolDrawerBounds,
+  cancelToolDrawerBoundsSync,
+  invalidateChatScrollCache,
   clearBufferedChatUpdates,
   setAutoFollowChat,
   scrollDown,
@@ -56,14 +55,14 @@ import {
   closeToolDrawer,
   toggleTool,
 } from './renderers/tools.js';
-import { scheduleMarkdownRender } from './markdown.js';
+import { preloadMarkdownEngine, scheduleMarkdownRender } from './markdown.js';
 import {
   beginAssistantStream,
   finishAssistantStream,
   finishReasoningStream,
   scheduleFlush,
 } from './handlers/stream.js';
-import { connect } from './socket.js';
+import { connect, cancelReconnect } from './socket.js';
 import {
   ensureUploadTokenInternal,
   updateAttachButton,
@@ -118,19 +117,6 @@ initDomRefs();
 // React islands (Settings & Usage) are now code-split and mounted lazily on
 // first `openSettingsPage()` / `openUsagePage()` call. We also prefetch them
 // during idle time so the first open is instant.
-
-// ── Markdown setup ──
-marked.use(
-  markedHighlight({
-    highlight(code, lang) {
-      if (lang && hljs.getLanguage(lang)) {
-        return hljs.highlight(code, { language: lang }).value;
-      }
-      return hljs.highlightAuto(code).value;
-    },
-  }),
-);
-marked.setOptions({ breaks: true });
 
 // ── View toggles ──
 
@@ -212,39 +198,18 @@ function appendRoundUsage(messageEl, inputTokens, outputTokens) {
 
 // ── History lazy-load ──
 
-function findHistoryRenderStart(messages, preferredStart) {
-  let startIdx = Math.max(0, preferredStart);
-  if (startIdx === 0) {
-    return 0;
-  }
-
-  const toolCallById = new Map();
-  for (let i = 0; i < messages.length; i++) {
-    const message = messages[i];
-    if (message.role === 'tool_call' && message.id) {
-      toolCallById.set(message.id, i);
-    }
-  }
-
-  let expanded = true;
-  while (expanded) {
-    expanded = false;
-    for (let i = startIdx; i < messages.length; i++) {
-      const message = messages[i];
-      if (message.role !== 'tool_result' || !message.id) {
-        continue;
-      }
-
-      const callIdx = toolCallById.get(message.id);
-      if (callIdx !== undefined && callIdx < startIdx) {
-        startIdx = callIdx;
-        expanded = true;
-        break;
-      }
-    }
-  }
-
-  return startIdx;
+function createLoadMoreRow(count: number): HTMLElement {
+  const loadMoreRow = document.createElement('div');
+  loadMoreRow.className = 'msg-row system';
+  loadMoreRow.id = 'load-more-row';
+  const btn = document.createElement('button');
+  btn.className = 'load-more-btn';
+  btn.dataset.action = 'load-earlier';
+  btn.type = 'button';
+  btn.textContent = `\u2191 \u52a0\u8f7d\u66f4\u65e9\u7684\u6d88\u606f (${count} \u6761)`;
+  btn.setAttribute('aria-label', `Load ${count} earlier messages`);
+  loadMoreRow.appendChild(btn);
+  return loadMoreRow;
 }
 
 function parseOrchestrationHistoryResult(resultText) {
@@ -284,6 +249,7 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
       if (m.thinking && m.thinking.trim() && state.showReasoning) {
         const panel = buildHistoryReasoningPanel(m.thinking);
         dom.chat.appendChild(wrapInTimeline(panel, 'reasoning'));
+        invalidateChatScrollCache();
       }
       const el = addMsg('assistant', m.content, m.timestamp);
       el._rawText = m.content;
@@ -372,8 +338,12 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
 }
 
 function loadEarlierMessages() {
-  const msgs = state.deferredHistory;
-  state.deferredHistory = [];
+  const { remaining, chunk: msgs } = splitHistoryLoadChunk(
+    state.deferredHistory,
+    HISTORY_LOAD_CHUNK_SIZE,
+  );
+  if (msgs.length === 0) return;
+  state.deferredHistory = remaining;
   state._historyTaskIds = null;
   state._historyOrchestrateIds = null;
   const loadMoreRow = document.getElementById('load-more-row');
@@ -381,8 +351,13 @@ function loadEarlierMessages() {
   if (loadMoreRow) loadMoreRow.remove();
   const existing = [...dom.chat.children];
   dom.chat.replaceChildren();
+  invalidateChatScrollCache();
   dom.chat.classList.add('no-animate');
   state.bulkRenderingChat = true;
+  if (state.deferredHistory.length > 0) {
+    dom.chat.appendChild(createLoadMoreRow(state.deferredHistory.length));
+    invalidateChatScrollCache();
+  }
   for (const m of msgs) renderHistoryMessage(m, { followMarkdown: false });
   // Finalize orphaned panels from deferred history.
   if (state._historyTaskIds && state._historyTaskIds.size > 0) {
@@ -398,6 +373,7 @@ function loadEarlierMessages() {
     state._historyOrchestrateIds = null;
   }
   for (const el of existing) dom.chat.appendChild(el);
+  invalidateChatScrollCache();
   requestAnimationFrame(() => {
     state.bulkRenderingChat = false;
     dom.chat.classList.remove('no-animate');
@@ -447,6 +423,7 @@ function handleMessage(data) {
       // replaceChildren() avoids the extra HTML parser invocation of
       // `innerHTML = ''` and is slightly friendlier to GC on large chats.
       dom.chat.replaceChildren();
+      invalidateChatScrollCache();
       state.deferredHistory = [];
       state.activeSubagentPanels.clear();
       state.activeOrchestrations.clear();
@@ -462,15 +439,8 @@ function handleMessage(data) {
         if (msgs.length > HISTORY_RENDER_LIMIT) {
           startIdx = findHistoryRenderStart(msgs, msgs.length - HISTORY_RENDER_LIMIT);
           state.deferredHistory = msgs.slice(0, startIdx);
-          const loadMoreRow = document.createElement('div');
-          loadMoreRow.className = 'msg-row system';
-          loadMoreRow.id = 'load-more-row';
-          const btn = document.createElement('button');
-          btn.className = 'load-more-btn';
-          btn.dataset.action = 'load-earlier';
-          btn.textContent = `\u2191 \u52a0\u8f7d\u66f4\u65e9\u7684\u6d88\u606f (${state.deferredHistory.length} \u6761)`;
-          loadMoreRow.appendChild(btn);
-          dom.chat.appendChild(loadMoreRow);
+          dom.chat.appendChild(createLoadMoreRow(state.deferredHistory.length));
+          invalidateChatScrollCache();
         }
         for (let i = startIdx; i < msgs.length; i++) {
           renderHistoryMessage(msgs[i]);
@@ -578,6 +548,7 @@ function handleMessage(data) {
       } else {
         dom.chat.appendChild(wrapper);
       }
+      invalidateChatScrollCache();
       pinReactStatusToBottom();
       animatePanelIn(panel);
       state.reasoningPanel = panel;
@@ -829,6 +800,11 @@ const actionHandlers = {
     closeMobileMenu();
   },
   'toggle-mobile-menu': () => toggleMobileMenu(),
+  'toggle-theme': () => cycleTheme(),
+  'show-shortcuts': () => {
+    closeMobileMenu();
+    toggleShortcutsOverlay();
+  },
   'close-tool-drawer': () => closeToolDrawer(),
   'dismiss-system-card': (el) => {
     if (!el) return;
@@ -878,6 +854,167 @@ function handleDocumentKeydown(e: KeyboardEvent) {
     closeMobileMenu();
     closeSettingsPage();
     closeUsagePage();
+    closeShortcutsOverlay();
+    return;
+  }
+
+  if (trapShortcutsFocus(e)) {
+    return;
+  }
+
+  if (shortcutsOverlay && !shortcutsOverlay.hidden) {
+    if ((e.ctrlKey || e.metaKey) && (e.key === '/' || e.key === 'k' || e.key === 'K')) {
+      e.preventDefault();
+    }
+    return;
+  }
+
+  // Avoid stealing keys while the user types. We only treat shortcuts as
+  // global when the active element is not an editable field, except for the
+  // meta-combo variants which are still safe to intercept (Ctrl/Cmd is rarely
+  // part of literal text input).
+  const active = document.activeElement;
+  const inField =
+    active instanceof HTMLElement &&
+    (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable);
+  const modKey = e.ctrlKey || e.metaKey;
+
+  // Ctrl/Cmd + / → cycle theme. Matches the shortcut shown in the help
+  // overlay; avoids the `?` key which conflicts with text entry.
+  if (modKey && e.key === '/') {
+    e.preventDefault();
+    cycleTheme();
+    return;
+  }
+
+  // Ctrl/Cmd + K → focus composer. Familiar pattern from Slack/Discord.
+  if (modKey && (e.key === 'k' || e.key === 'K')) {
+    e.preventDefault();
+    if (dom.input) {
+      dom.input.focus();
+      dom.input.setSelectionRange(dom.input.value.length, dom.input.value.length);
+    }
+    return;
+  }
+
+  // Shift + / (i.e. the `?` key on US layouts) opens the shortcuts overlay.
+  // We skip this when inside an editable field so typing a literal `?`
+  // into a message still works.
+  if (!inField && !modKey && e.key === '?') {
+    e.preventDefault();
+    toggleShortcutsOverlay();
+  }
+}
+
+let shortcutsOverlay: HTMLElement | null = null;
+let lastFocusBeforeShortcuts: Element | null = null;
+
+function ensureShortcutsOverlay(): HTMLElement {
+  if (shortcutsOverlay) return shortcutsOverlay;
+  const el = document.createElement('div');
+  el.className = 'shortcuts-overlay';
+  el.hidden = true;
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-modal', 'true');
+  el.setAttribute('aria-label', 'Keyboard shortcuts');
+  el.innerHTML = `
+    <div class="shortcuts-panel">
+      <div class="shortcuts-header">
+        <h2>Keyboard shortcuts</h2>
+        <button type="button" class="shortcuts-close" aria-label="Close">×</button>
+      </div>
+      <dl class="shortcuts-list">
+        <dt><kbd>Enter</kbd></dt><dd>Send message</dd>
+        <dt><kbd>Shift</kbd>+<kbd>Enter</kbd></dt><dd>Newline in composer</dd>
+        <dt><kbd>↑</kbd> / <kbd>↓</kbd></dt><dd>Browse input history</dd>
+        <dt><kbd>Ctrl</kbd>+<kbd>K</kbd></dt><dd>Focus the composer</dd>
+        <dt><kbd>Ctrl</kbd>+<kbd>/</kbd></dt><dd>Cycle theme (auto / light / dark)</dd>
+        <dt><kbd>?</kbd></dt><dd>Show this help</dd>
+        <dt><kbd>Esc</kbd></dt><dd>Close panels & menus</dd>
+      </dl>
+      <p class="shortcuts-hint">Press <kbd>Esc</kbd> to close.</p>
+    </div>
+  `;
+  el.addEventListener('click', (ev) => {
+    const t = ev.target;
+    if (!(t instanceof Element)) return;
+    if (t === el || t.classList.contains('shortcuts-close')) {
+      closeShortcutsOverlay();
+    }
+  });
+  document.body.appendChild(el);
+  shortcutsOverlay = el;
+  return el;
+}
+
+function getShortcutsFocusableElements(): HTMLElement[] {
+  if (!shortcutsOverlay) return [];
+  const selector = [
+    'button:not([disabled])',
+    '[href]',
+    'input:not([disabled])',
+    'select:not([disabled])',
+    'textarea:not([disabled])',
+    '[tabindex]:not([tabindex="-1"])',
+  ].join(',');
+  return Array.from(shortcutsOverlay.querySelectorAll<HTMLElement>(selector)).filter(
+    (el) => !el.hasAttribute('hidden') && el.getAttribute('aria-hidden') !== 'true',
+  );
+}
+
+function trapShortcutsFocus(e: KeyboardEvent): boolean {
+  if (e.key !== 'Tab' || !shortcutsOverlay || shortcutsOverlay.hidden) return false;
+  const focusable = getShortcutsFocusableElements();
+  if (focusable.length === 0) {
+    e.preventDefault();
+    shortcutsOverlay.focus();
+    return true;
+  }
+
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  const active = document.activeElement;
+  if (!(active instanceof HTMLElement) || !shortcutsOverlay.contains(active)) {
+    e.preventDefault();
+    first.focus();
+    return true;
+  }
+  if (e.shiftKey && active === first) {
+    e.preventDefault();
+    last.focus();
+    return true;
+  }
+  if (!e.shiftKey && active === last) {
+    e.preventDefault();
+    first.focus();
+    return true;
+  }
+  return false;
+}
+
+function toggleShortcutsOverlay(): void {
+  const el = ensureShortcutsOverlay();
+  if (el.hidden) {
+    lastFocusBeforeShortcuts = document.activeElement;
+    el.hidden = false;
+    const close = el.querySelector('.shortcuts-close');
+    if (close instanceof HTMLElement) close.focus();
+  } else {
+    closeShortcutsOverlay();
+  }
+}
+
+function closeShortcutsOverlay(): void {
+  if (shortcutsOverlay && !shortcutsOverlay.hidden) {
+    shortcutsOverlay.hidden = true;
+    // Restore focus to whatever the user had active before opening; falling
+    // back to the composer is nicer than leaving focus on <body>.
+    if (lastFocusBeforeShortcuts instanceof HTMLElement && lastFocusBeforeShortcuts.isConnected) {
+      lastFocusBeforeShortcuts.focus();
+    } else if (dom.input) {
+      dom.input.focus();
+    }
+    lastFocusBeforeShortcuts = null;
   }
 }
 
@@ -899,13 +1036,35 @@ function handleChatScroll() {
   if (scrollSyncRafId) return;
   scrollSyncRafId = requestAnimationFrame(() => {
     scrollSyncRafId = 0;
+    // User-driven scroll means any cached scroll-distance read is stale.
+    invalidateChatScrollCache();
     syncChatScrollState();
   });
+}
+
+// ResizeObserver handles the input composer growing as the user types (auto
+// resizing textarea), panels opening/closing inside `#chat`, and the chat
+// scroll container itself being resized. We used to pile three `window.resize`
+// and two `visualViewport` listeners on top of each other for this, firing
+// `getBoundingClientRect` on every burst; a single RO keeps the work O(frame).
+let chatResizeObserver: ResizeObserver | null = null;
+function installChatResizeObserver(): void {
+  if (typeof ResizeObserver !== 'function') return;
+  chatResizeObserver = new ResizeObserver(() => {
+    invalidateChatScrollCache();
+    syncToolDrawerBounds();
+  });
+  if (dom.chat) chatResizeObserver.observe(dom.chat);
+  if (dom.inputArea) chatResizeObserver.observe(dom.inputArea);
 }
 
 document.addEventListener('click', handleDocumentClick);
 
 // ── Init ──
+initTheme();
+scheduleBackgroundTask(() => {
+  void preloadMarkdownEngine();
+});
 updateViewToggleButtons();
 syncToolDrawerBounds();
 updateJumpToLatestVisibility();
@@ -922,6 +1081,7 @@ if (window.visualViewport) {
   window.visualViewport.addEventListener('resize', syncToolDrawerBounds);
   window.visualViewport.addEventListener('scroll', syncToolDrawerBounds);
 }
+installChatResizeObserver();
 if (dom.jumpToLatestBtn) {
   dom.jumpToLatestBtn.addEventListener('click', handleJumpToLatestClick);
 }
@@ -934,6 +1094,13 @@ if (import.meta.hot) {
       cancelAnimationFrame(scrollSyncRafId);
       scrollSyncRafId = 0;
     }
+    cancelToolDrawerBoundsSync();
+    if (chatResizeObserver) {
+      chatResizeObserver.disconnect();
+      chatResizeObserver = null;
+    }
+    disposeTheme();
+    cancelReconnect();
     document.removeEventListener('click', handleDocumentClick);
     document.removeEventListener('keydown', handleDocumentKeydown);
     dom.chat.removeEventListener('scroll', handleChatScroll);

@@ -1,7 +1,7 @@
 import { dom, state } from '../state.js';
 import { DEFAULT_BRAND_AVATAR, DEFAULT_WELCOME_LOGO } from '../constants.js';
 import { formatTime, hideWelcome } from '../utils.js';
-import { scrollDown, queueUnreadContent } from '../scroll.js';
+import { scrollDown, queueUnreadContent, invalidateChatScrollCache } from '../scroll.js';
 import { pinReactStatusToBottom } from './react-status.js';
 
 function setVersionBadge(el, version) {
@@ -78,6 +78,7 @@ export function addMsg(cls, text, timestamp = undefined, options: { trackUnread?
   }
 
   dom.chat.appendChild(row);
+  invalidateChatScrollCache();
   if (trackUnread) {
     queueUnreadContent({ countable: true });
   }
@@ -97,6 +98,11 @@ export function renderUserImageThumbnails(msgEl, images) {
   container.className = 'user-images';
   for (const img of images) {
     const imgEl = document.createElement('img');
+    // Defer decoding/fetching of off-screen user image thumbnails so long
+    // scrollback doesn't eagerly load every historical attachment on page
+    // load. `lazy` is a hint; browsers may still fetch when close to viewport.
+    imgEl.loading = 'lazy';
+    imgEl.decoding = 'async';
     imgEl.src = img.url;
     imgEl.alt = 'Attached image';
     imgEl.title = img.url;
@@ -111,6 +117,7 @@ export function renderUserImageThumbnails(msgEl, images) {
     const content = row.querySelector('.msg-content');
     if (content) {
       content.insertBefore(container, content.querySelector('.msg-time'));
+      invalidateChatScrollCache();
     }
   }
 }
@@ -170,6 +177,7 @@ export function addSystem(t, kind = 'info', options: { dismissible?: boolean } =
   }
   row.appendChild(card);
   dom.chat.appendChild(row);
+  invalidateChatScrollCache();
   queueUnreadContent({ countable: true });
   pinReactStatusToBottom();
   scrollDown();
@@ -187,6 +195,7 @@ export function addError(t, options: { dismissible?: boolean } = {}) {
   if (dismissible) card.appendChild(buildDismissButton());
   row.appendChild(card);
   dom.chat.appendChild(row);
+  invalidateChatScrollCache();
   queueUnreadContent({ countable: true });
   pinReactStatusToBottom();
   scrollDown();
@@ -250,6 +259,7 @@ export function showWelcome() {
   w.appendChild(shortcuts);
 
   dom.chat.appendChild(w);
+  invalidateChatScrollCache();
   syncVersionBadges();
 }
 

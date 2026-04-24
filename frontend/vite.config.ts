@@ -7,13 +7,24 @@ export default defineConfig({
     outDir: '../static',
     emptyOutDir: true,
     sourcemap: false,
+    modulePreload: {
+      resolveDependencies(_filename, deps) {
+        return deps.filter((dep) => !/\b(hljs|marked|katex)-/.test(dep));
+      },
+    },
     rollupOptions: {
       output: {
-        manualChunks: {
-          react: ['react', 'react-dom', 'react-dom/client'],
-          hljs: ['highlight.js'],
-          katex: ['katex'],
-          marked: ['marked', 'marked-highlight', 'dompurify'],
+        manualChunks(id) {
+          const normalizedId = id.replace(/\\/g, '/');
+          if (normalizedId.includes('commonjsHelpers.js')) return 'vendor-utils';
+          if (normalizedId.includes('/node_modules/react')) return 'react';
+          if (normalizedId.includes('/node_modules/react-dom')) return 'react';
+          if (normalizedId.includes('/node_modules/highlight.js/styles/')) return undefined;
+          if (normalizedId.includes('/node_modules/highlight.js')) return 'hljs';
+          if (normalizedId.includes('/node_modules/katex')) return 'katex';
+          if (normalizedId.includes('/node_modules/marked')) return 'marked';
+          if (normalizedId.includes('/node_modules/marked-highlight')) return 'marked';
+          if (normalizedId.includes('/node_modules/dompurify')) return 'marked';
         },
       },
     },

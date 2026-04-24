@@ -1567,3 +1567,43 @@
   background: var(--accent-error);
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-error) 18%, transparent);
 }
+
+/* Keyboard shortcuts overlay. Uses fixed backdrop + centered panel and is
+   built lazily by main.ts; hidden via the native [hidden] attribute so we
+   don't need extra state. */
+.shortcuts-overlay[hidden] { display: none; }
+.shortcuts-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  background: color-mix(in srgb, var(--bg) 70%, transparent);
+  backdrop-filter: blur(4px);
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px;
+}
+.shortcuts-panel {
+  background: var(--surface); color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  max-width: 440px; width: 100%;
+  box-shadow: 0 12px 32px rgba(0,0,0,0.18);
+  padding: 20px 24px;
+  max-height: 90vh; overflow-y: auto;
+}
+.shortcuts-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+.shortcuts-header h2 { margin: 0; font-size: 18px; }
+.shortcuts-close {
+  background: transparent; border: 0; color: var(--dim);
+  font-size: 24px; line-height: 1; cursor: pointer; padding: 4px 8px; border-radius: 6px;
+}
+.shortcuts-close:hover { background: var(--surface2); color: var(--text); }
+.shortcuts-list { display: grid; grid-template-columns: max-content 1fr; gap: 8px 16px; margin: 0; }
+.shortcuts-list dt { margin: 0; }
+.shortcuts-list dd { margin: 0; color: var(--dim); }
+.shortcuts-list kbd {
+  display: inline-block; padding: 2px 7px; border-radius: 5px;
+  background: var(--surface2); color: var(--text);
+  border: 1px solid var(--border); border-bottom-width: 2px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px; line-height: 1.4;
+}
+.shortcuts-hint { color: var(--dim); font-size: 13px; margin-top: 14px; margin-bottom: 0; }
+

@@ -7,6 +7,7 @@ declare global {
     _textNode?: Text;
     _rawText?: string;
     _renderedOffset?: number;
+    _markdownRenderedRaw?: string;
     _liveTail?: HTMLElement | null;
     _markdownIdleHandle?: number;
     _markdownShouldFollow?: boolean;

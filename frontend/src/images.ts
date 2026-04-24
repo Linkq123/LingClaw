@@ -239,6 +239,11 @@ export function renderImagePreviews() {
     const item = document.createElement('div');
     item.className = 'image-preview-item';
     const imgEl = document.createElement('img');
+    // Pending-upload previews stay above the composer so `lazy` rarely helps
+    // visually, but costs nothing and avoids a cold decode on slow devices
+    // when the user stages many images.
+    imgEl.loading = 'lazy';
+    imgEl.decoding = 'async';
     imgEl.src = img.url;
     imgEl.alt = 'Attached image';
     imgEl.onerror = () => {

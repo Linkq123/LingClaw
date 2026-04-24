@@ -1,6 +1,6 @@
 import { state } from '../state.js';
 import { addAssistant } from '../renderers/chat.js';
-import { scrollDown, isChatNearBottom } from '../scroll.js';
+import { scrollDown, isChatNearBottom, invalidateChatScrollCache } from '../scroll.js';
 import {
   findProgressiveSplitPoint,
   appendRenderedSegment,
@@ -9,29 +9,70 @@ import {
   scheduleMarkdownRender,
 } from '../markdown.js';
 
-function currentMsgRow() {
-  return state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
+function revealAssistantMessage(message) {
+  const row = message ? message.closest('.msg-row') : null;
+  if (row) {
+    row.hidden = false;
+  }
 }
 
-function flushAssistantText() {
-  if (!state.currentMsg || !state.pendingAssistantText) return;
-  state.currentMsg._rawText = (state.currentMsg._rawText || '') + state.pendingAssistantText;
-  state.pendingAssistantText = '';
+let flushInProgress = false;
+let flushRequested = false;
+let assistantRenderChain: Promise<void> = Promise.resolve();
 
-  const raw = state.currentMsg._rawText;
-  const offset = state.currentMsg._renderedOffset || 0;
+function enqueueAssistantRender(work: () => Promise<void> | void): Promise<void> {
+  const run = async () => {
+    try {
+      await work();
+    } catch (error) {
+      console.warn('Assistant render step failed:', error);
+    }
+  };
+  assistantRenderChain = assistantRenderChain.then(run, run);
+  return assistantRenderChain;
+}
+
+async function flushAssistantText() {
+  if (!state.currentMsg || !state.pendingAssistantText) return;
+  mergePendingAssistantText();
+
+  const message = state.currentMsg;
+  const raw = message._rawText;
+  const offset = message._renderedOffset || 0;
   const splitAt = findProgressiveSplitPoint(raw);
 
   if (splitAt > offset) {
-    appendRenderedSegment(state.currentMsg, raw.substring(offset, splitAt));
-    state.currentMsg._renderedOffset = splitAt;
-    updateLiveTail(state.currentMsg, raw.substring(splitAt));
+    await enqueueAssistantRender(async () => {
+      const renderedSegment = raw.substring(offset, splitAt);
+      const liveTail = raw.substring(splitAt);
+      try {
+        await appendRenderedSegment(message, renderedSegment);
+        message._renderedOffset = splitAt;
+        updateLiveTail(message, liveTail);
+      } catch (error) {
+        message._renderedOffset = offset;
+        updateLiveTail(message, raw.substring(offset));
+        throw error;
+      }
+      revealAssistantMessage(message);
+    });
   } else if (offset > 0) {
-    updateLiveTail(state.currentMsg, raw.substring(offset));
+    await enqueueAssistantRender(() => {
+      updateLiveTail(message, raw.substring(offset));
+      revealAssistantMessage(message);
+    });
   } else {
-    updateLiveTail(state.currentMsg, raw);
+    await enqueueAssistantRender(() => {
+      updateLiveTail(message, raw);
+      revealAssistantMessage(message);
+    });
   }
-  revealCurrentAssistant();
+}
+
+function mergePendingAssistantText() {
+  if (!state.currentMsg || !state.pendingAssistantText) return;
+  state.currentMsg._rawText = (state.currentMsg._rawText || '') + state.pendingAssistantText;
+  state.pendingAssistantText = '';
 }
 
 function flushReasoningText() {
@@ -57,17 +98,37 @@ function cancelFlushIfIdle() {
   }
 }
 
-function flushStreaming() {
+async function flushStreaming() {
+  if (flushInProgress) {
+    flushRequested = true;
+    return;
+  }
+  flushInProgress = true;
   state.flushHandle = 0;
   const follow = state.autoFollowChat || isChatNearBottom();
-  flushAssistantText();
-  flushReasoningText();
-  if (follow) scrollDown();
+  try {
+    await flushAssistantText();
+    flushReasoningText();
+    invalidateChatScrollCache();
+    if (follow) scrollDown();
+  } finally {
+    flushInProgress = false;
+    if (flushRequested || state.pendingAssistantText || state.pendingReasoningText) {
+      flushRequested = false;
+      scheduleFlush();
+    }
+  }
 }
 
 export function scheduleFlush() {
+  if (flushInProgress) {
+    flushRequested = true;
+    return;
+  }
   if (!state.flushHandle) {
-    state.flushHandle = requestAnimationFrame(flushStreaming);
+    state.flushHandle = requestAnimationFrame(() => {
+      void flushStreaming();
+    });
   }
 }
 
@@ -79,13 +140,6 @@ function cancelAssistantFlush() {
 function cancelReasoningFlush() {
   state.pendingReasoningText = '';
   cancelFlushIfIdle();
-}
-
-function revealCurrentAssistant() {
-  const row = currentMsgRow();
-  if (row) {
-    row.hidden = false;
-  }
 }
 
 export function beginAssistantStream() {
@@ -102,16 +156,16 @@ export function beginAssistantStream() {
 }
 
 export function finishAssistantStream({ discardIfEmpty = false } = {}) {
-  flushAssistantText();
+  mergePendingAssistantText();
   if (!state.currentMsg) {
     return null;
   }
 
   const message = state.currentMsg;
-  const row = currentMsgRow();
-  const rawText = state.currentMsg._rawText || '';
+  const row = message.closest('.msg-row');
+  const rawText = message._rawText || '';
   const raw = rawText.trim();
-  state.currentMsg.classList.remove('typing');
+  message.classList.remove('typing');
 
   if (!raw && discardIfEmpty) {
     row?.remove();
@@ -125,18 +179,33 @@ export function finishAssistantStream({ discardIfEmpty = false } = {}) {
     return null;
   }
 
-  revealCurrentAssistant();
+  revealAssistantMessage(message);
 
-  const offset = state.currentMsg._renderedOffset || 0;
-  if (offset > 0) {
-    removeLiveTail(state.currentMsg);
-    const tail = rawText.substring(offset);
-    if (tail) {
-      appendRenderedSegment(state.currentMsg, tail);
+  void enqueueAssistantRender(async () => {
+    const offset = message._renderedOffset || 0;
+    if (offset > 0) {
+      const tail = rawText.substring(offset);
+      if (tail) {
+        try {
+          await appendRenderedSegment(message, tail);
+        } catch (error) {
+          updateLiveTail(message, tail);
+          throw error;
+        }
+        removeLiveTail(message);
+        invalidateChatScrollCache();
+      } else {
+        removeLiveTail(message);
+      }
+      message._markdownRenderedRaw = rawText;
+      return;
     }
-  } else {
-    scheduleMarkdownRender(state.currentMsg);
-  }
+
+    if (message._rawText === rawText) {
+      scheduleMarkdownRender(message);
+      invalidateChatScrollCache();
+    }
+  });
   state.currentMsg = null;
   return message;
 }

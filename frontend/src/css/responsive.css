@@ -150,145 +150,195 @@
   }
 }
 
-/* ── Dark Mode ── */
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #1a1c2e;
-    --surface: #232540;
-    --surface2: #2c2e4a;
-    --msg-user: #261f3d;
-    --msg-ai: #282a46;
-    --accent: #d88aae;
-    --accent2: #5ba3e6;
-    --accent-error: #f06060;
-    --accent-success: #38c97a;
-    --accent-warn: #f0b040;
-    --text: #e2e4f0;
-    --dim: #8b90a8;
-    --border: #3a3c58;
-    --tool-bg: #262844;
-    --tool-border: #363858;
-  }
+/* ── Dark Mode ──
+   Activated when JS sets <html data-theme="dark">. The theme module resolves
+   the user preference ("auto" | "light" | "dark") against the system's
+   prefers-color-scheme at load time and whenever the system setting changes,
+   so CSS only needs to switch on this explicit attribute. */
+:root[data-theme='dark'] {
+  --bg: #1a1c2e;
+  --surface: #232540;
+  --surface2: #2c2e4a;
+  --msg-user: #261f3d;
+  --msg-ai: #282a46;
+  --accent: #d88aae;
+  --accent2: #5ba3e6;
+  --accent-error: #f06060;
+  --accent-success: #38c97a;
+  --accent-warn: #f0b040;
+  --text: #e2e4f0;
+  --dim: #9ea4bd;
+  --border: #3a3c58;
+  --tool-bg: #262844;
+  --tool-border: #363858;
+}
 
-  .msg.user {
-    background: linear-gradient(135deg, var(--msg-user), #1f2640);
-  }
-  .msg.assistant {
-    background: transparent;
-  }
+:root[data-theme='dark'] .msg.user {
+  background: linear-gradient(135deg, var(--msg-user), #1f2640);
+}
+:root[data-theme='dark'] .msg.assistant {
+  background: transparent;
+}
 
-  .msg.assistant blockquote {
-    border-left-color: color-mix(in srgb, var(--accent2) 45%, var(--border));
-  }
+:root[data-theme='dark'] .msg.assistant blockquote {
+  border-left-color: color-mix(in srgb, var(--accent2) 45%, var(--border));
+}
 
-  .react-status-card {
-    background: linear-gradient(135deg, rgba(35,37,64,.95), rgba(44,46,74,.88));
-    box-shadow: 0 8px 20px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.06);
-  }
+:root[data-theme='dark'] .react-status-card {
+  background: linear-gradient(135deg, rgba(35,37,64,.95), rgba(44,46,74,.88));
+  box-shadow: 0 8px 20px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.06);
+}
 
-  .msg.assistant pre {
-    background: linear-gradient(180deg, rgba(38,40,68,.96), rgba(31,33,58,.94));
-    border-color: #4a4c68;
-    box-shadow: 0 10px 24px rgba(0,0,0,.22);
-  }
+:root[data-theme='dark'] .msg.assistant pre {
+  background: linear-gradient(180deg, rgba(38,40,68,.96), rgba(31,33,58,.94));
+  border-color: #4a4c68;
+  box-shadow: 0 10px 24px rgba(0,0,0,.22);
+}
 
-  .msg.assistant pre::before,
-  .msg.assistant .live-code-tail::before {
-    border-bottom-color: rgba(58,60,88,.5);
-    background:
-      radial-gradient(circle at 16px 50%, #ff5f57 4px, transparent 4.5px),
-      radial-gradient(circle at 34px 50%, #febc2e 4px, transparent 4.5px),
-      radial-gradient(circle at 52px 50%, #28c840 4px, transparent 4.5px);
-    background-repeat: no-repeat;
-  }
+:root[data-theme='dark'] .msg.assistant pre::before,
+:root[data-theme='dark'] .msg.assistant .live-code-tail::before {
+  border-bottom-color: rgba(58,60,88,.5);
+  background:
+    radial-gradient(circle at 16px 50%, #ff5f57 4px, transparent 4.5px),
+    radial-gradient(circle at 34px 50%, #febc2e 4px, transparent 4.5px),
+    radial-gradient(circle at 52px 50%, #28c840 4px, transparent 4.5px);
+  background-repeat: no-repeat;
+}
 
-  .msg.assistant .live-code-tail {
-    background: linear-gradient(180deg, rgba(38,40,68,.96), rgba(31,33,58,.94));
-    border-color: color-mix(in srgb, var(--accent2) 38%, var(--border));
-    box-shadow: 0 10px 24px rgba(0,0,0,.22);
-  }
+:root[data-theme='dark'] .msg.assistant .live-code-tail {
+  background: linear-gradient(180deg, rgba(38,40,68,.96), rgba(31,33,58,.94));
+  border-color: color-mix(in srgb, var(--accent2) 38%, var(--border));
+  box-shadow: 0 10px 24px rgba(0,0,0,.22);
+}
 
-  .tool-drawer-backdrop {
-    background: rgba(5,8,18,.16);
-  }
+:root[data-theme='dark'] .tool-drawer-backdrop {
+  background: rgba(5,8,18,.16);
+}
 
-  .tool-drawer {
-    background: rgba(35,37,64,.96);
-    border-color: #4a4c68;
-    box-shadow: 0 10px 22px rgba(0,0,0,.22);
-  }
+:root[data-theme='dark'] .tool-drawer {
+  background: rgba(35,37,64,.96);
+  border-color: #4a4c68;
+  box-shadow: 0 10px 22px rgba(0,0,0,.22);
+}
 
-  .tool-drawer-header {
-    border-bottom-color: #4a4c68;
-  }
+:root[data-theme='dark'] .tool-drawer-header {
+  border-bottom-color: #4a4c68;
+}
 
-  .tool-drawer-close {
-    background: rgba(38,40,68,.66);
-    border-color: var(--border);
-  }
+:root[data-theme='dark'] .tool-drawer-close {
+  background: rgba(38,40,68,.66);
+  border-color: var(--border);
+}
 
-  .tool-drawer-code {
-    background: linear-gradient(180deg, rgba(38,40,68,.96), rgba(31,33,58,.94));
-    border-color: var(--border);
-    color: var(--text);
-  }
+:root[data-theme='dark'] .tool-drawer-code {
+  background: linear-gradient(180deg, rgba(38,40,68,.96), rgba(31,33,58,.94));
+  border-color: var(--border);
+  color: var(--text);
+}
 
-  #input-area {
-    background: transparent;
-  }
+:root[data-theme='dark'] #input-area {
+  background: transparent;
+}
 
-  .input-composer {
-    background: var(--surface);
-    border-color: var(--border);
-    box-shadow: inset 0 1px 3px rgba(0,0,0,.08), 0 2px 8px rgba(0,0,0,.06);
-  }
-  .input-composer:focus-within {
-    border-color: var(--accent2);
-    box-shadow: inset 0 1px 3px rgba(0,0,0,.08), 0 0 0 3px rgba(91,163,230,.12);
-  }
+:root[data-theme='dark'] .input-composer {
+  background: var(--surface);
+  border-color: var(--border);
+  box-shadow: inset 0 1px 3px rgba(0,0,0,.08), 0 2px 8px rgba(0,0,0,.06);
+}
+:root[data-theme='dark'] .input-composer:focus-within {
+  border-color: var(--accent2);
+  box-shadow: inset 0 1px 3px rgba(0,0,0,.08), 0 0 0 3px rgba(91,163,230,.12);
+}
 
-  #jump-to-latest {
-    background: rgba(35,37,64,.92);
-    border-color: color-mix(in srgb, var(--accent2) 42%, var(--border));
-    box-shadow: 0 10px 22px rgba(0,0,0,.24);
-  }
+:root[data-theme='dark'] #jump-to-latest {
+  background: rgba(35,37,64,.92);
+  border-color: color-mix(in srgb, var(--accent2) 42%, var(--border));
+  box-shadow: 0 10px 22px rgba(0,0,0,.24);
+  color: var(--text);
+}
 
-  #jump-to-latest .jump-to-latest-badge {
-    box-shadow: 0 6px 16px rgba(0,0,0,.24);
-  }
+:root[data-theme='dark'] #jump-to-latest .jump-to-latest-badge {
+  box-shadow: 0 6px 16px rgba(0,0,0,.24);
+}
 
-  .welcome-logo {
-    background: transparent;
-    box-shadow: none;
-  }
+:root[data-theme='dark'] .welcome-logo {
+  background: transparent;
+  box-shadow: none;
+}
 
-  .welcome-shortcuts button { background: var(--surface2); }
+:root[data-theme='dark'] .welcome-shortcuts button {
+  background: var(--surface2);
+}
 
-  .msg-row.assistant .msg-avatar {
-    background: linear-gradient(135deg, #2c2e4a, #363858);
-    border-color: var(--border);
-  }
+:root[data-theme='dark'] .msg-row.assistant .msg-avatar {
+  background: linear-gradient(135deg, #2c2e4a, #363858);
+  border-color: var(--border);
+}
 
-  #send { box-shadow: 0 2px 8px rgba(91,163,230,.25); }
-  #send:hover:not(:disabled) { box-shadow: 0 4px 12px rgba(91,163,230,.3); }
-  #stop { box-shadow: 0 2px 8px rgba(240,96,96,.3); }
-  #stop:hover:not(:disabled) { box-shadow: 0 4px 12px rgba(240,96,96,.4); }
+:root[data-theme='dark'] #send { box-shadow: 0 2px 8px rgba(91,163,230,.25); }
+:root[data-theme='dark'] #send:hover:not(:disabled) { box-shadow: 0 4px 12px rgba(91,163,230,.3); }
+:root[data-theme='dark'] #stop { box-shadow: 0 2px 8px rgba(240,96,96,.3); }
+:root[data-theme='dark'] #stop:hover:not(:disabled) { box-shadow: 0 4px 12px rgba(240,96,96,.4); }
 
-  ::-webkit-scrollbar-thumb { background: var(--border); }
-  ::-webkit-scrollbar-thumb:hover { background: #5a5c78; }
+:root[data-theme='dark'] ::-webkit-scrollbar-thumb { background: var(--border); }
+:root[data-theme='dark'] ::-webkit-scrollbar-thumb:hover { background: #5a5c78; }
 
-  .timeline-node::before {
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent2) 30%, transparent);
-  }
-  .timeline-node--reasoning::before {
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-warn) 30%, transparent);
-  }
-  .timeline-node--result::before {
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-success) 30%, transparent);
-  }
-  .timeline-node--tool:has(.tool-panel-ready)::before {
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-success) 30%, transparent);
-  }
+:root[data-theme='dark'] .timeline-node::before {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent2) 30%, transparent);
+}
+:root[data-theme='dark'] .timeline-node--reasoning::before {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-warn) 30%, transparent);
+}
+:root[data-theme='dark'] .timeline-node--result::before {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-success) 30%, transparent);
+}
+:root[data-theme='dark'] .timeline-node--tool:has(.tool-panel-ready)::before {
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-success) 30%, transparent);
+}
+
+/* Dark-mode tweaks for tool / sub-agent / orchestrate panels so that
+   `color-mix(..., white)` highlights (light-mode friendly) fall back to
+   readable surfaces on dark backgrounds. */
+:root[data-theme='dark'] .subagent-tool-pill.is-running {
+  background: color-mix(in srgb, var(--accent2) 14%, var(--surface));
+}
+:root[data-theme='dark'] .subagent-tool-pill.is-done {
+  background: color-mix(in srgb, var(--accent-success) 14%, var(--surface));
+}
+:root[data-theme='dark'] .subagent-tool-pill.is-failed {
+  background: color-mix(in srgb, var(--accent-error) 14%, var(--surface));
+}
+:root[data-theme='dark'] .subagent-tool-done .subagent-tool-status {
+  background: color-mix(in srgb, var(--accent-success) 18%, var(--surface));
+}
+:root[data-theme='dark'] .subagent-tool-failed .subagent-tool-status {
+  background: color-mix(in srgb, var(--accent-error) 18%, var(--surface));
+}
+:root[data-theme='dark'] .subagent-tool-code {
+  background: rgba(31,33,58,.92);
+  border-color: var(--border);
+}
+:root[data-theme='dark'] .subagent-summary {
+  background: rgba(35,37,64,.88);
+  border-color: var(--border);
+}
+:root[data-theme='dark'] .subagent-summary-chip {
+  background: rgba(44,46,74,.9);
+  border-color: var(--border);
+}
+:root[data-theme='dark'] .system-body { background: var(--surface2); }
+:root[data-theme='dark'] .system-card { box-shadow: 0 1px 4px rgba(0,0,0,.2); }
+:root[data-theme='dark'] .page-overlay { background: rgba(0,0,0,.52); }
+:root[data-theme='dark'] .page-panel { box-shadow: 0 12px 40px rgba(0,0,0,.46); }
+:root[data-theme='dark'] .usage-stat-card,
+:root[data-theme='dark'] .usage-role-card,
+:root[data-theme='dark'] .usage-chart-wrap {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 88%, black), var(--surface));
+  box-shadow: 0 10px 28px rgba(0,0,0,.3);
+}
+:root[data-theme='dark'] .usage-summary-note,
+:root[data-theme='dark'] .usage-role-metric {
+  background: color-mix(in srgb, var(--surface) 90%, black);
 }
 
 /* ── Reduced motion ── */

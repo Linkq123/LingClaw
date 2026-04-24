@@ -446,3 +446,14 @@ pre:hover .copy-btn { opacity: 1; }
   transition: opacity .2s ease, transform .22s cubic-bezier(.22,1,.36,1), border-color .2s ease, box-shadow .2s ease;
   z-index: 16;
 }
+
+/* Drag-and-drop image upload overlay. The class is toggled on #chat by
+   initDropzone() in input.ts. We use an inset ring + tinted background so
+   the drop target is unmistakable without layout shift. */
+#chat.dropzone-active {
+  outline: 2px dashed var(--accent);
+  outline-offset: -12px;
+  background-color: color-mix(in srgb, var(--accent) 6%, transparent);
+  transition: background-color .15s ease;
+}
+

@@ -3,7 +3,7 @@ import { INPUT_HISTORY_MAX } from './constants.js';
 import { canSendWhileBusy } from './utils.js';
 import { syncToolDrawerBounds, scrollDown } from './scroll.js';
 import { addMsg, addSystem, setBusy, renderUserImageThumbnails } from './renderers/chat.js';
-import { renderImagePreviews } from './images.js';
+import { renderImagePreviews, uploadLocalImages } from './images.js';
 
 // Guard: prevent double-registration on Vite HMR re-execution of main.ts.
 let _listenerInit = false;
@@ -133,5 +133,108 @@ export function initInputListeners() {
   });
   dom.stopBtn.addEventListener('click', () => {
     stopAgent();
+  });
+
+  // ── Clipboard paste: extract image blobs and route through the same
+  //    upload path as the file picker. Text paste is left untouched so that
+  //    mixed text+image clipboards (e.g. Markdown with a screenshot) still
+  //    paste the text into the textarea. ──
+  dom.input.addEventListener('paste', (e: ClipboardEvent) => {
+    if (!state.imageCapable) return;
+    const items = e.clipboardData?.items;
+    if (!items || items.length === 0) return;
+    const files: File[] = [];
+    for (const item of items) {
+      if (item.kind === 'file' && item.type.startsWith('image/')) {
+        const f = item.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length === 0) return;
+    // Prevent the browser from also inserting the image as inline base64
+    // HTML / file name into the textarea.
+    e.preventDefault();
+    void uploadLocalImages(files);
+  });
+
+  // ── Global drag-and-drop dropzone. We attach to document so the user can
+  //    drop anywhere in the window; visual feedback is driven by a class on
+  //    the chat container. `dragenter` uses a counter because `dragleave`
+  //    fires when the pointer crosses any child boundary. ──
+  initDropzone();
+}
+
+let dragCounter = 0;
+function hasFileDrop(dt: DataTransfer | null): boolean {
+  if (!dt) return false;
+  if (dt.items && dt.items.length > 0) {
+    for (const item of dt.items) {
+      if (item.kind === 'file') return true;
+    }
+  }
+  return Boolean(dt.types && Array.from(dt.types).includes('Files'));
+}
+
+function hasImageFiles(dt: DataTransfer | null): boolean {
+  if (!dt) return false;
+  // DataTransferItemList exposes types during dragover without revealing
+  // file contents (per the HTML spec); we can still filter by MIME type.
+  if (dt.items && dt.items.length > 0) {
+    let sawFile = false;
+    let sawTypedFile = false;
+    for (const item of dt.items) {
+      if (item.kind !== 'file') continue;
+      sawFile = true;
+      if (item.type) sawTypedFile = true;
+      if (item.kind === 'file' && item.type.startsWith('image/')) return true;
+    }
+    return sawFile && !sawTypedFile && Boolean(dt.types && Array.from(dt.types).includes('Files'));
+  }
+  if (dt.types && Array.from(dt.types).includes('Files')) return true;
+  return false;
+}
+
+function initDropzone(): void {
+  if (!dom.chat) return;
+  const target = document;
+
+  target.addEventListener('dragenter', (e) => {
+    if (!state.imageCapable) return;
+    if (!hasImageFiles(e.dataTransfer)) return;
+    dragCounter += 1;
+    dom.chat.classList.add('dropzone-active');
+  });
+
+  target.addEventListener('dragover', (e) => {
+    const isImageDrop = state.imageCapable && hasImageFiles(e.dataTransfer);
+    if (!isImageDrop && !hasFileDrop(e.dataTransfer)) return;
+    e.preventDefault();
+    // Required to allow drop. Use 'copy' so the OS cursor shows a plus sign
+    // regardless of whether the file originated from another app (move) or
+    // a browser image (link).
+    if (e.dataTransfer) e.dataTransfer.dropEffect = isImageDrop ? 'copy' : 'none';
+  });
+
+  target.addEventListener('dragleave', () => {
+    if (dragCounter > 0) dragCounter -= 1;
+    if (dragCounter === 0) dom.chat.classList.remove('dropzone-active');
+  });
+
+  target.addEventListener('drop', (e) => {
+    const wasActive = dom.chat.classList.contains('dropzone-active');
+    dragCounter = 0;
+    dom.chat.classList.remove('dropzone-active');
+    if (hasFileDrop(e.dataTransfer)) e.preventDefault();
+    if (!state.imageCapable) return;
+    if (!wasActive && !hasImageFiles(e.dataTransfer)) return;
+    const files: File[] = [];
+    const dt = e.dataTransfer;
+    if (dt?.files) {
+      for (const f of dt.files) {
+        if (f.type.startsWith('image/')) files.push(f);
+      }
+    }
+    if (files.length === 0) return;
+    void uploadLocalImages(files);
   });
 }

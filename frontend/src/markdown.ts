@@ -1,8 +1,3 @@
-import hljs from 'highlight.js';
-import { marked } from 'marked';
-import DOMPurify from 'dompurify';
-import katex from 'katex';
-
 import { dom, state } from './state.js';
 import {
   SOFT_SPLIT_MIN_CHARS,
@@ -10,7 +5,67 @@ import {
   SOFT_SPLIT_TAIL_MIN_CHARS,
 } from './constants.js';
 import { escHtml, fallbackCopy, scheduleBackgroundTask, isAsciiDigit } from './utils.js';
-import { scrollDown } from './scroll.js';
+import { scrollDown, invalidateChatScrollCache } from './scroll.js';
+
+type MarkdownDeps = {
+  hljs: typeof import('highlight.js').default;
+  marked: typeof import('marked').marked;
+  DOMPurify: typeof import('dompurify').default;
+  katex: typeof import('katex').default;
+};
+
+let markdownDepsPromise: Promise<MarkdownDeps> | null = null;
+
+function defaultExport<T>(module: T): T extends { default: infer D } ? D : T {
+  return ((module as { default?: unknown }).default ?? module) as T extends { default: infer D }
+    ? D
+    : T;
+}
+
+async function loadMarkdownDeps(): Promise<MarkdownDeps> {
+  if (markdownDepsPromise) return markdownDepsPromise;
+  markdownDepsPromise = Promise.all([
+    import('highlight.js'),
+    import('marked'),
+    import('marked-highlight'),
+    import('dompurify'),
+    import('katex'),
+    import('katex/dist/katex.min.css'),
+  ])
+    .then(([hljsModule, markedModule, markedHighlightModule, domPurifyModule, katexModule]) => {
+      const hljs = defaultExport(hljsModule);
+      const { marked } = markedModule;
+      const { markedHighlight } = markedHighlightModule;
+      const DOMPurify = defaultExport(domPurifyModule);
+      const katex = defaultExport(katexModule);
+
+      marked.use(
+        markedHighlight({
+          highlight(code, lang) {
+            if (code.length > 4000) {
+              return escHtml(code);
+            }
+            if (lang && hljs.getLanguage(lang)) {
+              return hljs.highlight(code, { language: lang }).value;
+            }
+            return escHtml(code);
+          },
+        }),
+      );
+      marked.setOptions({ breaks: true });
+
+      return { hljs, marked, DOMPurify, katex };
+    })
+    .catch((error) => {
+      markdownDepsPromise = null;
+      throw error;
+    });
+  return markdownDepsPromise;
+}
+
+export function preloadMarkdownEngine(): Promise<void> {
+  return loadMarkdownDeps().then(() => undefined);
+}
 
 // ── Markdown rendering queue ──
 
@@ -35,36 +90,47 @@ function shouldHighlightBlock(block, index, totalBlocks) {
 
 export function scheduleCodeHighlight(blocks) {
   const codeBlocks = [...blocks];
-  const highlightQueue = codeBlocks.filter((block, index) => {
-    if (!block.isConnected || !shouldHighlightBlock(block, index, codeBlocks.length)) {
-      block.classList.add('code-highlight-deferred');
-      return false;
-    }
-    return true;
-  });
+  void loadMarkdownDeps()
+    .then(({ hljs }) => {
+      const highlightQueue = codeBlocks.filter((block, index) => {
+        if (!block.isConnected || !shouldHighlightBlock(block, index, codeBlocks.length)) {
+          block.classList.add('code-highlight-deferred');
+          return false;
+        }
+        return true;
+      });
 
-  const highlightChunk = () => {
-    let processed = 0;
-    while (highlightQueue.length && processed < 2) {
-      const block = highlightQueue.shift();
-      if (block?.isConnected) {
-        hljs.highlightElement(block);
+      const highlightChunk = () => {
+        let processed = 0;
+        while (highlightQueue.length && processed < 2) {
+          const block = highlightQueue.shift();
+          if (block?.isConnected) {
+            hljs.highlightElement(block);
+          }
+          processed += 1;
+        }
+        if (highlightQueue.length) {
+          scheduleBackgroundTask(highlightChunk, 120);
+        }
+      };
+
+      if (highlightQueue.length) {
+        scheduleBackgroundTask(highlightChunk, 120);
       }
-      processed += 1;
-    }
-    if (highlightQueue.length) {
-      scheduleBackgroundTask(highlightChunk, 120);
-    }
-  };
-
-  if (highlightQueue.length) {
-    scheduleBackgroundTask(highlightChunk, 120);
-  }
+    })
+    .catch((error) => {
+      console.warn('Markdown highlighter failed to load:', error);
+      codeBlocks.forEach((block) => block.classList.add('code-highlight-deferred'));
+    });
 }
 
 export function scheduleMarkdownRender(el, options: { followScroll?: boolean } = {}) {
   if (!el) return;
   const { followScroll } = options;
+  const raw = getMarkdownRaw(el);
+  if (el._markdownRenderedRaw === raw && !el.classList.contains('markdown-pending')) {
+    return;
+  }
   cancelScheduledMarkdownRender(el);
   const queuedIndex = state.markdownRenderQueue.indexOf(el);
   if (queuedIndex !== -1) {
@@ -81,15 +147,21 @@ export function scheduleMarkdownRender(el, options: { followScroll?: boolean } =
   }
 }
 
-function processMarkdownQueue() {
+async function processMarkdownQueue() {
   state.markdownQueueHandle = 0;
   const el = state.markdownRenderQueue.shift();
   if (!el) return;
   el._markdownIdleHandle = 0;
   if (el.isConnected) {
-    renderMarkdown(el);
-    el.classList.remove('markdown-pending');
-    if (el._markdownShouldFollow) scrollDown();
+    try {
+      await renderMarkdown(el);
+      if (el._markdownShouldFollow) scrollDown();
+    } catch (error) {
+      console.warn('Markdown render failed:', error);
+    } finally {
+      el.classList.remove('markdown-pending');
+      invalidateChatScrollCache();
+    }
   }
   el._markdownShouldFollow = false;
   if (state.markdownRenderQueue.length) {
@@ -257,14 +329,14 @@ export function extractMath(text) {
   return { text: out, blocks };
 }
 
-export function renderMathPlaceholders(html, mathBlocks) {
+export function renderMathPlaceholders(html, mathBlocks, katexRenderer) {
   if (!mathBlocks.length) return html;
   return html.replace(/<span data-math="(\d+)"><\/span>/g, (_, idStr) => {
     const id = parseInt(idStr, 10);
     if (id < 0 || id >= mathBlocks.length) return '';
     const { formula, displayMode } = mathBlocks[id];
     try {
-      return katex.renderToString(formula, {
+      return katexRenderer.renderToString(formula, {
         displayMode,
         throwOnError: false,
         output: 'htmlAndMathml',
@@ -309,12 +381,13 @@ export function decorateCodeBlocks(container) {
   });
 }
 
-export function appendRenderedSegment(el, markdownText) {
+export async function appendRenderedSegment(el, markdownText) {
+  const { marked, DOMPurify, katex } = await loadMarkdownDeps();
   const { text: preprocessed, blocks: mathBlocks } = extractMath(markdownText);
   const html = marked.parse(preprocessed) as string;
   const sanitized = DOMPurify.sanitize(html, { ADD_ATTR: ['target'] });
   const temp = document.createElement('div');
-  temp.innerHTML = renderMathPlaceholders(sanitized, mathBlocks);
+  temp.innerHTML = renderMathPlaceholders(sanitized, mathBlocks, katex);
   temp.querySelectorAll('a[href]').forEach((a) => {
     a.setAttribute('target', '_blank');
     a.setAttribute('rel', 'noopener noreferrer');
@@ -329,6 +402,7 @@ export function appendRenderedSegment(el, markdownText) {
       el.appendChild(temp.firstChild);
     }
   }
+  invalidateChatScrollCache();
   scheduleCodeHighlight(codeBlocks);
 }
 
@@ -364,6 +438,7 @@ function ensureLiveTail(el, mode) {
     pre.appendChild(code);
     el.appendChild(pre);
     el._liveTail = pre;
+    invalidateChatScrollCache();
     return pre;
   }
 
@@ -372,6 +447,7 @@ function ensureLiveTail(el, mode) {
   span.dataset.mode = 'text';
   el.appendChild(span);
   el._liveTail = span;
+  invalidateChatScrollCache();
   return span;
 }
 
@@ -399,26 +475,43 @@ export function updateLiveTail(el, text) {
     if (codeEl) {
       codeEl.textContent = codeTail.code;
     }
+    invalidateChatScrollCache();
     return;
   }
 
   const tail = ensureLiveTail(el, 'text');
   tail.textContent = text;
+  invalidateChatScrollCache();
 }
 
 export function removeLiveTail(el) {
   if (el._liveTail) {
     if (el._liveTail.parentNode) el._liveTail.parentNode.removeChild(el._liveTail);
     el._liveTail = null;
+    invalidateChatScrollCache();
   }
 }
 
-export function renderMarkdown(el) {
-  const raw = el._rawText || el.textContent;
+function getMarkdownRaw(el) {
+  const raw = el._rawText ?? el.textContent ?? '';
+  if (!el._rawText) {
+    el._rawText = raw;
+  }
+  return raw;
+}
+
+export async function renderMarkdown(el) {
+  const raw = getMarkdownRaw(el);
+  if (el._markdownRenderedRaw === raw) {
+    invalidateChatScrollCache();
+    return;
+  }
+  const { marked, DOMPurify, katex } = await loadMarkdownDeps();
   const { text: preprocessed, blocks: mathBlocks } = extractMath(raw);
   const html = marked.parse(preprocessed) as string;
   const sanitized = DOMPurify.sanitize(html, { ADD_ATTR: ['target'] });
-  el.innerHTML = renderMathPlaceholders(sanitized, mathBlocks);
+  el.innerHTML = renderMathPlaceholders(sanitized, mathBlocks, katex);
+  el._liveTail = null;
   el.querySelectorAll('a[href]').forEach((a) => {
     a.setAttribute('target', '_blank');
     a.setAttribute('rel', 'noopener noreferrer');
@@ -427,4 +520,6 @@ export function renderMarkdown(el) {
 
   decorateCodeBlocks(el);
   scheduleCodeHighlight(el.querySelectorAll('pre code'));
+  el._markdownRenderedRaw = raw;
+  invalidateChatScrollCache();
 }

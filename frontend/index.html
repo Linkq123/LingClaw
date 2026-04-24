@@ -8,6 +8,10 @@
 </head>
 <body>
 
+<!-- Skip link — lets keyboard users jump past the header straight to the
+     composer. Visible only on focus. -->
+<a class="skip-link" href="#input">Skip to message input</a>
+
 <!-- Main -->
 <div class="main">
   <header>
@@ -23,6 +27,7 @@
     <span class="session-id" id="session-id"></span>
     <div class="actions">
       <span class="usage-badge" id="usage-badge" title="今日 Token 用量"></span>
+      <button id="theme-toggle-btn" class="theme-toggle-btn" data-action="toggle-theme" aria-label="Toggle theme" title="Toggle theme">◐ Auto</button>
       <button id="nav-settings-btn" data-action="nav-settings" aria-label="Settings" class="mobile-hide">Settings</button>
       <button id="nav-usage-btn" data-action="nav-usage" aria-label="Usage" class="mobile-hide">Usage</button>
       <button id="toggle-tools-btn" data-action="toggle-tools" aria-label="Toggle tools visibility">Tools: On</button>
@@ -32,6 +37,8 @@
       <button class="mobile-hide" data-action="cmd" data-cmd="/help" aria-label="Show help">Help</button>
       <button class="mobile-menu-toggle" id="mobile-menu-toggle" data-action="toggle-mobile-menu" aria-label="More actions" aria-expanded="false" aria-controls="mobile-menu">⋯</button>
       <div class="mobile-menu" id="mobile-menu" role="menu">
+        <button data-action="toggle-theme">Toggle theme</button>
+        <button data-action="show-shortcuts">Shortcuts</button>
         <button data-action="nav-settings">Settings</button>
         <button data-action="nav-usage">Usage</button>
         <button data-action="cmd-close-menu" data-cmd="/status">Status</button>
@@ -79,7 +86,7 @@
         </div>
       </div>
       <input type="file" id="image-file-input" accept="image/jpeg,image/png" multiple hidden />
-      <textarea id="input" placeholder="Message LingClaw... (/ for commands)" rows="1" aria-label="Message input"></textarea>
+      <textarea id="input" placeholder="Message LingClaw... (/ for commands)" rows="1" aria-label="Message input" enterkeyhint="send" autocomplete="off" autocapitalize="sentences" spellcheck="true"></textarea>
       <button id="stop" aria-label="Stop agent" title="Stop" style="display:none"><span id="stop-icon">■</span></button>
       <button id="send" aria-label="Send message"><span id="send-icon">↑</span></button>
     </div>
