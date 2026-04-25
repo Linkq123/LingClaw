@@ -190,6 +190,12 @@
   --glass-surface: rgba(35,37,64,.76);
   --glass-border: rgba(72,76,112,.62);
   --glass-shadow: 0 18px 48px rgba(0,0,0,.22);
+  --panel-surface: color-mix(in srgb, var(--glass-surface) 92%, var(--surface) 8%);
+  --panel-surface-alt: color-mix(in srgb, var(--glass-surface) 74%, var(--surface2) 26%);
+  --panel-border-soft: color-mix(in srgb, var(--glass-border) 82%, var(--border));
+  --panel-shadow-soft: 0 12px 28px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.05);
+  --panel-shadow-strong: 0 16px 36px rgba(0,0,0,.24), inset 0 1px 0 rgba(255,255,255,.06);
+  --panel-hover: color-mix(in srgb, var(--accent2) 8%, var(--panel-surface));
   --msg-user: #261f3d;
   --msg-ai: #282a46;
   --accent: #d88aae;
@@ -231,8 +237,8 @@
 }
 
 :root[data-theme='dark'] .react-status-card {
-  background: linear-gradient(135deg, rgba(35,37,64,.95), rgba(44,46,74,.88));
-  box-shadow: 0 8px 20px rgba(0,0,0,.18), inset 0 1px 0 rgba(255,255,255,.06);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--panel-surface) 94%, white 6%), var(--panel-surface-alt));
+  box-shadow: var(--panel-shadow-soft);
 }
 
 :root[data-theme='dark'] .msg.assistant pre {
@@ -262,18 +268,18 @@
 }
 
 :root[data-theme='dark'] .tool-drawer {
-  background: rgba(35,37,64,.96);
-  border-color: #4a4c68;
-  box-shadow: 0 10px 22px rgba(0,0,0,.22);
+  background: var(--panel-surface);
+  border-color: var(--panel-border-soft);
+  box-shadow: var(--panel-shadow-strong);
 }
 
 :root[data-theme='dark'] .tool-drawer-header {
-  border-bottom-color: #4a4c68;
+  border-bottom-color: var(--panel-border-soft);
 }
 
 :root[data-theme='dark'] .tool-drawer-close {
-  background: rgba(38,40,68,.66);
-  border-color: var(--border);
+  background: var(--panel-surface-alt);
+  border-color: var(--panel-border-soft);
 }
 
 :root[data-theme='dark'] .tool-drawer-code {
@@ -330,16 +336,16 @@
 :root[data-theme='dark'] ::-webkit-scrollbar-thumb:hover { background: #5a5c78; }
 
 :root[data-theme='dark'] .timeline-node::before {
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent2) 30%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent2) 20%, transparent);
 }
 :root[data-theme='dark'] .timeline-node--reasoning::before {
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-warn) 30%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-warn) 20%, transparent);
 }
 :root[data-theme='dark'] .timeline-node--result::before {
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-success) 30%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-success) 20%, transparent);
 }
 :root[data-theme='dark'] .timeline-node--tool:has(.tool-panel-ready)::before {
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-success) 30%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-success) 20%, transparent);
 }
 
 /* Dark-mode tweaks for tool / sub-agent / orchestrate panels so that
@@ -372,8 +378,8 @@
   background: rgba(44,46,74,.9);
   border-color: var(--border);
 }
-:root[data-theme='dark'] .system-body { background: var(--surface2); }
-:root[data-theme='dark'] .system-card { box-shadow: 0 1px 4px rgba(0,0,0,.2); }
+:root[data-theme='dark'] .system-body { background: var(--panel-surface-alt); }
+:root[data-theme='dark'] .system-card { box-shadow: var(--panel-shadow-soft); }
 :root[data-theme='dark'] .page-overlay { background: rgba(0,0,0,.52); }
 :root[data-theme='dark'] .page-panel { box-shadow: 0 12px 40px rgba(0,0,0,.46); }
 :root[data-theme='dark'] .usage-stat-card,

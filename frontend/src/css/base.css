@@ -12,6 +12,12 @@
   --glass-surface: rgba(255,255,255,.76);
   --glass-border: rgba(226,229,238,.72);
   --glass-shadow: 0 16px 42px rgba(54,66,98,.10);
+  --panel-surface: color-mix(in srgb, var(--glass-surface) 92%, var(--surface) 8%);
+  --panel-surface-alt: color-mix(in srgb, var(--glass-surface) 78%, var(--surface2) 22%);
+  --panel-border-soft: color-mix(in srgb, var(--glass-border) 86%, var(--border));
+  --panel-shadow-soft: 0 10px 28px rgba(44,46,62,.05), inset 0 1px 0 rgba(255,255,255,.52);
+  --panel-shadow-strong: 0 14px 34px rgba(44,46,62,.08), inset 0 1px 0 rgba(255,255,255,.58);
+  --panel-hover: color-mix(in srgb, var(--accent2) 4%, var(--panel-surface));
   --msg-user: #e4edfb;
   --msg-ai: #ffffff;
   --accent: #c06b9e;

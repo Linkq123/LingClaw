@@ -235,7 +235,8 @@
 }
 .msg.assistant .markdown-table-wrap {
   margin: 12px 0 16px;
-  max-width: min(100%, 96ch);
+  width: 100%;
+  max-width: 100%;
   overflow-x: auto;
   overscroll-behavior-x: contain;
   scrollbar-gutter: stable both-edges;
@@ -246,8 +247,8 @@
   box-shadow: 0 8px 24px rgba(44,46,62,.05);
 }
 .msg.assistant .markdown-table-wrap table {
-  width: max-content;
-  min-width: 100%;
+  width: 100%;
+  min-width: 0;
   border-collapse: collapse;
   font-size: .96em;
   line-height: 1.55;
@@ -262,6 +263,9 @@
   border-right: 1px solid color-mix(in srgb, var(--border) 64%, transparent);
   text-align: left;
   vertical-align: top;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 .msg.assistant .markdown-table-wrap th:last-child,
 .msg.assistant .markdown-table-wrap td:last-child {
@@ -276,7 +280,6 @@
 .msg.assistant .markdown-table-wrap th {
   font-weight: 700;
   color: var(--text);
-  white-space: nowrap;
 }
 .msg.assistant .katex-display {
   margin: 12px 0;
@@ -364,15 +367,15 @@
 
 /* ── System / Command cards ── */
 .system-card {
-  background: var(--surface);
-  border: 1px solid var(--border);
+  background: var(--panel-surface);
+  border: 1px solid var(--panel-border-soft);
   border-left: 3px solid var(--accent2);
   border-radius: 8px;
   padding: 10px 14px;
   font-size: 13px;
   color: var(--dim);
   animation: none;
-  box-shadow: 0 1px 4px rgba(0,0,0,.03);
+  box-shadow: var(--panel-shadow-soft);
 }
 .system-card.system-inline { display: flex; align-items: center; gap: 8px; padding: 8px 14px; }
 .system-card.is-dismissible { padding-right: 10px; }
@@ -421,9 +424,9 @@
   padding: 7px 12px;
   border-left: 0;
   border-radius: 999px;
-  background: linear-gradient(135deg, rgba(255,255,255,.95), rgba(248,250,255,.88));
-  border-color: color-mix(in srgb, var(--react-phase-color) 28%, var(--border));
-  box-shadow: 0 8px 20px rgba(44,46,62,.05), inset 0 1px 0 rgba(255,255,255,.7);
+  background: linear-gradient(135deg, color-mix(in srgb, var(--panel-surface) 96%, white), var(--panel-surface-alt));
+  border-color: color-mix(in srgb, var(--react-phase-color) 22%, var(--panel-border-soft));
+  box-shadow: var(--panel-shadow-soft);
 }
 .react-status-card[data-phase="analyze"] {
   --react-phase-color: var(--accent2);
@@ -524,10 +527,10 @@
   line-height: 1.7;
   white-space: pre-wrap;
   color: var(--text);
-  background: var(--bg);
+  background: var(--panel-surface-alt);
   border-radius: 6px;
   padding: 10px 12px;
-  border: 1px solid var(--border);
+  border: 1px solid var(--panel-border-soft);
   overflow-x: auto;
 }
 .typing::after { content: '▌'; opacity: .55; animation: none; }
