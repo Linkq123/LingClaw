@@ -74,6 +74,279 @@ fn effective_think_level_auto_treats_gemini3_as_reasoning_capable() {
         "medium"
     );
 }
+
+#[tokio::test]
+async fn handle_idle_socket_input_stop_cancels_reconnected_run() {
+    let state = Arc::new(test_app_state());
+    let run_cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let session_id = MAIN_SESSION_ID.to_string();
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+    }
+    {
+        let mut runs = state.active_runs.lock().await;
+        runs.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: run_cancel.clone(),
+                stop_requested: stop_requested.clone(),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+    }
+
+    let action = handle_idle_socket_input(
+        "/stop".into(),
+        &mut current_session_id,
+        &current_session_ref,
+        2,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    assert!(run_cancel.is_cancelled());
+    assert!(stop_requested.load(std::sync::atomic::Ordering::Relaxed));
+
+    let payload = rx.recv().await.expect("stop ack should be sent");
+    let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+    assert_eq!(parsed["type"].as_str(), Some("system"));
+    assert_eq!(parsed["content"].as_str(), Some("Stop requested."));
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_queues_new_prompt_while_reconnected_run_active() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
+    let deferred_interventions = Arc::new(Mutex::new(DeferredInterventionState::open()));
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+    }
+    let before_len = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .expect("session should exist")
+            .messages
+            .len()
+    };
+    {
+        let mut runs = state.active_runs.lock().await;
+        runs.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: deferred_interventions.clone(),
+            },
+        );
+    }
+
+    let action = handle_idle_socket_input(
+        "hello after refresh".into(),
+        &mut current_session_id,
+        &current_session_ref,
+        2,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+
+    let payload = rx.recv().await.expect("busy message should be sent");
+    let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+    assert_eq!(parsed["type"].as_str(), Some("progress"));
+    assert!(
+        parsed["content"]
+            .as_str()
+            .expect("content should be string")
+            .contains("Intervention received")
+    );
+
+    let after_len = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .expect("session should exist")
+            .messages
+            .len()
+    };
+    assert_eq!(after_len, before_len);
+
+    let queued = deferred_interventions.lock().await;
+    assert!(queued.accepting);
+    assert_eq!(queued.queue, vec!["hello after refresh".to_string()]);
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_rejects_intervention_when_reconnected_run_is_finishing() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
+    let deferred_interventions = Arc::new(Mutex::new(DeferredInterventionState {
+        queue: Vec::new(),
+        accepting: false,
+    }));
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+    }
+    {
+        let mut runs = state.active_runs.lock().await;
+        runs.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: deferred_interventions.clone(),
+            },
+        );
+    }
+
+    let action = handle_idle_socket_input(
+        "late intervention".into(),
+        &mut current_session_id,
+        &current_session_ref,
+        2,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+
+    let payload = rx.recv().await.expect("finishing message should be sent");
+    let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+    assert_eq!(parsed["type"].as_str(), Some("system"));
+    assert!(
+        parsed["content"]
+            .as_str()
+            .expect("content should be string")
+            .contains("already finishing")
+    );
+
+    let queued = deferred_interventions.lock().await;
+    assert!(queued.queue.is_empty());
+}
+
+#[tokio::test]
+async fn run_agent_session_emits_user_stop_done_for_shared_stop_request() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(true));
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
+    let (_inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<String>(4);
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+    }
+
+    let outcome = run_agent_session(
+        &state,
+        &session_id,
+        1,
+        &cancel,
+        &live_tx,
+        &mut inbound_rx,
+        &stop_requested,
+    )
+    .await;
+
+    assert!(!outcome.rerun_agent);
+    assert!(!outcome.shutting_down);
+
+    let done_event = live_rx.recv().await.expect("done event should be emitted");
+    assert_eq!(done_event["type"].as_str(), Some("done"));
+    assert_eq!(done_event["phase"].as_str(), Some("stopped"));
+    assert_eq!(done_event["reason"].as_str(), Some("user_stop"));
+}
+
+#[tokio::test]
+async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(true));
+    let deferred_interventions = Arc::new(Mutex::new(DeferredInterventionState::open()));
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
+
+    {
+        let mut runs = state.active_runs.lock().await;
+        runs.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: run_cancel.clone(),
+                stop_requested: stop_requested.clone(),
+                deferred_interventions,
+            },
+        );
+    }
+
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = AgentPhaseState {
+        round: 0,
+        pending_tool_calls: Vec::new(),
+        collected_results: Vec::new(),
+        cycle_workspace: PathBuf::new(),
+        last_observation_hint: None,
+        pending_interventions: Vec::new(),
+        react_ctx: agent::AgentLoopCtx::new(false),
+        shutting_down: false,
+        run_stopped: false,
+        run_detached: false,
+        last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
+    };
+
+    apply_run_cancel_outcome(&ctx, &mut phase_state).await;
+
+    assert!(phase_state.run_stopped);
+    assert!(!phase_state.run_detached);
+    assert!(!stop_requested.load(std::sync::atomic::Ordering::Relaxed));
+}
+
 fn test_app_state_with_config(config: Config) -> AppState {
     AppState {
         config: std::sync::Mutex::new(Arc::new(config)),

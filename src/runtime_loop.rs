@@ -1381,8 +1381,7 @@ async fn execute_tool_call(
     match run_state {
         ToolRunState::Completed(result) => Ok((result, Some(effective_args))),
         ToolRunState::Abort => {
-            phase_state.shutting_down = ctx.cancel.is_cancelled();
-            phase_state.run_detached = !phase_state.shutting_down;
+            apply_run_cancel_outcome(ctx, phase_state).await;
             Err(AgentPhaseControl::Break)
         }
     }
@@ -1683,8 +1682,7 @@ async fn run_analyze_phase(
         let result = tokio::select! {
             biased;
             _ = ctx.run_cancel.cancelled() => {
-                phase_state.shutting_down = ctx.cancel.is_cancelled();
-                phase_state.run_detached = !phase_state.shutting_down;
+                apply_run_cancel_outcome(ctx, phase_state).await;
                 return AgentPhaseControl::Break;
             }
             result = providers::call_llm_stream(
@@ -1712,8 +1710,7 @@ async fn run_analyze_phase(
                 tokio::select! {
                     biased;
                     _ = ctx.run_cancel.cancelled() => {
-                        phase_state.shutting_down = ctx.cancel.is_cancelled();
-                        phase_state.run_detached = !phase_state.shutting_down;
+                        apply_run_cancel_outcome(ctx, phase_state).await;
                         return AgentPhaseControl::Break;
                     }
                     _ = tokio::time::sleep(Duration::from_secs(3)) => {}
@@ -1763,8 +1760,7 @@ async fn run_act_phase(
         // Sequential path: single tool call or any mutating tool in the batch.
         for tc in &tool_calls {
             if ctx.run_cancel.is_cancelled() {
-                phase_state.shutting_down = ctx.cancel.is_cancelled();
-                phase_state.run_detached = !phase_state.shutting_down;
+                apply_run_cancel_outcome(ctx, phase_state).await;
                 return AgentPhaseControl::Break;
             }
 
@@ -1840,8 +1836,7 @@ async fn run_act_phase(
         //    then send any reject hook events (matching sequential path: tool_call → hook events).
         for (tc, hr) in tool_calls.iter().zip(hook_results.iter()) {
             if ctx.run_cancel.is_cancelled() {
-                phase_state.shutting_down = ctx.cancel.is_cancelled();
-                phase_state.run_detached = !phase_state.shutting_down;
+                apply_run_cancel_outcome(ctx, phase_state).await;
                 return AgentPhaseControl::Break;
             }
             // For rejected tools, show original args; for others, show effective args.
@@ -1936,8 +1931,7 @@ async fn run_act_phase(
                     }
                 }
                 ToolRunState::Abort => {
-                    phase_state.shutting_down = ctx.cancel.is_cancelled();
-                    phase_state.run_detached = !phase_state.shutting_down;
+                    apply_run_cancel_outcome(ctx, phase_state).await;
                     should_break = true;
                 }
             }
@@ -2195,6 +2189,27 @@ fn fire_stop_command_hook(state: &Arc<AppState>, session_id: &str, live_tx: &Liv
     });
 }
 
+async fn apply_run_cancel_outcome(ctx: &AgentRunCtx<'_>, phase_state: &mut AgentPhaseState) {
+    if ctx.cancel.is_cancelled() {
+        phase_state.shutting_down = true;
+        return;
+    }
+
+    let shared_stop_requested = {
+        let runs = ctx.state.active_runs.lock().await;
+        runs.get(ctx.current_session_id)
+            .map(|run| run.stop_requested.swap(false, Ordering::Relaxed))
+            .unwrap_or(false)
+    };
+
+    if shared_stop_requested {
+        fire_stop_command_hook(ctx.state, ctx.current_session_id, ctx.live_tx);
+        phase_state.run_stopped = true;
+    } else {
+        phase_state.run_detached = true;
+    }
+}
+
 pub(crate) async fn run_agent_session(
     state: &Arc<AppState>,
     current_session_id: &str,
@@ -2213,6 +2228,7 @@ pub(crate) async fn run_agent_session(
     };
 
     let run_cancel = cancel.child_token();
+    let deferred_interventions = Arc::new(Mutex::new(DeferredInterventionState::open()));
     {
         let mut runs = state.active_runs.lock().await;
         runs.insert(
@@ -2220,6 +2236,8 @@ pub(crate) async fn run_agent_session(
             SessionRunBinding {
                 connection_id,
                 cancel: run_cancel.clone(),
+                stop_requested: stop_requested.clone(),
+                deferred_interventions: deferred_interventions.clone(),
             },
         );
     }
@@ -2257,13 +2275,13 @@ pub(crate) async fn run_agent_session(
     }
 
     'agent: loop {
+        socket_input::drain_shared_interventions(
+            &deferred_interventions,
+            &mut phase_state.pending_interventions,
+        )
+        .await;
         if cancel.is_cancelled() {
             phase_state.shutting_down = true;
-            break;
-        }
-        if run_cancel.is_cancelled() {
-            phase_state.shutting_down = cancel.is_cancelled();
-            phase_state.run_detached = !phase_state.shutting_down;
             break;
         }
         if stop_requested.swap(false, Ordering::Relaxed) {
@@ -2286,11 +2304,10 @@ pub(crate) async fn run_agent_session(
             phase_state.run_stopped = true;
             break;
         }
-        if run_cancel.is_cancelled() && !cancel.is_cancelled() {
-            phase_state.run_stopped = true;
+        if run_cancel.is_cancelled() {
+            apply_run_cancel_outcome(&ctx, &mut phase_state).await;
             break;
         }
-
         let control = match phase_state.react_ctx.phase() {
             agent::AgentPhase::Analyze => run_analyze_phase(&ctx, &mut phase_state).await,
             agent::AgentPhase::Act => run_act_phase(&ctx, &mut phase_state).await,
@@ -2302,6 +2319,12 @@ pub(crate) async fn run_agent_session(
             break 'agent;
         }
     }
+
+    socket_input::close_shared_interventions(
+        &deferred_interventions,
+        &mut phase_state.pending_interventions,
+    )
+    .await;
 
     {
         let mut runs = state.active_runs.lock().await;

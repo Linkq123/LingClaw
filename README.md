@@ -479,7 +479,8 @@ tools:
 │                    Connection Layer (Loop)                        │
 │   handle_socket() · handle_command() · session persistence       │
 │   active_connections · session_clients · live_rounds             │
-│   memory queue · replay/rebind · cooperative shutdown            │
+│   memory queue · replay/rebind · refresh-safe active runs        │
+│   cooperative shutdown                                           │
 └───────┬──────────────────┬───────────────────┬───────────────────┘
         │                  │                   │
 ┌───────▼───────┐  ┌───────▼────────┐  ┌──────▼────────┐
@@ -514,6 +515,8 @@ tools:
 Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的 Thought → Action → Observation 循环转化为结构化阶段控制：
 
 运行中的用户干预不会强制截断当前阶段。LingClaw 会在阶段边界收集用户追加的普通文本，并在下一次 `Analyze` 前将其作为新的 user message 注入上下文；如果需要立刻停止当前轮次，使用 `/stop` 或聊天页停止按钮。
+
+如果浏览器在执行中刷新，后端会保留原来的 active run，并把新的 WebSocket 连接重绑到当前 live replay。刷新后的页面会继续接收流式输出，`/stop` 仍然可用，普通文本也会继续作为 deferred intervention 排队到下一次 `Analyze`。
 
 ```text
          ┌──────────────────────────────────────────────┐
@@ -851,6 +854,8 @@ think_level 映射：
 ```
 
 服务端 → 客户端：
+
+连接重绑说明：如果页面在 active run 期间刷新，服务端不会取消正在执行的 agent loop，而是把新连接附着到已有 `live_round` 上继续转发后续事件与终态 `done/error`。
 
 | type | 用途 |
 |---|---|

@@ -471,6 +471,23 @@ struct SessionClientBinding {
 struct SessionRunBinding {
     connection_id: u64,
     cancel: CancellationToken,
+    stop_requested: Arc<AtomicBool>,
+    deferred_interventions: Arc<Mutex<DeferredInterventionState>>,
+}
+
+#[derive(Default)]
+struct DeferredInterventionState {
+    queue: Vec<String>,
+    accepting: bool,
+}
+
+impl DeferredInterventionState {
+    fn open() -> Self {
+        Self {
+            queue: Vec::new(),
+            accepting: true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1169,24 +1186,32 @@ async fn dispatch_live_event(
 ) {
     let event_type = event["type"].as_str().unwrap_or_default();
     let mut delegated_replay_event: Option<serde_json::Value> = None;
+    let active_run_connection_id = {
+        let runs = state.active_runs.lock().await;
+        runs.get(session_id).map(|binding| binding.connection_id)
+    };
+    let live_round_connection_id = {
+        let live_rounds = state.live_rounds.lock().await;
+        live_rounds.get(session_id).map(|round| round.connection_id)
+    };
 
     // Validate connection ownership and update live replay state under a single
-    // critical section. We hold session_clients for the entire block to prevent
-    // unbind/rebind from racing between validation and live_rounds mutation.
-    {
-        let clients_guard = state.session_clients.lock().await;
-        let is_current = clients_guard
+    // critical section. Reconnected pages may receive events from the original
+    // run owner while a newer socket is bound for rendering, including run
+    // teardown after the active_runs entry has already been removed.
+    let binding = {
+        let mut clients_guard = state.session_clients.lock().await;
+        let current_connection_id = clients_guard
             .get(session_id)
-            .map(|b| b.connection_id == connection_id)
-            .unwrap_or(false);
-        if !is_current {
+            .map(|binding| binding.connection_id);
+        let is_current = current_connection_id == Some(connection_id);
+        let is_active_run_source = active_run_connection_id == Some(connection_id);
+        let is_live_round_source = live_round_connection_id == Some(connection_id);
+        if !(is_current || is_active_run_source || is_live_round_source) {
             return;
         }
 
         let mut live_rounds = state.live_rounds.lock().await;
-        // Drop the clients guard now — we've entered the live_rounds critical
-        // section and no longer need the binding check to stay valid.
-        drop(clients_guard);
 
         match event_type {
             "start" => {
@@ -1483,14 +1508,10 @@ async fn dispatch_live_event(
                 }
             }
         }
-    }
 
-    let binding = {
-        let mut clients = state.session_clients.lock().await;
-        if let Some(binding) = clients.get_mut(session_id) {
-            if binding.connection_id != connection_id {
-                return;
-            }
+        drop(live_rounds);
+
+        if let Some(binding) = clients_guard.get_mut(session_id) {
             if !binding.replay_ready {
                 binding.pending_events.push(event.clone());
                 None
@@ -1662,17 +1683,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             },
         );
     }
-    {
-        let active_run = {
-            let runs = state.active_runs.lock().await;
-            runs.get(&current_session_id).cloned()
-        };
-        if let Some(run) = active_run
-            && run.connection_id != connection_id
-        {
-            run.cancel.cancel();
-        }
-    }
 
     bind_session_connection(&state, &current_session_id, connection_id, &tx, false).await;
     replay_live_round(&tx, &state, &current_session_id).await;
@@ -1706,6 +1716,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                 connection_id,
                 &state,
                 &tx,
+                &live_tx,
                 &cancel,
             )
             .await

@@ -5645,6 +5645,120 @@ fn dispatch_live_event_ignores_stale_connection_after_rebind() {
     );
 }
 
+#[test]
+fn dispatch_live_event_allows_active_run_source_after_rebind() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-run-rebind-{}", now_epoch());
+    let run_cancel = CancellationToken::new();
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(4);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        2,
+        &bound_tx,
+        true,
+    ));
+    {
+        let mut runs = rt.block_on(state.active_runs.lock());
+        runs.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: run_cancel,
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+    }
+
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 1,
+            "phase": "analyze",
+            "cycle": 1,
+            "react_visible": true,
+        }),
+    ));
+
+    let payload = rt
+        .block_on(bound_rx.recv())
+        .expect("rebound client should receive live event from active run source");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload).expect("payload should be valid json");
+    assert_eq!(parsed["type"].as_str(), Some("start"));
+
+    let live_rounds = rt.block_on(state.live_rounds.lock());
+    let round = live_rounds
+        .get(&session_id)
+        .expect("live round should be recorded");
+    assert_eq!(round.connection_id, 1);
+}
+
+#[test]
+fn dispatch_live_event_allows_live_round_source_after_run_teardown() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-round-teardown-{}", now_epoch());
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(4);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        2,
+        &bound_tx,
+        true,
+    ));
+    {
+        let mut live_rounds = rt.block_on(state.live_rounds.lock());
+        live_rounds.insert(
+            session_id.clone(),
+            LiveRoundState {
+                connection_id: 1,
+                round: 1,
+                react_visible: true,
+                phase: Some("finish".into()),
+                cycle: Some(1),
+                has_observation: false,
+                assistant_text: String::new(),
+                reasoning_text: String::new(),
+                reasoning_done: false,
+                tools: Vec::new(),
+                delegated_events: Vec::new(),
+                active_tasks: HashSet::new(),
+                active_orchestrations: HashSet::new(),
+            },
+        );
+    }
+
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "done",
+            "phase": "complete",
+        }),
+    ));
+
+    let payload = rt
+        .block_on(bound_rx.recv())
+        .expect("rebound client should receive terminal event from live round source");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload).expect("payload should be valid json");
+    assert_eq!(parsed["type"].as_str(), Some("done"));
+    assert!(
+        rt.block_on(state.live_rounds.lock())
+            .get(&session_id)
+            .is_none()
+    );
+}
+
 // ── Phase 4: Tool Protocol + Session Recovery ────────────────────────────────
 
 #[test]
