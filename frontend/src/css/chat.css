@@ -111,6 +111,7 @@
   display: block;
   padding: 14px 16px;
   overflow-x: auto;
+  font-weight: 500;
 }
 .msg.assistant p { margin: 0 0 10px; max-width: var(--assistant-prose-max-width); }
 .msg.assistant p:last-child { margin-bottom: 0; }
@@ -356,6 +357,7 @@
   display: block;
   padding: 14px 16px;
   overflow-x: auto;
+  font-weight: 500;
 }
 .msg.assistant pre code.hljs,
 .msg.assistant .live-code-tail code.hljs {
