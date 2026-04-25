@@ -442,6 +442,87 @@ pub(crate) fn tool_definitions_ollama() -> serde_json::Value {
     tool_definitions_openai()
 }
 
+pub(crate) fn tool_definitions_gemini() -> serde_json::Value {
+    let tools = tool_specs()
+        .iter()
+        .map(|spec| {
+            json!({
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": gemini_tool_parameters((spec.parameters)()),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!(tools)
+}
+
+pub(crate) fn gemini_tool_parameters(parameters: Value) -> Value {
+    let normalized = normalize_gemini_schema(parameters);
+    if normalized.is_object() {
+        normalized
+    } else {
+        json!({ "type": "object" })
+    }
+}
+
+fn normalize_gemini_schema(value: Value) -> Value {
+    let Value::Object(input) = value else {
+        return value;
+    };
+
+    let mut output = serde_json::Map::new();
+    for (key, value) in input {
+        match key.as_str() {
+            "type" => match value {
+                Value::String(kind) => {
+                    output.insert("type".to_string(), Value::String(kind.to_ascii_lowercase()));
+                }
+                Value::Array(kinds) => {
+                    let mut nullable = false;
+                    let mut selected = None;
+                    for kind in kinds {
+                        if let Some(kind) = kind.as_str() {
+                            if kind.eq_ignore_ascii_case("null") {
+                                nullable = true;
+                            } else if selected.is_none() {
+                                selected = Some(kind.to_ascii_lowercase());
+                            }
+                        }
+                    }
+                    if let Some(kind) = selected {
+                        output.insert("type".to_string(), Value::String(kind));
+                    }
+                    if nullable {
+                        output.insert("nullable".to_string(), Value::Bool(true));
+                    }
+                }
+                _ => {}
+            },
+            "properties" => {
+                if let Value::Object(properties) = value {
+                    let normalized = properties
+                        .into_iter()
+                        .map(|(property, schema)| (property, normalize_gemini_schema(schema)))
+                        .collect();
+                    output.insert("properties".to_string(), Value::Object(normalized));
+                }
+            }
+            "items" => {
+                output.insert("items".to_string(), normalize_gemini_schema(value));
+            }
+            "format" | "description" | "nullable" | "enum" | "maxItems" | "minItems"
+            | "maxLength" | "minLength" | "pattern" | "required" => {
+                output.insert(key, value);
+            }
+            _ => {}
+        }
+    }
+    output
+        .entry("type".to_string())
+        .or_insert_with(|| Value::String("object".to_string()));
+    Value::Object(output)
+}
+
 pub(crate) fn tool_definitions_anthropic() -> serde_json::Value {
     let tools = tool_specs()
         .iter()
@@ -458,6 +539,23 @@ pub(crate) fn tool_definitions_anthropic() -> serde_json::Value {
 
 pub(crate) fn task_tool_definition_ollama(agent_names: &[String]) -> serde_json::Value {
     task_tool_definition_openai(agent_names)
+}
+
+pub(crate) fn task_tool_definition_gemini(agent_names: &[String]) -> serde_json::Value {
+    let catalog = if agent_names.is_empty() {
+        "No sub-agents currently available.".to_string()
+    } else {
+        format!("Available sub-agents: {}", agent_names.join(", "))
+    };
+    json!({
+        "name": "task",
+        "description": format!(
+            "Delegate a sub-task to a specialized sub-agent that runs in an isolated context \
+             with its own tool set and message history. Use this for research, code review, \
+             exploration, or any task that benefits from focused attention. {catalog}"
+        ),
+        "parameters": gemini_tool_parameters(task_tool_parameters()),
+    })
 }
 
 /// Returns true if the named tool performs no side effects (no writes, no exec).
@@ -611,6 +709,20 @@ pub(crate) fn orchestrate_tool_definition_anthropic(agent_names: &[String]) -> s
 /// Generate the `orchestrate` tool definition for Ollama format (reuses OpenAI format).
 pub(crate) fn orchestrate_tool_definition_ollama(agent_names: &[String]) -> serde_json::Value {
     orchestrate_tool_definition_openai(agent_names)
+}
+
+/// Generate the `orchestrate` tool definition for Gemini format.
+pub(crate) fn orchestrate_tool_definition_gemini(agent_names: &[String]) -> serde_json::Value {
+    let catalog = if agent_names.is_empty() {
+        "No sub-agents currently available.".to_string()
+    } else {
+        format!("Available sub-agents: {}", agent_names.join(", "))
+    };
+    json!({
+        "name": "orchestrate",
+        "description": orchestrate_tool_description(&catalog),
+        "parameters": gemini_tool_parameters(orchestrate_tool_parameters()),
+    })
 }
 
 pub(crate) fn orchestrate_tool_parameters() -> serde_json::Value {

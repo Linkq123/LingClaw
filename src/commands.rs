@@ -141,6 +141,9 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
         crate::Provider::Ollama => {
             tools::mcp::cached_tool_definitions_ollama(&config, &session.workspace)
         }
+        crate::Provider::Gemini => {
+            tools::mcp::cached_tool_definitions_gemini(&config, &session.workspace)
+        }
     };
     extra_tools.append(&mut cached_mcp_tools);
     let (cached_mcp_servers, enabled_mcp_servers) =

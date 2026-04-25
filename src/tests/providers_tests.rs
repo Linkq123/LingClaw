@@ -1058,6 +1058,225 @@ fn with_optional_bearer_auth_sets_header_for_non_empty_key() {
     );
 }
 
+#[tokio::test]
+async fn build_gemini_body_inlines_images_and_function_declarations() {
+    let resolved = ResolvedModel {
+        provider: Provider::Gemini,
+        api_base: Provider::Gemini.default_api_base().into(),
+        api_key: "gemini-key".into(),
+        model_id: "gemini-2.5-flash".into(),
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(512),
+        context_window: 1_000_000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("You are concise.".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("describe".into()),
+            images: Some(vec![ImageAttachment {
+                url: "memory://image.png".into(),
+                s3_object_key: None,
+                cache_path: None,
+                data: Some(
+                    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+                        .into(),
+                ),
+            }]),
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    ];
+    let workspace = unique_temp_dir("lingclaw-gemini-body");
+
+    let body = build_gemini_body(&resolved, &messages, &workspace, None, &[], true)
+        .await
+        .expect("gemini body should build");
+
+    assert_eq!(
+        body["systemInstruction"]["parts"][0]["text"],
+        "You are concise."
+    );
+    assert_eq!(body["contents"][0]["role"], "user");
+    assert_eq!(body["contents"][0]["parts"][0]["text"], "describe");
+    assert_eq!(
+        body["contents"][0]["parts"][1]["inlineData"]["mimeType"],
+        "image/png"
+    );
+    assert_eq!(body["generationConfig"]["maxOutputTokens"], 512);
+    assert!(body["tools"][0]["functionDeclarations"].is_array());
+}
+
+#[tokio::test]
+async fn process_gemini_data_line_collects_text_tools_and_usage() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let live_tx: LiveTx = tx;
+    let mut state = OpenAiStreamState {
+        content_buf: String::new(),
+        thinking_buf: String::new(),
+        tool_calls: Vec::new(),
+        input_tokens: None,
+        output_tokens: None,
+        client_gone: false,
+        reasoning_started: false,
+    };
+
+    process_gemini_data_line(
+        r#"{"candidates":[{"content":{"parts":[{"text":"hi"},{"functionCall":{"name":"read_file","args":{"path":"README.md"}}}]}}],"usageMetadata":{"promptTokenCount":7,"candidatesTokenCount":3,"thoughtsTokenCount":2}}"#,
+        &live_tx,
+        &mut state,
+    )
+    .await
+    .expect("gemini stream line should parse");
+
+    assert_eq!(state.content_buf, "hi");
+    assert_eq!(state.input_tokens, Some(7));
+    assert_eq!(state.output_tokens, Some(5));
+    assert_eq!(state.tool_calls.len(), 1);
+    assert_eq!(state.tool_calls[0].function.name, "read_file");
+    assert_eq!(
+        state.tool_calls[0].function.arguments,
+        r#"{"path":"README.md"}"#
+    );
+    assert_eq!(rx.try_recv().unwrap()["type"], "delta");
+}
+
+#[tokio::test]
+async fn process_gemini_data_line_rejects_blocked_prompt() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let live_tx: LiveTx = tx;
+    let mut state = OpenAiStreamState {
+        content_buf: String::new(),
+        thinking_buf: String::new(),
+        tool_calls: Vec::new(),
+        input_tokens: None,
+        output_tokens: None,
+        client_gone: false,
+        reasoning_started: false,
+    };
+
+    let error = process_gemini_data_line(
+        r#"{"promptFeedback":{"blockReason":"SAFETY"}}"#,
+        &live_tx,
+        &mut state,
+    )
+    .await
+    .expect_err("blocked Gemini prompt should be surfaced");
+
+    assert!(error.contains("SAFETY"));
+}
+
+#[tokio::test]
+async fn build_gemini_body_rejects_invalid_cached_image_data() {
+    let resolved = ResolvedModel {
+        provider: Provider::Gemini,
+        api_base: Provider::Gemini.default_api_base().into(),
+        api_key: "gemini-key".into(),
+        model_id: "gemini-2.5-flash".into(),
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(512),
+        context_window: 1_000_000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("describe".into()),
+        images: Some(vec![ImageAttachment {
+            url: "memory://bad-image".into(),
+            s3_object_key: None,
+            cache_path: None,
+            data: Some("not-base64".into()),
+        }]),
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let workspace = unique_temp_dir("lingclaw-gemini-bad-image");
+
+    let error = build_gemini_body(&resolved, &messages, &workspace, None, &[], true)
+        .await
+        .expect_err("invalid Gemini image data should fail request construction");
+
+    assert!(error.contains("not a supported PNG/JPEG payload"));
+}
+
+#[test]
+fn call_llm_simple_gemini_sends_key_header_and_expected_path() {
+    let response_body = r#"{"candidates":[{"content":{"parts":[{"text":"hello from gemini"}]}}],"usageMetadata":{"promptTokenCount":11,"candidatesTokenCount":5,"thoughtsTokenCount":2}}"#.to_string();
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server("application/json", response_body);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::Gemini,
+        api_base: format!("{api_base}/v1beta"),
+        api_key: "gemini-secret".into(),
+        model_id: "gemini-2.5-flash".into(),
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(64),
+        context_window: 1_000_000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hi".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let workspace = unique_temp_dir("lingclaw-call-gemini-simple");
+
+    let response = runtime
+        .block_on(async {
+            call_llm_simple_with_usage(&http, &resolved, &messages, &workspace, None, 2).await
+        })
+        .expect("gemini simple call should succeed");
+
+    let request = request_rx.recv().expect("captured request should exist");
+    handle.join().expect("server thread should join");
+
+    assert_eq!(response.content, "hello from gemini");
+    assert_eq!(response.input_tokens, Some(11));
+    assert_eq!(response.output_tokens, Some(7));
+    assert_eq!(
+        request.request_line,
+        "POST /v1beta/models/gemini-2.5-flash:generateContent HTTP/1.1"
+    );
+    assert_eq!(
+        request.headers.get("x-goog-api-key").map(String::as_str),
+        Some("gemini-secret")
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid json");
+    assert_eq!(body["contents"][0]["parts"][0]["text"], "hi");
+    assert_eq!(body["generationConfig"]["maxOutputTokens"], 64);
+    assert!(body.get("tools").is_none());
+}
+
 #[test]
 fn call_llm_simple_ollama_sends_auth_and_expected_body() {
     let response_body = r#"{"message":{"content":"hello from ollama"}}"#.to_string();
@@ -1542,7 +1761,7 @@ async fn fetch_images_base64_reads_persisted_cache_without_refetch() {
         timestamp: None,
     }];
 
-    let images_b64 = fetch_images_base64(&messages, &workspace, None)
+    let images_b64 = fetch_images_base64(&messages, &workspace, None, false)
         .await
         .expect("cached image should load");
     assert_eq!(
@@ -1574,10 +1793,15 @@ async fn fetch_images_base64_skips_uncached_historical_fetch_failures() {
     }];
 
     let workspace = unique_temp_dir("lingclaw-stale-image-cache");
-    let images_b64 = fetch_images_base64(&messages, &workspace, None)
+    let images_b64 = fetch_images_base64(&messages, &workspace, None, false)
         .await
         .expect("stale historical images should be skipped, not fail the request");
     assert!(images_b64.is_empty());
+
+    let error = fetch_images_base64(&messages, &workspace, None, true)
+        .await
+        .expect_err("strict image fetch should fail on missing data");
+    assert!(error.contains("Failed to fetch image"));
 }
 
 #[tokio::test]
@@ -1613,7 +1837,7 @@ async fn fetch_images_base64_trusted_uploaded_urls_bypass_ssrf_on_cache_miss() {
     let hydrated =
         materialize_image_urls(&messages, Some(&cfg)).expect("uploaded image should presign");
     let workspace = unique_temp_dir("lingclaw-trusted-history-image");
-    let images_b64 = fetch_images_base64(&hydrated, &workspace, Some(&cfg))
+    let images_b64 = fetch_images_base64(&hydrated, &workspace, Some(&cfg), false)
         .await
         .expect("trusted uploaded image should load on cache miss");
 

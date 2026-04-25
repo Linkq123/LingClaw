@@ -61,6 +61,30 @@ fn validate_tool_args_rejects_wrong_type_and_out_of_range() {
     assert!(range_error.contains("must be >= 1"));
 }
 
+#[test]
+fn gemini_tool_parameters_drop_unsupported_schema_keywords() {
+    let schema = gemini_tool_parameters(json!({
+        "type": "object",
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "additionalProperties": false,
+        "properties": {
+            "path": {
+                "type": ["string", "null"],
+                "description": "File path",
+                "oneOf": [{ "const": "README.md" }]
+            }
+        },
+        "required": ["path"]
+    }));
+
+    assert_eq!(schema["type"], "object");
+    assert!(schema.get("$schema").is_none());
+    assert!(schema.get("additionalProperties").is_none());
+    assert_eq!(schema["properties"]["path"]["type"], "string");
+    assert_eq!(schema["properties"]["path"]["nullable"], true);
+    assert!(schema["properties"]["path"].get("oneOf").is_none());
+}
+
 #[tokio::test]
 async fn execute_tool_rejects_descending_read_file_range() {
     let workspace = std::env::temp_dir().join("lingclaw-tools-range-test");

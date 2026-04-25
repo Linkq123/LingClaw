@@ -2425,11 +2425,11 @@ async fn main() {
 
     if config.api_key.is_empty()
         && config.providers.is_empty()
-        && config.provider.api_key_env_var().is_some()
+        && config.provider.api_key_env_hint().is_some()
     {
         eprintln!(
             "WARNING: {} is not set and no config file providers found. LLM calls will fail.",
-            config.provider.api_key_env_var().unwrap_or("API key")
+            config.provider.api_key_env_hint().unwrap_or("API key")
         );
     }
 

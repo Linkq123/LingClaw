@@ -16,6 +16,7 @@ pub(crate) enum Provider {
     OpenAI,
     Anthropic,
     Ollama,
+    Gemini,
 }
 
 impl Provider {
@@ -23,6 +24,7 @@ impl Provider {
         match api.trim().to_ascii_lowercase().as_str() {
             "anthropic" => Self::Anthropic,
             "ollama" => Self::Ollama,
+            "gemini" => Self::Gemini,
             _ => Self::OpenAI,
         }
     }
@@ -32,6 +34,7 @@ impl Provider {
             Self::OpenAI => "https://api.openai.com/v1",
             Self::Anthropic => "https://api.anthropic.com",
             Self::Ollama => "http://127.0.0.1:11434",
+            Self::Gemini => "https://generativelanguage.googleapis.com/v1beta",
         }
     }
 
@@ -40,6 +43,14 @@ impl Provider {
             Self::OpenAI => Some("OPENAI_API_KEY"),
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
             Self::Ollama => None,
+            Self::Gemini => Some("GEMINI_API_KEY"),
+        }
+    }
+
+    pub(crate) fn api_key_env_hint(self) -> Option<&'static str> {
+        match self {
+            Self::Gemini => Some("GEMINI_API_KEY or GOOGLE_API_KEY"),
+            _ => self.api_key_env_var(),
         }
     }
 
@@ -59,6 +70,9 @@ impl Provider {
         if explicit == "ollama" {
             return Self::Ollama;
         }
+        if explicit == "gemini" {
+            return Self::Gemini;
+        }
         if explicit == "openai" {
             return Self::OpenAI;
         }
@@ -73,6 +87,9 @@ impl Provider {
             if provider_name == "openai" {
                 return Self::OpenAI;
             }
+            if provider_name == "gemini" {
+                return Self::Gemini;
+            }
             if model_id.starts_with("claude") {
                 return Self::Anthropic;
             }
@@ -82,6 +99,10 @@ impl Provider {
             Self::Anthropic
         } else if api_base.contains("11434") || api_base.contains("ollama") {
             Self::Ollama
+        } else if model.starts_with("gemini-")
+            || api_base.contains("generativelanguage.googleapis.com")
+        {
+            Self::Gemini
         } else {
             Self::OpenAI
         }
@@ -92,6 +113,7 @@ impl Provider {
             Self::OpenAI => "openai",
             Self::Anthropic => "anthropic",
             Self::Ollama => "ollama",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -280,19 +302,19 @@ pub(crate) fn validate_provider_name(name: &str) -> Result<(), String> {
 fn is_builtin_provider_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "openai" | "anthropic" | "ollama"
+        "openai" | "anthropic" | "ollama" | "gemini"
     )
 }
 
 fn validate_provider_api_kind(api_kind: &str) -> Result<(), String> {
     if matches!(
         api_kind.trim().to_ascii_lowercase().as_str(),
-        "openai-completions" | "anthropic" | "ollama"
+        "openai-completions" | "anthropic" | "ollama" | "gemini"
     ) {
         Ok(())
     } else {
         Err(format!(
-            "unsupported api '{api_kind}'. Expected one of: openai-completions, anthropic, ollama."
+            "unsupported api '{api_kind}'. Expected one of: openai-completions, anthropic, ollama, gemini."
         ))
     }
 }
@@ -458,10 +480,12 @@ impl Config {
         let settings_api_base = settings.api_base.clone();
         let openai_api_base_env = std::env::var("OPENAI_API_BASE").ok();
         let ollama_api_base_env = std::env::var("OLLAMA_API_BASE").ok();
+        let gemini_api_base_env = std::env::var("GEMINI_API_BASE").ok();
         let api_base_hint = settings_api_base
             .clone()
             .or_else(|| openai_api_base_env.clone())
             .or_else(|| ollama_api_base_env.clone())
+            .or_else(|| gemini_api_base_env.clone())
             .unwrap_or_else(|| Provider::OpenAI.default_api_base().to_string());
 
         let provider = Provider::detect(&model, &api_base_hint, settings.provider.as_deref());
@@ -473,6 +497,10 @@ impl Config {
                 .unwrap_or_default(),
             Provider::OpenAI => std::env::var("OPENAI_API_KEY").unwrap_or_default(),
             Provider::Ollama => std::env::var("OLLAMA_API_KEY")
+                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                .unwrap_or_default(),
+            Provider::Gemini => std::env::var("GEMINI_API_KEY")
+                .or_else(|_| std::env::var("GOOGLE_API_KEY"))
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .unwrap_or_default(),
         });
@@ -489,6 +517,8 @@ impl Config {
                 },
                 Provider::Ollama => ollama_api_base_env
                     .unwrap_or_else(|| Provider::Ollama.default_api_base().to_string()),
+                Provider::Gemini => gemini_api_base_env
+                    .unwrap_or_else(|| Provider::Gemini.default_api_base().to_string()),
             }
         };
 
@@ -682,6 +712,13 @@ impl Config {
                     std::env::var("OLLAMA_API_BASE")
                         .unwrap_or_else(|_| Provider::Ollama.default_api_base().to_string())
                 }
+                Provider::Gemini
+                    if self.provider != Provider::Gemini
+                        || self.api_base == Provider::OpenAI.default_api_base() =>
+                {
+                    std::env::var("GEMINI_API_BASE")
+                        .unwrap_or_else(|_| Provider::Gemini.default_api_base().to_string())
+                }
                 _ => self.api_base.clone(),
             },
             api_key: match provider {
@@ -695,6 +732,12 @@ impl Config {
                 }
                 Provider::Ollama if self.provider != Provider::Ollama => {
                     std::env::var("OLLAMA_API_KEY")
+                        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                        .unwrap_or_else(|_| self.api_key.clone())
+                }
+                Provider::Gemini if self.provider != Provider::Gemini => {
+                    std::env::var("GEMINI_API_KEY")
+                        .or_else(|_| std::env::var("GOOGLE_API_KEY"))
                         .or_else(|_| std::env::var("OPENAI_API_KEY"))
                         .unwrap_or_else(|_| self.api_key.clone())
                 }
@@ -746,6 +789,7 @@ impl Config {
                     "anthropic" => Some(Provider::Anthropic),
                     "openai" => Some(Provider::OpenAI),
                     "ollama" => Some(Provider::Ollama),
+                    "gemini" => Some(Provider::Gemini),
                     _ => None,
                 };
                 if let Some(provider) = provider {
@@ -842,7 +886,11 @@ impl Config {
             }
             if self.providers.is_empty() {
                 let provider = prov_name.to_ascii_lowercase();
-                if provider == "openai" || provider == "anthropic" || provider == "ollama" {
+                if provider == "openai"
+                    || provider == "anthropic"
+                    || provider == "ollama"
+                    || provider == "gemini"
+                {
                     return format!("{provider}/{model_id}");
                 }
             }
@@ -894,11 +942,15 @@ impl Config {
         if let Some((prov_name, model_id)) = trimmed.split_once('/') {
             if self.providers.is_empty() {
                 let provider = prov_name.to_ascii_lowercase();
-                if provider == "openai" || provider == "anthropic" || provider == "ollama" {
+                if provider == "openai"
+                    || provider == "anthropic"
+                    || provider == "ollama"
+                    || provider == "gemini"
+                {
                     return Ok(format!("{provider}/{model_id}"));
                 }
                 return Err(format!(
-                    "Unknown provider '{prov_name}'. Use 'openai', 'anthropic', or 'ollama'."
+                    "Unknown provider '{prov_name}'. Use 'openai', 'anthropic', 'ollama', or 'gemini'."
                 ));
             }
             let Some(pc) = self.providers.get(prov_name) else {

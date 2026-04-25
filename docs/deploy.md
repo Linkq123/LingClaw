@@ -333,6 +333,34 @@ volumes:
 }
 ```
 
+### 3.6 使用 Gemini
+
+在 `lingclaw.json` 中配置 Gemini provider：
+
+```json
+{
+  "models": {
+    "providers": {
+      "gemini": {
+        "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+        "apiKey": "AIza-xxx",
+        "api": "gemini",
+        "models": [{ "id": "gemini-2.5-flash", "input": ["text", "image"] }]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "gemini/gemini-2.5-flash"
+      }
+    }
+  }
+}
+```
+
+也可以用环境变量快速启动：`GEMINI_API_KEY=AIza-xxx LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash lingclaw`。Gemini 图片输入使用本地预取后的 `inlineData`，因此与 Ollama 一样可以配合私网或 localhost 的 S3-compatible 图片网关。
+
 ---
 
 ## 配置参考
@@ -344,9 +372,9 @@ volumes:
 | JSON 字段 | 默认值 | 说明 | 环境变量覆盖 |
 |-----------|--------|------|--------------|
 | `port` | `18989` | HTTP 监听端口 | `LINGCLAW_PORT` |
-| `provider` | `"auto"` | 遗留兼容字段；仅在未使用 `models.providers` 时用于强制指定 `openai` / `anthropic` / `ollama` / `auto` | `LINGCLAW_PROVIDER` |
-| `apiKey` | — | 遗留兼容字段；新配置应优先写入 `models.providers.*.apiKey` | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `OLLAMA_API_KEY` |
-| `apiBase` | 按 provider 默认 | 遗留兼容字段；新配置应优先写入 `models.providers.*.baseUrl` | `OPENAI_API_BASE` / `OLLAMA_API_BASE` |
+| `provider` | `"auto"` | 遗留兼容字段；仅在未使用 `models.providers` 时用于强制指定 `openai` / `anthropic` / `ollama` / `gemini` / `auto` | `LINGCLAW_PROVIDER` |
+| `apiKey` | — | 遗留兼容字段；新配置应优先写入 `models.providers.*.apiKey` | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `OLLAMA_API_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` |
+| `apiBase` | 按 provider 默认 | 遗留兼容字段；新配置应优先写入 `models.providers.*.baseUrl` | `OPENAI_API_BASE` / `OLLAMA_API_BASE` / `GEMINI_API_BASE` |
 | `execTimeout` | `30` | Shell 命令超时（秒） | `LINGCLAW_EXEC_TIMEOUT` |
 | `toolTimeout` | `30` | 非 shell 的 Act 阶段工具预算；MCP 默认也继承这个超时 | `LINGCLAW_TOOL_TIMEOUT` |
 | `subAgentTimeout` | `300` | 子代理总执行超时（秒，`0` 表示不限时） | `LINGCLAW_SUB_AGENT_TIMEOUT` |
@@ -378,7 +406,7 @@ volumes:
 - `mcpServers` 是顶层对象，每个 server 可配置 `command`、`args`、`env`、`cwd`、`timeoutSecs`
 - `mcpServers.*.cwd` 必须位于当前主会话工作区 `~/.lingclaw/main/workspace/` 内，否则会被拒绝启动
 - `mcpServers.*.timeoutSecs` 未设置时继承 `toolTimeout`
-- 顶层 `s3` 用于本地 JPEG/PNG 上传；OpenAI/Anthropic 需要可被远端 provider 访问的现签 URL，私网 endpoint 仅推荐配合 Ollama 使用
+- 顶层 `s3` 用于本地 JPEG/PNG 上传；OpenAI/Anthropic 需要可被远端 provider 访问的现签 URL，私网 endpoint 推荐配合 Gemini/Ollama 使用
 
 ## 文件结构
 

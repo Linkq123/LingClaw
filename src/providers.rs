@@ -195,6 +195,65 @@ struct AnthropicContentBlock {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+//  Gemini Stream Models
+// ══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct GeminiGenerateResponse {
+    candidates: Option<Vec<GeminiCandidate>>,
+    usage_metadata: Option<GeminiUsage>,
+    prompt_feedback: Option<GeminiPromptFeedback>,
+    error: Option<GeminiApiError>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct GeminiCandidate {
+    content: Option<GeminiContent>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct GeminiContent {
+    parts: Option<Vec<GeminiPart>>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct GeminiPart {
+    text: Option<String>,
+    function_call: Option<GeminiFunctionCall>,
+}
+
+#[derive(Deserialize, Debug)]
+struct GeminiFunctionCall {
+    name: Option<String>,
+    args: Option<Value>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct GeminiUsage {
+    prompt_token_count: Option<u64>,
+    candidates_token_count: Option<u64>,
+    thoughts_token_count: Option<u64>,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct GeminiPromptFeedback {
+    block_reason: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct GeminiApiError {
+    code: Option<u16>,
+    message: Option<String>,
+    status: Option<String>,
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 //  Message Conversion
 // ══════════════════════════════════════════════════════════════════════════════
 
@@ -431,12 +490,13 @@ async fn fetch_image_base64_for_message(
 /// Falls back to a network fetch for legacy messages that lack cached data.
 /// Trusted local uploads identified by `s3_object_key` bypass SSRF checks after
 /// `materialize_image_urls()` regenerates their presigned URL from the object key.
-/// Individual image fetch failures are logged as warnings and skipped;
-/// only client construction failure returns `Err`.
+/// Individual image fetch failures are logged as warnings and skipped unless
+/// `strict_missing` is set; only client construction failure always returns `Err`.
 async fn fetch_images_base64(
     messages: &[ChatMessage],
     workspace: &Path,
     s3_cfg: Option<&crate::config::S3Config>,
+    strict_missing: bool,
 ) -> Result<HashMap<String, String>, String> {
     let mut map = HashMap::new();
     // Build the safe HTTP client once for the entire batch (legacy fallback path).
@@ -478,6 +538,12 @@ async fn fetch_images_base64(
                         match fetch_image_base64_for_message(img, http, s3_cfg).await {
                             Ok(cached) => Some(cached),
                             Err(err) => {
+                                if strict_missing {
+                                    return Err(format!(
+                                        "Failed to fetch image {} for model request: {}",
+                                        img.url, err
+                                    ));
+                                }
                                 eprintln!(
                                     "Warning: skipping uncached historical image {}: {}",
                                     img.url, err
@@ -500,6 +566,12 @@ async fn fetch_images_base64(
                     match fetch_image_base64_for_message(img, http, s3_cfg).await {
                         Ok(cached) => Some(cached),
                         Err(err) => {
+                            if strict_missing {
+                                return Err(format!(
+                                    "Failed to fetch image {} for model request: {}",
+                                    img.url, err
+                                ));
+                            }
                             eprintln!(
                                 "Warning: skipping uncached historical image {}: {}",
                                 img.url, err
@@ -758,12 +830,225 @@ fn convert_messages_to_ollama(
     out
 }
 
+fn gemini_image_mime_type(b64: &str) -> Option<&'static str> {
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .ok()
+        .and_then(|bytes| image_uploads::detect_image_upload_content_type(&bytes))
+}
+
+fn parse_function_args_object(args: &str) -> serde_json::Map<String, Value> {
+    serde_json::from_str::<Value>(args)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default()
+}
+
+fn convert_messages_to_gemini(
+    messages: &[ChatMessage],
+    images_b64: &HashMap<String, String>,
+) -> Result<(Option<serde_json::Value>, Vec<serde_json::Value>), String> {
+    let mut system_parts: Vec<Value> = Vec::new();
+    let mut contents: Vec<Value> = Vec::new();
+    let mut tool_names_by_id: HashMap<String, String> = HashMap::new();
+
+    for msg in messages {
+        match msg.role.as_str() {
+            "system" => {
+                if let Some(content) = msg.content.as_deref()
+                    && !content.is_empty()
+                {
+                    system_parts.push(json!({ "text": content }));
+                }
+            }
+            "user" => {
+                let mut parts = Vec::new();
+                let text = msg.content.as_deref().unwrap_or("");
+                if !text.is_empty() {
+                    parts.push(json!({ "text": text }));
+                }
+                if let Some(images) = &msg.images {
+                    for image in images {
+                        if let Some(b64) = images_b64.get(&image.url) {
+                            let Some(mime_type) = gemini_image_mime_type(b64) else {
+                                return Err(format!(
+                                    "Gemini image data for {} is not a supported PNG/JPEG payload",
+                                    image.url
+                                ));
+                            };
+                            parts.push(json!({
+                                "inlineData": {
+                                    "mimeType": mime_type,
+                                    "data": b64,
+                                }
+                            }));
+                        }
+                    }
+                }
+                if parts.is_empty() {
+                    parts.push(json!({ "text": "" }));
+                }
+                contents.push(json!({ "role": "user", "parts": parts }));
+            }
+            "assistant" => {
+                let mut parts = Vec::new();
+                if let Some(content) = msg.content.as_deref()
+                    && !content.is_empty()
+                {
+                    parts.push(json!({ "text": content }));
+                }
+                if let Some(tool_calls) = &msg.tool_calls {
+                    for tool_call in tool_calls {
+                        if !tool_call.id.is_empty() {
+                            tool_names_by_id
+                                .insert(tool_call.id.clone(), tool_call.function.name.clone());
+                        }
+                        parts.push(json!({
+                            "functionCall": {
+                                "name": tool_call.function.name,
+                                "args": parse_function_args_object(&tool_call.function.arguments),
+                            }
+                        }));
+                    }
+                }
+                if parts.is_empty() {
+                    parts.push(json!({ "text": "" }));
+                }
+                contents.push(json!({ "role": "model", "parts": parts }));
+            }
+            "tool" => {
+                let tool_name = msg
+                    .tool_call_id
+                    .as_ref()
+                    .and_then(|id| tool_names_by_id.get(id))
+                    .cloned()
+                    .unwrap_or_else(|| "tool_result".to_string());
+                contents.push(json!({
+                    "role": "user",
+                    "parts": [{
+                        "functionResponse": {
+                            "name": tool_name,
+                            "response": { "content": msg.content.as_deref().unwrap_or("") }
+                        }
+                    }]
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    let system_instruction = if system_parts.is_empty() {
+        None
+    } else {
+        Some(json!({ "parts": system_parts }))
+    };
+    Ok((system_instruction, contents))
+}
+
+fn gemini_blocking_finish_reason(reason: &str) -> bool {
+    matches!(
+        reason.trim().to_ascii_uppercase().as_str(),
+        "SAFETY"
+            | "RECITATION"
+            | "LANGUAGE"
+            | "BLOCKLIST"
+            | "PROHIBITED_CONTENT"
+            | "SPII"
+            | "IMAGE_SAFETY"
+            | "MALFORMED_FUNCTION_CALL"
+    )
+}
+
+fn gemini_response_error(response: &GeminiGenerateResponse) -> Option<String> {
+    if let Some(error) = &response.error {
+        let mut details = Vec::new();
+        if let Some(code) = error.code {
+            details.push(format!("code {code}"));
+        }
+        if let Some(status) = error.status.as_deref().filter(|status| !status.is_empty()) {
+            details.push(status.to_string());
+        }
+        if let Some(message) = error
+            .message
+            .as_deref()
+            .filter(|message| !message.is_empty())
+        {
+            details.push(message.to_string());
+        }
+        let message = if details.is_empty() {
+            "unknown error".to_string()
+        } else {
+            details.join(": ")
+        };
+        return Some(format!("Gemini API error: {message}"));
+    }
+    if let Some(reason) = response
+        .prompt_feedback
+        .as_ref()
+        .and_then(|feedback| feedback.block_reason.as_deref())
+        .filter(|reason| !reason.is_empty())
+    {
+        return Some(format!("Gemini blocked the prompt: {reason}"));
+    }
+    response.candidates.as_deref().and_then(|candidates| {
+        candidates.iter().find_map(|candidate| {
+            let reason = candidate.finish_reason.as_deref()?;
+            gemini_blocking_finish_reason(reason)
+                .then(|| format!("Gemini stopped generation with finishReason: {reason}"))
+        })
+    })
+}
+
 fn with_optional_bearer_auth(request: RequestBuilder, api_key: &str) -> RequestBuilder {
     if api_key.is_empty() {
         request
     } else {
         request.bearer_auth(api_key)
     }
+}
+
+fn with_optional_gemini_auth(request: RequestBuilder, api_key: &str) -> RequestBuilder {
+    if api_key.is_empty() {
+        request
+    } else {
+        request.header("x-goog-api-key", api_key)
+    }
+}
+
+fn gemini_model_path(model_id: &str) -> String {
+    let trimmed = model_id.trim().trim_start_matches('/');
+    if trimmed.starts_with("models/") || trimmed.starts_with("publishers/") {
+        trimmed.to_string()
+    } else {
+        format!("models/{trimmed}")
+    }
+}
+
+fn gemini_generate_url(api_base: &str, model_id: &str, stream: bool) -> String {
+    let method = if stream {
+        "streamGenerateContent?alt=sse"
+    } else {
+        "generateContent"
+    };
+    format!(
+        "{}/{}:{}",
+        api_base.trim_end_matches('/'),
+        gemini_model_path(model_id),
+        method
+    )
+}
+
+fn gemini_usage_pair(usage: Option<&GeminiUsage>) -> (Option<u64>, Option<u64>) {
+    let Some(usage) = usage else {
+        return (None, None);
+    };
+    let output = match (usage.candidates_token_count, usage.thoughts_token_count) {
+        (Some(candidates), Some(thoughts)) => Some(candidates + thoughts),
+        (Some(candidates), None) => Some(candidates),
+        (None, Some(thoughts)) => Some(thoughts),
+        (None, None) => None,
+    };
+    (usage.prompt_token_count, output)
 }
 
 fn ollama_request_options(resolved: &ResolvedModel) -> serde_json::Value {
@@ -773,6 +1058,38 @@ fn ollama_request_options(resolved: &ResolvedModel) -> serde_json::Value {
         options.insert("num_predict".to_string(), json!(max_tokens));
     }
     serde_json::Value::Object(options)
+}
+
+async fn build_gemini_body(
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+    workspace: &Path,
+    s3_cfg: Option<&crate::config::S3Config>,
+    extra_tools: &[serde_json::Value],
+    include_builtin_tools: bool,
+) -> Result<serde_json::Value, String> {
+    let messages = materialize_image_urls(messages, s3_cfg)?;
+    let images_b64 = fetch_images_base64(&messages, workspace, s3_cfg, true).await?;
+    let (system_instruction, contents) = convert_messages_to_gemini(&messages, &images_b64)?;
+    let mut all_tools: Vec<serde_json::Value> = if include_builtin_tools {
+        serde_json::from_value(tools::tool_definitions_gemini()).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    all_tools.extend_from_slice(extra_tools);
+    let mut body = json!({
+        "contents": contents,
+    });
+    if let Some(system_instruction) = system_instruction {
+        body["systemInstruction"] = system_instruction;
+    }
+    if !all_tools.is_empty() {
+        body["tools"] = json!([{ "functionDeclarations": all_tools }]);
+    }
+    if let Some(max_tokens) = resolved.max_tokens {
+        body["generationConfig"] = json!({ "maxOutputTokens": max_tokens });
+    }
+    Ok(body)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -851,7 +1168,7 @@ pub(crate) async fn call_llm_simple_with_usage(
         Provider::Ollama => {
             let url = format!("{}/api/chat", resolved.api_base);
             let messages = materialize_image_urls(messages, s3_cfg)?;
-            let images_b64 = fetch_images_base64(&messages, workspace, s3_cfg).await?;
+            let images_b64 = fetch_images_base64(&messages, workspace, s3_cfg, false).await?;
             let api_messages = convert_messages_to_ollama(&messages, &images_b64);
             let mut body = json!({
                 "model": resolved.model_id,
@@ -871,6 +1188,37 @@ pub(crate) async fn call_llm_simple_with_usage(
                     .to_string(),
                 input_tokens: data["prompt_eval_count"].as_u64(),
                 output_tokens: data["eval_count"].as_u64(),
+            })
+        }
+        Provider::Gemini => {
+            let url = gemini_generate_url(&resolved.api_base, &resolved.model_id, false);
+            let body = build_gemini_body(resolved, messages, workspace, s3_cfg, &[], false).await?;
+            let resp = send_with_retry(http, max_retries, || {
+                with_optional_gemini_auth(http.post(&url), &resolved.api_key).json(&body)
+            })
+            .await?;
+            let data: GeminiGenerateResponse = resp.json().await.map_err(|e| e.to_string())?;
+            if let Some(error) = gemini_response_error(&data) {
+                return Err(error);
+            }
+            let content = data
+                .candidates
+                .as_deref()
+                .and_then(|candidates| candidates.first())
+                .and_then(|candidate| candidate.content.as_ref())
+                .and_then(|content| content.parts.as_ref())
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|part| part.text.as_deref())
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+            let (input_tokens, output_tokens) = gemini_usage_pair(data.usage_metadata.as_ref());
+            Ok(SimpleLlmResponse {
+                content,
+                input_tokens,
+                output_tokens,
             })
         }
     }
@@ -1033,6 +1381,19 @@ pub(crate) async fn call_llm_stream(
                 s3_cfg,
                 tx,
                 effective_level,
+                extra_tools,
+                max_retries,
+            )
+            .await
+        }
+        Provider::Gemini => {
+            call_llm_stream_gemini(
+                http,
+                resolved,
+                messages,
+                workspace,
+                s3_cfg,
+                tx,
                 extra_tools,
                 max_retries,
             )
@@ -1391,6 +1752,63 @@ async fn process_ollama_json_line(data: &str, tx: &LiveTx, state: &mut OpenAiStr
     chunk.done.unwrap_or(false)
 }
 
+async fn process_gemini_data_line(
+    data: &str,
+    tx: &LiveTx,
+    state: &mut OpenAiStreamState,
+) -> Result<(), String> {
+    let Ok(chunk) = serde_json::from_str::<GeminiGenerateResponse>(data) else {
+        return Ok(());
+    };
+
+    if let Some(error) = gemini_response_error(&chunk) {
+        return Err(error);
+    }
+
+    let (input_tokens, output_tokens) = gemini_usage_pair(chunk.usage_metadata.as_ref());
+    if let Some(value) = input_tokens {
+        state.input_tokens = Some(value);
+    }
+    if let Some(value) = output_tokens {
+        state.output_tokens = Some(value);
+    }
+
+    let Some(candidates) = chunk.candidates else {
+        return Ok(());
+    };
+    for candidate in candidates {
+        let Some(parts) = candidate.content.and_then(|content| content.parts) else {
+            continue;
+        };
+        for part in parts {
+            if let Some(text) = part.text
+                && !text.is_empty()
+            {
+                state.content_buf.push_str(&text);
+                if !state.client_gone
+                    && !live_send(tx, json!({"type":"delta","content":text})).await
+                {
+                    state.client_gone = true;
+                }
+            }
+            if let Some(function_call) = part.function_call {
+                let idx = state.tool_calls.len();
+                let arguments = function_call.args.unwrap_or_else(|| json!({}));
+                state.tool_calls.push(ToolCall {
+                    id: format!("gemini_call_{}", idx + 1),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: function_call.name.unwrap_or_default(),
+                        arguments: serde_json::to_string(&arguments)
+                            .unwrap_or_else(|_| "{}".to_string()),
+                    },
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 fn drain_sse_lines(partial_buf: &mut String, chunk: &str) -> Vec<String> {
     partial_buf.push_str(chunk);
     let mut lines: Vec<String> = partial_buf
@@ -1451,7 +1869,7 @@ async fn build_ollama_stream_body(
     extra_tools: &[serde_json::Value],
 ) -> Result<serde_json::Value, String> {
     let messages = materialize_image_urls(messages, s3_cfg)?;
-    let images_b64 = fetch_images_base64(&messages, workspace, s3_cfg).await?;
+    let images_b64 = fetch_images_base64(&messages, workspace, s3_cfg, false).await?;
     let api_messages = convert_messages_to_ollama(&messages, &images_b64);
     let mut all_tools: Vec<serde_json::Value> =
         serde_json::from_value(tools::tool_definitions_ollama()).unwrap_or_default();
@@ -1615,6 +2033,40 @@ where
 
     if !stream_done && !partial_buf.trim().is_empty() {
         let _ = process_ollama_json_line(partial_buf.trim(), tx, state).await;
+    }
+
+    Ok(())
+}
+
+async fn consume_gemini_stream<S, B>(
+    stream: &mut S,
+    tx: &LiveTx,
+    state: &mut OpenAiStreamState,
+) -> Result<(), String>
+where
+    S: Stream<Item = Result<B, reqwest::Error>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    let mut partial_buf = String::new();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("stream error: {error}"))?;
+        let lines = drain_sse_lines(&mut partial_buf, &String::from_utf8_lossy(chunk.as_ref()));
+
+        for line in lines {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with(':') {
+                continue;
+            }
+            if let Some(data) = line.strip_prefix("data: ") {
+                process_gemini_data_line(data.trim(), tx, state).await?;
+            }
+        }
+    }
+
+    let trailing = partial_buf.trim();
+    if let Some(data) = trailing.strip_prefix("data: ") {
+        process_gemini_data_line(data.trim(), tx, state).await?;
     }
 
     Ok(())
@@ -1860,6 +2312,50 @@ async fn call_llm_stream_ollama(
     if stream_state.reasoning_started && !stream_state.client_gone {
         stream_state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
     }
+    if stream_state.client_gone {
+        return Err("Client disconnected".into());
+    }
+
+    build_llm_response(
+        stream_state.content_buf,
+        stream_state.thinking_buf,
+        stream_state.tool_calls,
+        stream_state.input_tokens,
+        stream_state.output_tokens,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn call_llm_stream_gemini(
+    http: &Client,
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+    workspace: &Path,
+    s3_cfg: Option<&crate::config::S3Config>,
+    tx: &LiveTx,
+    extra_tools: &[serde_json::Value],
+    max_retries: usize,
+) -> Result<LlmResponse, String> {
+    let url = gemini_generate_url(&resolved.api_base, &resolved.model_id, true);
+    let body = build_gemini_body(resolved, messages, workspace, s3_cfg, extra_tools, true).await?;
+
+    let resp = send_with_retry(http, max_retries, || {
+        with_optional_gemini_auth(http.post(&url), &resolved.api_key).json(&body)
+    })
+    .await?;
+
+    let mut stream = resp.bytes_stream();
+    let mut stream_state = OpenAiStreamState {
+        content_buf: String::new(),
+        thinking_buf: String::new(),
+        tool_calls: Vec::new(),
+        input_tokens: None,
+        output_tokens: None,
+        client_gone: false,
+        reasoning_started: false,
+    };
+    consume_gemini_stream(&mut stream, tx, &mut stream_state).await?;
+
     if stream_state.client_gone {
         return Err("Client disconnected".into());
     }

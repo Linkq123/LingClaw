@@ -19,12 +19,12 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **单主会话**：运行时固定使用 `main`，不再创建、切换或删除其他会话
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
 - **文档化斜杠命令**：`/new`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/reflection`、`/help`
-- **三 Provider 模型路由**：OpenAI + Anthropic + Ollama，支持 `provider/model` 和纯 model ID
+- **四 Provider 模型路由**：OpenAI + Anthropic + Ollama + Gemini，支持 `provider/model` 和纯 model ID
 - **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
 - **持久化主会话**：固定保存 `main` 工作区和磁盘存档
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
-- **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、输入框上下键历史导航（最多 10 条）；Settings 页面（React 岛屿）支持在线编辑配置、Provider 连接测试、MCP Server 连接测试；Usage 页面（React 岛屿）显示 Token 用量统计、按 Model Role 拆分的明细卡片与 Canvas 图表
-- **图片附件**：支持通过 URL 或本地 JPEG/PNG 上传附加图片到用户消息；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；私网、localhost 或仅局域网可达的网关仅保证 Ollama 可用，因为 LingClaw 会本地预取为 base64 并持久化缓存到会话工作区；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
+- **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、主回复右下角显示本轮输入/输出 token、首 token 耗时和总输出耗时、输入框上下键历史导航（最多 10 条）；Settings 页面（React 岛屿）支持在线编辑配置、Provider 连接测试、MCP Server 连接测试；Usage 页面（React 岛屿）显示 Token 用量统计、按 Model Role 拆分的明细卡片与 Canvas 图表
+- **图片附件**：支持通过 URL 或本地 JPEG/PNG 上传附加图片到用户消息；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；Gemini/Ollama 会由 LingClaw 本地预取为 base64/inlineData 并持久化缓存到会话工作区，因此可配合私网、localhost 或仅局域网可达的网关使用；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
 - **Structured Memory（可选）**：启用 `structuredMemory` 后，Finish 阶段会异步抽取稳定偏好、项目上下文和长期事实，写入 workspace 下的 `structured_memory.json`，并记录 `structured_memory.audit.jsonl` 诊断轨迹；`/memory`、`/memory stats`、`/memory debug` 可查看状态与最近审计信息
@@ -89,11 +89,14 @@ ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
 
 # Ollama
 LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:11434 lingclaw
+
+# Gemini
+GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash lingclaw
 ```
 
 ## Configuration
 
-配置文件在 `~/.lingclaw/.lingclaw.json`，首次运行由设置向导自动写入；如需本地图片上传，可在向导里额外配置顶层 `s3`，也可以之后手动补充。若要配合 OpenAI/Anthropic 使用，`s3.endpoint` 对应的现签 URL 必须公网可达；私网或 localhost 网关仅推荐与 Ollama 搭配。
+配置文件在 `~/.lingclaw/.lingclaw.json`，首次运行由设置向导自动写入；如需本地图片上传，可在向导里额外配置顶层 `s3`，也可以之后手动补充。若要配合 OpenAI/Anthropic 使用，`s3.endpoint` 对应的现签 URL 必须公网可达；私网或 localhost 网关推荐与 Gemini/Ollama 搭配。
 
 ```json
 {
@@ -160,6 +163,22 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
             "compat": { "thinkingFormat": "ollama" }
           }
         ]
+      },
+      "gemini": {
+        "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+        "apiKey": "AIza-your-gemini-key",
+        "api": "gemini",
+        "models": [
+          {
+            "id": "gemini-2.5-flash",
+            "name": "gemini-2.5-flash",
+            "reasoning": false,
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 1048576,
+            "maxTokens": 8192
+          }
+        ]
       }
     }
   },
@@ -197,9 +216,9 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 - `dailyReflection` 默认为 `false`；启用后会在满足轮次和冷却条件时，于 Finish 后台生成 post-execution reflection，并追加到 `memory/YYYY-MM-DD.md`；若配置了 `agents.defaults.model.reflection` 或 `LINGCLAW_REFLECTION_MODEL`，reflection 优先使用该模型，否则回退到 memory 模型，再回退到当前会话有效模型
 - 顶层 `s3` 为可选项；配置后聊天页会额外启用本地 JPEG/PNG 上传，上传对象以 object key 持久化，历史回放和 provider 请求都会即时重新现签 URL
 - AWS S3 若使用官方 endpoint，建议使用与 `region` 对应的区域 host；设置向导留空 endpoint 时会自动默认到该区域地址
-- OpenAI/Anthropic 直接使用现签 URL，因此 `s3.endpoint` 必须能被远端 provider 访问；私网、localhost 或 VPN-only 网关仅保证 Ollama 可用，因为 Ollama 路径会在本地预取并转成 base64
+- OpenAI/Anthropic 直接使用现签 URL，因此 `s3.endpoint` 必须能被远端 provider 访问；Gemini/Ollama 路径会在本地预取并转成 base64/inlineData，可用于私网、localhost 或 VPN-only 网关
 - 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容，但 Setup Wizard 不再生成它们；新配置应省略这些字段
-- `models.providers.*.api` 目前支持 `openai-completions`、`anthropic`、`ollama`
+- `models.providers.*.api` 目前支持 `openai-completions`、`anthropic`、`ollama`、`gemini`
 - Ollama 的 thinking / tool calling 依赖模型能力，推荐优先使用 `qwen3`、`gpt-oss`、`deepseek-r1` 等官方支持模型，而不是把任意本地模型都视为支持深度思考和工具调用
 - 可选的 `mcpServers` 顶层对象可声明 MCP server，例如 `command`、`args`、`env`、`cwd`、`timeoutSecs`
 - `mcpServers.*.cwd` 必须落在当前 session workspace 内；未设置 `timeoutSecs` 时默认继承 `toolTimeout`
@@ -247,9 +266,11 @@ LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:1
 | `OPENAI_API_KEY` | provider 配置或空 | OpenAI API Key |
 | `ANTHROPIC_API_KEY` | provider 配置或 `OPENAI_API_KEY` | Anthropic API Key |
 | `OLLAMA_API_KEY` | provider 配置或空 | Ollama API Key，可留空用于本地实例 |
-| `LINGCLAW_PROVIDER` | 自动检测 | 强制指定 `openai`、`anthropic` 或 `ollama` |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | provider 配置或 `OPENAI_API_KEY` | Gemini API Key |
+| `LINGCLAW_PROVIDER` | 自动检测 | 强制指定 `openai`、`anthropic`、`ollama` 或 `gemini` |
 | `OPENAI_API_BASE` | `https://api.openai.com/v1` | 备用 API Base |
 | `OLLAMA_API_BASE` | `http://127.0.0.1:11434` | Ollama API Base |
+| `GEMINI_API_BASE` | `https://generativelanguage.googleapis.com/v1beta` | Gemini API Base |
 | `LINGCLAW_MODEL` | `gpt-4o-mini` | 默认模型 |
 | `LINGCLAW_PORT` | `18989` | HTTP 端口 |
 | `LINGCLAW_EXEC_TIMEOUT` | `30` | Shell 命令超时（秒） |
@@ -471,9 +492,9 @@ tools:
     │         │
 ┌───▼─────────▼────────────────────────────────────────────────────┐
 │                      Provider Layer                               │
-│   call_llm_stream() → OpenAI SSE / Anthropic SSE / Ollama NDJSON │
+│   call_llm_stream() → OpenAI SSE / Anthropic SSE / Ollama NDJSON / Gemini SSE │
 │   ResolvedModel · thinking/reasoning 参数映射                      │
-│   tool_definitions() · tool_definitions_anthropic() · tool_definitions_ollama() │
+│   tool_definitions_*() → OpenAI / Anthropic / Ollama / Gemini tool schemas │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -517,7 +538,7 @@ Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的
 
 **关键设计决策：**
 
-- **不回退到文本协议**：保留 OpenAI/Anthropic/Ollama 原生结构化 tool calling，不使用文本版 `Action: tool_name\nAction Input: {...}` 解析
+- **不回退到文本协议**：保留 OpenAI/Anthropic/Ollama/Gemini 原生结构化 tool calling，不使用文本版 `Action: tool_name\nAction Input: {...}` 解析
 - **不污染对话历史**：完整思维链仅在 `think` 工具内部或 provider reasoning stream 中存在，不写入主消息序列
 - **推理可见性已实现**：默认启用 `react_phase` WS 事件，前端会显示阶段切换；可通过 `/react off` 关闭；`done` 事件始终包含结构化 `reason` 字段
 - **provider 层感知状态**：`auto` 模式下 `auto_think_level()` 根据循环深度动态调整推理预算（首轮 medium / 有 observation 时 high / 深轮 low）
@@ -579,7 +600,7 @@ src/
 ├── cli.rs             (~2220 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
 ├── config.rs          (~840 行)  — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
 ├── context.rs         (~350 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
-├── providers.rs       (~1640 行) — OpenAI/Anthropic/Ollama 调用, 流式解析, 推理模式, prompt caching
+├── providers.rs       (~1900 行) — OpenAI/Anthropic/Ollama/Gemini 调用, 流式解析, 推理模式, prompt caching
 ├── prompts.rs         (~870 行)  — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
 ├── hooks.rs           (~660 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
 ├── memory.rs          (~970 行)  — structured_memory.json 读写, MemoryUpdateQueue, prompt 注入, /memory 状态
@@ -649,7 +670,7 @@ src/tests/                      — 模块测试文件 (~13600 行)
 ### 核心数据结构
 
 ```rust
-enum Provider { OpenAI, Anthropic, Ollama }
+enum Provider { OpenAI, Anthropic, Ollama, Gemini }
 
 struct Config {
     api_key, api_base, model, provider,
@@ -703,7 +724,7 @@ enum AgentPhase {
 
 ### Provider 层
 
-三 Provider 支持，统一的调用接口：
+四 Provider 支持，统一的调用接口：
 
 ```text
 call_llm_stream(http, resolved, messages, tx, think_level, extra_tools)
@@ -728,6 +749,13 @@ call_llm_stream(http, resolved, messages, tx, think_level, extra_tools)
             ├─ tool_definitions_ollama()
             ├─ think_level → think 映射
             └─ NDJSON 流解析 → WebSocket 转发
+
+        └─ resolved.provider == Gemini
+          └─ call_llm_stream_gemini()
+            ├─ convert_messages_to_gemini()
+            ├─ tool_definitions_gemini()
+            ├─ 图片 inlineData(base64)
+            └─ SSE 流解析 → WebSocket 转发
 ```
 
 think_level 映射：

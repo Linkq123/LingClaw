@@ -107,7 +107,7 @@ const REQUEST_STRUCTURAL_OVERHEAD_TOKENS: usize = 256;
 pub(crate) fn message_token_len_for_provider(provider: Provider, message: &ChatMessage) -> usize {
     let base = message_token_len(message);
     match provider {
-        Provider::OpenAI | Provider::Ollama => {
+        Provider::OpenAI | Provider::Ollama | Provider::Gemini => {
             let tool_call_overhead = message
                 .tool_calls
                 .as_ref()
@@ -148,7 +148,7 @@ pub(crate) fn context_input_budget_for_model(config: &Config, model_ref: &str) -
     let ctx_limit = config.context_limit_for_model(model_ref);
     let resolved = config.resolve_model(model_ref);
     let provider_floor = match resolved.provider {
-        Provider::OpenAI | Provider::Ollama => OPENAI_MIN_REPLY_RESERVE_TOKENS,
+        Provider::OpenAI | Provider::Ollama | Provider::Gemini => OPENAI_MIN_REPLY_RESERVE_TOKENS,
         Provider::Anthropic => ANTHROPIC_MIN_REPLY_RESERVE_TOKENS,
     };
     let ratio_reserve = ctx_limit / CONTEXT_REPLY_RESERVE_RATIO_DIVISOR;
@@ -170,7 +170,7 @@ pub(crate) fn context_input_budget_for_runtime(
     let ctx_limit = config.context_limit_for_model(model_ref);
     let resolved = config.resolve_model(model_ref);
     let provider_floor = match resolved.provider {
-        Provider::OpenAI | Provider::Ollama => OPENAI_MIN_REPLY_RESERVE_TOKENS,
+        Provider::OpenAI | Provider::Ollama | Provider::Gemini => OPENAI_MIN_REPLY_RESERVE_TOKENS,
         Provider::Anthropic => ANTHROPIC_MIN_REPLY_RESERVE_TOKENS,
     };
     let ratio_reserve = ctx_limit / CONTEXT_REPLY_RESERVE_RATIO_DIVISOR;
@@ -202,6 +202,9 @@ fn builtin_tool_definitions_for_provider(provider: Provider) -> Vec<serde_json::
         }
         Provider::Ollama => {
             serde_json::from_value(crate::tools::tool_definitions_ollama()).unwrap_or_default()
+        }
+        Provider::Gemini => {
+            serde_json::from_value(crate::tools::tool_definitions_gemini()).unwrap_or_default()
         }
         Provider::Anthropic => {
             serde_json::from_value(crate::tools::tool_definitions_anthropic()).unwrap_or_default()

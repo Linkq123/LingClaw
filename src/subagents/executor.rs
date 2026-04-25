@@ -1008,6 +1008,13 @@ fn build_filtered_tool_defs(
                     "input_schema": (spec.parameters)(),
                 })
             }
+            crate::config::Provider::Gemini => {
+                json!({
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": crate::tools::gemini_tool_parameters((spec.parameters)()),
+                })
+            }
         })
         .collect();
 
@@ -1033,6 +1040,13 @@ fn build_filtered_tool_defs(
                     "name": descriptor.exposed_name,
                     "description": descriptor.description,
                     "input_schema": descriptor.input_schema,
+                })
+            }
+            crate::config::Provider::Gemini => {
+                json!({
+                    "name": descriptor.exposed_name,
+                    "description": descriptor.description,
+                    "parameters": crate::tools::gemini_tool_parameters(descriptor.input_schema),
                 })
             }
         };

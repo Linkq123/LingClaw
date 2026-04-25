@@ -135,6 +135,33 @@ pub(crate) fn cached_tool_definitions_ollama(config: &Config, workspace: &Path) 
     cached_tool_definitions_openai(config, workspace)
 }
 
+pub(crate) async fn tool_definitions_gemini(config: &Config, workspace: &Path) -> Vec<Value> {
+    list_tools(config, workspace)
+        .await
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.exposed_name,
+                "description": tool.description,
+                "parameters": super::gemini_tool_parameters(tool.input_schema),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn cached_tool_definitions_gemini(config: &Config, workspace: &Path) -> Vec<Value> {
+    cached_list_tools(config, workspace)
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.exposed_name,
+                "description": tool.description,
+                "parameters": super::gemini_tool_parameters(tool.input_schema),
+            })
+        })
+        .collect()
+}
+
 pub(crate) async fn tool_definitions_anthropic(config: &Config, workspace: &Path) -> Vec<Value> {
     list_tools(config, workspace)
         .await

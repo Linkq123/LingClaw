@@ -713,6 +713,7 @@ pub(crate) async fn build_runtime_tools(
             Provider::Anthropic => tools::task_tool_definition_anthropic(&agent_names),
             Provider::OpenAI => tools::task_tool_definition_openai(&agent_names),
             Provider::Ollama => tools::task_tool_definition_ollama(&agent_names),
+            Provider::Gemini => tools::task_tool_definition_gemini(&agent_names),
         };
         extra_tools.push(task_def);
 
@@ -720,6 +721,7 @@ pub(crate) async fn build_runtime_tools(
             Provider::Anthropic => tools::orchestrate_tool_definition_anthropic(&agent_names),
             Provider::OpenAI => tools::orchestrate_tool_definition_openai(&agent_names),
             Provider::Ollama => tools::orchestrate_tool_definition_ollama(&agent_names),
+            Provider::Gemini => tools::orchestrate_tool_definition_gemini(&agent_names),
         };
         extra_tools.push(orchestrate_def);
     }
@@ -728,6 +730,7 @@ pub(crate) async fn build_runtime_tools(
         Provider::Anthropic => tools::mcp::tool_definitions_anthropic(config, workspace).await,
         Provider::OpenAI => tools::mcp::tool_definitions_openai(config, workspace).await,
         Provider::Ollama => tools::mcp::tool_definitions_ollama(config, workspace).await,
+        Provider::Gemini => tools::mcp::tool_definitions_gemini(config, workspace).await,
     };
     extra_tools.append(&mut mcp_tools);
     extra_tools

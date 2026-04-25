@@ -235,6 +235,49 @@ fn model_supports_image_prefers_runtime_aligned_provider_for_plain_ids() {
 }
 
 #[test]
+fn gemini_is_supported_as_builtin_provider() {
+    assert_eq!(Provider::from_api_kind("gemini"), Provider::Gemini);
+    assert_eq!(
+        Provider::Gemini.default_api_base(),
+        "https://generativelanguage.googleapis.com/v1beta"
+    );
+    assert_eq!(Provider::Gemini.api_key_env_var(), Some("GEMINI_API_KEY"));
+    assert_eq!(
+        Provider::Gemini.api_key_env_hint(),
+        Some("GEMINI_API_KEY or GOOGLE_API_KEY")
+    );
+    assert_eq!(
+        Provider::detect("gemini-2.5-flash", "", None),
+        Provider::Gemini
+    );
+    assert!(is_builtin_provider_name("gemini"));
+    assert!(validate_provider_api_kind("gemini").is_ok());
+}
+
+#[test]
+fn empty_provider_config_accepts_gemini_model_prefix() {
+    let config = runtime_alignment_config(
+        Provider::Gemini,
+        Provider::Gemini.default_api_base(),
+        "gemini-key",
+        "gemini/gemini-2.5-flash",
+        HashMap::new(),
+    );
+
+    assert_eq!(
+        config
+            .canonical_model_ref("gemini/gemini-2.5-flash")
+            .unwrap(),
+        "gemini/gemini-2.5-flash"
+    );
+    assert_eq!(
+        config.resolve_model("gemini/gemini-2.5-flash").provider,
+        Provider::Gemini
+    );
+    assert_eq!(config.resolve_provider_name("gemini-2.5-flash"), "gemini");
+}
+
+#[test]
 fn validate_json_provider_names_rejects_invalid_provider_keys() {
     let mut providers = HashMap::new();
     providers.insert(

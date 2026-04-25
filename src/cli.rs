@@ -2302,6 +2302,7 @@ enum WizardProviderKind {
     OpenAI,
     Anthropic,
     Ollama,
+    Gemini,
 }
 
 impl WizardProviderKind {
@@ -2310,6 +2311,7 @@ impl WizardProviderKind {
             0 => Some(Self::OpenAI),
             1 => Some(Self::Anthropic),
             2 => Some(Self::Ollama),
+            3 => Some(Self::Gemini),
             _ => None,
         }
     }
@@ -2319,6 +2321,7 @@ impl WizardProviderKind {
             Self::OpenAI => "openai-completions",
             Self::Anthropic => "anthropic",
             Self::Ollama => "ollama",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -2327,6 +2330,7 @@ impl WizardProviderKind {
             Self::OpenAI => "https://api.openai.com/v1",
             Self::Anthropic => "https://api.anthropic.com",
             Self::Ollama => "http://127.0.0.1:11434",
+            Self::Gemini => "https://generativelanguage.googleapis.com/v1beta",
         }
     }
 
@@ -2335,6 +2339,7 @@ impl WizardProviderKind {
             Self::OpenAI => "openai",
             Self::Anthropic => "anthropic",
             Self::Ollama => "ollama",
+            Self::Gemini => "gemini",
         }
     }
 
@@ -2343,6 +2348,7 @@ impl WizardProviderKind {
             Self::OpenAI => "gpt-4o-mini",
             Self::Anthropic => "claude-sonnet-4-20250514",
             Self::Ollama => "qwen3",
+            Self::Gemini => "gemini-2.5-flash",
         }
     }
 
@@ -2350,13 +2356,13 @@ impl WizardProviderKind {
         match self {
             Self::OpenAI => Some("gpt-4o-mini"),
             Self::Anthropic => Some("claude-haiku-3-20250306"),
-            Self::Ollama => None,
+            Self::Ollama | Self::Gemini => None,
         }
     }
 
     fn api_key_prompt(self) -> &'static str {
         match self {
-            Self::OpenAI | Self::Anthropic => "  API Key: ",
+            Self::OpenAI | Self::Anthropic | Self::Gemini => "  API Key: ",
             Self::Ollama => "  API Key (optional, leave empty for local Ollama): ",
         }
     }
@@ -2494,6 +2500,7 @@ fn wizard_suggested_fast_model(
     let kind = match api_kind {
         "anthropic" => WizardProviderKind::Anthropic,
         "ollama" => WizardProviderKind::Ollama,
+        "gemini" => WizardProviderKind::Gemini,
         _ => WizardProviderKind::OpenAI,
     };
     if let Some(fast_model_id) = kind.preferred_fast_model_id()
@@ -2580,6 +2587,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
                 "OpenAI-compatible",
                 "Anthropic-compatible",
                 "Ollama",
+                "Gemini",
                 "Skip for now",
             ])
         } else {
@@ -2587,6 +2595,7 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
                 "OpenAI-compatible",
                 "Anthropic-compatible",
                 "Ollama",
+                "Gemini",
                 "Done adding providers",
             ])
         };
