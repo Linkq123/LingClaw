@@ -117,7 +117,10 @@ import {
   prefetchPageChunks,
 } from './pages/lazy.js';
 import { closeOverlayById } from './pages/overlay.js';
-import { buildHistoryReasoningPanel } from './renderers/reasoning.js';
+import {
+  buildHistoryReasoningPanel,
+  finalizeOrDiscardLiveReasoningPanel,
+} from './renderers/reasoning.js';
 
 // ── Initialize DOM ──
 initDomRefs();
@@ -522,7 +525,19 @@ function handleMessage(data) {
 
     case 'done': {
       const finishedAssistantMsg = finishAssistantStream({ discardIfEmpty: true });
+      const activeReasoningPanel = state.reasoningPanel;
       finishReasoningStream();
+      if (activeReasoningPanel) {
+        activeReasoningPanel.classList.remove('reasoning-active');
+        const body = activeReasoningPanel.querySelector('.reasoning-body') as Element | null;
+        const chevron = activeReasoningPanel.querySelector('.chevron') as Element | null;
+        if (finalizeOrDiscardLiveReasoningPanel(activeReasoningPanel)) {
+          setTimeout(() => {
+            if (body) animateCollapsibleSection(body, false);
+            if (chevron) chevron.classList.remove('open');
+          }, 600);
+        }
+      }
       requestClearReactStatus();
       state.reasoningPanel = null;
       if (data.daily_input_tokens != null) {
@@ -636,18 +651,13 @@ function handleMessage(data) {
       }
       if (state.reasoningPanel) {
         finishReasoningStream();
-        state.reasoningPanel.classList.remove('reasoning-active');
-        const status = state.reasoningPanel.querySelector<HTMLElement>('.reasoning-status');
-        const body = state.reasoningPanel.querySelector<HTMLElement>('.reasoning-body');
-        const chevron = state.reasoningPanel.querySelector<HTMLElement>('.chevron');
-        const rawText = body?._textNode?.nodeValue || body?.textContent || '';
-        const summaryText = rawText.trim().replace(/\n+/g, ' ');
-        const preview = summaryText.substring(0, 60);
-        if (status) {
-          status.textContent = preview
-            ? preview + (summaryText.length > 60 ? '\u2026' : '')
-            : '\u5b8c\u6210';
-          status.title = summaryText || '\u5b8c\u6210';
+        const reasoningPanel = state.reasoningPanel;
+        reasoningPanel.classList.remove('reasoning-active');
+        const body = reasoningPanel.querySelector('.reasoning-body') as Element | null;
+        const chevron = reasoningPanel.querySelector('.chevron') as Element | null;
+        if (!finalizeOrDiscardLiveReasoningPanel(reasoningPanel)) {
+          state.reasoningPanel = null;
+          break;
         }
         setTimeout(() => {
           if (body) animateCollapsibleSection(body, false);

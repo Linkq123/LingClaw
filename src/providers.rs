@@ -260,9 +260,36 @@ struct GeminiApiError {
 //  Message Conversion
 // ══════════════════════════════════════════════════════════════════════════════
 
+fn is_official_openai_api_base(api_base: &str) -> bool {
+    reqwest::Url::parse(api_base)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.eq_ignore_ascii_case("api.openai.com"))
+        })
+        .unwrap_or(false)
+}
+
+fn openai_prefers_null_tool_call_content_with_opt_in(
+    api_base: &str,
+    explicit_opt_in: bool,
+) -> bool {
+    is_official_openai_api_base(api_base) || explicit_opt_in
+}
+
+fn openai_prefers_null_tool_call_content(resolved: &ResolvedModel) -> bool {
+    openai_prefers_null_tool_call_content_with_opt_in(
+        &resolved.api_base,
+        crate::config::parse_boolish_env("LINGCLAW_OPENAI_NULL_TOOL_CALL_CONTENT") == Some(true),
+    )
+}
+
 /// Convert internal messages to clean OpenAI API format (strips timestamps and
 /// extra fields so the provider receives only role/content/tool_calls/tool_call_id).
-fn convert_messages_to_openai(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+fn convert_messages_to_openai_with_options(
+    messages: &[ChatMessage],
+    null_tool_call_content: bool,
+) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
 
     for msg in messages {
@@ -298,8 +325,13 @@ fn convert_messages_to_openai(messages: &[ChatMessage]) -> Vec<serde_json::Value
             "assistant" => {
                 let mut item = json!({
                     "role": "assistant",
-                    "content": msg.content.as_deref().unwrap_or(""),
                 });
+                let assistant_text = msg.content.as_deref().filter(|content| !content.is_empty());
+                if null_tool_call_content && msg.tool_calls.is_some() && assistant_text.is_none() {
+                    item["content"] = Value::Null;
+                } else {
+                    item["content"] = json!(assistant_text.unwrap_or(""));
+                }
                 if let Some(tool_calls) = &msg.tool_calls {
                     item["tool_calls"] = json!(
                         tool_calls
@@ -1198,6 +1230,26 @@ fn ollama_request_options(resolved: &ResolvedModel) -> serde_json::Value {
     serde_json::Value::Object(options)
 }
 
+fn build_openai_simple_body(
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+    s3_cfg: Option<&crate::config::S3Config>,
+) -> Result<serde_json::Value, String> {
+    let messages = materialize_image_urls(messages, s3_cfg)?;
+    let api_messages = convert_messages_to_openai_with_options(
+        &messages,
+        openai_prefers_null_tool_call_content(resolved),
+    );
+    let mut body = json!({
+        "model": resolved.model_id,
+        "messages": api_messages,
+    });
+    if let Some(mt) = resolved.max_tokens {
+        body["max_tokens"] = json!(mt);
+    }
+    Ok(body)
+}
+
 async fn build_gemini_body(
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
@@ -1260,15 +1312,7 @@ pub(crate) async fn call_llm_simple_with_usage(
     match resolved.provider {
         Provider::OpenAI => {
             let url = format!("{}/chat/completions", resolved.api_base);
-            let messages = materialize_image_urls(messages, s3_cfg)?;
-            let api_messages = convert_messages_to_openai(&messages);
-            let mut body = json!({
-                "model": resolved.model_id,
-                "messages": api_messages,
-            });
-            if let Some(mt) = resolved.max_tokens {
-                body["max_tokens"] = json!(mt);
-            }
+            let body = build_openai_simple_body(resolved, messages, s3_cfg)?;
             let resp = send_with_retry(http, max_retries, || {
                 http.post(&url).bearer_auth(&resolved.api_key).json(&body)
             })
@@ -2045,7 +2089,10 @@ fn build_openai_stream_body(
 ) -> Result<serde_json::Value, String> {
     let thinking_on = think_level != "off";
     let messages = materialize_image_urls(messages, s3_cfg)?;
-    let api_messages = convert_messages_to_openai(&messages);
+    let api_messages = convert_messages_to_openai_with_options(
+        &messages,
+        openai_prefers_null_tool_call_content(resolved),
+    );
     let mut all_tools: Vec<serde_json::Value> =
         serde_json::from_value(tools::tool_definitions()).unwrap_or_default();
     all_tools.extend_from_slice(extra_tools);
@@ -2056,7 +2103,7 @@ fn build_openai_stream_body(
         "stream": true,
     });
     if resolved.provider == Provider::OpenAI
-        && (resolved.api_base.contains("api.openai.com") || resolved.stream_include_usage)
+        && (is_official_openai_api_base(&resolved.api_base) || resolved.stream_include_usage)
     {
         body["stream_options"] = json!({ "include_usage": true });
     }

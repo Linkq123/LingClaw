@@ -3,6 +3,52 @@
  * This is the history-replay path — not the live streaming path
  * (which is handled incrementally in handlers/stream.ts via flushReasoningText).
  */
+import { removeTimelinePanel } from './timeline.js';
+
+export function summarizeReasoningText(thinking: string) {
+  const summaryText = String(thinking ?? '')
+    .trim()
+    .replace(/\n+/g, ' ');
+  const preview = summaryText.substring(0, 60);
+
+  return {
+    hasContent: summaryText.length > 0,
+    previewText: preview ? preview + (summaryText.length > 60 ? '…' : '') : '完成',
+    titleText: summaryText || '完成',
+  };
+}
+
+export function finalizeLiveReasoningPanel(panel: HTMLElement): boolean {
+  const statusEl = panel.querySelector('.reasoning-status') as Element | null;
+  const body = panel.querySelector('.reasoning-body') as
+    | (Element & {
+        _textNode?: Text | null;
+      })
+    | null;
+  const rawText = body?._textNode?.nodeValue || body?.textContent || '';
+  const summary = summarizeReasoningText(rawText);
+
+  if (!summary.hasContent) {
+    return false;
+  }
+
+  if (statusEl) {
+    statusEl.textContent = summary.previewText;
+    statusEl.title = summary.titleText;
+  }
+
+  return true;
+}
+
+export function finalizeOrDiscardLiveReasoningPanel(panel: HTMLElement): boolean {
+  if (!finalizeLiveReasoningPanel(panel)) {
+    removeTimelinePanel(panel);
+    return false;
+  }
+
+  return true;
+}
+
 export function buildHistoryReasoningPanel(thinking: string): HTMLElement {
   const panel = document.createElement('div');
   panel.className = 'reasoning-panel';
@@ -17,14 +63,11 @@ export function buildHistoryReasoningPanel(thinking: string): HTMLElement {
     <span class="chevron">\u25b8</span>
   `;
 
-  const statusEl = header.querySelector<HTMLElement>('.reasoning-status');
+  const statusEl = header.querySelector('.reasoning-status') as Element | null;
+  const summary = summarizeReasoningText(thinking);
   if (statusEl) {
-    const summaryText = thinking.trim().replace(/\n+/g, ' ');
-    const preview = summaryText.substring(0, 60);
-    statusEl.textContent = preview
-      ? preview + (summaryText.length > 60 ? '\u2026' : '')
-      : '\u5b8c\u6210';
-    statusEl.title = summaryText || '\u5b8c\u6210';
+    statusEl.textContent = summary.previewText;
+    statusEl.title = summary.titleText;
   }
 
   const body = document.createElement('div');

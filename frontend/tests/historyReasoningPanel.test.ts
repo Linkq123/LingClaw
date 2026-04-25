@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { buildHistoryReasoningPanel } from '../src/renderers/reasoning.js';
+import {
+  buildHistoryReasoningPanel,
+  finalizeOrDiscardLiveReasoningPanel,
+  finalizeLiveReasoningPanel,
+  summarizeReasoningText,
+} from '../src/renderers/reasoning.js';
+import { wrapInTimeline } from '../src/renderers/timeline.js';
 
 describe('buildHistoryReasoningPanel', () => {
   it('sets body.textContent to the full thinking text', () => {
@@ -56,6 +62,88 @@ describe('buildHistoryReasoningPanel', () => {
     const statusEl = panel.querySelector<HTMLElement>('.reasoning-status');
     expect(statusEl?.title).toBe('\u5b8c\u6210');
     expect(statusEl?.textContent).toBe('\u5b8c\u6210');
+  });
+
+  it('marks whitespace-only reasoning as empty summary content', () => {
+    const summary = summarizeReasoningText('   \n  ');
+    expect(summary.hasContent).toBe(false);
+    expect(summary.previewText).toBe('\u5b8c\u6210');
+    expect(summary.titleText).toBe('\u5b8c\u6210');
+  });
+
+  it('drops live reasoning panels that only contain whitespace', () => {
+    const panel = document.createElement('div');
+    panel.innerHTML = `
+      <div class="reasoning-header">
+        <span class="reasoning-status">推理中</span>
+      </div>
+      <div class="reasoning-body"></div>
+    `;
+
+    const body = panel.querySelector('.reasoning-body') as HTMLElement & { _textNode?: Text };
+    body._textNode = document.createTextNode('   \n  ');
+    body.appendChild(body._textNode);
+
+    expect(finalizeLiveReasoningPanel(panel)).toBe(false);
+  });
+
+  it('removes the timeline wrapper when discarding an empty live reasoning panel', () => {
+    const panel = document.createElement('div');
+    panel.innerHTML = `
+      <div class="reasoning-header">
+        <span class="reasoning-status">推理中</span>
+      </div>
+      <div class="reasoning-body"></div>
+    `;
+
+    const body = panel.querySelector('.reasoning-body') as HTMLElement & { _textNode?: Text };
+    body._textNode = document.createTextNode('   \n  ');
+    body.appendChild(body._textNode);
+
+    const wrapper = wrapInTimeline(panel, 'reasoning');
+    document.body.appendChild(wrapper);
+
+    expect(finalizeOrDiscardLiveReasoningPanel(panel)).toBe(false);
+    expect(wrapper.isConnected).toBe(false);
+  });
+
+  it('keeps live reasoning panels with real content and updates their summary', () => {
+    const panel = document.createElement('div');
+    panel.innerHTML = `
+      <div class="reasoning-header">
+        <span class="reasoning-status">推理中</span>
+      </div>
+      <div class="reasoning-body"></div>
+    `;
+
+    const body = panel.querySelector('.reasoning-body') as HTMLElement & { _textNode?: Text };
+    const statusEl = panel.querySelector('.reasoning-status') as HTMLElement;
+    body._textNode = document.createTextNode('first line\n\nsecond line');
+    body.appendChild(body._textNode);
+
+    expect(finalizeLiveReasoningPanel(panel)).toBe(true);
+    expect(statusEl.textContent).toBe('first line second line');
+    expect(statusEl.title).toBe('first line second line');
+  });
+
+  it('keeps the timeline wrapper when finalizing a non-empty live reasoning panel', () => {
+    const panel = document.createElement('div');
+    panel.innerHTML = `
+      <div class="reasoning-header">
+        <span class="reasoning-status">推理中</span>
+      </div>
+      <div class="reasoning-body"></div>
+    `;
+
+    const body = panel.querySelector('.reasoning-body') as HTMLElement & { _textNode?: Text };
+    body._textNode = document.createTextNode('first line\n\nsecond line');
+    body.appendChild(body._textNode);
+
+    const wrapper = wrapInTimeline(panel, 'reasoning');
+    document.body.appendChild(wrapper);
+
+    expect(finalizeOrDiscardLiveReasoningPanel(panel)).toBe(true);
+    expect(wrapper.isConnected).toBe(true);
   });
 
   it('panel has class reasoning-panel and header has class reasoning-header', () => {

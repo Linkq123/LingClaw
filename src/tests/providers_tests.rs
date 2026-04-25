@@ -212,7 +212,7 @@ fn convert_messages_to_openai_all_roles() {
             timestamp: None,
         },
     ];
-    let out = convert_messages_to_openai(&messages);
+    let out = convert_messages_to_openai_with_options(&messages, false);
     assert_eq!(out.len(), 4); // unknown_role skipped
     assert_eq!(out[0]["role"], "system");
     assert_eq!(out[1]["role"], "user");
@@ -241,8 +241,9 @@ fn convert_messages_to_openai_assistant_with_tool_calls() {
         tool_call_id: None,
         timestamp: None,
     }];
-    let out = convert_messages_to_openai(&messages);
+    let out = convert_messages_to_openai_with_options(&messages, false);
     assert_eq!(out.len(), 1);
+    assert_eq!(out[0]["content"], "");
     assert!(out[0]["tool_calls"].is_array());
     assert_eq!(out[0]["tool_calls"][0]["function"]["name"], "exec");
     assert!(
@@ -251,6 +252,33 @@ fn convert_messages_to_openai_assistant_with_tool_calls() {
             .unwrap()
             .contains_key("gemini_thought_signature")
     );
+}
+
+#[test]
+fn convert_messages_to_openai_allows_null_tool_call_content_when_requested() {
+    let messages = vec![ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: Some(vec![ToolCall {
+            id: "tc1".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: "exec".into(),
+                arguments: r#"{"cmd":"ls"}"#.into(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let out = convert_messages_to_openai_with_options(&messages, true);
+
+    assert_eq!(out.len(), 1);
+    assert!(out[0]["content"].is_null());
 }
 
 #[test]
@@ -1082,6 +1110,186 @@ fn with_optional_bearer_auth_sets_header_for_non_empty_key() {
         request.headers().get(reqwest::header::AUTHORIZATION),
         Some(&reqwest::header::HeaderValue::from_static("Bearer secret"))
     );
+}
+
+#[test]
+fn build_openai_stream_body_uses_null_tool_call_content_for_official_api() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: Provider::OpenAI.default_api_base().into(),
+        api_key: "openai-key".into(),
+        model_id: "gpt-4o-mini".into(),
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(128),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: Some(vec![ToolCall {
+            id: "tc1".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"README.md"}"#.into(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let body =
+        build_openai_stream_body(&resolved, &messages, None, "off", &[]).expect("body builds");
+
+    assert!(body["messages"][0]["content"].is_null());
+}
+
+#[test]
+fn build_openai_stream_body_keeps_string_tool_call_content_for_compatible_api() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://vip.aipro.love/v1".into(),
+        api_key: "openai-key".into(),
+        model_id: "gpt-5.4".into(),
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(128),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: Some(vec![ToolCall {
+            id: "tc1".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"README.md"}"#.into(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let body =
+        build_openai_stream_body(&resolved, &messages, None, "off", &[]).expect("body builds");
+
+    assert_eq!(body["messages"][0]["content"], "");
+}
+
+#[test]
+fn build_openai_simple_body_uses_null_tool_call_content_for_official_api() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: Provider::OpenAI.default_api_base().into(),
+        api_key: "openai-key".into(),
+        model_id: "gpt-4o-mini".into(),
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(128),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: Some(vec![ToolCall {
+            id: "tc1".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"README.md"}"#.into(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let body = build_openai_simple_body(&resolved, &messages, None).expect("body builds");
+
+    assert!(body["messages"][0]["content"].is_null());
+}
+
+#[test]
+fn build_openai_simple_body_keeps_string_tool_call_content_for_compatible_api() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://vip.aipro.love/v1".into(),
+        api_key: "openai-key".into(),
+        model_id: "gpt-5.4".into(),
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(128),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: Some(vec![ToolCall {
+            id: "tc1".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"README.md"}"#.into(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let body = build_openai_simple_body(&resolved, &messages, None).expect("body builds");
+
+    assert_eq!(body["messages"][0]["content"], "");
+}
+
+#[test]
+fn official_openai_api_base_requires_exact_hostname_match() {
+    assert!(is_official_openai_api_base("https://api.openai.com/v1"));
+    assert!(is_official_openai_api_base(
+        "https://API.OPENAI.COM/v1/chat/completions"
+    ));
+    assert!(!is_official_openai_api_base(
+        "https://proxy.example.com/openai/api.openai.com/v1"
+    ));
+    assert!(!is_official_openai_api_base(
+        "https://api.openai.com.example.com/v1"
+    ));
+}
+
+#[test]
+fn openai_null_tool_call_content_allows_explicit_opt_in_for_custom_domain() {
+    assert!(openai_prefers_null_tool_call_content_with_opt_in(
+        "https://openai.internal.example/v1",
+        true,
+    ));
+    assert!(!openai_prefers_null_tool_call_content_with_opt_in(
+        "https://openai.internal.example/v1",
+        false,
+    ));
 }
 
 #[tokio::test]
@@ -2194,7 +2402,7 @@ fn convert_messages_to_openai_user_with_images() {
         tool_call_id: None,
         timestamp: None,
     }];
-    let out = convert_messages_to_openai(&messages);
+    let out = convert_messages_to_openai_with_options(&messages, false);
     assert_eq!(out.len(), 1);
     let content = out[0]["content"]
         .as_array()
