@@ -486,8 +486,6 @@
   inset: 0;
   z-index: 101;
   background: rgba(18,22,34,.38);
-  backdrop-filter: blur(8px) saturate(1.1);
-  -webkit-backdrop-filter: blur(8px) saturate(1.1);
   animation: fadeIn .14s ease-out;
 }
 .subagent-modal-backdrop[hidden] { display: none; }
