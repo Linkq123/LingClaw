@@ -33,6 +33,8 @@
   --tool-drawer-bottom: 88px;
   --jump-to-latest-bottom: 104px;
   --chat-output-width: min(1280px, 84vw);
+  --assistant-output-width: min(1440px, 90vw);
+  --assistant-prose-max-width: 112ch;
   --assistant-body-font-size: 16px;
   --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
 }

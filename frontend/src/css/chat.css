@@ -10,7 +10,7 @@
 .msg-row.assistant {
   align-self: flex-start;
   align-items: flex-start;
-  width: min(var(--chat-output-width), calc(100% - 8px));
+  width: min(var(--assistant-output-width), calc(100% - 8px));
   max-width: 100%;
   min-width: 320px;
 }
@@ -112,7 +112,7 @@
   padding: 14px 16px;
   overflow-x: auto;
 }
-.msg.assistant p { margin: 0 0 10px; max-width: 96ch; }
+.msg.assistant p { margin: 0 0 10px; max-width: var(--assistant-prose-max-width); }
 .msg.assistant p:last-child { margin-bottom: 0; }
 .msg.assistant > :first-child { margin-top: 0; }
 .msg.assistant > :last-child { margin-bottom: 0; }
@@ -131,7 +131,7 @@
   margin: 20px 0 10px;
   line-height: 1.3;
   color: var(--text);
-  max-width: 96ch;
+  max-width: var(--assistant-prose-max-width);
   letter-spacing: 0;
   scroll-margin-top: 72px;
 }
@@ -189,7 +189,7 @@
   text-align: center;
 }
 .msg.assistant hr {
-  width: min(96ch, 100%);
+  width: min(var(--assistant-prose-max-width), 100%);
   height: 1px;
   margin: 18px 0;
   border: 0;
@@ -199,7 +199,7 @@
 .msg.assistant ol {
   margin: 0 0 12px 1.35em;
   padding-left: 0.2em;
-  max-width: 96ch;
+  max-width: var(--assistant-prose-max-width);
 }
 .msg.assistant li {
   margin: 6px 0;
@@ -228,7 +228,7 @@
   border-radius: 0 12px 12px 0;
   background: linear-gradient(90deg, color-mix(in srgb, var(--accent2) 8%, transparent), transparent);
   color: color-mix(in srgb, var(--dim) 86%, var(--text));
-  max-width: 96ch;
+  max-width: var(--assistant-prose-max-width);
 }
 .msg.assistant blockquote > :last-child {
   margin-bottom: 0;
@@ -290,7 +290,7 @@
 }
 .msg.assistant .katex { font-size: 1.05em; }
 .msg.assistant dl {
-  max-width: 96ch;
+  max-width: var(--assistant-prose-max-width);
   margin: 0 0 12px;
 }
 .msg.assistant dt {
@@ -303,7 +303,7 @@
   color: var(--dim);
 }
 .msg.assistant details {
-  max-width: 96ch;
+  max-width: var(--assistant-prose-max-width);
   margin: 12px 0;
   padding: 10px 12px;
   border: 1px solid color-mix(in srgb, var(--accent2) 16%, var(--border));
@@ -356,6 +356,10 @@
   display: block;
   padding: 14px 16px;
   overflow-x: auto;
+}
+.msg.assistant pre code.hljs,
+.msg.assistant .live-code-tail code.hljs {
+  background: transparent;
 }
 .msg.assistant :not(pre) > code {
   background: var(--tool-bg);
