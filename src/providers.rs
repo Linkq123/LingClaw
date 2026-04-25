@@ -1121,7 +1121,13 @@ pub(crate) async fn call_llm_simple_with_usage(
                 http.post(&url).bearer_auth(&resolved.api_key).json(&body)
             })
             .await?;
-            let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(resp.text().await.map_err(|e| e.to_string())?);
+            }
+            let data: serde_json::Value = match resp.json().await {
+                Ok(d) => d,
+                Err(e) => return Err(format!("OpenAI decode error: {e}")),
+            };
             Ok(SimpleLlmResponse {
                 content: data["choices"][0]["message"]["content"]
                     .as_str()
@@ -1152,7 +1158,13 @@ pub(crate) async fn call_llm_simple_with_usage(
                     .json(&body)
             })
             .await?;
-            let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(resp.text().await.map_err(|e| e.to_string())?);
+            }
+            let data: serde_json::Value = match resp.json().await {
+                Ok(d) => d,
+                Err(e) => return Err(format!("Anthropic decode error: {e}")),
+            };
             let content = data["content"]
                 .as_array()
                 .and_then(|arr| arr.iter().find(|b| b["type"] == "text"))
@@ -1180,7 +1192,13 @@ pub(crate) async fn call_llm_simple_with_usage(
                 with_optional_bearer_auth(http.post(&url), &resolved.api_key).json(&body)
             })
             .await?;
-            let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(resp.text().await.map_err(|e| e.to_string())?);
+            }
+            let data: serde_json::Value = match resp.json().await {
+                Ok(d) => d,
+                Err(e) => return Err(format!("Ollama decode error: {e}")),
+            };
             Ok(SimpleLlmResponse {
                 content: data["message"]["content"]
                     .as_str()
@@ -1197,7 +1215,13 @@ pub(crate) async fn call_llm_simple_with_usage(
                 with_optional_gemini_auth(http.post(&url), &resolved.api_key).json(&body)
             })
             .await?;
-            let data: GeminiGenerateResponse = resp.json().await.map_err(|e| e.to_string())?;
+            let text = resp.text().await.map_err(|e| e.to_string())?;
+            let data: GeminiGenerateResponse = match serde_json::from_str(&text) {
+                Ok(data) => data,
+                Err(e) => {
+                    return Err(format!("Gemini decode error: {} - body: {}", e, text.trim()));
+                }
+            };
             if let Some(error) = gemini_response_error(&data) {
                 return Err(error);
             }
@@ -2184,6 +2208,10 @@ async fn call_llm_stream_openai(
     })
     .await?;
 
+    if !resp.status().is_success() {
+        return Err(resp.text().await.unwrap_or_else(|_| "Unknown HTTP error".to_string()));
+    }
+
     let mut stream = resp.bytes_stream();
     let mut stream_state = OpenAiStreamState {
         content_buf: String::new(),
@@ -2234,6 +2262,10 @@ async fn call_llm_stream_anthropic(
             .json(&body)
     })
     .await?;
+
+    if !resp.status().is_success() {
+        return Err(resp.text().await.unwrap_or_else(|_| "Unknown HTTP error".to_string()));
+    }
 
     let mut stream = resp.bytes_stream();
     let mut stream_state = AnthropicStreamState {
@@ -2297,6 +2329,10 @@ async fn call_llm_stream_ollama(
     })
     .await?;
 
+    if !resp.status().is_success() {
+        return Err(resp.text().await.unwrap_or_else(|_| "Unknown HTTP error".to_string()));
+    }
+
     let mut stream = resp.bytes_stream();
     let mut stream_state = OpenAiStreamState {
         content_buf: String::new(),
@@ -2343,6 +2379,10 @@ async fn call_llm_stream_gemini(
         with_optional_gemini_auth(http.post(&url), &resolved.api_key).json(&body)
     })
     .await?;
+
+    if !resp.status().is_success() {
+        return Err(resp.text().await.unwrap_or_else(|_| "Unknown HTTP error".to_string()));
+    }
 
     let mut stream = resp.bytes_stream();
     let mut stream_state = OpenAiStreamState {
