@@ -165,6 +165,12 @@ async function processMarkdownQueue() {
 
 // ── Progressive segmented markdown ──
 
+function isTableRow(text: string, lineStart: number): boolean {
+  let k = lineStart;
+  while (k < text.length && (text[k] === ' ' || text[k] === '\t')) k++;
+  return k < text.length && text[k] === '|';
+}
+
 export function isSentenceSplitChar(text, index) {
   const ch = text[index];
   if ('。！？；：'.includes(ch)) return true;
@@ -195,6 +201,10 @@ export function findProgressiveSplitPoint(text: string, startFrom = 0): number {
   let lastSplit = startFrom > 0 ? startFrom : -1;
   let lastSoftSplit = -1;
   let charsSinceBoundary = 0;
+  // Find the true start of the line that contains startFrom so the table-row
+  // guard below works correctly when resuming from a mid-line offset.
+  let lineStart = startFrom;
+  while (lineStart > 0 && text[lineStart - 1] !== '\n') lineStart--;
   let i = startFrom;
   while (i < text.length) {
     const atLineStart = i === 0 || text[i - 1] === '\n';
@@ -210,6 +220,7 @@ export function findProgressiveSplitPoint(text: string, startFrom = 0): number {
       let j = i + 3;
       while (j < text.length && text[j] !== '\n') j++;
       i = j < text.length ? j + 1 : text.length;
+      lineStart = i; // code fence boundary → new line
       if (wasFenced && !inFence && i < text.length) {
         lastSplit = i;
         lastSoftSplit = -1;
@@ -224,16 +235,26 @@ export function findProgressiveSplitPoint(text: string, startFrom = 0): number {
       lastSoftSplit = -1;
       charsSinceBoundary = 0;
       i = j;
+      lineStart = j; // paragraph boundary → new line
       continue;
     }
     if (!inFence) {
       charsSinceBoundary += 1;
-      if (isSentenceSplitChar(text, i) && charsSinceBoundary >= SOFT_SPLIT_MIN_CHARS) {
+      // Never soft-split on a GFM table row — partial table rendering produces
+      // wrong markup that needsFinalMarkdownRender then fails to detect because
+      // the truncated row is still counted as a rendered table element.
+      const onTableRow = isTableRow(text, lineStart);
+      if (
+        !onTableRow &&
+        isSentenceSplitChar(text, i) &&
+        charsSinceBoundary >= SOFT_SPLIT_MIN_CHARS
+      ) {
         lastSoftSplit = i + 1;
-      } else if (/\s/.test(text[i]) && charsSinceBoundary >= SOFT_SPLIT_MAX_CHARS) {
+      } else if (!onTableRow && /\s/.test(text[i]) && charsSinceBoundary >= SOFT_SPLIT_MAX_CHARS) {
         lastSoftSplit = i + 1;
       }
     }
+    if (text[i] === '\n') lineStart = i + 1; // single newline → next line
     i++;
   }
   if (!inFence && lastSoftSplit > lastSplit) {

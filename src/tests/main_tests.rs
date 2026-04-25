@@ -899,6 +899,91 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
 }
 
 #[test]
+fn build_history_payload_includes_thinking_only_assistant_messages() {
+    // An assistant message that has thinking but no content (e.g., think → tool_call
+    // cycle with no text response) must appear in the history payload so that the
+    // reasoning card is replayed after a page refresh.
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None, // no text — only thinking + tool_calls
+                images: None,
+                thinking: Some("step by step reasoning".into()),
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![crate::ToolCall {
+                    id: "call_abc".into(),
+                    call_type: "function".into(),
+                    function: FunctionCall {
+                        name: "exec".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(1000),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some("done".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: Some(2000),
+            },
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let payload = build_history_payload(&session);
+    let msgs = payload["messages"].as_array().unwrap();
+
+    // The thinking-only assistant entry must appear.
+    let thinking_entry = msgs
+        .iter()
+        .find(|m| m["role"] == "assistant" && m.get("thinking").is_some())
+        .expect("history should contain the thinking-only assistant entry");
+    assert_eq!(
+        thinking_entry["thinking"].as_str(),
+        Some("step by step reasoning")
+    );
+    // Content should be present as an empty string (not omitted).
+    assert_eq!(thinking_entry["content"].as_str(), Some(""));
+
+    // The second assistant entry (with actual content) should also be present.
+    let content_entry = msgs
+        .iter()
+        .find(|m| m["role"] == "assistant" && m["content"] == "done")
+        .expect("history should contain the content assistant entry");
+    assert!(content_entry.get("thinking").is_none());
+}
+
+
+#[test]
 fn provider_detect_accepts_provider_prefixed_model_refs() {
     assert_eq!(
         Provider::detect(

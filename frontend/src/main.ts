@@ -272,9 +272,13 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
         dom.chat.appendChild(wrapInTimeline(panel, 'reasoning'));
         invalidateChatScrollCache();
       }
-      const el = addMsg('assistant', m.content, m.timestamp);
-      el._rawText = m.content;
-      scheduleMarkdownRender(el, { followScroll: followMarkdown });
+      // Thinking-only cycles (no text, tool call follows) have empty content.
+      // Only create a bubble when there is actual message text.
+      if (m.content) {
+        const el = addMsg('assistant', m.content, m.timestamp);
+        el._rawText = m.content;
+        scheduleMarkdownRender(el, { followScroll: followMarkdown });
+      }
       break;
     }
     case 'tool_call': {

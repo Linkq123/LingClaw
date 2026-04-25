@@ -120,6 +120,40 @@ describe('findProgressiveSplitPoint', () => {
     expect(incremental).toBe(full);
     expect(incremental).toBeGreaterThan(midOffset);
   });
+
+  it('does not soft-split inside a GFM table row', () => {
+    // A table row with a long cell containing a sentence-split character should
+    // NOT trigger a soft split, so the whole table renders atomically.
+    const tableMarkdown = [
+      '| Column A | Column B: This is a description that is long enough to exceed SOFT_SPLIT_MIN_CHARS. More text. |',
+      '| -------- | ------- |',
+      '| val1     | val2    |',
+    ].join('\n');
+    // The table rows contain '.' after > 72 chars, but no soft split should occur.
+    const result = findProgressiveSplitPoint(tableMarkdown);
+    // Expect no split point found (returns -1) — no paragraph boundary either.
+    expect(result).toBe(-1);
+  });
+
+  it('does not soft-split inside a table even when preceded by a paragraph', () => {
+    // Paragraph followed immediately by a table (no blank line between them would
+    // not be valid GFM, but even with a blank line the table rows must be atomic).
+    const para = 'Introductory text here.\n\n';
+    const tableRows = [
+      '| Option | A very long description that easily exceeds the soft-split minimum threshold. And more. |',
+      '| ------ | ------- |',
+      '| A      | val     |',
+    ].join('\n');
+    const text = para + tableRows;
+    const result = findProgressiveSplitPoint(text);
+    // The only valid split is the paragraph boundary before the table (after para).
+    // Any split inside the table rows is forbidden.
+    // The split point should be ≤ para.length (right at the start of the table),
+    // not inside a table row.
+    if (result > 0) {
+      expect(result).toBeLessThanOrEqual(para.length);
+    }
+  });
 });
 
 describe('renderMarkdown memoization', () => {

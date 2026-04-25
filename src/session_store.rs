@@ -280,11 +280,12 @@ pub(crate) fn build_history_payload_with_s3(
                 }
             }
             "assistant" => {
-                if let Some(c) = &msg.content
-                    && !c.is_empty()
-                {
+                let has_content = msg.content.as_deref().is_some_and(|c| !c.is_empty());
+                let has_thinking = msg.thinking.as_deref().is_some_and(|t| !t.is_empty());
+                if has_content || has_thinking {
+                    let content_str = msg.content.as_deref().unwrap_or("");
                     let mut entry =
-                        json!({"role":"assistant","content":c,"timestamp":msg.timestamp});
+                        json!({"role":"assistant","content":content_str,"timestamp":msg.timestamp});
                     if let Some(thinking) = &msg.thinking
                         && !thinking.is_empty()
                     {
