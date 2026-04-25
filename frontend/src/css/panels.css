@@ -23,6 +23,28 @@
   padding-left: 26px;
   --_tl-color: color-mix(in srgb, var(--accent2) 18%, var(--border));
 }
+.timeline-node.subagent-modal-host {
+  position: fixed;
+  inset: 0;
+  width: auto;
+  max-width: none;
+  min-width: 0;
+  padding-left: 0;
+  background: none !important;
+  z-index: 102;
+  pointer-events: none;
+}
+.timeline-node.subagent-modal-host::before,
+.timeline-node.subagent-modal-host::after {
+  display: none;
+}
+.timeline-node.subagent-modal-host > .subagent-panel.subagent-modal-open {
+  pointer-events: auto;
+}
+.subagent-modal-placeholder {
+  min-height: 1px;
+  pointer-events: none;
+}
 .timeline-node:has(+ .timeline-node) {
   background: linear-gradient(var(--_tl-color), var(--_tl-color)) no-repeat 7.5px 18px / 1px calc(100% - 18px);
 }
@@ -477,15 +499,18 @@
   flex-direction: column;
   transform: translateX(-50%);
   border-radius: 16px;
+  background: var(--surface);
   border-color: color-mix(in srgb, var(--accent2) 20%, var(--panel-border-soft));
   box-shadow: 0 24px 72px rgba(20,24,38,.20);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
   animation: panelSlideUp .18s ease-out;
 }
 .subagent-modal-backdrop {
   position: fixed;
   inset: 0;
   z-index: 101;
-  background: rgba(18,22,34,.38);
+  background: rgba(18,22,34,.16);
   animation: fadeIn .14s ease-out;
 }
 .subagent-modal-backdrop[hidden] { display: none; }

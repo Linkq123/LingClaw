@@ -12,6 +12,12 @@ import { scrollDown } from '../scroll.js';
 import { wrapInTimeline, animatePanelIn, animateCollapsibleSection } from './timeline.js';
 import { pinReactStatusToBottom } from './react-status.js';
 
+interface SubagentModalHost extends HTMLElement {
+  _subagentModalParent?: HTMLElement | null;
+  _subagentModalNextSibling?: ChildNode | null;
+  _subagentModalPlaceholder?: HTMLElement | null;
+}
+
 function getToolTrail(panel): HTMLElement | null {
   return (panel as Element).querySelector('[data-subagent-tool-trail]') as HTMLElement | null;
 }
@@ -245,6 +251,47 @@ function summaryCopyText(panel) {
   return parts.join('\n\n').trim();
 }
 
+function movePanelHostToBody(panel) {
+  const wrapper = panel?.closest('.timeline-node') as SubagentModalHost | null;
+  if (!wrapper || wrapper.classList.contains('subagent-modal-host')) return;
+  const parent = wrapper.parentElement;
+  if (!parent) return;
+
+  const placeholder = document.createElement('div');
+  placeholder.className = 'subagent-modal-placeholder';
+  placeholder.style.height = `${Math.max(wrapper.getBoundingClientRect().height, 1)}px`;
+
+  wrapper._subagentModalParent = parent;
+  wrapper._subagentModalNextSibling = wrapper.nextSibling;
+  wrapper._subagentModalPlaceholder = placeholder;
+  parent.replaceChild(placeholder, wrapper);
+  wrapper.classList.add('subagent-modal-host');
+  document.body.appendChild(wrapper);
+}
+
+function restorePanelHost(panel) {
+  const wrapper = panel?.closest('.timeline-node') as SubagentModalHost | null;
+  if (!wrapper || !wrapper.classList.contains('subagent-modal-host')) return;
+
+  const parent = wrapper._subagentModalParent;
+  const nextSibling = wrapper._subagentModalNextSibling;
+  const placeholder = wrapper._subagentModalPlaceholder;
+  if (placeholder?.parentNode) {
+    placeholder.parentNode.replaceChild(wrapper, placeholder);
+  } else if (parent) {
+    if (nextSibling && nextSibling.parentNode === parent) {
+      parent.insertBefore(wrapper, nextSibling);
+    } else {
+      parent.appendChild(wrapper);
+    }
+  }
+
+  wrapper.classList.remove('subagent-modal-host');
+  wrapper._subagentModalParent = null;
+  wrapper._subagentModalNextSibling = null;
+  wrapper._subagentModalPlaceholder = null;
+}
+
 function syncPanelActions(panel) {
   if (!panel) return;
 
@@ -383,6 +430,7 @@ export function closeSubagentModal() {
       body.style.height = '';
       body.setAttribute('inert', '');
     }
+    restorePanelHost(panel);
   }
   const backdrop = document.getElementById('subagent-modal-backdrop');
   if (backdrop) backdrop.hidden = true;
@@ -394,6 +442,7 @@ export function openSubagentModal(trigger) {
   closeSubagentModal();
   const backdrop = ensureSubagentBackdrop();
   backdrop.hidden = false;
+  movePanelHostToBody(panel);
   panel.classList.add('subagent-modal-open');
   panel.querySelector('.subagent-header')?.setAttribute('aria-expanded', 'true');
   panel.querySelector('.subagent-modal-close')?.removeAttribute('tabindex');

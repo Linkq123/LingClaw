@@ -76,6 +76,7 @@ import {
 } from './images.js';
 import { sendCmd, initInputListeners } from './input.js';
 import { toggleMobileMenu, closeMobileMenu, initMobileListeners } from './mobile.js';
+import { applyToolsVisibility } from './viewState.js';
 import {
   createSubagentPanel,
   addSubagentTool,
@@ -142,12 +143,12 @@ function applyViewState(viewState) {
   if (!viewState) return;
 
   if (typeof viewState.show_tools === 'boolean') {
-    state.showTools = viewState.show_tools;
-    dom.chat.classList.toggle('hide-tools', !state.showTools);
-    if (!state.showTools) {
-      closeToolDrawer();
-      state.activeToolPanel = null;
-    }
+    applyToolsVisibility(viewState.show_tools, {
+      state,
+      chat: dom.chat,
+      closeToolDrawer,
+      closeSubagentModal,
+    });
   }
 
   if (typeof viewState.show_reasoning === 'boolean') {
