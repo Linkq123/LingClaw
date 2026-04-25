@@ -1278,6 +1278,94 @@ fn call_llm_simple_gemini_sends_key_header_and_expected_path() {
 }
 
 #[test]
+fn call_llm_simple_openai_reports_raw_body_for_html_gateway_response() {
+    let response_body = "<!doctype html><html><body>gateway landing page</body></html>".to_string();
+    let (api_base, request_rx, handle) = spawn_one_shot_http_server("text/html", response_body);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base,
+        api_key: "openai-secret".into(),
+        model_id: "gpt-4o-mini".into(),
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(16),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hi".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let workspace = unique_temp_dir("lingclaw-call-openai-html");
+
+    let error = runtime
+        .block_on(async { call_llm_simple(&http, &resolved, &messages, &workspace, None, 2).await })
+        .expect_err("html response should surface a decode error with body context");
+
+    let request = request_rx.recv().expect("captured request should exist");
+    handle.join().expect("server thread should join");
+
+    assert_eq!(request.request_line, "POST /chat/completions HTTP/1.1");
+    assert!(error.contains("OpenAI decode error"));
+    assert!(error.contains("<!doctype html>"));
+    assert!(error.contains("gateway landing page"));
+}
+
+#[test]
+fn call_llm_simple_openai_surfaces_json_error_envelope() {
+    let response_body =
+        r#"{"error":{"message":"bad key","type":"invalid_request_error"}}"#.to_string();
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server("application/json", response_body);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base,
+        api_key: "openai-secret".into(),
+        model_id: "gpt-4o-mini".into(),
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(16),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hi".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let workspace = unique_temp_dir("lingclaw-call-openai-error-json");
+
+    let error = runtime
+        .block_on(async { call_llm_simple(&http, &resolved, &messages, &workspace, None, 2).await })
+        .expect_err("error envelope should not be treated as a successful reply");
+
+    let request = request_rx.recv().expect("captured request should exist");
+    handle.join().expect("server thread should join");
+
+    assert_eq!(request.request_line, "POST /chat/completions HTTP/1.1");
+    assert!(error.contains("OpenAI API error"));
+    assert!(error.contains("bad key"));
+    assert!(error.contains("invalid_request_error"));
+}
+
+#[test]
 fn call_llm_simple_ollama_sends_auth_and_expected_body() {
     let response_body = r#"{"message":{"content":"hello from ollama"}}"#.to_string();
     let (api_base, request_rx, handle) =
@@ -1427,6 +1515,122 @@ fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
     assert!(event_types.iter().any(|event| event == "thinking_delta"));
     assert!(event_types.iter().any(|event| event == "thinking_done"));
     assert!(event_types.iter().any(|event| event == "delta"));
+}
+
+#[test]
+fn call_llm_stream_openai_reports_html_gateway_response() {
+    let response_body = "<!doctype html><html><body>gateway landing page</body></html>".to_string();
+    let (api_base, request_rx, handle) = spawn_one_shot_http_server("text/html", response_body);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base,
+        api_key: "stream-secret".into(),
+        model_id: "gpt-4o-mini".into(),
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(32),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hi".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let live_tx: LiveTx = tx;
+
+    let error = match runtime.block_on(async {
+        call_llm_stream_openai(
+            &http,
+            &resolved,
+            &messages,
+            None,
+            &live_tx,
+            "medium",
+            &[],
+            2,
+        )
+        .await
+    }) {
+        Ok(_) => panic!("html response should fail before SSE parsing"),
+        Err(error) => error,
+    };
+
+    let request = request_rx.recv().expect("captured request should exist");
+    handle.join().expect("server thread should join");
+
+    assert_eq!(request.request_line, "POST /chat/completions HTTP/1.1");
+    assert!(error.contains("OpenAI stream error"));
+    assert!(error.contains("text/html"));
+    assert!(error.contains("gateway landing page"));
+}
+
+#[test]
+fn call_llm_stream_openai_surfaces_json_error_envelope() {
+    let response_body =
+        r#"{"error":{"message":"bad key","type":"invalid_request_error"}}"#.to_string();
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server("application/json", response_body);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base,
+        api_key: "stream-secret".into(),
+        model_id: "gpt-4o-mini".into(),
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(32),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hi".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let live_tx: LiveTx = tx;
+
+    let error = match runtime.block_on(async {
+        call_llm_stream_openai(
+            &http,
+            &resolved,
+            &messages,
+            None,
+            &live_tx,
+            "medium",
+            &[],
+            2,
+        )
+        .await
+    }) {
+        Ok(_) => panic!("json error envelope should fail before SSE parsing"),
+        Err(error) => error,
+    };
+
+    let request = request_rx.recv().expect("captured request should exist");
+    handle.join().expect("server thread should join");
+
+    assert_eq!(request.request_line, "POST /chat/completions HTTP/1.1");
+    assert!(error.contains("OpenAI API error"));
+    assert!(error.contains("bad key"));
+    assert!(error.contains("invalid_request_error"));
 }
 
 #[test]
