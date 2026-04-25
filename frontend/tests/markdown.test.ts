@@ -64,6 +64,23 @@ describe('isSentenceSplitChar', () => {
     expect(isSentenceSplitChar('3.14', 1)).toBe(false);
   });
 
+  it('period in ordered list marker', () => {
+    expect(isSentenceSplitChar('3. 中期修', 1)).toBe(false);
+  });
+
+  it('period in blockquote ordered list marker', () => {
+    expect(isSentenceSplitChar('> 12. 中期修', 4)).toBe(false);
+  });
+
+  it('period in common abbreviation', () => {
+    expect(isSentenceSplitChar('e.g. 后面还是同一句', 3)).toBe(false);
+    expect(isSentenceSplitChar('U.S. 后面还是同一句', 3)).toBe(false);
+  });
+
+  it('full-width punctuation before inline markdown opener', () => {
+    expect(isSentenceSplitChar('标题：**粗体**后续说明', 2)).toBe(false);
+  });
+
   it('exclamation CJK', () => {
     expect(isSentenceSplitChar('好！', 1)).toBe(true);
   });
@@ -173,6 +190,62 @@ describe('findProgressiveSplitPoint', () => {
     ].join('\n');
 
     expect(findProgressiveSplitPoint(tableMarkdown)).toBe(-1);
+  });
+
+  it('does not soft-split immediately after an ordered list marker', () => {
+    const text =
+      'a'.repeat(90) +
+      '\n3. 中期修 — 这一项后面还有足够长的正文内容，用来确保尾部长度超过软分段阈值。';
+
+    const listMarkerDotIndex = text.indexOf('3.') + 1;
+
+    expect(findProgressiveSplitPoint(text)).not.toBe(listMarkerDotIndex + 1);
+  });
+
+  it('does not soft-split after a blockquote ordered list marker', () => {
+    const text =
+      'a'.repeat(90) +
+      '\n> 12. 这是 blockquote 里的有序列表项，后面还有足够长的正文内容来触发软分段检查。';
+
+    const listMarkerDotIndex = text.indexOf('12.') + 2;
+
+    expect(findProgressiveSplitPoint(text)).not.toBe(listMarkerDotIndex + 1);
+  });
+
+  it('does not soft-split after a reference-style link definition colon', () => {
+    const text =
+      'a'.repeat(90) +
+      '\n[spec]: https://example.com/very/long/path/that/should/remain-attached';
+
+    expect(findProgressiveSplitPoint(text)).toBe(-1);
+  });
+
+  it('does not soft-split after a blockquote reference-style link definition colon', () => {
+    const text =
+      'a'.repeat(90) +
+      '\n> [spec]: https://example.com/very/long/path/that/should/remain-attached';
+
+    expect(findProgressiveSplitPoint(text)).toBe(-1);
+  });
+
+  it('does not soft-split after common abbreviations', () => {
+    const text =
+      'a'.repeat(90) +
+      ' e.g. 这里其实还在同一句里，后面还有足够长的正文内容来验证缩写误判。';
+
+    const abbreviationDotIndex = text.indexOf('e.g.') + 'e.g.'.length - 1;
+
+    expect(findProgressiveSplitPoint(text)).not.toBe(abbreviationDotIndex + 1);
+  });
+
+  it('does not soft-split after full-width punctuation before inline markdown', () => {
+    const text =
+      'a'.repeat(90) +
+      '\n### 长标题长标题长标题长标题：**后面紧跟粗体内容**并继续说明，且尾部再补一段更长的正文避免回落到别的切分点';
+
+    const fullWidthColonIndex = text.indexOf('：');
+
+    expect(findProgressiveSplitPoint(text)).not.toBe(fullWidthColonIndex + 1);
   });
 });
 

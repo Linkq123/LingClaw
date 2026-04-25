@@ -166,6 +166,21 @@ async function processMarkdownQueue() {
 // ── Progressive segmented markdown ──
 
 const GFM_TABLE_SEPARATOR_RE = /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+(?:\s*:?-{3,}:?\s*)?\|?\s*$/;
+const COMMON_SENTENCE_SPLIT_ABBREVIATIONS = new Set([
+  'e.g.',
+  'i.e.',
+  'etc.',
+  'no.',
+  'vs.',
+  'cf.',
+  'mr.',
+  'mrs.',
+  'ms.',
+  'dr.',
+  'prof.',
+  'sr.',
+  'jr.',
+]);
 
 function hasTableCells(line: string): boolean {
   return line.includes('|') && !GFM_TABLE_SEPARATOR_RE.test(line);
@@ -216,14 +231,88 @@ function isTableRow(text: string, lineStart: number): boolean {
   return false;
 }
 
-export function isSentenceSplitChar(text, index) {
+function isReferenceLinkDefinitionLine(text: string, lineStart: number): boolean {
+  const line = readLine(text, lineStart);
+  const normalizedLine = line.replace(/^\s{0,3}(?:>\s*)+/, '');
+  return /^\s{0,3}\[[^\]]+\]:\s+\S/.test(normalizedLine);
+}
+
+export function isSentenceSplitChar(text, index, lineStartOverride?: number) {
   const ch = text[index];
-  if ('。！？；：'.includes(ch)) return true;
+  if (!'。！？；：!?;:.'.includes(ch)) {
+    return false;
+  }
+
+  let lineStart = lineStartOverride;
+  let linePrefix: string | undefined;
+  let normalizedContainerPrefix: string | undefined;
+  let continuesInlineMarkdown: boolean | undefined;
+
+  const getLineStart = () => {
+    if (lineStart === undefined) {
+      lineStart = index;
+      while (lineStart > 0 && text[lineStart - 1] !== '\n') lineStart--;
+    }
+    return lineStart;
+  };
+
+  const getLinePrefix = () => {
+    if (linePrefix === undefined) {
+      linePrefix = text.slice(getLineStart(), index);
+    }
+    return linePrefix;
+  };
+
+  const getNormalizedContainerPrefix = () => {
+    if (normalizedContainerPrefix === undefined) {
+      normalizedContainerPrefix = getLinePrefix().replace(/^\s{0,3}(?:>\s*)+/, '');
+    }
+    return normalizedContainerPrefix;
+  };
+
+  const getContinuesInlineMarkdown = () => {
+    if (continuesInlineMarkdown === undefined) {
+      let nextNonWhitespace = index + 1;
+      while (nextNonWhitespace < text.length && /[ \t]/.test(text[nextNonWhitespace])) {
+        nextNonWhitespace++;
+      }
+      continuesInlineMarkdown =
+        nextNonWhitespace < text.length &&
+        text[nextNonWhitespace] !== '\n' &&
+        '*_`[!<~'.includes(text[nextNonWhitespace]);
+    }
+    return continuesInlineMarkdown;
+  };
+
+  if ('。！？；：'.includes(ch)) {
+    return !getContinuesInlineMarkdown();
+  }
   if ('!?;:'.includes(ch)) {
+    if (getContinuesInlineMarkdown()) {
+      return false;
+    }
+    if (ch === ':' && /^\s{0,3}\[[^\]]+\]$/.test(getNormalizedContainerPrefix())) {
+      return false;
+    }
     const next = text[index + 1] || '';
     return !next || /\s/.test(next);
   }
   if (ch === '.') {
+    if (/^\s{0,4}\d+$/.test(getNormalizedContainerPrefix())) {
+      return false;
+    }
+    const trailingTokenMatch = text
+      .slice(getLineStart(), index + 1)
+      .match(/([A-Za-z][A-Za-z.]*)\.$/);
+    if (trailingTokenMatch) {
+      const trailingToken = `${trailingTokenMatch[1]}.`.toLowerCase();
+      if (
+        /^(?:[a-z]\.){2,}$/i.test(trailingToken) ||
+        COMMON_SENTENCE_SPLIT_ABBREVIATIONS.has(trailingToken)
+      ) {
+        return false;
+      }
+    }
     const prev = text[index - 1] || '';
     const next = text[index + 1] || '';
     return /[A-Za-z0-9\)]/.test(prev) && (!next || /\s/.test(next));
@@ -247,6 +336,7 @@ export function findProgressiveSplitPoint(text: string, startFrom = 0): number {
   let lastSoftSplit = -1;
   let charsSinceBoundary = 0;
   const tableLineCache = new Map<number, boolean>();
+  const referenceDefinitionLineCache = new Map<number, boolean>();
   // Find the true start of the line that contains startFrom so the table-row
   // guard below works correctly when resuming from a mid-line offset.
   let lineStart = startFrom;
@@ -294,13 +384,23 @@ export function findProgressiveSplitPoint(text: string, startFrom = 0): number {
         onTableRow = isTableRow(text, lineStart);
         tableLineCache.set(lineStart, onTableRow);
       }
+      let onReferenceDefinitionLine = referenceDefinitionLineCache.get(lineStart);
+      if (onReferenceDefinitionLine === undefined) {
+        onReferenceDefinitionLine = isReferenceLinkDefinitionLine(text, lineStart);
+        referenceDefinitionLineCache.set(lineStart, onReferenceDefinitionLine);
+      }
+      const onAtomicMarkdownLine = onTableRow || onReferenceDefinitionLine;
       if (
-        !onTableRow &&
-        isSentenceSplitChar(text, i) &&
-        charsSinceBoundary >= SOFT_SPLIT_MIN_CHARS
+        !onAtomicMarkdownLine &&
+        charsSinceBoundary >= SOFT_SPLIT_MIN_CHARS &&
+        isSentenceSplitChar(text, i, lineStart)
       ) {
         lastSoftSplit = i + 1;
-      } else if (!onTableRow && /\s/.test(text[i]) && charsSinceBoundary >= SOFT_SPLIT_MAX_CHARS) {
+      } else if (
+        !onAtomicMarkdownLine &&
+        /\s/.test(text[i]) &&
+        charsSinceBoundary >= SOFT_SPLIT_MAX_CHARS
+      ) {
         lastSoftSplit = i + 1;
       }
     }
