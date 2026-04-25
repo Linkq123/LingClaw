@@ -232,6 +232,7 @@ fn convert_messages_to_openai_assistant_with_tool_calls() {
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
+            gemini_thought_signature: Some("sig-gemini".into()),
             function: FunctionCall {
                 name: "exec".into(),
                 arguments: r#"{"cmd":"ls"}"#.into(),
@@ -244,6 +245,12 @@ fn convert_messages_to_openai_assistant_with_tool_calls() {
     assert_eq!(out.len(), 1);
     assert!(out[0]["tool_calls"].is_array());
     assert_eq!(out[0]["tool_calls"][0]["function"]["name"], "exec");
+    assert!(
+        !out[0]["tool_calls"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("gemini_thought_signature")
+    );
 }
 
 #[test]
@@ -306,6 +313,7 @@ fn convert_messages_to_anthropic_assistant_with_tool_use() {
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
+            gemini_thought_signature: Some("sig-gemini".into()),
             function: FunctionCall {
                 name: "exec".into(),
                 arguments: r#"{"cmd":"ls"}"#.into(),
@@ -321,6 +329,12 @@ fn convert_messages_to_anthropic_assistant_with_tool_use() {
     assert_eq!(content[0]["type"], "text");
     assert_eq!(content[1]["type"], "tool_use");
     assert_eq!(content[1]["name"], "exec");
+    assert!(
+        !content[1]
+            .as_object()
+            .unwrap()
+            .contains_key("gemini_thought_signature")
+    );
 }
 
 #[test]
@@ -412,6 +426,7 @@ fn convert_messages_to_ollama_all_roles() {
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: Some("sig-gemini".into()),
                 function: FunctionCall {
                     name: "read_file".into(),
                     arguments: r#"{"path":"README.md"}"#.into(),
@@ -439,6 +454,12 @@ fn convert_messages_to_ollama_all_roles() {
     assert_eq!(out[1]["role"], "user");
     assert_eq!(out[2]["tool_calls"][0]["type"], "function");
     assert_eq!(out[2]["tool_calls"][0]["id"], "tc1");
+    assert!(
+        !out[2]["tool_calls"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("gemini_thought_signature")
+    );
     assert_eq!(out[2]["tool_calls"][0]["function"]["index"], 0);
     assert_eq!(out[2]["tool_calls"][0]["function"]["name"], "read_file");
     assert_eq!(
@@ -515,6 +536,7 @@ fn build_llm_response_with_content_and_tools() {
         vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
+            gemini_thought_signature: None,
             function: FunctionCall {
                 name: "exec".into(),
                 arguments: "{}".into(),
@@ -538,6 +560,7 @@ fn normalize_tool_call_ids_whitespace_only_id_gets_fallback() {
         vec![ToolCall {
             id: "   ".into(),
             call_type: "function".into(),
+            gemini_thought_signature: None,
             function: FunctionCall {
                 name: "search".into(),
                 arguments: "{}".into(),
@@ -564,6 +587,7 @@ fn build_llm_response_assigns_unique_fallback_tool_ids() {
             ToolCall {
                 id: String::new(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: FunctionCall {
                     name: "mcp__search".into(),
                     arguments: "{}".into(),
@@ -572,6 +596,7 @@ fn build_llm_response_assigns_unique_fallback_tool_ids() {
             ToolCall {
                 id: "dup".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: FunctionCall {
                     name: "read_file".into(),
                     arguments: "{}".into(),
@@ -580,6 +605,7 @@ fn build_llm_response_assigns_unique_fallback_tool_ids() {
             ToolCall {
                 id: "dup".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: FunctionCall {
                     name: "grep_search".into(),
                     arguments: "{}".into(),
@@ -1104,7 +1130,7 @@ async fn build_gemini_body_inlines_images_and_function_declarations() {
     ];
     let workspace = unique_temp_dir("lingclaw-gemini-body");
 
-    let body = build_gemini_body(&resolved, &messages, &workspace, None, &[], true)
+    let body = build_gemini_body(&resolved, &messages, &workspace, None, &[], true, "off")
         .await
         .expect("gemini body should build");
 
@@ -1120,6 +1146,257 @@ async fn build_gemini_body_inlines_images_and_function_declarations() {
     );
     assert_eq!(body["generationConfig"]["maxOutputTokens"], 512);
     assert!(body["tools"][0]["functionDeclarations"].is_array());
+}
+
+#[test]
+fn convert_messages_to_gemini_preserves_function_call_id_and_thought_signature() {
+    let messages = vec![
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "fc_1".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: Some("sigA".into()),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("contents".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("fc_1".into()),
+            timestamp: None,
+        },
+    ];
+
+    let (_, contents) = convert_messages_to_gemini(&messages, &std::collections::HashMap::new())
+        .expect("Gemini history should convert");
+
+    assert_eq!(contents.len(), 2);
+    assert_eq!(contents[0]["role"], "model");
+    assert_eq!(contents[0]["parts"][0]["functionCall"]["id"], "fc_1");
+    assert_eq!(contents[0]["parts"][0]["functionCall"]["name"], "read_file");
+    assert_eq!(contents[0]["parts"][0]["thoughtSignature"], "sigA");
+    assert_eq!(contents[1]["role"], "user");
+    assert_eq!(contents[1]["parts"][0]["functionResponse"]["id"], "fc_1");
+    assert_eq!(
+        contents[1]["parts"][0]["functionResponse"]["name"],
+        "read_file"
+    );
+}
+
+#[test]
+fn convert_messages_to_gemini_omits_missing_thought_signature() {
+    let messages = vec![ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: Some(vec![ToolCall {
+            id: "fc_1".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"README.md"}"#.into(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let (_, contents) = convert_messages_to_gemini(&messages, &std::collections::HashMap::new())
+        .expect("Gemini history should convert");
+
+    assert_eq!(contents[0]["parts"][0]["functionCall"]["id"], "fc_1");
+    assert!(
+        !contents[0]["parts"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("thoughtSignature")
+    );
+}
+
+#[test]
+fn convert_messages_to_gemini_groups_parallel_function_responses() {
+    let messages = vec![
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![
+                ToolCall {
+                    id: "fc_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: Some("sig1".into()),
+                    function: FunctionCall {
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"a.txt"}"#.into(),
+                    },
+                },
+                ToolCall {
+                    id: "fc_2".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: Some("sig2".into()),
+                    function: FunctionCall {
+                        name: "list_dir".into(),
+                        arguments: r#"{"path":"."}"#.into(),
+                    },
+                },
+            ]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("a".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("fc_1".into()),
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("b".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("fc_2".into()),
+            timestamp: None,
+        },
+    ];
+
+    let (_, contents) = convert_messages_to_gemini(&messages, &std::collections::HashMap::new())
+        .expect("Gemini history should convert");
+
+    assert_eq!(contents.len(), 2);
+    assert_eq!(contents[1]["role"], "user");
+    let response_parts = contents[1]["parts"].as_array().unwrap();
+    assert_eq!(response_parts.len(), 2);
+    assert_eq!(response_parts[0]["functionResponse"]["id"], "fc_1");
+    assert_eq!(response_parts[0]["functionResponse"]["name"], "read_file");
+    assert_eq!(response_parts[1]["functionResponse"]["id"], "fc_2");
+    assert_eq!(response_parts[1]["functionResponse"]["name"], "list_dir");
+}
+
+#[tokio::test]
+async fn build_gemini_body_for_gemini3_includes_thinking_config() {
+    let resolved = ResolvedModel {
+        provider: Provider::Gemini,
+        api_base: Provider::Gemini.default_api_base().into(),
+        api_key: "gemini-key".into(),
+        model_id: "gemini-3-flash-preview".into(),
+        reasoning: true,
+        thinking_format: None,
+        max_tokens: Some(512),
+        context_window: 1_000_000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hello".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let workspace = unique_temp_dir("lingclaw-gemini3-thinking");
+
+    let body = build_gemini_body(&resolved, &messages, &workspace, None, &[], true, "low")
+        .await
+        .expect("gemini body should build");
+
+    assert_eq!(body["generationConfig"]["maxOutputTokens"], 512);
+    assert_eq!(
+        body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+        true
+    );
+    assert_eq!(
+        body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "LOW"
+    );
+}
+
+#[tokio::test]
+async fn call_llm_stream_gemini_auto_enables_medium_thinking_config() {
+    let response_body =
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"ok\"}]}}]}\n\n".to_string();
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server("text/event-stream", response_body);
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::Gemini,
+        api_base,
+        api_key: "gemini-key".into(),
+        model_id: "gemini-3-flash-preview".into(),
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(512),
+        context_window: 1_000_000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hello".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let workspace = unique_temp_dir("lingclaw-gemini-auto-thinking");
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let live_tx: LiveTx = tx;
+
+    let response = call_llm_stream(
+        &http,
+        &resolved,
+        &messages,
+        &workspace,
+        None,
+        &live_tx,
+        "auto",
+        &[],
+        0,
+    )
+    .await
+    .expect("Gemini stream should complete");
+
+    let request = request_rx.recv().expect("request should be captured");
+    handle.join().expect("server thread should finish");
+    let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(response.message.content.as_deref(), Some("ok"));
+    assert_eq!(
+        body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+        true
+    );
+    assert_eq!(
+        body["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+        "MEDIUM"
+    );
 }
 
 #[tokio::test]
@@ -1154,6 +1431,97 @@ async fn process_gemini_data_line_collects_text_tools_and_usage() {
         r#"{"path":"README.md"}"#
     );
     assert_eq!(rx.try_recv().unwrap()["type"], "delta");
+}
+
+#[tokio::test]
+async fn process_gemini_data_line_collects_thought_summary_signature_and_function_call_id() {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let live_tx: LiveTx = tx;
+    let mut state = OpenAiStreamState {
+        content_buf: String::new(),
+        thinking_buf: String::new(),
+        tool_calls: Vec::new(),
+        input_tokens: None,
+        output_tokens: None,
+        client_gone: false,
+        reasoning_started: false,
+    };
+
+    process_gemini_data_line(
+        r#"{"candidates":[{"content":{"parts":[{"text":"plan","thought":true},{"functionCall":{"id":"fc_1","name":"read_file","args":{"path":"README.md"}},"thoughtSignature":"sigA"}]}}]}"#,
+        &live_tx,
+        &mut state,
+    )
+    .await
+    .expect("gemini stream line should parse");
+
+    assert_eq!(state.thinking_buf, "plan");
+    assert_eq!(state.content_buf, "");
+    assert_eq!(state.tool_calls.len(), 1);
+    assert_eq!(state.tool_calls[0].id, "fc_1");
+    assert_eq!(state.tool_calls[0].function.name, "read_file");
+    assert_eq!(
+        state.tool_calls[0].gemini_thought_signature.as_deref(),
+        Some("sigA")
+    );
+    assert_eq!(rx.try_recv().unwrap()["type"], "thinking_start");
+    assert_eq!(rx.try_recv().unwrap()["type"], "thinking_delta");
+    assert_eq!(rx.try_recv().unwrap()["type"], "thinking_done");
+}
+
+#[tokio::test]
+async fn call_llm_stream_gemini_closes_thinking_on_thought_only_stream_end() {
+    let response_body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"plan\",\"thought\":true}]}}]}\n\n".to_string();
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server("text/event-stream", response_body);
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::Gemini,
+        api_base,
+        api_key: "gemini-key".into(),
+        model_id: "gemini-3-flash-preview".into(),
+        reasoning: true,
+        thinking_format: None,
+        max_tokens: Some(512),
+        context_window: 1_000_000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("think".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let workspace = unique_temp_dir("lingclaw-gemini-thinking-end");
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let live_tx: LiveTx = tx;
+
+    let response = call_llm_stream_gemini(
+        &http,
+        &resolved,
+        &messages,
+        &workspace,
+        None,
+        &live_tx,
+        "low",
+        &[],
+        0,
+    )
+    .await
+    .expect("Gemini stream should complete");
+
+    let request = request_rx.recv().expect("request should be captured");
+    assert!(request.request_line.contains(":streamGenerateContent"));
+    handle.join().expect("server thread should finish");
+    assert_eq!(response.message.thinking.as_deref(), Some("plan"));
+    assert_eq!(rx.try_recv().unwrap()["type"], "thinking_start");
+    assert_eq!(rx.try_recv().unwrap()["type"], "thinking_delta");
+    assert_eq!(rx.try_recv().unwrap()["type"], "thinking_done");
 }
 
 #[tokio::test]
@@ -1212,7 +1580,7 @@ async fn build_gemini_body_rejects_invalid_cached_image_data() {
     }];
     let workspace = unique_temp_dir("lingclaw-gemini-bad-image");
 
-    let error = build_gemini_body(&resolved, &messages, &workspace, None, &[], true)
+    let error = build_gemini_body(&resolved, &messages, &workspace, None, &[], true, "off")
         .await
         .expect_err("invalid Gemini image data should fail request construction");
 

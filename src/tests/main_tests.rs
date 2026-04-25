@@ -916,6 +916,7 @@ fn build_history_payload_includes_thinking_only_assistant_messages() {
                 tool_calls: Some(vec![crate::ToolCall {
                     id: "call_abc".into(),
                     call_type: "function".into(),
+                    gemini_thought_signature: None,
                     function: FunctionCall {
                         name: "exec".into(),
                         arguments: "{}".into(),
@@ -981,7 +982,6 @@ fn build_history_payload_includes_thinking_only_assistant_messages() {
         .expect("history should contain the content assistant entry");
     assert!(content_entry.get("thinking").is_none());
 }
-
 
 #[test]
 fn provider_detect_accepts_provider_prefixed_model_refs() {
@@ -2339,6 +2339,7 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
             tool_calls: Some(vec![ToolCall {
                 id: "call-1".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: FunctionCall {
                     name: "exec".into(),
                     arguments: "{}".into(),
@@ -3374,6 +3375,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
                 tool_calls: Some(vec![ToolCall {
                     id: "call_obs".into(),
                     call_type: "function".into(),
+                    gemini_thought_signature: None,
                     function: FunctionCall {
                         name: "exec".into(),
                         arguments: r#"{"command":"ls"}"#.into(),
@@ -6014,6 +6016,7 @@ fn message_token_len_with_tool_calls() {
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
+            gemini_thought_signature: None,
             function: FunctionCall {
                 name: "exec".into(),                 // 4
                 arguments: r#"{"cmd":"ls"}"#.into(), // 12
@@ -6102,6 +6105,7 @@ fn provider_aware_estimate_adds_tool_protocol_overhead() {
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: FunctionCall {
                     name: "exec".into(),
                     arguments: r#"{"cmd":"ls"}"#.into(),
@@ -6341,6 +6345,7 @@ fn turn_len_user_assistant_with_tool_calls_and_results() {
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: FunctionCall {
                     name: "list_dir".into(),
                     arguments: "{}".into(),
@@ -6376,6 +6381,7 @@ fn turn_len_orphan_assistant_with_tool_results() {
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: FunctionCall {
                     name: "exec".into(),
                     arguments: "{}".into(),
@@ -6500,6 +6506,7 @@ fn chat_message_has_tool_calls() {
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
+            gemini_thought_signature: None,
             function: FunctionCall {
                 name: "exec".into(),
                 arguments: "{}".into(),
@@ -6509,6 +6516,22 @@ fn chat_message_has_tool_calls() {
         timestamp: None,
     };
     assert!(with_tc.has_tool_calls());
+}
+
+#[test]
+fn chat_message_with_thinking_is_not_empty_assistant_message() {
+    let msg = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: Some("reasoning summary".into()),
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+
+    assert!(!msg.is_empty_assistant_message());
 }
 
 #[test]
@@ -6602,6 +6625,7 @@ fn prune_messages_removes_complete_tool_turn() {
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: FunctionCall {
                     name: "exec".into(),
                     arguments: big.clone(),
@@ -6677,6 +6701,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
                 ToolCall {
                     id: "tc1".into(),
                     call_type: "function".into(),
+                    gemini_thought_signature: None,
                     function: FunctionCall {
                         name: "exec".into(),
                         arguments: r#"{"cmd":"ls"}"#.into(),
@@ -6685,6 +6710,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
                 ToolCall {
                     id: "tc2".into(),
                     call_type: "function".into(),
+                    gemini_thought_signature: None,
                     function: FunctionCall {
                         name: "read_file".into(),
                         arguments: r#"{"path":"a.txt"}"#.into(),
@@ -6753,6 +6779,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
                 ToolCall {
                     id: "tc1".into(),
                     call_type: "function".into(),
+                    gemini_thought_signature: None,
                     function: FunctionCall {
                         name: "exec".into(),
                         arguments: "{}".into(),
@@ -6761,6 +6788,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
                 ToolCall {
                     id: "tc2".into(),
                     call_type: "function".into(),
+                    gemini_thought_signature: None,
                     function: FunctionCall {
                         name: "read_file".into(),
                         arguments: "{}".into(),

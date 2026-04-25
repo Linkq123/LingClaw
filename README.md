@@ -221,6 +221,7 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 - OpenAI/Anthropic 直接使用现签 URL，因此 `s3.endpoint` 必须能被远端 provider 访问；Gemini/Ollama 路径会在本地预取并转成 base64/inlineData，可用于私网、localhost 或 VPN-only 网关
 - 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容，但 Setup Wizard 不再生成它们；新配置应省略这些字段
 - `models.providers.*.api` 目前支持 `openai-completions`、`anthropic`、`ollama`、`gemini`
+- Gemini 3 使用官方 `generationConfig.thinkingConfig`：`includeThoughts` 控制思考摘要是否流式返回，`thinkingLevel` 映射到 `MINIMAL`/`LOW`/`MEDIUM`/`HIGH`；原生 tool calling 会保留并回传 `functionCall.id`、`functionResponse.id`，并在响应提供真实 `thoughtSignature` 时随原始 `functionCall` part 回传，以兼容并行工具调用与 Gemini 的签名校验
 - Ollama 的 thinking / tool calling 依赖模型能力，推荐优先使用 `qwen3`、`gpt-oss`、`deepseek-r1` 等官方支持模型，而不是把任意本地模型都视为支持深度思考和工具调用
 - 可选的 `mcpServers` 顶层对象可声明 MCP server，例如 `command`、`args`、`env`、`cwd`、`timeoutSecs`
 - `mcpServers.*.cwd` 必须落在当前 session workspace 内；未设置 `timeoutSecs` 时默认继承 `toolTimeout`
@@ -756,21 +757,23 @@ call_llm_stream(http, resolved, messages, tx, think_level, extra_tools)
           └─ call_llm_stream_gemini()
             ├─ convert_messages_to_gemini()
             ├─ tool_definitions_gemini()
+            ├─ Gemini 3 thinkingConfig(thinkingLevel/includeThoughts)
+            ├─ functionCall.id / functionResponse.id / thoughtSignature 回传
             ├─ 图片 inlineData(base64)
             └─ SSE 流解析 → WebSocket 转发
 ```
 
 think_level 映射：
 
-| level | OpenAI reasoning_effort | Anthropic budget_tokens | Ollama think |
-|---|---|---|---|
-| off | — | — | `false`（GPT-OSS 例外，无法完全关闭） |
-| minimal | low | 1024 | `true`；GPT-OSS 映射到 `low` |
-| low | low | 4096 | `true`；GPT-OSS 映射到 `low` |
-| medium | medium | 10240 | `true`；GPT-OSS 映射到 `medium` |
-| high | high | 16384 | `true`；GPT-OSS 映射到 `high` |
-| xhigh | high | 32768 | `true`；GPT-OSS 映射到 `high` |
-| auto | model 支持 reasoning? medium : off | 同左 | model 支持 reasoning? `true` : off |
+| level | OpenAI reasoning_effort | Anthropic budget_tokens | Ollama think | Gemini 3 thinkingLevel |
+|---|---|---|---|---|
+| off | — | — | `false`（GPT-OSS 例外，无法完全关闭） | `MINIMAL`，`includeThoughts=false` |
+| minimal | low | 1024 | `true`；GPT-OSS 映射到 `low` | `MINIMAL` |
+| low | low | 4096 | `true`；GPT-OSS 映射到 `low` | `LOW` |
+| medium | medium | 10240 | `true`；GPT-OSS 映射到 `medium` | `MEDIUM` |
+| high | high | 16384 | `true`；GPT-OSS 映射到 `high` | `HIGH` |
+| xhigh | high | 32768 | `true`；GPT-OSS 映射到 `high` | `HIGH` |
+| auto | model 支持 reasoning? medium : off | 同左 | model 支持 reasoning? `true` : off | 解析后同目标 level |
 
 ### 安全架构
 

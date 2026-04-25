@@ -170,9 +170,16 @@ impl ChatMessage {
             .is_some_and(|blocks| !blocks.is_empty())
     }
 
+    fn has_nonempty_thinking(&self) -> bool {
+        self.thinking
+            .as_deref()
+            .is_some_and(|thinking| !thinking.is_empty())
+    }
+
     fn is_empty_assistant_message(&self) -> bool {
         self.role == "assistant"
             && !self.has_nonempty_content()
+            && !self.has_nonempty_thinking()
             && !self.has_tool_calls()
             && !self.has_anthropic_thinking_blocks()
     }
@@ -183,6 +190,8 @@ struct ToolCall {
     id: String,
     #[serde(rename = "type")]
     call_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gemini_thought_signature: Option<String>,
     function: FunctionCall,
 }
 

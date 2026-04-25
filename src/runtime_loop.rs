@@ -673,7 +673,10 @@ fn effective_think_level(
     consecutive_errors: usize,
 ) -> String {
     if think_level == "auto" {
-        if resolved.reasoning || resolved.thinking_format.is_some() {
+        if resolved.reasoning
+            || resolved.thinking_format.is_some()
+            || providers::gemini_uses_thinking_level(resolved)
+        {
             agent::auto_think_level(
                 cycles,
                 had_observation_hint,

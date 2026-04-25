@@ -403,6 +403,7 @@ fn test_build_conversation_excerpt_includes_tool_calls_and_results() {
             tool_calls: Some(vec![crate::ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: crate::FunctionCall {
                     name: "search_files".into(),
                     arguments: "{}".into(),

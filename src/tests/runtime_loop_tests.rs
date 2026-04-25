@@ -54,6 +54,26 @@ fn test_app_state() -> AppState {
     }
 }
 
+#[test]
+fn effective_think_level_auto_treats_gemini3_as_reasoning_capable() {
+    let resolved = providers::ResolvedModel {
+        provider: Provider::Gemini,
+        api_base: Provider::Gemini.default_api_base().into(),
+        api_key: "gemini-key".into(),
+        model_id: "gemini-3-flash-preview".into(),
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(512),
+        context_window: 1_000_000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+
+    assert_eq!(
+        effective_think_level("auto", &resolved, 0, false, 10, 0),
+        "medium"
+    );
+}
 fn test_app_state_with_config(config: Config) -> AppState {
     AppState {
         config: std::sync::Mutex::new(Arc::new(config)),

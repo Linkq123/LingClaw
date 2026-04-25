@@ -223,11 +223,14 @@ struct GeminiContent {
 #[serde(rename_all = "camelCase")]
 struct GeminiPart {
     text: Option<String>,
+    thought: Option<bool>,
+    thought_signature: Option<String>,
     function_call: Option<GeminiFunctionCall>,
 }
 
 #[derive(Deserialize, Debug)]
 struct GeminiFunctionCall {
+    id: Option<String>,
     name: Option<String>,
     args: Option<Value>,
 }
@@ -298,7 +301,19 @@ fn convert_messages_to_openai(messages: &[ChatMessage]) -> Vec<serde_json::Value
                     "content": msg.content.as_deref().unwrap_or(""),
                 });
                 if let Some(tool_calls) = &msg.tool_calls {
-                    item["tool_calls"] = json!(tool_calls);
+                    item["tool_calls"] = json!(
+                        tool_calls
+                            .iter()
+                            .map(|tool_call| json!({
+                                "id": tool_call.id,
+                                "type": tool_call.call_type,
+                                "function": {
+                                    "name": tool_call.function.name,
+                                    "arguments": tool_call.function.arguments,
+                                }
+                            }))
+                            .collect::<Vec<_>>()
+                    );
                 }
                 out.push(item);
             }
@@ -852,7 +867,9 @@ fn convert_messages_to_gemini(
     let mut contents: Vec<Value> = Vec::new();
     let mut tool_names_by_id: HashMap<String, String> = HashMap::new();
 
-    for msg in messages {
+    let mut index = 0;
+    while index < messages.len() {
+        let msg = &messages[index];
         match msg.role.as_str() {
             "system" => {
                 if let Some(content) = msg.content.as_deref()
@@ -903,12 +920,22 @@ fn convert_messages_to_gemini(
                             tool_names_by_id
                                 .insert(tool_call.id.clone(), tool_call.function.name.clone());
                         }
-                        parts.push(json!({
-                            "functionCall": {
-                                "name": tool_call.function.name,
-                                "args": parse_function_args_object(&tool_call.function.arguments),
-                            }
-                        }));
+                        let mut function_call = json!({
+                            "name": tool_call.function.name,
+                            "args": parse_function_args_object(&tool_call.function.arguments),
+                        });
+                        if !tool_call.id.is_empty() {
+                            function_call["id"] = json!(tool_call.id);
+                        }
+                        let mut part = json!({ "functionCall": function_call });
+                        if let Some(signature) = tool_call
+                            .gemini_thought_signature
+                            .as_deref()
+                            .filter(|signature| !signature.is_empty())
+                        {
+                            part["thoughtSignature"] = json!(signature);
+                        }
+                        parts.push(part);
                     }
                 }
                 if parts.is_empty() {
@@ -917,24 +944,32 @@ fn convert_messages_to_gemini(
                 contents.push(json!({ "role": "model", "parts": parts }));
             }
             "tool" => {
-                let tool_name = msg
-                    .tool_call_id
-                    .as_ref()
-                    .and_then(|id| tool_names_by_id.get(id))
-                    .cloned()
-                    .unwrap_or_else(|| "tool_result".to_string());
-                contents.push(json!({
-                    "role": "user",
-                    "parts": [{
-                        "functionResponse": {
-                            "name": tool_name,
-                            "response": { "content": msg.content.as_deref().unwrap_or("") }
-                        }
-                    }]
-                }));
+                let mut parts = Vec::new();
+                while index < messages.len() && messages[index].role == "tool" {
+                    let tool_msg = &messages[index];
+                    let tool_call_id = tool_msg.tool_call_id.as_deref().unwrap_or("");
+                    let tool_name = tool_msg
+                        .tool_call_id
+                        .as_ref()
+                        .and_then(|id| tool_names_by_id.get(id))
+                        .cloned()
+                        .unwrap_or_else(|| "tool_result".to_string());
+                    let mut function_response = json!({
+                        "name": tool_name,
+                        "response": { "content": tool_msg.content.as_deref().unwrap_or("") }
+                    });
+                    if !tool_call_id.is_empty() {
+                        function_response["id"] = json!(tool_call_id);
+                    }
+                    parts.push(json!({ "functionResponse": function_response }));
+                    index += 1;
+                }
+                contents.push(json!({ "role": "user", "parts": parts }));
+                continue;
             }
             _ => {}
         }
+        index += 1;
     }
 
     let system_instruction = if system_parts.is_empty() {
@@ -1170,6 +1205,7 @@ async fn build_gemini_body(
     s3_cfg: Option<&crate::config::S3Config>,
     extra_tools: &[serde_json::Value],
     include_builtin_tools: bool,
+    think_level: &str,
 ) -> Result<serde_json::Value, String> {
     let messages = materialize_image_urls(messages, s3_cfg)?;
     let images_b64 = fetch_images_base64(&messages, workspace, s3_cfg, true).await?;
@@ -1189,8 +1225,21 @@ async fn build_gemini_body(
     if !all_tools.is_empty() {
         body["tools"] = json!([{ "functionDeclarations": all_tools }]);
     }
+    let mut generation_config = serde_json::Map::new();
     if let Some(max_tokens) = resolved.max_tokens {
-        body["generationConfig"] = json!({ "maxOutputTokens": max_tokens });
+        generation_config.insert("maxOutputTokens".to_string(), json!(max_tokens));
+    }
+    if gemini_uses_thinking_level(resolved) {
+        generation_config.insert(
+            "thinkingConfig".to_string(),
+            json!({
+                "includeThoughts": think_level != "off",
+                "thinkingLevel": think_level_to_gemini_thinking_level(think_level),
+            }),
+        );
+    }
+    if !generation_config.is_empty() {
+        body["generationConfig"] = Value::Object(generation_config);
     }
     Ok(body)
 }
@@ -1307,7 +1356,8 @@ pub(crate) async fn call_llm_simple_with_usage(
         }
         Provider::Gemini => {
             let url = gemini_generate_url(&resolved.api_base, &resolved.model_id, false);
-            let body = build_gemini_body(resolved, messages, workspace, s3_cfg, &[], false).await?;
+            let body =
+                build_gemini_body(resolved, messages, workspace, s3_cfg, &[], false, "off").await?;
             let resp = send_with_retry(http, max_retries, || {
                 with_optional_gemini_auth(http.post(&url), &resolved.api_key).json(&body)
             })
@@ -1385,6 +1435,24 @@ fn think_level_to_ollama_level(level: &str) -> &'static str {
     }
 }
 
+fn think_level_to_gemini_thinking_level(level: &str) -> &'static str {
+    match level {
+        "off" | "minimal" => "MINIMAL",
+        "low" => "LOW",
+        "medium" => "MEDIUM",
+        "high" | "xhigh" => "HIGH",
+        _ => "HIGH",
+    }
+}
+
+pub(crate) fn gemini_uses_thinking_level(resolved: &ResolvedModel) -> bool {
+    resolved
+        .model_id
+        .trim()
+        .to_ascii_lowercase()
+        .contains("gemini-3")
+}
+
 fn ollama_uses_think_levels(resolved: &ResolvedModel) -> bool {
     resolved
         .thinking_format
@@ -1453,7 +1521,10 @@ pub(crate) async fn call_llm_stream(
 ) -> Result<LlmResponse, String> {
     // Resolve "auto": enable thinking at medium level if model supports it, else off
     let effective_level = if think_level == "auto" {
-        if resolved.reasoning || resolved.thinking_format.is_some() {
+        if resolved.reasoning
+            || resolved.thinking_format.is_some()
+            || gemini_uses_thinking_level(resolved)
+        {
             "medium"
         } else {
             "off"
@@ -1510,6 +1581,7 @@ pub(crate) async fn call_llm_stream(
                 workspace,
                 s3_cfg,
                 tx,
+                effective_level,
                 extra_tools,
                 max_retries,
             )
@@ -1587,6 +1659,7 @@ async fn process_openai_data_line(data: &str, tx: &LiveTx, state: &mut OpenAiStr
                             state.tool_calls.push(ToolCall {
                                 id: String::new(),
                                 call_type: "function".into(),
+                                gemini_thought_signature: None,
                                 function: FunctionCall {
                                     name: String::new(),
                                     arguments: String::new(),
@@ -1692,6 +1765,7 @@ async fn process_anthropic_sse_line(line: &str, tx: &LiveTx, state: &mut Anthrop
                             state.tool_calls.push(ToolCall {
                                 id: block.id.clone().unwrap_or_default(),
                                 call_type: "function".into(),
+                                gemini_thought_signature: None,
                                 function: FunctionCall {
                                     name: block.name.clone().unwrap_or_default(),
                                     arguments: String::new(),
@@ -1844,6 +1918,7 @@ async fn process_ollama_json_line(data: &str, tx: &LiveTx, state: &mut OpenAiStr
                 state.tool_calls.push(ToolCall {
                     id: format!("ollama_call_{}", idx + 1),
                     call_type: "function".into(),
+                    gemini_thought_signature: None,
                     function: FunctionCall {
                         name: String::new(),
                         arguments: "{}".into(),
@@ -1900,19 +1975,44 @@ async fn process_gemini_data_line(
             if let Some(text) = part.text
                 && !text.is_empty()
             {
-                state.content_buf.push_str(&text);
-                if !state.client_gone
-                    && !live_send(tx, json!({"type":"delta","content":text})).await
-                {
-                    state.client_gone = true;
+                if part.thought.unwrap_or(false) {
+                    if !state.reasoning_started && !state.client_gone {
+                        state.reasoning_started = true;
+                        state.client_gone = !live_send(tx, json!({"type":"thinking_start"})).await;
+                    }
+                    state.thinking_buf.push_str(&text);
+                    if !state.client_gone
+                        && !live_send(tx, json!({"type":"thinking_delta","content":text})).await
+                    {
+                        state.client_gone = true;
+                    }
+                } else {
+                    if state.reasoning_started && !state.client_gone {
+                        state.reasoning_started = false;
+                        state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+                    }
+                    state.content_buf.push_str(&text);
+                    if !state.client_gone
+                        && !live_send(tx, json!({"type":"delta","content":text})).await
+                    {
+                        state.client_gone = true;
+                    }
                 }
             }
             if let Some(function_call) = part.function_call {
+                if state.reasoning_started && !state.client_gone {
+                    state.reasoning_started = false;
+                    state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+                }
                 let idx = state.tool_calls.len();
                 let arguments = function_call.args.unwrap_or_else(|| json!({}));
                 state.tool_calls.push(ToolCall {
-                    id: format!("gemini_call_{}", idx + 1),
+                    id: function_call
+                        .id
+                        .filter(|id| !id.trim().is_empty())
+                        .unwrap_or_else(|| format!("gemini_call_{}", idx + 1)),
                     call_type: "function".into(),
+                    gemini_thought_signature: part.thought_signature,
                     function: FunctionCall {
                         name: function_call.name.unwrap_or_default(),
                         arguments: serde_json::to_string(&arguments)
@@ -2452,11 +2552,21 @@ async fn call_llm_stream_gemini(
     workspace: &Path,
     s3_cfg: Option<&crate::config::S3Config>,
     tx: &LiveTx,
+    think_level: &str,
     extra_tools: &[serde_json::Value],
     max_retries: usize,
 ) -> Result<LlmResponse, String> {
     let url = gemini_generate_url(&resolved.api_base, &resolved.model_id, true);
-    let body = build_gemini_body(resolved, messages, workspace, s3_cfg, extra_tools, true).await?;
+    let body = build_gemini_body(
+        resolved,
+        messages,
+        workspace,
+        s3_cfg,
+        extra_tools,
+        true,
+        think_level,
+    )
+    .await?;
 
     let resp = send_with_retry(http, max_retries, || {
         with_optional_gemini_auth(http.post(&url), &resolved.api_key).json(&body)
@@ -2476,6 +2586,9 @@ async fn call_llm_stream_gemini(
     };
     consume_gemini_stream(&mut stream, tx, &mut stream_state).await?;
 
+    if stream_state.reasoning_started && !stream_state.client_gone {
+        stream_state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+    }
     if stream_state.client_gone {
         return Err("Client disconnected".into());
     }
