@@ -378,7 +378,7 @@ export function closeSubagentModal() {
     panel.querySelector('.subagent-header')?.setAttribute('aria-expanded', 'false');
     panel.querySelector('.subagent-modal-close')?.setAttribute('tabindex', '-1');
     panel.querySelector('.subagent-body')?.classList.remove('show');
-    const body = panel.querySelector<HTMLElement>('.subagent-body');
+    const body = panel.querySelector('.subagent-body') as HTMLElement | null;
     if (body) {
       body.style.height = '';
       body.setAttribute('inert', '');
@@ -397,7 +397,7 @@ export function openSubagentModal(trigger) {
   panel.classList.add('subagent-modal-open');
   panel.querySelector('.subagent-header')?.setAttribute('aria-expanded', 'true');
   panel.querySelector('.subagent-modal-close')?.removeAttribute('tabindex');
-  const body = panel.querySelector<HTMLElement>('.subagent-body');
+  const body = panel.querySelector('.subagent-body') as HTMLElement | null;
   if (body) {
     body.removeAttribute('inert');
     body.classList.add('show');

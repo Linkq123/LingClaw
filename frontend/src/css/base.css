@@ -2,7 +2,11 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg: #f5f7fb;
+  --bg: #f4f7fb;
+  --bg-deep: #e9f0f8;
+  --bg-wash-a: rgba(45,139,207,.14);
+  --bg-wash-b: rgba(214,106,152,.12);
+  --bg-wash-c: rgba(82,184,158,.10);
   --surface: #ffffff;
   --surface2: #eef2f8;
   --glass-surface: rgba(255,255,255,.76);
@@ -30,9 +34,10 @@
 body {
   font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
   background:
-    linear-gradient(135deg, rgba(45,139,207,.08), transparent 34%),
-    linear-gradient(215deg, rgba(192,107,158,.08), transparent 38%),
-    linear-gradient(180deg, #f8f9fc 0%, var(--bg) 45%, #eef3f9 100%);
+    linear-gradient(125deg, var(--bg-wash-a) 0%, transparent 34%),
+    linear-gradient(230deg, transparent 0%, var(--bg-wash-b) 46%, transparent 86%),
+    linear-gradient(330deg, transparent 4%, var(--bg-wash-c) 68%, transparent 100%),
+    linear-gradient(180deg, #fbfcff 0%, var(--bg) 42%, var(--bg-deep) 100%);
   color: var(--text);
   /* `100vh` leaves whitespace below the composer on iOS Safari when the URL
      bar collapses; `100dvh` tracks the real viewport. Keep `100vh` as the
@@ -41,6 +46,31 @@ body {
   height: 100dvh;
   display: flex;
   overflow: hidden;
+  isolation: isolate;
+}
+body::before,
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+body::before {
+  z-index: 0;
+  background:
+    linear-gradient(115deg, rgba(255,255,255,.62), rgba(255,255,255,.10) 40%, transparent 70%),
+    repeating-linear-gradient(90deg, rgba(255,255,255,.16) 0 1px, transparent 1px 72px),
+    repeating-linear-gradient(0deg, rgba(45,139,207,.05) 0 1px, transparent 1px 72px);
+  mask-image: linear-gradient(180deg, rgba(0,0,0,.72), rgba(0,0,0,.20));
+  -webkit-mask-image: linear-gradient(180deg, rgba(0,0,0,.72), rgba(0,0,0,.20));
+}
+body::after {
+  z-index: 0;
+  inset: 18px;
+  border: 1px solid rgba(255,255,255,.32);
+  border-radius: 28px;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.50), 0 28px 80px rgba(54,66,98,.08);
+  opacity: .72;
 }
 
 /* ── Accessibility helpers ── */
@@ -94,8 +124,8 @@ body {
 /* ── Animations ── */
 @keyframes blink { 50% { opacity: 0; } }
 @keyframes msgSlideIn {
-  from { opacity: 0; transform: translateY(12px); }
-  to   { opacity: 1; transform: translateY(0); }
+  from { opacity: 1; transform: none; }
+  to   { opacity: 1; transform: none; }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .5; } }

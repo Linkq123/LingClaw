@@ -381,6 +381,72 @@ export function decorateCodeBlocks(container) {
   });
 }
 
+function decorateTables(container) {
+  container.querySelectorAll('table').forEach((table) => {
+    if (table.parentElement?.classList.contains('markdown-table-wrap')) {
+      return;
+    }
+    const wrap = document.createElement('div');
+    wrap.className = 'markdown-table-wrap';
+    table.parentNode?.insertBefore(wrap, table);
+    wrap.appendChild(table);
+  });
+}
+
+function countGfmTables(raw) {
+  const lines = raw.split('\n');
+  let inFence = false;
+  let tableCount = 0;
+
+  for (let index = 0; index < lines.length - 1; index += 1) {
+    const line = lines[index];
+    const nextLine = lines[index + 1];
+    const trimmed = line.trimStart();
+
+    if (trimmed.startsWith('```')) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+
+    if (!line.includes('|')) continue;
+    if (/^\s*\|?(?:\s*:?-{3,}:?\s*\|)+(?:\s*:?-{3,}:?\s*)?\|?\s*$/.test(nextLine)) {
+      tableCount += 1;
+      index += 1;
+    }
+  }
+
+  return tableCount;
+}
+
+export function needsFinalMarkdownRender(el, raw) {
+  const text = el.textContent || '';
+
+  if (countGfmTables(raw) > el.querySelectorAll('.markdown-table-wrap table').length) {
+    return true;
+  }
+  if (/(^|\n)\s{0,3}#{1,6}\s+\S/.test(raw) && !el.querySelector('h1, h2, h3, h4, h5, h6')) {
+    return true;
+  }
+  if (/(^|\n)\s*>\s+\S/.test(raw) && !el.querySelector('blockquote')) {
+    return true;
+  }
+  if (/(^|\n)\s*[-*+]\s+\S/.test(raw) && !el.querySelector('ul')) {
+    return true;
+  }
+  if (/(^|\n)\s*\d+\.\s+\S/.test(raw) && !el.querySelector('ol')) {
+    return true;
+  }
+  if (/\[[^\]]+\]\([^\)]+\)/.test(raw) && /\[[^\]]+\]\([^\)]+\)/.test(text)) {
+    return true;
+  }
+  if (/(\*\*|__|~~)/.test(raw) && /(\*\*|__|~~)/.test(text)) {
+    return true;
+  }
+
+  return false;
+}
+
 export async function appendRenderedSegment(el, markdownText) {
   const { marked, DOMPurify, katex } = await loadMarkdownDeps();
   const { text: preprocessed, blocks: mathBlocks } = extractMath(markdownText);
@@ -392,6 +458,7 @@ export async function appendRenderedSegment(el, markdownText) {
     a.setAttribute('target', '_blank');
     a.setAttribute('rel', 'noopener noreferrer');
   });
+  decorateTables(temp);
   decorateCodeBlocks(temp);
   const codeBlocks = [...temp.querySelectorAll('pre code')];
   const tail = el._liveTail;
@@ -518,6 +585,7 @@ export async function renderMarkdown(el) {
   });
   el._markdownIdleHandle = 0;
 
+  decorateTables(el);
   decorateCodeBlocks(el);
   scheduleCodeHighlight(el.querySelectorAll('pre code'));
   el._markdownRenderedRaw = raw;

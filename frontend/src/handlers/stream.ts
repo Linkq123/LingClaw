@@ -4,9 +4,10 @@ import { scrollDown, isChatNearBottom, invalidateChatScrollCache } from '../scro
 import {
   findProgressiveSplitPoint,
   appendRenderedSegment,
+  needsFinalMarkdownRender,
   updateLiveTail,
   removeLiveTail,
-  scheduleMarkdownRender,
+  renderMarkdown,
 } from '../markdown.js';
 
 function revealAssistantMessage(message) {
@@ -197,12 +198,18 @@ export function finishAssistantStream({ discardIfEmpty = false } = {}) {
       } else {
         removeLiveTail(message);
       }
-      message._markdownRenderedRaw = rawText;
+      if (needsFinalMarkdownRender(message, rawText)) {
+        await renderMarkdown(message);
+      } else {
+        message._markdownRenderedRaw = rawText;
+      }
+      message._renderedOffset = rawText.length;
       return;
     }
 
     if (message._rawText === rawText) {
-      scheduleMarkdownRender(message);
+      await renderMarkdown(message);
+      message._renderedOffset = rawText.length;
       invalidateChatScrollCache();
     }
   });

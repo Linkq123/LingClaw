@@ -181,6 +181,10 @@
    so CSS only needs to switch on this explicit attribute. */
 :root[data-theme='dark'] {
   --bg: #1a1c2e;
+  --bg-deep: #101422;
+  --bg-wash-a: rgba(91,163,230,.16);
+  --bg-wash-b: rgba(216,138,174,.12);
+  --bg-wash-c: rgba(56,201,122,.08);
   --surface: #232540;
   --surface2: #2c2e4a;
   --glass-surface: rgba(35,37,64,.76);
@@ -209,6 +213,21 @@
 
 :root[data-theme='dark'] .msg.assistant blockquote {
   border-left-color: color-mix(in srgb, var(--accent2) 45%, var(--border));
+  background: linear-gradient(90deg, color-mix(in srgb, var(--accent2) 12%, transparent), transparent);
+}
+
+:root[data-theme='dark'] .msg.assistant .markdown-table-wrap {
+  background: linear-gradient(180deg, rgba(38,40,68,.96), rgba(31,33,58,.92));
+  border-color: color-mix(in srgb, var(--accent2) 24%, var(--border));
+  box-shadow: 0 10px 26px rgba(0,0,0,.18);
+}
+
+:root[data-theme='dark'] .msg.assistant .markdown-table-wrap thead {
+  background: linear-gradient(180deg, rgba(91,163,230,.18), rgba(91,163,230,.08));
+}
+
+:root[data-theme='dark'] .msg.assistant .markdown-table-wrap tbody tr:nth-child(even) {
+  background: color-mix(in srgb, var(--accent2) 8%, transparent);
 }
 
 :root[data-theme='dark'] .react-status-card {

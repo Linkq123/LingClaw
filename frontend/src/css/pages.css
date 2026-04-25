@@ -347,7 +347,7 @@
   font-weight: 700;
   color: var(--accent2);
   font-family: var(--font-mono);
-  letter-spacing: -.04em;
+  letter-spacing: 0;
   line-height: 1;
 }
 .usage-stat-label {

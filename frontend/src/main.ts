@@ -190,13 +190,7 @@ function updateUsageBadge() {
   dom.usageBadge.title = `今日: ${formatTokenCount(inp)} input, ${formatTokenCount(out)} output\n累计: ${formatTokenCount(state.totalInputTokens)} input, ${formatTokenCount(state.totalOutputTokens)} output`;
 }
 
-function appendRoundUsage(
-  messageEl,
-  inputTokens,
-  outputTokens,
-  firstTokenMs = null,
-  totalMs = null,
-) {
+function appendRoundUsage(messageEl, inputTokens, outputTokens, firstTokenMs = null) {
   const lastAssistantRow = messageEl ? messageEl.closest('.msg-row') : null;
   if (!lastAssistantRow) return;
   const content = lastAssistantRow.querySelector('.msg-content');
@@ -206,7 +200,6 @@ function appendRoundUsage(
   label.className = 'msg-usage';
   const parts = [`${formatTokenCount(inputTokens)} in / ${formatTokenCount(outputTokens)} out`];
   if (firstTokenMs != null) parts.push(`首 token ${formatToolDuration(firstTokenMs)}`);
-  if (totalMs != null) parts.push(`总耗时 ${formatToolDuration(totalMs)}`);
   label.replaceChildren(
     ...parts.map((part) => {
       const item = document.createElement('span');
@@ -218,7 +211,6 @@ function appendRoundUsage(
     `Input: ${inputTokens.toLocaleString()} tokens`,
     `Output: ${outputTokens.toLocaleString()} tokens`,
     firstTokenMs != null ? `First token latency: ${formatToolDuration(firstTokenMs)}` : '',
-    totalMs != null ? `Total output time: ${formatToolDuration(totalMs)}` : '',
   ]
     .filter(Boolean)
     .join('\n');
@@ -536,19 +528,14 @@ function handleMessage(data) {
         updateUsageBadge();
       }
       if (data.round_input_tokens != null || data.round_output_tokens != null) {
-        const finishedAt = performance.now();
         const firstTokenMs = state.currentRoundFirstTokenAt
           ? Math.max(0, state.currentRoundFirstTokenAt - state.currentRoundStartedAt)
-          : null;
-        const totalMs = state.currentRoundStartedAt
-          ? Math.max(0, finishedAt - state.currentRoundStartedAt)
           : null;
         appendRoundUsage(
           finishedAssistantMsg,
           data.round_input_tokens ?? 0,
           data.round_output_tokens ?? 0,
           firstTokenMs,
-          totalMs,
         );
       }
       state.currentRoundStartedAt = 0;

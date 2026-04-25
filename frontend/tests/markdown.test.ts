@@ -1,10 +1,20 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
 import {
   extractMath,
   findProgressiveSplitPoint,
   isSentenceSplitChar,
+  needsFinalMarkdownRender,
+  preloadMarkdownEngine,
   renderMarkdown,
 } from '../src/markdown.js';
+import { finishAssistantStream } from '../src/handlers/stream.js';
+import { state } from '../src/state.js';
+
+afterEach(() => {
+  state.currentMsg = null;
+  state.pendingAssistantText = '';
+  document.body.innerHTML = '';
+});
 
 describe('extractMath', () => {
   it('extracts inline math', () => {
@@ -100,5 +110,173 @@ describe('renderMarkdown memoization', () => {
     await renderMarkdown(el);
 
     expect(el.querySelector('strong')?.textContent).toBe('second');
+  });
+
+  it('wraps gfm tables for horizontal scrolling and styling', async () => {
+    const el = document.createElement('div');
+    el._rawText = [
+      '| # | 热点 | 核心内容 |',
+      '| --- | --- | --- |',
+      '| 1 | OpenAI | 发布新模型 |',
+    ].join('\n');
+
+    await renderMarkdown(el);
+
+    const wrap = el.querySelector('.markdown-table-wrap');
+    expect(wrap).not.toBeNull();
+    expect(wrap?.querySelector('table')).not.toBeNull();
+    expect(el.querySelectorAll('thead th')).toHaveLength(3);
+    expect(el.querySelector('tbody td')?.textContent).toBe('1');
+  });
+
+  it('renders common markdown blocks and inline elements', async () => {
+    const el = document.createElement('div');
+    el._rawText = [
+      '# 标题',
+      '',
+      '包含 **加粗**、*强调*、`inline` 和 [链接](https://example.com)。',
+      '',
+      '> 引用内容',
+      '',
+      '- [x] 已完成任务',
+      '- 普通列表',
+      '',
+      '1. 有序项目',
+      '',
+      '```ts',
+      'const value = 1;',
+      '```',
+      '',
+      '---',
+      '',
+      '![示例图片](https://example.com/image.png)',
+    ].join('\n');
+
+    await renderMarkdown(el);
+
+    expect(el.querySelector('h1')?.textContent).toBe('标题');
+    expect(el.querySelector('strong')?.textContent).toBe('加粗');
+    expect(el.querySelector('em')?.textContent).toBe('强调');
+    expect(el.querySelector('p code')?.textContent).toBe('inline');
+    expect(el.querySelector('a')?.getAttribute('target')).toBe('_blank');
+    expect(el.querySelector('a')?.getAttribute('rel')).toBe('noopener noreferrer');
+    expect(el.querySelector('blockquote')?.textContent).toContain('引用内容');
+    expect(el.querySelector('input[type="checkbox"]')).not.toBeNull();
+    expect(el.querySelector('ol li')?.textContent).toContain('有序项目');
+    expect(el.querySelector('pre code')?.textContent).toContain('const value = 1;');
+    expect(el.querySelector('hr')).not.toBeNull();
+    expect(el.querySelector('img')?.getAttribute('alt')).toBe('示例图片');
+  });
+});
+
+describe('needsFinalMarkdownRender', () => {
+  it('returns false for plain text that already rendered cleanly', () => {
+    const el = document.createElement('div');
+    el.innerHTML = '<p>这是一段已经稳定显示的正文。</p>';
+
+    expect(needsFinalMarkdownRender(el, '这是一段已经稳定显示的正文。')).toBe(false);
+  });
+
+  it('detects unresolved table markdown when no table element exists yet', () => {
+    const el = document.createElement('div');
+    el.innerHTML = '<p>| # | 热点 | 核心内容 |</p><p>| --- | --- | --- |</p>';
+
+    expect(
+      needsFinalMarkdownRender(
+        el,
+        ['| # | 热点 | 核心内容 |', '| --- | --- | --- |', '| 1 | OpenAI | 发布新模型 |'].join(
+          '\n',
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it('detects unresolved later tables even when an earlier table rendered', () => {
+    const el = document.createElement('div');
+    el.innerHTML = [
+      '<div class="markdown-table-wrap"><table><tbody><tr><td>1</td></tr></tbody></table></div>',
+      '<p>| Name | Value |</p><p>| --- | --- |</p>',
+    ].join('');
+
+    expect(
+      needsFinalMarkdownRender(
+        el,
+        [
+          '| # | Item |',
+          '| --- | --- |',
+          '| 1 | First |',
+          '',
+          '| Name | Value |',
+          '| --- | --- |',
+          '| Second | Pending |',
+        ].join('\n'),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe('finishAssistantStream markdown finalization', () => {
+  it('re-renders segmented table markdown as a final table', async () => {
+    await preloadMarkdownEngine();
+
+    const row = document.createElement('div');
+    row.className = 'msg-row assistant';
+    row.hidden = true;
+
+    const message = document.createElement('div');
+    message.className = 'msg assistant';
+    message._rawText = [
+      '今日热点日报',
+      '',
+      '| # | 热点 | 核心内容 |',
+      '| --- | --- | --- |',
+      '| 1 | OpenAI | 发布新模型 |',
+      '| 2 | Gemini | 网关修复 |',
+    ].join('\n');
+    message._renderedOffset = 18;
+    message.innerHTML = '<p>今日热点日报</p><p>| # | 热点 | 核心内容 |</p>';
+
+    row.appendChild(message);
+    document.body.appendChild(row);
+    state.currentMsg = message;
+
+    const result = finishAssistantStream();
+    expect(result).toBe(message);
+
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await Promise.resolve();
+
+    expect(row.hidden).toBe(false);
+    expect(message.querySelector('.markdown-table-wrap table')).not.toBeNull();
+    expect(message.querySelectorAll('tbody tr')).toHaveLength(2);
+  });
+
+  it('keeps already-rendered plain text DOM when no final markdown correction is needed', async () => {
+    await preloadMarkdownEngine();
+
+    const row = document.createElement('div');
+    row.className = 'msg-row assistant';
+    row.hidden = true;
+
+    const message = document.createElement('div');
+    message.className = 'msg assistant';
+    message._rawText = '第一段已经渲染完成。\n\n第二段也是普通正文。';
+    message._renderedOffset = message._rawText.length;
+    message.innerHTML =
+      '<p>第一段已经渲染完成。</p><p>第二段也是普通正文。</p><span data-test-marker="keep"></span>';
+
+    row.appendChild(message);
+    document.body.appendChild(row);
+    state.currentMsg = message;
+
+    const result = finishAssistantStream();
+    expect(result).toBe(message);
+
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await Promise.resolve();
+
+    expect(message.querySelector('[data-test-marker="keep"]')).not.toBeNull();
   });
 });
