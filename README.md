@@ -651,7 +651,7 @@ frontend/                         — 前端源码 (TypeScript + React, Vite 构
 │   │   ├── react-status.ts       — ReAct 状态指示器
 │   │   └── timeline.ts           — 时间线动画
 │   └── css/                      — 模块化样式 (base, layout, chat, panels, pages, responsive)
-├── tests/                        — Vitest 单元测试 (27 tests: utils + markdown)
+├── tests/                        — Vitest 单元测试 (80 tests: utils + markdown)
 ├── tsconfig.json                 — TypeScript 配置
 ├── vite.config.ts                — Vite 构建配置 (输出到 ../static/)
 ├── eslint.config.js              — ESLint flat config + Prettier

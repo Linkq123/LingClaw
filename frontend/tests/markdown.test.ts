@@ -83,6 +83,43 @@ describe('findProgressiveSplitPoint', () => {
     const text = '```js\nconsole.log("hi")\n```\nAfter code.';
     expect(findProgressiveSplitPoint(text)).toBeGreaterThan(0);
   });
+
+  it('startFrom: incremental scan from intermediate boundary agrees with full scan', () => {
+    // Four paragraphs — full scan finds the boundary before the last paragraph.
+    const text = 'First paragraph.\n\nSecond paragraph.\n\nThird paragraph.\n\nFourth.';
+    const full = findProgressiveSplitPoint(text);
+    expect(full).toBeGreaterThan(0);
+    // Scan from the boundary BEFORE the third paragraph (position 36).
+    // Should find the same final boundary as the full scan.
+    const incremental = findProgressiveSplitPoint(text, 36);
+    expect(incremental).toBe(full);
+    expect(incremental).toBeGreaterThan(36);
+  });
+
+  it('startFrom: returns startFrom when no further boundary exists', () => {
+    // Text ends right after the first paragraph with no further double-newline.
+    const text = 'Para one.\n\nTail.';
+    const full = findProgressiveSplitPoint(text);
+    expect(full).toBeGreaterThan(0);
+    // Resume from that boundary — nothing beyond, so result equals startFrom.
+    const incremental = findProgressiveSplitPoint(text, full);
+    expect(incremental).toBe(full);
+  });
+
+  it('startFrom: handles soft split as a valid resume point', () => {
+    // A long paragraph ending in a sentence split, followed by two more paragraphs.
+    const line1 =
+      'This is a fairly long sentence that exceeds the minimum chars threshold. And this follows.';
+    const text = line1 + '\n\nSecond paragraph.\n\nThird paragraph.';
+    const full = findProgressiveSplitPoint(text);
+    expect(full).toBeGreaterThan(0);
+    // Resume from the paragraph boundary after line1 (len(line1) + 2 = position of "Second").
+    const midOffset = line1.length + 2;
+    const incremental = findProgressiveSplitPoint(text, midOffset);
+    // Should find the boundary before "Third paragraph.", same as full scan.
+    expect(incremental).toBe(full);
+    expect(incremental).toBeGreaterThan(midOffset);
+  });
 });
 
 describe('renderMarkdown memoization', () => {

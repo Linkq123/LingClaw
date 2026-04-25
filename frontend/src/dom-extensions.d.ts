@@ -9,7 +9,6 @@ declare global {
     _renderedOffset?: number;
     _markdownRenderedRaw?: string;
     _liveTail?: HTMLElement | null;
-    _markdownIdleHandle?: number;
     _markdownShouldFollow?: boolean;
     _focusFlashTimer?: number;
     _resetLabelTimer?: number;

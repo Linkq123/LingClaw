@@ -69,18 +69,6 @@ export function preloadMarkdownEngine(): Promise<void> {
 
 // ── Markdown rendering queue ──
 
-function cancelScheduledMarkdownRender(el) {
-  if (!el) return;
-  if (el._markdownIdleHandle) {
-    if (typeof cancelIdleCallback === 'function') {
-      cancelIdleCallback(el._markdownIdleHandle);
-    } else {
-      clearTimeout(el._markdownIdleHandle);
-    }
-    el._markdownIdleHandle = 0;
-  }
-}
-
 function shouldHighlightBlock(block, index, totalBlocks) {
   const code = block.textContent || '';
   if (code.length > 4000) return false;
@@ -93,6 +81,8 @@ export function scheduleCodeHighlight(blocks) {
   void loadMarkdownDeps()
     .then(({ hljs }) => {
       const highlightQueue = codeBlocks.filter((block, index) => {
+        // Block already processed by hljs — silently skip, no deferred marker.
+        if (block.classList.contains('hljs')) return false;
         if (!block.isConnected || !shouldHighlightBlock(block, index, codeBlocks.length)) {
           block.classList.add('code-highlight-deferred');
           return false;
@@ -131,7 +121,6 @@ export function scheduleMarkdownRender(el, options: { followScroll?: boolean } =
   if (el._markdownRenderedRaw === raw && !el.classList.contains('markdown-pending')) {
     return;
   }
-  cancelScheduledMarkdownRender(el);
   const queuedIndex = state.markdownRenderQueue.indexOf(el);
   if (queuedIndex !== -1) {
     state.markdownRenderQueue.splice(queuedIndex, 1);
@@ -149,21 +138,26 @@ export function scheduleMarkdownRender(el, options: { followScroll?: boolean } =
 
 async function processMarkdownQueue() {
   state.markdownQueueHandle = 0;
-  const el = state.markdownRenderQueue.shift();
-  if (!el) return;
-  el._markdownIdleHandle = 0;
-  if (el.isConnected) {
+  // Process multiple elements per scheduling callback, capped at a 12 ms
+  // time budget so the main thread stays responsive during history loads.
+  const deadline = performance.now() + 12;
+  while (state.markdownRenderQueue.length) {
+    const el = state.markdownRenderQueue.shift()!;
     try {
-      await renderMarkdown(el);
-      if (el._markdownShouldFollow) scrollDown();
+      if (el.isConnected) {
+        await renderMarkdown(el);
+        if (el._markdownShouldFollow) scrollDown();
+      }
     } catch (error) {
       console.warn('Markdown render failed:', error);
     } finally {
+      // Always clean up state regardless of connection status.
       el.classList.remove('markdown-pending');
+      el._markdownShouldFollow = false;
       invalidateChatScrollCache();
     }
+    if (performance.now() > deadline) break;
   }
-  el._markdownShouldFollow = false;
   if (state.markdownRenderQueue.length) {
     state.markdownQueueHandle = scheduleBackgroundTask(processMarkdownQueue);
   }
@@ -186,12 +180,22 @@ export function isSentenceSplitChar(text, index) {
   return false;
 }
 
-export function findProgressiveSplitPoint(text) {
+/**
+ * Find the latest safe split point in `text`.
+ * @param startFrom Resume scanning from this offset. The offset must be
+ *   outside a code fence (`inFence=false`). Both hard paragraph/fence
+ *   boundaries and soft sentence-split positions are valid start offsets.
+ *   Defaults to 0 (full scan).
+ */
+export function findProgressiveSplitPoint(text: string, startFrom = 0): number {
   let inFence = false;
-  let lastSplit = -1;
+  // At a known-clean boundary we treat it as a hard split so any newly found
+  // split will be > startFrom. Use -1 when startFrom is 0 so the empty-string
+  // case still returns -1.
+  let lastSplit = startFrom > 0 ? startFrom : -1;
   let lastSoftSplit = -1;
   let charsSinceBoundary = 0;
-  let i = 0;
+  let i = startFrom;
   while (i < text.length) {
     const atLineStart = i === 0 || text[i - 1] === '\n';
     if (
@@ -420,8 +424,6 @@ function countGfmTables(raw) {
 }
 
 export function needsFinalMarkdownRender(el, raw) {
-  const text = el.textContent || '';
-
   if (countGfmTables(raw) > el.querySelectorAll('.markdown-table-wrap table').length) {
     return true;
   }
@@ -437,12 +439,12 @@ export function needsFinalMarkdownRender(el, raw) {
   if (/(^|\n)\s*\d+\.\s+\S/.test(raw) && !el.querySelector('ol')) {
     return true;
   }
-  if (/\[[^\]]+\]\([^\)]+\)/.test(raw) && /\[[^\]]+\]\([^\)]+\)/.test(text)) {
+  if (/\[[^\]]+\]\([^)]+\)/.test(raw) && !el.querySelector('a[href]')) {
     return true;
   }
-  if (/(\*\*|__|~~)/.test(raw) && /(\*\*|__|~~)/.test(text)) {
-    return true;
-  }
+  if (/\*\*\S/.test(raw) && !el.querySelector('strong, b')) return true;
+  if (/(^|\s)__\S/.test(raw) && !el.querySelector('strong')) return true;
+  if (/~~\S/.test(raw) && !el.querySelector('s, del')) return true;
 
   return false;
 }
@@ -583,7 +585,6 @@ export async function renderMarkdown(el) {
     a.setAttribute('target', '_blank');
     a.setAttribute('rel', 'noopener noreferrer');
   });
-  el._markdownIdleHandle = 0;
 
   decorateTables(el);
   decorateCodeBlocks(el);

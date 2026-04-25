@@ -40,7 +40,7 @@ async function flushAssistantText() {
   const message = state.currentMsg;
   const raw = message._rawText;
   const offset = message._renderedOffset || 0;
-  const splitAt = findProgressiveSplitPoint(raw);
+  const splitAt = findProgressiveSplitPoint(raw, offset);
 
   if (splitAt > offset) {
     await enqueueAssistantRender(async () => {
