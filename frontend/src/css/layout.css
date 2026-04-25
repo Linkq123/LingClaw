@@ -37,7 +37,7 @@ header {
 header .session-name {
   font-size: 14px;
   font-weight: 700;
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -60,15 +60,20 @@ header .session-id { font-size: 11px; color: var(--dim); font-family: var(--font
   white-space: nowrap;
 }
 .header-version {
+  margin-left: auto;
   flex-shrink: 0;
 }
 .header-theme-toggle {
   flex-shrink: 0;
+  border-radius: 999px;
+  padding: 4px 12px;
+  border-color: color-mix(in srgb, var(--accent2) 18%, var(--border));
+  background: color-mix(in srgb, var(--surface) 76%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.35);
 }
 header .actions { display: flex; gap: 6px; position: relative; align-items: center; }
 header .actions button,
 .header-theme-toggle {
-  background: none;
   border: 1px solid var(--border);
   color: var(--dim);
   padding: 4px 10px;
@@ -94,6 +99,15 @@ header .actions button.is-active {
   min-width: 78px;
   font-variant-numeric: tabular-nums;
   letter-spacing: .02em;
+}
+.header-theme-toggle.theme-toggle-btn {
+  min-width: 84px;
+  justify-content: center;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border-color: color-mix(in srgb, var(--accent2) 18%, var(--border));
+  background: color-mix(in srgb, var(--surface) 76%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.35);
 }
 .usage-badge {
   font-size: 11px;
