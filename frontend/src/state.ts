@@ -99,6 +99,8 @@ export interface AppState {
   dailyOutputTokens: number;
   totalInputTokens: number;
   totalOutputTokens: number;
+  currentRoundStartedAt: number;
+  currentRoundFirstTokenAt: number;
   _historyTaskIds: Map<string, { task_id: string; agent: string }> | null;
   _historyOrchestrateIds: Map<string, string> | null;
 }
@@ -150,6 +152,8 @@ export const state: AppState = {
   dailyOutputTokens: 0,
   totalInputTokens: 0,
   totalOutputTokens: 0,
+  currentRoundStartedAt: 0,
+  currentRoundFirstTokenAt: 0,
   _historyTaskIds: null,
   _historyOrchestrateIds: null,
 };

@@ -516,6 +516,7 @@ function ProviderCardInner({
             <option value="openai-completions">OpenAI Completions</option>
             <option value="anthropic">Anthropic</option>
             <option value="ollama">Ollama</option>
+            <option value="gemini">Gemini</option>
           </select>
         </SettingsRow>
         <SettingsRow label="Base URL">

@@ -359,6 +359,53 @@ function resolvePanel(ref) {
   return null;
 }
 
+function ensureSubagentBackdrop() {
+  let backdrop = document.getElementById('subagent-modal-backdrop');
+  if (backdrop) return backdrop;
+  backdrop = document.createElement('div');
+  backdrop.id = 'subagent-modal-backdrop';
+  backdrop.className = 'subagent-modal-backdrop';
+  backdrop.dataset.action = 'close-subagent-modal';
+  backdrop.hidden = true;
+  document.body.appendChild(backdrop);
+  return backdrop;
+}
+
+export function closeSubagentModal() {
+  const panel = document.querySelector('.subagent-panel.subagent-modal-open');
+  if (panel) {
+    panel.classList.remove('subagent-modal-open');
+    panel.querySelector('.subagent-header')?.setAttribute('aria-expanded', 'false');
+    panel.querySelector('.subagent-modal-close')?.setAttribute('tabindex', '-1');
+    panel.querySelector('.subagent-body')?.classList.remove('show');
+    const body = panel.querySelector<HTMLElement>('.subagent-body');
+    if (body) {
+      body.style.height = '';
+      body.setAttribute('inert', '');
+    }
+  }
+  const backdrop = document.getElementById('subagent-modal-backdrop');
+  if (backdrop) backdrop.hidden = true;
+}
+
+export function openSubagentModal(trigger) {
+  const panel = trigger?.closest?.('.subagent-panel');
+  if (!panel) return;
+  closeSubagentModal();
+  const backdrop = ensureSubagentBackdrop();
+  backdrop.hidden = false;
+  panel.classList.add('subagent-modal-open');
+  panel.querySelector('.subagent-header')?.setAttribute('aria-expanded', 'true');
+  panel.querySelector('.subagent-modal-close')?.removeAttribute('tabindex');
+  const body = panel.querySelector<HTMLElement>('.subagent-body');
+  if (body) {
+    body.removeAttribute('inert');
+    body.classList.add('show');
+    body.style.height = 'auto';
+  }
+  panel.scrollIntoView({ block: 'nearest' });
+}
+
 function panelKey(ref) {
   if (ref && ref.task_id) return ref.task_id;
   return (ref && ref.agent) || '';
@@ -378,7 +425,10 @@ export function createSubagentPanel(agentName, prompt, taskId) {
 
   const header = document.createElement('div');
   header.className = 'subagent-header';
-  header.dataset.action = 'toggle-tool';
+  header.dataset.action = 'open-subagent-modal';
+  header.setAttribute('role', 'button');
+  header.setAttribute('tabindex', '0');
+  header.setAttribute('aria-expanded', 'false');
   header.innerHTML = `
     <span class="subagent-icon">✦</span>
     <span class="subagent-head-copy">
@@ -386,11 +436,13 @@ export function createSubagentPanel(agentName, prompt, taskId) {
       <span class="subagent-label">${escHtml(agentName)}</span>
     </span>
     <span class="subagent-status">执行中</span>
-    <span class="chevron open">▸</span>
+    <span class="chevron">↗</span>
+    <button type="button" class="subagent-modal-close" data-action="close-subagent-modal" aria-label="Close sub-agent details" tabindex="-1">×</button>
   `;
 
   const body = document.createElement('div');
-  body.className = 'subagent-body show';
+  body.className = 'subagent-body';
+  body.setAttribute('inert', '');
 
   const meta = document.createElement('div');
   meta.className = 'subagent-meta';

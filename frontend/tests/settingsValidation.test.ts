@@ -18,6 +18,21 @@ describe('settings validation', () => {
     ).not.toThrow();
   });
 
+  it('accepts Gemini provider api kind', () => {
+    expect(() =>
+      validateModelsConfigDraftShape({
+        providers: {
+          gemini: {
+            api: 'gemini',
+            baseUrl: 'https://generativelanguage.googleapis.com/v1beta',
+            apiKey: 'test-key',
+            models: [{ id: 'gemini-2.5-flash', input: ['text', 'image'] }],
+          },
+        },
+      }),
+    ).not.toThrow();
+  });
+
   it('rejects providers that omit apiKey', () => {
     expect(() =>
       validateModelsConfigDraftShape({

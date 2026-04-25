@@ -455,8 +455,39 @@
   transform: translateY(0);
   transition: opacity .2s ease, transform .24s cubic-bezier(.22,1,.36,1), border-color .18s ease;
   position: relative;
-  background: var(--surface);
+  background: var(--glass-surface);
+  box-shadow: 0 10px 26px rgba(44,46,62,.06);
+  backdrop-filter: blur(12px) saturate(1.1);
+  -webkit-backdrop-filter: blur(12px) saturate(1.1);
 }
+.subagent-panel.subagent-modal-open {
+  position: fixed;
+  top: 28px;
+  left: 50%;
+  bottom: 28px;
+  width: min(960px, calc(100vw - 40px));
+  max-width: calc(100vw - 40px);
+  min-width: 0;
+  margin: 0;
+  z-index: 102;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(-50%);
+  border-radius: 16px;
+  border-color: color-mix(in srgb, var(--accent2) 24%, var(--border));
+  box-shadow: 0 24px 72px rgba(20,24,38,.24);
+  animation: panelSlideUp .18s ease-out;
+}
+.subagent-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 101;
+  background: rgba(18,22,34,.38);
+  backdrop-filter: blur(8px) saturate(1.1);
+  -webkit-backdrop-filter: blur(8px) saturate(1.1);
+  animation: fadeIn .14s ease-out;
+}
+.subagent-modal-backdrop[hidden] { display: none; }
 .panel-actions {
   display: flex;
   flex-wrap: wrap;
@@ -525,6 +556,11 @@
   color: var(--dim);
   transition: background .15s;
 }
+.subagent-panel.subagent-modal-open .subagent-header {
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--glass-border);
+  background: color-mix(in srgb, var(--glass-surface) 82%, var(--surface));
+}
 .subagent-header:hover {
   background: var(--surface2);
 }
@@ -573,7 +609,28 @@
   font-weight: 600;
 }
 .subagent-header .chevron { margin-left: 8px; transition: transform .25s ease; }
-.subagent-header .chevron.open { transform: rotate(90deg); }
+.subagent-panel.subagent-modal-open .subagent-header .chevron { transform: rotate(45deg); }
+.subagent-modal-close {
+  display: none;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  align-items: center;
+  justify-content: center;
+}
+.subagent-panel.subagent-modal-open .subagent-modal-close {
+  display: inline-flex;
+}
+.subagent-modal-close:hover {
+  border-color: var(--accent2);
+  color: var(--text);
+}
 .subagent-active .subagent-status::after {
   content: '';
   display: inline-block;
@@ -601,6 +658,12 @@
   padding: 0 14px 14px;
   overflow-y: auto;
   max-height: 540px;
+}
+.subagent-panel.subagent-modal-open .subagent-body.show {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: none;
+  padding: 0 18px 18px;
 }
 .subagent-body.is-open {
   opacity: 1;

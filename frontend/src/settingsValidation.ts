@@ -51,11 +51,13 @@ export function parsePositiveIntegerField(rawValue: string, label: string): numb
 }
 
 export function isBuiltinProviderName(name: string): boolean {
-  return ['openai', 'anthropic', 'ollama'].includes((name || '').toLowerCase());
+  return ['openai', 'anthropic', 'ollama', 'gemini'].includes((name || '').toLowerCase());
 }
 
 export function isSupportedProviderApiKind(value: string): boolean {
-  return ['openai-completions', 'anthropic', 'ollama'].includes((value || '').trim().toLowerCase());
+  return ['openai-completions', 'anthropic', 'ollama', 'gemini'].includes(
+    (value || '').trim().toLowerCase(),
+  );
 }
 
 export function validateProviderName(
@@ -111,7 +113,7 @@ export function validateModelsConfigDraftShape(parsed: unknown): void {
     ensureOptionalString(p['api'], `Models JSON field "providers.${name}.api"`);
     if (!isAbsent(p['api']) && !isSupportedProviderApiKind(p['api'] as string)) {
       throw new Error(
-        `Models JSON field "providers.${name}.api" must be one of: openai-completions, anthropic, ollama.`,
+        `Models JSON field "providers.${name}.api" must be one of: openai-completions, anthropic, ollama, gemini.`,
       );
     }
     if (typeof p['baseUrl'] !== 'string') {

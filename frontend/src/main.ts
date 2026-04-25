@@ -12,7 +12,12 @@ import { initTheme, cycleTheme, disposeTheme } from './theme.js';
 import { dom, initDomRefs, state } from './state.js';
 import { HISTORY_LOAD_CHUNK_SIZE, HISTORY_RENDER_LIMIT } from './constants.js';
 import { findHistoryRenderStart, splitHistoryLoadChunk } from './historyWindow.js';
-import { formatTokenCount, hideWelcome, scheduleBackgroundTask } from './utils.js';
+import {
+  formatTokenCount,
+  formatToolDuration,
+  hideWelcome,
+  scheduleBackgroundTask,
+} from './utils.js';
 import {
   syncToolDrawerBounds,
   cancelToolDrawerBoundsSync,
@@ -84,6 +89,8 @@ import {
   toggleSubagentTools,
   focusSubagentCurrent,
   copySubagentSummary,
+  openSubagentModal,
+  closeSubagentModal,
 } from './renderers/subagent.js';
 import {
   createOrchestratePanel,
@@ -183,7 +190,13 @@ function updateUsageBadge() {
   dom.usageBadge.title = `今日: ${formatTokenCount(inp)} input, ${formatTokenCount(out)} output\n累计: ${formatTokenCount(state.totalInputTokens)} input, ${formatTokenCount(state.totalOutputTokens)} output`;
 }
 
-function appendRoundUsage(messageEl, inputTokens, outputTokens) {
+function appendRoundUsage(
+  messageEl,
+  inputTokens,
+  outputTokens,
+  firstTokenMs = null,
+  totalMs = null,
+) {
   const lastAssistantRow = messageEl ? messageEl.closest('.msg-row') : null;
   if (!lastAssistantRow) return;
   const content = lastAssistantRow.querySelector('.msg-content');
@@ -191,8 +204,24 @@ function appendRoundUsage(messageEl, inputTokens, outputTokens) {
   if (content.querySelector('.msg-usage')) return;
   const label = document.createElement('div');
   label.className = 'msg-usage';
-  label.textContent = `${formatTokenCount(inputTokens)} in / ${formatTokenCount(outputTokens)} out`;
-  label.title = `Input: ${inputTokens.toLocaleString()} tokens, Output: ${outputTokens.toLocaleString()} tokens`;
+  const parts = [`${formatTokenCount(inputTokens)} in / ${formatTokenCount(outputTokens)} out`];
+  if (firstTokenMs != null) parts.push(`首 token ${formatToolDuration(firstTokenMs)}`);
+  if (totalMs != null) parts.push(`总耗时 ${formatToolDuration(totalMs)}`);
+  label.replaceChildren(
+    ...parts.map((part) => {
+      const item = document.createElement('span');
+      item.textContent = part;
+      return item;
+    }),
+  );
+  label.title = [
+    `Input: ${inputTokens.toLocaleString()} tokens`,
+    `Output: ${outputTokens.toLocaleString()} tokens`,
+    firstTokenMs != null ? `First token latency: ${formatToolDuration(firstTokenMs)}` : '',
+    totalMs != null ? `Total output time: ${formatToolDuration(totalMs)}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n');
   content.appendChild(label);
 }
 
@@ -417,6 +446,7 @@ function handleMessage(data) {
 
     case 'history': {
       closeToolDrawer();
+      closeSubagentModal();
       clearReactStatus();
       clearBufferedChatUpdates();
       setAutoFollowChat(true);
@@ -473,6 +503,8 @@ function handleMessage(data) {
 
     case 'start':
       setBusy(true);
+      state.currentRoundStartedAt = performance.now();
+      state.currentRoundFirstTokenAt = 0;
       finishAssistantStream({ discardIfEmpty: true });
       beginAssistantStream();
       if (data.react_visible && data.phase) {
@@ -482,6 +514,9 @@ function handleMessage(data) {
 
     case 'delta':
       if (data.subagent) break;
+      if (data.content && !state.currentRoundFirstTokenAt) {
+        state.currentRoundFirstTokenAt = performance.now();
+      }
       if (state.currentMsg) {
         state.pendingAssistantText += data.content;
         scheduleFlush();
@@ -501,12 +536,23 @@ function handleMessage(data) {
         updateUsageBadge();
       }
       if (data.round_input_tokens != null || data.round_output_tokens != null) {
+        const finishedAt = performance.now();
+        const firstTokenMs = state.currentRoundFirstTokenAt
+          ? Math.max(0, state.currentRoundFirstTokenAt - state.currentRoundStartedAt)
+          : null;
+        const totalMs = state.currentRoundStartedAt
+          ? Math.max(0, finishedAt - state.currentRoundStartedAt)
+          : null;
         appendRoundUsage(
           finishedAssistantMsg,
           data.round_input_tokens ?? 0,
           data.round_output_tokens ?? 0,
+          firstTokenMs,
+          totalMs,
         );
       }
+      state.currentRoundStartedAt = 0;
+      state.currentRoundFirstTokenAt = 0;
       setBusy(false);
       break;
     }
@@ -818,6 +864,8 @@ const actionHandlers = {
   'subagent-focus-current': (el) => focusSubagentCurrent(el),
   'subagent-focus-tool': (el) => focusSubagentTool(el),
   'subagent-copy-summary': (el) => copySubagentSummary(el),
+  'open-subagent-modal': (el) => openSubagentModal(el),
+  'close-subagent-modal': () => closeSubagentModal(),
   'orchestrate-toggle-all': (el) => toggleOrchestrateTasks(el),
   'orchestrate-focus-active': (el) => focusOrchestrateActive(el),
   'orchestrate-focus-tool': (el) => focusOrchestrateTool(el),
@@ -852,10 +900,25 @@ function handleDocumentKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') {
     closeToolDrawer();
     closeMobileMenu();
+    closeSubagentModal();
     closeSettingsPage();
     closeUsagePage();
     closeShortcutsOverlay();
     return;
+  }
+
+  if (e.key === 'Enter' || e.key === ' ') {
+    const target = e.target;
+    const el = target instanceof Element ? target.closest('[data-action]') : null;
+    if (el instanceof HTMLElement && el.getAttribute('role') === 'button') {
+      const action = el.dataset.action;
+      const handler = action ? actionHandlers[action] : null;
+      if (handler) {
+        e.preventDefault();
+        handler(el);
+        return;
+      }
+    }
   }
 
   if (trapShortcutsFocus(e)) {

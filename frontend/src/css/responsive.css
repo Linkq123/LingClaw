@@ -67,6 +67,24 @@
   header .actions .mobile-hide {
     display: none;
   }
+  .header-theme-toggle {
+    min-width: 34px;
+    width: 34px;
+    padding-inline: 0;
+    overflow: hidden;
+    font-size: 0;
+  }
+  .header-theme-toggle::before {
+    content: '◐';
+    color: var(--dim);
+    font-size: 12px;
+  }
+  .header-theme-toggle[data-theme-choice='light']::before {
+    content: '☀';
+  }
+  .header-theme-toggle[data-theme-choice='dark']::before {
+    content: '☾';
+  }
   .mobile-menu-toggle {
     display: flex;
   }
@@ -139,6 +157,12 @@
   .subagent-summary-head {
     align-items: stretch;
   }
+  .subagent-panel.subagent-modal-open {
+    top: 10px;
+    bottom: 10px;
+    width: calc(100vw - 20px);
+    max-width: calc(100vw - 20px);
+  }
   #jump-to-latest {
     right: 12px;
     min-width: 0;
@@ -159,6 +183,9 @@
   --bg: #1a1c2e;
   --surface: #232540;
   --surface2: #2c2e4a;
+  --glass-surface: rgba(35,37,64,.76);
+  --glass-border: rgba(72,76,112,.62);
+  --glass-shadow: 0 18px 48px rgba(0,0,0,.22);
   --msg-user: #261f3d;
   --msg-ai: #282a46;
   --accent: #d88aae;

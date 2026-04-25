@@ -2,9 +2,12 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 :root {
-  --bg: #f7f8fb;
+  --bg: #f5f7fb;
   --surface: #ffffff;
-  --surface2: #f0f2f8;
+  --surface2: #eef2f8;
+  --glass-surface: rgba(255,255,255,.76);
+  --glass-border: rgba(226,229,238,.72);
+  --glass-shadow: 0 16px 42px rgba(54,66,98,.10);
   --msg-user: #e4edfb;
   --msg-ai: #ffffff;
   --accent: #c06b9e;
@@ -20,13 +23,16 @@
   --tool-drawer-bottom: 88px;
   --jump-to-latest-bottom: 104px;
   --chat-output-width: min(1280px, 84vw);
-  --assistant-body-font-size: 15px;
+  --assistant-body-font-size: 16px;
   --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
 }
 
 body {
   font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
-  background: var(--bg);
+  background:
+    linear-gradient(135deg, rgba(45,139,207,.08), transparent 34%),
+    linear-gradient(215deg, rgba(192,107,158,.08), transparent 38%),
+    linear-gradient(180deg, #f8f9fc 0%, var(--bg) 45%, #eef3f9 100%);
   color: var(--text);
   /* `100vh` leaves whitespace below the composer on iOS Safari when the URL
      bar collapses; `100dvh` tracks the real viewport. Keep `100vh` as the
