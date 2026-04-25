@@ -154,6 +154,26 @@ describe('findProgressiveSplitPoint', () => {
       expect(result).toBeLessThanOrEqual(para.length);
     }
   });
+
+  it('does not soft-split inside a GFM table without a leading pipe in the header row', () => {
+    const tableMarkdown = [
+      'Column A | A long column title that exceeds the soft-split threshold. More text.',
+      '-------- | -------',
+      'val1     | val2',
+    ].join('\n');
+
+    expect(findProgressiveSplitPoint(tableMarkdown)).toBe(-1);
+  });
+
+  it('does not soft-split inside a GFM table without a leading pipe in data rows', () => {
+    const tableMarkdown = [
+      'Column A | Column B',
+      '-------- | -------',
+      'val1 | This is a long table cell that exceeds the minimum split threshold. More text.',
+    ].join('\n');
+
+    expect(findProgressiveSplitPoint(tableMarkdown)).toBe(-1);
+  });
 });
 
 describe('renderMarkdown memoization', () => {

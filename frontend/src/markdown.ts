@@ -165,10 +165,55 @@ async function processMarkdownQueue() {
 
 // ── Progressive segmented markdown ──
 
+const GFM_TABLE_SEPARATOR_RE = /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+(?:\s*:?-{3,}:?\s*)?\|?\s*$/;
+
+function hasTableCells(line: string): boolean {
+  return line.includes('|') && !GFM_TABLE_SEPARATOR_RE.test(line);
+}
+
+function lineEnd(text: string, lineStart: number): number {
+  let index = lineStart;
+  while (index < text.length && text[index] !== '\n') index++;
+  return index;
+}
+
+function readLine(text: string, lineStart: number): string {
+  return text.slice(lineStart, lineEnd(text, lineStart));
+}
+
+function previousLineStart(text: string, lineStart: number): number {
+  if (lineStart === 0) return -1;
+  let index = lineStart - 2;
+  while (index >= 0 && text[index] !== '\n') index--;
+  return index + 1;
+}
+
 function isTableRow(text: string, lineStart: number): boolean {
-  let k = lineStart;
-  while (k < text.length && (text[k] === ' ' || text[k] === '\t')) k++;
-  return k < text.length && text[k] === '|';
+  const line = readLine(text, lineStart);
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (GFM_TABLE_SEPARATOR_RE.test(line)) return true;
+  if (!hasTableCells(line)) return false;
+
+  const currentLineEnd = lineEnd(text, lineStart);
+  if (currentLineEnd < text.length) {
+    const nextLine = readLine(text, currentLineEnd + 1);
+    if (GFM_TABLE_SEPARATOR_RE.test(nextLine)) {
+      return true;
+    }
+  }
+
+  let prevStart = previousLineStart(text, lineStart);
+  while (prevStart >= 0) {
+    const prevLine = readLine(text, prevStart);
+    const prevTrimmed = prevLine.trim();
+    if (!prevTrimmed) break;
+    if (GFM_TABLE_SEPARATOR_RE.test(prevLine)) return true;
+    if (!hasTableCells(prevLine)) break;
+    prevStart = previousLineStart(text, prevStart);
+  }
+
+  return false;
 }
 
 export function isSentenceSplitChar(text, index) {
@@ -201,6 +246,7 @@ export function findProgressiveSplitPoint(text: string, startFrom = 0): number {
   let lastSplit = startFrom > 0 ? startFrom : -1;
   let lastSoftSplit = -1;
   let charsSinceBoundary = 0;
+  const tableLineCache = new Map<number, boolean>();
   // Find the true start of the line that contains startFrom so the table-row
   // guard below works correctly when resuming from a mid-line offset.
   let lineStart = startFrom;
@@ -243,7 +289,11 @@ export function findProgressiveSplitPoint(text: string, startFrom = 0): number {
       // Never soft-split on a GFM table row — partial table rendering produces
       // wrong markup that needsFinalMarkdownRender then fails to detect because
       // the truncated row is still counted as a rendered table element.
-      const onTableRow = isTableRow(text, lineStart);
+      let onTableRow = tableLineCache.get(lineStart);
+      if (onTableRow === undefined) {
+        onTableRow = isTableRow(text, lineStart);
+        tableLineCache.set(lineStart, onTableRow);
+      }
       if (
         !onTableRow &&
         isSentenceSplitChar(text, i) &&
@@ -435,7 +485,7 @@ function countGfmTables(raw) {
     if (inFence) continue;
 
     if (!line.includes('|')) continue;
-    if (/^\s*\|?(?:\s*:?-{3,}:?\s*\|)+(?:\s*:?-{3,}:?\s*)?\|?\s*$/.test(nextLine)) {
+    if (GFM_TABLE_SEPARATOR_RE.test(nextLine)) {
       tableCount += 1;
       index += 1;
     }
