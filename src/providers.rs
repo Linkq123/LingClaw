@@ -286,9 +286,15 @@ fn openai_prefers_null_tool_call_content(resolved: &ResolvedModel) -> bool {
 
 /// Convert internal messages to clean OpenAI API format (strips timestamps and
 /// extra fields so the provider receives only role/content/tool_calls/tool_call_id).
+///
+/// When `thinking_format` is `"deepseek-v4"`, assistant messages include
+/// `reasoning_content` from the internal `thinking` field so that the
+/// DeepSeek API receives the reasoning chain for context (required when
+/// tool calls are present).
 fn convert_messages_to_openai_with_options(
     messages: &[ChatMessage],
     null_tool_call_content: bool,
+    thinking_format: Option<&str>,
 ) -> Vec<serde_json::Value> {
     let mut out = Vec::new();
 
@@ -346,6 +352,17 @@ fn convert_messages_to_openai_with_options(
                             }))
                             .collect::<Vec<_>>()
                     );
+                }
+                if thinking_format == Some("deepseek-v4") {
+                    // DeepSeek requires reasoning_content on assistant messages that
+                    // include tool_calls (400 error if missing).  For messages
+                    // without tool_calls the API ignores the field, so we always
+                    // include it when present — simpler and safer than conditional logic.
+                    if let Some(reasoning) = &msg.thinking
+                        && !reasoning.is_empty()
+                    {
+                        item["reasoning_content"] = json!(reasoning);
+                    }
                 }
                 out.push(item);
             }
@@ -1239,6 +1256,7 @@ fn build_openai_simple_body(
     let api_messages = convert_messages_to_openai_with_options(
         &messages,
         openai_prefers_null_tool_call_content(resolved),
+        resolved.thinking_format.as_deref(),
     );
     let mut body = json!({
         "model": resolved.model_id,
@@ -1455,6 +1473,15 @@ fn think_level_to_reasoning_effort(level: &str) -> &str {
         "medium" => "medium",
         "high" | "xhigh" => "high",
         _ => "medium",
+    }
+}
+
+/// Map think_level to DeepSeek reasoning_effort string.
+/// DeepSeek-v4 only supports "high" and "max"; lower levels map to "high".
+fn think_level_to_deepseek_reasoning_effort(level: &str) -> &str {
+    match level {
+        "xhigh" => "max",
+        _ => "high",
     }
 }
 
@@ -2092,6 +2119,7 @@ fn build_openai_stream_body(
     let api_messages = convert_messages_to_openai_with_options(
         &messages,
         openai_prefers_null_tool_call_content(resolved),
+        resolved.thinking_format.as_deref(),
     );
     let mut all_tools: Vec<serde_json::Value> =
         serde_json::from_value(tools::tool_definitions()).unwrap_or_default();
@@ -2112,10 +2140,18 @@ fn build_openai_stream_body(
             "qwen" => {
                 body["enable_thinking"] = json!(true);
             }
+            "deepseek-v4" => {
+                body["reasoning_effort"] =
+                    json!(think_level_to_deepseek_reasoning_effort(think_level));
+                body["thinking"] = json!({"type": "enabled"});
+            }
             _ => {
                 body["reasoning_effort"] = json!(think_level_to_reasoning_effort(think_level));
             }
         }
+    } else if resolved.thinking_format.as_deref() == Some("deepseek-v4") {
+        // DeepSeek defaults to thinking enabled; explicitly disable it.
+        body["thinking"] = json!({"type": "disabled"});
     }
     if let Some(max_tokens) = resolved.max_tokens {
         body["max_tokens"] = json!(max_tokens);

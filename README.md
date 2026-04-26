@@ -709,7 +709,7 @@ struct ChatMessage {
 struct ResolvedModel {
     provider, api_base, api_key, model_id,
     reasoning: bool,
-  thinking_format: Option<String>,  // "qwen"|"openai"|"anthropic"|"ollama"
+  thinking_format: Option<String>,  // "qwen"|"openai"|"anthropic"|"ollama"|"deepseek-v4"
     max_tokens: Option<u64>,
 }
 

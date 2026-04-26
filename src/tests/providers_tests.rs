@@ -143,6 +143,17 @@ fn think_level_to_budget_all_levels() {
 }
 
 #[test]
+fn think_level_to_deepseek_reasoning_effort_all_levels() {
+    assert_eq!(think_level_to_deepseek_reasoning_effort("minimal"), "high");
+    assert_eq!(think_level_to_deepseek_reasoning_effort("low"), "high");
+    assert_eq!(think_level_to_deepseek_reasoning_effort("medium"), "high");
+    assert_eq!(think_level_to_deepseek_reasoning_effort("high"), "high");
+    assert_eq!(think_level_to_deepseek_reasoning_effort("xhigh"), "max");
+    assert_eq!(think_level_to_deepseek_reasoning_effort("unknown"), "high");
+    assert_eq!(think_level_to_deepseek_reasoning_effort("auto"), "high");
+}
+
+#[test]
 fn drain_sse_lines_preserves_partial_tail() {
     let mut partial = String::new();
 
@@ -212,7 +223,7 @@ fn convert_messages_to_openai_all_roles() {
             timestamp: None,
         },
     ];
-    let out = convert_messages_to_openai_with_options(&messages, false);
+    let out = convert_messages_to_openai_with_options(&messages, false, None);
     assert_eq!(out.len(), 4); // unknown_role skipped
     assert_eq!(out[0]["role"], "system");
     assert_eq!(out[1]["role"], "user");
@@ -241,7 +252,7 @@ fn convert_messages_to_openai_assistant_with_tool_calls() {
         tool_call_id: None,
         timestamp: None,
     }];
-    let out = convert_messages_to_openai_with_options(&messages, false);
+    let out = convert_messages_to_openai_with_options(&messages, false, None);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0]["content"], "");
     assert!(out[0]["tool_calls"].is_array());
@@ -275,10 +286,64 @@ fn convert_messages_to_openai_allows_null_tool_call_content_when_requested() {
         timestamp: None,
     }];
 
-    let out = convert_messages_to_openai_with_options(&messages, true);
+    let out = convert_messages_to_openai_with_options(&messages, true, None);
 
     assert_eq!(out.len(), 1);
     assert!(out[0]["content"].is_null());
+}
+
+#[test]
+fn convert_messages_to_openai_deepseek_v4_includes_reasoning_content() {
+    let messages = vec![
+        ChatMessage {
+            role: "user".into(),
+            content: Some("hello".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("let me think".into()),
+            images: None,
+            thinking: Some("I need to reason about this".into()),
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    ];
+
+    // Without deepseek-v4 format: no reasoning_content in output
+    let out_plain = convert_messages_to_openai_with_options(&messages, false, None);
+    assert!(out_plain[1].get("reasoning_content").is_none());
+
+    // With deepseek-v4 format: reasoning_content is included
+    let out_ds = convert_messages_to_openai_with_options(&messages, false, Some("deepseek-v4"));
+    assert_eq!(
+        out_ds[1]["reasoning_content"].as_str(),
+        Some("I need to reason about this")
+    );
+}
+
+#[test]
+fn convert_messages_to_openai_deepseek_v4_omits_empty_reasoning_content() {
+    let messages = vec![ChatMessage {
+        role: "assistant".into(),
+        content: Some("answer".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let out = convert_messages_to_openai_with_options(&messages, false, Some("deepseek-v4"));
+    assert!(out[0].get("reasoning_content").is_none());
 }
 
 #[test]
@@ -1188,6 +1253,172 @@ fn build_openai_stream_body_keeps_string_tool_call_content_for_compatible_api() 
         build_openai_stream_body(&resolved, &messages, None, "off", &[]).expect("body builds");
 
     assert_eq!(body["messages"][0]["content"], "");
+}
+
+#[test]
+fn build_openai_stream_body_deepseek_v4_sends_thinking_and_reasoning_effort() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://api.deepseek.com/v1".into(),
+        api_key: "deepseek-key".into(),
+        model_id: "deepseek-v4-pro".into(),
+        reasoning: true,
+        thinking_format: Some("deepseek-v4".into()),
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![
+        ChatMessage {
+            role: "user".into(),
+            content: Some("hello".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("thinking step".into()),
+            images: None,
+            thinking: Some("I reasoned about this".into()),
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "tc1".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"a.txt"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+    ];
+
+    let body =
+        build_openai_stream_body(&resolved, &messages, None, "high", &[]).expect("body builds");
+
+    assert_eq!(body["reasoning_effort"], "high");
+    assert_eq!(body["thinking"]["type"], "enabled");
+    // reasoning_content must be present for tool-call assistant messages
+    assert_eq!(
+        body["messages"][1]["reasoning_content"].as_str(),
+        Some("I reasoned about this")
+    );
+}
+
+#[test]
+fn build_openai_stream_body_deepseek_v4_maps_xhigh_to_max() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://api.deepseek.com/v1".into(),
+        api_key: "deepseek-key".into(),
+        model_id: "deepseek-v4-pro".into(),
+        reasoning: true,
+        thinking_format: Some("deepseek-v4".into()),
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+
+    let body =
+        build_openai_stream_body(&resolved, &[], None, "xhigh", &[]).expect("body builds");
+
+    assert_eq!(body["reasoning_effort"], "max");
+    assert_eq!(body["thinking"]["type"], "enabled");
+}
+
+#[test]
+fn build_openai_stream_body_deepseek_v4_maps_low_to_high() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://api.deepseek.com/v1".into(),
+        api_key: "deepseek-key".into(),
+        model_id: "deepseek-v4-pro".into(),
+        reasoning: true,
+        thinking_format: Some("deepseek-v4".into()),
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+
+    let body =
+        build_openai_stream_body(&resolved, &[], None, "low", &[]).expect("body builds");
+
+    assert_eq!(body["reasoning_effort"], "high");
+}
+
+#[test]
+fn build_openai_stream_body_deepseek_v4_off_sends_thinking_disabled() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://api.deepseek.com/v1".into(),
+        api_key: "deepseek-key".into(),
+        model_id: "deepseek-v4-pro".into(),
+        reasoning: true,
+        thinking_format: Some("deepseek-v4".into()),
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+
+    let body =
+        build_openai_stream_body(&resolved, &[], None, "off", &[]).expect("body builds");
+
+    assert!(body.get("reasoning_effort").is_none());
+    assert_eq!(body["thinking"]["type"], "disabled");
+}
+
+#[test]
+fn build_openai_simple_body_deepseek_v4_includes_reasoning_content_in_messages() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://api.deepseek.com/v1".into(),
+        api_key: "deepseek-key".into(),
+        model_id: "deepseek-v4-pro".into(),
+        reasoning: true,
+        thinking_format: Some("deepseek-v4".into()),
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "assistant".into(),
+        content: Some("result".into()),
+        images: None,
+        thinking: Some("my reasoning".into()),
+        anthropic_thinking_blocks: None,
+        tool_calls: Some(vec![ToolCall {
+            id: "tc1".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"a.txt"}"#.into(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let body = build_openai_simple_body(&resolved, &messages, None).expect("body builds");
+
+    assert_eq!(
+        body["messages"][0]["reasoning_content"].as_str(),
+        Some("my reasoning")
+    );
+    // Simple body does not include thinking control fields
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("thinking").is_none());
 }
 
 #[test]
@@ -2402,7 +2633,7 @@ fn convert_messages_to_openai_user_with_images() {
         tool_call_id: None,
         timestamp: None,
     }];
-    let out = convert_messages_to_openai_with_options(&messages, false);
+    let out = convert_messages_to_openai_with_options(&messages, false, None);
     assert_eq!(out.len(), 1);
     let content = out[0]["content"]
         .as_array()
