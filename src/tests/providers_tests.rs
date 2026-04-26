@@ -2648,6 +2648,64 @@ fn convert_messages_to_openai_user_with_images() {
 }
 
 #[test]
+fn convert_messages_to_openai_strips_images_when_tool_messages_present() {
+    let messages = vec![
+        ChatMessage {
+            role: "user".into(),
+            content: Some("describe this".into()),
+            images: Some(vec![ImageAttachment {
+                url: "https://example.com/a.png".into(),
+                s3_object_key: None,
+                cache_path: None,
+                data: None,
+            }]),
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "tc1".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "exec".into(),
+                    arguments: r#"{"cmd":"ls"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("file1.txt".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("tc1".into()),
+            timestamp: None,
+        },
+    ];
+    let out = convert_messages_to_openai_with_options(&messages, false, None);
+    assert_eq!(out.len(), 3);
+    // When tool messages are present, user message content must be a plain
+    // string — not an array with image_url — to avoid 400 InvalidParameter
+    // from OpenAI-compatible providers.
+    assert_eq!(out[0]["role"], "user");
+    assert!(out[0]["content"].is_string(), "content should be plain string when tool messages exist");
+    assert_eq!(out[0]["content"].as_str(), Some("describe this"));
+    assert!(!out[0].get("content").unwrap().is_array());
+}
+
+#[test]
 fn convert_messages_to_anthropic_user_with_images() {
     let messages = vec![ChatMessage {
         role: "user".into(),

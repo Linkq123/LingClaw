@@ -296,6 +296,12 @@ fn convert_messages_to_openai_with_options(
     null_tool_call_content: bool,
     thinking_format: Option<&str>,
 ) -> Vec<serde_json::Value> {
+    // Many OpenAI-compatible providers reject image_url content in user
+    // messages when the conversation also contains tool-role messages
+    // (400 InvalidParameter).  Pre-scan for tool messages and strip images
+    // from user messages when any are present.
+    let has_tool_messages = messages.iter().any(|m| m.role == "tool");
+
     let mut out = Vec::new();
 
     for msg in messages {
@@ -307,7 +313,8 @@ fn convert_messages_to_openai_with_options(
                 }));
             }
             "user" => {
-                if let Some(images) = &msg.images
+                if !has_tool_messages
+                    && let Some(images) = &msg.images
                     && !images.is_empty()
                 {
                     let mut parts: Vec<Value> = vec![json!({
