@@ -5,6 +5,7 @@ import {
   formatTokenCount,
   formatDetailText,
   inlinePreview,
+  stripDelegatedPromptRuntimeContext,
   pulseFocus,
   copyButtonText,
 } from '../utils.js';
@@ -17,6 +18,13 @@ import {
 } from './timeline.js';
 import { pinReactStatusToBottom } from './react-status.js';
 import { openToolDrawer, syncToolDrawer } from './tools.js';
+
+interface OrchestrateTaskModalHost extends HTMLElement {
+  _orchestrateModalParent?: HTMLElement | null;
+  _orchestrateModalNextSibling?: ChildNode | null;
+  _orchestrateModalPlaceholder?: HTMLElement | null;
+  _orchestrateModalWasExpanded?: boolean;
+}
 
 // Parse a composite task_id of the form `<orchestrate_id>:<task_id>` emitted by
 // orchestrator-wrapped sub-agent runs. Returns { orchestrateId, taskId } when
@@ -32,6 +40,20 @@ export function parseOrchestrateCompositeTaskId(compositeId) {
 }
 
 function getTaskRows(panel): HTMLElement[] {
+  if (!panel) return [];
+  const orchestrateId = (panel as HTMLElement).dataset.orchestrateId;
+  if (orchestrateId && state.activeOrchestrations.has(orchestrateId)) {
+    return Array.from(state.activeOrchestrations.get(orchestrateId)?.taskRows.values() || []);
+  }
+  if (orchestrateId) {
+    const escapedId =
+      typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+        ? CSS.escape(orchestrateId)
+        : orchestrateId.replace(/"/g, '\\"');
+    return Array.from(
+      document.querySelectorAll(`.orchestrate-task[data-orchestrate-id="${escapedId}"]`),
+    ) as HTMLElement[];
+  }
   return Array.from((panel as Element).querySelectorAll('.orchestrate-task')) as HTMLElement[];
 }
 
@@ -49,9 +71,17 @@ function summarizeTaskCounts(rows) {
 }
 
 function setTaskExpanded(row, expand) {
+  const host = row as OrchestrateTaskModalHost | null;
   const details = row?.querySelector('.orchestrate-task-details');
   const chevron = row?.querySelector('.orchestrate-task-summary .chevron');
   if (!details) return;
+  if (host?.classList.contains('orchestrate-task-modal-open')) {
+    host._orchestrateModalWasExpanded = expand;
+    details.style.height = 'auto';
+    details.classList.add('show', 'is-open');
+    if (chevron) chevron.classList.add('open');
+    return;
+  }
   animateCollapsibleSection(details, expand);
   if (chevron) chevron.classList.toggle('open', expand);
 }
@@ -89,13 +119,113 @@ function orchestrationSummaryText(panel) {
       const agent = row.querySelector('.orchestrate-task-agent')?.textContent?.trim() || '';
       const taskStatus = row.querySelector('.orchestrate-task-status')?.textContent?.trim() || '';
       const preview = row.querySelector('.orchestrate-task-preview')?.textContent?.trim() || '';
-      return [`${taskId}${agent ? ` · ${agent}` : ''}`, taskStatus, preview]
+      return [`${taskId}${agent ? ` / ${agent}` : ''}`, taskStatus, preview]
         .filter(Boolean)
         .join('\n');
     })
     .filter(Boolean);
 
   return [title, status, progress, tasks.join('\n\n')].filter(Boolean).join('\n\n').trim();
+}
+
+function moveTaskHostToBody(row) {
+  const host = row as OrchestrateTaskModalHost;
+  if (host.classList.contains('orchestrate-task-modal-open') || host._orchestrateModalPlaceholder) {
+    return;
+  }
+  const parent = host.parentElement;
+  if (!parent) return;
+
+  const placeholder = document.createElement('div');
+  placeholder.className = 'orchestrate-task-modal-placeholder';
+  placeholder.style.height = `${Math.max(host.getBoundingClientRect().height, 1)}px`;
+
+  host._orchestrateModalParent = parent;
+  host._orchestrateModalNextSibling = host.nextSibling;
+  host._orchestrateModalPlaceholder = placeholder;
+  parent.replaceChild(placeholder, host);
+  document.body.appendChild(host);
+}
+
+function restoreTaskHost(row) {
+  const host = row as OrchestrateTaskModalHost;
+  const parent = host._orchestrateModalParent;
+  const nextSibling = host._orchestrateModalNextSibling;
+  const placeholder = host._orchestrateModalPlaceholder;
+
+  if (placeholder?.parentNode) {
+    placeholder.parentNode.replaceChild(host, placeholder);
+  } else if (parent) {
+    if (nextSibling && nextSibling.parentNode === parent) {
+      parent.insertBefore(host, nextSibling);
+    } else {
+      parent.appendChild(host);
+    }
+  }
+
+  host._orchestrateModalParent = null;
+  host._orchestrateModalNextSibling = null;
+  host._orchestrateModalPlaceholder = null;
+}
+
+function ensureOrchestrateTaskBackdrop() {
+  let backdrop = document.getElementById('orchestrate-task-modal-backdrop');
+  if (backdrop) return backdrop;
+  backdrop = document.createElement('div');
+  backdrop.id = 'orchestrate-task-modal-backdrop';
+  backdrop.className = 'orchestrate-task-modal-backdrop';
+  backdrop.dataset.action = 'close-orchestrate-task-modal';
+  backdrop.hidden = true;
+  document.body.appendChild(backdrop);
+  return backdrop;
+}
+
+export function closeOrchestrateTaskModal() {
+  const row = document.querySelector(
+    '.orchestrate-task.orchestrate-task-modal-open',
+  ) as OrchestrateTaskModalHost | null;
+  if (row) {
+    const restoreExpanded = row._orchestrateModalWasExpanded === true;
+    const details = row.querySelector('.orchestrate-task-details') as HTMLElement | null;
+    const chevron = row.querySelector('.orchestrate-task-summary .chevron');
+    row.classList.remove('orchestrate-task-modal-open');
+    row.querySelector('.orchestrate-task-summary')?.setAttribute('aria-expanded', 'false');
+    row.querySelector('.orchestrate-task-modal-close')?.setAttribute('tabindex', '-1');
+    if (details) {
+      details.style.height = restoreExpanded ? 'auto' : '0px';
+      details.classList.toggle('show', restoreExpanded);
+      details.classList.toggle('is-open', restoreExpanded);
+      details.scrollTop = 0;
+    }
+    if (chevron) chevron.classList.toggle('open', restoreExpanded);
+    restoreTaskHost(row);
+    row._orchestrateModalWasExpanded = undefined;
+  }
+  const backdrop = document.getElementById('orchestrate-task-modal-backdrop');
+  if (backdrop) backdrop.hidden = true;
+}
+
+export function openOrchestrateTaskModal(trigger) {
+  const row = trigger?.closest?.('.orchestrate-task') as OrchestrateTaskModalHost | null;
+  if (!row || row.classList.contains('orchestrate-task-modal-open')) return;
+  closeOrchestrateTaskModal();
+  const backdrop = ensureOrchestrateTaskBackdrop();
+  row._orchestrateModalWasExpanded =
+    row.querySelector('.orchestrate-task-details')?.classList.contains('show') || false;
+  backdrop.hidden = false;
+  moveTaskHostToBody(row);
+  row.classList.add('orchestrate-task-modal-open');
+  row.querySelector('.orchestrate-task-summary')?.setAttribute('aria-expanded', 'true');
+  row.querySelector('.orchestrate-task-modal-close')?.removeAttribute('tabindex');
+  const chevron = row.querySelector('.orchestrate-task-summary .chevron');
+  const details = row.querySelector('.orchestrate-task-details') as HTMLElement | null;
+  if (details) {
+    details.style.height = 'auto';
+    details.classList.add('show', 'is-open');
+    details.scrollTop = 0;
+  }
+  if (chevron) chevron.classList.add('open');
+  (row.querySelector('.orchestrate-task-modal-close') as HTMLElement | null)?.focus();
 }
 
 function syncActionButtons(panel) {
@@ -110,7 +240,7 @@ function syncActionButtons(panel) {
     rows.every((row) => row.querySelector('.orchestrate-task-details')?.classList.contains('show'));
 
   if (toggleAllBtn) {
-    toggleAllBtn.textContent = rows.length > 0 && allExpanded ? '收起全部' : '展开全部';
+    toggleAllBtn.textContent = rows.length > 0 && allExpanded ? 'Collapse all' : 'Expand all';
     toggleAllBtn.disabled = rows.length === 0;
   }
   if (focusBtn) {
@@ -143,13 +273,13 @@ function syncProgressVisuals(entry) {
     counts.total > 0 ? Math.round((counts.completed / counts.total) * 100) : 0;
   const progressLabel = panel.querySelector('[data-orchestrate-progress-label]');
   if (progressLabel) {
-    const parts = [`${counts.completed}/${counts.total} 完成`];
+    const parts = [`${counts.completed}/${counts.total} completed`];
     parts.push(`${completionPercent}%`);
-    if (counts.running) parts.push(`${counts.running} 执行中`);
-    if (counts.failed) parts.push(`${counts.failed} 失败`);
-    if (counts.skipped) parts.push(`${counts.skipped} 跳过`);
-    if (counts.pending) parts.push(`${counts.pending} 等待`);
-    progressLabel.textContent = parts.join(' · ');
+    if (counts.running) parts.push(`${counts.running} running`);
+    if (counts.failed) parts.push(`${counts.failed} failed`);
+    if (counts.skipped) parts.push(`${counts.skipped} skipped`);
+    if (counts.pending) parts.push(`${counts.pending} pending`);
+    progressLabel.textContent = parts.join(' / ');
   }
 
   const segmentCounts = {
@@ -164,7 +294,15 @@ function syncProgressVisuals(entry) {
     if (!segment) return;
     segment.style.width = `${(value / total) * 100}%`;
     segment.hidden = value === 0;
-    segment.title = `${{ completed: '完成', running: '执行中', failed: '失败', skipped: '跳过', pending: '等待' }[key] || key}: ${value}`;
+    const segmentLabel =
+      {
+        completed: 'Completed',
+        running: 'Running',
+        failed: 'Failed',
+        skipped: 'Skipped',
+        pending: 'Pending',
+      }[key] || key;
+    segment.title = `${segmentLabel}: ${value}`;
   });
 
   syncTaskHighlights(panel);
@@ -217,7 +355,7 @@ function ensureDependencySection(row, deps = []) {
 
   section.classList.remove('hidden');
   section.innerHTML = `
-    <div class="orchestrate-task-section-title">依赖任务</div>
+    <div class="orchestrate-task-section-title">Dependencies</div>
     <div class="orchestrate-task-deps">
       ${deps.map((dep) => `<span class="orchestrate-task-dep">${escHtml(dep)}</span>`).join('')}
     </div>
@@ -227,13 +365,13 @@ function ensureDependencySection(row, deps = []) {
 function setTaskPreview(row, text) {
   const previewEl = row.querySelector('.orchestrate-task-preview');
   if (!previewEl) return;
-  previewEl.textContent = inlinePreview(text || '等待执行');
+  previewEl.textContent = inlinePreview(text || 'Waiting to run');
 }
 
-function reasoningPreview(rawText, fallback = '完成') {
+function reasoningPreview(rawText, fallback = 'Completed') {
   const summaryText = (rawText || '').trim().replace(/\n+/g, ' ');
   const preview = summaryText.slice(0, 60);
-  return preview ? preview + (summaryText.length > 60 ? '…' : '') : fallback;
+  return preview ? preview + (summaryText.length > 60 ? '...' : '') : fallback;
 }
 
 function setTaskStatusTone(row, status) {
@@ -269,7 +407,7 @@ function ensureTaskReasoningSection(row) {
     section.innerHTML = `
       <div class="orchestrate-task-reasoning-header" data-action="toggle-tool">
         <span class="orchestrate-task-reasoning-icon">\ud83d\udcad</span>
-        <span class="orchestrate-task-reasoning-label" data-orchestrate-reasoning-label>思考链</span>
+        <span class="orchestrate-task-reasoning-label" data-orchestrate-reasoning-label>Reasoning</span>
         <span class="chevron">\u25b8</span>
       </div>
       <pre class="orchestrate-task-reasoning-body" data-orchestrate-reasoning-body></pre>
@@ -294,11 +432,11 @@ function updateHeaderProgress(entry) {
   if (!statusEl || !entry.panel.classList.contains('orchestrate-active')) return;
 
   const parts = [`${completed}/${total}`];
-  if (running) parts.push(`${running} 执行中`);
-  if (failed) parts.push(`${failed} 失败`);
-  if (skipped) parts.push(`${skipped} 跳过`);
-  if (!running && pending && completed < total) parts.push(`${pending} 等待`);
-  statusEl.textContent = parts.join(' · ');
+  if (running) parts.push(`${running} running`);
+  if (failed) parts.push(`${failed} failed`);
+  if (skipped) parts.push(`${skipped} skipped`);
+  if (!running && pending && completed < total) parts.push(`${pending} pending`);
+  statusEl.textContent = parts.join(' / ');
 }
 
 /**
@@ -313,42 +451,42 @@ function ensureRegistry() {
 function statusText(status) {
   switch (status) {
     case 'running':
-      return '执行中';
+      return 'Running';
     case 'completed':
-      return '完成';
+      return 'Completed';
     case 'failed':
-      return '失败';
+      return 'Failed';
     case 'skipped':
-      return '跳过';
+      return 'Skipped';
     case 'pending':
     default:
-      return '等待';
+      return 'Pending';
   }
 }
 
 function statusIcon(status) {
   switch (status) {
     case 'running':
-      return '⏳';
+      return '\u25cf';
     case 'completed':
-      return '✅';
+      return '\u2713';
     case 'failed':
-      return '❌';
+      return '\u2715';
     case 'skipped':
-      return '⏭️';
+      return '\u21b7';
     case 'pending':
     default:
-      return '⚪';
+      return '\u2026';
   }
 }
 
 /**
- * Build the DAG layout (layers × tasks) into the given container.
+ * Build the DAG layout (layers -> tasks) into the given container.
  * @param {HTMLElement} layersContainer
  * @param {Array<{id:string,agent:string,depends_on:string[],prompt_preview?:string}>} tasks
  * @returns {{ taskRows: Map<string,HTMLElement>, taskLayer: Map<string,number>, layerCount: number }}
  */
-function buildDagLayout(layersContainer, tasks) {
+function buildDagLayout(layersContainer, tasks, orchestrateId) {
   // Compute layers: a task belongs to layer = 1 + max(layer(dep)).
   const layer = new Map();
   const deps = new Map();
@@ -366,7 +504,7 @@ function buildDagLayout(layersContainer, tasks) {
       changed = true;
     }
   }
-  // Anything still unassigned (impossible if plan is a DAG) → layer 0.
+  // Anything still unassigned (impossible if plan is a DAG) goes to layer 0.
   for (const t of tasks) {
     if (!layer.has(t.id)) layer.set(t.id, 0);
   }
@@ -390,27 +528,30 @@ function buildDagLayout(layersContainer, tasks) {
     const taskContainer = document.createElement('div');
     taskContainer.className = 'orchestrate-task-grid';
     for (const t of buckets[li]) {
+      const displayPrompt = stripDelegatedPromptRuntimeContext(t.prompt_preview || '');
       const row = document.createElement('div');
       row.className = 'orchestrate-task orchestrate-task-pending';
+      row.dataset.orchestrateId = orchestrateId;
       row.dataset.taskId = t.id;
-      if (t.prompt_preview) row.dataset.promptPreview = t.prompt_preview;
+      if (displayPrompt) row.dataset.promptPreview = displayPrompt;
       row.innerHTML = `
-        <div class="orchestrate-task-summary" data-action="toggle-tool">
+        <div class="orchestrate-task-summary" data-action="open-orchestrate-task-modal" role="button" tabindex="0" aria-expanded="false">
           <span class="orchestrate-task-icon">${statusIcon('pending')}</span>
           <span class="orchestrate-task-main">
             <span class="orchestrate-task-title">
               <span class="orchestrate-task-id">${escHtml(t.id)}</span>
               <span class="orchestrate-task-agent">${escHtml(t.agent)}</span>
             </span>
-            <span class="orchestrate-task-preview">${escHtml(inlinePreview(t.prompt_preview || '等待执行'))}</span>
+            <span class="orchestrate-task-preview">${escHtml(inlinePreview(displayPrompt || 'Waiting to run'))}</span>
           </span>
           <span class="orchestrate-task-status">${statusText('pending')}</span>
-          <span class="chevron">▸</span>
+          <span class="chevron">\u25b8</span>
+          <button type="button" class="orchestrate-task-modal-close" data-action="close-orchestrate-task-modal" aria-label="Close task details" tabindex="-1">&times;</button>
         </div>
         <div class="orchestrate-task-details"></div>
       `;
       ensureDependencySection(row, t.depends_on || []);
-      ensureTaskSection(row, 'prompt', '任务说明', t.prompt_preview || '');
+      ensureTaskSection(row, 'prompt', 'Task prompt', displayPrompt);
       taskContainer.appendChild(row);
       taskRows.set(t.id, row);
       taskLayer.set(t.id, li);
@@ -444,10 +585,10 @@ export function createOrchestratePanel(data) {
   header.className = 'orchestrate-header';
   header.dataset.action = 'toggle-tool';
   header.innerHTML = `
-    <span class="orchestrate-icon">🗺️</span>
-    <span class="orchestrate-label">Orchestrate · ${data.task_count || 0} tasks · ${data.layer_count || 0} layers</span>
-    <span class="orchestrate-status">执行中</span>
-    <span class="chevron">▸</span>
+    <span class="orchestrate-icon">\u2699</span>
+    <span class="orchestrate-label">Orchestrate / ${data.task_count || 0} tasks / ${data.layer_count || 0} layers</span>
+    <span class="orchestrate-status">Running</span>
+    <span class="chevron">\u25b8</span>
   `;
 
   const body = document.createElement('div');
@@ -464,12 +605,12 @@ export function createOrchestratePanel(data) {
         <span class="orchestrate-progress-segment is-skipped" data-orchestrate-progress="skipped" hidden></span>
         <span class="orchestrate-progress-segment is-pending" data-orchestrate-progress="pending"></span>
       </div>
-      <div class="orchestrate-progress-label" data-orchestrate-progress-label>0/${Array.isArray(data.tasks) ? data.tasks.length : 0} 完成</div>
+      <div class="orchestrate-progress-label" data-orchestrate-progress-label>0/${Array.isArray(data.tasks) ? data.tasks.length : 0} completed</div>
     </div>
     <div class="panel-actions orchestrate-actions">
-      <button type="button" class="panel-action-btn" data-action="orchestrate-toggle-all">展开全部</button>
-      <button type="button" class="panel-action-btn" data-action="orchestrate-focus-active">定位当前</button>
-      <button type="button" class="panel-action-btn" data-action="orchestrate-copy-summary">复制摘要</button>
+      <button type="button" class="panel-action-btn" data-action="orchestrate-toggle-all">Expand all</button>
+      <button type="button" class="panel-action-btn" data-action="orchestrate-focus-active">Focus active</button>
+      <button type="button" class="panel-action-btn" data-action="orchestrate-copy-summary">Copy summary</button>
     </div>
   `;
   body.appendChild(overview);
@@ -486,14 +627,14 @@ export function createOrchestratePanel(data) {
   panel.appendChild(body);
 
   const tasks = Array.isArray(data.tasks) ? data.tasks : [];
-  const layout = buildDagLayout(layers, tasks);
+  const layout = buildDagLayout(layers, tasks, data.orchestrate_id);
 
   // Update header with computed layer count when the provided value is 0 or
   // missing (e.g. during history replay where layer_count isn't available).
   if (!data.layer_count && layout.layerCount) {
     const label = panel.querySelector('.orchestrate-label');
     if (label)
-      label.textContent = `Orchestrate · ${tasks.length} tasks · ${layout.layerCount} layers`;
+      label.textContent = `Orchestrate / ${tasks.length} tasks / ${layout.layerCount} layers`;
   }
 
   const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
@@ -518,7 +659,7 @@ export function createOrchestratePanel(data) {
 }
 
 /**
- * Handle `orchestrate_layer` event — highlight the layer currently running.
+ * Handle `orchestrate_layer` event - highlight the layer currently running.
  */
 export function updateOrchestrateLayer(data) {
   const registry = ensureRegistry();
@@ -572,27 +713,28 @@ export function markOrchestrateTask(data, status) {
     } else if (status === 'skipped' && data.reason) {
       parts.push(String(data.reason).slice(0, 60));
     }
-    statusEl.textContent = parts.join(' · ');
+    statusEl.textContent = parts.join(' / ');
   }
 
+  const displayPrompt = stripDelegatedPromptRuntimeContext(data.prompt || '');
   if (data.prompt) {
-    row.dataset.promptPreview = data.prompt;
-    ensureTaskSection(row, 'prompt', '任务说明', data.prompt);
+    row.dataset.promptPreview = displayPrompt;
+    ensureTaskSection(row, 'prompt', 'Task prompt', displayPrompt);
   }
 
   if (status === 'running') {
-    setTaskPreview(row, data.prompt || row.dataset.promptPreview || '正在执行');
+    setTaskPreview(row, displayPrompt || row.dataset.promptPreview || 'Running');
     pulseFocus(row);
   } else if (status === 'completed') {
-    ensureTaskSection(row, 'result', '任务输出', data.result_excerpt || '', 'is-result');
-    setTaskPreview(row, data.result_excerpt || '任务完成');
+    ensureTaskSection(row, 'result', 'Result', data.result_excerpt || '', 'is-result');
+    setTaskPreview(row, data.result_excerpt || 'Task completed');
   } else if (status === 'failed') {
-    ensureTaskSection(row, 'result', '失败详情', data.error || '', 'is-error');
-    setTaskPreview(row, data.error || '任务失败');
+    ensureTaskSection(row, 'result', 'Error details', data.error || '', 'is-error');
+    setTaskPreview(row, data.error || 'Task failed');
     maybeOpenTaskDetails(row, true);
   } else if (status === 'skipped') {
-    ensureTaskSection(row, 'result', '跳过原因', data.reason || '', 'is-muted');
-    setTaskPreview(row, data.reason || '任务跳过');
+    ensureTaskSection(row, 'result', 'Skip reason', data.reason || '', 'is-muted');
+    setTaskPreview(row, data.reason || 'Task skipped');
   }
 
   if (status === 'failed' && data.error) {
@@ -603,7 +745,7 @@ export function markOrchestrateTask(data, status) {
 }
 
 /**
- * Handle `orchestrate_completed` event — finalize the panel and collapse.
+ * Handle `orchestrate_completed` event - finalize the panel and collapse.
  */
 export function finishOrchestratePanel(data) {
   const registry = ensureRegistry();
@@ -622,31 +764,31 @@ export function finishOrchestratePanel(data) {
   const status = panel.querySelector('.orchestrate-status');
   if (status) {
     const parts = [];
-    parts.push(`${data.completed || 0} ✓`);
-    if (data.failed) parts.push(`${data.failed} ✗`);
-    if (data.skipped) parts.push(`${data.skipped} ⏭`);
+    parts.push(`${data.completed || 0} completed`);
+    if (data.failed) parts.push(`${data.failed} failed`);
+    if (data.skipped) parts.push(`${data.skipped} skipped`);
     if (data.duration_ms != null) {
       const dur = formatToolDuration(data.duration_ms);
       if (dur) parts.push(dur);
     }
     status.textContent = data.aborted
-      ? `中断 (${parts.join(' · ')})`
-      : `完成 (${parts.join(' · ')})`;
+      ? `Aborted (${parts.join(' / ')})`
+      : `Completed (${parts.join(' / ')})`;
   }
 
   const summary = panel.querySelector('.orchestrate-summary');
   if (summary) {
     const metrics = [
-      `${data.completed || 0} 完成`,
-      data.failed ? `${data.failed} 失败` : '',
-      data.skipped ? `${data.skipped} 跳过` : '',
-      data.duration_ms != null ? `耗时 ${formatToolDuration(data.duration_ms)}` : '',
+      `${data.completed || 0} completed`,
+      data.failed ? `${data.failed} failed` : '',
+      data.skipped ? `${data.skipped} skipped` : '',
+      data.duration_ms != null ? `Duration ${formatToolDuration(data.duration_ms)}` : '',
       data.input_tokens != null ? `In ${formatTokenCount(data.input_tokens)}` : '',
       data.output_tokens != null ? `Out ${formatTokenCount(data.output_tokens)}` : '',
     ].filter(Boolean);
     summary.innerHTML = `
       <div class="orchestrate-summary-head">
-        <div class="orchestrate-summary-title">${data.aborted ? '执行状态' : '执行摘要'}</div>
+        <div class="orchestrate-summary-title">${data.aborted ? 'Execution aborted' : 'Execution summary'}</div>
         <div class="orchestrate-summary-metrics">
           ${metrics.map((metric) => `<span class="orchestrate-summary-chip">${escHtml(metric)}</span>`).join('')}
         </div>
@@ -692,7 +834,7 @@ export function focusOrchestrateActive(button) {
 export function copyOrchestrateSummary(button) {
   const panel = button.closest('.orchestrate-panel');
   if (!panel) return;
-  void copyButtonText(button, orchestrationSummaryText(panel), '复制摘要');
+  void copyButtonText(button, orchestrationSummaryText(panel), 'Copy summary');
 }
 
 export function focusOrchestrateTool(button) {
@@ -720,7 +862,9 @@ export function startOrchestrateTaskReasoning(orchestrateId, taskId, agentName =
   if (body._textNode.nodeValue.trim()) body._textNode.nodeValue += '\n\n';
   if (agentName) body._textNode.nodeValue += `[${agentName}]\n`;
 
-  label.textContent = agentName ? `思考链 · ${agentName} 推理中` : '思考链 · 推理中';
+  label.textContent = agentName
+    ? `Reasoning / ${agentName} thinking...`
+    : 'Reasoning / Thinking...';
   label.title = label.textContent;
 }
 
@@ -755,11 +899,11 @@ export function finishOrchestrateTaskReasoning(orchestrateId, taskId) {
 
   const rawText = body._textNode?.nodeValue || body.textContent || '';
   const preview = reasoningPreview(rawText);
-  label.textContent = `思考链 · ${preview}`;
-  label.title = rawText.trim() || '完成';
+  label.textContent = `Reasoning / ${preview}`;
+  label.title = rawText.trim() || 'Completed';
 }
 
-/* ──────────────────── Inner tool chain (per task row) ──────────────────── */
+/* Inner tool chain (per task row) */
 
 function getTaskRow(entry, taskId) {
   if (!entry || !taskId) return null;
@@ -775,7 +919,7 @@ function ensureToolChainSection(row) {
     section.className = 'orchestrate-task-section orchestrate-task-tools';
     section.dataset.orchestrateSection = 'tools';
     section.innerHTML = `
-      <div class="orchestrate-task-section-title">工具链</div>
+      <div class="orchestrate-task-section-title">Tool chain</div>
       <div class="orchestrate-tool-chain" data-orchestrate-tool-chain></div>
     `;
     details.appendChild(section);
@@ -858,12 +1002,12 @@ export function addOrchestrateTaskTool(orchestrateId, taskId, toolName, toolId, 
   pill.dataset.toolArgs = formattedArgs;
   pill.dataset.toolResult = '';
   pill.dataset.toolHasResult = 'false';
-  pill.dataset.toolStatus = '执行中';
+  pill.dataset.toolStatus = 'Running';
 
   pill.innerHTML = `
     <span class="orchestrate-tool-pill-index">${container.childElementCount + 1}</span>
     <span class="orchestrate-tool-pill-name">${escHtml(toolName || 'tool')}</span>
-    <span class="orchestrate-tool-pill-state">执行中</span>
+    <span class="orchestrate-tool-pill-state">Running</span>
   `;
   syncToolPillContent(pill, toolName, toolArgs);
   container.appendChild(pill);
@@ -894,7 +1038,7 @@ export function updateOrchestrateTaskTool(
   if (!pill) return;
 
   const durationLabel = formatToolDuration(durationMs);
-  const stateText = `${isError ? '失败' : '完成'}${durationLabel ? ` · ${durationLabel}` : ''}`;
+  const stateText = `${isError ? 'Failed' : 'Completed'}${durationLabel ? ` / ${durationLabel}` : ''}`;
   setToolPillState(pill, stateText, isError ? 'is-failed' : 'is-done');
 
   // Update drawer-compatible dataset on the pill.

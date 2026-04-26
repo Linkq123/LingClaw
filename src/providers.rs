@@ -1614,6 +1614,34 @@ pub(crate) async fn call_llm_stream(
     extra_tools: &[serde_json::Value],
     max_retries: usize,
 ) -> Result<LlmResponse, String> {
+    call_llm_stream_with_tool_mode(
+        http,
+        resolved,
+        messages,
+        workspace,
+        s3_cfg,
+        tx,
+        think_level,
+        extra_tools,
+        true,
+        max_retries,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn call_llm_stream_with_tool_mode(
+    http: &Client,
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+    workspace: &Path,
+    s3_cfg: Option<&crate::config::S3Config>,
+    tx: &LiveTx,
+    think_level: &str,
+    extra_tools: &[serde_json::Value],
+    include_builtin_tools: bool,
+    max_retries: usize,
+) -> Result<LlmResponse, String> {
     // Resolve "auto": enable thinking at medium level if model supports it, else off
     let effective_level = if think_level == "auto" {
         if auto_think_supported(resolved) {
@@ -1634,6 +1662,7 @@ pub(crate) async fn call_llm_stream(
                 tx,
                 effective_level,
                 extra_tools,
+                include_builtin_tools,
                 max_retries,
             )
             .await
@@ -1647,6 +1676,7 @@ pub(crate) async fn call_llm_stream(
                 tx,
                 effective_level,
                 extra_tools,
+                include_builtin_tools,
                 max_retries,
             )
             .await
@@ -1661,6 +1691,7 @@ pub(crate) async fn call_llm_stream(
                 tx,
                 effective_level,
                 extra_tools,
+                include_builtin_tools,
                 max_retries,
             )
             .await
@@ -1675,6 +1706,7 @@ pub(crate) async fn call_llm_stream(
                 tx,
                 effective_level,
                 extra_tools,
+                include_builtin_tools,
                 max_retries,
             )
             .await
@@ -2134,6 +2166,7 @@ fn build_openai_stream_body(
     s3_cfg: Option<&crate::config::S3Config>,
     think_level: &str,
     extra_tools: &[serde_json::Value],
+    include_builtin_tools: bool,
 ) -> Result<serde_json::Value, String> {
     let thinking_on = think_level != "off";
     let messages = materialize_image_urls(messages, s3_cfg)?;
@@ -2142,8 +2175,11 @@ fn build_openai_stream_body(
         openai_prefers_null_tool_call_content(resolved),
         resolved.thinking_format.as_deref(),
     );
-    let mut all_tools: Vec<serde_json::Value> =
-        serde_json::from_value(tools::tool_definitions()).unwrap_or_default();
+    let mut all_tools: Vec<serde_json::Value> = if include_builtin_tools {
+        serde_json::from_value(tools::tool_definitions()).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     all_tools.extend_from_slice(extra_tools);
     let mut body = json!({
         "model": resolved.model_id,
@@ -2187,12 +2223,16 @@ async fn build_ollama_stream_body(
     s3_cfg: Option<&crate::config::S3Config>,
     think_level: &str,
     extra_tools: &[serde_json::Value],
+    include_builtin_tools: bool,
 ) -> Result<serde_json::Value, String> {
     let messages = materialize_image_urls(messages, s3_cfg)?;
     let images_b64 = fetch_images_base64(&messages, workspace, s3_cfg, false).await?;
     let api_messages = convert_messages_to_ollama(&messages, &images_b64);
-    let mut all_tools: Vec<serde_json::Value> =
-        serde_json::from_value(tools::tool_definitions_ollama()).unwrap_or_default();
+    let mut all_tools: Vec<serde_json::Value> = if include_builtin_tools {
+        serde_json::from_value(tools::tool_definitions_ollama()).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     all_tools.extend_from_slice(extra_tools);
     let mut body = json!({
         "model": resolved.model_id,
@@ -2257,13 +2297,17 @@ fn build_anthropic_stream_body(
     s3_cfg: Option<&crate::config::S3Config>,
     think_level: &str,
     extra_tools: &[serde_json::Value],
+    include_builtin_tools: bool,
 ) -> Result<serde_json::Value, String> {
     let thinking_on = think_level != "off";
     let messages = materialize_image_urls(messages, s3_cfg)?;
     let (system_prompt, anthropic_msgs) = convert_messages_to_anthropic(&messages);
     let base_max = resolved.max_tokens.unwrap_or(8192);
-    let mut all_tools: Vec<serde_json::Value> =
-        serde_json::from_value(tools::tool_definitions_anthropic()).unwrap_or_default();
+    let mut all_tools: Vec<serde_json::Value> = if include_builtin_tools {
+        serde_json::from_value(tools::tool_definitions_anthropic()).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     all_tools.extend_from_slice(extra_tools);
     let cache_enabled = anthropic_prompt_caching_enabled(resolved);
     maybe_apply_anthropic_tool_cache_control(&mut all_tools, cache_enabled);
@@ -2494,10 +2538,18 @@ async fn call_llm_stream_openai(
     tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
+    include_builtin_tools: bool,
     max_retries: usize,
 ) -> Result<LlmResponse, String> {
     let url = format!("{}/chat/completions", resolved.api_base);
-    let body = build_openai_stream_body(resolved, messages, s3_cfg, think_level, extra_tools)?;
+    let body = build_openai_stream_body(
+        resolved,
+        messages,
+        s3_cfg,
+        think_level,
+        extra_tools,
+        include_builtin_tools,
+    )?;
 
     let resp = send_with_retry(http, max_retries, || {
         http.post(&url).bearer_auth(&resolved.api_key).json(&body)
@@ -2542,10 +2594,18 @@ async fn call_llm_stream_anthropic(
     tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
+    include_builtin_tools: bool,
     max_retries: usize,
 ) -> Result<LlmResponse, String> {
     let url = format!("{}/v1/messages", resolved.api_base);
-    let body = build_anthropic_stream_body(resolved, messages, s3_cfg, think_level, extra_tools)?;
+    let body = build_anthropic_stream_body(
+        resolved,
+        messages,
+        s3_cfg,
+        think_level,
+        extra_tools,
+        include_builtin_tools,
+    )?;
 
     let resp = send_with_retry(http, max_retries, || {
         http.post(&url)
@@ -2601,6 +2661,7 @@ async fn call_llm_stream_ollama(
     tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
+    include_builtin_tools: bool,
     max_retries: usize,
 ) -> Result<LlmResponse, String> {
     let url = format!("{}/api/chat", resolved.api_base);
@@ -2611,6 +2672,7 @@ async fn call_llm_stream_ollama(
         s3_cfg,
         think_level,
         extra_tools,
+        include_builtin_tools,
     )
     .await?;
 
@@ -2658,6 +2720,7 @@ async fn call_llm_stream_gemini(
     tx: &LiveTx,
     think_level: &str,
     extra_tools: &[serde_json::Value],
+    include_builtin_tools: bool,
     max_retries: usize,
 ) -> Result<LlmResponse, String> {
     let url = gemini_generate_url(&resolved.api_base, &resolved.model_id, true);
@@ -2667,7 +2730,7 @@ async fn call_llm_stream_gemini(
         workspace,
         s3_cfg,
         extra_tools,
-        true,
+        include_builtin_tools,
         think_level,
     )
     .await?;

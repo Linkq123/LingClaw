@@ -7,6 +7,7 @@ export function applyToolsVisibility(
     chat: HTMLElement | null;
     closeToolDrawer: () => void;
     closeSubagentModal: () => void;
+    closeOrchestrateTaskModal: () => void;
   },
 ) {
   deps.state.showTools = showTools;
@@ -15,6 +16,7 @@ export function applyToolsVisibility(
   if (!showTools) {
     deps.closeToolDrawer();
     deps.closeSubagentModal();
+    deps.closeOrchestrateTaskModal();
     deps.state.activeToolPanel = null;
   }
 }

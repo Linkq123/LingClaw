@@ -897,6 +897,9 @@ async fn execute_task_tool(
             };
         }
     };
+    let effective_prompt = crate::subagents::executor::augment_subagent_prompt_with_current_time(
+        prompt,
+    );
 
     let spec = match crate::subagents::discovery::find_agent(workspace, agent_name) {
         Some(s) => s,
@@ -952,7 +955,15 @@ async fn execute_task_tool(
     let mut guard = TaskEventGuard::new(live_tx, agent_name, &task_id);
 
     let outcome = crate::subagents::executor::run_subagent(
-        &spec, prompt, config, http, workspace, live_tx, cancel, hooks, &task_id,
+        &spec,
+        &effective_prompt,
+        config,
+        http,
+        workspace,
+        live_tx,
+        cancel,
+        hooks,
+        &task_id,
     )
     .await;
 

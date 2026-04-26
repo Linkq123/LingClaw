@@ -5,6 +5,7 @@ import {
   formatTokenCount,
   formatDetailText,
   inlinePreview,
+  stripDelegatedPromptRuntimeContext,
   pulseFocus,
   copyButtonText,
 } from '../utils.js';
@@ -468,6 +469,7 @@ function panelKey(ref) {
  * @param {string} [taskId]
  */
 export function createSubagentPanel(agentName, prompt, taskId) {
+  const displayPrompt = stripDelegatedPromptRuntimeContext(prompt);
   const panel = document.createElement('div');
   panel.className = 'subagent-panel subagent-active';
   panel.dataset.agent = agentName;
@@ -517,7 +519,7 @@ export function createSubagentPanel(agentName, prompt, taskId) {
     promptCard.className = 'subagent-section-card';
     promptCard.innerHTML = `
       <div class="subagent-section-title">委托任务</div>
-      <div class="subagent-prompt">${escHtml(prompt)}</div>
+      <div class="subagent-prompt">${escHtml(displayPrompt)}</div>
     `;
     body.appendChild(promptCard);
   }

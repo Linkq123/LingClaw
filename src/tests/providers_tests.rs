@@ -810,7 +810,7 @@ fn anthropic_thinking_does_not_inflate_max_tokens() {
         },
     ];
 
-    let body = build_anthropic_stream_body(&resolved, &messages, None, "medium", &[])
+    let body = build_anthropic_stream_body(&resolved, &messages, None, "medium", &[], true)
         .expect("body should build");
 
     assert_eq!(body["max_tokens"].as_u64(), Some(128_000));
@@ -844,7 +844,7 @@ fn anthropic_thinking_clamps_budget_when_max_tokens_is_small() {
         timestamp: None,
     }];
 
-    let body = build_anthropic_stream_body(&resolved, &messages, None, "medium", &[])
+    let body = build_anthropic_stream_body(&resolved, &messages, None, "medium", &[], true)
         .expect("body should build");
 
     assert_eq!(body["max_tokens"].as_u64(), Some(4_096));
@@ -879,7 +879,7 @@ fn anthropic_thinking_disabled_when_max_tokens_too_small() {
         timestamp: None,
     }];
 
-    let body = build_anthropic_stream_body(&resolved, &messages, None, "medium", &[])
+    let body = build_anthropic_stream_body(&resolved, &messages, None, "medium", &[], true)
         .expect("body should build");
 
     assert_eq!(body["max_tokens"].as_u64(), Some(1_024));
@@ -1114,7 +1114,7 @@ async fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
     }];
 
     let workspace = unique_temp_dir("lingclaw-ollama-body");
-    let body = build_ollama_stream_body(&resolved, &messages, &workspace, None, "high", &[])
+    let body = build_ollama_stream_body(&resolved, &messages, &workspace, None, "high", &[], true)
         .await
         .unwrap();
 
@@ -1142,7 +1142,7 @@ async fn build_ollama_stream_body_uses_levels_for_gpt_oss() {
     };
 
     let workspace = unique_temp_dir("lingclaw-ollama-levels");
-    let body = build_ollama_stream_body(&resolved, &[], &workspace, None, "high", &[])
+    let body = build_ollama_stream_body(&resolved, &[], &workspace, None, "high", &[], true)
         .await
         .unwrap();
 
@@ -1210,8 +1210,8 @@ fn build_openai_stream_body_uses_null_tool_call_content_for_official_api() {
         timestamp: None,
     }];
 
-    let body =
-        build_openai_stream_body(&resolved, &messages, None, "off", &[]).expect("body builds");
+    let body = build_openai_stream_body(&resolved, &messages, None, "off", &[], true)
+        .expect("body builds");
 
     assert!(body["messages"][0]["content"].is_null());
 }
@@ -1249,8 +1249,8 @@ fn build_openai_stream_body_keeps_string_tool_call_content_for_compatible_api() 
         timestamp: None,
     }];
 
-    let body =
-        build_openai_stream_body(&resolved, &messages, None, "off", &[]).expect("body builds");
+    let body = build_openai_stream_body(&resolved, &messages, None, "off", &[], true)
+        .expect("body builds");
 
     assert_eq!(body["messages"][0]["content"], "");
 }
@@ -1300,8 +1300,8 @@ fn build_openai_stream_body_deepseek_v4_sends_thinking_and_reasoning_effort() {
         },
     ];
 
-    let body =
-        build_openai_stream_body(&resolved, &messages, None, "high", &[]).expect("body builds");
+    let body = build_openai_stream_body(&resolved, &messages, None, "high", &[], true)
+        .expect("body builds");
 
     assert_eq!(body["reasoning_effort"], "high");
     assert_eq!(body["thinking"]["type"], "enabled");
@@ -1327,7 +1327,8 @@ fn build_openai_stream_body_deepseek_v4_maps_xhigh_to_max() {
         anthropic_prompt_caching: false,
     };
 
-    let body = build_openai_stream_body(&resolved, &[], None, "xhigh", &[]).expect("body builds");
+    let body =
+        build_openai_stream_body(&resolved, &[], None, "xhigh", &[], true).expect("body builds");
 
     assert_eq!(body["reasoning_effort"], "max");
     assert_eq!(body["thinking"]["type"], "enabled");
@@ -1348,7 +1349,8 @@ fn build_openai_stream_body_deepseek_v4_maps_low_to_high() {
         anthropic_prompt_caching: false,
     };
 
-    let body = build_openai_stream_body(&resolved, &[], None, "low", &[]).expect("body builds");
+    let body =
+        build_openai_stream_body(&resolved, &[], None, "low", &[], true).expect("body builds");
 
     assert_eq!(body["reasoning_effort"], "high");
 }
@@ -1368,7 +1370,8 @@ fn build_openai_stream_body_deepseek_v4_off_sends_thinking_disabled() {
         anthropic_prompt_caching: false,
     };
 
-    let body = build_openai_stream_body(&resolved, &[], None, "off", &[]).expect("body builds");
+    let body =
+        build_openai_stream_body(&resolved, &[], None, "off", &[], true).expect("body builds");
 
     assert!(body.get("reasoning_effort").is_none());
     assert_eq!(body["thinking"]["type"], "disabled");
@@ -1991,6 +1994,7 @@ async fn call_llm_stream_gemini_closes_thinking_on_thought_only_stream_end() {
         &live_tx,
         "low",
         &[],
+        true,
         0,
     )
     .await
@@ -2319,6 +2323,7 @@ fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
                 &live_tx,
                 "high",
                 &[],
+                true,
                 2,
             )
             .await
@@ -2406,6 +2411,7 @@ fn call_llm_stream_openai_reports_html_gateway_response() {
             &live_tx,
             "medium",
             &[],
+            true,
             2,
         )
         .await
@@ -2518,6 +2524,7 @@ fn call_llm_stream_openai_surfaces_json_error_envelope() {
             &live_tx,
             "medium",
             &[],
+            true,
             2,
         )
         .await

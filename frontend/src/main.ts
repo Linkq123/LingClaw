@@ -98,6 +98,8 @@ import {
   updateOrchestrateLayer,
   markOrchestrateTask,
   finishOrchestratePanel,
+  openOrchestrateTaskModal,
+  closeOrchestrateTaskModal,
   toggleOrchestrateTasks,
   focusOrchestrateActive,
   copyOrchestrateSummary,
@@ -151,6 +153,7 @@ function applyViewState(viewState) {
       chat: dom.chat,
       closeToolDrawer,
       closeSubagentModal,
+      closeOrchestrateTaskModal,
     });
   }
 
@@ -447,6 +450,7 @@ function handleMessage(data) {
     case 'history': {
       closeToolDrawer();
       closeSubagentModal();
+      closeOrchestrateTaskModal();
       clearReactStatus();
       clearBufferedChatUpdates();
       setAutoFollowChat(true);
@@ -866,8 +870,16 @@ const actionHandlers = {
   'subagent-focus-current': (el) => focusSubagentCurrent(el),
   'subagent-focus-tool': (el) => focusSubagentTool(el),
   'subagent-copy-summary': (el) => copySubagentSummary(el),
-  'open-subagent-modal': (el) => openSubagentModal(el),
+  'open-subagent-modal': (el) => {
+    closeOrchestrateTaskModal();
+    openSubagentModal(el);
+  },
   'close-subagent-modal': () => closeSubagentModal(),
+  'open-orchestrate-task-modal': (el) => {
+    closeSubagentModal();
+    openOrchestrateTaskModal(el);
+  },
+  'close-orchestrate-task-modal': () => closeOrchestrateTaskModal(),
   'orchestrate-toggle-all': (el) => toggleOrchestrateTasks(el),
   'orchestrate-focus-active': (el) => focusOrchestrateActive(el),
   'orchestrate-focus-tool': (el) => focusOrchestrateTool(el),
@@ -903,6 +915,7 @@ function handleDocumentKeydown(e: KeyboardEvent) {
     closeToolDrawer();
     closeMobileMenu();
     closeSubagentModal();
+    closeOrchestrateTaskModal();
     closeSettingsPage();
     closeUsagePage();
     closeShortcutsOverlay();

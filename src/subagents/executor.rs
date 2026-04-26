@@ -19,18 +19,41 @@ use tokio_util::sync::CancellationToken;
 
 use super::SubAgentSpec;
 use crate::{
-    ChatMessage, Config, LiveTx, agent, context,
+    ChatMessage, Config, LiveTx, agent, context, prompts,
     hooks::{self, HookRegistry, ToolHookInput, run_tool_hooks},
     live_send, providers, tools, truncate,
 };
 
 /// Maximum characters in the sub-agent's final result returned to the parent.
 const MAX_RESULT_CHARS: usize = 30_000;
+const DELEGATED_PROMPT_CONTEXT_HEADING: &str = "## Delegated Task Context";
 
 pub(crate) struct ParallelToolBatchResult {
     pub results: Vec<Option<tools::ToolOutcome>>,
     pub interrupted: bool,
     pub timed_out: bool,
+}
+
+pub(crate) fn augment_subagent_prompt_with_runtime_context(
+    prompt: &str,
+    local_time: &str,
+) -> String {
+    if prompt.trim_start().starts_with(DELEGATED_PROMPT_CONTEXT_HEADING) {
+        return prompt.to_string();
+    }
+
+    format!(
+        "{DELEGATED_PROMPT_CONTEXT_HEADING}\n\
+         - Current system local time: {local_time}\n\n\
+         ## Delegated Task\n\
+         {}",
+        prompt.trim()
+    )
+}
+
+pub(crate) fn augment_subagent_prompt_with_current_time(prompt: &str) -> String {
+    let local_time = prompts::current_local_snapshot().datetime_label();
+    augment_subagent_prompt_with_runtime_context(prompt, &local_time)
 }
 
 pub(crate) async fn collect_parallel_tool_results(
@@ -479,7 +502,7 @@ pub(crate) async fn run_subagent(
                         let _ = forward_handle.await;
                         break 'react;
                     }
-                    result = providers::call_llm_stream(
+                    result = providers::call_llm_stream_with_tool_mode(
                         http,
                         &resolved,
                         &messages,
@@ -488,6 +511,7 @@ pub(crate) async fn run_subagent(
                         &sub_tx,
                         think_level,
                         &tool_defs,
+                        false,
                         config.max_llm_retries,
                     ) => {
                         drop(sub_tx);

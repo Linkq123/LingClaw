@@ -95,6 +95,30 @@ fn test_render_agents_catalog_with_agents() {
 }
 
 #[test]
+fn test_augment_subagent_prompt_with_runtime_context_prepends_local_time() {
+    let prompt = "Review the current diff and explain the bug.";
+    let augmented = crate::subagents::executor::augment_subagent_prompt_with_runtime_context(
+        prompt,
+        "2026-04-27 09:30:00 +08:00",
+    );
+
+    assert!(augmented.contains("## Delegated Task Context"));
+    assert!(augmented.contains("Current system local time: 2026-04-27 09:30:00 +08:00"));
+    assert!(augmented.ends_with(prompt));
+}
+
+#[test]
+fn test_augment_subagent_prompt_with_runtime_context_is_idempotent() {
+    let prompt = "## Delegated Task Context\n- Current system local time: 2026-04-27 09:30:00 +08:00\n\n## Delegated Task\nInspect the logs.";
+    let augmented = crate::subagents::executor::augment_subagent_prompt_with_runtime_context(
+        prompt,
+        "2026-04-28 10:45:00 +08:00",
+    );
+
+    assert_eq!(augmented, prompt);
+}
+
+#[test]
 fn test_parse_agent_frontmatter() {
     let content = r#"---
 name: test-agent
@@ -1452,11 +1476,23 @@ async fn run_subagent_configured_openai_gateway_auto_disables_reasoning_controls
 
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be valid json");
+    let tool_names: Vec<&str> = body["tools"]
+        .as_array()
+        .expect("tool definitions should be an array")
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    let unique_tool_names: std::collections::HashSet<&str> = tool_names.iter().copied().collect();
 
     assert!(!outcome.aborted);
     assert_eq!(outcome.result, "Frontend task complete.");
     assert!(body.get("reasoning_effort").is_none());
     assert!(body.get("enable_thinking").is_none());
+    assert_eq!(
+        tool_names.len(),
+        unique_tool_names.len(),
+        "sub-agent requests should not duplicate tool definitions"
+    );
 
     let _ = fs::remove_dir_all(&workspace);
 }

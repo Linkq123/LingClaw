@@ -123,6 +123,7 @@ describe('subagent modal hosting', () => {
       chat: dom.chat,
       closeToolDrawer,
       closeSubagentModal,
+      closeOrchestrateTaskModal: vi.fn(),
     });
 
     expect(closeToolDrawer).toHaveBeenCalledTimes(1);
@@ -130,5 +131,16 @@ describe('subagent modal hosting', () => {
     expect(wrapper?.parentElement).toBe(dom.chat);
     expect(dom.chat?.classList.contains('hide-tools')).toBe(true);
     expect(document.getElementById('subagent-modal-backdrop')?.hidden).toBe(true);
+  });
+  it('strips delegated runtime context from the displayed prompt', () => {
+    createSubagentPanel(
+      'explore',
+      '## Delegated Task Context\n- Current system local time: 2026-04-27 09:30:00 +08:00\n\n## Delegated Task\nInspect the logs and summarize the failure.',
+      'task-4',
+    );
+
+    const promptEl = dom.chat?.querySelector('.subagent-prompt');
+    expect(promptEl?.textContent).toBe('Inspect the logs and summarize the failure.');
+    expect(promptEl?.textContent).not.toContain('Delegated Task Context');
   });
 });

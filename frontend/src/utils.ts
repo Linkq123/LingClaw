@@ -82,6 +82,26 @@ export function inlinePreview(text, max = 100) {
   );
 }
 
+export function stripDelegatedPromptRuntimeContext(text) {
+  const raw = String(text ?? '');
+  const trimmedStart = raw.trimStart();
+  const lines = trimmedStart.split(/\r?\n/);
+  if (
+    lines[0] !== '## Delegated Task Context' ||
+    !lines[1]?.startsWith('- Current system local time:')
+  ) {
+    return raw;
+  }
+
+  const taskHeaderIdx = lines.findIndex((line, idx) => idx >= 2 && line.trim() === '## Delegated Task');
+  if (taskHeaderIdx < 0) {
+    return raw;
+  }
+
+  const taskBody = lines.slice(taskHeaderIdx + 1).join('\n').trim();
+  return taskBody || raw;
+}
+
 export function pulseFocus(el) {
   if (!el) return;
   el.classList.remove('focus-flash');

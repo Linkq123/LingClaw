@@ -30,12 +30,13 @@
   max-width: none;
   min-width: 0;
   padding-left: 0;
-  padding: 28px 20px;
+  padding: 28px 20px 56px;
   display: flex;
   justify-content: center;
-  align-items: stretch;
+  align-items: flex-start;
   overflow-y: auto;
   overflow-x: hidden;
+  overscroll-behavior: contain;
   background: none !important;
   z-index: 102;
   pointer-events: none;
@@ -502,7 +503,8 @@
   width: min(960px, 100%);
   max-width: 100%;
   min-width: 0;
-  height: 100%;
+  max-height: 100%;
+  height: auto;
   margin: 0;
   z-index: 102;
   display: flex;
@@ -701,6 +703,9 @@
   min-height: 0;
   max-height: none;
   padding: 0 18px 18px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 .subagent-body.is-open {
   opacity: 1;
@@ -1283,6 +1288,23 @@
   transition: background 180ms ease, border-color 180ms ease;
   overflow: hidden;
 }
+.orchestrate-task.orchestrate-task-modal-open {
+  position: fixed;
+  top: 28px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(920px, calc(100vw - 40px));
+  max-width: calc(100vw - 40px);
+  max-height: calc(100vh - 68px);
+  z-index: 102;
+  display: flex;
+  flex-direction: column;
+  border-radius: 16px;
+  background: var(--surface);
+  border-color: color-mix(in srgb, var(--accent2) 20%, var(--panel-border-soft));
+  box-shadow: 0 24px 72px rgba(20,24,38,.20);
+  animation: panelSlideUp .18s ease-out;
+}
 .orchestrate-task-summary {
   display: flex;
   align-items: flex-start;
@@ -1291,6 +1313,13 @@
   cursor: pointer;
   background: transparent;
   transition: background .15s;
+}
+.orchestrate-task.orchestrate-task-modal-open .orchestrate-task-summary {
+  flex-shrink: 0;
+  gap: 12px;
+  padding: 14px 16px 12px;
+  border-bottom: 1px solid var(--panel-border-soft);
+  background: var(--panel-surface-alt);
 }
 .orchestrate-task-summary:hover {
   background: var(--panel-hover);
@@ -1302,11 +1331,18 @@
   flex: 1 1 0;
   min-width: 0;
 }
+.orchestrate-task.orchestrate-task-modal-open .orchestrate-task-main {
+  gap: 6px;
+}
 .orchestrate-task-title {
   display: flex;
   align-items: center;
   gap: 8px;
   min-width: 0;
+}
+.orchestrate-task.orchestrate-task-modal-open .orchestrate-task-title {
+  flex-wrap: wrap;
+  row-gap: 4px;
 }
 .orchestrate-task-preview {
   color: var(--dim);
@@ -1314,6 +1350,13 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.orchestrate-task.orchestrate-task-modal-open .orchestrate-task-preview {
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow: visible;
+  text-overflow: clip;
 }
 .orchestrate-task-id {
   font-weight: 600;
@@ -1343,6 +1386,31 @@
 .orchestrate-task-summary .chevron.open {
   transform: rotate(90deg);
 }
+.orchestrate-task.orchestrate-task-modal-open .orchestrate-task-summary .chevron {
+  transform: rotate(45deg);
+}
+.orchestrate-task-modal-close {
+  display: none;
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--panel-border-soft);
+  border-radius: 999px;
+  background: var(--panel-surface-alt);
+  color: var(--dim);
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.orchestrate-task.orchestrate-task-modal-open .orchestrate-task-modal-close {
+  display: inline-flex;
+}
+.orchestrate-task-modal-close:hover {
+  border-color: var(--accent2);
+  color: var(--text);
+}
 .orchestrate-task-details {
   height: 0;
   opacity: 0;
@@ -1359,6 +1427,16 @@
 }
 .orchestrate-task-details.is-open {
   opacity: 1;
+}
+.orchestrate-task.orchestrate-task-modal-open .orchestrate-task-details {
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.orchestrate-task.orchestrate-task-modal-open .orchestrate-task-details.show {
+  padding: 0 16px 16px;
+  max-height: calc(100vh - 184px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .orchestrate-task-section + .orchestrate-task-section {
   margin-top: 10px;
@@ -1600,6 +1678,18 @@
 .orchestrate-task-failed .orchestrate-task-status { color: var(--accent-error); }
 .orchestrate-task-failed .orchestrate-task-preview { color: color-mix(in srgb, var(--accent-error) 80%, var(--text)); }
 .orchestrate-task-skipped { opacity: 0.55; }
+.orchestrate-task-modal-placeholder {
+  min-height: 1px;
+  pointer-events: none;
+}
+.orchestrate-task-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 101;
+  background: rgba(18,22,34,.16);
+  animation: fadeIn .14s ease-out;
+}
+.orchestrate-task-modal-backdrop[hidden] { display: none; }
 .orchestrate-summary {
   margin-top: 12px;
   padding: 12px;

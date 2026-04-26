@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::executor::run_subagent;
+use super::executor::{augment_subagent_prompt_with_current_time, run_subagent};
 use crate::hooks::HookRegistry;
 use crate::{Config, LiveTx, live_send, truncate};
 
@@ -779,6 +779,7 @@ async fn execute_single_task(
 
     // Interpolate dependency results into prompt
     let resolved_prompt = interpolate_results(&task.prompt, completed_results);
+    let effective_prompt = augment_subagent_prompt_with_current_time(&resolved_prompt);
 
     // Send task started event
     let _ = live_send(
@@ -802,7 +803,7 @@ async fn execute_single_task(
     // Run sub-agent
     let outcome = run_subagent(
         &spec,
-        &resolved_prompt,
+        &effective_prompt,
         config,
         http,
         workspace,

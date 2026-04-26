@@ -358,10 +358,49 @@
   padding: 14px 16px;
   overflow-x: auto;
   font-weight: 500;
+  color: var(--text);
 }
 .msg.assistant pre code.hljs,
 .msg.assistant .live-code-tail code.hljs {
   background: transparent;
+  color: var(--text);
+}
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-comment,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-quote,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-meta {
+  color: color-mix(in srgb, var(--dim) 90%, var(--text));
+}
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-keyword,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-literal,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-section,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-selector-tag,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-type,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-built_in {
+  color: color-mix(in srgb, var(--accent2) 82%, var(--text));
+}
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-title,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-title.function_,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-title.class_,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-attr,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-attribute,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-name,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-tag,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-property {
+  color: color-mix(in srgb, var(--text) 72%, var(--accent2));
+}
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-string,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-regexp,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-doctag,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-template-tag,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-template-variable {
+  color: color-mix(in srgb, var(--accent-success) 78%, var(--text));
+}
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-number,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-symbol,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-bullet,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-variable,
+.msg.assistant :is(pre, .live-code-tail) code.hljs .hljs-params {
+  color: color-mix(in srgb, var(--accent-warn) 76%, var(--text));
 }
 .msg.assistant :not(pre) > code {
   background: var(--tool-bg);
@@ -645,4 +684,3 @@ pre:hover .copy-btn { opacity: 1; }
   background-color: color-mix(in srgb, var(--accent) 6%, transparent);
   transition: background-color .15s ease;
 }
-
