@@ -437,7 +437,10 @@ pub(crate) async fn run_subagent(
         // tool schema tokens, and structural overhead — matching the main loop's
         // request_message_budget_for_runtime but using the sub-agent's actual
         // (filtered) tool definitions instead of all builtins + extras.
-        let think_level = "medium";
+        // Let provider/model capabilities decide whether delegated runs should
+        // send reasoning controls. This avoids 400s on OpenAI-compatible
+        // models that reject `reasoning_effort` or similar fields.
+        let think_level = "auto";
         let budget =
             context::message_budget_for_tool_defs(config, &model_id, think_level, &tool_defs);
         context::prune_messages_for_provider(&mut messages, resolved.provider, budget);

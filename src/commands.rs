@@ -101,7 +101,7 @@ async fn status_effective_think_level(
     if session.think_level != "auto" {
         return session.think_level.clone();
     }
-    if !(resolved.reasoning || resolved.thinking_format.is_some()) {
+    if !providers::auto_think_supported(resolved) {
         return "off".to_string();
     }
 

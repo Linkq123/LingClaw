@@ -427,7 +427,7 @@ Bad policy.
 // These tests call the production `resolve_subagent_model()` function.
 
 use crate::Config;
-use crate::config::{JsonMcpServerConfig, Provider};
+use crate::config::{JsonMcpServerConfig, JsonModelEntry, JsonProviderConfig, Provider};
 use crate::hooks::{AgentHook, HookInput, HookOutput, HookRegistry, ToolHookInput};
 use crate::subagents::executor::resolve_subagent_model;
 use std::collections::HashMap;
@@ -446,6 +446,10 @@ use std::thread;
 use std::time::Duration;
 
 const MOCK_MCP_SERVER_SOURCE: &str = include_str!("fixtures/mock_mcp_server.rs");
+
+struct CapturedHttpRequest {
+    body: String,
+}
 
 fn base_config() -> Config {
     Config {
@@ -562,7 +566,7 @@ fn parse_content_length(header_text: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn read_http_request(stream: &mut TcpStream) {
+fn read_http_request(stream: &mut TcpStream) -> CapturedHttpRequest {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("read timeout should be set");
@@ -586,6 +590,10 @@ fn read_http_request(stream: &mut TcpStream) {
             }
         }
     }
+
+    let headers_end = find_headers_end(&buffer).expect("request should contain headers");
+    let body = String::from_utf8_lossy(&buffer[headers_end + 4..]).to_string();
+    CapturedHttpRequest { body }
 }
 
 fn spawn_one_shot_http_server(
@@ -606,7 +614,7 @@ fn spawn_http_server_with_responses(
     let handle = thread::spawn(move || {
         for (response_content_type, response_body) in responses {
             let (mut stream, _) = listener.accept().expect("request should connect");
-            read_http_request(&mut stream);
+            let _ = read_http_request(&mut stream);
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: {response_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 response_body.len(),
@@ -620,6 +628,40 @@ fn spawn_http_server_with_responses(
     });
 
     (format!("http://{}", address), handle)
+}
+
+fn spawn_one_shot_http_server_with_capture(
+    response_content_type: &'static str,
+    response_body: String,
+) -> (
+    String,
+    std::sync::mpsc::Receiver<CapturedHttpRequest>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose address");
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("request should connect");
+        let request = read_http_request(&mut stream);
+        request_tx
+            .send(request)
+            .expect("captured request should be sent");
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {response_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("response should be written");
+        stream.flush().expect("response should flush");
+    });
+
+    (format!("http://{}", address), request_rx, handle)
 }
 
 fn build_openai_tool_call_stream(tool_name: &str, args: serde_json::Value) -> String {
@@ -664,6 +706,17 @@ fn build_openai_multi_tool_call_stream(tool_calls: Vec<(&str, serde_json::Value)
                 "tool_calls": calls
             },
             "finish_reason": "tool_calls"
+        }]
+    });
+    format!("data: {}\n\ndata: [DONE]\n\n", chunk)
+}
+
+fn build_openai_content_stream(content: &str) -> String {
+    let chunk = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "content": content
+            }
         }]
     });
     format!("data: {}\n\ndata: [DONE]\n\n", chunk)
@@ -1330,6 +1383,80 @@ async fn run_subagent_forces_final_summary_after_tool_only_last_turn() {
     assert!(!outcome.result.contains("Now let me check"));
     assert!(outcome.total_input_tokens >= 120);
     assert!(outcome.total_output_tokens >= 32);
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_subagent_configured_openai_gateway_auto_disables_reasoning_controls() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-configured-openai-auto-think");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+
+    let response_body = build_openai_content_stream("Frontend task complete.");
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server_with_capture("text/event-stream", response_body);
+
+    let mut config = base_config();
+    config.providers.insert(
+        "gateway".to_string(),
+        JsonProviderConfig {
+            base_url: api_base,
+            api_key: "test-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "kimi-k2.6".to_string(),
+                name: None,
+                reasoning: Some(true),
+                input: Some(vec!["text".to_string(), "image".to_string()]),
+                cost: None,
+                context_window: Some(256_000),
+                max_tokens: Some(32_000),
+                compat: None,
+            }],
+        },
+    );
+    config.sub_agent_model_overrides.insert(
+        "frontend-coder".to_string(),
+        "gateway/kimi-k2.6".to_string(),
+    );
+
+    let spec = SubAgentSpec {
+        name: "frontend-coder".into(),
+        description: String::new(),
+        system_prompt: "Implement the requested UI update.".into(),
+        max_turns: 1,
+        tools: ToolPermissions::default(),
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(16);
+    let http = reqwest::Client::new();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Center the modal and polish spacing.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &HookRegistry::new(),
+        "test-task-configured-openai-auto-think",
+    )
+    .await;
+
+    let request = request_rx.recv().expect("request should be captured");
+    handle.join().expect("server thread should join");
+
+    let body: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid json");
+
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.result, "Frontend task complete.");
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("enable_thinking").is_none());
 
     let _ = fs::remove_dir_all(&workspace);
 }

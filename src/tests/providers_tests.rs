@@ -1509,6 +1509,51 @@ fn official_openai_api_base_requires_exact_hostname_match() {
 }
 
 #[test]
+fn auto_think_supported_for_openai_requires_official_or_explicit_format() {
+    let compatible = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://vip.aipro.love/v1".into(),
+        api_key: "openai-key".into(),
+        model_id: "gpt-5.4".into(),
+        reasoning: true,
+        thinking_format: None,
+        max_tokens: Some(128),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    assert!(!auto_think_supported(&compatible));
+
+    let official = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: Provider::OpenAI.default_api_base().into(),
+        api_key: "openai-key".into(),
+        model_id: "gpt-5.4".into(),
+        reasoning: true,
+        thinking_format: None,
+        max_tokens: Some(128),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    assert!(auto_think_supported(&official));
+
+    let explicit = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://vip.aipro.love/v1".into(),
+        api_key: "openai-key".into(),
+        model_id: "gpt-5.4".into(),
+        reasoning: true,
+        thinking_format: Some("qwen".into()),
+        max_tokens: Some(128),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    assert!(auto_think_supported(&explicit));
+}
+
+#[test]
 fn openai_null_tool_call_content_allows_explicit_opt_in_for_custom_domain() {
     assert!(openai_prefers_null_tool_call_content_with_opt_in(
         "https://openai.internal.example/v1",
@@ -2376,6 +2421,59 @@ fn call_llm_stream_openai_reports_html_gateway_response() {
     assert!(error.contains("OpenAI stream error"));
     assert!(error.contains("text/html"));
     assert!(error.contains("gateway landing page"));
+}
+
+#[test]
+fn call_llm_stream_openai_auto_skips_reasoning_effort_for_compatible_gateway() {
+    let response_body =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n".to_string();
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server("text/event-stream", response_body);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base,
+        api_key: "stream-secret".into(),
+        model_id: "gpt-5.4".into(),
+        reasoning: true,
+        thinking_format: None,
+        max_tokens: Some(32),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hi".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let live_tx: LiveTx = tx;
+    let workspace = unique_temp_dir("lingclaw-openai-auto-compatible");
+
+    let response = runtime
+        .block_on(async {
+            call_llm_stream(
+                &http, &resolved, &messages, &workspace, None, &live_tx, "auto", &[], 0,
+            )
+            .await
+        })
+        .expect("compatible gateway stream should succeed");
+
+    let request = request_rx.recv().expect("captured request should exist");
+    handle.join().expect("server thread should join");
+
+    let body: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid json");
+    assert_eq!(response.message.content.as_deref(), Some("ok"));
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("enable_thinking").is_none());
 }
 
 #[test]

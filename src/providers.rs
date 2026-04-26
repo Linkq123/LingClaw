@@ -284,6 +284,10 @@ fn openai_prefers_null_tool_call_content(resolved: &ResolvedModel) -> bool {
     )
 }
 
+fn openai_supports_reasoning_controls(resolved: &ResolvedModel) -> bool {
+    is_official_openai_api_base(&resolved.api_base) || resolved.thinking_format.is_some()
+}
+
 /// Convert internal messages to clean OpenAI API format (strips timestamps and
 /// extra fields so the provider receives only role/content/tool_calls/tool_call_id).
 ///
@@ -1531,6 +1535,19 @@ pub(crate) fn gemini_uses_thinking_level(resolved: &ResolvedModel) -> bool {
         .contains("gemini-3")
 }
 
+pub(crate) fn auto_think_supported(resolved: &ResolvedModel) -> bool {
+    match resolved.provider {
+        Provider::OpenAI => resolved.reasoning && openai_supports_reasoning_controls(resolved),
+        Provider::Anthropic => resolved.reasoning,
+        Provider::Ollama => resolved.reasoning || resolved.thinking_format.is_some(),
+        Provider::Gemini => {
+            resolved.reasoning
+                || resolved.thinking_format.is_some()
+                || gemini_uses_thinking_level(resolved)
+        }
+    }
+}
+
 fn ollama_uses_think_levels(resolved: &ResolvedModel) -> bool {
     resolved
         .thinking_format
@@ -1599,10 +1616,7 @@ pub(crate) async fn call_llm_stream(
 ) -> Result<LlmResponse, String> {
     // Resolve "auto": enable thinking at medium level if model supports it, else off
     let effective_level = if think_level == "auto" {
-        if resolved.reasoning
-            || resolved.thinking_format.is_some()
-            || gemini_uses_thinking_level(resolved)
-        {
+        if auto_think_supported(resolved) {
             "medium"
         } else {
             "off"
