@@ -30,6 +30,12 @@
   max-width: none;
   min-width: 0;
   padding-left: 0;
+  padding: 28px 20px;
+  display: flex;
+  justify-content: center;
+  align-items: stretch;
+  overflow-y: auto;
+  overflow-x: hidden;
   background: none !important;
   z-index: 102;
   pointer-events: none;
@@ -40,6 +46,9 @@
 }
 .timeline-node.subagent-modal-host > .subagent-panel.subagent-modal-open {
   pointer-events: auto;
+  width: min(960px, 100%);
+  max-width: 100%;
+  max-height: 100%;
 }
 .subagent-modal-placeholder {
   min-height: 1px;
@@ -486,18 +495,19 @@
   -webkit-backdrop-filter: blur(12px) saturate(1.1);
 }
 .subagent-panel.subagent-modal-open {
-  position: fixed;
-  top: 28px;
-  left: 50%;
-  bottom: 28px;
-  width: min(960px, calc(100vw - 40px));
-  max-width: calc(100vw - 40px);
+  position: relative;
+  top: auto;
+  left: auto;
+  bottom: auto;
+  width: min(960px, 100%);
+  max-width: 100%;
   min-width: 0;
+  height: 100%;
   margin: 0;
   z-index: 102;
   display: flex;
   flex-direction: column;
-  transform: translateX(-50%);
+  transform: none;
   border-radius: 16px;
   background: var(--surface);
   border-color: color-mix(in srgb, var(--accent2) 20%, var(--panel-border-soft));
@@ -505,6 +515,7 @@
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
   animation: panelSlideUp .18s ease-out;
+  box-sizing: border-box;
 }
 .subagent-modal-backdrop {
   position: fixed;

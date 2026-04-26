@@ -666,11 +666,11 @@ fn orchestrate_tool_description(catalog: &str) -> String {
          Example — parallel exploration then synthesis:\n\
          tasks: [{{\"id\":\"code\",\"agent\":\"explore\",\"prompt\":\"Analyze code...\"}},\n\
           {{\"id\":\"docs\",\"agent\":\"researcher\",\"prompt\":\"Research docs...\"}},\n\
-          {{\"id\":\"plan\",\"agent\":\"coder\",\"prompt\":\"Synthesize: {{{{results.code}}}} and {{{{results.docs}}}}\",\"depends_on\":[\"code\",\"docs\"]}}]\n\n\
+          {{\"id\":\"plan\",\"agent\":\"general-coder\",\"prompt\":\"Synthesize: {{{{results.code}}}} and {{{{results.docs}}}}\",\"depends_on\":[\"code\",\"docs\"]}}]\n\n\
          Example — serial review pipeline:\n\
-         tasks: [{{\"id\":\"impl\",\"agent\":\"coder\",\"prompt\":\"Implement...\"}},\n\
+         tasks: [{{\"id\":\"impl\",\"agent\":\"general-coder\",\"prompt\":\"Implement...\"}},\n\
           {{\"id\":\"review\",\"agent\":\"reviewer\",\"prompt\":\"Review: {{{{results.impl}}}}\",\"depends_on\":[\"impl\"]}},\n\
-          {{\"id\":\"fix\",\"agent\":\"coder\",\"prompt\":\"Fix: {{{{results.review}}}}\",\"depends_on\":[\"review\"]}}]\n\n\
+          {{\"id\":\"fix\",\"agent\":\"general-coder\",\"prompt\":\"Fix: {{{{results.review}}}}\",\"depends_on\":[\"review\"]}}]\n\n\
          {catalog}"
     )
 }

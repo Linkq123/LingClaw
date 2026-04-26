@@ -451,8 +451,9 @@ export function openSubagentModal(trigger) {
     body.removeAttribute('inert');
     body.classList.add('show');
     body.style.height = 'auto';
+    body.scrollTop = 0;
   }
-  panel.scrollIntoView({ block: 'nearest' });
+  panel.querySelector('.subagent-modal-close')?.focus();
 }
 
 function panelKey(ref) {

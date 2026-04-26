@@ -157,11 +157,12 @@
   .subagent-summary-head {
     align-items: stretch;
   }
+  .timeline-node.subagent-modal-host {
+    padding: 10px;
+  }
   .subagent-panel.subagent-modal-open {
-    top: 10px;
-    bottom: 10px;
-    width: calc(100vw - 20px);
-    max-width: calc(100vw - 20px);
+    width: 100%;
+    max-width: 100%;
   }
   #jump-to-latest {
     right: 12px;

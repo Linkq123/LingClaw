@@ -592,23 +592,31 @@ fn spawn_one_shot_http_server(
     response_content_type: &'static str,
     response_body: String,
 ) -> (String, thread::JoinHandle<()>) {
+    spawn_http_server_with_responses(vec![(response_content_type, response_body)])
+}
+
+fn spawn_http_server_with_responses(
+    responses: Vec<(&'static str, String)>,
+) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
     let address = listener
         .local_addr()
         .expect("listener should expose address");
 
     let handle = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().expect("request should connect");
-        read_http_request(&mut stream);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {response_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            response_body.len(),
-            response_body
-        );
-        stream
-            .write_all(response.as_bytes())
-            .expect("response should be written");
-        stream.flush().expect("response should flush");
+        for (response_content_type, response_body) in responses {
+            let (mut stream, _) = listener.accept().expect("request should connect");
+            read_http_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {response_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("response should be written");
+            stream.flush().expect("response should flush");
+        }
     });
 
     (format!("http://{}", address), handle)
@@ -661,9 +669,58 @@ fn build_openai_multi_tool_call_stream(tool_calls: Vec<(&str, serde_json::Value)
     format!("data: {}\n\ndata: [DONE]\n\n", chunk)
 }
 
+fn build_openai_content_then_tool_call_stream(
+    content: &str,
+    tool_name: &str,
+    args: serde_json::Value,
+) -> String {
+    let args_json = serde_json::to_string(&args).expect("tool args should serialize");
+    let content_chunk = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "content": content
+            }
+        }]
+    });
+    let tool_chunk = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": args_json
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        content_chunk, tool_chunk
+    )
+}
+
+fn build_openai_simple_text_response(content: &str) -> String {
+    serde_json::json!({
+        "choices": [{
+            "message": {
+                "content": content
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 32
+        }
+    })
+    .to_string()
+}
+
 fn slow_tool_command() -> String {
     if cfg!(windows) {
-        "timeout /T 2 /NOBREAK > NUL".to_string()
+        "ping -n 3 127.0.0.1 > NUL".to_string()
     } else {
         "while :; do :; done".to_string()
     }
@@ -1204,6 +1261,75 @@ async fn run_subagent_emits_tool_result_event_for_completed_tool() {
 
     assert!(saw_task_tool);
     assert!(saw_tool_result);
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_subagent_forces_final_summary_after_tool_only_last_turn() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-forced-final-summary");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")
+        .expect("fixture file should be written");
+
+    let stream_body = build_openai_content_then_tool_call_stream(
+        "Now let me check a few more things to verify specific issues: ",
+        "read_file",
+        serde_json::json!({
+            "path": "notes.txt"
+        }),
+    );
+    let summary_body = build_openai_simple_text_response(
+        "Findings:\n- Reviewed notes.txt\n- Ready to hand the final summary back to the parent agent.",
+    );
+    let (api_base, handle) = spawn_http_server_with_responses(vec![
+        ("text/event-stream", stream_body),
+        ("application/json", summary_body),
+    ]);
+
+    let mut config = base_config();
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+
+    let spec = SubAgentSpec {
+        name: "forced-summary-agent".into(),
+        description: String::new(),
+        system_prompt: "Inspect the delegated file and return a final review.".into(),
+        max_turns: 1,
+        tools: ToolPermissions {
+            allow: vec!["read_file".into()],
+            deny: vec![],
+        },
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(16);
+    let http = reqwest::Client::new();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Review notes.txt.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &HookRegistry::new(),
+        "test-task-forced-summary",
+    )
+    .await;
+
+    handle.join().expect("server thread should join");
+
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.cycles, 1);
+    assert_eq!(outcome.tool_calls, 1);
+    assert!(outcome.result.contains("Findings:"));
+    assert!(!outcome.result.contains("Now let me check"));
+    assert!(outcome.total_input_tokens >= 120);
+    assert!(outcome.total_output_tokens >= 32);
 
     let _ = fs::remove_dir_all(&workspace);
 }

@@ -255,6 +255,84 @@ pub(crate) fn resolve_subagent_model<'a>(config: &'a Config, agent_name: &str) -
     config.sub_agent_model_for(agent_name)
 }
 
+fn accumulate_usage(
+    total_input_tokens: &mut u64,
+    total_output_tokens: &mut u64,
+    provider_usage: &mut HashMap<String, [u64; 2]>,
+    provider_name: &str,
+    input_used: u64,
+    output_used: u64,
+) {
+    *total_input_tokens = total_input_tokens.saturating_add(input_used);
+    *total_output_tokens = total_output_tokens.saturating_add(output_used);
+    let entry = provider_usage
+        .entry(context::usage_provider_label(provider_name))
+        .or_insert([0, 0]);
+    entry[0] = entry[0].saturating_add(input_used);
+    entry[1] = entry[1].saturating_add(output_used);
+}
+
+fn last_assistant_message(messages: &[ChatMessage]) -> Option<&ChatMessage> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+}
+
+fn final_assistant_content(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant" && message.has_nonempty_content())
+        .and_then(|message| message.content.clone())
+        .unwrap_or_default()
+}
+
+fn needs_forced_final_response(messages: &[ChatMessage]) -> bool {
+    last_assistant_message(messages)
+        .is_some_and(|message| message.has_tool_calls() || !message.has_nonempty_content())
+}
+
+fn build_forced_final_response_prompt() -> String {
+    "The delegated run is ending now. Provide your final response for the parent agent using only the information already gathered. Follow your normal output format. Do not call tools, do not continue investigating, and do not end with a note about checking more files.".to_string()
+}
+
+async fn request_forced_final_response(
+    model_id: &str,
+    resolved: &providers::ResolvedModel,
+    config: &Config,
+    http: &Client,
+    workspace: &Path,
+    messages: &[ChatMessage],
+) -> Result<(Vec<ChatMessage>, providers::SimpleLlmResponse), String> {
+    let mut final_messages = messages.to_vec();
+    final_messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some(build_forced_final_response_prompt()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+
+    let budget = context::message_budget_for_tool_defs(config, model_id, "off", &[]);
+    context::prune_messages_for_provider(&mut final_messages, resolved.provider, budget);
+
+    let response = providers::call_llm_simple_with_usage(
+        http,
+        resolved,
+        &final_messages,
+        workspace,
+        config.s3.as_ref(),
+        config.max_llm_retries,
+    )
+    .await?;
+
+    Ok((final_messages, response))
+}
+
 /// Run a sub-agent with full isolation.
 ///
 /// The sub-agent gets:
@@ -451,13 +529,14 @@ pub(crate) async fn run_subagent(
                 let output_used = resp.output_tokens.unwrap_or_else(|| {
                     context::message_token_len_for_provider(resolved.provider, &resp.message) as u64
                 });
-                total_input_tokens = total_input_tokens.saturating_add(input_used);
-                total_output_tokens = total_output_tokens.saturating_add(output_used);
-                let entry = provider_usage
-                    .entry(context::usage_provider_label(&provider_name))
-                    .or_insert([0, 0]);
-                entry[0] = entry[0].saturating_add(input_used);
-                entry[1] = entry[1].saturating_add(output_used);
+                accumulate_usage(
+                    &mut total_input_tokens,
+                    &mut total_output_tokens,
+                    &mut provider_usage,
+                    &provider_name,
+                    input_used,
+                    output_used,
+                );
 
                 messages.push(resp.message.clone());
 
@@ -882,13 +961,59 @@ pub(crate) async fn run_subagent(
         }
     }
 
-    // Extract final result from the last assistant message
-    let final_content = messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "assistant" && m.has_nonempty_content())
-        .and_then(|m| m.content.clone())
-        .unwrap_or_default();
+    if !aborted && needs_forced_final_response(&messages) {
+        match request_forced_final_response(
+            &model_id, &resolved, config, http, workspace, &messages,
+        )
+        .await
+        {
+            Ok((forced_messages, forced_response))
+                if !forced_response.content.trim().is_empty() =>
+            {
+                let final_message = ChatMessage {
+                    role: "assistant".into(),
+                    content: Some(forced_response.content),
+                    images: None,
+                    thinking: None,
+                    anthropic_thinking_blocks: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: None,
+                };
+                let input_used = forced_response.input_tokens.unwrap_or_else(|| {
+                    context::estimate_tokens_for_provider(resolved.provider, &forced_messages)
+                        as u64
+                });
+                let output_used = forced_response.output_tokens.unwrap_or_else(|| {
+                    context::message_token_len_for_provider(resolved.provider, &final_message)
+                        as u64
+                });
+                accumulate_usage(
+                    &mut total_input_tokens,
+                    &mut total_output_tokens,
+                    &mut provider_usage,
+                    &provider_name,
+                    input_used,
+                    output_used,
+                );
+                messages.push(final_message);
+            }
+            Ok(_) => {
+                eprintln!(
+                    "Sub-agent '{}' forced final response returned empty content",
+                    spec.name
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "Sub-agent '{}' forced final response failed: {}",
+                    spec.name, error
+                );
+            }
+        }
+    }
+
+    let final_content = final_assistant_content(&messages);
 
     let result = if timed_out {
         let partial = truncate(&final_content, MAX_RESULT_CHARS.saturating_sub(200));

@@ -52,6 +52,7 @@ describe('subagent modal hosting', () => {
     expect(panel).not.toBeNull();
     const wrapper = panel?.closest('.timeline-node') as HTMLElement | null;
     const header = panel?.querySelector('.subagent-header') as HTMLElement | null;
+    const scrollIntoViewSpy = Element.prototype.scrollIntoView as unknown as ReturnType<typeof vi.fn>;
 
     expect(wrapper?.parentElement).toBe(dom.chat);
 
@@ -65,6 +66,8 @@ describe('subagent modal hosting', () => {
       (panel?.querySelector('.subagent-body') as HTMLElement | null)?.hasAttribute('inert'),
     ).toBe(false);
     expect(document.getElementById('subagent-modal-backdrop')?.hidden).toBe(false);
+    expect(panel?.querySelector('.subagent-modal-close')).toBe(document.activeElement);
+    expect(scrollIntoViewSpy).not.toHaveBeenCalled();
 
     closeSubagentModal();
 

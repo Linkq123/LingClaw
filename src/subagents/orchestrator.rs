@@ -5,10 +5,10 @@
 //  Tasks without mutual dependencies execute in parallel; dependent tasks
 //  wait for upstream results, which are injected via {{results.<id>}} placeholders.
 //
-//  Example serial:   coder → reviewer → coder
-//  Example parallel: (explore + researcher) → coder  (both run first, coder waits)
-//  Example mixed:    explore → coder → reviewer → coder  (serial chain)
-//                    researcher ──────↗                   (parallel with explore→coder)
+//  Example serial:   general-coder → reviewer → general-coder
+//  Example parallel: (explore + researcher) → general-coder  (both run first, general-coder waits)
+//  Example mixed:    explore → general-coder → reviewer → general-coder  (serial chain)
+//                    researcher ─────────────↗                         (parallel with explore→general-coder)
 // ══════════════════════════════════════════════════════════════════════════════
 
 use std::collections::{HashMap, HashSet};

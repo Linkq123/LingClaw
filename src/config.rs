@@ -1450,7 +1450,7 @@ pub(crate) struct JsonDefaultModel {
     pub(crate) reflection: Option<String>,
     /// Optional model for context compression.
     pub(crate) context: Option<String>,
-    /// Dynamic per-sub-agent model overrides such as `sub-agent-coder`.
+    /// Dynamic per-sub-agent model overrides such as `sub-agent-reviewer`.
     #[serde(flatten)]
     pub(crate) extra: HashMap<String, serde_json::Value>,
 }
