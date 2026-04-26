@@ -1964,6 +1964,18 @@ async fn api_get_config(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_local_request_headers(&headers)?;
+    let workspace = session_workspace_path(MAIN_SESSION_ID);
+    let discovered_agents: Vec<serde_json::Value> =
+        subagents::discovery::discover_all_agents(&workspace)
+            .into_iter()
+            .map(|agent| {
+                json!({
+                    "name": agent.name,
+                    "description": agent.description,
+                    "source": agent.source.label(),
+                })
+            })
+            .collect();
     let path = config_file_path().ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1980,6 +1992,7 @@ async fn api_get_config(
         Ok(value) => Ok(Json(json!({
             "config": value,
             "path": path.display().to_string(),
+            "discoveredAgents": discovered_agents.clone(),
         }))),
         Err(e) => {
             let msg = e.to_string();
@@ -1991,6 +2004,7 @@ async fn api_get_config(
                 "parse_error": msg,
                 "line": line,
                 "column": column,
+                "discoveredAgents": discovered_agents,
             })))
         }
     }

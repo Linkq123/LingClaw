@@ -44,6 +44,7 @@ fn test_config_with_broken_mcp() -> Config {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,

@@ -27,6 +27,7 @@ fn test_config() -> Config {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -413,6 +414,7 @@ fn resolve_model_uses_config_for_plain_model_id() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1035,6 +1037,7 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
         model: "llama3.2".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1114,6 +1117,7 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1199,6 +1203,7 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1276,6 +1281,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1353,6 +1359,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_anthropic_provider_type() 
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1430,6 +1437,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_ollama_provider_type() {
         model: "qwen3".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1491,6 +1499,7 @@ fn canonical_model_ref_expands_unique_plain_id() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1567,6 +1576,7 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1645,6 +1655,7 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1703,6 +1714,7 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1761,6 +1773,7 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1799,6 +1812,7 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1837,6 +1851,7 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1875,6 +1890,7 @@ fn resolve_model_accepts_ollama_prefix_without_provider_config() {
         model: "llama3.2".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1933,6 +1949,7 @@ fn build_session_status_reports_resolved_target() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -6365,6 +6382,7 @@ fn context_input_budget_reserves_headroom() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,

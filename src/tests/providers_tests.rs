@@ -1327,8 +1327,7 @@ fn build_openai_stream_body_deepseek_v4_maps_xhigh_to_max() {
         anthropic_prompt_caching: false,
     };
 
-    let body =
-        build_openai_stream_body(&resolved, &[], None, "xhigh", &[]).expect("body builds");
+    let body = build_openai_stream_body(&resolved, &[], None, "xhigh", &[]).expect("body builds");
 
     assert_eq!(body["reasoning_effort"], "max");
     assert_eq!(body["thinking"]["type"], "enabled");
@@ -1349,8 +1348,7 @@ fn build_openai_stream_body_deepseek_v4_maps_low_to_high() {
         anthropic_prompt_caching: false,
     };
 
-    let body =
-        build_openai_stream_body(&resolved, &[], None, "low", &[]).expect("body builds");
+    let body = build_openai_stream_body(&resolved, &[], None, "low", &[]).expect("body builds");
 
     assert_eq!(body["reasoning_effort"], "high");
 }
@@ -1370,8 +1368,7 @@ fn build_openai_stream_body_deepseek_v4_off_sends_thinking_disabled() {
         anthropic_prompt_caching: false,
     };
 
-    let body =
-        build_openai_stream_body(&resolved, &[], None, "off", &[]).expect("body builds");
+    let body = build_openai_stream_body(&resolved, &[], None, "off", &[]).expect("body builds");
 
     assert!(body.get("reasoning_effort").is_none());
     assert_eq!(body["thinking"]["type"], "disabled");
@@ -2700,7 +2697,10 @@ fn convert_messages_to_openai_strips_images_when_tool_messages_present() {
     // string — not an array with image_url — to avoid 400 InvalidParameter
     // from OpenAI-compatible providers.
     assert_eq!(out[0]["role"], "user");
-    assert!(out[0]["content"].is_string(), "content should be plain string when tool messages exist");
+    assert!(
+        out[0]["content"].is_string(),
+        "content should be plain string when tool messages exist"
+    );
     assert_eq!(out[0]["content"].as_str(), Some("describe this"));
     assert!(!out[0].get("content").unwrap().is_array());
 }

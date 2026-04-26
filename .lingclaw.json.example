@@ -189,6 +189,10 @@
         "primary": "openai/gpt-4o-mini",
         "fast": "openai-2/gpt-4o-mini",
         "sub-agent": "openai-2/gpt-4o-mini",
+        "sub-agent-coder": "openai/gpt-4o",
+        "sub-agent-explore": "openai-2/gpt-4o-mini",
+        "sub-agent-researcher": "anthropic/claude-sonnet-4-20250514",
+        "sub-agent-reviewer": "anthropic/claude-sonnet-4-20250514",
         "memory": "openai-2/gpt-4o-mini",
         "reflection": "anthropic/claude-sonnet-4-20250514",
         "context": "anthropic-2/claude-haiku-3-20250306"

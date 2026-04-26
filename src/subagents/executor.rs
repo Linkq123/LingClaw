@@ -250,10 +250,9 @@ pub(crate) struct SubAgentOutcome {
 }
 
 /// Resolve which model a sub-agent should use.
-/// Sub-agents always use the runtime config: `sub_agent_model` when set,
-/// otherwise the primary model.
-pub(crate) fn resolve_subagent_model(config: &Config) -> &str {
-    config.sub_agent_model.as_deref().unwrap_or(&config.model)
+/// Fallback chain: `sub-agent-<name>` -> `sub-agent` -> primary.
+pub(crate) fn resolve_subagent_model<'a>(config: &'a Config, agent_name: &str) -> &'a str {
+    config.sub_agent_model_for(agent_name)
 }
 
 /// Run a sub-agent with full isolation.
@@ -275,7 +274,7 @@ pub(crate) async fn run_subagent(
     hooks: &HookRegistry,
     task_id: &str,
 ) -> SubAgentOutcome {
-    let model_id = resolve_subagent_model(config).to_string();
+    let model_id = resolve_subagent_model(config, &spec.name).to_string();
     let resolved = config.resolve_model(&model_id);
     let provider_name = config.resolve_provider_name(&model_id);
 

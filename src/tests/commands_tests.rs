@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, atomic::AtomicU64},
@@ -107,6 +107,7 @@ async fn status_command_reports_runtime_request_estimate() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
 
             reflection_model: None,
@@ -244,6 +245,7 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
             model: "openai/gpt-4o-reasoner".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
 
             reflection_model: None,
@@ -355,6 +357,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
 
             reflection_model: None,
@@ -475,6 +478,7 @@ async fn switch_command_is_blocked_in_single_session_mode() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
 
             reflection_model: None,
@@ -547,6 +551,7 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
 
             reflection_model: None,
@@ -660,6 +665,7 @@ async fn memory_command_rejects_unknown_subcommand() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
 
             reflection_model: None,
@@ -794,6 +800,7 @@ async fn reflection_command_disabled_shows_hint() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -923,6 +930,7 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
         reflection_model: None,
         context_model: None,
@@ -1097,6 +1105,7 @@ async fn reflection_command_disabled_allows_read_today() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -1227,6 +1236,7 @@ async fn reflection_command_enabled_shows_status() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -1369,6 +1379,7 @@ async fn reflection_command_today_shows_content() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -1517,6 +1528,7 @@ async fn reflection_command_today_filters_out_new_summaries() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -1668,6 +1680,7 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -1822,6 +1835,7 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -1953,6 +1967,7 @@ async fn reflection_command_invalid_arg_shows_usage() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,

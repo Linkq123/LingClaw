@@ -11,6 +11,7 @@ fn test_config() -> Config {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -459,7 +460,7 @@ fn select_analyze_model_keeps_primary_for_image_turn_when_fast_lacks_image_suppo
         config.fast_model.as_deref(),
         0,
         false,
-        Some("这张图里是什么？"),
+        Some("杩欏紶鍥鹃噷鏄粈涔堬紵"),
         true,
     );
 
@@ -1058,11 +1059,11 @@ fn try_claim_reflection_respects_cooldown() {
     let _guard = reflection_test_guard().blocking_lock();
     let now = epoch_secs_now();
 
-    // Last reflection was just now — should be blocked.
+    // Last reflection was just now 鈥?should be blocked.
     LAST_REFLECTION_EPOCH.store(now, std::sync::atomic::Ordering::Relaxed);
     assert!(try_claim_reflection(5, 5).is_none());
 
-    // Last reflection was long ago — should be allowed.
+    // Last reflection was long ago 鈥?should be allowed.
     LAST_REFLECTION_EPOCH.store(
         now - REFLECTION_COOLDOWN_SECS - 1,
         std::sync::atomic::Ordering::Relaxed,
@@ -1072,7 +1073,7 @@ fn try_claim_reflection_respects_cooldown() {
     let (prev_epoch, claimed_epoch) = prev.unwrap();
     rollback_reflection_claim(prev_epoch, claimed_epoch);
 
-    // Exactly at the boundary — should be allowed.
+    // Exactly at the boundary 鈥?should be allowed.
     LAST_REFLECTION_EPOCH.store(
         now - REFLECTION_COOLDOWN_SECS,
         std::sync::atomic::Ordering::Relaxed,
@@ -1117,7 +1118,7 @@ fn rollback_reflection_claim_is_noop_when_slot_already_reclaimed() {
     let newer_epoch = claimed_epoch + REFLECTION_COOLDOWN_SECS + 1;
     LAST_REFLECTION_EPOCH.store(newer_epoch, std::sync::atomic::Ordering::Relaxed);
 
-    // The first run's rollback should be a no-op — CAS fails because the
+    // The first run's rollback should be a no-op 鈥?CAS fails because the
     // stored value (newer_epoch) != claimed_epoch.
     rollback_reflection_claim(prev_epoch, claimed_epoch);
     assert_eq!(
@@ -1129,15 +1130,15 @@ fn rollback_reflection_claim_is_noop_when_slot_already_reclaimed() {
 
 #[test]
 fn reflection_model_or_fallback_chain() {
-    // No reflection_model, no memory_model → use fallback.
+    // No reflection_model, no memory_model 鈫?use fallback.
     let mut config = test_config();
     assert_eq!(config.reflection_model_or("primary-model"), "primary-model");
 
-    // memory_model set → reflection inherits from memory.
+    // memory_model set 鈫?reflection inherits from memory.
     config.memory_model = Some("memory-llm".to_string());
     assert_eq!(config.reflection_model_or("primary-model"), "memory-llm");
 
-    // reflection_model set → overrides memory_model.
+    // reflection_model set 鈫?overrides memory_model.
     config.reflection_model = Some("reflection-llm".to_string());
     assert_eq!(
         config.reflection_model_or("primary-model"),

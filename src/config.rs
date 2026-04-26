@@ -127,6 +127,8 @@ pub(crate) struct Config {
     pub(crate) fast_model: Option<String>,
     /// Optional model for sub-agent task delegation.
     pub(crate) sub_agent_model: Option<String>,
+    /// Optional per-sub-agent delegated model overrides.
+    pub(crate) sub_agent_model_overrides: HashMap<String, String>,
     /// Optional model for structured memory extraction.
     pub(crate) memory_model: Option<String>,
     /// Optional model for post-execution reflection.
@@ -180,6 +182,36 @@ pub(crate) fn format_sub_agent_timeout(timeout: Duration) -> String {
 fn trimmed_nonempty(value: Option<String>) -> Option<String> {
     let value = value?.trim().to_string();
     if value.is_empty() { None } else { Some(value) }
+}
+
+const SUB_AGENT_MODEL_FIELD_PREFIX: &str = "sub-agent-";
+
+fn parse_dynamic_sub_agent_model_field(field: &str) -> Result<Option<&str>, String> {
+    let Some(agent_name) = field.strip_prefix(SUB_AGENT_MODEL_FIELD_PREFIX) else {
+        return Ok(None);
+    };
+    if agent_name.trim().is_empty() {
+        return Err(format!(
+            "Invalid agents.defaults.model.{field}: sub-agent override key must include an agent name suffix."
+        ));
+    }
+    Ok(Some(agent_name))
+}
+
+fn parse_dynamic_sub_agent_model_value<'a>(
+    field: &str,
+    value: &'a serde_json::Value,
+) -> Result<Option<&'a str>, String> {
+    match parse_dynamic_sub_agent_model_field(field)? {
+        Some(_) => match value {
+            serde_json::Value::String(model_ref) => Ok(Some(model_ref.as_str())),
+            serde_json::Value::Null => Ok(None),
+            _ => Err(format!(
+                "Invalid agents.defaults.model.{field}: sub-agent override must be a string or null."
+            )),
+        },
+        None => Ok(None),
+    }
 }
 
 pub(crate) fn parse_boolish_env(name: &str) -> Option<bool> {
@@ -459,6 +491,26 @@ impl Config {
             .as_ref()
             .and_then(|m| m.sub_agent.clone())
             .or_else(|| std::env::var("LINGCLAW_SUB_AGENT_MODEL").ok());
+        let sub_agent_model_overrides = model_config
+            .as_ref()
+            .map(|m| {
+                let mut overrides = HashMap::new();
+                for (field, raw_model_ref) in &m.extra {
+                    let Ok(Some(agent_name)) = parse_dynamic_sub_agent_model_field(field) else {
+                        continue;
+                    };
+                    let Some(model_ref) = raw_model_ref.as_str() else {
+                        continue;
+                    };
+                    let model_ref = model_ref.trim();
+                    if model_ref.is_empty() {
+                        continue;
+                    }
+                    overrides.insert(agent_name.to_string(), model_ref.to_string());
+                }
+                overrides
+            })
+            .unwrap_or_default();
         let memory_model = model_config
             .as_ref()
             .and_then(|m| m.memory.clone())
@@ -528,6 +580,7 @@ impl Config {
             model,
             fast_model,
             sub_agent_model,
+            sub_agent_model_overrides,
             memory_model,
             reflection_model,
             context_model,
@@ -676,6 +729,14 @@ impl Config {
 
     pub(crate) fn memory_model_or<'a>(&'a self, fallback: &'a str) -> &'a str {
         self.memory_model.as_deref().unwrap_or(fallback)
+    }
+
+    pub(crate) fn sub_agent_model_for<'a>(&'a self, agent_name: &str) -> &'a str {
+        self.sub_agent_model_overrides
+            .get(agent_name)
+            .map(String::as_str)
+            .or(self.sub_agent_model.as_deref())
+            .unwrap_or(&self.model)
     }
 
     pub(crate) fn reflection_model_or<'a>(&'a self, fallback: &'a str) -> &'a str {
@@ -1106,6 +1167,21 @@ fn sanitize_loaded_json_config(json_cfg: JsonConfig) -> JsonConfig {
                 *model_ref = None;
             }
         }
+        model_defaults.extra.retain(|field, model_ref| {
+            let model_ref = match parse_dynamic_sub_agent_model_value(field, model_ref) {
+                Ok(Some(model_ref)) => model_ref,
+                Ok(None) => return true,
+                Err(error) => {
+                    eprintln!("WARNING: Ignoring invalid config file entry: {error}");
+                    return false;
+                }
+            };
+            if let Err(error) = validate_agent_model_ref(field, model_ref, &providers) {
+                eprintln!("WARNING: Ignoring invalid config file entry: {error}");
+                return false;
+            }
+            true
+        });
     }
 
     json_cfg
@@ -1267,6 +1343,12 @@ pub(crate) fn validate_json_agent_model_refs(json_cfg: &JsonConfig) -> Result<()
         };
         validate_agent_model_ref(field, model_ref, &providers)?;
     }
+    for (field, model_ref) in &model_defaults.extra {
+        let Some(model_ref) = parse_dynamic_sub_agent_model_value(field, model_ref)? else {
+            continue;
+        };
+        validate_agent_model_ref(field, model_ref, &providers)?;
+    }
 
     Ok(())
 }
@@ -1368,6 +1450,9 @@ pub(crate) struct JsonDefaultModel {
     pub(crate) reflection: Option<String>,
     /// Optional model for context compression.
     pub(crate) context: Option<String>,
+    /// Dynamic per-sub-agent model overrides such as `sub-agent-coder`.
+    #[serde(flatten)]
+    pub(crate) extra: HashMap<String, serde_json::Value>,
 }
 
 pub(crate) fn config_dir_path() -> Option<PathBuf> {

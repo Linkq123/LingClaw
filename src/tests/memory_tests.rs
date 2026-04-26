@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -9,6 +9,7 @@ fn queue_test_config() -> Config {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
         reflection_model: None,
         context_model: None,

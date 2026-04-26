@@ -8,6 +8,7 @@ fn test_config() -> Config {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -142,7 +143,7 @@ async fn execute_tool_rejects_zero_search_results_limit() {
     let _ = tokio::fs::remove_dir_all(&workspace).await;
 }
 
-// ── is_parallelizable_tool / is_read_only_tool / is_task_tool tests ─────────
+// 鈹€鈹€ is_parallelizable_tool / is_read_only_tool / is_task_tool tests 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 #[test]
 fn is_read_only_tool_covers_expected_set() {
@@ -194,7 +195,7 @@ fn is_parallelizable_tool_matches_read_only_tools_only() {
     }
 }
 
-// ── validate_string_property pattern enforcement ────────────────────────────
+// 鈹€鈹€ validate_string_property pattern enforcement 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 #[test]
 fn validate_tool_args_enforces_string_pattern() {
@@ -223,7 +224,7 @@ fn validate_tool_args_enforces_string_pattern() {
     assert!(err.contains("does not match pattern"));
 }
 
-// ── validate_array_property minItems/maxItems enforcement ───────────────────
+// 鈹€鈹€ validate_array_property minItems/maxItems enforcement 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
 
 #[test]
 fn validate_tool_args_enforces_array_min_items() {

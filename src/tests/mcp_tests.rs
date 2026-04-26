@@ -35,6 +35,7 @@ fn test_config_with_mcp() -> Config {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -751,10 +752,10 @@ fn path_to_file_uri_encodes_spaces_and_non_ascii() {
     let uri = path_to_file_uri(Path::new("/tmp/my workspace"));
     assert_eq!(uri, "file:///tmp/my%20workspace");
 
-    let uri_cn = path_to_file_uri(Path::new("/home/用户/workspace"));
+    let uri_cn = path_to_file_uri(Path::new("/home/鐢ㄦ埛/workspace"));
     assert!(uri_cn.starts_with("file:///home/"));
     assert!(
-        !uri_cn.contains("用户"),
+        !uri_cn.contains("鐢ㄦ埛"),
         "non-ASCII chars must be percent-encoded"
     );
     assert!(

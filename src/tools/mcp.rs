@@ -89,7 +89,7 @@ pub(crate) fn runtime_tool_note(config: &Config) -> Option<String> {
 
 /// Ensure MCP tool descriptors are cached for all enabled servers.
 /// Triggers async discovery for any server whose cache entry is missing or expired.
-/// Safe to call multiple times — hits cache on subsequent calls within the TTL window.
+/// Safe to call multiple times 鈥?hits cache on subsequent calls within the TTL window.
 pub(crate) async fn ensure_tools_cached(config: &Config, workspace: &Path) {
     let _ = list_tools(config, workspace).await;
 }
@@ -339,6 +339,7 @@ pub(crate) async fn test_mcp_server(
         model: String::new(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
         reflection_model: None,
         context_model: None,
@@ -390,7 +391,7 @@ pub(crate) async fn refresh_servers(
                     .ok_or_else(|| format!("unknown MCP server '{server_name}'"));
                 match server.and_then(|server| cache_key(server_name, server, workspace, config)) {
                     Ok(cache_key) => {
-                        // Lock scope is synchronous — no .await while held.
+                        // Lock scope is synchronous 鈥?no .await while held.
                         let mut cache = tool_cache()
                             .lock()
                             .map_err(|_| "MCP tool cache lock poisoned".to_string())?;

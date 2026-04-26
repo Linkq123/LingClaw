@@ -39,6 +39,13 @@ export interface AgentModelDefaults {
   memory?: string;
   reflection?: string;
   context?: string;
+  [key: string]: string | undefined;
+}
+
+export interface DiscoveredAgentInfo {
+  name: string;
+  description?: string;
+  source?: string;
 }
 
 export interface McpServerConfig {
@@ -83,6 +90,7 @@ export interface ConfigApiResponse {
   error?: string;
   line?: number;
   column?: number;
+  discoveredAgents?: DiscoveredAgentInfo[];
 }
 
 export interface UsageData {

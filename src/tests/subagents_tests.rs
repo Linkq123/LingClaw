@@ -454,6 +454,7 @@ fn base_config() -> Config {
         model: "openai/gpt-4o".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -722,14 +723,35 @@ fn test_model_resolution_prefers_sub_agent_config() {
         sub_agent_model: Some("openai/gpt-4o-mini".to_string()),
         ..base_config()
     };
-    assert_eq!(resolve_subagent_model(&config), "openai/gpt-4o-mini");
+    assert_eq!(
+        resolve_subagent_model(&config, "reviewer"),
+        "openai/gpt-4o-mini"
+    );
 }
 
 /// Falls back to config.model when no dedicated sub-agent model is configured.
 #[test]
 fn test_model_resolution_falls_back_to_primary() {
     let config = base_config(); // sub_agent_model = None
-    assert_eq!(resolve_subagent_model(&config), "openai/gpt-4o");
+    assert_eq!(resolve_subagent_model(&config, "reviewer"), "openai/gpt-4o");
+}
+
+#[test]
+fn test_model_resolution_prefers_specific_sub_agent_override() {
+    let mut config = base_config();
+    config.sub_agent_model = Some("openai/gpt-4o-mini".to_string());
+    config.sub_agent_model_overrides.insert(
+        "reviewer".to_string(),
+        "anthropic/claude-sonnet-4-20250514".to_string(),
+    );
+    assert_eq!(
+        resolve_subagent_model(&config, "reviewer"),
+        "anthropic/claude-sonnet-4-20250514"
+    );
+    assert_eq!(
+        resolve_subagent_model(&config, "coder"),
+        "openai/gpt-4o-mini"
+    );
 }
 
 /// max_turns is clamped to MAX_AGENT_TURNS even when AGENT.md specifies a higher value.

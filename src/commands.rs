@@ -1537,7 +1537,7 @@ async fn handle_agents_command(current_session_id: &str, state: &AppState) -> Co
         } else {
             tools.join(", ")
         };
-        let model_info = config.sub_agent_model.as_deref().unwrap_or(&config.model);
+        let model_info = config.sub_agent_model_for(&agent.name);
         lines.push(format!(
             "- **{}** [`{}`] — {}\n  model: {} | max_turns: {} | tools: {}",
             agent.name,

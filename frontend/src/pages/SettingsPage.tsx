@@ -1,6 +1,11 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import type { AppConfig, McpServerConfig, S3Config } from '../types/config.js';
-import type { ConfigApiResponse } from '../types/config.js';
+import type {
+  AppConfig,
+  ConfigApiResponse,
+  DiscoveredAgentInfo,
+  McpServerConfig,
+  S3Config,
+} from '../types/config.js';
 import {
   validateProviderName,
   validateMcpCwdValue,
@@ -68,6 +73,18 @@ const AGENT_ROLES: ReadonlyArray<{ key: string; label: string }> = [
   { key: 'reflection', label: 'Reflection' },
   { key: 'context', label: 'Context' },
 ];
+
+const SUB_AGENT_OVERRIDE_PREFIX = 'sub-agent-';
+
+function subAgentOverrideKey(agentName: string): string {
+  return `${SUB_AGENT_OVERRIDE_PREFIX}${agentName}`;
+}
+
+function subAgentNameFromOverrideKey(key: string): string | null {
+  if (!key.startsWith(SUB_AGENT_OVERRIDE_PREFIX) || key === 'sub-agent') return null;
+  const agentName = key.slice(SUB_AGENT_OVERRIDE_PREFIX.length);
+  return agentName.trim() ? agentName : null;
+}
 
 function SettingsRow({ label, children }: { label: string; children: React.ReactNode }) {
   return (
@@ -254,21 +271,30 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
 
 // ── Agents Tab ────────────────────────────────────────────────────────────────
 
-function AgentsTab({ config, onChange }: { config: AppConfig; onChange: (c: AppConfig) => void }) {
-  const model = config.agents?.defaults?.model || {};
+function AgentsTab({
+  config,
+  onChange,
+  discoveredAgents,
+}: {
+  config: AppConfig;
+  onChange: (c: AppConfig) => void;
+  discoveredAgents: DiscoveredAgentInfo[];
+}) {
+  const model = (config.agents?.defaults?.model || {}) as Record<string, string | undefined>;
   const providersRaw = config.models?.providers;
   // Stabilise the providers reference so downstream memoization deps are stable.
   const providers = useMemo(() => providersRaw || {}, [providersRaw]);
   // Memoize the flattened provider/model list so that typing into other
   // fields doesn't recompute this on every keystroke.
   const allModels = useMemo(() => buildModelOptions(providers), [providers]);
+  const [selectedAgentName, setSelectedAgentName] = useState('');
 
-  // Stable callback so AgentRoleRow.memo can bail out when the config hasn't
-  // changed. Reads model from config at call time to avoid stale captures.
-  const setModel = useCallback(
+  const setModelValue = useCallback(
     (key: string, val: string) => {
-      const m = (config.agents?.defaults?.model || {}) as Record<string, string | undefined>;
-      const newModel = { ...m, [key]: val || undefined };
+      const currentModel = (config.agents?.defaults?.model || {}) as Record<string, string | undefined>;
+      const newModel = { ...currentModel };
+      if (val) newModel[key] = val;
+      else delete newModel[key];
       onChange({
         ...config,
         agents: {
@@ -280,12 +306,69 @@ function AgentsTab({ config, onChange }: { config: AppConfig; onChange: (c: AppC
     [config, onChange],
   );
 
+  const subAgentOverrides = useMemo(
+    () =>
+      Object.entries(model)
+        .map(([key, value]) => {
+          const agentName = subAgentNameFromOverrideKey(key);
+          if (!agentName) return null;
+          return { key, agentName, value };
+        })
+        .filter(
+          (
+            entry,
+          ): entry is { key: string; agentName: string; value: string | undefined } => entry !== null,
+        )
+        .sort((a, b) => a.agentName.localeCompare(b.agentName)),
+    [model],
+  );
+  const discoveredAgentByName = useMemo(
+    () => new Map(discoveredAgents.map((agent) => [agent.name, agent])),
+    [discoveredAgents],
+  );
+  const availableAgentsToAdd = useMemo(() => {
+    const existing = new Set(subAgentOverrides.map((entry) => entry.agentName));
+    return discoveredAgents.filter((agent) => !existing.has(agent.name));
+  }, [discoveredAgents, subAgentOverrides]);
+  const defaultNewSubAgentModel = useMemo(
+    () => model['sub-agent'] || model.primary || allModels[0] || '',
+    [allModels, model],
+  );
+
+  useEffect(() => {
+    setSelectedAgentName((current) => {
+      if (current && availableAgentsToAdd.some((agent) => agent.name === current)) return current;
+      return availableAgentsToAdd[0]?.name || '';
+    });
+  }, [availableAgentsToAdd]);
+
+  // Stable callback so AgentRoleRow.memo can bail out when the config hasn't
+  // changed. Reads model from config at call time to avoid stale captures.
+  const setModel = useCallback(
+    (key: string, val: string) => setModelValue(key, val),
+    [setModelValue],
+  );
+
+  const addSubAgentOverride = useCallback(() => {
+    if (!selectedAgentName || !defaultNewSubAgentModel) return;
+    setModelValue(subAgentOverrideKey(selectedAgentName), defaultNewSubAgentModel);
+  }, [defaultNewSubAgentModel, selectedAgentName, setModelValue]);
+
+  const removeSubAgentOverride = useCallback(
+    (key: string) => setModelValue(key, ''),
+    [setModelValue],
+  );
+
   return (
     <div className="settings-group">
       <div className="settings-group-title">Agent Default Models</div>
       <p style={{ fontSize: 12, color: 'var(--dim)', marginBottom: 12 }}>
         Models must reference a provider configured in the Models tab (format:{' '}
         <code>provider/model-id</code>).
+      </p>
+      <p style={{ fontSize: 12, color: 'var(--dim)', marginBottom: 12 }}>
+        Sub-agent resolution order is <code>sub-agent-&lt;name&gt;</code> {'->'}{' '}
+        <code>sub-agent</code> {'->'} <code>primary</code>.
       </p>
       {AGENT_ROLES.map(({ key, label }) => (
         <AgentRoleRow
@@ -297,6 +380,85 @@ function AgentsTab({ config, onChange }: { config: AppConfig; onChange: (c: AppC
           onSetModel={setModel}
         />
       ))}
+      <div
+        style={{
+          marginTop: 18,
+          paddingTop: 14,
+          borderTop: '1px solid var(--border)',
+          display: 'grid',
+          gap: 10,
+        }}
+      >
+        <div style={{ fontSize: 12, fontWeight: 600 }}>Per-Sub-Agent Overrides</div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <select
+            value={selectedAgentName}
+            onChange={(e) => setSelectedAgentName(e.target.value)}
+            disabled={availableAgentsToAdd.length === 0}
+          >
+            {availableAgentsToAdd.length === 0 ? (
+              <option value="">No discovered sub-agents available</option>
+            ) : (
+              availableAgentsToAdd.map((agent) => (
+                <option key={agent.name} value={agent.name}>
+                  {agent.name}
+                  {agent.source ? ` (${agent.source})` : ''}
+                </option>
+              ))
+            )}
+          </select>
+          <button
+            className="btn-secondary"
+            onClick={addSubAgentOverride}
+            disabled={!selectedAgentName || !defaultNewSubAgentModel}
+          >
+            + Add Sub-Agent Override
+          </button>
+        </div>
+        {!defaultNewSubAgentModel && (
+          <div style={{ fontSize: 12, color: 'var(--dim)' }}>
+            Add at least one model in the Models tab before creating a sub-agent-specific override.
+          </div>
+        )}
+        {subAgentOverrides.length === 0 ? (
+          <div style={{ fontSize: 12, color: 'var(--dim)' }}>
+            No sub-agent-specific model overrides configured.
+          </div>
+        ) : (
+          subAgentOverrides.map(({ key, agentName, value }) => {
+            const discovered = discoveredAgentByName.get(agentName);
+            const label = discovered?.source
+              ? `${agentName} (${discovered.source})`
+              : `${agentName} (not currently discovered)`;
+            return (
+              <div
+                key={key}
+                style={{ display: 'grid', gap: 6, padding: '8px 0', borderTop: '1px solid var(--border)' }}
+              >
+                <div
+                  style={{
+                    display: 'flex',
+                    gap: 8,
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    flexWrap: 'wrap',
+                  }}
+                >
+                  <div style={{ fontSize: 12, color: 'var(--dim)' }}>{label}</div>
+                  <button
+                    className="btn-danger-sm"
+                    title={`Remove override for ${agentName}`}
+                    onClick={() => removeSubAgentOverride(key)}
+                  >
+                    Remove
+                  </button>
+                </div>
+                <ModelSelect value={value} options={allModels} onChange={(val) => setModel(key, val)} />
+              </div>
+            );
+          })
+        )}
+      </div>
     </div>
   );
 }
@@ -1387,6 +1549,7 @@ export function SettingsPage() {
   const [activeTab, setActiveTab] = useState<TabId>('tab-general');
   const [status, setStatus] = useState({ message: '', type: 'idle' as StatusType });
   const [corruptData, setCorruptData] = useState<ConfigApiResponse | null>(null);
+  const [discoveredAgents, setDiscoveredAgents] = useState<DiscoveredAgentInfo[]>([]);
 
   // Register bridge functions
   useEffect(() => {
@@ -1419,6 +1582,7 @@ export function SettingsPage() {
         const resp = await fetch('/api/config', { signal: controller.signal });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data: ConfigApiResponse = await resp.json();
+        setDiscoveredAgents(data.discoveredAgents || []);
         if (data.parse_error) {
           setCorruptData(data);
           setStatus({ message: 'Config file has syntax errors', type: 'error' });
@@ -1587,7 +1751,13 @@ export function SettingsPage() {
           </div>
           <div className="page-body" id="settings-body">
             {activeTab === 'tab-general' && <GeneralTab config={config} onChange={setConfig} />}
-            {activeTab === 'tab-agents' && <AgentsTab config={config} onChange={setConfig} />}
+            {activeTab === 'tab-agents' && (
+              <AgentsTab
+                config={config}
+                onChange={setConfig}
+                discoveredAgents={discoveredAgents}
+              />
+            )}
             {activeTab === 'tab-models' && (
               <ModelsTab config={config} onChange={setConfig} onStatus={handleStatus} />
             )}

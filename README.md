@@ -437,10 +437,11 @@ tools:
 
 ### 模型选择
 
-所有子代理统一使用配置文件中的模型设置：
+子代理模型按以下顺序解析：
 
-1. **`agents.defaults.model.sub-agent`** — 全局子代理模型配置（JSON 配置或 `LINGCLAW_SUB_AGENT_MODEL` 环境变量）
-2. **`agents.defaults.model.primary`** — 主模型（兜底）
+1. **`agents.defaults.model.sub-agent-<name>`** — 指定子代理的专属模型（例如 `sub-agent-reviewer`）
+2. **`agents.defaults.model.sub-agent`** — 全局子代理模型配置（JSON 配置或 `LINGCLAW_SUB_AGENT_MODEL` 环境变量）
+3. **`agents.defaults.model.primary`** — 主模型（兜底）
 
 `AGENT.md` 中即使存在遗留的 `model` 字段，当前版本也会忽略，不参与运行时模型选择。
 
