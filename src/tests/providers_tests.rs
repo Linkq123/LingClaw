@@ -1376,7 +1376,12 @@ fn build_openai_stream_body_deepseek_v4_replays_missing_reasoning_tool_turn_as_t
     assert_eq!(body_messages.len(), 2);
     assert_eq!(body_messages[1]["role"], "assistant");
     assert!(body_messages[1].get("tool_calls").is_none());
-    assert!(body_messages[1].get("reasoning_content").is_none());
+    assert_eq!(
+        body_messages[1]["reasoning_content"].as_str(),
+        Some(
+            "Historical tool turn summarized because the original DeepSeek response omitted reasoning_content."
+        )
+    );
     let summary = body_messages[1]["content"]
         .as_str()
         .expect("replayed assistant summary should be text");
@@ -1772,6 +1777,152 @@ fn build_openai_simple_body_deepseek_v4_includes_reasoning_content_in_messages()
     // Simple body does not include thinking control fields
     assert!(body.get("reasoning_effort").is_none());
     assert!(body.get("thinking").is_none());
+}
+
+#[test]
+fn build_openai_simple_body_deepseek_v4_replays_missing_reasoning_tool_turn_as_text() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://api.deepseek.com/v1".into(),
+        api_key: "deepseek-key".into(),
+        model_id: "deepseek-v4-pro".into(),
+        reasoning: true,
+        thinking_format: Some("deepseek-v4".into()),
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![
+        ChatMessage {
+            role: "user".into(),
+            content: Some("continue".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "exec".into(),
+                    arguments: r#"{"command":"dir"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("dir output".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            timestamp: None,
+        },
+    ];
+
+    let body = build_openai_simple_body(&resolved, &messages, None).expect("body builds");
+    let body_messages = body["messages"]
+        .as_array()
+        .expect("messages should serialize as an array");
+
+    assert_eq!(body_messages.len(), 2);
+    assert_eq!(body_messages[1]["role"], "assistant");
+    assert!(body_messages[1].get("tool_calls").is_none());
+    assert_eq!(
+        body_messages[1]["reasoning_content"].as_str(),
+        Some(
+            "Historical tool turn summarized because the original DeepSeek response omitted reasoning_content."
+        )
+    );
+    assert!(body_messages[1]["content"]
+        .as_str()
+        .expect("summary should be text")
+        .contains("DeepSeek omitted reasoning_content"));
+}
+
+#[test]
+fn build_openai_simple_body_non_deepseek_keeps_reasoningless_tool_turn_structured() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://example-openai-compatible.invalid/v1".into(),
+        api_key: "api-key".into(),
+        model_id: "gpt-4.1".into(),
+        reasoning: true,
+        thinking_format: None,
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![
+        ChatMessage {
+            role: "user".into(),
+            content: Some("continue".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "exec".into(),
+                    arguments: r#"{"command":"dir"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("dir output".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            timestamp: None,
+        },
+    ];
+
+    let body = build_openai_simple_body(&resolved, &messages, None).expect("body builds");
+    let body_messages = body["messages"]
+        .as_array()
+        .expect("messages should serialize as an array");
+
+    assert_eq!(body_messages.len(), 3);
+    assert_eq!(
+        body_messages[1]["tool_calls"]
+            .as_array()
+            .expect("tool calls should stay structured")
+            .len(),
+        1
+    );
+    assert_eq!(body_messages[2]["role"], "tool");
 }
 
 #[test]

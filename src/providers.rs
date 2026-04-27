@@ -309,6 +309,9 @@ fn summarize_deepseek_tool_turn_as_plain_assistant(
     assistant: &ChatMessage,
     tool_messages: &[ChatMessage],
 ) -> ChatMessage {
+    let replay_reasoning =
+        "Historical tool turn summarized because the original DeepSeek response omitted reasoning_content."
+            .to_string();
     let mut result_by_id: HashMap<&str, &str> = HashMap::new();
     for tool_message in tool_messages {
         if let Some(tool_call_id) = tool_message.tool_call_id.as_deref() {
@@ -357,7 +360,7 @@ fn summarize_deepseek_tool_turn_as_plain_assistant(
         role: "assistant".into(),
         content: Some(lines.join("\n")),
         images: None,
-        thinking: None,
+        thinking: Some(replay_reasoning),
         anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
@@ -391,13 +394,13 @@ fn repair_deepseek_thinking_tool_history(messages: &[ChatMessage]) -> Vec<ChatMe
     repaired
 }
 
-fn prepare_openai_messages_for_stream<'a>(
+fn prepare_openai_messages_for_request<'a>(
     resolved: &ResolvedModel,
     messages: &'a [ChatMessage],
-    thinking_on: bool,
+    repair_deepseek_history: bool,
 ) -> Cow<'a, [ChatMessage]> {
-    if resolved.provider == Provider::OpenAI
-        && thinking_on
+    if repair_deepseek_history
+        && resolved.provider == Provider::OpenAI
         && resolved.thinking_format.as_deref() == Some("deepseek-v4")
         && messages
             .iter()
@@ -1378,8 +1381,13 @@ fn build_openai_simple_body(
     s3_cfg: Option<&crate::config::S3Config>,
 ) -> Result<serde_json::Value, String> {
     let messages = materialize_image_urls(messages, s3_cfg)?;
-    let api_messages = convert_messages_to_openai_with_options(
+    let prepared_messages = prepare_openai_messages_for_request(
+        resolved,
         &messages,
+        resolved.thinking_format.as_deref() == Some("deepseek-v4"),
+    );
+    let api_messages = convert_messages_to_openai_with_options(
+        prepared_messages.as_ref(),
         openai_prefers_null_tool_call_content(resolved),
         resolved.thinking_format.as_deref(),
     );
@@ -2284,7 +2292,7 @@ fn build_openai_stream_body(
 ) -> Result<serde_json::Value, String> {
     let thinking_on = think_level != "off";
     let messages = materialize_image_urls(messages, s3_cfg)?;
-    let prepared_messages = prepare_openai_messages_for_stream(resolved, &messages, thinking_on);
+    let prepared_messages = prepare_openai_messages_for_request(resolved, &messages, thinking_on);
     let api_messages = convert_messages_to_openai_with_options(
         prepared_messages.as_ref(),
         openai_prefers_null_tool_call_content(resolved),
