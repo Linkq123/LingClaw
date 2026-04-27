@@ -343,7 +343,10 @@ fn convert_messages_to_openai_deepseek_v4_omits_empty_reasoning_content() {
     }];
 
     let out = convert_messages_to_openai_with_options(&messages, false, Some("deepseek-v4"));
-    assert!(out[0].get("reasoning_content").is_none());
+    assert_eq!(
+        out[0]["reasoning_content"].as_str(),
+        Some("Historical assistant response replayed without original reasoning_content.")
+    );
 }
 
 #[test]
@@ -1311,6 +1314,7 @@ fn build_openai_stream_body_deepseek_v4_sends_thinking_and_reasoning_effort() {
         Some("I reasoned about this")
     );
 }
+
 
 #[test]
 fn build_openai_stream_body_deepseek_v4_replays_missing_reasoning_tool_turn_as_text() {

@@ -305,6 +305,14 @@ fn deepseek_thinking_replay_needs_tool_turn_repair(message: &ChatMessage) -> boo
         && message.thinking.as_deref().is_none_or(str::is_empty)
 }
 
+fn deepseek_reasoning_replay_placeholder(has_tool_calls: bool) -> String {
+    if has_tool_calls {
+        "Historical assistant tool turn replayed without original reasoning_content.".to_string()
+    } else {
+        "Historical assistant response replayed without original reasoning_content.".to_string()
+    }
+}
+
 fn summarize_deepseek_tool_turn_as_plain_assistant(
     assistant: &ChatMessage,
     tool_messages: &[ChatMessage],
@@ -482,15 +490,20 @@ fn convert_messages_to_openai_with_options(
                     );
                 }
                 if thinking_format == Some("deepseek-v4") {
-                    // DeepSeek requires reasoning_content on assistant messages that
-                    // include tool_calls (400 error if missing).  For messages
-                    // without tool_calls the API ignores the field, so we always
-                    // include it when present — simpler and safer than conditional logic.
-                    if let Some(reasoning) = &msg.thinking
-                        && !reasoning.is_empty()
-                    {
-                        item["reasoning_content"] = json!(reasoning);
-                    }
+                    // DeepSeek may reject historical assistant messages in thinking
+                    // mode when reasoning_content is absent, including plain
+                    // assistant replies. Preserve original reasoning when
+                    // available; otherwise synthesize a stable placeholder so
+                    // legacy sessions continue to replay safely.
+                    let reasoning = msg
+                        .thinking
+                        .as_deref()
+                        .filter(|reasoning| !reasoning.is_empty())
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| {
+                            deepseek_reasoning_replay_placeholder(msg.tool_calls.is_some())
+                        });
+                    item["reasoning_content"] = json!(reasoning);
                 }
                 out.push(item);
             }
