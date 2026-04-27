@@ -78,6 +78,8 @@ lingclaw --version
 
 手动执行 `cargo install --path .` 时，必须同步部署 `static/`、`docs/reference/skills/` 和 `docs/reference/agents/`；否则首页可能返回 404，且内置 Skills / Sub-Agents 不可用。Windows 优先推荐 `powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1`，Linux 优先推荐 `bash scripts/install-linux.sh`。
 
+两个安装脚本都会优先尝试自动补齐满足前端构建要求的 Node.js / `npm` 并重建 `frontend/`；若自动安装失败但仓库里已有可用的 `static/index.html`，则会回退到现有静态产物继续安装。
+
 如果你使用的是手动 `cargo install --path .` 路径，并且修改了 `frontend/`，在复制 `static/` 之前先执行 `cd frontend && npm ci && npm run build`，把最新前端产物重新生成到 `static/`。如果改用 `lingclaw install -d /path/to/source`，命令会在检测到 `frontend/package.json` 且 `npm` 可用时自动构建前端；若 `npm` 不可用但仓库里已有可用的 `static/`，则回退为安装现有静态产物。`lingclaw update` 在源码目录内升级时也会沿用同一套前端准备与安装逻辑。
 
 前端体验相关改动建议同时执行 `cd frontend && npm test`、`npx eslint .`、`npx prettier --check "src/**/*.{ts,tsx}" "tests/**/*.ts"` 和 `npm run build`；Markdown 或流式渲染调整需要特别确认普通文本不会在完成时整段重绘，表格等跨段格式则能在最终阶段按需修正。

@@ -10,6 +10,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $RootDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$MinimumNodeVersion = [Version]'20.19.0'
 
 function Write-Info {
     param([string]$Message)
@@ -131,25 +132,190 @@ function Ensure-Rust {
 }
 
 function Get-NpmProgram {
-    if (Test-Tool 'npm.cmd') {
-        return 'npm.cmd'
+    $candidates = @()
+    if ($env:ProgramFiles) {
+        $candidates += (Join-Path $env:ProgramFiles 'nodejs\npm.cmd')
     }
-    if (Test-Tool 'npm') {
-        return 'npm'
+    if (${env:ProgramFiles(x86)}) {
+        $candidates += (Join-Path ${env:ProgramFiles(x86)} 'nodejs\npm.cmd')
+    }
+    if ($env:LOCALAPPDATA) {
+        $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\nodejs\npm.cmd')
+    }
+    foreach ($name in 'npm.cmd', 'npm') {
+        $command = Get-Command $name -ErrorAction SilentlyContinue
+        if ($command) {
+            $path = $command.Source
+            if ([string]::IsNullOrWhiteSpace($path)) {
+                $path = $command.Path
+            }
+            if (-not [string]::IsNullOrWhiteSpace($path)) {
+                $candidates += $path
+            }
+        }
+    }
+
+    foreach ($candidate in $candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate)) {
+            return $candidate
+        }
     }
     return $null
 }
 
-function Build-Frontend {
+function Get-StaticIndexPath {
+    return (Join-Path $RootDir 'static\index.html')
+}
+
+function Get-NodeExecutablePath {
+    $candidates = @()
+    if ($env:ProgramFiles) {
+        $candidates += (Join-Path $env:ProgramFiles 'nodejs\node.exe')
+    }
+    if (${env:ProgramFiles(x86)}) {
+        $candidates += (Join-Path ${env:ProgramFiles(x86)} 'nodejs\node.exe')
+    }
+    if ($env:LOCALAPPDATA) {
+        $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\nodejs\node.exe')
+    }
+
+    $command = Get-Command 'node' -ErrorAction SilentlyContinue
+    if ($command) {
+        $path = $command.Source
+        if ([string]::IsNullOrWhiteSpace($path)) {
+            $path = $command.Path
+        }
+        if (-not [string]::IsNullOrWhiteSpace($path)) {
+            $candidates += $path
+        }
+    }
+
+    foreach ($candidate in $candidates) {
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and (Test-Path -LiteralPath $candidate)) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+function Get-NodeVersion {
+    $nodeExecutable = Get-NodeExecutablePath
+    if (-not $nodeExecutable) {
+        return $null
+    }
+
+    try {
+        $raw = (& $nodeExecutable --version).Trim()
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return $null
+        }
+        return [Version]($raw.TrimStart('v'))
+    } catch {
+        return $null
+    }
+}
+
+function Refresh-SessionPathFromRegistry {
+    $segments = New-Object System.Collections.Generic.List[string]
+    foreach ($scope in 'Machine', 'User') {
+        $value = [Environment]::GetEnvironmentVariable('Path', $scope)
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            continue
+        }
+        foreach ($segment in ($value -split ';')) {
+            $trimmed = $segment.Trim()
+            if ([string]::IsNullOrWhiteSpace($trimmed)) {
+                continue
+            }
+            if (-not $segments.Contains($trimmed)) {
+                $segments.Add($trimmed)
+            }
+        }
+    }
+
+    foreach ($segment in ($env:Path -split ';')) {
+        $trimmed = $segment.Trim()
+        if ([string]::IsNullOrWhiteSpace($trimmed)) {
+            continue
+        }
+        if (-not $segments.Contains($trimmed)) {
+            $segments.Add($trimmed)
+        }
+    }
+
+    $env:Path = ($segments -join ';')
+}
+
+function Add-NodeInstallPaths {
+    $candidates = @()
+    if ($env:ProgramFiles) {
+        $candidates += (Join-Path $env:ProgramFiles 'nodejs')
+    }
+    if (${env:ProgramFiles(x86)}) {
+        $candidates += (Join-Path ${env:ProgramFiles(x86)} 'nodejs')
+    }
+    if ($env:LOCALAPPDATA) {
+        $candidates += (Join-Path $env:LOCALAPPDATA 'Programs\nodejs')
+    }
+
+    foreach ($candidate in $candidates) {
+        Add-ToSessionPath $candidate
+    }
+}
+
+function Ensure-Node {
     $npmProgram = Get-NpmProgram
-    if ((-not (Test-Tool 'node')) -or (-not $npmProgram)) {
-        Write-Warn 'Node.js / npm not found. Skipping frontend build; web UI may be outdated or missing.'
-        Write-Warn 'Install Node.js (https://nodejs.org) and re-run the installer to build the frontend.'
-        return
+    $nodeVersion = Get-NodeVersion
+    if ($nodeVersion -and $npmProgram -and $nodeVersion -ge $MinimumNodeVersion) {
+        return $true
+    }
+
+    if ($nodeVersion -and $nodeVersion -lt $MinimumNodeVersion) {
+        Write-Warn "Node.js $nodeVersion is below the required minimum $MinimumNodeVersion. Attempting automatic upgrade."
+    }
+
+    if (-not (Test-Tool 'winget')) {
+        Write-Warn 'Node.js / npm not found and winget is unavailable. Falling back to the existing static bundle.'
+        return $false
+    }
+
+    Write-Info 'Node.js / npm not found. Installing Node.js LTS via winget.'
+    & winget install --source winget --id OpenJS.NodeJS.LTS -e --accept-package-agreements --accept-source-agreements
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "winget install OpenJS.NodeJS.LTS failed with exit code $LASTEXITCODE. Falling back to the existing static bundle."
+        return $false
+    }
+
+    Refresh-SessionPathFromRegistry
+    Add-NodeInstallPaths
+
+    $npmProgram = Get-NpmProgram
+    $nodeVersion = Get-NodeVersion
+    $nodeExecutable = Get-NodeExecutablePath
+    if ($nodeVersion -and $npmProgram -and $nodeVersion -ge $MinimumNodeVersion -and $nodeExecutable) {
+        Write-Info "Node.js environment installed: $(& $nodeExecutable --version)"
+        return $true
+    }
+
+    Write-Warn "Node.js installation finished but the current shell still does not have a compatible Node.js runtime (need >= $MinimumNodeVersion). Falling back to the existing static bundle."
+    return $false
+}
+
+function Build-Frontend {
+    $nodeReady = Ensure-Node
+    $npmProgram = Get-NpmProgram
+    $nodeExecutable = Get-NodeExecutablePath
+    if (($nodeReady -ne $true) -or (-not $npmProgram) -or (-not $nodeExecutable)) {
+        $staticIndex = Get-StaticIndexPath
+        if (Test-Path -LiteralPath $staticIndex) {
+            Write-Warn "Using existing frontend bundle: $staticIndex"
+            return
+        }
+        throw 'Node.js / npm could not be prepared and static/index.html is missing.'
     }
 
     $frontendDir = Join-Path $RootDir 'frontend'
-    Write-Info "Building frontend assets (Node.js $(& node --version), npm $(& $npmProgram --version))."
+    Write-Info "Building frontend assets (Node.js $(& $nodeExecutable --version), npm $(& $npmProgram --version))."
     Invoke-Step -Program $npmProgram -Arguments @('ci') -WorkingDirectory $frontendDir -Label 'frontend dependency install'
     Invoke-Step -Program $npmProgram -Arguments @('run', 'build') -WorkingDirectory $frontendDir -Label 'frontend build'
     Write-Info 'Frontend build complete: static/'

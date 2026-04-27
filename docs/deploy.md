@@ -1,6 +1,6 @@
 # LingClaw 部署指南
 
-LingClaw 是单二进制 + 一组静态前端资源的架构，部署仍然很简单。前端源码位于 `frontend/`，通过 Vite 构建输出到 `static/`；运行时实际读取的是 `static/` 目录。普通源码包可直接使用仓库内已有的 `static/`，如果你改动了 `frontend/`，部署前需要先重新生成 `static/`。只有在你需要重建前端时，才需要额外安装 Node.js（建议当前 LTS 版本）。首次启动时会进入交互式 Setup Wizard，引导你配置 API Provider、Key 和默认模型，配置保存在 `~/.lingclaw/.lingclaw.json`。
+LingClaw 是单二进制 + 一组静态前端资源的架构，部署仍然很简单。前端源码位于 `frontend/`，通过 Vite 构建输出到 `static/`；运行时实际读取的是 `static/` 目录。普通源码包可直接使用仓库内已有的 `static/`，如果你改动了 `frontend/`，部署前需要先重新生成 `static/`。安装脚本会优先自动补齐 Node.js / `npm` 并重建前端；只有在你走手动构建流程时，才需要自己先准备 Node.js（建议当前 LTS 版本）。首次启动时会进入交互式 Setup Wizard，引导你配置 API Provider、Key 和默认模型，配置保存在 `~/.lingclaw/.lingclaw.json`。
 
 默认 Web 端口为 `18989`。
 
@@ -19,7 +19,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 脚本会自动：
 
 - 检查 Rust 环境；若未安装则通过 `winget` 安装 `rustup`
-- 若检测到 Node.js / `npm`，则执行 `frontend\npm ci` 和 `npm run build`；否则回退到仓库内已有的 `static/`
+- 若缺少 Node.js / `npm`，或现有版本过旧，则通过 `winget` 自动安装符合前端构建要求的 Node.js LTS，并执行 `frontend\npm ci` 和 `npm run build`
+- 如果 Node.js 自动安装失败但仓库里已有 `static/index.html`，则回退到现有静态产物继续安装
 - 在 Windows 下预处理 `target\release\lingclaw.exe` 的占用问题，避免 `cargo build --release` 被旧文件卡住
 - 执行 `cargo build --release` 和 `cargo install --path . --force`
 - 将 `static/` 部署到 cargo bin 目录旁边，避免首页 404
@@ -115,13 +116,15 @@ bash scripts/install-linux.sh
 
 - 检查 Rust 环境；若未安装则自动安装，已安装时跳过 Rust 安装本身
 - 按 Linux 发行版安装 `openssl` / `pkg-config` 构建依赖
+- 若缺少 Node.js / `npm`，或现有版本过旧，则优先自动下载符合前端构建要求的 Node.js LTS；必要时再回退到支持的发行版安装方式，并重建最新前端产物
+- 如果 Node.js 自动安装失败但仓库里已有 `static/index.html`，则回退到现有静态产物继续安装
 - 执行 `cargo build --release`
 - 将 `static/` 前端资源部署到 cargo bin 目录旁边，避免首页 404
 - 执行安装后自检，确认 `lingclaw` 二进制和 `static/index.html` 都已就位
 - 最后让你选择 `Install`、`Install-daemon` 或 `Skip for now`
 - `Install` 路径会继续询问是否持久化 PATH、是否添加 systemd 服务
 
-说明：安装脚本会部署当前仓库里的 `static/`。如果你先改过 `frontend/`，请在运行脚本前手动执行 `cd frontend && npm ci && npm run build`，把新的前端产物刷新到 `static/`。
+说明：安装脚本会优先尝试自动构建最新的 `frontend/` 产物，并把生成后的 `static/` 一并部署。如果当前系统不支持自动安装 Node.js / `npm`，或者自动安装失败，但仓库里已经有可用的 `static/index.html`，脚本会回退到部署现有 `static/`。
 
 手动构建流程如下：
 
