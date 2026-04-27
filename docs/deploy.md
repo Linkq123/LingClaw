@@ -8,7 +8,33 @@ LingClaw 是单二进制 + 一组静态前端资源的架构，部署仍然很�
 
 ## 1. Windows
 
-### 1.1 从源码构建
+### 1.1 直接安装（推荐）
+
+推荐直接使用安装脚本：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+```
+
+脚本会自动：
+
+- 检查 Rust 环境；若未安装则通过 `winget` 安装 `rustup`
+- 若检测到 Node.js / `npm`，则执行 `frontend\npm ci` 和 `npm run build`；否则回退到仓库内已有的 `static/`
+- 在 Windows 下预处理 `target\release\lingclaw.exe` 的占用问题，避免 `cargo build --release` 被旧文件卡住
+- 执行 `cargo build --release` 和 `cargo install --path . --force`
+- 将 `static/` 部署到 cargo bin 目录旁边，避免首页 404
+- 将 `docs/reference/skills/` 和 `docs/reference/agents/` 安装到 `%USERPROFILE%\.lingclaw\system-skills\`、`%USERPROFILE%\.lingclaw\system-agents\`
+- 执行安装后自检，确认 `lingclaw.exe` 和 `static/index.html` 都已就位
+- 最后让你选择 `Install`、`Install-daemon` 或 `Skip for now`
+- `Install` 路径会继续询问是否写入用户 PATH
+
+如果你想安装后立刻进入 Setup Wizard 并自动拉起后台服务，可以直接：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -Mode InstallDaemon
+```
+
+### 1.2 手动从源码构建
 
 ```powershell
 # 安装 Rust（如尚未安装）
@@ -35,7 +61,7 @@ cd ..
 
 `lingclaw install -d <source-dir>` 会先构建 Rust 二进制；若检测到 `frontend/package.json` 且 `npm` 可用，还会自动执行前端构建并安装最新 `static/`。如果 `npm` 不可用但源码目录里已有可用的 `static/index.html`，则会回退到安装现有静态产物。`lingclaw update` 在源码目录内升级时，前端处理逻辑与这里保持一致。
 
-### 1.2 运行
+### 1.3 运行
 
 ```powershell
 # 首次运行 — 进入 Setup Wizard，完成后自动后台启动
@@ -65,7 +91,7 @@ lingclaw --version  # 显示版本号
 
 浏览器打开 `http://127.0.0.1:18989`。
 
-### 1.3 防火墙
+### 1.4 防火墙
 
 如需局域网访问，放通端口：
 

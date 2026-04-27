@@ -42,6 +42,10 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 
 ## Quick Start
 
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1   # Windows 一键安装/构建/部署 static/ 并执行安装后自检
+```
+
 ```bash
 bash scripts/install-linux.sh   # Linux 一键安装/构建/部署 static/ 并执行安装后自检
 
@@ -72,7 +76,7 @@ lingclaw help
 lingclaw --version
 ```
 
-手动执行 `cargo install --path .` 时，必须同步部署 `static/`、`docs/reference/skills/` 和 `docs/reference/agents/`；否则首页可能返回 404，且内置 Skills / Sub-Agents 不可用。优先推荐直接使用 `bash scripts/install-linux.sh`。
+手动执行 `cargo install --path .` 时，必须同步部署 `static/`、`docs/reference/skills/` 和 `docs/reference/agents/`；否则首页可能返回 404，且内置 Skills / Sub-Agents 不可用。Windows 优先推荐 `powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1`，Linux 优先推荐 `bash scripts/install-linux.sh`。
 
 如果你使用的是手动 `cargo install --path .` 路径，并且修改了 `frontend/`，在复制 `static/` 之前先执行 `cd frontend && npm ci && npm run build`，把最新前端产物重新生成到 `static/`。如果改用 `lingclaw install -d /path/to/source`，命令会在检测到 `frontend/package.json` 且 `npm` 可用时自动构建前端；若 `npm` 不可用但仓库里已有可用的 `static/`，则回退为安装现有静态产物。`lingclaw update` 在源码目录内升级时也会沿用同一套前端准备与安装逻辑。
 
