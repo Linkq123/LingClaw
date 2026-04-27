@@ -406,6 +406,111 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
     }
 }
 
+#[tokio::test]
+async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
+    let state = Arc::new(test_app_state());
+    let session_id = "deepseek-session".to_string();
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(8);
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "DeepSeek", None));
+    }
+
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = AgentPhaseState {
+        round: 0,
+        pending_tool_calls: Vec::new(),
+        collected_results: Vec::new(),
+        cycle_workspace: PathBuf::new(),
+        last_observation_hint: None,
+        pending_interventions: Vec::new(),
+        react_ctx: agent::AgentLoopCtx::new(false),
+        shutting_down: false,
+        run_stopped: false,
+        run_detached: false,
+        last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
+    };
+
+    let response = providers::LlmResponse {
+        message: ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: Some("plan both files".into()),
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![
+                ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"README.md"}"#.into(),
+                    },
+                },
+                ToolCall {
+                    id: "call_2".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"Cargo.toml"}"#.into(),
+                    },
+                },
+            ]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        input_tokens: Some(123),
+        output_tokens: Some(45),
+    };
+
+    apply_llm_response(
+        &ctx,
+        &mut phase_state,
+        Provider::OpenAI,
+        "deepseek".to_string(),
+        crate::context::USAGE_ROLE_PRIMARY,
+        123,
+        response,
+    )
+    .await;
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&session_id)
+        .expect("session should be persisted");
+    let saved = session
+        .messages
+        .last()
+        .expect("assistant message should be appended");
+
+    assert_eq!(saved.role, "assistant");
+    assert_eq!(saved.thinking.as_deref(), Some("plan both files"));
+    assert!(saved.content.is_none());
+    let tool_calls = saved
+        .tool_calls
+        .as_ref()
+        .expect("assistant tool calls should be saved");
+    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls[0].id, "call_1");
+    assert_eq!(tool_calls[1].id, "call_2");
+    assert_eq!(phase_state.pending_tool_calls.len(), 2);
+    assert_eq!(phase_state.pending_tool_calls[0].id, "call_1");
+    assert_eq!(phase_state.pending_tool_calls[1].id, "call_2");
+}
+
 fn test_s3_config() -> S3Config {
     S3Config {
         endpoint: "https://minio.example.test/storage".to_string(),

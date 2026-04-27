@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
@@ -295,6 +296,119 @@ fn openai_supports_reasoning_controls(resolved: &ResolvedModel) -> bool {
 /// `reasoning_content` from the internal `thinking` field so that the
 /// DeepSeek API receives the reasoning chain for context (required when
 /// tool calls are present).
+fn deepseek_thinking_replay_needs_tool_turn_repair(message: &ChatMessage) -> bool {
+    message.role == "assistant"
+        && message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tool_calls| !tool_calls.is_empty())
+        && message.thinking.as_deref().is_none_or(str::is_empty)
+}
+
+fn summarize_deepseek_tool_turn_as_plain_assistant(
+    assistant: &ChatMessage,
+    tool_messages: &[ChatMessage],
+) -> ChatMessage {
+    let mut result_by_id: HashMap<&str, &str> = HashMap::new();
+    for tool_message in tool_messages {
+        if let Some(tool_call_id) = tool_message.tool_call_id.as_deref() {
+            result_by_id.insert(tool_call_id, tool_message.content.as_deref().unwrap_or(""));
+        }
+    }
+
+    let mut lines = vec![
+        "Prior tool turn replayed as plain context because DeepSeek omitted reasoning_content."
+            .to_string(),
+    ];
+    if let Some(content) = assistant.content.as_deref().filter(|content| !content.is_empty()) {
+        lines.push(format!("Assistant content: {content}"));
+    }
+    if let Some(tool_calls) = &assistant.tool_calls {
+        for tool_call in tool_calls {
+            lines.push(format!(
+                "Tool {} args: {}",
+                tool_call.function.name, tool_call.function.arguments
+            ));
+            match result_by_id.get(tool_call.id.as_str()) {
+                Some(result) => lines.push(format!("Tool result: {result}")),
+                None => lines.push(format!("Tool result missing for id: {}", tool_call.id)),
+            }
+        }
+    }
+    for tool_message in tool_messages {
+        let Some(tool_call_id) = tool_message.tool_call_id.as_deref() else {
+            continue;
+        };
+        if assistant
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tool_calls| tool_calls.iter().any(|tool_call| tool_call.id == tool_call_id))
+        {
+            continue;
+        }
+        lines.push(format!(
+            "Tool result for unmatched id {}: {}",
+            tool_call_id,
+            tool_message.content.as_deref().unwrap_or("")
+        ));
+    }
+
+    ChatMessage {
+        role: "assistant".into(),
+        content: Some(lines.join("\n")),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: assistant.timestamp,
+    }
+}
+
+fn repair_deepseek_thinking_tool_history(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut repaired = Vec::with_capacity(messages.len());
+    let mut idx = 0;
+
+    while idx < messages.len() {
+        let message = &messages[idx];
+        if !deepseek_thinking_replay_needs_tool_turn_repair(message) {
+            repaired.push(message.clone());
+            idx += 1;
+            continue;
+        }
+
+        let mut next = idx + 1;
+        while next < messages.len() && messages[next].role == "tool" {
+            next += 1;
+        }
+        repaired.push(summarize_deepseek_tool_turn_as_plain_assistant(
+            message,
+            &messages[idx + 1..next],
+        ));
+        idx = next;
+    }
+
+    repaired
+}
+
+fn prepare_openai_messages_for_stream<'a>(
+    resolved: &ResolvedModel,
+    messages: &'a [ChatMessage],
+    thinking_on: bool,
+) -> Cow<'a, [ChatMessage]> {
+    if resolved.provider == Provider::OpenAI
+        && thinking_on
+        && resolved.thinking_format.as_deref() == Some("deepseek-v4")
+        && messages
+            .iter()
+            .any(deepseek_thinking_replay_needs_tool_turn_repair)
+    {
+        Cow::Owned(repair_deepseek_thinking_tool_history(messages))
+    } else {
+        Cow::Borrowed(messages)
+    }
+}
+
 fn convert_messages_to_openai_with_options(
     messages: &[ChatMessage],
     null_tool_call_content: bool,
@@ -2170,8 +2284,9 @@ fn build_openai_stream_body(
 ) -> Result<serde_json::Value, String> {
     let thinking_on = think_level != "off";
     let messages = materialize_image_urls(messages, s3_cfg)?;
+    let prepared_messages = prepare_openai_messages_for_stream(resolved, &messages, thinking_on);
     let api_messages = convert_messages_to_openai_with_options(
-        &messages,
+        prepared_messages.as_ref(),
         openai_prefers_null_tool_call_content(resolved),
         resolved.thinking_format.as_deref(),
     );

@@ -1312,6 +1312,79 @@ fn build_openai_stream_body_deepseek_v4_sends_thinking_and_reasoning_effort() {
     );
 }
 
+#[test]
+fn build_openai_stream_body_deepseek_v4_replays_missing_reasoning_tool_turn_as_text() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://api.deepseek.com/v1".into(),
+        api_key: "deepseek-key".into(),
+        model_id: "deepseek-v4-pro".into(),
+        reasoning: true,
+        thinking_format: Some("deepseek-v4".into()),
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![
+        ChatMessage {
+            role: "user".into(),
+            content: Some("continue".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("README contents".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            timestamp: None,
+        },
+    ];
+
+    let body = build_openai_stream_body(&resolved, &messages, None, "high", &[], true)
+        .expect("body builds");
+
+    let body_messages = body["messages"]
+        .as_array()
+        .expect("messages should serialize as an array");
+    assert_eq!(body_messages.len(), 2);
+    assert_eq!(body_messages[1]["role"], "assistant");
+    assert!(body_messages[1].get("tool_calls").is_none());
+    assert!(body_messages[1].get("reasoning_content").is_none());
+    let summary = body_messages[1]["content"]
+        .as_str()
+        .expect("replayed assistant summary should be text");
+    assert!(summary.contains("DeepSeek omitted reasoning_content"));
+    assert!(summary.contains("Tool read_file args: {\"path\":\"README.md\"}"));
+    assert!(summary.contains("Tool result: README contents"));
+}
+
 #[tokio::test]
 async fn build_openai_stream_body_deepseek_v4_keeps_reasoning_after_parallel_tool_calls() {
     let (tx, _rx) = tokio::sync::mpsc::channel(16);
@@ -1446,6 +1519,150 @@ async fn build_openai_stream_body_deepseek_v4_keeps_reasoning_after_parallel_too
     );
     assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
     assert_eq!(body["messages"][3]["tool_call_id"], "call_2");
+}
+
+#[test]
+fn build_openai_stream_body_deepseek_v4_off_keeps_reasoningless_tool_turn_structured() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://api.deepseek.com/v1".into(),
+        api_key: "deepseek-key".into(),
+        model_id: "deepseek-v4-pro".into(),
+        reasoning: true,
+        thinking_format: Some("deepseek-v4".into()),
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![
+        ChatMessage {
+            role: "user".into(),
+            content: Some("continue".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("README contents".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            timestamp: None,
+        },
+    ];
+
+    let body = build_openai_stream_body(&resolved, &messages, None, "off", &[], true)
+        .expect("body builds");
+
+    let body_messages = body["messages"]
+        .as_array()
+        .expect("messages should serialize as an array");
+    assert_eq!(body_messages.len(), 3);
+    assert_eq!(
+        body_messages[1]["tool_calls"]
+            .as_array()
+            .expect("tool calls should stay structured")
+            .len(),
+        1
+    );
+    assert_eq!(body_messages[2]["role"], "tool");
+}
+
+#[test]
+fn build_openai_stream_body_non_deepseek_keeps_reasoningless_tool_turn_structured() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://example-openai-compatible.invalid/v1".into(),
+        api_key: "api-key".into(),
+        model_id: "gpt-4.1".into(),
+        reasoning: true,
+        thinking_format: None,
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![
+        ChatMessage {
+            role: "user".into(),
+            content: Some("continue".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("README contents".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            timestamp: None,
+        },
+    ];
+
+    let body = build_openai_stream_body(&resolved, &messages, None, "high", &[], true)
+        .expect("body builds");
+
+    let body_messages = body["messages"]
+        .as_array()
+        .expect("messages should serialize as an array");
+    assert_eq!(body_messages.len(), 3);
+    assert_eq!(
+        body_messages[1]["tool_calls"]
+            .as_array()
+            .expect("tool calls should stay structured")
+            .len(),
+        1
+    );
+    assert_eq!(body_messages[2]["role"], "tool");
 }
 
 #[test]
@@ -2563,6 +2780,106 @@ fn call_llm_stream_openai_reports_html_gateway_response() {
     assert!(error.contains("OpenAI stream error"));
     assert!(error.contains("text/html"));
     assert!(error.contains("gateway landing page"));
+}
+
+#[test]
+fn call_llm_stream_openai_deepseek_multi_tool_stream_keeps_two_tool_calls_and_thinking() {
+    let response_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan \"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"both files\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[",
+        "{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}},",
+        "{\"index\":1,\"id\":\"call_2\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"Cargo.toml\\\"}\"}}",
+        "]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: [DONE]\n\n"
+    )
+    .to_string();
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server("text/event-stream", response_body);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base,
+        api_key: "deepseek-key".into(),
+        model_id: "deepseek-v4-pro".into(),
+        reasoning: true,
+        thinking_format: Some("deepseek-v4".into()),
+        max_tokens: Some(256),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("compare both files".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let live_tx: LiveTx = tx;
+
+    let response = runtime
+        .block_on(async {
+            call_llm_stream_openai(
+                &http,
+                &resolved,
+                &messages,
+                None,
+                &live_tx,
+                "high",
+                &[],
+                true,
+                2,
+            )
+            .await
+        })
+        .expect("deepseek multi-tool stream should succeed");
+
+    let request = request_rx.recv().expect("captured request should exist");
+    handle.join().expect("server thread should join");
+
+    assert_eq!(request.request_line, "POST /chat/completions HTTP/1.1");
+    let body: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid json");
+    assert_eq!(body["reasoning_effort"], "high");
+    assert_eq!(body["thinking"]["type"], "enabled");
+
+    assert!(response.message.content.is_none());
+    assert_eq!(response.message.thinking.as_deref(), Some("plan both files"));
+    let tool_calls = response
+        .message
+        .tool_calls
+        .expect("stream response should keep tool calls");
+    assert_eq!(tool_calls.len(), 2);
+    assert_eq!(tool_calls[0].id, "call_1");
+    assert_eq!(tool_calls[0].function.name, "read_file");
+    assert_eq!(tool_calls[0].function.arguments, r#"{"path":"README.md"}"#);
+    assert_eq!(tool_calls[1].id, "call_2");
+    assert_eq!(tool_calls[1].function.name, "read_file");
+    assert_eq!(tool_calls[1].function.arguments, r#"{"path":"Cargo.toml"}"#);
+
+    let mut event_types = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        let event_type = event["type"]
+            .as_str()
+            .expect("event type should be present")
+            .to_string();
+        event_types.push(event_type);
+    }
+    assert_eq!(
+        event_types,
+        vec![
+            "thinking_start".to_string(),
+            "thinking_delta".to_string(),
+            "thinking_delta".to_string(),
+            "thinking_done".to_string(),
+        ]
+    );
 }
 
 #[test]
