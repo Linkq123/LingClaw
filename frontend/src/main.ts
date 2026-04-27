@@ -225,6 +225,11 @@ function appendRoundUsage(messageEl, inputTokens, outputTokens, firstTokenMs = n
   content.appendChild(label);
 }
 
+function markCurrentRoundFirstTokenAt() {
+  if (!state.currentRoundStartedAt || state.currentRoundFirstTokenAt) return;
+  state.currentRoundFirstTokenAt = performance.now();
+}
+
 // ── History lazy-load ──
 
 function createLoadMoreRow(count: number): HTMLElement {
@@ -510,22 +515,24 @@ function handleMessage(data) {
       applyViewState(data);
       break;
 
-    case 'start':
+    case 'start': {
+      const isNewTurn = !state.busy;
       setBusy(true);
-      state.currentRoundStartedAt = performance.now();
-      state.currentRoundFirstTokenAt = 0;
+      if (isNewTurn) {
+        state.currentRoundStartedAt = performance.now();
+        state.currentRoundFirstTokenAt = 0;
+      }
       finishAssistantStream({ discardIfEmpty: true });
       beginAssistantStream();
       if (data.react_visible && data.phase) {
         showReactStatus(data.phase, data.cycle);
       }
       break;
+    }
 
     case 'delta':
       if (data.subagent) break;
-      if (data.content && !state.currentRoundFirstTokenAt) {
-        state.currentRoundFirstTokenAt = performance.now();
-      }
+      if (data.content) markCurrentRoundFirstTokenAt();
       if (state.currentMsg) {
         state.pendingAssistantText += data.content;
         scheduleFlush();
@@ -620,6 +627,9 @@ function handleMessage(data) {
     }
 
     case 'thinking_delta':
+      if (data.content && !data.subagent) {
+        markCurrentRoundFirstTokenAt();
+      }
       if (!state.showReasoning) break;
       if (data.subagent) {
         const orchInfo = parseOrchestrateCompositeTaskId(data.task_id);
@@ -678,6 +688,7 @@ function handleMessage(data) {
 
     case 'tool_call':
       if (data.subagent) break;
+      markCurrentRoundFirstTokenAt();
       setReactActTool(data.name, 0);
       addToolCall(data.name, data.arguments, data.id);
       break;
