@@ -293,6 +293,22 @@ describe('renderMarkdown memoization', () => {
     expect(el.querySelector('tbody td')?.textContent).toBe('1');
   });
 
+  it('renders a gfm table after a paragraph without a blank line', async () => {
+    const el = document.createElement('div');
+    el._rawText = [
+      'Intro before the table:',
+      '| Site | Url | Notes |',
+      '| --- | --- | --- |',
+      '| BateCode | https://www.batecode.xyz | Works |',
+    ].join('\n');
+
+    await renderMarkdown(el);
+
+    expect(el.querySelector('p')?.textContent).toContain('Intro before the table');
+    expect(el.querySelector('.markdown-table-wrap table')).not.toBeNull();
+    expect(el.querySelectorAll('tbody tr')).toHaveLength(1);
+  });
+
   it('renders common markdown blocks and inline elements', async () => {
     const el = document.createElement('div');
     el._rawText = [
@@ -414,6 +430,40 @@ describe('finishAssistantStream markdown finalization', () => {
     expect(row.hidden).toBe(false);
     expect(message.querySelector('.markdown-table-wrap table')).not.toBeNull();
     expect(message.querySelectorAll('tbody tr')).toHaveLength(2);
+  });
+
+  it('finalizes a table after a paragraph without a blank line', async () => {
+    await preloadMarkdownEngine();
+
+    const row = document.createElement('div');
+    row.className = 'msg-row assistant';
+    row.hidden = true;
+
+    const message = document.createElement('div');
+    message.className = 'msg assistant';
+    message._rawText = [
+      'Intro before the table:',
+      '| Site | Url | Notes |',
+      '| --- | --- | --- |',
+      '| BateCode | https://www.batecode.xyz | Works |',
+    ].join('\n');
+    message._renderedOffset = message._rawText.length;
+    message.innerHTML =
+      '<p>Intro before the table:</p><p>| Site | Url | Notes |</p><p>| --- | --- | --- |</p>';
+
+    row.appendChild(message);
+    document.body.appendChild(row);
+    state.currentMsg = message;
+
+    const result = finishAssistantStream();
+    expect(result).toBe(message);
+
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await Promise.resolve();
+
+    expect(message.querySelector('.markdown-table-wrap table')).not.toBeNull();
+    expect(message.querySelectorAll('tbody tr')).toHaveLength(1);
   });
 
   it('keeps already-rendered plain text DOM when no final markdown correction is needed', async () => {

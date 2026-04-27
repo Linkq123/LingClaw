@@ -166,6 +166,7 @@ async function processMarkdownQueue() {
 // ── Progressive segmented markdown ──
 
 const GFM_TABLE_SEPARATOR_RE = /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+(?:\s*:?-{3,}:?\s*)?\|?\s*$/;
+const MARKDOWN_FENCE_RE = /^\s*(```|~~~)/;
 const COMMON_SENTENCE_SPLIT_ABBREVIATIONS = new Set([
   'e.g.',
   'i.e.',
@@ -184,6 +185,42 @@ const COMMON_SENTENCE_SPLIT_ABBREVIATIONS = new Set([
 
 function hasTableCells(line: string): boolean {
   return line.includes('|') && !GFM_TABLE_SEPARATOR_RE.test(line);
+}
+
+function tableContainerBreak(line: string): string {
+  const blockquotePrefix = line.match(/^(\s{0,3}(?:>\s*)+)/)?.[1];
+  return blockquotePrefix ? blockquotePrefix.trimEnd() : '';
+}
+
+function normalizeGfmTableBoundaries(text: string): string {
+  if (!text.includes('|')) return text;
+
+  const lines = text.split('\n');
+  const normalized: string[] = [];
+  let inFence = false;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const nextLine = index + 1 < lines.length ? lines[index + 1] : '';
+
+    if (
+      !inFence &&
+      hasTableCells(line) &&
+      GFM_TABLE_SEPARATOR_RE.test(nextLine) &&
+      normalized.length > 0 &&
+      normalized[normalized.length - 1].trim() !== ''
+    ) {
+      normalized.push(tableContainerBreak(line));
+    }
+
+    normalized.push(line);
+
+    if (MARKDOWN_FENCE_RE.test(line)) {
+      inFence = !inFence;
+    }
+  }
+
+  return normalized.join('\n');
 }
 
 function lineEnd(text: string, lineStart: number): number {
@@ -622,7 +659,8 @@ export function needsFinalMarkdownRender(el, raw) {
 
 export async function appendRenderedSegment(el, markdownText) {
   const { marked, DOMPurify, katex } = await loadMarkdownDeps();
-  const { text: preprocessed, blocks: mathBlocks } = extractMath(markdownText);
+  const normalizedMarkdown = normalizeGfmTableBoundaries(markdownText);
+  const { text: preprocessed, blocks: mathBlocks } = extractMath(normalizedMarkdown);
   const html = marked.parse(preprocessed) as string;
   const sanitized = DOMPurify.sanitize(html, { ADD_ATTR: ['target'] });
   const temp = document.createElement('div');
@@ -747,7 +785,8 @@ export async function renderMarkdown(el) {
     return;
   }
   const { marked, DOMPurify, katex } = await loadMarkdownDeps();
-  const { text: preprocessed, blocks: mathBlocks } = extractMath(raw);
+  const normalizedMarkdown = normalizeGfmTableBoundaries(raw);
+  const { text: preprocessed, blocks: mathBlocks } = extractMath(normalizedMarkdown);
   const html = marked.parse(preprocessed) as string;
   const sanitized = DOMPurify.sanitize(html, { ADD_ATTR: ['target'] });
   el.innerHTML = renderMathPlaceholders(sanitized, mathBlocks, katex);
