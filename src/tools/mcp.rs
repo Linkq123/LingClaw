@@ -28,6 +28,8 @@ const MCP_SPAWN_FAILURE_COOLDOWN_SECS: u64 = 15;
 static MCP_TOOL_CACHE: OnceLock<Mutex<HashMap<String, CachedToolDescriptors>>> = OnceLock::new();
 static MCP_SESSION_CACHE: OnceLock<Mutex<HashMap<String, CachedMcpSession>>> = OnceLock::new();
 static MCP_SPAWN_FAILURES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct McpToolDescriptor {
@@ -1173,6 +1175,17 @@ fn should_reset_mcp_session(error: &str) -> bool {
         || error.contains("pipe")
 }
 
+fn apply_mcp_process_flags(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        // Keep console-style MCP helpers such as `uvx.exe` attached to pipes
+        // without flashing a separate terminal window for every tool call.
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
+}
+
 async fn spawn_server_session(
     server_name: &str,
     config: &Config,
@@ -1200,6 +1213,7 @@ async fn spawn_server_session(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .current_dir(server_cwd);
+    apply_mcp_process_flags(&mut command);
     for (key, value) in &server.env {
         command.env(key, value);
     }
