@@ -1,6 +1,9 @@
 use crate::{Config, check_dangerous_command, resolve_path_checked, truncate};
 use std::path::Path;
 
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 // ── think ────────────────────────────────────────────────────────────────────
 
 pub(crate) fn tool_think(args: &serde_json::Value) -> String {
@@ -37,16 +40,15 @@ pub(crate) async fn tool_exec(
     let shell = if cfg!(windows) { "cmd" } else { "sh" };
     let flag = if cfg!(windows) { "/C" } else { "-c" };
 
-    let result = tokio::time::timeout(
-        config.exec_timeout,
-        tokio::process::Command::new(shell)
-            .arg(flag)
-            .arg(command)
-            .current_dir(&work_dir)
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await;
+    let mut command_process = tokio::process::Command::new(shell);
+    command_process
+        .arg(flag)
+        .arg(command)
+        .current_dir(&work_dir)
+        .kill_on_drop(true);
+    apply_exec_process_flags(&mut command_process);
+
+    let result = tokio::time::timeout(config.exec_timeout, command_process.output()).await;
 
     match result {
         Ok(Ok(output)) => {
@@ -66,4 +68,15 @@ pub(crate) async fn tool_exec(
             config.exec_timeout.as_secs()
         ),
     }
+}
+
+fn apply_exec_process_flags(command: &mut tokio::process::Command) {
+    #[cfg(target_os = "windows")]
+    {
+        // Prevent `cmd.exe` from flashing a transient console window for each
+        // exec tool invocation when LingClaw is launched outside a terminal.
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
 }
