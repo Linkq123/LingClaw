@@ -20,6 +20,65 @@ interface SubagentModalHost extends HTMLElement {
   _subagentModalPlaceholder?: HTMLElement | null;
 }
 
+type SubagentPanelRef = {
+  task_id?: string;
+  agent?: string;
+};
+
+type SubagentStats = {
+  cycles?: number;
+  tool_calls?: number;
+  duration_ms?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  result_excerpt?: string;
+  result_preview?: string;
+  error?: string;
+};
+
+type ToolCounts = {
+  total: number;
+  settled: number;
+  failed: number;
+  running: number;
+};
+
+type TextNodeHost = HTMLElement & {
+  _textNode?: Text;
+};
+
+const LABELS = {
+  subagent: 'Sub-agent',
+  running: 'Running',
+  thinking: 'Thinking...',
+  completed: 'Completed',
+  failed: 'Failed',
+  waiting: 'Waiting',
+  reasoning: 'Reasoning',
+  expandAll: 'Expand all',
+  collapseAll: 'Collapse all',
+  focusActive: 'Focus active',
+  copySummary: 'Copy summary',
+  taskPrompt: 'Task prompt',
+  toolChain: 'Tool chain',
+  toolDetails: 'Tool details',
+  toolDetailsHint: 'Expand to inspect arguments and output',
+  noToolCallsYet: 'No tool calls yet',
+  noToolCallsInHistory: 'Tool details were not saved for this history replay.',
+  noArguments: 'No arguments',
+  noOutput: 'No output',
+  toolFailedNoOutput: 'Tool failed without returning displayable output.',
+  arguments: 'Arguments',
+  output: 'Output',
+  executionSummary: 'Execution summary',
+  failureDetails: 'Failure details',
+  duration: 'Duration',
+} as const;
+
+function pluralize(count: number, singular: string, plural = `${singular}s`) {
+  return count === 1 ? singular : plural;
+}
+
 function getToolTrail(panel): HTMLElement | null {
   return (panel as Element).querySelector('[data-subagent-tool-trail]') as HTMLElement | null;
 }
@@ -40,8 +99,8 @@ function getReasoningMeta(panel): HTMLElement | null {
   return (panel as Element).querySelector('[data-subagent-reasoning-meta]') as HTMLElement | null;
 }
 
-function getReasoningBody(panel): HTMLElement | null {
-  return (panel as Element).querySelector('[data-subagent-reasoning-body]') as HTMLElement | null;
+function getReasoningBody(panel): TextNodeHost | null {
+  return (panel as Element).querySelector('[data-subagent-reasoning-body]') as TextNodeHost | null;
 }
 
 function ensureReasoningCard(panel) {
@@ -56,8 +115,8 @@ function ensureReasoningCard(panel) {
   card.hidden = true;
   card.innerHTML = `
     <div class="subagent-section-head">
-      <div class="subagent-section-title">思考链</div>
-      <div class="subagent-section-meta" data-subagent-reasoning-meta>等待中</div>
+      <div class="subagent-section-title">${LABELS.reasoning}</div>
+      <div class="subagent-section-meta" data-subagent-reasoning-meta>${LABELS.waiting}</div>
     </div>
     <pre class="subagent-reasoning-body" data-subagent-reasoning-body></pre>
   `;
@@ -70,10 +129,10 @@ function ensureReasoningCard(panel) {
   return card;
 }
 
-function reasoningPreview(rawText, fallback = '完成') {
+function reasoningPreview(rawText, fallback = LABELS.completed) {
   const summaryText = (rawText || '').trim().replace(/\n+/g, ' ');
   const preview = summaryText.slice(0, 60);
-  return preview ? preview + (summaryText.length > 60 ? '…' : '') : fallback;
+  return preview ? preview + (summaryText.length > 60 ? '...' : '') : fallback;
 }
 
 function setChipText(panel, key, value, extraClass = '') {
@@ -142,13 +201,13 @@ function ensureToolBadge(panel, toolId, toolName) {
   badge.innerHTML = `
     <span class="subagent-tool-pill-index">${trail.childElementCount + 1}</span>
     <span class="subagent-tool-pill-name">${escHtml(toolName)}</span>
-    <span class="subagent-tool-pill-state">执行中</span>
+    <span class="subagent-tool-pill-state">${LABELS.running}</span>
   `;
   trail.appendChild(badge);
   return badge;
 }
 
-function syncToolOverview(panel, fallbackTotal = null, counts = null) {
+function syncToolOverview(panel, fallbackTotal: number | null = null, counts: ToolCounts | null = null) {
   if (!panel) return;
 
   const rows = counts ? null : getToolRows(panel);
@@ -172,23 +231,25 @@ function syncToolOverview(panel, fallbackTotal = null, counts = null) {
     if (total === 0) {
       meta.textContent =
         fallbackTotal != null && fallbackTotal > 0
-          ? `历史记录保留了 ${fallbackTotal} 次调用统计`
-          : '尚未调用';
+          ? `History replay preserved ${fallbackTotal} ${pluralize(fallbackTotal, 'tool call')}.`
+          : LABELS.noToolCallsYet;
     } else {
-      const parts = [`${total} 次调用`];
-      if (running) parts.push(`${running} 运行中`);
-      if (succeeded) parts.push(`${succeeded} 成功`);
-      if (failed) parts.push(`${failed} 失败`);
-      meta.textContent = parts.join(' · ');
+      const parts = [`${total} ${pluralize(total, 'call')}`];
+      if (running) parts.push(`${running} running`);
+      if (succeeded) parts.push(`${succeeded} completed`);
+      if (failed) parts.push(`${failed} failed`);
+      meta.textContent = parts.join(' / ');
     }
   }
+
   if (empty) {
     empty.hidden = total > 0;
     empty.textContent =
       fallbackTotal != null && fallbackTotal > 0
-        ? '当前是历史回放视图，未保存具体工具名。'
-        : '暂无工具调用';
+        ? LABELS.noToolCallsInHistory
+        : LABELS.noToolCallsYet;
   }
+
   if (trail) trail.hidden = total === 0;
 }
 
@@ -212,7 +273,7 @@ function focusToolRow(row) {
 function summaryCopyText(panel) {
   if (!panel) return '';
 
-  const parts = [];
+  const parts: string[] = [];
   const label = panel.querySelector('.subagent-label')?.textContent?.trim();
   const status = panel.querySelector('.subagent-status')?.textContent?.trim();
   const prompt = panel.querySelector('.subagent-prompt')?.textContent?.trim();
@@ -221,7 +282,7 @@ function summaryCopyText(panel) {
   )
     .map((chip) => chip.textContent?.trim() || '')
     .filter(Boolean)
-    .join(' · ');
+    .join(' / ');
   const summaryBody = panel
     .querySelector(
       '.subagent-summary:not(.hidden) .subagent-preview, .subagent-summary:not(.hidden) .subagent-error',
@@ -244,8 +305,8 @@ function summaryCopyText(panel) {
 
   if (label) parts.push(label);
   if (status) parts.push(status);
-  if (prompt) parts.push(`委托任务\n${prompt}`);
-  if (toolsUsed) parts.push(`工具轨迹\n${toolsUsed}`);
+  if (prompt) parts.push(`${LABELS.taskPrompt}\n${prompt}`);
+  if (toolsUsed) parts.push(`${LABELS.toolChain}\n${toolsUsed}`);
   if (metrics) parts.push(metrics);
   if (summaryBody) parts.push(summaryBody);
   if (!summaryBody && latestOutput) parts.push(latestOutput);
@@ -306,7 +367,7 @@ function syncPanelActions(panel) {
     rows.every((row) => row.querySelector('.subagent-tool-details')?.classList.contains('show'));
 
   if (toggleAllBtn) {
-    toggleAllBtn.textContent = rows.length > 0 && allExpanded ? '收起全部' : '展开全部';
+    toggleAllBtn.textContent = rows.length > 0 && allExpanded ? LABELS.collapseAll : LABELS.expandAll;
     toggleAllBtn.disabled = rows.length === 0;
   }
   if (focusBtn) {
@@ -317,7 +378,7 @@ function syncPanelActions(panel) {
   }
 }
 
-function syncToolCount(panel, fallbackTotal = null) {
+function syncToolCount(panel, fallbackTotal: number | null = null) {
   const rows = getToolRows(panel);
   const total = rows.length;
   const settled = rows.filter((row) => row.classList.contains('subagent-tool-done')).length;
@@ -332,35 +393,22 @@ function syncToolCount(panel, fallbackTotal = null) {
   syncToolOverview(panel, fallbackTotal, { total, settled, failed, running });
 }
 
-function renderSummary(
-  panel,
-  success,
-  stats: {
-    cycles?: number;
-    tool_calls?: number;
-    duration_ms?: number;
-    input_tokens?: number;
-    output_tokens?: number;
-    result_excerpt?: string;
-    result_preview?: string;
-    error?: string;
-  } = {},
-) {
+function renderSummary(panel, success, stats: SubagentStats = {}) {
   const summary = panel.querySelector('.subagent-summary');
   if (!summary) return;
 
-  const metrics = [];
+  const metrics: string[] = [];
   if (stats.cycles != null) metrics.push(`Cycles ${stats.cycles}`);
   if (stats.tool_calls != null) metrics.push(`Tools ${stats.tool_calls}`);
   if (stats.duration_ms != null) {
     const duration = formatToolDuration(stats.duration_ms);
-    if (duration) metrics.push(`耗时 ${duration}`);
+    if (duration) metrics.push(`${LABELS.duration} ${duration}`);
   }
   if (stats.input_tokens != null || stats.output_tokens != null) {
-    const tokens = [];
+    const tokens: string[] = [];
     if (stats.input_tokens != null) tokens.push(`In ${formatTokenCount(stats.input_tokens)}`);
     if (stats.output_tokens != null) tokens.push(`Out ${formatTokenCount(stats.output_tokens)}`);
-    if (tokens.length) metrics.push(tokens.join(' · '));
+    if (tokens.length) metrics.push(tokens.join(' / '));
   }
 
   const bodyText = success
@@ -382,7 +430,7 @@ function renderSummary(
 
   summary.innerHTML = `
     <div class="subagent-summary-head">
-      <div class="subagent-summary-title">${success ? '最终输出' : '失败信息'}</div>
+      <div class="subagent-summary-title">${success ? LABELS.executionSummary : LABELS.failureDetails}</div>
       <div class="subagent-summary-metrics">${metricHtml}</div>
     </div>
     ${contentHtml}
@@ -390,15 +438,7 @@ function renderSummary(
   summary.classList.remove('hidden');
 }
 
-/**
- * Resolve an active sub-agent panel by task_id (preferred) or agent name
- * (legacy fallback). Before panels were keyed by agent name alone, which
- * collided when the same agent ran in parallel. The backend now emits a
- * unique `task_id` for every delegated task; old sessions / older backends
- * fall back to agent name so the UI keeps working.
- * @param {{ task_id?: string, agent?: string }} ref
- */
-function resolvePanel(ref) {
+function resolvePanel(ref: SubagentPanelRef) {
   if (ref && ref.task_id && state.activeSubagentPanels.has(ref.task_id)) {
     return state.activeSubagentPanels.get(ref.task_id);
   }
@@ -458,17 +498,11 @@ export function openSubagentModal(trigger) {
   panel.querySelector('.subagent-modal-close')?.focus();
 }
 
-function panelKey(ref) {
+function panelKey(ref: SubagentPanelRef) {
   if (ref && ref.task_id) return ref.task_id;
   return (ref && ref.agent) || '';
 }
 
-/**
- * Create a collapsible sub-agent panel and insert it into the chat timeline.
- * @param {string} agentName
- * @param {string} [prompt]
- * @param {string} [taskId]
- */
 export function createSubagentPanel(agentName, prompt, taskId) {
   const displayPrompt = stripDelegatedPromptRuntimeContext(prompt);
   const panel = document.createElement('div');
@@ -483,14 +517,14 @@ export function createSubagentPanel(agentName, prompt, taskId) {
   header.setAttribute('tabindex', '0');
   header.setAttribute('aria-expanded', 'false');
   header.innerHTML = `
-    <span class="subagent-icon">✦</span>
+    <span class="subagent-icon">&#10022;</span>
     <span class="subagent-head-copy">
-      <span class="subagent-kicker">Sub-agent</span>
+      <span class="subagent-kicker">${LABELS.subagent}</span>
       <span class="subagent-label">${escHtml(agentName)}</span>
     </span>
-    <span class="subagent-status">执行中</span>
-    <span class="chevron">↗</span>
-    <button type="button" class="subagent-modal-close" data-action="close-subagent-modal" aria-label="Close sub-agent details" tabindex="-1">×</button>
+    <span class="subagent-status">${LABELS.running}</span>
+    <span class="chevron">&#9656;</span>
+    <button type="button" class="subagent-modal-close" data-action="close-subagent-modal" aria-label="Close sub-agent details" tabindex="-1">&times;</button>
   `;
 
   const body = document.createElement('div');
@@ -500,7 +534,7 @@ export function createSubagentPanel(agentName, prompt, taskId) {
   const meta = document.createElement('div');
   meta.className = 'subagent-meta';
   meta.innerHTML = `
-    <span class="subagent-chip is-live" data-subagent-chip="state">运行中</span>
+    <span class="subagent-chip is-live" data-subagent-chip="state">${LABELS.running}</span>
     <span class="subagent-chip" data-subagent-chip="cycle">Cycle 1</span>
     <span class="subagent-chip" data-subagent-chip="tools">0 tools</span>
   `;
@@ -509,9 +543,9 @@ export function createSubagentPanel(agentName, prompt, taskId) {
   const actions = document.createElement('div');
   actions.className = 'panel-actions subagent-actions';
   actions.innerHTML = `
-    <button type="button" class="panel-action-btn" data-action="subagent-toggle-all">展开全部</button>
-    <button type="button" class="panel-action-btn" data-action="subagent-focus-current">定位当前</button>
-    <button type="button" class="panel-action-btn" data-action="subagent-copy-summary" disabled>复制摘要</button>
+    <button type="button" class="panel-action-btn" data-action="subagent-toggle-all">${LABELS.expandAll}</button>
+    <button type="button" class="panel-action-btn" data-action="subagent-focus-current">${LABELS.focusActive}</button>
+    <button type="button" class="panel-action-btn" data-action="subagent-copy-summary" disabled>${LABELS.copySummary}</button>
   `;
   body.appendChild(actions);
 
@@ -519,7 +553,7 @@ export function createSubagentPanel(agentName, prompt, taskId) {
     const promptCard = document.createElement('div');
     promptCard.className = 'subagent-section-card';
     promptCard.innerHTML = `
-      <div class="subagent-section-title">委托任务</div>
+      <div class="subagent-section-title">${LABELS.taskPrompt}</div>
       <div class="subagent-prompt">${escHtml(displayPrompt)}</div>
     `;
     body.appendChild(promptCard);
@@ -529,10 +563,10 @@ export function createSubagentPanel(agentName, prompt, taskId) {
   toolOverview.className = 'subagent-section-card subagent-tools-overview';
   toolOverview.innerHTML = `
     <div class="subagent-section-head">
-      <div class="subagent-section-title">工具轨迹</div>
-      <div class="subagent-section-meta" data-subagent-tools-meta>尚未调用</div>
+      <div class="subagent-section-title">${LABELS.toolChain}</div>
+      <div class="subagent-section-meta" data-subagent-tools-meta>${LABELS.noToolCallsYet}</div>
     </div>
-    <div class="subagent-tool-empty" data-subagent-tool-empty>暂无工具调用</div>
+    <div class="subagent-tool-empty" data-subagent-tool-empty>${LABELS.noToolCallsYet}</div>
     <div class="subagent-tool-trail" data-subagent-tool-trail hidden></div>
   `;
   body.appendChild(toolOverview);
@@ -541,8 +575,8 @@ export function createSubagentPanel(agentName, prompt, taskId) {
   toolListSection.className = 'subagent-section-card subagent-tool-list-section';
   toolListSection.innerHTML = `
     <div class="subagent-section-head">
-      <div class="subagent-section-title">工具明细</div>
-      <div class="subagent-section-meta">展开可查看参数与输出</div>
+      <div class="subagent-section-title">${LABELS.toolDetails}</div>
+      <div class="subagent-section-meta">${LABELS.toolDetailsHint}</div>
     </div>
   `;
   body.appendChild(toolListSection);
@@ -551,7 +585,6 @@ export function createSubagentPanel(agentName, prompt, taskId) {
   toolList.className = 'subagent-tool-list';
   toolListSection.appendChild(toolList);
 
-  // Result / stats block — filled on terminal event.
   const summary = document.createElement('div');
   summary.className = 'subagent-summary hidden';
   body.appendChild(summary);
@@ -575,14 +608,7 @@ export function createSubagentPanel(agentName, prompt, taskId) {
   syncPanelActions(panel);
 }
 
-/**
- * Append a mini tool row inside the sub-agent panel.
- * @param {{ task_id?: string, agent: string }} ref
- * @param {string} toolName
- * @param {string} [toolId]
- * @param {string} [toolArgs]
- */
-export function addSubagentTool(ref, toolName, toolId, toolArgs = '') {
+export function addSubagentTool(ref: SubagentPanelRef, toolName, toolId, toolArgs = '') {
   const panel = resolvePanel(ref);
   if (!panel) return;
 
@@ -596,50 +622,45 @@ export function addSubagentTool(ref, toolName, toolId, toolArgs = '') {
   row.dataset.toolName = toolName;
   row.innerHTML = `
     <div class="subagent-tool-summary" data-action="toggle-tool">
-      <span class="subagent-tool-icon">⚡</span>
+      <span class="subagent-tool-icon">&#9881;</span>
       <span class="subagent-tool-main">
         <span class="subagent-tool-name">${escHtml(toolName)}</span>
-        <span class="subagent-tool-preview">${escHtml(inlinePreview(formattedArgs || '无参数'))}</span>
+        <span class="subagent-tool-preview">${escHtml(inlinePreview(formattedArgs || LABELS.noArguments))}</span>
       </span>
-      <span class="subagent-tool-status">执行中</span>
-      <span class="chevron">▸</span>
+      <span class="subagent-tool-status">${LABELS.running}</span>
+      <span class="chevron">&#9656;</span>
     </div>
     <div class="subagent-tool-details">
       <div class="subagent-tool-section">
-        <div class="subagent-tool-section-title">参数</div>
-        <pre class="subagent-tool-code">${escHtml(formattedArgs || '无参数')}</pre>
+        <div class="subagent-tool-section-title">${LABELS.arguments}</div>
+        <pre class="subagent-tool-code">${escHtml(formattedArgs || LABELS.noArguments)}</pre>
       </div>
       <div class="subagent-tool-section subagent-tool-output" hidden>
-        <div class="subagent-tool-section-title">输出</div>
+        <div class="subagent-tool-section-title">${LABELS.output}</div>
         <pre class="subagent-tool-code subagent-tool-output-code"></pre>
       </div>
     </div>
   `;
   toolList.appendChild(row);
   const badge = ensureToolBadge(panel, toolId, toolName);
-  updateToolBadgeState(badge, '执行中', 'is-running');
+  updateToolBadgeState(badge, LABELS.running, 'is-running');
   syncToolCount(panel);
   syncPanelActions(panel);
   scrollDown();
 }
 
-/**
- * Update the sub-agent panel header with current cycle number.
- * @param {{ task_id?: string, agent: string }} ref
- * @param {number} cycle
- */
-export function updateSubagentProgress(ref, cycle) {
+export function updateSubagentProgress(ref: SubagentPanelRef, cycle) {
   const panel = resolvePanel(ref);
   if (!panel) return;
 
   const status = panel.querySelector('.subagent-status');
   if (status) {
-    status.textContent = `执行中 (cycle ${cycle})`;
+    status.textContent = `${LABELS.running} (cycle ${cycle})`;
   }
   setChipText(panel, 'cycle', `Cycle ${cycle}`);
 }
 
-export function startSubagentReasoning(ref) {
+export function startSubagentReasoning(ref: SubagentPanelRef) {
   const panel = resolvePanel(ref);
   if (!panel) return;
 
@@ -655,19 +676,19 @@ export function startSubagentReasoning(ref) {
   }
 
   const cycleLabel = panel.querySelector('[data-subagent-chip="cycle"]')?.textContent?.trim() || '';
-  if (body._textNode.nodeValue.trim()) body._textNode.nodeValue += '\n\n';
+  if ((body._textNode.nodeValue || '').trim()) body._textNode.nodeValue += '\n\n';
   if (cycleLabel) body._textNode.nodeValue += `[${cycleLabel}]\n`;
 
   card.hidden = false;
   if (meta) {
-    meta.textContent = cycleLabel ? `${cycleLabel} · 推理中` : '推理中';
+    meta.textContent = cycleLabel ? `${cycleLabel} / ${LABELS.thinking}` : LABELS.thinking;
     meta.title = meta.textContent;
   }
 
   scrollDown();
 }
 
-export function appendSubagentReasoning(ref, content) {
+export function appendSubagentReasoning(ref: SubagentPanelRef, content) {
   if (!content) return;
 
   const panel = resolvePanel(ref);
@@ -688,7 +709,7 @@ export function appendSubagentReasoning(ref, content) {
   scrollDown();
 }
 
-export function finishSubagentReasoning(ref) {
+export function finishSubagentReasoning(ref: SubagentPanelRef) {
   const panel = resolvePanel(ref);
   if (!panel) return;
 
@@ -699,10 +720,10 @@ export function finishSubagentReasoning(ref) {
   const rawText = body._textNode?.nodeValue || body.textContent || '';
   const preview = reasoningPreview(rawText);
   meta.textContent = preview;
-  meta.title = rawText.trim() || '完成';
+  meta.title = rawText.trim() || LABELS.completed;
 }
 
-export function restoreSubagentHistorySnapshot(ref, snapshot: SubagentHistorySnapshot) {
+export function restoreSubagentHistorySnapshot(ref: SubagentPanelRef, snapshot: SubagentHistorySnapshot) {
   const panel = resolvePanel(ref);
   if (!panel || !snapshot) return;
 
@@ -754,17 +775,8 @@ export function restoreSubagentHistorySnapshot(ref, snapshot: SubagentHistorySna
   );
 }
 
-/**
- * Update a tool row inside the sub-agent panel when its result arrives.
- * @param {{ task_id?: string, agent: string }} ref
- * @param {string} toolId
- * @param {number} [durationMs]
- * @param {string} [result]
- * @param {boolean} [isError]
- * @param {string} [toolName]
- */
 export function updateSubagentToolResult(
-  ref,
+  ref: SubagentPanelRef,
   toolId,
   durationMs,
   result,
@@ -776,8 +788,8 @@ export function updateSubagentToolResult(
 
   let row = null;
   for (const candidate of panel.querySelectorAll('.subagent-tool-row')) {
-    if (candidate.dataset.toolId === toolId) {
-      row = candidate;
+    if ((candidate as HTMLElement).dataset.toolId === toolId) {
+      row = candidate as HTMLElement;
       break;
     }
   }
@@ -786,7 +798,7 @@ export function updateSubagentToolResult(
     addSubagentTool(ref, toolName || 'tool', toolId);
     row =
       Array.from(panel.querySelectorAll('.subagent-tool-row')).find(
-        (candidate) => candidate.dataset.toolId === toolId,
+        (candidate) => (candidate as HTMLElement).dataset.toolId === toolId,
       ) || null;
   }
   if (!row) return;
@@ -798,7 +810,7 @@ export function updateSubagentToolResult(
   const statusEl = row.querySelector('.subagent-tool-status');
   if (statusEl) {
     const label = formatToolDuration(durationMs);
-    statusEl.textContent = `${isError ? '失败' : '完成'}${label ? ` · ${label}` : ''}`;
+    statusEl.textContent = `${isError ? LABELS.failed : LABELS.completed}${label ? ` / ${label}` : ''}`;
   }
 
   const hasResult = typeof result === 'string';
@@ -812,12 +824,16 @@ export function updateSubagentToolResult(
   const outputCode = row.querySelector('.subagent-tool-output-code');
   if (outputSection && outputCode && (hasResult || isError)) {
     outputCode.textContent =
-      formattedResult || (isError ? '工具执行失败，未返回可展示的输出。' : '无输出');
-    outputSection.hidden = false;
+      formattedResult || (isError ? LABELS.toolFailedNoOutput : LABELS.noOutput);
+    (outputSection as HTMLElement).hidden = false;
   }
 
   const badge = findToolBadge(panel, toolId);
-  updateToolBadgeState(badge, isError ? '失败' : '完成', isError ? 'is-failed' : 'is-done');
+  updateToolBadgeState(
+    badge,
+    isError ? LABELS.failed : LABELS.completed,
+    isError ? 'is-failed' : 'is-done',
+  );
 
   syncToolCount(panel);
   syncPanelActions(panel);
@@ -830,13 +846,12 @@ export function updateSubagentToolResult(
   scrollDown();
 }
 
-/**
- * Mark a sub-agent panel as completed or failed and auto-collapse after delay.
- * @param {{ task_id?: string, agent: string }} ref
- * @param {boolean} success
- * @param {{ cycles?: number, tool_calls?: number, duration_ms?: number, input_tokens?: number, output_tokens?: number, error?: string, result_preview?: string, result_excerpt?: string }} stats
- */
-export function finishSubagentPanel(ref, success, stats, { immediate = false } = {}) {
+export function finishSubagentPanel(
+  ref: SubagentPanelRef,
+  success,
+  stats: SubagentStats,
+  { immediate = false } = {},
+) {
   const panel = resolvePanel(ref);
   if (!panel) return;
 
@@ -846,24 +861,28 @@ export function finishSubagentPanel(ref, success, stats, { immediate = false } =
   const status = panel.querySelector('.subagent-status');
   if (status) {
     if (success) {
-      const parts = [];
+      const parts: string[] = [];
       if (stats.cycles != null) parts.push(`${stats.cycles} cycles`);
       if (stats.tool_calls != null) parts.push(`${stats.tool_calls} tools`);
       if (stats.duration_ms != null) {
         const dur = formatToolDuration(stats.duration_ms);
         if (dur) parts.push(dur);
       }
-      status.textContent = parts.length ? `完成 (${parts.join(', ')})` : '完成';
+      status.textContent = parts.length
+        ? `${LABELS.completed} (${parts.join(', ')})`
+        : LABELS.completed;
     } else {
-      status.textContent = stats.error ? `失败: ${stats.error.slice(0, 60)}` : '失败';
+      status.textContent = stats.error
+        ? `${LABELS.failed}: ${stats.error.slice(0, 60)}`
+        : LABELS.failed;
     }
   }
 
-  setChipText(panel, 'state', success ? '已完成' : '失败', success ? 'is-success' : 'is-error');
+  setChipText(panel, 'state', success ? LABELS.completed : LABELS.failed, success ? 'is-success' : 'is-error');
   if (stats.cycles != null) setChipText(panel, 'cycle', `Cycle ${stats.cycles}`);
 
   renderSummary(panel, success, stats);
-  syncToolCount(panel, stats.tool_calls);
+  syncToolCount(panel, stats.tool_calls ?? null);
   syncPanelActions(panel);
 
   const collapsePanel = () => {
@@ -878,8 +897,6 @@ export function finishSubagentPanel(ref, success, stats, { immediate = false } =
   }
 
   state.activeSubagentPanels.delete(panelKey(ref));
-  // Also drop the legacy agent-name key if it was used as a fallback, so
-  // parallel later tasks for the same agent start with a clean slate.
   if (ref && ref.agent) state.activeSubagentPanels.delete(ref.agent);
 }
 
@@ -908,7 +925,7 @@ export function focusSubagentCurrent(button) {
 export function copySubagentSummary(button) {
   const panel = button.closest('.subagent-panel');
   if (!panel) return;
-  void copyButtonText(button, summaryCopyText(panel), '复制摘要');
+  void copyButtonText(button, summaryCopyText(panel), LABELS.copySummary);
 }
 
 export function focusSubagentTool(button) {

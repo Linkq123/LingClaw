@@ -148,6 +148,44 @@ describe('subagent modal hosting', () => {
     expect(promptEl?.textContent).not.toContain('Delegated Task Context');
   });
 
+  it('uses English labels that match the orchestrate card style', () => {
+    createSubagentPanel('explore', 'Inspect the logs and summarize the failure.', 'task-4b');
+
+    const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
+    const actionButtons = Array.from(
+      panel?.querySelectorAll('.panel-action-btn') || [],
+    ).map((button) => (button as HTMLButtonElement).textContent?.trim());
+    const sectionTitles = Array.from(
+      panel?.querySelectorAll('.subagent-section-title') || [],
+    ).map((title) => (title as HTMLElement).textContent?.trim());
+
+    expect(panel?.querySelector('.subagent-status')?.textContent).toBe('Running');
+    expect(panel?.querySelector('.subagent-icon')?.textContent).toBe('✦');
+    expect(actionButtons).toEqual(['Expand all', 'Focus active', 'Copy summary']);
+    expect(sectionTitles).toEqual(['Task prompt', 'Tool chain', 'Tool details']);
+  });
+
+  it('keeps history replay empty state consistent when only tool counts were saved', () => {
+    createSubagentPanel('reviewer', 'Inspect the logs and summarize the failure.', 'task-4c');
+
+    finishSubagentPanel(
+      { task_id: 'task-4c', agent: 'reviewer' },
+      true,
+      {
+        tool_calls: 3,
+        result_excerpt: 'Replay restored only summary data.',
+      },
+      { immediate: true },
+    );
+
+    const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
+    const meta = panel?.querySelector('[data-subagent-tools-meta]') as HTMLElement | null;
+    const empty = panel?.querySelector('[data-subagent-tool-empty]') as HTMLElement | null;
+
+    expect(meta?.textContent).toBe('History replay preserved 3 tool calls.');
+    expect(empty?.textContent).toBe('Tool details were not saved for this history replay.');
+  });
+
   it('restores reasoning, tools, and summary from a history snapshot', () => {
     createSubagentPanel('reviewer', 'Inspect the logs and summarize the failure.', 'task-5');
 
