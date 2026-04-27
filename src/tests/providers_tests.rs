@@ -1312,6 +1312,142 @@ fn build_openai_stream_body_deepseek_v4_sends_thinking_and_reasoning_effort() {
     );
 }
 
+#[tokio::test]
+async fn build_openai_stream_body_deepseek_v4_keeps_reasoning_after_parallel_tool_calls() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let live_tx: LiveTx = tx;
+    let mut state = OpenAiStreamState {
+        content_buf: String::new(),
+        thinking_buf: String::new(),
+        tool_calls: Vec::new(),
+        input_tokens: None,
+        output_tokens: None,
+        client_gone: false,
+        reasoning_started: false,
+    };
+
+    let thinking_chunk = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "reasoning_content": "plan both reads"
+            }
+        }]
+    })
+    .to_string();
+    process_openai_data_line(&thinking_chunk, &live_tx, &mut state).await;
+
+    let tool_chunk = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"README.md\"}"
+                        }
+                    },
+                    {
+                        "index": 1,
+                        "id": "call_2",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"Cargo.toml\"}"
+                        }
+                    }
+                ]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    })
+    .to_string();
+    process_openai_data_line(&tool_chunk, &live_tx, &mut state).await;
+
+    let response = build_llm_response(
+        state.content_buf,
+        state.thinking_buf,
+        state.tool_calls,
+        None,
+        None,
+    )
+    .expect("response should build");
+
+    assert_eq!(response.message.thinking.as_deref(), Some("plan both reads"));
+    assert_eq!(
+        response
+            .message
+            .tool_calls
+            .as_ref()
+            .expect("tool calls should exist")
+            .len(),
+        2
+    );
+
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://api.deepseek.com/v1".into(),
+        api_key: "deepseek-key".into(),
+        model_id: "deepseek-v4-pro".into(),
+        reasoning: true,
+        thinking_format: Some("deepseek-v4".into()),
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![
+        ChatMessage {
+            role: "user".into(),
+            content: Some("compare both files".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        response.message.clone(),
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("README contents".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("Cargo contents".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("call_2".into()),
+            timestamp: None,
+        },
+    ];
+
+    let body = build_openai_stream_body(&resolved, &messages, None, "high", &[], true)
+        .expect("body builds");
+
+    assert_eq!(
+        body["messages"][1]["reasoning_content"].as_str(),
+        Some("plan both reads")
+    );
+    assert_eq!(
+        body["messages"][1]["tool_calls"]
+            .as_array()
+            .expect("assistant tool calls should be serialized")
+            .len(),
+        2
+    );
+    assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
+    assert_eq!(body["messages"][3]["tool_call_id"], "call_2");
+}
+
 #[test]
 fn build_openai_stream_body_deepseek_v4_maps_xhigh_to_max() {
     let resolved = ResolvedModel {
