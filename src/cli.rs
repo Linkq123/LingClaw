@@ -733,27 +733,190 @@ fn install_global_path() {
     }
 }
 
-/// On Windows, rename the target exe to `.old` so `cargo build` can produce a fresh one.
-/// Returns the `.old` path if a rename was performed, for cleanup after build.
-fn rename_target_exe_for_build(source_dir: &std::path::Path) -> Option<PathBuf> {
+#[derive(Debug, Clone)]
+struct RenamedTargetExe {
+    target_exe: PathBuf,
+    backup_exe: PathBuf,
+}
+
+const INSTALL_TARGET_EXE_ENV: &str = "LINGCLAW_INSTALL_TARGET_EXE";
+const INSTALL_SKIP_CONFIRM_ENV: &str = "LINGCLAW_INSTALL_SKIP_CONFIRM";
+
+fn same_path(lhs: &Path, rhs: &Path) -> bool {
+    lhs.canonicalize().unwrap_or_else(|_| lhs.to_path_buf())
+        == rhs.canonicalize().unwrap_or_else(|_| rhs.to_path_buf())
+}
+
+fn effective_install_exe_path() -> Option<PathBuf> {
+    std::env::var_os(INSTALL_TARGET_EXE_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_exe().ok())
+}
+
+#[cfg(windows)]
+fn relaunch_via_temporary_helper_if_in_place_release(
+    source_dir: &Path,
+    skip_confirm: bool,
+) -> io::Result<bool> {
+    if std::env::var_os(INSTALL_TARGET_EXE_ENV).is_some() {
+        return Ok(false);
+    }
+
+    let current_exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(_) => return Ok(false),
+    };
+    let target_exe = release_binary_path(source_dir);
+    if !same_path(&current_exe, &target_exe) {
+        return Ok(false);
+    }
+
+    let helper_exe = std::env::temp_dir().join(format!(
+        "lingclaw-install-helper-{}-{}.exe",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    ));
+    std::fs::copy(&current_exe, &helper_exe)?;
+
+    println!("Windows in-place release build detected; continuing from a temporary helper...");
+
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    let mut command = std::process::Command::new(&helper_exe);
+    command
+        .args(&args)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .env(INSTALL_TARGET_EXE_ENV, &current_exe);
+    if skip_confirm {
+        command.env(INSTALL_SKIP_CONFIRM_ENV, "1");
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        command.current_dir(cwd);
+    }
+    command.spawn()?;
+    Ok(true)
+}
+
+#[cfg(not(windows))]
+fn relaunch_via_temporary_helper_if_in_place_release(
+    _source_dir: &Path,
+    _skip_confirm: bool,
+) -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(windows)]
+fn stop_lingclaw_processes_for_paths(paths: &[PathBuf]) {
+    let targets = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if targets.trim().is_empty() {
+        return;
+    }
+
+    let script = format!(
+        r#"$targets = @"
+{targets}
+"@ -split "`r?`n" | ForEach-Object {{ $_.Trim() }} | Where-Object {{ $_ }}
+Get-Process lingclaw -ErrorAction SilentlyContinue |
+  Where-Object {{ $_.Id -ne {pid} -and $_.Path -and ($targets -contains $_.Path) }} |
+  ForEach-Object {{ Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }}
+"#,
+        pid = std::process::id()
+    );
+
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .status();
+}
+
+#[cfg(not(windows))]
+fn stop_lingclaw_processes_for_paths(_paths: &[PathBuf]) {}
+
+fn file_write_available(path: &Path) -> bool {
+    if !path.exists() {
+        return true;
+    }
+    std::fs::OpenOptions::new().write(true).open(path).is_ok()
+}
+
+fn wait_for_paths_to_be_released(paths: &[PathBuf], attempts: usize, delay: Duration) -> bool {
+    if paths.is_empty() {
+        return true;
+    }
+
+    for attempt in 0..attempts {
+        if paths.iter().all(|path| file_write_available(path)) {
+            return true;
+        }
+        if attempt + 1 < attempts {
+            std::thread::sleep(delay);
+        }
+    }
+
+    false
+}
+
+/// On Windows, move the existing target exe aside so `cargo build` can produce a fresh one.
+/// Returns the backup path if a rename was performed, for cleanup or restoration after build.
+fn rename_target_exe_for_build(source_dir: &std::path::Path) -> Option<RenamedTargetExe> {
     #[cfg(not(windows))]
     {
         let _ = source_dir;
-        return None;
+        None
     }
     #[cfg(windows)]
     {
-        let exe_name = "lingclaw.exe";
-        let target_exe = source_dir.join("target").join("release").join(exe_name);
-        if target_exe.exists() {
-            let old_exe = target_exe.with_extension("exe.old");
-            // Remove stale .old if present
-            let _ = std::fs::remove_file(&old_exe);
-            if std::fs::rename(&target_exe, &old_exe).is_ok() {
-                return Some(old_exe);
+        let target_exe = release_binary_path(source_dir);
+        if !target_exe.exists() {
+            return None;
+        }
+
+        let file_name = target_exe.file_name()?.to_string_lossy().to_string();
+        let backup_exe = target_exe.with_file_name(format!(
+            "{file_name}.old.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_millis()
+        ));
+
+        for attempt in 0..20 {
+            match std::fs::rename(&target_exe, &backup_exe) {
+                Ok(()) => {
+                    return Some(RenamedTargetExe {
+                        target_exe,
+                        backup_exe,
+                    });
+                }
+                Err(_) if attempt + 1 < 20 => {
+                    std::thread::sleep(Duration::from_millis(250));
+                }
+                Err(_) => {
+                    return None;
+                }
             }
         }
+
         None
+    }
+}
+
+fn cleanup_renamed_target_exe(renamed: &RenamedTargetExe) {
+    let _ = std::fs::remove_file(&renamed.backup_exe);
+}
+
+fn restore_renamed_target_exe(renamed: &RenamedTargetExe) {
+    if renamed.backup_exe.exists() {
+        let _ = std::fs::rename(&renamed.backup_exe, &renamed.target_exe);
     }
 }
 
@@ -937,7 +1100,7 @@ fn install_release_artifacts(
     built_exe: &Path,
     current_exe: &Path,
 ) -> io::Result<()> {
-    if built_exe == current_exe {
+    if same_path(built_exe, current_exe) {
         return Ok(());
     }
 
@@ -1061,9 +1224,10 @@ fn handle_start_command(port_override: Option<u16>) -> bool {
         return true;
     }
 
-    let exe = match std::env::current_exe() {
-        Ok(path) => path,
-        Err(error) => {
+    let exe = match effective_install_exe_path() {
+        Some(path) => path,
+        None => {
+            let error = io::Error::other("current executable path unavailable");
             eprintln!("Failed to resolve current executable: {error}");
             return true;
         }
@@ -1269,6 +1433,14 @@ fn handle_update_command(port_override: Option<u16>) -> bool {
         eprintln!("ERROR: Cargo.toml not found. Run `lingclaw update` from the source directory.");
         return true;
     }
+    match relaunch_via_temporary_helper_if_in_place_release(&workspace, false) {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("ERROR: Failed to relaunch Windows update helper: {e}");
+            return true;
+        }
+    }
     println!("Current version: v{VERSION}");
     println!("Pulling latest source...");
     let pull = std::process::Command::new("git").args(["pull"]).status();
@@ -1307,29 +1479,24 @@ fn handle_update_command(port_override: Option<u16>) -> bool {
     if was_running {
         println!("Stopping service before build...");
         handle_stop_command(port_override);
-        let exe = std::env::current_exe().ok();
-        let mut released = false;
-        for i in 0..10 {
-            if let Some(ref path) = exe {
-                if std::fs::OpenOptions::new().write(true).open(path).is_ok() {
-                    released = true;
-                    break;
-                }
-            } else {
-                std::thread::sleep(Duration::from_secs(2));
-                released = true;
-                break;
-            }
-            if i < 9 {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-        }
-        if !released {
-            eprintln!(
-                "   ❌ Failed to release binary file lock after 5s. Is the process still running?"
-            );
-            return true;
-        }
+    }
+    let mut paths_to_release = Vec::new();
+    if let Some(install_exe) = effective_install_exe_path() {
+        paths_to_release.push(install_exe);
+    }
+    let target_release_exe = release_binary_path(&workspace);
+    if !paths_to_release
+        .iter()
+        .any(|path| same_path(path, &target_release_exe))
+    {
+        paths_to_release.push(target_release_exe);
+    }
+    stop_lingclaw_processes_for_paths(&paths_to_release);
+    if !wait_for_paths_to_be_released(&paths_to_release, 20, Duration::from_millis(500)) {
+        eprintln!(
+            "   ❌ Failed to release binary file lock after 10s. Another LingClaw process may still be running."
+        );
+        return true;
     }
 
     println!("Building...");
@@ -1340,7 +1507,7 @@ fn handle_update_command(port_override: Option<u16>) -> bool {
     match build {
         Ok(s) if s.success() => {
             if let Some(ref p) = old_exe {
-                let _ = std::fs::remove_file(p);
+                cleanup_renamed_target_exe(p);
             }
             match prepare_frontend_assets(&workspace) {
                 Ok(FrontendPrepareResult::BuiltFromSource) => {
@@ -1369,13 +1536,13 @@ fn handle_update_command(port_override: Option<u16>) -> bool {
             }
 
             let built_exe = release_binary_path(&workspace);
-            if let Ok(current_exe) = std::env::current_exe() {
-                let installs_release = built_exe != current_exe;
-                match install_release_artifacts(&workspace, &built_exe, &current_exe) {
+            if let Some(install_exe) = effective_install_exe_path() {
+                let installs_release = !same_path(&built_exe, &install_exe);
+                match install_release_artifacts(&workspace, &built_exe, &install_exe) {
                     Ok(()) => {
                         if installs_release {
-                            println!("   ✅ Installed v{new_version} → {}", current_exe.display());
-                            if let Some(install_dir) = current_exe.parent() {
+                            println!("   ✅ Installed v{new_version} → {}", install_exe.display());
+                            if let Some(install_dir) = install_exe.parent() {
                                 println!(
                                     "   ✅ Frontend assets installed → {}",
                                     install_dir.join("static").display()
@@ -1410,8 +1577,7 @@ fn handle_update_command(port_override: Option<u16>) -> bool {
         }
         _ => {
             if let Some(ref p) = old_exe {
-                let target = p.with_extension("exe");
-                let _ = std::fs::rename(p, &target);
+                restore_renamed_target_exe(p);
             }
             eprintln!("   ❌ Build failed");
             if was_running {
@@ -2080,6 +2246,7 @@ fn handle_install_command(port_override: Option<u16>) -> bool {
         .find(|w| w[0] == "-d")
         .map(|w| PathBuf::from(&w[1]))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let source_dir = source_dir.canonicalize().unwrap_or(source_dir);
 
     let cargo_toml = source_dir.join("Cargo.toml");
     if !cargo_toml.exists() {
@@ -2120,6 +2287,7 @@ fn handle_install_command(port_override: Option<u16>) -> bool {
         .collect();
     let cur_parts: Vec<u32> = VERSION.split('.').filter_map(|s| s.parse().ok()).collect();
     let cmp = src_parts.cmp(&cur_parts);
+    let skip_confirm = std::env::var_os(INSTALL_SKIP_CONFIRM_ENV).is_some();
 
     match cmp {
         std::cmp::Ordering::Less => {
@@ -2129,24 +2297,36 @@ fn handle_install_command(port_override: Option<u16>) -> bool {
             return true;
         }
         std::cmp::Ordering::Equal => {
-            print!("Already at v{VERSION}. Reinstall? [y/N] ");
-            let _ = io::stdout().flush();
-            let mut answer = String::new();
-            let _ = io::stdin().read_line(&mut answer);
-            if !answer.trim().eq_ignore_ascii_case("y") {
-                println!("Cancelled.");
-                return true;
+            if !skip_confirm {
+                print!("Already at v{VERSION}. Reinstall? [y/N] ");
+                let _ = io::stdout().flush();
+                let mut answer = String::new();
+                let _ = io::stdin().read_line(&mut answer);
+                if !answer.trim().eq_ignore_ascii_case("y") {
+                    println!("Cancelled.");
+                    return true;
+                }
             }
         }
         std::cmp::Ordering::Greater => {
-            print!("Upgrade v{VERSION} → v{source_version}? [y/N] ");
-            let _ = io::stdout().flush();
-            let mut answer = String::new();
-            let _ = io::stdin().read_line(&mut answer);
-            if !answer.trim().eq_ignore_ascii_case("y") {
-                println!("Cancelled.");
-                return true;
+            if !skip_confirm {
+                print!("Upgrade v{VERSION} → v{source_version}? [y/N] ");
+                let _ = io::stdout().flush();
+                let mut answer = String::new();
+                let _ = io::stdin().read_line(&mut answer);
+                if !answer.trim().eq_ignore_ascii_case("y") {
+                    println!("Cancelled.");
+                    return true;
+                }
             }
+        }
+    }
+    match relaunch_via_temporary_helper_if_in_place_release(&source_dir, true) {
+        Ok(true) => return true,
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("ERROR: Failed to relaunch Windows install helper: {e}");
+            return true;
         }
     }
 
@@ -2158,15 +2338,28 @@ fn handle_install_command(port_override: Option<u16>) -> bool {
     if was_running {
         println!("Stopping service...");
         handle_stop_command(port_override);
-        let exe = std::env::current_exe().ok();
-        for _ in 0..10 {
-            if let Some(ref path) = exe
-                && std::fs::OpenOptions::new().write(true).open(path).is_ok()
-            {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(500));
+    }
+    let mut paths_to_release = Vec::new();
+    if let Some(install_exe) = effective_install_exe_path() {
+        paths_to_release.push(install_exe);
+    }
+    let target_release_exe = release_binary_path(&source_dir);
+    if !paths_to_release
+        .iter()
+        .any(|path| same_path(path, &target_release_exe))
+    {
+        paths_to_release.push(target_release_exe);
+    }
+    stop_lingclaw_processes_for_paths(&paths_to_release);
+    if !wait_for_paths_to_be_released(&paths_to_release, 20, Duration::from_millis(500)) {
+        eprintln!(
+            "   ❌ Failed to release binary file lock after 10s. Another LingClaw process may still be running."
+        );
+        if was_running {
+            println!("Restarting previous version...");
+            handle_start_command(port_override);
         }
+        return true;
     }
 
     println!("Building v{source_version}...");
@@ -2178,7 +2371,7 @@ fn handle_install_command(port_override: Option<u16>) -> bool {
     match build {
         Ok(s) if s.success() => {
             if let Some(ref p) = old_exe {
-                let _ = std::fs::remove_file(p);
+                cleanup_renamed_target_exe(p);
             }
             match prepare_frontend_assets(&source_dir) {
                 Ok(FrontendPrepareResult::BuiltFromSource) => {
@@ -2205,12 +2398,12 @@ fn handle_install_command(port_override: Option<u16>) -> bool {
                 }
             }
             let built_exe = release_binary_path(&source_dir);
-            if let Ok(current_exe) = std::env::current_exe() {
-                if built_exe != current_exe {
-                    match install_built_binary(&built_exe, &current_exe) {
+            if let Some(install_exe) = effective_install_exe_path() {
+                if !same_path(&built_exe, &install_exe) {
+                    match install_built_binary(&built_exe, &install_exe) {
                         Ok(_) => println!(
                             "   ✅ Installed v{source_version} → {}",
-                            current_exe.display()
+                            install_exe.display()
                         ),
                         Err(e) => {
                             eprintln!("   ❌ Failed to copy binary: {e}");
@@ -2220,7 +2413,7 @@ fn handle_install_command(port_override: Option<u16>) -> bool {
                             return true;
                         }
                     }
-                    if let Some(install_dir) = current_exe.parent() {
+                    if let Some(install_dir) = install_exe.parent() {
                         match install_frontend_assets(&source_dir, install_dir) {
                             Ok(()) => println!(
                                 "   ✅ Frontend assets installed → {}",
@@ -2256,8 +2449,7 @@ fn handle_install_command(port_override: Option<u16>) -> bool {
         }
         _ => {
             if let Some(ref p) = old_exe {
-                let target = p.with_extension("exe");
-                let _ = std::fs::rename(p, &target);
+                restore_renamed_target_exe(p);
             }
             eprintln!("   ❌ Build failed");
             if was_running {
