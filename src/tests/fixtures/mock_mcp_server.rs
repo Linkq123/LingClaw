@@ -51,11 +51,12 @@ fn initialize_response(id: &str) -> String {
     )
 }
 
-fn tools_list_response(id: &str, tool_name: &str) -> String {
+fn tools_list_response(id: &str, tool_name: &str, description: &str) -> String {
     format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"tools\":[{{\"name\":\"{}\",\"description\":\"mock tool\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{}}}}}}]}}}}",
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"tools\":[{{\"name\":\"{}\",\"description\":\"{}\",\"inputSchema\":{{\"type\":\"object\",\"properties\":{{}}}}}}]}}}}",
         id,
-        tool_name
+        tool_name,
+        description
     )
 }
 
@@ -98,13 +99,15 @@ fn main() {
             Some("notifications/initialized") => {}
             Some("tools/list") => {
                 tools_list_count += 1;
-                let tool_name = if mode == "tool-change" && tools_list_count >= 2 {
-                    "beta"
+                let (tool_name, description) = if mode == "mutating" {
+                    ("delete_issue", "Delete an issue")
+                } else if mode == "tool-change" && tools_list_count >= 2 {
+                    ("beta", "Retrieve the current value")
                 } else {
-                    "alpha"
+                    ("alpha", "Retrieve the current value")
                 };
                 if let Some(id) = id.as_deref() {
-                    write_line(&mut stdout, &tools_list_response(id, tool_name));
+                    write_line(&mut stdout, &tools_list_response(id, tool_name, description));
                 }
                 if mode == "tool-change" && tools_list_count == 1 {
                     write_line(

@@ -350,8 +350,20 @@ fn test_mcp_tool_classification_no_false_positives_from_substrings() {
     )));
 }
 
+#[test]
+fn test_mcp_tool_classification_defaults_unknown_tools_to_mutating() {
+    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
+        "clone_repo",
+        "Repository operation"
+    )));
+    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
+        "operation_42",
+        "Tool exposed by MCP server"
+    )));
+}
+
 #[tokio::test]
-async fn test_mcp_read_only_tools_remain_sequential_for_parallel_dispatch() {
+async fn test_mcp_read_only_tools_are_parallelizable_for_dispatch() {
     let workspace = unique_temp_workspace("lingclaw-subagent-parallel-readonly-mcp");
     let _ = fs::remove_dir_all(&workspace);
     fs::create_dir_all(&workspace).expect("workspace should exist");
@@ -378,6 +390,9 @@ async fn test_mcp_read_only_tools_remain_sequential_for_parallel_dispatch() {
     assert!(is_mcp_tool_read_only(&descriptor));
     assert!(crate::tools::is_read_only_tool("read_file"));
     assert!(!crate::tools::is_read_only_tool(&tool_name));
+    assert!(crate::tools::is_parallelizable_tool_call(
+        &tool_name, &config, &workspace
+    ));
     assert!(!crate::tools::is_read_only_tool("exec"));
 
     let _ = crate::tools::mcp::refresh_servers(&config, &workspace).await;

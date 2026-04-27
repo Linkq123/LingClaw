@@ -227,6 +227,27 @@ async fn cached_tool_definitions_do_not_start_server_on_cache_miss() {
     let _ = fs::remove_dir_all(&workspace);
 }
 
+#[tokio::test]
+async fn parallelizable_tool_call_cache_miss_does_not_start_server() {
+    let _guard = acquire_mcp_test_guard().await;
+    clear_mcp_caches_for_test().await;
+
+    let workspace = unique_temp_workspace("lingclaw-mcp-parallelizable-cache-miss");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    let log_path = workspace.join("mock.log");
+    let config = test_config_with_mock_server("normal", &log_path);
+    let tool_name = build_exposed_name("mock", "alpha");
+
+    assert!(!crate::tools::is_parallelizable_tool_call(
+        &tool_name, &config, &workspace
+    ));
+    assert_eq!(log_line_count(&log_path, "start"), 0);
+    assert_eq!(log_line_count(&log_path, "tools/list"), 0);
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
 #[test]
 fn server_timeout_defaults_to_tool_timeout_when_override_missing() {
     let mut config = test_config_with_mcp();
@@ -709,6 +730,66 @@ async fn concurrent_calls_share_cached_session() {
         "right"
     );
     assert_eq!(log_line_count(&log_path, "start"), 1);
+
+    clear_mcp_caches_for_test().await;
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn isolated_mcp_calls_use_separate_sessions() {
+    let _guard = acquire_mcp_test_guard().await;
+    clear_mcp_caches_for_test().await;
+
+    let workspace = unique_temp_workspace("lingclaw-mcp-isolated");
+    fs::create_dir_all(&workspace).expect("workspace should be created");
+    let log_path = workspace.join("mock.log");
+    let config = test_config_with_mock_server("concurrent", &log_path);
+
+    let reports = refresh_servers(&config, &workspace)
+        .await
+        .expect("mock MCP server should refresh");
+    let tool_name = reports[0]
+        .tool_names
+        .first()
+        .cloned()
+        .expect("mock MCP server should expose a tool");
+
+    let _ = fs::remove_file(&log_path);
+
+    let left = execute_tool_isolated(&tool_name, r#"{"value":"left"}"#, &config, &workspace);
+    let right = execute_tool_isolated(&tool_name, r#"{"value":"right"}"#, &config, &workspace);
+
+    let (left, right) = tokio::join!(left, right);
+    assert_eq!(left.expect("left call should succeed").output, "left");
+    assert_eq!(right.expect("right call should succeed").output, "right");
+    assert_eq!(log_line_count(&log_path, "start"), 2);
+
+    clear_mcp_caches_for_test().await;
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mutating_mcp_tools_are_not_parallelizable() {
+    let _guard = acquire_mcp_test_guard().await;
+    clear_mcp_caches_for_test().await;
+
+    let workspace = unique_temp_workspace("lingclaw-mcp-mutating");
+    fs::create_dir_all(&workspace).expect("workspace should be created");
+    let log_path = workspace.join("mock.log");
+    let config = test_config_with_mock_server("mutating", &log_path);
+
+    let reports = refresh_servers(&config, &workspace)
+        .await
+        .expect("mock MCP server should refresh");
+    let tool_name = reports[0]
+        .tool_names
+        .first()
+        .cloned()
+        .expect("mock MCP server should expose a tool");
+
+    assert!(!crate::tools::is_parallelizable_tool_call(
+        &tool_name, &config, &workspace
+    ));
 
     clear_mcp_caches_for_test().await;
     let _ = fs::remove_dir_all(&workspace);

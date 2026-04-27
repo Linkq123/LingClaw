@@ -830,8 +830,15 @@ async fn execute_tool(
     config: &Config,
     http: &Client,
     workspace: &Path,
+    isolated_mcp_session: bool,
 ) -> tools::ToolOutcome {
-    if let Some(result) = tools::mcp::execute_tool(name, args_str, config, workspace).await {
+    let mcp_result = if isolated_mcp_session {
+        tools::mcp::execute_tool_isolated(name, args_str, config, workspace).await
+    } else {
+        tools::mcp::execute_tool(name, args_str, config, workspace).await
+    };
+
+    if let Some(result) = mcp_result {
         result
     } else {
         tools::execute_tool(name, args_str, config, http, workspace).await
@@ -1381,6 +1388,7 @@ async fn execute_tool_call(
                 &config,
                 &ctx.state.http,
                 &phase_state.cycle_workspace,
+                false,
             ),
         )
         .await
@@ -1759,10 +1767,20 @@ async fn run_act_phase(
     phase_state.collected_results.clear();
     let tool_calls = std::mem::take(&mut phase_state.pending_tool_calls);
 
-    let all_parallelizable = tool_calls.len() > 1
-        && tool_calls
-            .iter()
-            .all(|tc| tools::is_parallelizable_tool(&tc.function.name));
+    let mut all_parallelizable = tool_calls.len() > 1;
+    if all_parallelizable {
+        for tc in &tool_calls {
+            if !tools::is_parallelizable_tool_call(
+                &tc.function.name,
+                &config,
+                &phase_state.cycle_workspace,
+            )
+            {
+                all_parallelizable = false;
+                break;
+            }
+        }
+    }
 
     if !all_parallelizable {
         // Sequential path: single tool call or any mutating tool in the batch.
@@ -1785,9 +1803,10 @@ async fn run_act_phase(
             }
         }
     } else {
-        // Multiple parallel-safe read-only tool calls: parallel execution with
-        // ordered result recording. Mutating tools and delegated `task` runs
-        // stay sequential because they share the parent workspace.
+        // Multiple parallel-safe tool calls: parallel execution with ordered
+        // result recording. Built-in read-only tools and read-only MCP tools
+        // can run concurrently; mutating tools and delegated `task` runs stay
+        // sequential because they share the parent workspace.
         // 1. Run BeforeToolExec hooks sequentially (may reject or modify args).
         struct HookEvalResult {
             effective_args: Option<String>,
@@ -1906,6 +1925,7 @@ async fn run_act_phase(
                         &config,
                         &ctx.state.http,
                         &phase_state.cycle_workspace,
+                        true,
                     ),
                 ))
             })

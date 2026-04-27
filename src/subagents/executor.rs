@@ -574,10 +574,20 @@ pub(crate) async fn run_subagent(
 
                 // Execute tool calls — parallel for read-only batches, sequential otherwise.
                 if let Some(ref tool_calls) = resp.message.tool_calls {
-                    let all_read_only = tool_calls.len() > 1
-                        && tool_calls
-                            .iter()
-                            .all(|tc| tools::is_read_only_tool(&tc.function.name));
+                    let mut all_read_only = tool_calls.len() > 1;
+                    if all_read_only {
+                        for tc in tool_calls {
+                            if !tools::is_parallelizable_tool_call(
+                                &tc.function.name,
+                                config,
+                                workspace,
+                            )
+                            {
+                                all_read_only = false;
+                                break;
+                            }
+                        }
+                    }
 
                     if !all_read_only {
                         // ── Sequential path ──────────────────────────────────────
@@ -685,6 +695,7 @@ pub(crate) async fn run_subagent(
                                         config,
                                         http,
                                         workspace,
+                                        false,
                                     )
                                     .await,
                                     false,
@@ -697,6 +708,7 @@ pub(crate) async fn run_subagent(
                                         config,
                                         http,
                                         workspace,
+                                        false,
                                     ) => (res, false),
                                     _ = tokio::time::sleep_until(deadline) => {
                                         timed_out = true;
@@ -757,9 +769,10 @@ pub(crate) async fn run_subagent(
                         }
                     } else {
                         // ── Parallel path for read-only tool batches ─────────────
-                        // Covers built-in read-only tools only.
-                        // MCP read-only classification is a permission heuristic,
-                        // not a strong enough signal for safe parallel scheduling.
+                        // Covers built-in read-only tools plus MCP tools whose
+                        // descriptors are conservatively classified as read-only.
+                        // MCP calls in this path use isolated sessions so they
+                        // do not serialize behind the shared session cache.
                         // Mirrors the parent run_act_phase() 4-phase pattern:
                         //   1. Sequential hook evaluation
                         //   2. Send task_tool events
@@ -890,7 +903,10 @@ pub(crate) async fn run_subagent(
                                 let cl = http.clone();
                                 let ws = workspace.to_path_buf();
                                 Box::pin(async move {
-                                    Some(execute_subagent_tool(&name, &args, &cfg, &cl, &ws).await)
+                                    Some(
+                                        execute_subagent_tool(&name, &args, &cfg, &cl, &ws, true)
+                                            .await,
+                                    )
                                 })
                             })
                             .collect();
@@ -1216,8 +1232,15 @@ async fn execute_subagent_tool(
     config: &Config,
     http: &Client,
     workspace: &Path,
+    isolated_mcp_session: bool,
 ) -> tools::ToolOutcome {
-    if let Some(result) = tools::mcp::execute_tool(name, args_str, config, workspace).await {
+    let mcp_result = if isolated_mcp_session {
+        tools::mcp::execute_tool_isolated(name, args_str, config, workspace).await
+    } else {
+        tools::mcp::execute_tool(name, args_str, config, workspace).await
+    };
+
+    if let Some(result) = mcp_result {
         result
     } else {
         tools::execute_tool(name, args_str, config, http, workspace).await

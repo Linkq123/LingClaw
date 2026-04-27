@@ -72,6 +72,131 @@ struct McpServerSession {
     stderr_lines: Arc<Mutex<Vec<String>>>,
 }
 
+pub(crate) fn is_mcp_tool_name(name: &str) -> bool {
+    name.starts_with(MCP_NAME_PREFIX)
+}
+
+/// Conservative read-only classification for MCP tools.
+/// Unknown tools default to mutating. A tool is considered read-only only when
+/// it avoids mutation keywords and explicitly matches a read-only keyword.
+pub(crate) fn is_read_only_tool_descriptor(descriptor: &McpToolDescriptor) -> bool {
+    const MUTATION_WORDS: &[&str] = &[
+        "write",
+        "clone",
+        "create",
+        "update",
+        "delete",
+        "remove",
+        "modify",
+        "set",
+        "put",
+        "post",
+        "patch",
+        "insert",
+        "add",
+        "edit",
+        "append",
+        "replace",
+        "rename",
+        "move",
+        "copy",
+        "checkout",
+        "switch",
+        "execute",
+        "run",
+        "exec",
+        "deploy",
+        "install",
+        "uninstall",
+        "send",
+        "publish",
+        "push",
+        "commit",
+        "approve",
+        "merge",
+        "close",
+        "reopen",
+        "assign",
+        "drop",
+        "truncate",
+        "grant",
+        "revoke",
+        "enable",
+        "disable",
+        "start",
+        "stop",
+        "restart",
+        "kill",
+        "terminate",
+        "upload",
+        "submit",
+        "apply",
+        "reset",
+        "purge",
+        "destroy",
+        "dismiss",
+        "invite",
+        "ban",
+        "block",
+        "archive",
+    ];
+    const READ_ONLY_WORDS: &[&str] = &[
+        "get",
+        "read",
+        "list",
+        "search",
+        "find",
+        "fetch",
+        "lookup",
+        "describe",
+        "show",
+        "inspect",
+        "retrieve",
+        "view",
+        "stat",
+        "status",
+        "count",
+    ];
+
+    let name = descriptor.raw_name.to_lowercase();
+    let desc = descriptor.description.to_lowercase();
+    let name_words = name.split(|c: char| !c.is_alphanumeric());
+    let desc_words = desc.split(|c: char| !c.is_alphanumeric());
+    let mut saw_read_only_keyword = false;
+
+    for word in name_words.chain(desc_words) {
+        if word.is_empty() {
+            continue;
+        }
+        if MUTATION_WORDS.contains(&word) {
+            return false;
+        }
+        if READ_ONLY_WORDS.contains(&word) {
+            saw_read_only_keyword = true;
+        }
+    }
+
+    saw_read_only_keyword
+}
+
+/// Cached-only lookup for MCP parallel classification.
+/// Cache misses are treated as mutating so scheduling never has to spawn or
+/// probe an MCP server before tool execution begins.
+pub(crate) fn is_read_only_tool_name(
+    name: &str,
+    config: &Config,
+    workspace: &Path,
+) -> bool {
+    if !is_mcp_tool_name(name) {
+        return false;
+    }
+
+    cached_list_tools(config, workspace)
+        .into_iter()
+        .find(|descriptor| descriptor.exposed_name == name)
+        .is_some_and(|descriptor| is_read_only_tool_descriptor(&descriptor))
+}
+
 pub(crate) fn runtime_tool_note(config: &Config) -> Option<String> {
     let mut names: Vec<&str> = config
         .mcp_servers
@@ -232,7 +357,29 @@ pub(crate) async fn execute_tool(
     config: &Config,
     workspace: &Path,
 ) -> Option<ToolOutcome> {
-    if !name.starts_with(MCP_NAME_PREFIX) {
+    execute_tool_with_session_mode(name, args_str, config, workspace, false).await
+}
+
+/// Execute an MCP tool with an isolated per-call session.
+/// Used for parallel read-only batches so concurrent calls are not serialized
+/// behind the shared cached session mutex.
+pub(crate) async fn execute_tool_isolated(
+    name: &str,
+    args_str: &str,
+    config: &Config,
+    workspace: &Path,
+) -> Option<ToolOutcome> {
+    execute_tool_with_session_mode(name, args_str, config, workspace, true).await
+}
+
+async fn execute_tool_with_session_mode(
+    name: &str,
+    args_str: &str,
+    config: &Config,
+    workspace: &Path,
+    isolated_session: bool,
+) -> Option<ToolOutcome> {
+    if !is_mcp_tool_name(name) {
         return None;
     }
 
@@ -266,17 +413,31 @@ pub(crate) async fn execute_tool(
         }
     };
 
-    let call_result = call_server(
-        &descriptor.server_name,
-        config,
-        workspace,
-        "tools/call",
-        json!({
-            "name": descriptor.raw_name,
-            "arguments": args,
-        }),
-    )
-    .await;
+    let call_result = if isolated_session {
+        call_server_once(
+            &descriptor.server_name,
+            config,
+            workspace,
+            "tools/call",
+            json!({
+                "name": descriptor.raw_name,
+                "arguments": args,
+            }),
+        )
+        .await
+    } else {
+        call_server(
+            &descriptor.server_name,
+            config,
+            workspace,
+            "tools/call",
+            json!({
+                "name": descriptor.raw_name,
+                "arguments": args,
+            }),
+        )
+        .await
+    };
 
     let duration_ms = start.elapsed().as_millis() as u64;
     match call_result {

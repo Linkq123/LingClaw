@@ -575,10 +575,25 @@ pub(crate) fn is_task_tool(name: &str) -> bool {
 
 /// Returns true if the named tool can safely run in parallel with other parallelizable tools.
 /// Parent runs share a single workspace, so this is intentionally limited to
-/// read-only tools until delegated tasks gain real filesystem isolation.
-/// Used by `run_act_phase()` to decide between sequential and parallel dispatch.
+/// built-in read-only tools until delegated tasks gain real filesystem isolation.
 pub(crate) fn is_parallelizable_tool(name: &str) -> bool {
     is_read_only_tool(name)
+}
+
+/// Returns true if the named tool call can safely run in a parallel batch.
+/// This includes built-in read-only tools plus cached MCP tools whose
+/// descriptors are conservatively classified as read-only from their
+/// name/description. Cache misses fall back to sequential execution.
+pub(crate) fn is_parallelizable_tool_call(
+    name: &str,
+    config: &Config,
+    workspace: &std::path::Path,
+) -> bool {
+    if is_parallelizable_tool(name) {
+        return true;
+    }
+
+    mcp::is_read_only_tool_name(name, config, workspace)
 }
 
 /// Generate the `task` tool definition for OpenAI format.
