@@ -5,6 +5,7 @@ import {
   createSubagentPanel,
   finishSubagentPanel,
   openSubagentModal,
+  restoreSubagentHistorySnapshot,
 } from '../src/renderers/subagent.js';
 import { dom, state } from '../src/state.js';
 import { applyToolsVisibility } from '../src/viewState.js';
@@ -65,6 +66,9 @@ describe('subagent modal hosting', () => {
     expect(
       (panel?.querySelector('.subagent-body') as HTMLElement | null)?.hasAttribute('inert'),
     ).toBe(false);
+    expect((panel?.querySelector('.subagent-body') as HTMLElement | null)?.style.height).toBe(
+      'auto',
+    );
     expect(document.getElementById('subagent-modal-backdrop')?.hidden).toBe(false);
     expect(panel?.querySelector('.subagent-modal-close')).toBe(document.activeElement);
     expect(scrollIntoViewSpy).not.toHaveBeenCalled();
@@ -142,5 +146,49 @@ describe('subagent modal hosting', () => {
     const promptEl = dom.chat?.querySelector('.subagent-prompt');
     expect(promptEl?.textContent).toBe('Inspect the logs and summarize the failure.');
     expect(promptEl?.textContent).not.toContain('Delegated Task Context');
+  });
+
+  it('restores reasoning, tools, and summary from a history snapshot', () => {
+    createSubagentPanel('reviewer', 'Inspect the logs and summarize the failure.', 'task-5');
+
+    restoreSubagentHistorySnapshot(
+      { task_id: 'task-5', agent: 'reviewer' },
+      {
+        success: true,
+        cycles: 2,
+        tool_calls: 1,
+        duration_ms: 480,
+        input_tokens: 120,
+        output_tokens: 64,
+        reasoning: '[Cycle 1]\nCheck the log file and summarize the failure.',
+        result_excerpt: 'Found the root cause in the startup logs.',
+        tools: [
+          {
+            id: 'tool-1',
+            name: 'read_file',
+            arguments: '{"path":"logs/app.log"}',
+            result: 'panic: startup config missing',
+            duration_ms: 18,
+            is_error: false,
+          },
+        ],
+      },
+    );
+
+    const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
+    const reasoningBody = panel?.querySelector('[data-subagent-reasoning-body]') as HTMLElement | null;
+    const toolRows = panel?.querySelectorAll('.subagent-tool-row') || [];
+    const summary = panel?.querySelector('.subagent-summary') as HTMLElement | null;
+
+    expect(reasoningBody?.textContent).toContain('Check the log file');
+    expect(toolRows).toHaveLength(1);
+    expect((toolRows[0].querySelector('.subagent-tool-name') as HTMLElement | null)?.textContent).toBe(
+      'read_file',
+    );
+    expect((toolRows[0].querySelector('.subagent-tool-output-code') as HTMLElement | null)?.textContent).toContain(
+      'startup config missing',
+    );
+    expect(summary?.classList.contains('hidden')).toBe(false);
+    expect(summary?.textContent).toContain('Found the root cause in the startup logs.');
   });
 });

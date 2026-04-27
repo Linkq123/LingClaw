@@ -141,21 +141,8 @@ pub(crate) fn is_read_only_tool_descriptor(descriptor: &McpToolDescriptor) -> bo
         "archive",
     ];
     const READ_ONLY_WORDS: &[&str] = &[
-        "get",
-        "read",
-        "list",
-        "search",
-        "find",
-        "fetch",
-        "lookup",
-        "describe",
-        "show",
-        "inspect",
-        "retrieve",
-        "view",
-        "stat",
-        "status",
-        "count",
+        "get", "read", "list", "search", "find", "fetch", "lookup", "describe", "show", "inspect",
+        "retrieve", "view", "stat", "status", "count",
     ];
 
     let name = descriptor.raw_name.to_lowercase();
@@ -182,11 +169,7 @@ pub(crate) fn is_read_only_tool_descriptor(descriptor: &McpToolDescriptor) -> bo
 /// Cached-only lookup for MCP parallel classification.
 /// Cache misses are treated as mutating so scheduling never has to spawn or
 /// probe an MCP server before tool execution begins.
-pub(crate) fn is_read_only_tool_name(
-    name: &str,
-    config: &Config,
-    workspace: &Path,
-) -> bool {
+pub(crate) fn is_read_only_tool_name(name: &str, config: &Config, workspace: &Path) -> bool {
     if !is_mcp_tool_name(name) {
         return false;
     }
@@ -391,6 +374,7 @@ async fn execute_tool_with_session_mode(
                 output: format!("{name} error: invalid arguments JSON: {error}"),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             });
         }
     };
@@ -402,6 +386,7 @@ async fn execute_tool_with_session_mode(
                 output: format!("Unknown MCP tool: {name}"),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             });
         }
         Err(error) => {
@@ -409,6 +394,7 @@ async fn execute_tool_with_session_mode(
                 output: format!("{name} error: {error}"),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             });
         }
     };
@@ -450,12 +436,14 @@ async fn execute_tool_with_session_mode(
                 output: render_call_result(&result),
                 is_error,
                 duration_ms,
+                subagent_snapshot: None,
             })
         }
         Err(error) => Some(ToolOutcome {
             output: format!("{name} error: {error}"),
             is_error: true,
             duration_ms,
+            subagent_snapshot: None,
         }),
     }
 }

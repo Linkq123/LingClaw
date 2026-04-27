@@ -870,6 +870,7 @@ async fn execute_task_tool(
                 output: format!("task error: invalid arguments JSON: {e}"),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
@@ -880,6 +881,7 @@ async fn execute_task_tool(
             output: err,
             is_error: true,
             duration_ms: start.elapsed().as_millis() as u64,
+            subagent_snapshot: None,
         };
     }
 
@@ -890,6 +892,7 @@ async fn execute_task_tool(
                 output: "task error: missing required parameter 'agent'".to_string(),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
@@ -901,12 +904,12 @@ async fn execute_task_tool(
                 output: "task error: missing required parameter 'prompt'".to_string(),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
-    let effective_prompt = crate::subagents::executor::augment_subagent_prompt_with_current_time(
-        prompt,
-    );
+    let effective_prompt =
+        crate::subagents::executor::augment_subagent_prompt_with_current_time(prompt);
 
     let spec = match crate::subagents::discovery::find_agent(workspace, agent_name) {
         Some(s) => s,
@@ -925,6 +928,7 @@ async fn execute_task_tool(
                 ),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
@@ -1031,10 +1035,21 @@ async fn execute_task_tool(
     let _ = live_send(live_tx, terminal_event).await;
     guard.mark_finished();
 
+    let mut history_snapshot = outcome.history_snapshot;
+    history_snapshot.duration_ms = duration_ms;
+    if outcome.aborted {
+        history_snapshot.error = Some(crate::truncate(&outcome.result, 4_000).to_string());
+        history_snapshot.result_excerpt = None;
+    } else {
+        history_snapshot.result_excerpt = Some(crate::truncate(&outcome.result, 4_000).to_string());
+        history_snapshot.error = None;
+    }
+
     tools::ToolOutcome {
         output: outcome.result,
         is_error: outcome.aborted,
         duration_ms,
+        subagent_snapshot: Some(history_snapshot),
     }
 }
 
@@ -1063,6 +1078,7 @@ async fn execute_orchestrate_tool(
                 output: format!("orchestrate error: invalid arguments JSON: {e}"),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
@@ -1075,6 +1091,7 @@ async fn execute_orchestrate_tool(
             output: err,
             is_error: true,
             duration_ms: start.elapsed().as_millis() as u64,
+            subagent_snapshot: None,
         };
     }
 
@@ -1089,6 +1106,7 @@ async fn execute_orchestrate_tool(
                 output: "orchestrate error: missing or invalid 'tasks' array".to_string(),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
@@ -1101,6 +1119,7 @@ async fn execute_orchestrate_tool(
                 output: e,
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
@@ -1145,6 +1164,7 @@ async fn execute_orchestrate_tool(
         output: result,
         is_error: outcome.aborted || outcome.has_non_completed_tasks(),
         duration_ms,
+        subagent_snapshot: None,
     }
 }
 
@@ -1227,6 +1247,7 @@ where
                     output: format!("{tool_name} error: tool execution timed out ({}s)", timeout_secs),
                     is_error: true,
                     duration_ms: start.elapsed().as_millis() as u64,
+                    subagent_snapshot: None,
                 });
             }
             _ = heartbeat.tick() => {
@@ -1304,6 +1325,7 @@ async fn execute_tool_call(
                     output: format!("[rejected by hook] {reason}"),
                     is_error: true,
                     duration_ms: 0,
+                    subagent_snapshot: None,
                 },
                 None, // rejected — skip AfterToolExec
             ));
@@ -1470,6 +1492,36 @@ async fn record_tool_result(
                 session.failed_tool_results.insert(tc.id.clone());
             } else {
                 session.failed_tool_results.remove(&tc.id);
+            }
+            if let Some(snapshot) = result.subagent_snapshot.take() {
+                let occurrence = session
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        message.role == "tool"
+                            && message.tool_call_id.as_deref() == Some(tc.id.as_str())
+                    })
+                    .count()
+                    + 1;
+                session.subagent_snapshots.insert(
+                    session_store::subagent_snapshot_storage_key(&tc.id, occurrence),
+                    snapshot,
+                );
+            } else {
+                let occurrence = session
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        message.role == "tool"
+                            && message.tool_call_id.as_deref() == Some(tc.id.as_str())
+                    })
+                    .count()
+                    + 1;
+                session
+                    .subagent_snapshots
+                    .remove(&session_store::subagent_snapshot_storage_key(
+                        &tc.id, occurrence,
+                    ));
             }
             session.messages.push(ChatMessage {
                 role: "tool".into(),
@@ -1774,8 +1826,7 @@ async fn run_act_phase(
                 &tc.function.name,
                 &config,
                 &phase_state.cycle_workspace,
-            )
-            {
+            ) {
                 all_parallelizable = false;
                 break;
             }
@@ -1840,6 +1891,7 @@ async fn run_act_phase(
                         output: format!("[rejected by hook] {reason}"),
                         is_error: true,
                         duration_ms: 0,
+                        subagent_snapshot: None,
                     }),
                     reject_events: events,
                 },
@@ -1906,6 +1958,7 @@ async fn run_act_phase(
                             output: String::new(), // placeholder, replaced below
                             is_error: true,
                             duration_ms: 0,
+                            subagent_snapshot: None,
                         })
                     });
                 }
@@ -2387,7 +2440,7 @@ pub(crate) async fn run_agent_session(
         {
             let mut sessions = state.sessions.lock().await;
             if let Some(session) = sessions.get_mut(current_session_id) {
-                session_store::trim_incomplete_tool_calls(&mut session.messages);
+                session_store::trim_incomplete_tool_calls_in_session(session);
             }
         }
         let usage = build_done_usage(
@@ -2413,7 +2466,7 @@ pub(crate) async fn run_agent_session(
     if phase_state.run_detached {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(current_session_id) {
-            session_store::trim_incomplete_tool_calls(&mut session.messages);
+            session_store::trim_incomplete_tool_calls_in_session(session);
         }
     }
 

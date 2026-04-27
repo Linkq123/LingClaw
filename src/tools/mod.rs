@@ -16,6 +16,7 @@ pub(crate) struct ToolOutcome {
     pub output: String,
     pub is_error: bool,
     pub duration_ms: u64,
+    pub subagent_snapshot: Option<crate::SubagentHistorySnapshot>,
 }
 
 type ToolFuture<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
@@ -804,6 +805,7 @@ pub(crate) async fn execute_tool(
                 output: format!("{name} error: invalid arguments JSON: {e}"),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
@@ -813,6 +815,7 @@ pub(crate) async fn execute_tool(
             output: format!("Unknown tool: {name}"),
             is_error: true,
             duration_ms: start.elapsed().as_millis() as u64,
+            subagent_snapshot: None,
         };
     };
 
@@ -822,6 +825,7 @@ pub(crate) async fn execute_tool(
             output: err,
             is_error: true,
             duration_ms: start.elapsed().as_millis() as u64,
+            subagent_snapshot: None,
         };
     }
 
@@ -833,6 +837,7 @@ pub(crate) async fn execute_tool(
         output,
         is_error,
         duration_ms,
+        subagent_snapshot: None,
     }
 }
 

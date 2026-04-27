@@ -87,7 +87,9 @@ use session_store::{
     build_active_session_lines, build_global_today_usage, build_history_payload,
     build_session_status, build_session_usage, build_usage_report, list_saved_session_ids_in_dir,
     list_saved_session_summaries_in_dir, recoverable_session_ids_from_summaries,
-    resolve_session_target, sanitize_session_messages, sessions_dir, trim_incomplete_tool_calls,
+    replace_session_messages, resolve_session_target, sanitize_session_messages, sessions_dir,
+    subagent_snapshot_storage_key, trim_incomplete_tool_calls,
+    trim_incomplete_tool_calls_in_session,
 };
 use std::collections::HashSet;
 
@@ -130,6 +132,44 @@ struct AnthropicThinkingBlock {
     signature: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     data: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub(crate) struct SubagentToolHistorySnapshot {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub is_error: bool,
+    #[serde(default)]
+    pub duration_ms: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub(crate) struct SubagentHistorySnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<SubagentToolHistorySnapshot>,
+    #[serde(default)]
+    pub cycles: usize,
+    #[serde(default)]
+    pub tool_calls: usize,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_excerpt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -259,6 +299,9 @@ struct Session {
     /// Tool call ids whose persisted tool result ended in an error state.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     failed_tool_results: HashSet<String>,
+    /// Compact delegated-task snapshots keyed by parent `task` tool_call_id.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    subagent_snapshots: HashMap<String, SubagentHistorySnapshot>,
     #[serde(default)]
     version: u32,
     #[serde(skip)]
@@ -354,6 +397,7 @@ impl Session {
             show_reasoning: default_show_reasoning(),
             disabled_system_skills: HashSet::new(),
             failed_tool_results: HashSet::new(),
+            subagent_snapshots: HashMap::new(),
             version: SESSION_VERSION,
             workspace,
         }

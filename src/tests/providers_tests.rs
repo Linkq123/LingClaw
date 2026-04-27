@@ -1315,7 +1315,6 @@ fn build_openai_stream_body_deepseek_v4_sends_thinking_and_reasoning_effort() {
     );
 }
 
-
 #[test]
 fn build_openai_stream_body_deepseek_v4_replays_missing_reasoning_tool_turn_as_text() {
     let resolved = ResolvedModel {
@@ -1455,7 +1454,10 @@ async fn build_openai_stream_body_deepseek_v4_keeps_reasoning_after_parallel_too
     )
     .expect("response should build");
 
-    assert_eq!(response.message.thinking.as_deref(), Some("plan both reads"));
+    assert_eq!(
+        response.message.thinking.as_deref(),
+        Some("plan both reads")
+    );
     assert_eq!(
         response
             .message
@@ -1852,10 +1854,12 @@ fn build_openai_simple_body_deepseek_v4_replays_missing_reasoning_tool_turn_as_t
             "Historical tool turn summarized because the original DeepSeek response omitted reasoning_content."
         )
     );
-    assert!(body_messages[1]["content"]
-        .as_str()
-        .expect("summary should be text")
-        .contains("DeepSeek omitted reasoning_content"));
+    assert!(
+        body_messages[1]["content"]
+            .as_str()
+            .expect("summary should be text")
+            .contains("DeepSeek omitted reasoning_content")
+    );
 }
 
 #[test]
@@ -3005,7 +3009,10 @@ fn call_llm_stream_openai_deepseek_multi_tool_stream_keeps_two_tool_calls_and_th
     assert_eq!(body["thinking"]["type"], "enabled");
 
     assert!(response.message.content.is_none());
-    assert_eq!(response.message.thinking.as_deref(), Some("plan both files"));
+    assert_eq!(
+        response.message.thinking.as_deref(),
+        Some("plan both files")
+    );
     let tool_calls = response
         .message
         .tool_calls
@@ -3074,7 +3081,15 @@ fn call_llm_stream_openai_auto_skips_reasoning_effort_for_compatible_gateway() {
     let response = runtime
         .block_on(async {
             call_llm_stream(
-                &http, &resolved, &messages, &workspace, None, &live_tx, "auto", &[], 0,
+                &http,
+                &resolved,
+                &messages,
+                &workspace,
+                None,
+                &live_tx,
+                "auto",
+                &[],
+                0,
             )
             .await
         })

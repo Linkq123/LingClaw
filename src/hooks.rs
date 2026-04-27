@@ -11,7 +11,9 @@ use crate::{
         USAGE_ROLE_CONTEXT, UsageUpdate, apply_usage_update, build_usage_labels,
         context_input_budget_for_model, estimate_tokens_for_provider, turn_len,
     },
-    providers, truncate,
+    providers,
+    session_store::replace_session_messages,
+    truncate,
 };
 
 // ── Hook Infrastructure ──────────────────────────────────────────────────────
@@ -580,7 +582,7 @@ pub(crate) async fn run_hooks(
             } => {
                 let mut sessions_guard = sessions.lock().await;
                 if let Some(session) = sessions_guard.get_mut(session_id) {
-                    session.messages = new_msgs;
+                    replace_session_messages(session, new_msgs);
                     session.updated_at = crate::now_epoch();
                     if let Some(usage) = usage.as_ref() {
                         apply_usage_update(session, usage);

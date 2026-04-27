@@ -401,6 +401,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 0,
         workspace: PathBuf::new(),
     }
@@ -416,7 +417,10 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
 
     {
         let mut sessions = state.sessions.lock().await;
-        sessions.insert(session_id.clone(), test_session(&session_id, "DeepSeek", None));
+        sessions.insert(
+            session_id.clone(),
+            test_session(&session_id, "DeepSeek", None),
+        );
     }
 
     let ctx = AgentRunCtx {

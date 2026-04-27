@@ -86,6 +86,7 @@ import {
   startSubagentReasoning,
   appendSubagentReasoning,
   finishSubagentReasoning,
+  restoreSubagentHistorySnapshot,
   focusSubagentTool,
   toggleSubagentTools,
   focusSubagentCurrent,
@@ -331,13 +332,17 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
       if (state._historyTaskIds && state._historyTaskIds.has(m.id)) {
         const ref = state._historyTaskIds.get(m.id);
         state._historyTaskIds.delete(m.id);
-        const r = (m.result || '').trimStart();
-        const failed =
-          m.is_error === true ||
-          r.startsWith('task error:') ||
-          r.startsWith('[rejected') ||
-          /^Sub-agent '.+' (failed|timed out)/.test(r);
-        finishSubagentPanel(ref, !failed, {}, { immediate: true });
+        if (ref && m.subagent_snapshot) {
+          restoreSubagentHistorySnapshot(ref, m.subagent_snapshot);
+        } else {
+          const r = (m.result || '').trimStart();
+          const failed =
+            m.is_error === true ||
+            r.startsWith('task error:') ||
+            r.startsWith('[rejected') ||
+            /^Sub-agent '.+' (failed|timed out)/.test(r);
+          finishSubagentPanel(ref, !failed, {}, { immediate: true });
+        }
         break;
       }
       if (state._historyOrchestrateIds && state._historyOrchestrateIds.has(m.id)) {

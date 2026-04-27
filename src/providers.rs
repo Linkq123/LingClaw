@@ -331,7 +331,11 @@ fn summarize_deepseek_tool_turn_as_plain_assistant(
         "Prior tool turn replayed as plain context because DeepSeek omitted reasoning_content."
             .to_string(),
     ];
-    if let Some(content) = assistant.content.as_deref().filter(|content| !content.is_empty()) {
+    if let Some(content) = assistant
+        .content
+        .as_deref()
+        .filter(|content| !content.is_empty())
+    {
         lines.push(format!("Assistant content: {content}"));
     }
     if let Some(tool_calls) = &assistant.tool_calls {
@@ -350,11 +354,11 @@ fn summarize_deepseek_tool_turn_as_plain_assistant(
         let Some(tool_call_id) = tool_message.tool_call_id.as_deref() else {
             continue;
         };
-        if assistant
-            .tool_calls
-            .as_ref()
-            .is_some_and(|tool_calls| tool_calls.iter().any(|tool_call| tool_call.id == tool_call_id))
-        {
+        if assistant.tool_calls.as_ref().is_some_and(|tool_calls| {
+            tool_calls
+                .iter()
+                .any(|tool_call| tool_call.id == tool_call_id)
+        }) {
             continue;
         }
         lines.push(format!(

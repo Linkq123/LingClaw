@@ -16,6 +16,29 @@ export interface HistoryMessage {
   arguments?: string;
   result?: string;
   thinking?: string;
+  subagent_snapshot?: SubagentHistorySnapshot;
+}
+
+export interface SubagentToolHistorySnapshot {
+  id: string;
+  name: string;
+  arguments?: string;
+  result?: string;
+  is_error?: boolean;
+  duration_ms?: number;
+}
+
+export interface SubagentHistorySnapshot {
+  reasoning?: string;
+  tools?: SubagentToolHistorySnapshot[];
+  cycles?: number;
+  tool_calls?: number;
+  duration_ms?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  success?: boolean;
+  result_excerpt?: string;
+  error?: string;
 }
 
 export type ReactPhase = 'analyze' | 'act' | 'observe' | 'finish' | '';

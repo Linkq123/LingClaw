@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     AppState, LiveTx, MAIN_SESSION_ID, WsTx,
-    session_store::{save_session_to_disk, trim_incomplete_tool_calls},
+    session_store::{save_session_to_disk, trim_incomplete_tool_calls_in_session},
 };
 
 pub(crate) struct SocketTaskHandles {
@@ -86,7 +86,7 @@ pub(crate) async fn finalize_connection(
     {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(session_id) {
-            trim_incomplete_tool_calls(&mut session.messages);
+            trim_incomplete_tool_calls_in_session(session);
         }
     }
 

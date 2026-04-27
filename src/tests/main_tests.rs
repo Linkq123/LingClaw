@@ -257,6 +257,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 0,
         workspace: PathBuf::new(),
     }
@@ -709,6 +710,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 0,
         workspace: PathBuf::new(),
     };
@@ -764,6 +766,7 @@ fn build_history_payload_marks_failed_tool_result_with_is_error() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: HashSet::from(["task_1".to_string()]),
+        subagent_snapshots: HashMap::new(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -821,6 +824,7 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
         show_reasoning: default_show_reasoning(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -875,6 +879,7 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
         show_reasoning: default_show_reasoning(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -958,6 +963,7 @@ fn build_history_payload_includes_thinking_only_assistant_messages() {
         show_reasoning: default_show_reasoning(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -983,6 +989,387 @@ fn build_history_payload_includes_thinking_only_assistant_messages() {
         .find(|m| m["role"] == "assistant" && m["content"] == "done")
         .expect("history should contain the content assistant entry");
     assert!(content_entry.get("thinking").is_none());
+}
+
+#[test]
+fn build_history_payload_includes_subagent_snapshot_on_task_results() {
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![crate::ToolCall {
+                    id: "task_call_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "task".into(),
+                        arguments: r#"{"agent":"reviewer","prompt":"Inspect logs"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(1000),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("Found the issue in the logs.".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: Some("task_call_1".into()),
+                timestamp: Some(1001),
+            },
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::from([(
+            subagent_snapshot_storage_key("task_call_1", 1),
+            SubagentHistorySnapshot {
+                reasoning: Some("[Cycle 1]\nInspect logs".into()),
+                tools: vec![SubagentToolHistorySnapshot {
+                    id: "tool-1".into(),
+                    name: "read_file".into(),
+                    arguments: Some(r#"{"path":"logs/app.log"}"#.into()),
+                    result: Some("panic: startup config missing".into()),
+                    is_error: false,
+                    duration_ms: 12,
+                }],
+                cycles: 1,
+                tool_calls: 1,
+                duration_ms: 120,
+                input_tokens: 55,
+                output_tokens: 21,
+                success: true,
+                result_excerpt: Some("Found the issue in the logs.".into()),
+                error: None,
+            },
+        )]),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let payload = build_history_payload(&session);
+    let msgs = payload["messages"]
+        .as_array()
+        .expect("history messages should be an array");
+    let tool_result = msgs
+        .iter()
+        .find(|message| message["role"] == "tool_result" && message["id"] == "task_call_1")
+        .expect("task tool_result should be present");
+
+    assert_eq!(
+        tool_result["subagent_snapshot"]["reasoning"].as_str(),
+        Some("[Cycle 1]\nInspect logs")
+    );
+    assert_eq!(
+        tool_result["subagent_snapshot"]["tools"][0]["name"].as_str(),
+        Some("read_file")
+    );
+    assert_eq!(
+        tool_result["subagent_snapshot"]["result_excerpt"].as_str(),
+        Some("Found the issue in the logs.")
+    );
+}
+
+#[test]
+fn build_history_payload_distinguishes_repeated_task_tool_call_ids() {
+    let first_snapshot = SubagentHistorySnapshot {
+        result_excerpt: Some("First delegated result".into()),
+        success: true,
+        ..Default::default()
+    };
+    let second_snapshot = SubagentHistorySnapshot {
+        result_excerpt: Some("Second delegated result".into()),
+        success: true,
+        ..Default::default()
+    };
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![crate::ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "task".into(),
+                        arguments: r#"{"agent":"reviewer","prompt":"Inspect logs"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(1000),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("First delegated result".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+                timestamp: Some(1001),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![crate::ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "task".into(),
+                        arguments: r#"{"agent":"reviewer","prompt":"Inspect newer logs"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(1002),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("Second delegated result".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+                timestamp: Some(1003),
+            },
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 2,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::from([
+            (
+                subagent_snapshot_storage_key("call_1", 1),
+                first_snapshot.clone(),
+            ),
+            (
+                subagent_snapshot_storage_key("call_1", 2),
+                second_snapshot.clone(),
+            ),
+        ]),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let payload = build_history_payload(&session);
+    let results: Vec<_> = payload["messages"]
+        .as_array()
+        .expect("history messages should be an array")
+        .iter()
+        .filter(|message| message["role"] == "tool_result" && message["id"] == "call_1")
+        .collect();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0]["subagent_snapshot"]["result_excerpt"].as_str(),
+        Some("First delegated result")
+    );
+    assert_eq!(
+        results[1]["subagent_snapshot"]["result_excerpt"].as_str(),
+        Some("Second delegated result")
+    );
+}
+
+#[test]
+fn replace_session_messages_rekeys_subagent_snapshots_for_remaining_history() {
+    let assistant_first = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: Some(vec![crate::ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: "task".into(),
+                arguments: r#"{"agent":"reviewer","prompt":"Inspect logs"}"#.into(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: Some(1000),
+    };
+    let tool_first = ChatMessage {
+        role: "tool".into(),
+        content: Some("First delegated result".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: Some("call_1".into()),
+        timestamp: Some(1001),
+    };
+    let assistant_second = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: Some(vec![crate::ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: "task".into(),
+                arguments: r#"{"agent":"reviewer","prompt":"Inspect newer logs"}"#.into(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: Some(1002),
+    };
+    let tool_second = ChatMessage {
+        role: "tool".into(),
+        content: Some("Second delegated result".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: Some("call_1".into()),
+        timestamp: Some(1003),
+    };
+    let mut session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("sys".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: Some(999),
+            },
+            assistant_first.clone(),
+            tool_first,
+            assistant_second.clone(),
+            tool_second,
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 2,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::from([
+            (
+                subagent_snapshot_storage_key("call_1", 1),
+                SubagentHistorySnapshot {
+                    result_excerpt: Some("First delegated result".into()),
+                    success: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                subagent_snapshot_storage_key("call_1", 2),
+                SubagentHistorySnapshot {
+                    result_excerpt: Some("Second delegated result".into()),
+                    success: true,
+                    ..Default::default()
+                },
+            ),
+        ]),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let kept_system = session.messages[0].clone();
+    let kept_tool = session.messages[4].clone();
+    replace_session_messages(
+        &mut session,
+        vec![
+            kept_system,
+            build_auto_summary_message("compressed summary"),
+            assistant_second,
+            kept_tool,
+        ],
+    );
+
+    assert_eq!(session.subagent_snapshots.len(), 1);
+    assert!(
+        session
+            .subagent_snapshots
+            .contains_key(&subagent_snapshot_storage_key("call_1", 1))
+    );
+    let payload = build_history_payload(&session);
+    let results: Vec<_> = payload["messages"]
+        .as_array()
+        .expect("history messages should be an array")
+        .iter()
+        .filter(|message| message["role"] == "tool_result")
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0]["subagent_snapshot"]["result_excerpt"].as_str(),
+        Some("Second delegated result")
+    );
 }
 
 #[test]
@@ -2523,6 +2910,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 0,
         workspace: workspace.clone(),
     };
@@ -2602,6 +2990,7 @@ fn save_session_to_disk_overwrites_existing_file() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 1,
         workspace: workspace.clone(),
     };
@@ -3432,6 +3821,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 0,
         workspace: PathBuf::new(),
     };
@@ -6950,6 +7340,111 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
 }
 
 // ───── Phase 5: tool_think ─────
+
+#[test]
+fn trim_incomplete_tool_calls_in_session_drops_orphaned_subagent_snapshots() {
+    let mut session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("sys".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("do something".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![
+                    ToolCall {
+                        id: "tc1".into(),
+                        call_type: "function".into(),
+                        gemini_thought_signature: None,
+                        function: FunctionCall {
+                            name: "task".into(),
+                            arguments: r#"{"agent":"reviewer","prompt":"one"}"#.into(),
+                        },
+                    },
+                    ToolCall {
+                        id: "tc2".into(),
+                        call_type: "function".into(),
+                        gemini_thought_signature: None,
+                        function: FunctionCall {
+                            name: "task".into(),
+                            arguments: r#"{"agent":"reviewer","prompt":"two"}"#.into(),
+                        },
+                    },
+                ]),
+                tool_call_id: None,
+                timestamp: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("partial result".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: Some("tc1".into()),
+                timestamp: None,
+            },
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: HashSet::from(["tc1".to_string()]),
+        subagent_snapshots: HashMap::from([(
+            subagent_snapshot_storage_key("tc1", 1),
+            SubagentHistorySnapshot {
+                result_excerpt: Some("partial result".into()),
+                success: false,
+                ..Default::default()
+            },
+        )]),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    trim_incomplete_tool_calls_in_session(&mut session);
+
+    assert_eq!(session.messages.len(), 2);
+    assert!(session.subagent_snapshots.is_empty());
+    assert!(session.failed_tool_results.is_empty());
+}
 
 #[test]
 fn tool_think_records_thought() {

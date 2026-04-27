@@ -1,4 +1,5 @@
 import { dom, state } from '../state.js';
+import type { SubagentHistorySnapshot } from '../types.js';
 import {
   escHtml,
   formatToolDuration,
@@ -699,6 +700,58 @@ export function finishSubagentReasoning(ref) {
   const preview = reasoningPreview(rawText);
   meta.textContent = preview;
   meta.title = rawText.trim() || '完成';
+}
+
+export function restoreSubagentHistorySnapshot(ref, snapshot: SubagentHistorySnapshot) {
+  const panel = resolvePanel(ref);
+  if (!panel || !snapshot) return;
+
+  const reasoning = typeof snapshot.reasoning === 'string' ? snapshot.reasoning.trim() : '';
+  if (reasoning) {
+    const card = ensureReasoningCard(panel);
+    const body = getReasoningBody(panel);
+    const meta = getReasoningMeta(panel);
+    if (card && body) {
+      body.textContent = '';
+      body._textNode = document.createTextNode(reasoning);
+      body.appendChild(body._textNode);
+      card.hidden = false;
+      if (meta) {
+        const preview = reasoningPreview(reasoning);
+        meta.textContent = preview;
+        meta.title = reasoning;
+      }
+    }
+  }
+
+  const tools = Array.isArray(snapshot.tools) ? snapshot.tools : [];
+  for (const [index, tool] of tools.entries()) {
+    const toolId = tool?.id || `${tool?.name || 'tool'}-${index}`;
+    addSubagentTool(ref, tool?.name || 'tool', toolId, tool?.arguments || '');
+    updateSubagentToolResult(
+      ref,
+      toolId,
+      tool?.duration_ms,
+      tool?.result,
+      tool?.is_error === true,
+      tool?.name || 'tool',
+    );
+  }
+
+  finishSubagentPanel(
+    ref,
+    snapshot.success !== false,
+    {
+      cycles: snapshot.cycles,
+      tool_calls: snapshot.tool_calls,
+      duration_ms: snapshot.duration_ms,
+      input_tokens: snapshot.input_tokens,
+      output_tokens: snapshot.output_tokens,
+      result_excerpt: snapshot.result_excerpt,
+      error: snapshot.error,
+    },
+    { immediate: true },
+  );
 }
 
 /**

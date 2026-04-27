@@ -19,14 +19,44 @@ use tokio_util::sync::CancellationToken;
 
 use super::SubAgentSpec;
 use crate::{
-    ChatMessage, Config, LiveTx, agent, context, prompts,
+    ChatMessage, Config, LiveTx, SubagentHistorySnapshot, SubagentToolHistorySnapshot, agent,
+    context,
     hooks::{self, HookRegistry, ToolHookInput, run_tool_hooks},
-    live_send, providers, tools, truncate,
+    live_send, prompts, providers, tools, truncate,
 };
 
 /// Maximum characters in the sub-agent's final result returned to the parent.
 const MAX_RESULT_CHARS: usize = 30_000;
+const MAX_SNAPSHOT_REASONING_CHARS: usize = 12_000;
+const MAX_SNAPSHOT_TOOL_ARGS_CHARS: usize = 4_000;
+const MAX_SNAPSHOT_TOOL_RESULT_CHARS: usize = 8_000;
+const MAX_SNAPSHOT_RESULT_CHARS: usize = 4_000;
 const DELEGATED_PROMPT_CONTEXT_HEADING: &str = "## Delegated Task Context";
+
+fn append_reasoning_snapshot(snapshot: &mut SubagentHistorySnapshot, cycle: usize, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let entry = format!("[Cycle {cycle}]\n{trimmed}");
+    let reasoning = snapshot.reasoning.get_or_insert_with(String::new);
+    if !reasoning.is_empty() {
+        reasoning.push_str("\n\n");
+    }
+    reasoning.push_str(&entry);
+    if reasoning.len() > MAX_SNAPSHOT_REASONING_CHARS {
+        *reasoning = truncate(reasoning, MAX_SNAPSHOT_REASONING_CHARS).to_string();
+    }
+}
+
+fn truncated_option(text: &str, limit: usize) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(truncate(trimmed, limit).to_string())
+    }
+}
 
 pub(crate) struct ParallelToolBatchResult {
     pub results: Vec<Option<tools::ToolOutcome>>,
@@ -38,7 +68,10 @@ pub(crate) fn augment_subagent_prompt_with_runtime_context(
     prompt: &str,
     local_time: &str,
 ) -> String {
-    if prompt.trim_start().starts_with(DELEGATED_PROMPT_CONTEXT_HEADING) {
+    if prompt
+        .trim_start()
+        .starts_with(DELEGATED_PROMPT_CONTEXT_HEADING)
+    {
         return prompt.to_string();
     }
 
@@ -162,6 +195,7 @@ fn interrupted_parallel_tool_outcome(
         output,
         is_error: true,
         duration_ms,
+        subagent_snapshot: None,
     }
 }
 
@@ -270,6 +304,8 @@ pub(crate) struct SubAgentOutcome {
     pub total_output_tokens: u64,
     /// Per-provider usage aggregated across the sub-agent run.
     pub provider_usage: HashMap<String, [u64; 2]>,
+    /// Compact history snapshot for restoring delegated task cards after reload.
+    pub history_snapshot: crate::SubagentHistorySnapshot,
 }
 
 /// Resolve which model a sub-agent should use.
@@ -418,6 +454,7 @@ pub(crate) async fn run_subagent(
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
     let mut provider_usage: HashMap<String, [u64; 2]> = HashMap::new();
+    let mut history_snapshot = SubagentHistorySnapshot::default();
     let mut aborted = false;
     let mut timed_out = false;
 
@@ -565,6 +602,10 @@ pub(crate) async fn run_subagent(
                     output_used,
                 );
 
+                if let Some(thinking) = resp.message.thinking.as_deref() {
+                    append_reasoning_snapshot(&mut history_snapshot, cycles, thinking);
+                }
+
                 messages.push(resp.message.clone());
 
                 if !has_tools {
@@ -581,8 +622,7 @@ pub(crate) async fn run_subagent(
                                 &tc.function.name,
                                 config,
                                 workspace,
-                            )
-                            {
+                            ) {
                                 all_read_only = false;
                                 break;
                             }
@@ -721,6 +761,7 @@ pub(crate) async fn run_subagent(
                                                 ),
                                                 is_error: true,
                                                 duration_ms: tool_started.elapsed().as_millis() as u64,
+                                                subagent_snapshot: None,
                                             },
                                             true,
                                         )
@@ -751,6 +792,21 @@ pub(crate) async fn run_subagent(
                                 &outcome,
                             )
                             .await;
+
+                            history_snapshot.tools.push(SubagentToolHistorySnapshot {
+                                id: tc.id.clone(),
+                                name: tc.function.name.clone(),
+                                arguments: truncated_option(
+                                    &effective_args,
+                                    MAX_SNAPSHOT_TOOL_ARGS_CHARS,
+                                ),
+                                result: truncated_option(
+                                    &outcome.output,
+                                    MAX_SNAPSHOT_TOOL_RESULT_CHARS,
+                                ),
+                                is_error: outcome.is_error,
+                                duration_ms: outcome.duration_ms,
+                            });
 
                             messages.push(ChatMessage {
                                 role: "tool".into(),
@@ -969,6 +1025,17 @@ pub(crate) async fn run_subagent(
                                 &outcome,
                             )
                             .await;
+                            history_snapshot.tools.push(SubagentToolHistorySnapshot {
+                                id: tc.id.clone(),
+                                name: tc.function.name.clone(),
+                                arguments: truncated_option(eff_args, MAX_SNAPSHOT_TOOL_ARGS_CHARS),
+                                result: truncated_option(
+                                    &outcome.output,
+                                    MAX_SNAPSHOT_TOOL_RESULT_CHARS,
+                                ),
+                                is_error: outcome.is_error,
+                                duration_ms: outcome.duration_ms,
+                            });
                             messages.push(ChatMessage {
                                 role: "tool".into(),
                                 content: Some(outcome.output),
@@ -991,6 +1058,18 @@ pub(crate) async fn run_subagent(
                 // LLM error — abort sub-agent.
                 // Do NOT send task_failed here; execute_task_tool() in
                 // runtime_loop.rs sends the final event based on outcome.aborted.
+                history_snapshot.cycles = cycles;
+                history_snapshot.tool_calls = total_tool_calls;
+                history_snapshot.input_tokens = total_input_tokens;
+                history_snapshot.output_tokens = total_output_tokens;
+                history_snapshot.success = false;
+                history_snapshot.error = Some(
+                    truncate(
+                        &format!("Sub-agent '{}' failed: {}", spec.name, error),
+                        MAX_SNAPSHOT_RESULT_CHARS,
+                    )
+                    .to_string(),
+                );
                 return SubAgentOutcome {
                     result: format!("Sub-agent '{}' failed: {}", spec.name, error),
                     cycles,
@@ -999,6 +1078,7 @@ pub(crate) async fn run_subagent(
                     total_input_tokens,
                     total_output_tokens,
                     provider_usage,
+                    history_snapshot,
                 };
             }
         }
@@ -1087,6 +1167,18 @@ pub(crate) async fn run_subagent(
         truncate(&final_content, MAX_RESULT_CHARS).to_string()
     };
 
+    history_snapshot.cycles = cycles;
+    history_snapshot.tool_calls = total_tool_calls;
+    history_snapshot.input_tokens = total_input_tokens;
+    history_snapshot.output_tokens = total_output_tokens;
+    history_snapshot.success = !aborted;
+    if aborted {
+        history_snapshot.error = Some(truncate(&result, MAX_SNAPSHOT_RESULT_CHARS).to_string());
+    } else {
+        history_snapshot.result_excerpt =
+            Some(truncate(&result, MAX_SNAPSHOT_RESULT_CHARS).to_string());
+    }
+
     SubAgentOutcome {
         result,
         cycles,
@@ -1095,6 +1187,7 @@ pub(crate) async fn run_subagent(
         total_input_tokens,
         total_output_tokens,
         provider_usage,
+        history_snapshot,
     }
 }
 

@@ -169,6 +169,7 @@ async fn status_command_reports_runtime_request_estimate() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -307,6 +308,7 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -419,6 +421,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -613,6 +616,7 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -727,6 +731,7 @@ async fn memory_command_rejects_unknown_subcommand() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -860,6 +865,7 @@ async fn reflection_command_disabled_shows_hint() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -993,6 +999,7 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1165,6 +1172,7 @@ async fn reflection_command_disabled_allows_read_today() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1296,6 +1304,7 @@ async fn reflection_command_enabled_shows_status() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1439,6 +1448,7 @@ async fn reflection_command_today_shows_content() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1588,6 +1598,7 @@ async fn reflection_command_today_filters_out_new_summaries() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1740,6 +1751,7 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1895,6 +1907,7 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -2027,6 +2040,7 @@ async fn reflection_command_invalid_arg_shows_usage() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };

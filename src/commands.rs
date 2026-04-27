@@ -10,7 +10,9 @@ use crate::{
     build_system_prompt_with_query, default_show_react, default_show_reasoning, default_show_tools,
     memory, now_epoch, prompts, providers,
     session_admin::gather_global_today_usage,
-    session_store::{build_session_status, build_usage_report, save_session_to_disk},
+    session_store::{
+        build_session_status, build_usage_report, replace_session_messages, save_session_to_disk,
+    },
     tools, truncate, ws_send,
 };
 
@@ -243,6 +245,8 @@ async fn reset_session_context_and_persist(
         |session| {
             (
                 session.messages.clone(),
+                session.subagent_snapshots.clone(),
+                session.failed_tool_results.clone(),
                 session.tool_calls_count,
                 session.updated_at,
             )
@@ -255,11 +259,13 @@ async fn reset_session_context_and_persist(
                 &model,
                 &session.disabled_system_skills,
             );
-            session.messages = vec![sys];
+            replace_session_messages(session, vec![sys]);
             session.tool_calls_count = 0;
         },
-        |session, (messages, tool_calls_count, updated_at)| {
+        |session, (messages, subagent_snapshots, failed_tool_results, tool_calls_count, updated_at)| {
             session.messages = messages;
+            session.subagent_snapshots = subagent_snapshots;
+            session.failed_tool_results = failed_tool_results;
             session.tool_calls_count = tool_calls_count;
             session.updated_at = updated_at;
         },

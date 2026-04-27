@@ -825,6 +825,7 @@ async fn collect_parallel_tool_results_preserves_finished_results_on_deadline() 
             output: "fast result".to_string(),
             is_error: false,
             duration_ms: 1,
+            subagent_snapshot: None,
         })
     })
         as std::pin::Pin<
@@ -1142,6 +1143,7 @@ async fn timeout_outcome_still_runs_after_tool_exec_hook() {
             output: "Tool 'exec' aborted: sub-agent deadline exceeded".to_string(),
             is_error: true,
             duration_ms: 12,
+            subagent_snapshot: None,
         },
     )
     .await;
@@ -1631,6 +1633,7 @@ async fn parallel_batch_interrupt_fires_hooks_only_for_completed_tools() {
             output: "file contents here".to_string(),
             is_error: false,
             duration_ms: 1,
+            subagent_snapshot: None,
         })
     })
         as std::pin::Pin<
