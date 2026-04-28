@@ -34,7 +34,7 @@ If `MEMORY.md` has guidance on what to remember, follow it. Otherwise: capture d
 - Memory is limited — if you want to remember something, write it to a file
 - Mental notes do not survive session restarts. Files do.
 - When someone says "remember this" → update `memory/YYYY-MM-DD.md` or the relevant file
-- When you learn a lesson → update `AGENTS.md`, `TOOLS.md`, or the relevant skill
+- When you learn a lesson → update `AGENTS.md` or the relevant skill
 - When you make a mistake → document it so future-you does not repeat it
 
 ## Red Lines
@@ -49,7 +49,7 @@ If `MEMORY.md` has guidance on what to remember, follow it. Otherwise: capture d
 
 Skills provide specialized knowledge for specific tasks. They are loaded from three layers — system (bundled), global (`~/.lingclaw/skills/`), and session (`skills/` in this workspace) — with later layers shadowing earlier ones on name collision. When a task matches a skill's description, read its `SKILL.md` before proceeding.
 
-Use `/skills` to see all tools and installed skills (with source tags), or `/skills-system`, `/skills-global`, `/skills-session` to filter by layer. Keep local notes such as camera names, SSH details, and voice preferences in `TOOLS.md`.
+Use `/skills` to see all tools and installed skills (with source tags), or `/skills-system`, `/skills-global`, `/skills-session` to filter by layer. Keep personal notes like camera names, SSH hosts, and voice preferences in `USER.md` or `MEMORY.md`.
 
 ## Make It Yours
 

@@ -829,7 +829,6 @@ think_level 映射：
 │   ├── IDENTITY.md         — 身份信息
 │   ├── SOUL.md             — 高层推理规则
 │   ├── USER.md             — 用户特定行为
-│   ├── TOOLS.md            — 工具使用指南
 │   ├── MEMORY.md           — 持久记忆指南
 │   ├── structured_memory.json  — 机器可读结构化记忆（启用时生成）
 │   ├── skills/             — session 专属 Skills
@@ -843,7 +842,7 @@ think_level 映射：
 | 模式 | 条件 | 加载文件 |
 |---|---|---|
 | **Bootstrap** | `BOOTSTRAP.md` 存在 | `BOOTSTRAP.md + AGENTS.md` |
-| **Normal** | `BOOTSTRAP.md` 不存在 | `AGENTS.md + IDENTITY.md + USER.md + SOUL.md + TOOLS.md`，然后加载当前 session 的 `MEMORY.md` + 今日/昨日记忆 |
+| **Normal** | `BOOTSTRAP.md` 不存在 | `AGENTS.md + IDENTITY.md + USER.md + SOUL.md`，然后加载当前 session 的 `MEMORY.md` + 今日/昨日记忆 |
 
 关键不变式：
 - 当 `IDENTITY.md` 和 `USER.md` 中的关键字段已被有效填写后，后端会自动删除 `BOOTSTRAP.md` 并切换到 Normal 模式
@@ -929,7 +928,6 @@ think_level 映射：
 | `IDENTITY.md` | 身份/人格信息 |
 | `SOUL.md` | 高层推理规则 |
 | `USER.md` | 用户特定行为指导 |
-| `TOOLS.md` | 工具使用指导 |
 | `MEMORY.md` | 持久记忆指导 |
 
 每个工作区还有 `memory/` 子目录，存放 `memory/YYYY-MM-DD.md` 每日日志。
