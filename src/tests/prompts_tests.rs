@@ -45,8 +45,8 @@ fn load_session_prompt_files_uses_same_snapshot_for_today_and_yesterday() {
     );
     let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
 
-    assert!(loaded.contains("<!-- memory/2026-03-16.md -->\ntoday memory"));
-    assert!(loaded.contains("<!-- memory/2026-03-15.md -->\nyesterday memory"));
+    assert!(loaded.memory.contains("<!-- memory/2026-03-16.md -->\ntoday memory"));
+    assert!(loaded.memory.contains("<!-- memory/2026-03-15.md -->\nyesterday memory"));
 
     let _ = fs::remove_dir_all(&workspace);
 }
@@ -78,10 +78,10 @@ fn load_session_prompt_files_auto_completes_bootstrap_when_identity_is_edited() 
     let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
 
     assert!(!workspace.join("BOOTSTRAP.md").exists());
-    assert!(!loaded.contains("<!-- BOOTSTRAP.md -->"));
-    assert!(loaded.contains("<!-- AGENTS.md -->\nagent"));
-    assert!(loaded.contains("<!-- IDENTITY.md -->"));
-    assert!(loaded.contains("<!-- USER.md -->"));
+    assert!(!loaded.persona.contains("<!-- BOOTSTRAP.md -->"));
+    assert!(loaded.persona.contains("<!-- AGENTS.md -->\nagent"));
+    assert!(loaded.persona.contains("<!-- IDENTITY.md -->"));
+    assert!(loaded.persona.contains("<!-- USER.md -->"));
 
     let _ = fs::remove_dir_all(&workspace);
 }
@@ -111,7 +111,7 @@ fn load_session_prompt_files_keeps_bootstrap_until_profile_files_change() {
     let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
 
     assert!(workspace.join("BOOTSTRAP.md").exists());
-    assert!(loaded.contains("<!-- BOOTSTRAP.md -->\nbootstrap"));
+    assert!(loaded.persona.contains("<!-- BOOTSTRAP.md -->\nbootstrap"));
 
     let _ = fs::remove_dir_all(&workspace);
 }
@@ -141,7 +141,7 @@ fn load_session_prompt_files_auto_completes_bootstrap_when_user_is_edited() {
     let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
 
     assert!(!workspace.join("BOOTSTRAP.md").exists());
-    assert!(!loaded.contains("<!-- BOOTSTRAP.md -->"));
+    assert!(!loaded.persona.contains("<!-- BOOTSTRAP.md -->"));
 
     let _ = fs::remove_dir_all(&workspace);
 }
@@ -172,9 +172,9 @@ fn load_session_prompt_files_auto_completes_bootstrap_when_values_are_appended_b
     let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
 
     assert!(!workspace.join("BOOTSTRAP.md").exists());
-    assert!(!loaded.contains("<!-- BOOTSTRAP.md -->"));
-    assert!(loaded.contains("<!-- IDENTITY.md -->"));
-    assert!(loaded.contains("<!-- USER.md -->"));
+    assert!(!loaded.persona.contains("<!-- BOOTSTRAP.md -->"));
+    assert!(loaded.persona.contains("<!-- IDENTITY.md -->"));
+    assert!(loaded.persona.contains("<!-- USER.md -->"));
 
     let _ = fs::remove_dir_all(&workspace);
 }
@@ -212,7 +212,7 @@ fn bootstrap_completion_uses_session_baseline_instead_of_current_template() {
     let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
 
     assert!(workspace.join("BOOTSTRAP.md").exists());
-    assert!(loaded.contains("<!-- BOOTSTRAP.md -->\nbootstrap"));
+    assert!(loaded.persona.contains("<!-- BOOTSTRAP.md -->\nbootstrap"));
 
     let _ = fs::remove_dir_all(&workspace);
 }
@@ -643,9 +643,10 @@ fn load_session_prompt_files_truncates_large_daily_memory() {
     // The injected daily memory must not exceed the budget + truncation marker.
     let daily_marker = "<!-- memory/2026-03-16.md -->";
     let daily_start = loaded
+        .memory
         .find(daily_marker)
         .expect("daily memory should be present");
-    let daily_section = &loaded[daily_start..];
+    let daily_section = &loaded.memory[daily_start..];
     // Budget is 4000 chars; with truncation marker overhead, the section should
     // be well under 4200 chars and certainly below the original 6000.
     assert!(
@@ -765,13 +766,13 @@ fn prompt_cache_invalidates_on_file_change() {
         DateTime::parse_from_rfc3339("2026-03-16T12:00:00+08:00").unwrap(),
     );
     let first = load_session_prompt_files_with_snapshot(&workspace, snapshot);
-    assert!(first.contains("identity-v1"));
+    assert!(first.persona.contains("identity-v1"));
 
     // Modify IDENTITY.md — mtime changes → cache miss
     fs::write(workspace.join("IDENTITY.md"), "identity-v2").unwrap();
     let second = load_session_prompt_files_with_snapshot(&workspace, snapshot);
     assert!(
-        second.contains("identity-v2"),
+        second.persona.contains("identity-v2"),
         "changed file should invalidate prompt cache"
     );
 

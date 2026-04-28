@@ -802,7 +802,7 @@ struct PromptCache {
     workspace: PathBuf,
     today: String,
     mtimes: Vec<Option<SystemTime>>,
-    result: String,
+    result: PromptFiles,
 }
 
 type PromptCacheLock = OnceLock<Mutex<Option<PromptCache>>>;
@@ -853,7 +853,7 @@ fn collect_prompt_mtimes(
 pub(crate) fn load_session_prompt_files_with_snapshot(
     workspace: &Path,
     snapshot: LocalTimeSnapshot,
-) -> String {
+) -> PromptFiles {
     maybe_complete_bootstrap(workspace);
 
     let today = snapshot.today();
@@ -885,47 +885,59 @@ pub(crate) fn load_session_prompt_files_with_snapshot(
     result
 }
 
-fn load_prompt_files_uncached(workspace: &Path, today: &str, yesterday: &str) -> String {
+#[derive(Clone)]
+pub(crate) struct PromptFiles {
+    pub persona: String,
+    pub memory: String,
+}
+
+fn load_prompt_files_uncached(workspace: &Path, today: &str, yesterday: &str) -> PromptFiles {
     let bootstrap = read_nonempty(workspace.join(BOOTSTRAP_FILE));
 
     if let Some(bs_content) = bootstrap {
-        // Bootstrap mode: first-run identity setup
+        // Bootstrap mode: first-run identity setup — no memory section
         let mut parts = vec![format!("<!-- {BOOTSTRAP_FILE} -->\n{bs_content}")];
         if let Some((name, agent)) = read_agent_prompt(workspace) {
             parts.push(format!("<!-- {name} -->\n{agent}"));
         }
-        return parts.join("\n\n---\n\n");
+        return PromptFiles {
+            persona: parts.join("\n\n---\n\n"),
+            memory: String::new(),
+        };
     }
 
-    // Normal mode: full persona
-    let mut parts = Vec::new();
+    // Normal mode: persona (stable) + memory (dynamic)
+    let mut persona_parts = Vec::new();
     if let Some((name, content)) = read_agent_prompt(workspace) {
-        parts.push(format!("<!-- {name} -->\n{content}"));
+        persona_parts.push(format!("<!-- {name} -->\n{content}"));
     }
 
     for name in &["IDENTITY.md", "USER.md", "SOUL.md"] {
         if let Some(content) = read_nonempty(workspace.join(name)) {
-            parts.push(format!("<!-- {name} -->\n{content}"));
+            persona_parts.push(format!("<!-- {name} -->\n{content}"));
         }
     }
 
+    let mut memory_parts = Vec::new();
     if let Some(content) = read_nonempty(workspace.join("MEMORY.md")) {
-        parts.push(format!("<!-- MEMORY.md -->\n{content}"));
+        memory_parts.push(format!("<!-- MEMORY.md -->\n{content}"));
     }
 
     // Daily memory budget: cap each day file to avoid unbounded prompt growth
-    // (reflection entries accumulate over a busy day).
     const DAILY_MEMORY_CHAR_BUDGET: usize = 4000;
 
     for date_str in &[today, yesterday] {
         let path = workspace.join("memory").join(format!("{date_str}.md"));
         if let Some(content) = read_nonempty(&path) {
             let content = crate::truncate(&content, DAILY_MEMORY_CHAR_BUDGET);
-            parts.push(format!("<!-- memory/{date_str}.md -->\n{content}"));
+            memory_parts.push(format!("<!-- memory/{date_str}.md -->\n{content}"));
         }
     }
 
-    parts.join("\n\n---\n\n")
+    PromptFiles {
+        persona: persona_parts.join("\n\n---\n\n"),
+        memory: memory_parts.join("\n\n---\n\n"),
+    }
 }
 
 /// Read a file and return its trimmed content if non-empty.

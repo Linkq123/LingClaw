@@ -654,10 +654,12 @@ fn build_system_prompt_with_query(
     let local_snapshot = prompts::current_local_snapshot();
     let local_time = local_snapshot.datetime_label();
     let tool_lines = tools::render_tool_prompt_lines(config);
-    let persona = prompts::load_session_prompt_files_with_snapshot(workspace, local_snapshot);
+    let prompt_files = prompts::load_session_prompt_files_with_snapshot(workspace, local_snapshot);
+    let persona = prompt_files.persona;
+    let memory_files = prompt_files.memory;
     let prompt_file_note = "## Preloaded Prompt Files\n\
 These prompt-file contents were already loaded into this system prompt from the session workspace.\n\
-Do not call file tools just to verify or re-read BOOTSTRAP.md, AGENTS.md, AGENT.md, IDENTITY.md, USER.md, SOUL.md, or MEMORY.md when their content is already present below.\n\
+Do not call file tools just to verify or re-read BOOTSTRAP.md, AGENTS.md, AGENT.md, IDENTITY.md, USER.md, or SOUL.md when their content is already present below.\n\
 Only read those files if the user explicitly asks to inspect them, if you need to edit them, or if a task depends on checking whether the on-disk file has changed.";
     let mcp_note = tools::mcp::runtime_tool_note(config)
         .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
@@ -700,7 +702,7 @@ Only read those files if the user explicitly asks to inspect them, if you need t
     };
 
     let prompt = format!(
-        r#"{persona}{structured_memory_section}
+        r#"{persona}
 
 {prompt_file_note}
 
@@ -718,11 +720,14 @@ You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools
 
 ---
 
+## Memory
+{memory_files}{structured_memory_section}
+
 ## Environment
 - OS: {os_name}
 - Current system local time: {local_time}
 - Working directory: {cwd}
-- Model: {model}"#, // The `---\n## Environment\n- OS:` prefix above is used as a cache-split
+- Model: {model}"#, // The `---\n## Memory\n` prefix above is used as the cache-split
         // delimiter by ENV_BLOCK_DELIMITER in providers.rs — keep them in sync.
         model = model,
         local_time = local_time,
@@ -731,6 +736,7 @@ You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools
         prompt_file_note = prompt_file_note,
         mcp_note = mcp_note,
         skills_section = skills_section,
+        memory_files = memory_files,
         structured_memory_section = structured_memory_section,
         agents_section = agents_section,
     );
