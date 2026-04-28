@@ -10,7 +10,9 @@ use crate::{
     build_system_prompt_with_query, default_show_react, default_show_reasoning, default_show_tools,
     memory, now_epoch, prompts, providers,
     session_admin::gather_global_today_usage,
-    session_store::{build_session_status, build_usage_report, save_session_to_disk},
+    session_store::{
+        build_session_status, build_usage_report, replace_session_messages, save_session_to_disk,
+    },
     tools, truncate, ws_send,
 };
 
@@ -101,7 +103,7 @@ async fn status_effective_think_level(
     if session.think_level != "auto" {
         return session.think_level.clone();
     }
-    if !(resolved.reasoning || resolved.thinking_format.is_some()) {
+    if !providers::auto_think_supported(resolved) {
         return "off".to_string();
     }
 
@@ -140,6 +142,9 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
         }
         crate::Provider::Ollama => {
             tools::mcp::cached_tool_definitions_ollama(&config, &session.workspace)
+        }
+        crate::Provider::Gemini => {
+            tools::mcp::cached_tool_definitions_gemini(&config, &session.workspace)
         }
     };
     extra_tools.append(&mut cached_mcp_tools);
@@ -240,6 +245,8 @@ async fn reset_session_context_and_persist(
         |session| {
             (
                 session.messages.clone(),
+                session.subagent_snapshots.clone(),
+                session.failed_tool_results.clone(),
                 session.tool_calls_count,
                 session.updated_at,
             )
@@ -252,11 +259,13 @@ async fn reset_session_context_and_persist(
                 &model,
                 &session.disabled_system_skills,
             );
-            session.messages = vec![sys];
+            replace_session_messages(session, vec![sys]);
             session.tool_calls_count = 0;
         },
-        |session, (messages, tool_calls_count, updated_at)| {
+        |session, (messages, subagent_snapshots, failed_tool_results, tool_calls_count, updated_at)| {
             session.messages = messages;
+            session.subagent_snapshots = subagent_snapshots;
+            session.failed_tool_results = failed_tool_results;
             session.tool_calls_count = tool_calls_count;
             session.updated_at = updated_at;
         },
@@ -341,6 +350,8 @@ async fn handle_new_command(
             role: "system".into(),
             content: Some("You are a conversation summarizer. Compress the following conversation into a concise markdown summary. Keep key decisions, code changes, problems solved, and important context. Use bullet points. Write in the same language as the conversation. Do NOT wrap in code blocks.".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -349,6 +360,8 @@ async fn handle_new_command(
             role: "user".into(),
             content: Some(truncate(&conversation_text, 60_000)),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: Some(now_epoch()),
@@ -389,6 +402,8 @@ async fn handle_new_command(
                 role: "assistant".into(),
                 content: Some(summary.content.clone()),
                 images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -1292,17 +1307,18 @@ async fn handle_memory_command(
         }
     };
 
+    let memory_queue = state.memory_queue();
     let response = match arg {
         "" => format!(
             "{}\n\n{}",
             memory::memory_status(&workspace),
-            memory::memory_runtime_status(state.memory_queue.as_ref())
+            memory::memory_runtime_status(memory_queue.as_ref())
         ),
-        "stats" => memory::memory_runtime_status(state.memory_queue.as_ref()),
+        "stats" => memory::memory_runtime_status(memory_queue.as_ref()),
         "debug" => format!(
             "{}\n\n{}",
             memory::memory_status(&workspace),
-            memory::memory_debug_status(&workspace, state.memory_queue.as_ref())
+            memory::memory_debug_status(&workspace, memory_queue.as_ref())
         ),
         _ => return command_result("Usage: /memory [stats|debug]", "system", false),
     };
@@ -1327,7 +1343,7 @@ async fn handle_reflection_command(
     let local = prompts::current_local_snapshot();
     let today = local.today();
     let yesterday = local.yesterday();
-    let enabled = config.daily_reflection;
+    let enabled = crate::runtime_loop::reflection_runtime_enabled();
 
     let response = match arg {
         "" => {
@@ -1527,7 +1543,7 @@ async fn handle_agents_command(current_session_id: &str, state: &AppState) -> Co
         } else {
             tools.join(", ")
         };
-        let model_info = config.sub_agent_model.as_deref().unwrap_or(&config.model);
+        let model_info = config.sub_agent_model_for(&agent.name);
         lines.push(format!(
             "- **{}** [`{}`] — {}\n  model: {} | max_turns: {} | tools: {}",
             agent.name,

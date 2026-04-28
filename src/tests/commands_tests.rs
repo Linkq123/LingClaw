@@ -107,6 +107,7 @@ async fn status_command_reports_runtime_request_estimate() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
 
             reflection_model: None,
@@ -141,7 +142,7 @@ async fn status_command_reports_runtime_request_estimate() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     };
 
     let mut session = Session {
@@ -168,6 +169,7 @@ async fn status_command_reports_runtime_request_estimate() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -183,6 +185,8 @@ async fn status_command_reports_runtime_request_estimate() {
         role: "user".into(),
         content: Some("Summarize the current backend architecture.".into()),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -242,6 +246,7 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
             model: "openai/gpt-4o-reasoner".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
 
             reflection_model: None,
@@ -276,7 +281,7 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     };
 
     let mut session = Session {
@@ -303,6 +308,7 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -353,6 +359,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
 
             reflection_model: None,
@@ -387,7 +394,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     };
 
     let mut session = Session {
@@ -414,6 +421,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -429,6 +437,8 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
         role: "user".into(),
         content: Some("Explain the current runtime architecture.".into()),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -471,6 +481,7 @@ async fn switch_command_is_blocked_in_single_session_mode() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
 
             reflection_model: None,
@@ -505,7 +516,7 @@ async fn switch_command_is_blocked_in_single_session_mode() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     };
 
     let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
@@ -543,6 +554,7 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
 
             reflection_model: None,
@@ -577,7 +589,7 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     };
 
     let mut session = Session {
@@ -604,6 +616,7 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -656,6 +669,7 @@ async fn memory_command_rejects_unknown_subcommand() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
 
             reflection_model: None,
@@ -690,7 +704,7 @@ async fn memory_command_rejects_unknown_subcommand() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     };
 
     let mut session = Session {
@@ -717,6 +731,7 @@ async fn memory_command_rejects_unknown_subcommand() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -756,6 +771,7 @@ async fn memory_command_rejects_unknown_subcommand() {
 
 #[tokio::test]
 async fn reflection_command_disabled_shows_hint() {
+    let _guard = crate::runtime_loop::reflection_test_guard().lock().await;
     let workspace = unique_temp_workspace("lingclaw-cmd-reflect-disabled");
     let _ = tokio::fs::remove_dir_all(&workspace).await;
     tokio::fs::create_dir_all(&workspace)
@@ -789,6 +805,7 @@ async fn reflection_command_disabled_shows_hint() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -821,7 +838,7 @@ async fn reflection_command_disabled_shows_hint() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     };
 
     let mut session = Session {
@@ -848,6 +865,7 @@ async fn reflection_command_disabled_shows_hint() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -863,6 +881,7 @@ async fn reflection_command_disabled_shows_hint() {
         .lock()
         .await
         .insert(MAIN_SESSION_ID.to_string(), session);
+    state.apply_runtime_config(config.as_ref().clone());
 
     let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
     let result = handle_command(
@@ -879,6 +898,170 @@ async fn reflection_command_disabled_shows_hint() {
     assert_eq!(result.response_type, "system");
     assert!(result.response.contains("disabled"));
 
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn reflection_command_reads_runtime_daily_reflection_updates() {
+    let _guard = crate::runtime_loop::reflection_test_guard().lock().await;
+    let workspace = unique_temp_workspace("lingclaw-cmd-reflect-runtime-update");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai".to_string(),
+        crate::config::JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "test-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![crate::config::JsonModelEntry {
+                id: "gpt-4o-mini".to_string(),
+                name: None,
+                reasoning: Some(false),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(16384),
+                compat: None,
+            }],
+        },
+    );
+
+    let base_config = crate::Config {
+        api_key: "test-key".to_string(),
+        api_base: "https://api.openai.com/v1".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        fast_model: None,
+        sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
+        memory_model: None,
+        reflection_model: None,
+        context_model: None,
+        provider: crate::Provider::OpenAI,
+        anthropic_prompt_caching: false,
+        providers,
+        mcp_servers: HashMap::new(),
+        port: crate::DEFAULT_PORT,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
+        structured_memory: false,
+        daily_reflection: false,
+        s3: None,
+    };
+
+    let state = AppState {
+        config: std::sync::Mutex::new(Arc::new(base_config.clone())),
+        http: reqwest::Client::new(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+        memory_queue: std::sync::Mutex::new(None),
+    };
+
+    let mut session = Session {
+        id: MAIN_SESSION_ID.to_string(),
+        name: "main".to_string(),
+        messages: Vec::new(),
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: "estimated".to_string(),
+        output_token_source: "estimated".to_string(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: "auto".to_string(),
+        show_react: false,
+        show_tools: true,
+        show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
+        version: 4,
+        workspace: workspace.clone(),
+    };
+    let config = state.config();
+    session.messages.push(build_system_prompt(
+        &config,
+        &workspace,
+        &config.model,
+        &session.disabled_system_skills,
+    ));
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(MAIN_SESSION_ID.to_string(), session);
+    state.apply_runtime_config(base_config.clone());
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+    let disabled = handle_command(
+        "/reflection",
+        MAIN_SESSION_ID,
+        1,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("disabled reflection command should resolve");
+    assert!(disabled.response.contains("disabled"));
+
+    let mut enabled_config = base_config;
+    enabled_config.daily_reflection = true;
+    state.replace_config(enabled_config.clone());
+
+    let config_only = handle_command(
+        "/reflection",
+        MAIN_SESSION_ID,
+        1,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("config-only reflection command should resolve");
+    assert!(config_only.response.contains("disabled"));
+
+    state.apply_runtime_config(enabled_config);
+
+    let enabled = handle_command(
+        "/reflection",
+        MAIN_SESSION_ID,
+        1,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("enabled reflection command should resolve");
+    assert!(enabled.response.contains("enabled"));
+    assert!(enabled.response.contains("Last reflection:"));
+
+    state.apply_runtime_config(config.as_ref().clone());
     let _ = tokio::fs::remove_dir_all(&workspace).await;
 }
 
@@ -929,6 +1112,7 @@ async fn reflection_command_disabled_allows_read_today() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -961,7 +1145,7 @@ async fn reflection_command_disabled_allows_read_today() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     };
 
     let mut session = Session {
@@ -988,6 +1172,7 @@ async fn reflection_command_disabled_allows_read_today() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1025,6 +1210,7 @@ async fn reflection_command_disabled_allows_read_today() {
 
 #[tokio::test]
 async fn reflection_command_enabled_shows_status() {
+    let _guard = crate::runtime_loop::reflection_test_guard().lock().await;
     let workspace = unique_temp_workspace("lingclaw-cmd-reflect-enabled");
     let _ = tokio::fs::remove_dir_all(&workspace).await;
     tokio::fs::create_dir_all(&workspace)
@@ -1058,6 +1244,7 @@ async fn reflection_command_enabled_shows_status() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -1090,7 +1277,7 @@ async fn reflection_command_enabled_shows_status() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     };
 
     let mut session = Session {
@@ -1117,6 +1304,7 @@ async fn reflection_command_enabled_shows_status() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1132,6 +1320,7 @@ async fn reflection_command_enabled_shows_status() {
         .lock()
         .await
         .insert(MAIN_SESSION_ID.to_string(), session);
+    state.apply_runtime_config(config.as_ref().clone());
 
     let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
     let result = handle_command(
@@ -1199,6 +1388,7 @@ async fn reflection_command_today_shows_content() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -1231,7 +1421,7 @@ async fn reflection_command_today_shows_content() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     };
 
     let mut session = Session {
@@ -1258,6 +1448,7 @@ async fn reflection_command_today_shows_content() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1347,6 +1538,7 @@ async fn reflection_command_today_filters_out_new_summaries() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -1379,7 +1571,7 @@ async fn reflection_command_today_filters_out_new_summaries() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     };
 
     let mut session = Session {
@@ -1406,6 +1598,7 @@ async fn reflection_command_today_filters_out_new_summaries() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1498,6 +1691,7 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -1530,7 +1724,7 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     };
 
     let mut session = Session {
@@ -1557,6 +1751,7 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1652,6 +1847,7 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -1684,7 +1880,7 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     };
 
     let mut session = Session {
@@ -1711,6 +1907,7 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1783,6 +1980,7 @@ async fn reflection_command_invalid_arg_shows_usage() {
             model: "gpt-4o-mini".to_string(),
             fast_model: None,
             sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
             memory_model: None,
             reflection_model: None,
             context_model: None,
@@ -1815,7 +2013,7 @@ async fn reflection_command_invalid_arg_shows_usage() {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: crate::HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     };
 
     let mut session = Session {
@@ -1842,6 +2040,7 @@ async fn reflection_command_invalid_arg_shows_usage() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 4,
         workspace: workspace.clone(),
     };

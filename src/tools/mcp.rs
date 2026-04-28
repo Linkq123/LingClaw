@@ -28,6 +28,8 @@ const MCP_SPAWN_FAILURE_COOLDOWN_SECS: u64 = 15;
 static MCP_TOOL_CACHE: OnceLock<Mutex<HashMap<String, CachedToolDescriptors>>> = OnceLock::new();
 static MCP_SESSION_CACHE: OnceLock<Mutex<HashMap<String, CachedMcpSession>>> = OnceLock::new();
 static MCP_SPAWN_FAILURES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct McpToolDescriptor {
@@ -70,6 +72,114 @@ struct McpServerSession {
     stderr_lines: Arc<Mutex<Vec<String>>>,
 }
 
+pub(crate) fn is_mcp_tool_name(name: &str) -> bool {
+    name.starts_with(MCP_NAME_PREFIX)
+}
+
+/// Conservative read-only classification for MCP tools.
+/// Unknown tools default to mutating. A tool is considered read-only only when
+/// it avoids mutation keywords and explicitly matches a read-only keyword.
+pub(crate) fn is_read_only_tool_descriptor(descriptor: &McpToolDescriptor) -> bool {
+    const MUTATION_WORDS: &[&str] = &[
+        "write",
+        "clone",
+        "create",
+        "update",
+        "delete",
+        "remove",
+        "modify",
+        "set",
+        "put",
+        "post",
+        "patch",
+        "insert",
+        "add",
+        "edit",
+        "append",
+        "replace",
+        "rename",
+        "move",
+        "copy",
+        "checkout",
+        "switch",
+        "execute",
+        "run",
+        "exec",
+        "deploy",
+        "install",
+        "uninstall",
+        "send",
+        "publish",
+        "push",
+        "commit",
+        "approve",
+        "merge",
+        "close",
+        "reopen",
+        "assign",
+        "drop",
+        "truncate",
+        "grant",
+        "revoke",
+        "enable",
+        "disable",
+        "start",
+        "stop",
+        "restart",
+        "kill",
+        "terminate",
+        "upload",
+        "submit",
+        "apply",
+        "reset",
+        "purge",
+        "destroy",
+        "dismiss",
+        "invite",
+        "ban",
+        "block",
+        "archive",
+    ];
+    const READ_ONLY_WORDS: &[&str] = &[
+        "get", "read", "list", "search", "find", "fetch", "lookup", "describe", "show", "inspect",
+        "retrieve", "view", "stat", "status", "count",
+    ];
+
+    let name = descriptor.raw_name.to_lowercase();
+    let desc = descriptor.description.to_lowercase();
+    let name_words = name.split(|c: char| !c.is_alphanumeric());
+    let desc_words = desc.split(|c: char| !c.is_alphanumeric());
+    let mut saw_read_only_keyword = false;
+
+    for word in name_words.chain(desc_words) {
+        if word.is_empty() {
+            continue;
+        }
+        if MUTATION_WORDS.contains(&word) {
+            return false;
+        }
+        if READ_ONLY_WORDS.contains(&word) {
+            saw_read_only_keyword = true;
+        }
+    }
+
+    saw_read_only_keyword
+}
+
+/// Cached-only lookup for MCP parallel classification.
+/// Cache misses are treated as mutating so scheduling never has to spawn or
+/// probe an MCP server before tool execution begins.
+pub(crate) fn is_read_only_tool_name(name: &str, config: &Config, workspace: &Path) -> bool {
+    if !is_mcp_tool_name(name) {
+        return false;
+    }
+
+    cached_list_tools(config, workspace)
+        .into_iter()
+        .find(|descriptor| descriptor.exposed_name == name)
+        .is_some_and(|descriptor| is_read_only_tool_descriptor(&descriptor))
+}
+
 pub(crate) fn runtime_tool_note(config: &Config) -> Option<String> {
     let mut names: Vec<&str> = config
         .mcp_servers
@@ -89,7 +199,7 @@ pub(crate) fn runtime_tool_note(config: &Config) -> Option<String> {
 
 /// Ensure MCP tool descriptors are cached for all enabled servers.
 /// Triggers async discovery for any server whose cache entry is missing or expired.
-/// Safe to call multiple times — hits cache on subsequent calls within the TTL window.
+/// Safe to call multiple times 鈥?hits cache on subsequent calls within the TTL window.
 pub(crate) async fn ensure_tools_cached(config: &Config, workspace: &Path) {
     let _ = list_tools(config, workspace).await;
 }
@@ -133,6 +243,33 @@ pub(crate) async fn tool_definitions_ollama(config: &Config, workspace: &Path) -
 
 pub(crate) fn cached_tool_definitions_ollama(config: &Config, workspace: &Path) -> Vec<Value> {
     cached_tool_definitions_openai(config, workspace)
+}
+
+pub(crate) async fn tool_definitions_gemini(config: &Config, workspace: &Path) -> Vec<Value> {
+    list_tools(config, workspace)
+        .await
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.exposed_name,
+                "description": tool.description,
+                "parameters": super::gemini_tool_parameters(tool.input_schema),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn cached_tool_definitions_gemini(config: &Config, workspace: &Path) -> Vec<Value> {
+    cached_list_tools(config, workspace)
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.exposed_name,
+                "description": tool.description,
+                "parameters": super::gemini_tool_parameters(tool.input_schema),
+            })
+        })
+        .collect()
 }
 
 pub(crate) async fn tool_definitions_anthropic(config: &Config, workspace: &Path) -> Vec<Value> {
@@ -203,7 +340,29 @@ pub(crate) async fn execute_tool(
     config: &Config,
     workspace: &Path,
 ) -> Option<ToolOutcome> {
-    if !name.starts_with(MCP_NAME_PREFIX) {
+    execute_tool_with_session_mode(name, args_str, config, workspace, false).await
+}
+
+/// Execute an MCP tool with an isolated per-call session.
+/// Used for parallel read-only batches so concurrent calls are not serialized
+/// behind the shared cached session mutex.
+pub(crate) async fn execute_tool_isolated(
+    name: &str,
+    args_str: &str,
+    config: &Config,
+    workspace: &Path,
+) -> Option<ToolOutcome> {
+    execute_tool_with_session_mode(name, args_str, config, workspace, true).await
+}
+
+async fn execute_tool_with_session_mode(
+    name: &str,
+    args_str: &str,
+    config: &Config,
+    workspace: &Path,
+    isolated_session: bool,
+) -> Option<ToolOutcome> {
+    if !is_mcp_tool_name(name) {
         return None;
     }
 
@@ -215,6 +374,7 @@ pub(crate) async fn execute_tool(
                 output: format!("{name} error: invalid arguments JSON: {error}"),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             });
         }
     };
@@ -226,6 +386,7 @@ pub(crate) async fn execute_tool(
                 output: format!("Unknown MCP tool: {name}"),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             });
         }
         Err(error) => {
@@ -233,21 +394,36 @@ pub(crate) async fn execute_tool(
                 output: format!("{name} error: {error}"),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             });
         }
     };
 
-    let call_result = call_server(
-        &descriptor.server_name,
-        config,
-        workspace,
-        "tools/call",
-        json!({
-            "name": descriptor.raw_name,
-            "arguments": args,
-        }),
-    )
-    .await;
+    let call_result = if isolated_session {
+        call_server_once(
+            &descriptor.server_name,
+            config,
+            workspace,
+            "tools/call",
+            json!({
+                "name": descriptor.raw_name,
+                "arguments": args,
+            }),
+        )
+        .await
+    } else {
+        call_server(
+            &descriptor.server_name,
+            config,
+            workspace,
+            "tools/call",
+            json!({
+                "name": descriptor.raw_name,
+                "arguments": args,
+            }),
+        )
+        .await
+    };
 
     let duration_ms = start.elapsed().as_millis() as u64;
     match call_result {
@@ -260,12 +436,14 @@ pub(crate) async fn execute_tool(
                 output: render_call_result(&result),
                 is_error,
                 duration_ms,
+                subagent_snapshot: None,
             })
         }
         Err(error) => Some(ToolOutcome {
             output: format!("{name} error: {error}"),
             is_error: true,
             duration_ms,
+            subagent_snapshot: None,
         }),
     }
 }
@@ -312,6 +490,7 @@ pub(crate) async fn test_mcp_server(
         model: String::new(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
         reflection_model: None,
         context_model: None,
@@ -363,7 +542,7 @@ pub(crate) async fn refresh_servers(
                     .ok_or_else(|| format!("unknown MCP server '{server_name}'"));
                 match server.and_then(|server| cache_key(server_name, server, workspace, config)) {
                     Ok(cache_key) => {
-                        // Lock scope is synchronous — no .await while held.
+                        // Lock scope is synchronous 鈥?no .await while held.
                         let mut cache = tool_cache()
                             .lock()
                             .map_err(|_| "MCP tool cache lock poisoned".to_string())?;
@@ -1145,6 +1324,17 @@ fn should_reset_mcp_session(error: &str) -> bool {
         || error.contains("pipe")
 }
 
+fn apply_mcp_process_flags(command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        // Keep console-style MCP helpers such as `uvx.exe` attached to pipes
+        // without flashing a separate terminal window for every tool call.
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = command;
+}
+
 async fn spawn_server_session(
     server_name: &str,
     config: &Config,
@@ -1172,6 +1362,7 @@ async fn spawn_server_session(
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
         .current_dir(server_cwd);
+    apply_mcp_process_flags(&mut command);
     for (key, value) in &server.env {
         command.env(key, value);
     }

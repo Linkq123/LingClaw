@@ -95,6 +95,30 @@ fn test_render_agents_catalog_with_agents() {
 }
 
 #[test]
+fn test_augment_subagent_prompt_with_runtime_context_prepends_local_time() {
+    let prompt = "Review the current diff and explain the bug.";
+    let augmented = crate::subagents::executor::augment_subagent_prompt_with_runtime_context(
+        prompt,
+        "2026-04-27 09:30:00 +08:00",
+    );
+
+    assert!(augmented.contains("## Delegated Task Context"));
+    assert!(augmented.contains("Current system local time: 2026-04-27 09:30:00 +08:00"));
+    assert!(augmented.ends_with(prompt));
+}
+
+#[test]
+fn test_augment_subagent_prompt_with_runtime_context_is_idempotent() {
+    let prompt = "## Delegated Task Context\n- Current system local time: 2026-04-27 09:30:00 +08:00\n\n## Delegated Task\nInspect the logs.";
+    let augmented = crate::subagents::executor::augment_subagent_prompt_with_runtime_context(
+        prompt,
+        "2026-04-28 10:45:00 +08:00",
+    );
+
+    assert_eq!(augmented, prompt);
+}
+
+#[test]
 fn test_parse_agent_frontmatter() {
     let content = r#"---
 name: test-agent
@@ -326,8 +350,20 @@ fn test_mcp_tool_classification_no_false_positives_from_substrings() {
     )));
 }
 
+#[test]
+fn test_mcp_tool_classification_defaults_unknown_tools_to_mutating() {
+    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
+        "clone_repo",
+        "Repository operation"
+    )));
+    assert!(!is_mcp_tool_read_only(&make_mcp_descriptor(
+        "operation_42",
+        "Tool exposed by MCP server"
+    )));
+}
+
 #[tokio::test]
-async fn test_mcp_read_only_tools_remain_sequential_for_parallel_dispatch() {
+async fn test_mcp_read_only_tools_are_parallelizable_for_dispatch() {
     let workspace = unique_temp_workspace("lingclaw-subagent-parallel-readonly-mcp");
     let _ = fs::remove_dir_all(&workspace);
     fs::create_dir_all(&workspace).expect("workspace should exist");
@@ -354,6 +390,9 @@ async fn test_mcp_read_only_tools_remain_sequential_for_parallel_dispatch() {
     assert!(is_mcp_tool_read_only(&descriptor));
     assert!(crate::tools::is_read_only_tool("read_file"));
     assert!(!crate::tools::is_read_only_tool(&tool_name));
+    assert!(crate::tools::is_parallelizable_tool_call(
+        &tool_name, &config, &workspace
+    ));
     assert!(!crate::tools::is_read_only_tool("exec"));
 
     let _ = crate::tools::mcp::refresh_servers(&config, &workspace).await;
@@ -427,7 +466,7 @@ Bad policy.
 // These tests call the production `resolve_subagent_model()` function.
 
 use crate::Config;
-use crate::config::{JsonMcpServerConfig, Provider};
+use crate::config::{JsonMcpServerConfig, JsonModelEntry, JsonProviderConfig, Provider};
 use crate::hooks::{AgentHook, HookInput, HookOutput, HookRegistry, ToolHookInput};
 use crate::subagents::executor::resolve_subagent_model;
 use std::collections::HashMap;
@@ -447,6 +486,10 @@ use std::time::Duration;
 
 const MOCK_MCP_SERVER_SOURCE: &str = include_str!("fixtures/mock_mcp_server.rs");
 
+struct CapturedHttpRequest {
+    body: String,
+}
+
 fn base_config() -> Config {
     Config {
         api_key: String::new(),
@@ -454,6 +497,7 @@ fn base_config() -> Config {
         model: "openai/gpt-4o".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -561,7 +605,7 @@ fn parse_content_length(header_text: &str) -> usize {
         .unwrap_or(0)
 }
 
-fn read_http_request(stream: &mut TcpStream) {
+fn read_http_request(stream: &mut TcpStream) -> CapturedHttpRequest {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("read timeout should be set");
@@ -585,11 +629,21 @@ fn read_http_request(stream: &mut TcpStream) {
             }
         }
     }
+
+    let headers_end = find_headers_end(&buffer).expect("request should contain headers");
+    let body = String::from_utf8_lossy(&buffer[headers_end + 4..]).to_string();
+    CapturedHttpRequest { body }
 }
 
 fn spawn_one_shot_http_server(
     response_content_type: &'static str,
     response_body: String,
+) -> (String, thread::JoinHandle<()>) {
+    spawn_http_server_with_responses(vec![(response_content_type, response_body)])
+}
+
+fn spawn_http_server_with_responses(
+    responses: Vec<(&'static str, String)>,
 ) -> (String, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
     let address = listener
@@ -597,8 +651,44 @@ fn spawn_one_shot_http_server(
         .expect("listener should expose address");
 
     let handle = thread::spawn(move || {
+        for (response_content_type, response_body) in responses {
+            let (mut stream, _) = listener.accept().expect("request should connect");
+            let _ = read_http_request(&mut stream);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {response_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("response should be written");
+            stream.flush().expect("response should flush");
+        }
+    });
+
+    (format!("http://{}", address), handle)
+}
+
+fn spawn_one_shot_http_server_with_capture(
+    response_content_type: &'static str,
+    response_body: String,
+) -> (
+    String,
+    std::sync::mpsc::Receiver<CapturedHttpRequest>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose address");
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+
+    let handle = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("request should connect");
-        read_http_request(&mut stream);
+        let request = read_http_request(&mut stream);
+        request_tx
+            .send(request)
+            .expect("captured request should be sent");
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: {response_content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             response_body.len(),
@@ -610,7 +700,7 @@ fn spawn_one_shot_http_server(
         stream.flush().expect("response should flush");
     });
 
-    (format!("http://{}", address), handle)
+    (format!("http://{}", address), request_rx, handle)
 }
 
 fn build_openai_tool_call_stream(tool_name: &str, args: serde_json::Value) -> String {
@@ -660,9 +750,69 @@ fn build_openai_multi_tool_call_stream(tool_calls: Vec<(&str, serde_json::Value)
     format!("data: {}\n\ndata: [DONE]\n\n", chunk)
 }
 
+fn build_openai_content_stream(content: &str) -> String {
+    let chunk = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "content": content
+            }
+        }]
+    });
+    format!("data: {}\n\ndata: [DONE]\n\n", chunk)
+}
+
+fn build_openai_content_then_tool_call_stream(
+    content: &str,
+    tool_name: &str,
+    args: serde_json::Value,
+) -> String {
+    let args_json = serde_json::to_string(&args).expect("tool args should serialize");
+    let content_chunk = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "content": content
+            }
+        }]
+    });
+    let tool_chunk = serde_json::json!({
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": args_json
+                    }
+                }]
+            },
+            "finish_reason": "tool_calls"
+        }]
+    });
+    format!(
+        "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+        content_chunk, tool_chunk
+    )
+}
+
+fn build_openai_simple_text_response(content: &str) -> String {
+    serde_json::json!({
+        "choices": [{
+            "message": {
+                "content": content
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 120,
+            "completion_tokens": 32
+        }
+    })
+    .to_string()
+}
+
 fn slow_tool_command() -> String {
     if cfg!(windows) {
-        "timeout /T 2 /NOBREAK > NUL".to_string()
+        "ping -n 3 127.0.0.1 > NUL".to_string()
     } else {
         "while :; do :; done".to_string()
     }
@@ -675,6 +825,7 @@ async fn collect_parallel_tool_results_preserves_finished_results_on_deadline() 
             output: "fast result".to_string(),
             is_error: false,
             duration_ms: 1,
+            subagent_snapshot: None,
         })
     })
         as std::pin::Pin<
@@ -722,14 +873,35 @@ fn test_model_resolution_prefers_sub_agent_config() {
         sub_agent_model: Some("openai/gpt-4o-mini".to_string()),
         ..base_config()
     };
-    assert_eq!(resolve_subagent_model(&config), "openai/gpt-4o-mini");
+    assert_eq!(
+        resolve_subagent_model(&config, "reviewer"),
+        "openai/gpt-4o-mini"
+    );
 }
 
 /// Falls back to config.model when no dedicated sub-agent model is configured.
 #[test]
 fn test_model_resolution_falls_back_to_primary() {
     let config = base_config(); // sub_agent_model = None
-    assert_eq!(resolve_subagent_model(&config), "openai/gpt-4o");
+    assert_eq!(resolve_subagent_model(&config, "reviewer"), "openai/gpt-4o");
+}
+
+#[test]
+fn test_model_resolution_prefers_specific_sub_agent_override() {
+    let mut config = base_config();
+    config.sub_agent_model = Some("openai/gpt-4o-mini".to_string());
+    config.sub_agent_model_overrides.insert(
+        "reviewer".to_string(),
+        "anthropic/claude-sonnet-4-20250514".to_string(),
+    );
+    assert_eq!(
+        resolve_subagent_model(&config, "reviewer"),
+        "anthropic/claude-sonnet-4-20250514"
+    );
+    assert_eq!(
+        resolve_subagent_model(&config, "coder"),
+        "openai/gpt-4o-mini"
+    );
 }
 
 /// max_turns is clamped to MAX_AGENT_TURNS even when AGENT.md specifies a higher value.
@@ -971,6 +1143,7 @@ async fn timeout_outcome_still_runs_after_tool_exec_hook() {
             output: "Tool 'exec' aborted: sub-agent deadline exceeded".to_string(),
             is_error: true,
             duration_ms: 12,
+            subagent_snapshot: None,
         },
     )
     .await;
@@ -1187,6 +1360,161 @@ async fn run_subagent_emits_tool_result_event_for_completed_tool() {
 }
 
 #[tokio::test]
+async fn run_subagent_forces_final_summary_after_tool_only_last_turn() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-forced-final-summary");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+    fs::write(workspace.join("notes.txt"), "alpha\nbeta\n")
+        .expect("fixture file should be written");
+
+    let stream_body = build_openai_content_then_tool_call_stream(
+        "Now let me check a few more things to verify specific issues: ",
+        "read_file",
+        serde_json::json!({
+            "path": "notes.txt"
+        }),
+    );
+    let summary_body = build_openai_simple_text_response(
+        "Findings:\n- Reviewed notes.txt\n- Ready to hand the final summary back to the parent agent.",
+    );
+    let (api_base, handle) = spawn_http_server_with_responses(vec![
+        ("text/event-stream", stream_body),
+        ("application/json", summary_body),
+    ]);
+
+    let mut config = base_config();
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+
+    let spec = SubAgentSpec {
+        name: "forced-summary-agent".into(),
+        description: String::new(),
+        system_prompt: "Inspect the delegated file and return a final review.".into(),
+        max_turns: 1,
+        tools: ToolPermissions {
+            allow: vec!["read_file".into()],
+            deny: vec![],
+        },
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(16);
+    let http = reqwest::Client::new();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Review notes.txt.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &HookRegistry::new(),
+        "test-task-forced-summary",
+    )
+    .await;
+
+    handle.join().expect("server thread should join");
+
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.cycles, 1);
+    assert_eq!(outcome.tool_calls, 1);
+    assert!(outcome.result.contains("Findings:"));
+    assert!(!outcome.result.contains("Now let me check"));
+    assert!(outcome.total_input_tokens >= 120);
+    assert!(outcome.total_output_tokens >= 32);
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_subagent_configured_openai_gateway_auto_disables_reasoning_controls() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-configured-openai-auto-think");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+
+    let response_body = build_openai_content_stream("Frontend task complete.");
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server_with_capture("text/event-stream", response_body);
+
+    let mut config = base_config();
+    config.providers.insert(
+        "gateway".to_string(),
+        JsonProviderConfig {
+            base_url: api_base,
+            api_key: "test-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "kimi-k2.6".to_string(),
+                name: None,
+                reasoning: Some(true),
+                input: Some(vec!["text".to_string(), "image".to_string()]),
+                cost: None,
+                context_window: Some(256_000),
+                max_tokens: Some(32_000),
+                compat: None,
+            }],
+        },
+    );
+    config.sub_agent_model_overrides.insert(
+        "frontend-coder".to_string(),
+        "gateway/kimi-k2.6".to_string(),
+    );
+
+    let spec = SubAgentSpec {
+        name: "frontend-coder".into(),
+        description: String::new(),
+        system_prompt: "Implement the requested UI update.".into(),
+        max_turns: 1,
+        tools: ToolPermissions::default(),
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(16);
+    let http = reqwest::Client::new();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Center the modal and polish spacing.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &HookRegistry::new(),
+        "test-task-configured-openai-auto-think",
+    )
+    .await;
+
+    let request = request_rx.recv().expect("request should be captured");
+    handle.join().expect("server thread should join");
+
+    let body: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid json");
+    let tool_names: Vec<&str> = body["tools"]
+        .as_array()
+        .expect("tool definitions should be an array")
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .collect();
+    let unique_tool_names: std::collections::HashSet<&str> = tool_names.iter().copied().collect();
+
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.result, "Frontend task complete.");
+    assert!(body.get("reasoning_effort").is_none());
+    assert!(body.get("enable_thinking").is_none());
+    assert_eq!(
+        tool_names.len(),
+        unique_tool_names.len(),
+        "sub-agent requests should not duplicate tool definitions"
+    );
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
 async fn run_subagent_sequential_tools_emit_interleaved_tool_events() {
     let workspace = unique_temp_workspace("lingclaw-subagent-sequential-tool-events");
     let _ = fs::remove_dir_all(&workspace);
@@ -1305,6 +1633,7 @@ async fn parallel_batch_interrupt_fires_hooks_only_for_completed_tools() {
             output: "file contents here".to_string(),
             is_error: false,
             duration_ms: 1,
+            subagent_snapshot: None,
         })
     })
         as std::pin::Pin<
@@ -1753,22 +2082,166 @@ fn test_compute_layers_diamond() {
 }
 
 #[test]
+fn test_validate_plan_infers_dependencies_from_prompt_placeholders() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // Use a deterministic built-in agent name rather than relying on
+    // discover_all_agents() ordering, which is filesystem-dependent.
+    let agent_name = "explore".to_string();
+    let tasks = vec![
+        OrchestrationTask {
+            id: "project_spec".into(),
+            agent: agent_name.clone(),
+            prompt: "Write the project specification".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "frontend_dev".into(),
+            agent: agent_name.clone(),
+            prompt: "Build the frontend from {{results.project_spec}}".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "backend_dev".into(),
+            agent: agent_name.clone(),
+            prompt: "Build the backend from {{results.project_spec}}".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "frontend_review".into(),
+            agent: agent_name.clone(),
+            prompt: "Review {{results.frontend_dev}}".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "backend_review".into(),
+            agent: agent_name.clone(),
+            prompt: "Review {{results.backend_dev}}".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "integration_review".into(),
+            agent: agent_name,
+            prompt: "Integrate {{results.frontend_review}} with {{results.backend_review}}".into(),
+            depends_on: vec![],
+        },
+    ];
+
+    let plan =
+        validate_plan(tasks, workspace).expect("placeholder references should infer dependencies");
+    let layers = compute_execution_layers(&plan);
+
+    assert_eq!(plan.tasks[1].depends_on, vec!["project_spec"]);
+    assert_eq!(plan.tasks[2].depends_on, vec!["project_spec"]);
+    assert_eq!(plan.tasks[3].depends_on, vec!["frontend_dev"]);
+    assert_eq!(plan.tasks[4].depends_on, vec!["backend_dev"]);
+    assert_eq!(
+        plan.tasks[5].depends_on,
+        vec!["frontend_review", "backend_review"]
+    );
+    assert_eq!(layers.len(), 4);
+    assert_eq!(layers[0], vec![0]);
+    assert_eq!(layers[1].len(), 2);
+    assert!(layers[1].contains(&1));
+    assert!(layers[1].contains(&2));
+    assert_eq!(layers[2].len(), 2);
+    assert!(layers[2].contains(&3));
+    assert!(layers[2].contains(&4));
+    assert_eq!(layers[3], vec![5]);
+}
+
+#[test]
+fn test_validate_plan_merges_explicit_and_prompt_dependencies_without_duplicates() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let agent_name = "explore".to_string();
+    let tasks = vec![
+        OrchestrationTask {
+            id: "explore".into(),
+            agent: agent_name.clone(),
+            prompt: "Explore the codebase".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "research".into(),
+            agent: agent_name.clone(),
+            prompt: "Research the API".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "implement".into(),
+            agent: agent_name,
+            prompt: "Implement using {{results.explore}} and {{results.research}} and {{results.explore}} again".into(),
+            depends_on: vec!["explore".into()],
+        },
+    ];
+
+    let plan =
+        validate_plan(tasks, workspace).expect("explicit and inferred dependencies should merge");
+
+    assert_eq!(plan.tasks[2].depends_on, vec!["explore", "research"]);
+}
+
+#[test]
+fn test_validate_plan_ignores_unknown_prompt_placeholders() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let agent_name = "explore".to_string();
+    let tasks = vec![
+        OrchestrationTask {
+            id: "spec".into(),
+            agent: agent_name.clone(),
+            prompt: "Write the specification".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "implement".into(),
+            agent: agent_name,
+            prompt: "Use {{results.spec}} and keep {{results.literal_example}} verbatim".into(),
+            depends_on: vec![],
+        },
+    ];
+
+    let plan = validate_plan(tasks, workspace)
+        .expect("unknown prompt placeholders should not invalidate the plan");
+
+    assert_eq!(plan.tasks[1].depends_on, vec!["spec"]);
+}
+
+#[test]
 fn test_validate_plan_rejects_non_placeholder_compatible_task_id() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let agent_name = discover_all_agents(workspace)
-        .into_iter()
-        .next()
-        .expect("expected at least one built-in agent")
-        .name;
     let tasks = vec![OrchestrationTask {
         id: "bad id".into(),
-        agent: agent_name,
+        agent: "explore".into(),
         prompt: "Do work".into(),
         depends_on: vec![],
     }];
 
     let err = validate_plan(tasks, workspace).expect_err("invalid task id should be rejected");
     assert!(err.contains("must use only ASCII letters, digits, '_' or '-'"));
+}
+
+#[test]
+fn test_validate_plan_rejects_cycle_introduced_by_prompt_placeholders() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // task_a implicitly depends on task_b via placeholder,
+    // and task_b implicitly depends on task_a — a cycle.
+    let tasks = vec![
+        OrchestrationTask {
+            id: "task_a".into(),
+            agent: "explore".into(),
+            prompt: "Do work with {{results.task_b}}".into(),
+            depends_on: vec![],
+        },
+        OrchestrationTask {
+            id: "task_b".into(),
+            agent: "explore".into(),
+            prompt: "Do work with {{results.task_a}}".into(),
+            depends_on: vec![],
+        },
+    ];
+
+    let err = validate_plan(tasks, workspace)
+        .expect_err("cycle via inferred prompt placeholders should be rejected");
+    assert!(err.contains("cycle"), "error should mention cycle: {err}");
 }
 
 #[tokio::test]

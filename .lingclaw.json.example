@@ -55,6 +55,32 @@
           }
         ]
       },
+      "deepseek": {
+        "baseUrl": "https://api.deepseek.com/v1",
+        "apiKey": "sk-your-deepseek-key",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "deepseek-chat",
+            "name": "deepseek-chat",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 128000,
+            "maxTokens": 8192
+          },
+          {
+            "id": "deepseek-reasoner",
+            "name": "deepseek-reasoner",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 128000,
+            "maxTokens": 8192,
+            "compat": { "thinkingFormat": "deepseek-v4" }
+          }
+        ]
+      },
       "anthropic": {
         "baseUrl": "https://api.anthropic.com",
         "apiKey": "sk-ant-your-anthropic-key",
@@ -92,6 +118,31 @@
             "input": ["text", "image"],
             "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
             "contextWindow": 200000,
+            "maxTokens": 8192
+          }
+        ]
+      },
+      "gemini": {
+        "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+        "apiKey": "AIza-your-gemini-key",
+        "api": "gemini",
+        "models": [
+          {
+            "id": "gemini-2.5-flash",
+            "name": "gemini-2.5-flash",
+            "reasoning": false,
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 1048576,
+            "maxTokens": 8192
+          },
+          {
+            "id": "gemini-2.5-pro",
+            "name": "gemini-2.5-pro",
+            "reasoning": true,
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 1048576,
             "maxTokens": 8192
           }
         ]
@@ -138,6 +189,12 @@
         "primary": "openai/gpt-4o-mini",
         "fast": "openai-2/gpt-4o-mini",
         "sub-agent": "openai-2/gpt-4o-mini",
+        "sub-agent-frontend-coder": "openai/gpt-4o",
+        "sub-agent-backend-coder": "anthropic/claude-sonnet-4-20250514",
+        "sub-agent-general-coder": "openai/gpt-4o",
+        "sub-agent-explore": "openai-2/gpt-4o-mini",
+        "sub-agent-researcher": "anthropic/claude-sonnet-4-20250514",
+        "sub-agent-reviewer": "anthropic/claude-sonnet-4-20250514",
         "memory": "openai-2/gpt-4o-mini",
         "reflection": "anthropic/claude-sonnet-4-20250514",
         "context": "anthropic-2/claude-haiku-3-20250306"

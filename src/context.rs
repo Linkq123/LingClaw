@@ -104,21 +104,10 @@ const CONTEXT_REPLY_RESERVE_RATIO_DIVISOR: usize = 10;
 const CONTEXT_REPLY_RESERVE_CAP_DIVISOR: usize = 5;
 const REQUEST_STRUCTURAL_OVERHEAD_TOKENS: usize = 256;
 
-fn anthropic_thinking_budget_tokens(level: &str) -> usize {
-    match level {
-        "minimal" => 1_024,
-        "low" => 4_096,
-        "medium" => 10_240,
-        "high" => 16_384,
-        "xhigh" => 32_768,
-        _ => 10_240,
-    }
-}
-
 pub(crate) fn message_token_len_for_provider(provider: Provider, message: &ChatMessage) -> usize {
     let base = message_token_len(message);
     match provider {
-        Provider::OpenAI | Provider::Ollama => {
+        Provider::OpenAI | Provider::Ollama | Provider::Gemini => {
             let tool_call_overhead = message
                 .tool_calls
                 .as_ref()
@@ -137,12 +126,13 @@ pub(crate) fn message_token_len_for_provider(provider: Provider, message: &ChatM
                 .as_ref()
                 .map(|calls| calls.len() * ANTHROPIC_TOOL_USE_OVERHEAD_TOKENS)
                 .unwrap_or(0);
+            let thinking_block_tokens = anthropic_thinking_block_tokens(message);
             let tool_result_overhead = if message.role == "tool" {
                 ANTHROPIC_TOOL_RESULT_OVERHEAD_TOKENS
             } else {
                 0
             };
-            base + tool_use_overhead + tool_result_overhead
+            base + tool_use_overhead + tool_result_overhead + thinking_block_tokens
         }
     }
 }
@@ -158,7 +148,7 @@ pub(crate) fn context_input_budget_for_model(config: &Config, model_ref: &str) -
     let ctx_limit = config.context_limit_for_model(model_ref);
     let resolved = config.resolve_model(model_ref);
     let provider_floor = match resolved.provider {
-        Provider::OpenAI | Provider::Ollama => OPENAI_MIN_REPLY_RESERVE_TOKENS,
+        Provider::OpenAI | Provider::Ollama | Provider::Gemini => OPENAI_MIN_REPLY_RESERVE_TOKENS,
         Provider::Anthropic => ANTHROPIC_MIN_REPLY_RESERVE_TOKENS,
     };
     let ratio_reserve = ctx_limit / CONTEXT_REPLY_RESERVE_RATIO_DIVISOR;
@@ -175,24 +165,20 @@ pub(crate) fn context_input_budget_for_model(config: &Config, model_ref: &str) -
 pub(crate) fn context_input_budget_for_runtime(
     config: &Config,
     model_ref: &str,
-    think_level: &str,
+    _think_level: &str,
 ) -> usize {
     let ctx_limit = config.context_limit_for_model(model_ref);
     let resolved = config.resolve_model(model_ref);
     let provider_floor = match resolved.provider {
-        Provider::OpenAI | Provider::Ollama => OPENAI_MIN_REPLY_RESERVE_TOKENS,
+        Provider::OpenAI | Provider::Ollama | Provider::Gemini => OPENAI_MIN_REPLY_RESERVE_TOKENS,
         Provider::Anthropic => ANTHROPIC_MIN_REPLY_RESERVE_TOKENS,
     };
     let ratio_reserve = ctx_limit / CONTEXT_REPLY_RESERVE_RATIO_DIVISOR;
-    let mut model_reserve = resolved
+    let model_reserve = resolved
         .max_tokens
         .map(|value| value as usize)
         .unwrap_or(provider_floor)
         .min(ctx_limit / CONTEXT_REPLY_RESERVE_CAP_DIVISOR);
-
-    if resolved.provider == Provider::Anthropic && think_level != "off" {
-        model_reserve = model_reserve.saturating_add(anthropic_thinking_budget_tokens(think_level));
-    }
 
     let reserve = provider_floor.max(ratio_reserve).max(model_reserve);
     let minimum_budget = ctx_limit.min(1_024);
@@ -216,6 +202,9 @@ fn builtin_tool_definitions_for_provider(provider: Provider) -> Vec<serde_json::
         }
         Provider::Ollama => {
             serde_json::from_value(crate::tools::tool_definitions_ollama()).unwrap_or_default()
+        }
+        Provider::Gemini => {
+            serde_json::from_value(crate::tools::tool_definitions_gemini()).unwrap_or_default()
         }
         Provider::Anthropic => {
             serde_json::from_value(crate::tools::tool_definitions_anthropic()).unwrap_or_default()
@@ -429,6 +418,36 @@ fn is_cjk_like(c: char) -> bool {
             | '\u{30A0}'..='\u{30FF}'
             | '\u{AC00}'..='\u{D7AF}'
     )
+}
+
+fn anthropic_thinking_block_tokens(message: &ChatMessage) -> usize {
+    message
+        .anthropic_thinking_blocks
+        .as_ref()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .map(|block| {
+                    let payload_tokens = block
+                        .thinking
+                        .as_deref()
+                        .map(estimate_text_tokens)
+                        .unwrap_or(0)
+                        + block
+                            .signature
+                            .as_deref()
+                            .map(estimate_text_tokens)
+                            .unwrap_or(0)
+                        + block.data.as_deref().map(estimate_text_tokens).unwrap_or(0);
+                    if payload_tokens == 0 {
+                        0
+                    } else {
+                        payload_tokens + 4
+                    }
+                })
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 pub(crate) fn message_token_len(message: &ChatMessage) -> usize {

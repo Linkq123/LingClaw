@@ -19,18 +19,74 @@ use tokio_util::sync::CancellationToken;
 
 use super::SubAgentSpec;
 use crate::{
-    ChatMessage, Config, LiveTx, agent, context,
+    ChatMessage, Config, LiveTx, SubagentHistorySnapshot, SubagentToolHistorySnapshot, agent,
+    context,
     hooks::{self, HookRegistry, ToolHookInput, run_tool_hooks},
-    live_send, providers, tools, truncate,
+    live_send, prompts, providers, tools, truncate,
 };
 
 /// Maximum characters in the sub-agent's final result returned to the parent.
 const MAX_RESULT_CHARS: usize = 30_000;
+const MAX_SNAPSHOT_REASONING_CHARS: usize = 12_000;
+const MAX_SNAPSHOT_TOOL_ARGS_CHARS: usize = 4_000;
+const MAX_SNAPSHOT_TOOL_RESULT_CHARS: usize = 8_000;
+const MAX_SNAPSHOT_RESULT_CHARS: usize = 4_000;
+const DELEGATED_PROMPT_CONTEXT_HEADING: &str = "## Delegated Task Context";
+
+fn append_reasoning_snapshot(snapshot: &mut SubagentHistorySnapshot, cycle: usize, text: &str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let entry = format!("[Cycle {cycle}]\n{trimmed}");
+    let reasoning = snapshot.reasoning.get_or_insert_with(String::new);
+    if !reasoning.is_empty() {
+        reasoning.push_str("\n\n");
+    }
+    reasoning.push_str(&entry);
+    if reasoning.len() > MAX_SNAPSHOT_REASONING_CHARS {
+        *reasoning = truncate(reasoning, MAX_SNAPSHOT_REASONING_CHARS).to_string();
+    }
+}
+
+fn truncated_option(text: &str, limit: usize) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(truncate(trimmed, limit).to_string())
+    }
+}
 
 pub(crate) struct ParallelToolBatchResult {
     pub results: Vec<Option<tools::ToolOutcome>>,
     pub interrupted: bool,
     pub timed_out: bool,
+}
+
+pub(crate) fn augment_subagent_prompt_with_runtime_context(
+    prompt: &str,
+    local_time: &str,
+) -> String {
+    if prompt
+        .trim_start()
+        .starts_with(DELEGATED_PROMPT_CONTEXT_HEADING)
+    {
+        return prompt.to_string();
+    }
+
+    format!(
+        "{DELEGATED_PROMPT_CONTEXT_HEADING}\n\
+         - Current system local time: {local_time}\n\n\
+         ## Delegated Task\n\
+         {}",
+        prompt.trim()
+    )
+}
+
+pub(crate) fn augment_subagent_prompt_with_current_time(prompt: &str) -> String {
+    let local_time = prompts::current_local_snapshot().datetime_label();
+    augment_subagent_prompt_with_runtime_context(prompt, &local_time)
 }
 
 pub(crate) async fn collect_parallel_tool_results(
@@ -139,6 +195,7 @@ fn interrupted_parallel_tool_outcome(
         output,
         is_error: true,
         duration_ms,
+        subagent_snapshot: None,
     }
 }
 
@@ -247,13 +304,92 @@ pub(crate) struct SubAgentOutcome {
     pub total_output_tokens: u64,
     /// Per-provider usage aggregated across the sub-agent run.
     pub provider_usage: HashMap<String, [u64; 2]>,
+    /// Compact history snapshot for restoring delegated task cards after reload.
+    pub history_snapshot: crate::SubagentHistorySnapshot,
 }
 
 /// Resolve which model a sub-agent should use.
-/// Sub-agents always use the runtime config: `sub_agent_model` when set,
-/// otherwise the primary model.
-pub(crate) fn resolve_subagent_model(config: &Config) -> &str {
-    config.sub_agent_model.as_deref().unwrap_or(&config.model)
+/// Fallback chain: `sub-agent-<name>` -> `sub-agent` -> primary.
+pub(crate) fn resolve_subagent_model<'a>(config: &'a Config, agent_name: &str) -> &'a str {
+    config.sub_agent_model_for(agent_name)
+}
+
+fn accumulate_usage(
+    total_input_tokens: &mut u64,
+    total_output_tokens: &mut u64,
+    provider_usage: &mut HashMap<String, [u64; 2]>,
+    provider_name: &str,
+    input_used: u64,
+    output_used: u64,
+) {
+    *total_input_tokens = total_input_tokens.saturating_add(input_used);
+    *total_output_tokens = total_output_tokens.saturating_add(output_used);
+    let entry = provider_usage
+        .entry(context::usage_provider_label(provider_name))
+        .or_insert([0, 0]);
+    entry[0] = entry[0].saturating_add(input_used);
+    entry[1] = entry[1].saturating_add(output_used);
+}
+
+fn last_assistant_message(messages: &[ChatMessage]) -> Option<&ChatMessage> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+}
+
+fn final_assistant_content(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "assistant" && message.has_nonempty_content())
+        .and_then(|message| message.content.clone())
+        .unwrap_or_default()
+}
+
+fn needs_forced_final_response(messages: &[ChatMessage]) -> bool {
+    last_assistant_message(messages)
+        .is_some_and(|message| message.has_tool_calls() || !message.has_nonempty_content())
+}
+
+fn build_forced_final_response_prompt() -> String {
+    "The delegated run is ending now. Provide your final response for the parent agent using only the information already gathered. Follow your normal output format. Do not call tools, do not continue investigating, and do not end with a note about checking more files.".to_string()
+}
+
+async fn request_forced_final_response(
+    model_id: &str,
+    resolved: &providers::ResolvedModel,
+    config: &Config,
+    http: &Client,
+    workspace: &Path,
+    messages: &[ChatMessage],
+) -> Result<(Vec<ChatMessage>, providers::SimpleLlmResponse), String> {
+    let mut final_messages = messages.to_vec();
+    final_messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some(build_forced_final_response_prompt()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+
+    let budget = context::message_budget_for_tool_defs(config, model_id, "off", &[]);
+    context::prune_messages_for_provider(&mut final_messages, resolved.provider, budget);
+
+    let response = providers::call_llm_simple_with_usage(
+        http,
+        resolved,
+        &final_messages,
+        workspace,
+        config.s3.as_ref(),
+        config.max_llm_retries,
+    )
+    .await?;
+
+    Ok((final_messages, response))
 }
 
 /// Run a sub-agent with full isolation.
@@ -275,7 +411,7 @@ pub(crate) async fn run_subagent(
     hooks: &HookRegistry,
     task_id: &str,
 ) -> SubAgentOutcome {
-    let model_id = resolve_subagent_model(config).to_string();
+    let model_id = resolve_subagent_model(config, &spec.name).to_string();
     let resolved = config.resolve_model(&model_id);
     let provider_name = config.resolve_provider_name(&model_id);
 
@@ -295,6 +431,8 @@ pub(crate) async fn run_subagent(
             role: "system".into(),
             content: Some(system_prompt),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -303,6 +441,8 @@ pub(crate) async fn run_subagent(
             role: "user".into(),
             content: Some(prompt.to_string()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -314,6 +454,7 @@ pub(crate) async fn run_subagent(
     let mut total_input_tokens: u64 = 0;
     let mut total_output_tokens: u64 = 0;
     let mut provider_usage: HashMap<String, [u64; 2]> = HashMap::new();
+    let mut history_snapshot = SubagentHistorySnapshot::default();
     let mut aborted = false;
     let mut timed_out = false;
 
@@ -356,7 +497,10 @@ pub(crate) async fn run_subagent(
         // tool schema tokens, and structural overhead — matching the main loop's
         // request_message_budget_for_runtime but using the sub-agent's actual
         // (filtered) tool definitions instead of all builtins + extras.
-        let think_level = "medium";
+        // Let provider/model capabilities decide whether delegated runs should
+        // send reasoning controls. This avoids 400s on OpenAI-compatible
+        // models that reject `reasoning_effort` or similar fields.
+        let think_level = "auto";
         let budget =
             context::message_budget_for_tool_defs(config, &model_id, think_level, &tool_defs);
         context::prune_messages_for_provider(&mut messages, resolved.provider, budget);
@@ -395,7 +539,7 @@ pub(crate) async fn run_subagent(
                         let _ = forward_handle.await;
                         break 'react;
                     }
-                    result = providers::call_llm_stream(
+                    result = providers::call_llm_stream_with_tool_mode(
                         http,
                         &resolved,
                         &messages,
@@ -404,6 +548,7 @@ pub(crate) async fn run_subagent(
                         &sub_tx,
                         think_level,
                         &tool_defs,
+                        false,
                         config.max_llm_retries,
                     ) => {
                         drop(sub_tx);
@@ -448,13 +593,18 @@ pub(crate) async fn run_subagent(
                 let output_used = resp.output_tokens.unwrap_or_else(|| {
                     context::message_token_len_for_provider(resolved.provider, &resp.message) as u64
                 });
-                total_input_tokens = total_input_tokens.saturating_add(input_used);
-                total_output_tokens = total_output_tokens.saturating_add(output_used);
-                let entry = provider_usage
-                    .entry(context::usage_provider_label(&provider_name))
-                    .or_insert([0, 0]);
-                entry[0] = entry[0].saturating_add(input_used);
-                entry[1] = entry[1].saturating_add(output_used);
+                accumulate_usage(
+                    &mut total_input_tokens,
+                    &mut total_output_tokens,
+                    &mut provider_usage,
+                    &provider_name,
+                    input_used,
+                    output_used,
+                );
+
+                if let Some(thinking) = resp.message.thinking.as_deref() {
+                    append_reasoning_snapshot(&mut history_snapshot, cycles, thinking);
+                }
 
                 messages.push(resp.message.clone());
 
@@ -465,10 +615,19 @@ pub(crate) async fn run_subagent(
 
                 // Execute tool calls — parallel for read-only batches, sequential otherwise.
                 if let Some(ref tool_calls) = resp.message.tool_calls {
-                    let all_read_only = tool_calls.len() > 1
-                        && tool_calls
-                            .iter()
-                            .all(|tc| tools::is_read_only_tool(&tc.function.name));
+                    let mut all_read_only = tool_calls.len() > 1;
+                    if all_read_only {
+                        for tc in tool_calls {
+                            if !tools::is_parallelizable_tool_call(
+                                &tc.function.name,
+                                config,
+                                workspace,
+                            ) {
+                                all_read_only = false;
+                                break;
+                            }
+                        }
+                    }
 
                     if !all_read_only {
                         // ── Sequential path ──────────────────────────────────────
@@ -495,6 +654,8 @@ pub(crate) async fn run_subagent(
                                     role: "tool".into(),
                                     content: Some(result_msg),
                                     images: None,
+                                    thinking: None,
+                                    anthropic_thinking_blocks: None,
                                     tool_calls: None,
                                     tool_call_id: Some(tc.id.clone()),
                                     timestamp: None,
@@ -535,6 +696,8 @@ pub(crate) async fn run_subagent(
                                         role: "tool".into(),
                                         content: Some(format!("[rejected by hook] {reason}")),
                                         images: None,
+                                        thinking: None,
+                                        anthropic_thinking_blocks: None,
                                         tool_calls: None,
                                         tool_call_id: Some(tc.id.clone()),
                                         timestamp: None,
@@ -572,6 +735,7 @@ pub(crate) async fn run_subagent(
                                         config,
                                         http,
                                         workspace,
+                                        false,
                                     )
                                     .await,
                                     false,
@@ -584,6 +748,7 @@ pub(crate) async fn run_subagent(
                                         config,
                                         http,
                                         workspace,
+                                        false,
                                     ) => (res, false),
                                     _ = tokio::time::sleep_until(deadline) => {
                                         timed_out = true;
@@ -596,6 +761,7 @@ pub(crate) async fn run_subagent(
                                                 ),
                                                 is_error: true,
                                                 duration_ms: tool_started.elapsed().as_millis() as u64,
+                                                subagent_snapshot: None,
                                             },
                                             true,
                                         )
@@ -627,10 +793,27 @@ pub(crate) async fn run_subagent(
                             )
                             .await;
 
+                            history_snapshot.tools.push(SubagentToolHistorySnapshot {
+                                id: tc.id.clone(),
+                                name: tc.function.name.clone(),
+                                arguments: truncated_option(
+                                    &effective_args,
+                                    MAX_SNAPSHOT_TOOL_ARGS_CHARS,
+                                ),
+                                result: truncated_option(
+                                    &outcome.output,
+                                    MAX_SNAPSHOT_TOOL_RESULT_CHARS,
+                                ),
+                                is_error: outcome.is_error,
+                                duration_ms: outcome.duration_ms,
+                            });
+
                             messages.push(ChatMessage {
                                 role: "tool".into(),
                                 content: Some(outcome.output),
                                 images: None,
+                                thinking: None,
+                                anthropic_thinking_blocks: None,
                                 tool_calls: None,
                                 tool_call_id: Some(tc.id.clone()),
                                 timestamp: None,
@@ -642,9 +825,10 @@ pub(crate) async fn run_subagent(
                         }
                     } else {
                         // ── Parallel path for read-only tool batches ─────────────
-                        // Covers built-in read-only tools only.
-                        // MCP read-only classification is a permission heuristic,
-                        // not a strong enough signal for safe parallel scheduling.
+                        // Covers built-in read-only tools plus MCP tools whose
+                        // descriptors are conservatively classified as read-only.
+                        // MCP calls in this path use isolated sessions so they
+                        // do not serialize behind the shared session cache.
                         // Mirrors the parent run_act_phase() 4-phase pattern:
                         //   1. Sequential hook evaluation
                         //   2. Send task_tool events
@@ -775,7 +959,10 @@ pub(crate) async fn run_subagent(
                                 let cl = http.clone();
                                 let ws = workspace.to_path_buf();
                                 Box::pin(async move {
-                                    Some(execute_subagent_tool(&name, &args, &cfg, &cl, &ws).await)
+                                    Some(
+                                        execute_subagent_tool(&name, &args, &cfg, &cl, &ws, true)
+                                            .await,
+                                    )
                                 })
                             })
                             .collect();
@@ -803,6 +990,8 @@ pub(crate) async fn run_subagent(
                                     role: "tool".into(),
                                     content: Some(rejected_msg),
                                     images: None,
+                                    thinking: None,
+                                    anthropic_thinking_blocks: None,
                                     tool_calls: None,
                                     tool_call_id: Some(tc.id.clone()),
                                     timestamp: None,
@@ -836,10 +1025,23 @@ pub(crate) async fn run_subagent(
                                 &outcome,
                             )
                             .await;
+                            history_snapshot.tools.push(SubagentToolHistorySnapshot {
+                                id: tc.id.clone(),
+                                name: tc.function.name.clone(),
+                                arguments: truncated_option(eff_args, MAX_SNAPSHOT_TOOL_ARGS_CHARS),
+                                result: truncated_option(
+                                    &outcome.output,
+                                    MAX_SNAPSHOT_TOOL_RESULT_CHARS,
+                                ),
+                                is_error: outcome.is_error,
+                                duration_ms: outcome.duration_ms,
+                            });
                             messages.push(ChatMessage {
                                 role: "tool".into(),
                                 content: Some(outcome.output),
                                 images: None,
+                                thinking: None,
+                                anthropic_thinking_blocks: None,
                                 tool_calls: None,
                                 tool_call_id: Some(tc.id.clone()),
                                 timestamp: None,
@@ -856,6 +1058,18 @@ pub(crate) async fn run_subagent(
                 // LLM error — abort sub-agent.
                 // Do NOT send task_failed here; execute_task_tool() in
                 // runtime_loop.rs sends the final event based on outcome.aborted.
+                history_snapshot.cycles = cycles;
+                history_snapshot.tool_calls = total_tool_calls;
+                history_snapshot.input_tokens = total_input_tokens;
+                history_snapshot.output_tokens = total_output_tokens;
+                history_snapshot.success = false;
+                history_snapshot.error = Some(
+                    truncate(
+                        &format!("Sub-agent '{}' failed: {}", spec.name, error),
+                        MAX_SNAPSHOT_RESULT_CHARS,
+                    )
+                    .to_string(),
+                );
                 return SubAgentOutcome {
                     result: format!("Sub-agent '{}' failed: {}", spec.name, error),
                     cycles,
@@ -864,18 +1078,65 @@ pub(crate) async fn run_subagent(
                     total_input_tokens,
                     total_output_tokens,
                     provider_usage,
+                    history_snapshot,
                 };
             }
         }
     }
 
-    // Extract final result from the last assistant message
-    let final_content = messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "assistant" && m.has_nonempty_content())
-        .and_then(|m| m.content.clone())
-        .unwrap_or_default();
+    if !aborted && needs_forced_final_response(&messages) {
+        match request_forced_final_response(
+            &model_id, &resolved, config, http, workspace, &messages,
+        )
+        .await
+        {
+            Ok((forced_messages, forced_response))
+                if !forced_response.content.trim().is_empty() =>
+            {
+                let final_message = ChatMessage {
+                    role: "assistant".into(),
+                    content: Some(forced_response.content),
+                    images: None,
+                    thinking: None,
+                    anthropic_thinking_blocks: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: None,
+                };
+                let input_used = forced_response.input_tokens.unwrap_or_else(|| {
+                    context::estimate_tokens_for_provider(resolved.provider, &forced_messages)
+                        as u64
+                });
+                let output_used = forced_response.output_tokens.unwrap_or_else(|| {
+                    context::message_token_len_for_provider(resolved.provider, &final_message)
+                        as u64
+                });
+                accumulate_usage(
+                    &mut total_input_tokens,
+                    &mut total_output_tokens,
+                    &mut provider_usage,
+                    &provider_name,
+                    input_used,
+                    output_used,
+                );
+                messages.push(final_message);
+            }
+            Ok(_) => {
+                eprintln!(
+                    "Sub-agent '{}' forced final response returned empty content",
+                    spec.name
+                );
+            }
+            Err(error) => {
+                eprintln!(
+                    "Sub-agent '{}' forced final response failed: {}",
+                    spec.name, error
+                );
+            }
+        }
+    }
+
+    let final_content = final_assistant_content(&messages);
 
     let result = if timed_out {
         let partial = truncate(&final_content, MAX_RESULT_CHARS.saturating_sub(200));
@@ -906,6 +1167,18 @@ pub(crate) async fn run_subagent(
         truncate(&final_content, MAX_RESULT_CHARS).to_string()
     };
 
+    history_snapshot.cycles = cycles;
+    history_snapshot.tool_calls = total_tool_calls;
+    history_snapshot.input_tokens = total_input_tokens;
+    history_snapshot.output_tokens = total_output_tokens;
+    history_snapshot.success = !aborted;
+    if aborted {
+        history_snapshot.error = Some(truncate(&result, MAX_SNAPSHOT_RESULT_CHARS).to_string());
+    } else {
+        history_snapshot.result_excerpt =
+            Some(truncate(&result, MAX_SNAPSHOT_RESULT_CHARS).to_string());
+    }
+
     SubAgentOutcome {
         result,
         cycles,
@@ -914,6 +1187,7 @@ pub(crate) async fn run_subagent(
         total_input_tokens,
         total_output_tokens,
         provider_usage,
+        history_snapshot,
     }
 }
 
@@ -994,6 +1268,13 @@ fn build_filtered_tool_defs(
                     "input_schema": (spec.parameters)(),
                 })
             }
+            crate::config::Provider::Gemini => {
+                json!({
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": crate::tools::gemini_tool_parameters((spec.parameters)()),
+                })
+            }
         })
         .collect();
 
@@ -1021,6 +1302,13 @@ fn build_filtered_tool_defs(
                     "input_schema": descriptor.input_schema,
                 })
             }
+            crate::config::Provider::Gemini => {
+                json!({
+                    "name": descriptor.exposed_name,
+                    "description": descriptor.description,
+                    "parameters": crate::tools::gemini_tool_parameters(descriptor.input_schema),
+                })
+            }
         };
         defs.push(def);
     }
@@ -1037,8 +1325,15 @@ async fn execute_subagent_tool(
     config: &Config,
     http: &Client,
     workspace: &Path,
+    isolated_mcp_session: bool,
 ) -> tools::ToolOutcome {
-    if let Some(result) = tools::mcp::execute_tool(name, args_str, config, workspace).await {
+    let mcp_result = if isolated_mcp_session {
+        tools::mcp::execute_tool_isolated(name, args_str, config, workspace).await
+    } else {
+        tools::mcp::execute_tool(name, args_str, config, workspace).await
+    };
+
+    if let Some(result) = mcp_result {
         result
     } else {
         tools::execute_tool(name, args_str, config, http, workspace).await

@@ -4,22 +4,17 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>LingClaw</title>
-<link rel="icon" type="image/png" href="branding/logo-mark.png">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" integrity="sha384-eFTL69TLRZTkNfYZOLM+G04821K1qZao/4QLJbet1pP4tcF+fdXq/9CdqAbWRl/L" crossorigin="anonymous" media="(prefers-color-scheme: light), (prefers-color-scheme: no-preference)">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" integrity="sha384-wH75j6z1lH97ZOpMOInqhgKzFkAInZPPSPlZpYKYTOqsaizPvhQZmAtLcPKXpLyH" crossorigin="anonymous" media="(prefers-color-scheme: dark)">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.css" integrity="sha384-n8MVd4RsNIU0tAv4ct0nTaAbDJwPJzDEaqSD1odI+WdtXRGWt2kTvGFasHpSy3SV" crossorigin="anonymous">
-<link rel="stylesheet" href="css/base.css">
-<link rel="stylesheet" href="css/layout.css">
-<link rel="stylesheet" href="css/chat.css">
-<link rel="stylesheet" href="css/panels.css">
-<link rel="stylesheet" href="css/pages.css">
-<link rel="stylesheet" href="css/responsive.css">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js" integrity="sha384-F/bZzf7p3Joyp5psL90p/p89AZJsndkSoGwRpXcZhleCWhd8SnRuoYo4d0yirjJp" crossorigin="anonymous"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/marked/12.0.0/marked.min.js" integrity="sha384-NNQgBjjuhtXzPmmy4gurS5X7P4uTt1DThyevz4Ua0IVK5+kazYQI1W27JHjbbxQz" crossorigin="anonymous"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js" integrity="sha384-+VfUPEb0PdtChMwmBcBmykRMDd+v6D/oFmB3rZM/puCMDYcIvF968OimRh4KQY9a" crossorigin="anonymous"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.9/katex.min.js" integrity="sha384-XjKyOOlGwcjNTAIQHIpgOno0Hl1YQqzUOEleOLALmuqehneUG+vnGctmUb0ZY0l8" crossorigin="anonymous"></script>
+<link rel="icon" type="image/png" href="/branding/logo-mark.png">
+  <script type="module" crossorigin src="/assets/index-B7PvAbUw.js"></script>
+  <link rel="modulepreload" crossorigin href="/assets/vendor-utils-CqkleIqs.js">
+  <link rel="modulepreload" crossorigin href="/assets/react-B-rQfcWf.js">
+  <link rel="stylesheet" crossorigin href="/assets/index-iLq6qzK2.css">
 </head>
 <body>
+
+<!-- Skip link — lets keyboard users jump past the header straight to the
+     composer. Visible only on focus. -->
+<a class="skip-link" href="#input">Skip to message input</a>
 
 <!-- Main -->
 <div class="main">
@@ -29,8 +24,9 @@
       <span class="conn-label" id="conn-label">Offline</span>
     </div>
     <div class="brand-block">
-      <img class="brand-logo" src="branding/logo-mark.png" alt="" width="28" height="28">
+      <img class="brand-logo" src="/branding/logo-mark.png" alt="" width="28" height="28">
       <span class="session-name" id="session-name">LingClaw</span>
+      <button id="theme-toggle-btn" class="theme-toggle-btn header-theme-toggle" data-action="toggle-theme" aria-label="Toggle theme" title="Toggle theme">◐ Auto</button>
       <span class="app-version-badge header-version" id="app-version-header" hidden></span>
     </div>
     <span class="session-id" id="session-id"></span>
@@ -45,6 +41,8 @@
       <button class="mobile-hide" data-action="cmd" data-cmd="/help" aria-label="Show help">Help</button>
       <button class="mobile-menu-toggle" id="mobile-menu-toggle" data-action="toggle-mobile-menu" aria-label="More actions" aria-expanded="false" aria-controls="mobile-menu">⋯</button>
       <div class="mobile-menu" id="mobile-menu" role="menu">
+        <button data-action="toggle-theme">Toggle theme</button>
+        <button data-action="show-shortcuts">Shortcuts</button>
         <button data-action="nav-settings">Settings</button>
         <button data-action="nav-usage">Usage</button>
         <button data-action="cmd-close-menu" data-cmd="/status">Status</button>
@@ -55,7 +53,7 @@
   </header>
   <div id="chat" role="log" aria-live="polite">
     <div class="welcome" id="welcome">
-      <div class="welcome-logo"><img src="branding/logo-wordmark.png" alt="LingClaw"></div>
+      <div class="welcome-logo"><img src="/branding/logo-wordmark.png" alt="LingClaw"></div>
       <div class="app-version-badge welcome-version" id="app-version-welcome" hidden></div>
       <div class="welcome-hint">
         你的私人 AI 助手已就绪<br>
@@ -92,7 +90,7 @@
         </div>
       </div>
       <input type="file" id="image-file-input" accept="image/jpeg,image/png" multiple hidden />
-      <textarea id="input" placeholder="Message LingClaw... (/ for commands)" rows="1" aria-label="Message input"></textarea>
+      <textarea id="input" placeholder="Message LingClaw... (/ for commands)" rows="1" aria-label="Message input" enterkeyhint="send" autocomplete="off" autocapitalize="sentences" spellcheck="true"></textarea>
       <button id="stop" aria-label="Stop agent" title="Stop" style="display:none"><span id="stop-icon">■</span></button>
       <button id="send" aria-label="Send message"><span id="send-icon">↑</span></button>
     </div>
@@ -101,72 +99,11 @@
 
 <div class="tool-drawer-backdrop" id="tool-drawer-backdrop" data-action="close-tool-drawer"></div>
 
-<!-- Settings Page -->
-<div class="page-overlay" id="settings-page" hidden>
-  <div class="page-panel">
-    <div class="page-header">
-      <h2>Settings</h2>
-      <button class="page-close" data-action="close-page" aria-label="Close">×</button>
-    </div>
-    <div class="page-tabs" id="settings-tabs">
-      <button class="page-tab active" data-tab="tab-general">General</button>
-      <button class="page-tab" data-tab="tab-agents">Agent Models</button>
-      <button class="page-tab" data-tab="tab-models">Models</button>
-      <button class="page-tab" data-tab="tab-mcp">MCP Servers</button>
-      <button class="page-tab" data-tab="tab-s3">File Storage</button>
-    </div>
-    <div class="page-body" id="settings-body">
-      <div class="tab-content active" id="tab-general"></div>
-      <div class="tab-content" id="tab-agents"></div>
-      <div class="tab-content" id="tab-models"></div>
-      <div class="tab-content" id="tab-mcp"></div>
-      <div class="tab-content" id="tab-s3"></div>
-    </div>
-    <div class="page-footer">
-      <span class="settings-status" id="settings-status"></span>
-      <button class="btn-primary" id="settings-save-btn">Save</button>
-    </div>
-  </div>
-</div>
+<!-- Settings Page — React root -->
+<div class="page-overlay" id="settings-page" hidden></div>
 
-<!-- Usage Page -->
-<div class="page-overlay" id="usage-page" hidden>
-  <div class="page-panel page-panel-wide">
-    <div class="page-header">
-      <h2>Token Usage</h2>
-      <button class="page-close" data-action="close-page" aria-label="Close">×</button>
-    </div>
-    <div class="page-body" id="usage-body">
-      <div class="usage-summary" id="usage-summary"></div>
-      <div class="usage-role-section">
-        <div class="usage-chart-header">
-          <h3>Model Role Breakdown</h3>
-        </div>
-        <div class="usage-role-breakdown" id="usage-role-breakdown"></div>
-      </div>
-      <div class="usage-chart-section">
-        <div class="usage-chart-header">
-          <h3>Daily Token Usage</h3>
-          <div class="usage-range-picker" id="daily-range-picker">
-            <button class="range-btn active" data-range="7">7d</button>
-            <button class="range-btn" data-range="14">14d</button>
-          </div>
-        </div>
-        <div class="usage-chart-container"><canvas id="daily-chart"></canvas></div>
-      </div>
-      <div class="usage-chart-section">
-        <div class="usage-chart-header">
-          <h3>Provider Breakdown</h3>
-          <div class="usage-range-picker" id="provider-range-picker">
-            <button class="range-btn active" data-range="7">7d</button>
-            <button class="range-btn" data-range="14">14d</button>
-          </div>
-        </div>
-        <div class="usage-chart-container"><canvas id="provider-chart"></canvas></div>
-      </div>
-    </div>
-  </div>
-</div>
+<!-- Usage Page — React root -->
+<div class="page-overlay" id="usage-page" hidden></div>
 <aside class="tool-drawer" id="tool-drawer" aria-hidden="true">
   <div class="tool-drawer-header">
     <div class="tool-drawer-title-wrap">
@@ -187,7 +124,6 @@
     </section>
   </div>
 </aside>
-
-<script type="module" src="js/main.js"></script>
+
 </body>
 </html>

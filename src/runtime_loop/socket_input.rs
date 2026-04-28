@@ -103,6 +103,7 @@ async fn ensure_main_session_ready(state: &Arc<AppState>) {
         .or_insert(session);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_idle_socket_input(
     text: String,
     current_session_id: &mut String,
@@ -110,10 +111,80 @@ pub(crate) async fn handle_idle_socket_input(
     connection_id: u64,
     state: &Arc<AppState>,
     tx: &WsTx,
+    _live_tx: &LiveTx,
     cancel: &CancellationToken,
 ) -> IdleSocketInputAction {
     let trimmed = text.trim();
     if trimmed.is_empty() {
+        return IdleSocketInputAction::Continue;
+    }
+
+    let active_run = {
+        let runs = state.active_runs.lock().await;
+        runs.get(current_session_id).cloned()
+    };
+    if let Some(run) = active_run {
+        if trimmed.eq_ignore_ascii_case("/stop") {
+            run.stop_requested.store(true, Ordering::Relaxed);
+            run.cancel.cancel();
+            ws_send(
+                tx,
+                &json!({
+                    "type":"system",
+                    "content":"Stop requested.",
+                    "dismissible": true,
+                }),
+            )
+            .await;
+            return IdleSocketInputAction::Continue;
+        }
+
+        if let Some((intervention_text, had_images)) = extract_busy_intervention(trimmed) {
+            if enqueue_shared_intervention(&run.deferred_interventions, intervention_text).await {
+                ws_send(
+                    tx,
+                    &json!({
+                        "type":"progress",
+                        "content": busy_intervention_notice(had_images),
+                    }),
+                )
+                .await;
+            } else {
+                ws_send(
+                    tx,
+                    &json!({
+                        "type":"system",
+                        "content":"The active run is already finishing. Please resend after it completes.",
+                        "dismissible": true,
+                    }),
+                )
+                .await;
+            }
+            return IdleSocketInputAction::Continue;
+        }
+
+        if trimmed.starts_with('/') {
+            ws_send(
+                tx,
+                &json!({
+                    "type":"system",
+                    "content":"A run is already in progress. Use /stop or wait for it to finish.",
+                    "dismissible": true,
+                }),
+            )
+            .await;
+            return IdleSocketInputAction::Continue;
+        }
+
+        ws_send(
+            tx,
+            &json!({
+                "type":"system",
+                "content":"A run is already in progress. Wait for it to finish or use /stop.",
+                "dismissible": true,
+            }),
+        )
+        .await;
         return IdleSocketInputAction::Continue;
     }
 
@@ -350,6 +421,8 @@ pub(crate) async fn handle_idle_socket_input(
                 role: "user".into(),
                 content: Some(msg_text),
                 images: msg_images,
+                thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: Some(now_epoch()),
@@ -378,12 +451,72 @@ pub(super) async fn persist_pending_interventions(
                 role: "user".into(),
                 content: Some(text),
                 images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: Some(now_epoch()),
             });
         }
         session.updated_at = now_epoch();
+    }
+}
+
+pub(super) async fn drain_shared_interventions(
+    shared_interventions: &Arc<Mutex<DeferredInterventionState>>,
+    pending_interventions: &mut Vec<String>,
+) {
+    let drained = {
+        let mut shared = shared_interventions.lock().await;
+        std::mem::take(&mut shared.queue)
+    };
+    pending_interventions.extend(drained);
+}
+
+pub(super) async fn close_shared_interventions(
+    shared_interventions: &Arc<Mutex<DeferredInterventionState>>,
+    pending_interventions: &mut Vec<String>,
+) {
+    let drained = {
+        let mut shared = shared_interventions.lock().await;
+        shared.accepting = false;
+        std::mem::take(&mut shared.queue)
+    };
+    pending_interventions.extend(drained);
+}
+
+async fn enqueue_shared_intervention(
+    shared_interventions: &Arc<Mutex<DeferredInterventionState>>,
+    intervention_text: String,
+) -> bool {
+    let mut shared = shared_interventions.lock().await;
+    if !shared.accepting {
+        return false;
+    }
+    shared.queue.push(intervention_text);
+    true
+}
+
+fn extract_busy_intervention(trimmed: &str) -> Option<(String, bool)> {
+    if trimmed.is_empty() || trimmed.starts_with('/') {
+        return None;
+    }
+
+    if trimmed.starts_with('{') {
+        match serde_json::from_str::<UserMessagePayload>(trimmed) {
+            Ok(payload) => Some((payload.text, !payload.images.is_empty())),
+            Err(_) => Some((trimmed.to_string(), false)),
+        }
+    } else {
+        Some((trimmed.to_string(), false))
+    }
+}
+
+fn busy_intervention_notice(had_images: bool) -> &'static str {
+    if had_images {
+        "📝 Intervention received (text only — image attachments are not supported during active runs). Will apply at next reasoning cycle."
+    } else {
+        "📝 Intervention received — will apply at next reasoning cycle"
     }
 }
 
@@ -408,25 +541,9 @@ pub(super) async fn drain_busy_socket_messages(
             run_cancel.cancel();
             return true;
         }
-        if !trimmed.is_empty() && !trimmed.starts_with('/') {
-            // Extract text from structured JSON payloads (images dropped during busy state).
-            let (intervention_text, had_images) = if trimmed.starts_with('{') {
-                match serde_json::from_str::<UserMessagePayload>(trimmed) {
-                    Ok(p) => {
-                        let had = !p.images.is_empty();
-                        (p.text, had)
-                    }
-                    Err(_) => (trimmed.to_string(), false),
-                }
-            } else {
-                (trimmed.to_string(), false)
-            };
+        if let Some((intervention_text, had_images)) = extract_busy_intervention(trimmed) {
             pending_interventions.push(intervention_text);
-            let notice = if had_images {
-                "📝 Intervention received (text only — image attachments are not supported during active runs). Will apply at next reasoning cycle."
-            } else {
-                "📝 Intervention received — will apply at next reasoning cycle"
-            };
+            let notice = busy_intervention_notice(had_images);
             let _ = live_send(live_tx, json!({"type":"progress","content":notice})).await;
         }
     }

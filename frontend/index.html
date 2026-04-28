@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LingClaw</title>
+<link rel="icon" type="image/png" href="/branding/logo-mark.png">
+</head>
+<body>
+
+<!-- Skip link — lets keyboard users jump past the header straight to the
+     composer. Visible only on focus. -->
+<a class="skip-link" href="#input">Skip to message input</a>
+
+<!-- Main -->
+<div class="main">
+  <header>
+    <div class="conn-badge" id="conn-badge">
+      <span class="conn-dot disconnected" id="conn-dot"></span>
+      <span class="conn-label" id="conn-label">Offline</span>
+    </div>
+    <div class="brand-block">
+      <img class="brand-logo" src="/branding/logo-mark.png" alt="" width="28" height="28">
+      <span class="session-name" id="session-name">LingClaw</span>
+      <button id="theme-toggle-btn" class="theme-toggle-btn header-theme-toggle" data-action="toggle-theme" aria-label="Toggle theme" title="Toggle theme">◐ Auto</button>
+      <span class="app-version-badge header-version" id="app-version-header" hidden></span>
+    </div>
+    <span class="session-id" id="session-id"></span>
+    <div class="actions">
+      <span class="usage-badge" id="usage-badge" title="今日 Token 用量"></span>
+      <button id="nav-settings-btn" data-action="nav-settings" aria-label="Settings" class="mobile-hide">Settings</button>
+      <button id="nav-usage-btn" data-action="nav-usage" aria-label="Usage" class="mobile-hide">Usage</button>
+      <button id="toggle-tools-btn" data-action="toggle-tools" aria-label="Toggle tools visibility">Tools: On</button>
+      <button id="toggle-reasoning-btn" data-action="toggle-reasoning" aria-label="Toggle reasoning visibility">Reasoning: On</button>
+      <button class="mobile-hide" data-action="cmd" data-cmd="/status" aria-label="Show status">Status</button>
+      <button class="mobile-hide" data-action="cmd" data-cmd="/clear" aria-label="Clear chat">Clear</button>
+      <button class="mobile-hide" data-action="cmd" data-cmd="/help" aria-label="Show help">Help</button>
+      <button class="mobile-menu-toggle" id="mobile-menu-toggle" data-action="toggle-mobile-menu" aria-label="More actions" aria-expanded="false" aria-controls="mobile-menu">⋯</button>
+      <div class="mobile-menu" id="mobile-menu" role="menu">
+        <button data-action="toggle-theme">Toggle theme</button>
+        <button data-action="show-shortcuts">Shortcuts</button>
+        <button data-action="nav-settings">Settings</button>
+        <button data-action="nav-usage">Usage</button>
+        <button data-action="cmd-close-menu" data-cmd="/status">Status</button>
+        <button data-action="cmd-close-menu" data-cmd="/clear">Clear</button>
+        <button data-action="cmd-close-menu" data-cmd="/help">Help</button>
+      </div>
+    </div>
+  </header>
+  <div id="chat" role="log" aria-live="polite">
+    <div class="welcome" id="welcome">
+      <div class="welcome-logo"><img src="/branding/logo-wordmark.png" alt="LingClaw"></div>
+      <div class="app-version-badge welcome-version" id="app-version-welcome" hidden></div>
+      <div class="welcome-hint">
+        你的私人 AI 助手已就绪<br>
+        输入消息开始对话，或使用 <strong>/</strong> 命令
+      </div>
+      <div class="welcome-shortcuts">
+        <button data-action="cmd" data-cmd="/clear">New Conversation</button>
+        <button data-action="cmd" data-cmd="/status">Status</button>
+        <button data-action="cmd" data-cmd="/help">Help</button>
+      </div>
+    </div>
+  </div>
+  <button id="jump-to-latest" type="button" hidden aria-label="Jump to latest messages">
+    <span class="jump-to-latest-label">回到底部</span>
+    <span class="jump-to-latest-badge" id="jump-to-latest-badge" hidden></span>
+  </button>
+  <div id="input-area">
+    <div id="image-preview-bar" class="image-preview-bar" style="display:none"></div>
+    <div class="input-composer">
+      <div class="attach-wrapper">
+        <button id="attach-btn" class="attach-btn" aria-label="Attach image" title="Attach image" style="display:none">📎</button>
+        <div id="attach-popup" class="attach-popup" style="display:none">
+          <div id="attach-menu" class="attach-menu">
+            <button class="attach-menu-item" id="attach-local-btn">📁 上传本地图片</button>
+            <button class="attach-menu-item" id="attach-url-btn">🔗 输入图片 URL</button>
+          </div>
+          <div id="attach-url-input" class="attach-url-input" style="display:none">
+            <input type="text" id="image-url-field" placeholder="https://example.com/image.jpg" autocomplete="off" />
+            <button id="image-url-add" class="attach-url-add-btn">添加</button>
+          </div>
+          <div id="attach-upload-status" class="attach-upload-status" style="display:none">
+            <span class="upload-spinner"></span> 上传中...
+          </div>
+        </div>
+      </div>
+      <input type="file" id="image-file-input" accept="image/jpeg,image/png" multiple hidden />
+      <textarea id="input" placeholder="Message LingClaw... (/ for commands)" rows="1" aria-label="Message input" enterkeyhint="send" autocomplete="off" autocapitalize="sentences" spellcheck="true"></textarea>
+      <button id="stop" aria-label="Stop agent" title="Stop" style="display:none"><span id="stop-icon">■</span></button>
+      <button id="send" aria-label="Send message"><span id="send-icon">↑</span></button>
+    </div>
+  </div>
+</div>
+
+<div class="tool-drawer-backdrop" id="tool-drawer-backdrop" data-action="close-tool-drawer"></div>
+
+<!-- Settings Page — React root -->
+<div class="page-overlay" id="settings-page" hidden></div>
+
+<!-- Usage Page — React root -->
+<div class="page-overlay" id="usage-page" hidden></div>
+<aside class="tool-drawer" id="tool-drawer" aria-hidden="true">
+  <div class="tool-drawer-header">
+    <div class="tool-drawer-title-wrap">
+      <span class="tool-drawer-kicker">Tool</span>
+      <h3 class="tool-drawer-title" id="tool-drawer-title">Tool details</h3>
+    </div>
+    <button class="tool-drawer-close" data-action="close-tool-drawer" aria-label="Close tool drawer">×</button>
+  </div>
+  <div class="tool-drawer-meta" id="tool-drawer-meta"></div>
+  <div class="tool-drawer-content">
+    <section class="tool-drawer-section">
+      <div class="tool-drawer-section-title">Arguments</div>
+      <pre class="tool-drawer-code" id="tool-drawer-args"></pre>
+    </section>
+    <section class="tool-drawer-section" id="tool-drawer-result-section" hidden>
+      <div class="tool-drawer-section-title">Result</div>
+      <pre class="tool-drawer-code" id="tool-drawer-result"></pre>
+    </section>
+  </div>
+</aside>
+
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>

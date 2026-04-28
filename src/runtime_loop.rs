@@ -1,7 +1,7 @@
 use super::*;
 
 use serde_json::json;
-use std::sync::atomic::{AtomicI64, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use tokio::time::MissedTickBehavior;
 
 mod socket_input;
@@ -20,9 +20,30 @@ const REFLECTION_COOLDOWN_SECS: i64 = 600; // 10 minutes
 /// Epoch-seconds timestamp of the last reflection run (0 = never).
 static LAST_REFLECTION_EPOCH: AtomicI64 = AtomicI64::new(0);
 
+/// Runtime switch for whether post-execution reflection is currently enabled.
+static REFLECTION_RUNTIME_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Generation counter for reflection runtime policy updates.
+static REFLECTION_RUNTIME_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+/// Active background reflection cancellations keyed by an internal task id.
+static ACTIVE_REFLECTION_CANCELS: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<u64, CancellationToken>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Monotonic ids for background reflection tasks.
+static NEXT_REFLECTION_TASK_ID: AtomicU64 = AtomicU64::new(1);
+
 /// Monotonic counter used to make fallback task ids unique even if the system
 /// clock has coarse granularity or multiple tasks start within the same tick.
 static NEXT_FALLBACK_TASK_ID: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+pub(crate) fn reflection_test_guard() -> &'static tokio::sync::Mutex<()> {
+    static REFLECTION_TEST_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    &REFLECTION_TEST_LOCK
+}
 
 fn epoch_secs_now() -> i64 {
     chrono::Local::now().timestamp()
@@ -90,6 +111,70 @@ pub(crate) fn reflection_runtime_status() -> String {
             "Last reflection: {}s ago (cooldown elapsed, ready)",
             elapsed
         )
+    }
+}
+
+pub(crate) fn refresh_reflection_runtime(enabled: bool) -> u64 {
+    let previous = REFLECTION_RUNTIME_ENABLED.swap(enabled, std::sync::atomic::Ordering::AcqRel);
+    if previous == enabled {
+        return REFLECTION_RUNTIME_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    }
+    REFLECTION_RUNTIME_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+}
+
+pub(crate) fn reflection_runtime_enabled() -> bool {
+    REFLECTION_RUNTIME_ENABLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn reflection_runtime_generation() -> u64 {
+    REFLECTION_RUNTIME_GENERATION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn reflection_runtime_matches(generation: u64) -> bool {
+    REFLECTION_RUNTIME_ENABLED.load(std::sync::atomic::Ordering::Acquire)
+        && REFLECTION_RUNTIME_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation
+}
+
+fn register_active_reflection(cancel: CancellationToken) -> u64 {
+    let task_id = NEXT_REFLECTION_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    match ACTIVE_REFLECTION_CANCELS.lock() {
+        Ok(mut guard) => {
+            guard.insert(task_id, cancel);
+        }
+        Err(poisoned) => {
+            eprintln!("Warning: reflection cancel registry poisoned during register; recovering");
+            let mut guard = poisoned.into_inner();
+            guard.insert(task_id, cancel);
+        }
+    }
+    task_id
+}
+
+fn finish_active_reflection(task_id: u64) {
+    match ACTIVE_REFLECTION_CANCELS.lock() {
+        Ok(mut guard) => {
+            guard.remove(&task_id);
+        }
+        Err(poisoned) => {
+            eprintln!("Warning: reflection cancel registry poisoned during cleanup; recovering");
+            let mut guard = poisoned.into_inner();
+            guard.remove(&task_id);
+        }
+    }
+}
+
+pub(crate) fn cancel_active_reflections() {
+    let cancels = match ACTIVE_REFLECTION_CANCELS.lock() {
+        Ok(mut guard) => guard.drain().map(|(_, cancel)| cancel).collect::<Vec<_>>(),
+        Err(poisoned) => {
+            eprintln!("Warning: reflection cancel registry poisoned during cancel; recovering");
+            let mut guard = poisoned.into_inner();
+            guard.drain().map(|(_, cancel)| cancel).collect::<Vec<_>>()
+        }
+    };
+
+    for cancel in cancels {
+        cancel.cancel();
     }
 }
 
@@ -177,12 +262,14 @@ impl Drop for TaskEventGuard<'_> {
                 "[task-guard] sub-agent '{}' dropped before terminal event — sending task_failed",
                 self.agent_name
             );
-            let _ = self.live_tx.try_send(json!({
+            if let Err(err) = self.live_tx.try_send(json!({
                 "type": "task_failed",
                 "task_id": self.task_id,
                 "agent": self.agent_name,
                 "error": "task aborted (timeout or cancellation)",
-            }));
+            })) {
+                eprintln!("[task-guard] failed to emit fallback task_failed event: {err}");
+            }
         }
     }
 }
@@ -197,6 +284,7 @@ struct PostExecutionReflectionInput {
     workspace: std::path::PathBuf,
     model: String,
     messages: Vec<ChatMessage>,
+    policy_generation: u64,
     cycles: usize,
     tool_calls: usize,
 }
@@ -217,9 +305,14 @@ async fn run_post_execution_reflection(
         workspace,
         model,
         messages,
+        policy_generation,
         cycles,
         tool_calls,
     } = input;
+
+    if !reflection_runtime_matches(policy_generation) {
+        return Ok(false);
+    }
 
     // Build a compact excerpt of the conversation for reflection.
     let excerpt = crate::memory::build_conversation_excerpt(&messages);
@@ -245,6 +338,8 @@ async fn run_post_execution_reflection(
             role: "system".into(),
             content: Some(system_prompt),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -253,6 +348,8 @@ async fn run_post_execution_reflection(
             role: "user".into(),
             content: Some(excerpt),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -282,6 +379,8 @@ async fn run_post_execution_reflection(
                 role: "assistant".into(),
                 content: Some(reflection.content.clone()),
                 images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -306,6 +405,10 @@ async fn run_post_execution_reflection(
 
     let reflection = reflection.content.trim().to_string();
     if reflection.is_empty() {
+        return Ok(false);
+    }
+
+    if !reflection_runtime_matches(policy_generation) {
         return Ok(false);
     }
 
@@ -360,6 +463,41 @@ async fn send_react_phase_event(live_tx: &LiveTx, react_ctx: &agent::AgentLoopCt
     }
 }
 
+fn select_analyze_model(
+    config: &Config,
+    base_model: &str,
+    fast_model: Option<&str>,
+    cycles: usize,
+    has_model_override: bool,
+    latest_query: Option<&str>,
+    context_has_images: bool,
+) -> (String, &'static str) {
+    if cycles != 0 || has_model_override {
+        return (base_model.to_string(), crate::context::USAGE_ROLE_PRIMARY);
+    }
+
+    let Some(fast_model) = fast_model else {
+        return (base_model.to_string(), crate::context::USAGE_ROLE_PRIMARY);
+    };
+
+    let simple_query = latest_query.map(agent::is_simple_query).unwrap_or(false);
+    let fast_supports_images = !context_has_images || config.model_supports_image(fast_model);
+    if simple_query && fast_supports_images {
+        (fast_model.to_string(), crate::context::USAGE_ROLE_FAST)
+    } else {
+        (base_model.to_string(), crate::context::USAGE_ROLE_PRIMARY)
+    }
+}
+
+fn messages_have_images(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|message| {
+        message
+            .images
+            .as_ref()
+            .is_some_and(|images| !images.is_empty())
+    })
+}
+
 async fn prepare_analyze_snapshot(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
@@ -377,30 +515,21 @@ async fn prepare_analyze_snapshot(
         .rev()
         .find(|m| m.role == "user")
         .and_then(|m| m.content.clone());
+    let context_has_images = messages_have_images(&session.messages);
     let user_msg_chars = latest_query
         .as_ref()
         .map(|q| q.chars().count())
         .unwrap_or(0);
 
-    // On the first cycle, downgrade to fast model for simple queries when configured.
-    let (model_str, usage_role) =
-        if phase_state.react_ctx.cycles == 0 && session.model_override.is_none() {
-            if let Some(ref fast) = config.fast_model {
-                if latest_query
-                    .as_deref()
-                    .map(agent::is_simple_query)
-                    .unwrap_or(false)
-                {
-                    (fast.clone(), crate::context::USAGE_ROLE_FAST)
-                } else {
-                    (base_model, crate::context::USAGE_ROLE_PRIMARY)
-                }
-            } else {
-                (base_model, crate::context::USAGE_ROLE_PRIMARY)
-            }
-        } else {
-            (base_model, crate::context::USAGE_ROLE_PRIMARY)
-        };
+    let (model_str, usage_role) = select_analyze_model(
+        &config,
+        &base_model,
+        config.fast_model.as_deref(),
+        phase_state.react_ctx.cycles,
+        session.model_override.is_some(),
+        latest_query.as_deref(),
+        context_has_images,
+    );
 
     let mut fresh_system = build_system_prompt_with_query(
         &config,
@@ -544,7 +673,7 @@ fn effective_think_level(
     consecutive_errors: usize,
 ) -> String {
     if think_level == "auto" {
-        if resolved.reasoning || resolved.thinking_format.is_some() {
+        if providers::auto_think_supported(resolved) {
             agent::auto_think_level(
                 cycles,
                 had_observation_hint,
@@ -584,6 +713,7 @@ pub(crate) async fn build_runtime_tools(
             Provider::Anthropic => tools::task_tool_definition_anthropic(&agent_names),
             Provider::OpenAI => tools::task_tool_definition_openai(&agent_names),
             Provider::Ollama => tools::task_tool_definition_ollama(&agent_names),
+            Provider::Gemini => tools::task_tool_definition_gemini(&agent_names),
         };
         extra_tools.push(task_def);
 
@@ -591,6 +721,7 @@ pub(crate) async fn build_runtime_tools(
             Provider::Anthropic => tools::orchestrate_tool_definition_anthropic(&agent_names),
             Provider::OpenAI => tools::orchestrate_tool_definition_openai(&agent_names),
             Provider::Ollama => tools::orchestrate_tool_definition_ollama(&agent_names),
+            Provider::Gemini => tools::orchestrate_tool_definition_gemini(&agent_names),
         };
         extra_tools.push(orchestrate_def);
     }
@@ -599,6 +730,7 @@ pub(crate) async fn build_runtime_tools(
         Provider::Anthropic => tools::mcp::tool_definitions_anthropic(config, workspace).await,
         Provider::OpenAI => tools::mcp::tool_definitions_openai(config, workspace).await,
         Provider::Ollama => tools::mcp::tool_definitions_ollama(config, workspace).await,
+        Provider::Gemini => tools::mcp::tool_definitions_gemini(config, workspace).await,
     };
     extra_tools.append(&mut mcp_tools);
     extra_tools
@@ -698,8 +830,15 @@ async fn execute_tool(
     config: &Config,
     http: &Client,
     workspace: &Path,
+    isolated_mcp_session: bool,
 ) -> tools::ToolOutcome {
-    if let Some(result) = tools::mcp::execute_tool(name, args_str, config, workspace).await {
+    let mcp_result = if isolated_mcp_session {
+        tools::mcp::execute_tool_isolated(name, args_str, config, workspace).await
+    } else {
+        tools::mcp::execute_tool(name, args_str, config, workspace).await
+    };
+
+    if let Some(result) = mcp_result {
         result
     } else {
         tools::execute_tool(name, args_str, config, http, workspace).await
@@ -731,6 +870,7 @@ async fn execute_task_tool(
                 output: format!("task error: invalid arguments JSON: {e}"),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
@@ -741,6 +881,7 @@ async fn execute_task_tool(
             output: err,
             is_error: true,
             duration_ms: start.elapsed().as_millis() as u64,
+            subagent_snapshot: None,
         };
     }
 
@@ -751,6 +892,7 @@ async fn execute_task_tool(
                 output: "task error: missing required parameter 'agent'".to_string(),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
@@ -762,9 +904,12 @@ async fn execute_task_tool(
                 output: "task error: missing required parameter 'prompt'".to_string(),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
+    let effective_prompt =
+        crate::subagents::executor::augment_subagent_prompt_with_current_time(prompt);
 
     let spec = match crate::subagents::discovery::find_agent(workspace, agent_name) {
         Some(s) => s,
@@ -783,6 +928,7 @@ async fn execute_task_tool(
                 ),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
@@ -820,7 +966,15 @@ async fn execute_task_tool(
     let mut guard = TaskEventGuard::new(live_tx, agent_name, &task_id);
 
     let outcome = crate::subagents::executor::run_subagent(
-        &spec, prompt, config, http, workspace, live_tx, cancel, hooks, &task_id,
+        &spec,
+        &effective_prompt,
+        config,
+        http,
+        workspace,
+        live_tx,
+        cancel,
+        hooks,
+        &task_id,
     )
     .await;
 
@@ -881,10 +1035,21 @@ async fn execute_task_tool(
     let _ = live_send(live_tx, terminal_event).await;
     guard.mark_finished();
 
+    let mut history_snapshot = outcome.history_snapshot;
+    history_snapshot.duration_ms = duration_ms;
+    if outcome.aborted {
+        history_snapshot.error = Some(crate::truncate(&outcome.result, 4_000).to_string());
+        history_snapshot.result_excerpt = None;
+    } else {
+        history_snapshot.result_excerpt = Some(crate::truncate(&outcome.result, 4_000).to_string());
+        history_snapshot.error = None;
+    }
+
     tools::ToolOutcome {
         output: outcome.result,
         is_error: outcome.aborted,
         duration_ms,
+        subagent_snapshot: Some(history_snapshot),
     }
 }
 
@@ -913,6 +1078,7 @@ async fn execute_orchestrate_tool(
                 output: format!("orchestrate error: invalid arguments JSON: {e}"),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
@@ -925,6 +1091,7 @@ async fn execute_orchestrate_tool(
             output: err,
             is_error: true,
             duration_ms: start.elapsed().as_millis() as u64,
+            subagent_snapshot: None,
         };
     }
 
@@ -939,6 +1106,7 @@ async fn execute_orchestrate_tool(
                 output: "orchestrate error: missing or invalid 'tasks' array".to_string(),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
@@ -951,6 +1119,7 @@ async fn execute_orchestrate_tool(
                 output: e,
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
@@ -995,6 +1164,7 @@ async fn execute_orchestrate_tool(
         output: result,
         is_error: outcome.aborted || outcome.has_non_completed_tasks(),
         duration_ms,
+        subagent_snapshot: None,
     }
 }
 
@@ -1077,6 +1247,7 @@ where
                     output: format!("{tool_name} error: tool execution timed out ({}s)", timeout_secs),
                     is_error: true,
                     duration_ms: start.elapsed().as_millis() as u64,
+                    subagent_snapshot: None,
                 });
             }
             _ = heartbeat.tick() => {
@@ -1154,6 +1325,7 @@ async fn execute_tool_call(
                     output: format!("[rejected by hook] {reason}"),
                     is_error: true,
                     duration_ms: 0,
+                    subagent_snapshot: None,
                 },
                 None, // rejected — skip AfterToolExec
             ));
@@ -1238,6 +1410,7 @@ async fn execute_tool_call(
                 &config,
                 &ctx.state.http,
                 &phase_state.cycle_workspace,
+                false,
             ),
         )
         .await
@@ -1246,8 +1419,7 @@ async fn execute_tool_call(
     match run_state {
         ToolRunState::Completed(result) => Ok((result, Some(effective_args))),
         ToolRunState::Abort => {
-            phase_state.shutting_down = ctx.cancel.is_cancelled();
-            phase_state.run_detached = !phase_state.shutting_down;
+            apply_run_cancel_outcome(ctx, phase_state).await;
             Err(AgentPhaseControl::Break)
         }
     }
@@ -1321,10 +1493,42 @@ async fn record_tool_result(
             } else {
                 session.failed_tool_results.remove(&tc.id);
             }
+            if let Some(snapshot) = result.subagent_snapshot.take() {
+                let occurrence = session
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        message.role == "tool"
+                            && message.tool_call_id.as_deref() == Some(tc.id.as_str())
+                    })
+                    .count()
+                    + 1;
+                session.subagent_snapshots.insert(
+                    session_store::subagent_snapshot_storage_key(&tc.id, occurrence),
+                    snapshot,
+                );
+            } else {
+                let occurrence = session
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        message.role == "tool"
+                            && message.tool_call_id.as_deref() == Some(tc.id.as_str())
+                    })
+                    .count()
+                    + 1;
+                session
+                    .subagent_snapshots
+                    .remove(&session_store::subagent_snapshot_storage_key(
+                        &tc.id, occurrence,
+                    ));
+            }
             session.messages.push(ChatMessage {
                 role: "tool".into(),
                 content: Some(result.output),
                 images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: Some(tc.id.clone()),
                 timestamp: Some(now_epoch()),
@@ -1546,8 +1750,7 @@ async fn run_analyze_phase(
         let result = tokio::select! {
             biased;
             _ = ctx.run_cancel.cancelled() => {
-                phase_state.shutting_down = ctx.cancel.is_cancelled();
-                phase_state.run_detached = !phase_state.shutting_down;
+                apply_run_cancel_outcome(ctx, phase_state).await;
                 return AgentPhaseControl::Break;
             }
             result = providers::call_llm_stream(
@@ -1575,8 +1778,7 @@ async fn run_analyze_phase(
                 tokio::select! {
                     biased;
                     _ = ctx.run_cancel.cancelled() => {
-                        phase_state.shutting_down = ctx.cancel.is_cancelled();
-                        phase_state.run_detached = !phase_state.shutting_down;
+                        apply_run_cancel_outcome(ctx, phase_state).await;
                         return AgentPhaseControl::Break;
                     }
                     _ = tokio::time::sleep(Duration::from_secs(3)) => {}
@@ -1617,17 +1819,25 @@ async fn run_act_phase(
     phase_state.collected_results.clear();
     let tool_calls = std::mem::take(&mut phase_state.pending_tool_calls);
 
-    let all_parallelizable = tool_calls.len() > 1
-        && tool_calls
-            .iter()
-            .all(|tc| tools::is_parallelizable_tool(&tc.function.name));
+    let mut all_parallelizable = tool_calls.len() > 1;
+    if all_parallelizable {
+        for tc in &tool_calls {
+            if !tools::is_parallelizable_tool_call(
+                &tc.function.name,
+                &config,
+                &phase_state.cycle_workspace,
+            ) {
+                all_parallelizable = false;
+                break;
+            }
+        }
+    }
 
     if !all_parallelizable {
         // Sequential path: single tool call or any mutating tool in the batch.
         for tc in &tool_calls {
             if ctx.run_cancel.is_cancelled() {
-                phase_state.shutting_down = ctx.cancel.is_cancelled();
-                phase_state.run_detached = !phase_state.shutting_down;
+                apply_run_cancel_outcome(ctx, phase_state).await;
                 return AgentPhaseControl::Break;
             }
 
@@ -1644,9 +1854,10 @@ async fn run_act_phase(
             }
         }
     } else {
-        // Multiple parallel-safe read-only tool calls: parallel execution with
-        // ordered result recording. Mutating tools and delegated `task` runs
-        // stay sequential because they share the parent workspace.
+        // Multiple parallel-safe tool calls: parallel execution with ordered
+        // result recording. Built-in read-only tools and read-only MCP tools
+        // can run concurrently; mutating tools and delegated `task` runs stay
+        // sequential because they share the parent workspace.
         // 1. Run BeforeToolExec hooks sequentially (may reject or modify args).
         struct HookEvalResult {
             effective_args: Option<String>,
@@ -1680,6 +1891,7 @@ async fn run_act_phase(
                         output: format!("[rejected by hook] {reason}"),
                         is_error: true,
                         duration_ms: 0,
+                        subagent_snapshot: None,
                     }),
                     reject_events: events,
                 },
@@ -1703,8 +1915,7 @@ async fn run_act_phase(
         //    then send any reject hook events (matching sequential path: tool_call → hook events).
         for (tc, hr) in tool_calls.iter().zip(hook_results.iter()) {
             if ctx.run_cancel.is_cancelled() {
-                phase_state.shutting_down = ctx.cancel.is_cancelled();
-                phase_state.run_detached = !phase_state.shutting_down;
+                apply_run_cancel_outcome(ctx, phase_state).await;
                 return AgentPhaseControl::Break;
             }
             // For rejected tools, show original args; for others, show effective args.
@@ -1747,6 +1958,7 @@ async fn run_act_phase(
                             output: String::new(), // placeholder, replaced below
                             is_error: true,
                             duration_ms: 0,
+                            subagent_snapshot: None,
                         })
                     });
                 }
@@ -1766,6 +1978,7 @@ async fn run_act_phase(
                         &config,
                         &ctx.state.http,
                         &phase_state.cycle_workspace,
+                        true,
                     ),
                 ))
             })
@@ -1799,8 +2012,7 @@ async fn run_act_phase(
                     }
                 }
                 ToolRunState::Abort => {
-                    phase_state.shutting_down = ctx.cancel.is_cancelled();
-                    phase_state.run_detached = !phase_state.shutting_down;
+                    apply_run_cancel_outcome(ctx, phase_state).await;
                     should_break = true;
                 }
             }
@@ -1915,7 +2127,10 @@ async fn run_finish_phase(
 
     // Enqueue structured memory update (async, non-blocking).
     // Pre-filter messages to avoid cloning the full session history.
-    if let (Some(queue), Some(session)) = (&ctx.state.memory_queue, &snapshot) {
+    let memory_queue = ctx.state.memory_queue();
+    if config.structured_memory
+        && let (Some(queue), Some(session)) = (memory_queue.as_ref(), &snapshot)
+    {
         let fallback_model = session.effective_model(&config.model);
         let model = config.memory_model_or(fallback_model).to_string();
         let excerpt = crate::memory::prefilter_for_memory(&session.messages);
@@ -1933,62 +2148,77 @@ async fn run_finish_phase(
     // NOTE: snapshot check must precede try_claim_reflection() because the
     // CAS has a side-effect; if it fires but the session is gone, nobody
     // would roll back the cooldown slot.
-    if config.daily_reflection
+    if reflection_runtime_enabled()
         && let Some(ref session) = snapshot
         && let Some((previous_epoch, claimed_epoch)) = try_claim_reflection(
             phase_state.react_ctx.cycles,
             phase_state.react_ctx.tool_calls,
         )
     {
-        let config = config.clone();
-        let http = ctx.state.http.clone();
-        let sessions = ctx.state.sessions.clone();
-        let session_id = session.id.clone();
-        let workspace = session.workspace.clone();
-        let fallback_model = session.effective_model(&config.model).to_string();
-        let model = config.reflection_model_or(&fallback_model).to_string();
-        let messages = crate::memory::prefilter_for_memory(&session.messages);
-        let cycles = phase_state.react_ctx.cycles;
-        let tool_calls = phase_state.react_ctx.tool_calls;
-        // Match structured memory: floor at 30s so a low toolTimeout doesn't
-        // cause reflections to time out systematically.
-        let reflection_timeout = config.tool_timeout.max(std::time::Duration::from_secs(30));
-        tokio::spawn(async move {
-            match tokio::time::timeout(
-                reflection_timeout,
-                run_post_execution_reflection(PostExecutionReflectionInput {
-                    config,
-                    http,
-                    sessions,
-                    session_id,
-                    workspace,
-                    model,
-                    messages,
-                    cycles,
-                    tool_calls,
-                }),
-            )
-            .await
-            {
-                Ok(Err(e)) => {
-                    eprintln!("Reflection failed (non-critical): {e}");
-                    // Roll back so the next non-trivial run can try again.
-                    rollback_reflection_claim(previous_epoch, claimed_epoch);
+        let reflection_generation = reflection_runtime_generation();
+        if !reflection_runtime_matches(reflection_generation) {
+            rollback_reflection_claim(previous_epoch, claimed_epoch);
+        } else {
+            let config = ctx.state.config();
+            let http = ctx.state.http.clone();
+            let sessions = ctx.state.sessions.clone();
+            let session_id = session.id.clone();
+            let workspace = session.workspace.clone();
+            let fallback_model = session.effective_model(&config.model).to_string();
+            let model = config.reflection_model_or(&fallback_model).to_string();
+            let messages = crate::memory::prefilter_for_memory(&session.messages);
+            let cycles = phase_state.react_ctx.cycles;
+            let tool_calls = phase_state.react_ctx.tool_calls;
+            // Match structured memory: floor at 30s so a low toolTimeout doesn't
+            // cause reflections to time out systematically.
+            let reflection_timeout = config.tool_timeout.max(std::time::Duration::from_secs(30));
+            let reflection_cancel = CancellationToken::new();
+            let reflection_task_id = register_active_reflection(reflection_cancel.clone());
+            tokio::spawn(async move {
+                let outcome = tokio::select! {
+                    _ = reflection_cancel.cancelled() => None,
+                    outcome = tokio::time::timeout(
+                        reflection_timeout,
+                        run_post_execution_reflection(PostExecutionReflectionInput {
+                            config,
+                            http,
+                            sessions,
+                            session_id,
+                            workspace,
+                            model,
+                            messages,
+                            policy_generation: reflection_generation,
+                            cycles,
+                            tool_calls,
+                        }),
+                    ) => Some(outcome),
+                };
+                finish_active_reflection(reflection_task_id);
+
+                match outcome {
+                    None => {
+                        rollback_reflection_claim(previous_epoch, claimed_epoch);
+                    }
+                    Some(Ok(Err(e))) => {
+                        eprintln!("Reflection failed (non-critical): {e}");
+                        // Roll back so the next non-trivial run can try again.
+                        rollback_reflection_claim(previous_epoch, claimed_epoch);
+                    }
+                    Some(Err(_elapsed)) => {
+                        eprintln!("Reflection timed out (non-critical)");
+                        rollback_reflection_claim(previous_epoch, claimed_epoch);
+                    }
+                    Some(Ok(Ok(true))) => {
+                        // CAS already claimed the slot — nothing more to do.
+                    }
+                    Some(Ok(Ok(false))) => {
+                        // Conversation was too trivial — no reflection written.
+                        // Roll back so the next non-trivial run can reflect.
+                        rollback_reflection_claim(previous_epoch, claimed_epoch);
+                    }
                 }
-                Err(_elapsed) => {
-                    eprintln!("Reflection timed out (non-critical)");
-                    rollback_reflection_claim(previous_epoch, claimed_epoch);
-                }
-                Ok(Ok(true)) => {
-                    // CAS already claimed the slot — nothing more to do.
-                }
-                Ok(Ok(false)) => {
-                    // Conversation was too trivial — no reflection written.
-                    // Roll back so the next non-trivial run can reflect.
-                    rollback_reflection_claim(previous_epoch, claimed_epoch);
-                }
-            }
-        });
+            });
+        }
     }
 
     let finish_label = phase_state
@@ -2040,6 +2270,27 @@ fn fire_stop_command_hook(state: &Arc<AppState>, session_id: &str, live_tx: &Liv
     });
 }
 
+async fn apply_run_cancel_outcome(ctx: &AgentRunCtx<'_>, phase_state: &mut AgentPhaseState) {
+    if ctx.cancel.is_cancelled() {
+        phase_state.shutting_down = true;
+        return;
+    }
+
+    let shared_stop_requested = {
+        let runs = ctx.state.active_runs.lock().await;
+        runs.get(ctx.current_session_id)
+            .map(|run| run.stop_requested.swap(false, Ordering::Relaxed))
+            .unwrap_or(false)
+    };
+
+    if shared_stop_requested {
+        fire_stop_command_hook(ctx.state, ctx.current_session_id, ctx.live_tx);
+        phase_state.run_stopped = true;
+    } else {
+        phase_state.run_detached = true;
+    }
+}
+
 pub(crate) async fn run_agent_session(
     state: &Arc<AppState>,
     current_session_id: &str,
@@ -2058,6 +2309,7 @@ pub(crate) async fn run_agent_session(
     };
 
     let run_cancel = cancel.child_token();
+    let deferred_interventions = Arc::new(Mutex::new(DeferredInterventionState::open()));
     {
         let mut runs = state.active_runs.lock().await;
         runs.insert(
@@ -2065,6 +2317,8 @@ pub(crate) async fn run_agent_session(
             SessionRunBinding {
                 connection_id,
                 cancel: run_cancel.clone(),
+                stop_requested: stop_requested.clone(),
+                deferred_interventions: deferred_interventions.clone(),
             },
         );
     }
@@ -2102,13 +2356,13 @@ pub(crate) async fn run_agent_session(
     }
 
     'agent: loop {
+        socket_input::drain_shared_interventions(
+            &deferred_interventions,
+            &mut phase_state.pending_interventions,
+        )
+        .await;
         if cancel.is_cancelled() {
             phase_state.shutting_down = true;
-            break;
-        }
-        if run_cancel.is_cancelled() {
-            phase_state.shutting_down = cancel.is_cancelled();
-            phase_state.run_detached = !phase_state.shutting_down;
             break;
         }
         if stop_requested.swap(false, Ordering::Relaxed) {
@@ -2131,11 +2385,10 @@ pub(crate) async fn run_agent_session(
             phase_state.run_stopped = true;
             break;
         }
-        if run_cancel.is_cancelled() && !cancel.is_cancelled() {
-            phase_state.run_stopped = true;
+        if run_cancel.is_cancelled() {
+            apply_run_cancel_outcome(&ctx, &mut phase_state).await;
             break;
         }
-
         let control = match phase_state.react_ctx.phase() {
             agent::AgentPhase::Analyze => run_analyze_phase(&ctx, &mut phase_state).await,
             agent::AgentPhase::Act => run_act_phase(&ctx, &mut phase_state).await,
@@ -2147,6 +2400,12 @@ pub(crate) async fn run_agent_session(
             break 'agent;
         }
     }
+
+    socket_input::close_shared_interventions(
+        &deferred_interventions,
+        &mut phase_state.pending_interventions,
+    )
+    .await;
 
     {
         let mut runs = state.active_runs.lock().await;
@@ -2181,7 +2440,7 @@ pub(crate) async fn run_agent_session(
         {
             let mut sessions = state.sessions.lock().await;
             if let Some(session) = sessions.get_mut(current_session_id) {
-                session_store::trim_incomplete_tool_calls(&mut session.messages);
+                session_store::trim_incomplete_tool_calls_in_session(session);
             }
         }
         let usage = build_done_usage(
@@ -2207,7 +2466,7 @@ pub(crate) async fn run_agent_session(
     if phase_state.run_detached {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(current_session_id) {
-            session_store::trim_incomplete_tool_calls(&mut session.messages);
+            session_store::trim_incomplete_tool_calls_in_session(session);
         }
     }
 

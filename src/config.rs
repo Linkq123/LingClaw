@@ -16,6 +16,7 @@ pub(crate) enum Provider {
     OpenAI,
     Anthropic,
     Ollama,
+    Gemini,
 }
 
 impl Provider {
@@ -23,6 +24,7 @@ impl Provider {
         match api.trim().to_ascii_lowercase().as_str() {
             "anthropic" => Self::Anthropic,
             "ollama" => Self::Ollama,
+            "gemini" => Self::Gemini,
             _ => Self::OpenAI,
         }
     }
@@ -32,6 +34,7 @@ impl Provider {
             Self::OpenAI => "https://api.openai.com/v1",
             Self::Anthropic => "https://api.anthropic.com",
             Self::Ollama => "http://127.0.0.1:11434",
+            Self::Gemini => "https://generativelanguage.googleapis.com/v1beta",
         }
     }
 
@@ -40,6 +43,14 @@ impl Provider {
             Self::OpenAI => Some("OPENAI_API_KEY"),
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
             Self::Ollama => None,
+            Self::Gemini => Some("GEMINI_API_KEY"),
+        }
+    }
+
+    pub(crate) fn api_key_env_hint(self) -> Option<&'static str> {
+        match self {
+            Self::Gemini => Some("GEMINI_API_KEY or GOOGLE_API_KEY"),
+            _ => self.api_key_env_var(),
         }
     }
 
@@ -59,6 +70,9 @@ impl Provider {
         if explicit == "ollama" {
             return Self::Ollama;
         }
+        if explicit == "gemini" {
+            return Self::Gemini;
+        }
         if explicit == "openai" {
             return Self::OpenAI;
         }
@@ -73,6 +87,9 @@ impl Provider {
             if provider_name == "openai" {
                 return Self::OpenAI;
             }
+            if provider_name == "gemini" {
+                return Self::Gemini;
+            }
             if model_id.starts_with("claude") {
                 return Self::Anthropic;
             }
@@ -82,6 +99,10 @@ impl Provider {
             Self::Anthropic
         } else if api_base.contains("11434") || api_base.contains("ollama") {
             Self::Ollama
+        } else if model.starts_with("gemini-")
+            || api_base.contains("generativelanguage.googleapis.com")
+        {
+            Self::Gemini
         } else {
             Self::OpenAI
         }
@@ -92,6 +113,7 @@ impl Provider {
             Self::OpenAI => "openai",
             Self::Anthropic => "anthropic",
             Self::Ollama => "ollama",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -105,6 +127,8 @@ pub(crate) struct Config {
     pub(crate) fast_model: Option<String>,
     /// Optional model for sub-agent task delegation.
     pub(crate) sub_agent_model: Option<String>,
+    /// Optional per-sub-agent delegated model overrides.
+    pub(crate) sub_agent_model_overrides: HashMap<String, String>,
     /// Optional model for structured memory extraction.
     pub(crate) memory_model: Option<String>,
     /// Optional model for post-execution reflection.
@@ -158,6 +182,36 @@ pub(crate) fn format_sub_agent_timeout(timeout: Duration) -> String {
 fn trimmed_nonempty(value: Option<String>) -> Option<String> {
     let value = value?.trim().to_string();
     if value.is_empty() { None } else { Some(value) }
+}
+
+const SUB_AGENT_MODEL_FIELD_PREFIX: &str = "sub-agent-";
+
+fn parse_dynamic_sub_agent_model_field(field: &str) -> Result<Option<&str>, String> {
+    let Some(agent_name) = field.strip_prefix(SUB_AGENT_MODEL_FIELD_PREFIX) else {
+        return Ok(None);
+    };
+    if agent_name.trim().is_empty() {
+        return Err(format!(
+            "Invalid agents.defaults.model.{field}: sub-agent override key must include an agent name suffix."
+        ));
+    }
+    Ok(Some(agent_name))
+}
+
+fn parse_dynamic_sub_agent_model_value<'a>(
+    field: &str,
+    value: &'a serde_json::Value,
+) -> Result<Option<&'a str>, String> {
+    match parse_dynamic_sub_agent_model_field(field)? {
+        Some(_) => match value {
+            serde_json::Value::String(model_ref) => Ok(Some(model_ref.as_str())),
+            serde_json::Value::Null => Ok(None),
+            _ => Err(format!(
+                "Invalid agents.defaults.model.{field}: sub-agent override must be a string or null."
+            )),
+        },
+        None => Ok(None),
+    }
 }
 
 pub(crate) fn parse_boolish_env(name: &str) -> Option<bool> {
@@ -280,19 +334,19 @@ pub(crate) fn validate_provider_name(name: &str) -> Result<(), String> {
 fn is_builtin_provider_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "openai" | "anthropic" | "ollama"
+        "openai" | "anthropic" | "ollama" | "gemini"
     )
 }
 
 fn validate_provider_api_kind(api_kind: &str) -> Result<(), String> {
     if matches!(
         api_kind.trim().to_ascii_lowercase().as_str(),
-        "openai-completions" | "anthropic" | "ollama"
+        "openai-completions" | "anthropic" | "ollama" | "gemini"
     ) {
         Ok(())
     } else {
         Err(format!(
-            "unsupported api '{api_kind}'. Expected one of: openai-completions, anthropic, ollama."
+            "unsupported api '{api_kind}'. Expected one of: openai-completions, anthropic, ollama, gemini."
         ))
     }
 }
@@ -437,6 +491,26 @@ impl Config {
             .as_ref()
             .and_then(|m| m.sub_agent.clone())
             .or_else(|| std::env::var("LINGCLAW_SUB_AGENT_MODEL").ok());
+        let sub_agent_model_overrides = model_config
+            .as_ref()
+            .map(|m| {
+                let mut overrides = HashMap::new();
+                for (field, raw_model_ref) in &m.extra {
+                    let Ok(Some(agent_name)) = parse_dynamic_sub_agent_model_field(field) else {
+                        continue;
+                    };
+                    let Some(model_ref) = raw_model_ref.as_str() else {
+                        continue;
+                    };
+                    let model_ref = model_ref.trim();
+                    if model_ref.is_empty() {
+                        continue;
+                    }
+                    overrides.insert(agent_name.to_string(), model_ref.to_string());
+                }
+                overrides
+            })
+            .unwrap_or_default();
         let memory_model = model_config
             .as_ref()
             .and_then(|m| m.memory.clone())
@@ -458,10 +532,12 @@ impl Config {
         let settings_api_base = settings.api_base.clone();
         let openai_api_base_env = std::env::var("OPENAI_API_BASE").ok();
         let ollama_api_base_env = std::env::var("OLLAMA_API_BASE").ok();
+        let gemini_api_base_env = std::env::var("GEMINI_API_BASE").ok();
         let api_base_hint = settings_api_base
             .clone()
             .or_else(|| openai_api_base_env.clone())
             .or_else(|| ollama_api_base_env.clone())
+            .or_else(|| gemini_api_base_env.clone())
             .unwrap_or_else(|| Provider::OpenAI.default_api_base().to_string());
 
         let provider = Provider::detect(&model, &api_base_hint, settings.provider.as_deref());
@@ -473,6 +549,10 @@ impl Config {
                 .unwrap_or_default(),
             Provider::OpenAI => std::env::var("OPENAI_API_KEY").unwrap_or_default(),
             Provider::Ollama => std::env::var("OLLAMA_API_KEY")
+                .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                .unwrap_or_default(),
+            Provider::Gemini => std::env::var("GEMINI_API_KEY")
+                .or_else(|_| std::env::var("GOOGLE_API_KEY"))
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .unwrap_or_default(),
         });
@@ -489,6 +569,8 @@ impl Config {
                 },
                 Provider::Ollama => ollama_api_base_env
                     .unwrap_or_else(|| Provider::Ollama.default_api_base().to_string()),
+                Provider::Gemini => gemini_api_base_env
+                    .unwrap_or_else(|| Provider::Gemini.default_api_base().to_string()),
             }
         };
 
@@ -498,6 +580,7 @@ impl Config {
             model,
             fast_model,
             sub_agent_model,
+            sub_agent_model_overrides,
             memory_model,
             reflection_model,
             context_model,
@@ -648,6 +731,14 @@ impl Config {
         self.memory_model.as_deref().unwrap_or(fallback)
     }
 
+    pub(crate) fn sub_agent_model_for<'a>(&'a self, agent_name: &str) -> &'a str {
+        self.sub_agent_model_overrides
+            .get(agent_name)
+            .map(String::as_str)
+            .or(self.sub_agent_model.as_deref())
+            .unwrap_or(&self.model)
+    }
+
     pub(crate) fn reflection_model_or<'a>(&'a self, fallback: &'a str) -> &'a str {
         self.reflection_model
             .as_deref()
@@ -682,6 +773,13 @@ impl Config {
                     std::env::var("OLLAMA_API_BASE")
                         .unwrap_or_else(|_| Provider::Ollama.default_api_base().to_string())
                 }
+                Provider::Gemini
+                    if self.provider != Provider::Gemini
+                        || self.api_base == Provider::OpenAI.default_api_base() =>
+                {
+                    std::env::var("GEMINI_API_BASE")
+                        .unwrap_or_else(|_| Provider::Gemini.default_api_base().to_string())
+                }
                 _ => self.api_base.clone(),
             },
             api_key: match provider {
@@ -695,6 +793,12 @@ impl Config {
                 }
                 Provider::Ollama if self.provider != Provider::Ollama => {
                     std::env::var("OLLAMA_API_KEY")
+                        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+                        .unwrap_or_else(|_| self.api_key.clone())
+                }
+                Provider::Gemini if self.provider != Provider::Gemini => {
+                    std::env::var("GEMINI_API_KEY")
+                        .or_else(|_| std::env::var("GOOGLE_API_KEY"))
                         .or_else(|_| std::env::var("OPENAI_API_KEY"))
                         .unwrap_or_else(|_| self.api_key.clone())
                 }
@@ -746,6 +850,7 @@ impl Config {
                     "anthropic" => Some(Provider::Anthropic),
                     "openai" => Some(Provider::OpenAI),
                     "ollama" => Some(Provider::Ollama),
+                    "gemini" => Some(Provider::Gemini),
                     _ => None,
                 };
                 if let Some(provider) = provider {
@@ -842,7 +947,11 @@ impl Config {
             }
             if self.providers.is_empty() {
                 let provider = prov_name.to_ascii_lowercase();
-                if provider == "openai" || provider == "anthropic" || provider == "ollama" {
+                if provider == "openai"
+                    || provider == "anthropic"
+                    || provider == "ollama"
+                    || provider == "gemini"
+                {
                     return format!("{provider}/{model_id}");
                 }
             }
@@ -894,11 +1003,15 @@ impl Config {
         if let Some((prov_name, model_id)) = trimmed.split_once('/') {
             if self.providers.is_empty() {
                 let provider = prov_name.to_ascii_lowercase();
-                if provider == "openai" || provider == "anthropic" || provider == "ollama" {
+                if provider == "openai"
+                    || provider == "anthropic"
+                    || provider == "ollama"
+                    || provider == "gemini"
+                {
                     return Ok(format!("{provider}/{model_id}"));
                 }
                 return Err(format!(
-                    "Unknown provider '{prov_name}'. Use 'openai', 'anthropic', or 'ollama'."
+                    "Unknown provider '{prov_name}'. Use 'openai', 'anthropic', 'ollama', or 'gemini'."
                 ));
             }
             let Some(pc) = self.providers.get(prov_name) else {
@@ -941,12 +1054,14 @@ impl Config {
         {
             return pc.models.iter().find(|m| m.id == model_id);
         }
-        // Fallback: search all providers by plain id
-        for pc in self.providers.values() {
-            if let Some(entry) = pc.models.iter().find(|m| m.id == model_ref) {
-                return Some(entry);
-            }
+
+        let resolved_ref = self.resolved_model_ref(model_ref);
+        if let Some((prov_name, model_id)) = resolved_ref.split_once('/')
+            && let Some(pc) = self.providers.get(prov_name)
+        {
+            return pc.models.iter().find(|m| m.id == model_id);
         }
+
         None
     }
 
@@ -1052,6 +1167,21 @@ fn sanitize_loaded_json_config(json_cfg: JsonConfig) -> JsonConfig {
                 *model_ref = None;
             }
         }
+        model_defaults.extra.retain(|field, model_ref| {
+            let model_ref = match parse_dynamic_sub_agent_model_value(field, model_ref) {
+                Ok(Some(model_ref)) => model_ref,
+                Ok(None) => return true,
+                Err(error) => {
+                    eprintln!("WARNING: Ignoring invalid config file entry: {error}");
+                    return false;
+                }
+            };
+            if let Err(error) = validate_agent_model_ref(field, model_ref, &providers) {
+                eprintln!("WARNING: Ignoring invalid config file entry: {error}");
+                return false;
+            }
+            true
+        });
     }
 
     json_cfg
@@ -1213,6 +1343,12 @@ pub(crate) fn validate_json_agent_model_refs(json_cfg: &JsonConfig) -> Result<()
         };
         validate_agent_model_ref(field, model_ref, &providers)?;
     }
+    for (field, model_ref) in &model_defaults.extra {
+        let Some(model_ref) = parse_dynamic_sub_agent_model_value(field, model_ref)? else {
+            continue;
+        };
+        validate_agent_model_ref(field, model_ref, &providers)?;
+    }
 
     Ok(())
 }
@@ -1314,6 +1450,9 @@ pub(crate) struct JsonDefaultModel {
     pub(crate) reflection: Option<String>,
     /// Optional model for context compression.
     pub(crate) context: Option<String>,
+    /// Dynamic per-sub-agent model overrides such as `sub-agent-reviewer`.
+    #[serde(flatten)]
+    pub(crate) extra: HashMap<String, serde_json::Value>,
 }
 
 pub(crate) fn config_dir_path() -> Option<PathBuf> {

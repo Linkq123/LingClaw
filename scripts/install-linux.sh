@@ -4,6 +4,18 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+MIN_NODE_VERSION="20.19.0"
+PREFERRED_NODE_MAJOR="24"
+TEMP_NODE_DIR=""
+
+cleanup_temp_node() {
+  if [[ -n "$TEMP_NODE_DIR" && -d "$TEMP_NODE_DIR" ]]; then
+    rm -rf "$TEMP_NODE_DIR"
+  fi
+}
+
+trap cleanup_temp_node EXIT
+
 info() {
   printf '[LingClaw] %s\n' "$1"
 }
@@ -72,6 +84,190 @@ install_build_deps() {
   fi
 
   warn "Unsupported Linux distribution (${ID:-unknown}). Please install OpenSSL and pkg-config development packages manually if cargo build fails."
+}
+
+version_gte() {
+  local lhs="${1#v}"
+  local rhs="${2#v}"
+  local lhs_major lhs_minor lhs_patch rhs_major rhs_minor rhs_patch
+  IFS=. read -r lhs_major lhs_minor lhs_patch <<<"$lhs"
+  IFS=. read -r rhs_major rhs_minor rhs_patch <<<"$rhs"
+  lhs_major="${lhs_major:-0}"
+  lhs_minor="${lhs_minor:-0}"
+  lhs_patch="${lhs_patch:-0}"
+  rhs_major="${rhs_major:-0}"
+  rhs_minor="${rhs_minor:-0}"
+  rhs_patch="${rhs_patch:-0}"
+
+  if ((10#$lhs_major != 10#$rhs_major)); then
+    ((10#$lhs_major > 10#$rhs_major))
+    return
+  fi
+  if ((10#$lhs_minor != 10#$rhs_minor)); then
+    ((10#$lhs_minor > 10#$rhs_minor))
+    return
+  fi
+  ((10#$lhs_patch >= 10#$rhs_patch))
+}
+
+current_node_version() {
+  if ! command -v node >/dev/null 2>&1; then
+    return 1
+  fi
+  node --version 2>/dev/null | tr -d '\r' | sed 's/^v//'
+}
+
+download_node_runtime() {
+  if ! command -v curl >/dev/null 2>&1; then
+    warn 'curl is unavailable. Cannot download a compatible Node.js runtime automatically.'
+    return 1
+  fi
+  if ! command -v tar >/dev/null 2>&1; then
+    warn 'tar is unavailable. Cannot unpack a compatible Node.js runtime automatically.'
+    return 1
+  fi
+
+  local arch raw_arch base_url manifest archive tmp_dir archive_path node_dir
+  raw_arch="$(uname -m)"
+  case "$raw_arch" in
+    x86_64|amd64) arch="x64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *)
+      warn "Unsupported Linux architecture for automatic Node.js download: $raw_arch"
+      return 1
+      ;;
+  esac
+
+  base_url="https://nodejs.org/dist/latest-v${PREFERRED_NODE_MAJOR}.x"
+  info "Downloading Node.js LTS runtime for frontend build (${raw_arch})."
+  manifest="$(curl -fsSL "$base_url/SHASUMS256.txt")" || {
+    warn 'Failed to fetch the Node.js release manifest.'
+    return 1
+  }
+
+  archive="$(printf '%s\n' "$manifest" | awk "/linux-${arch}\\.tar\\.xz$/ { print \$2; exit }")"
+  if [[ -z "$archive" ]]; then
+    warn "Could not find a Node.js archive for linux-${arch} in the release manifest."
+    return 1
+  fi
+
+  tmp_dir="$(mktemp -d)"
+  archive_path="$tmp_dir/$archive"
+  if ! curl -fsSL "$base_url/$archive" -o "$archive_path"; then
+    warn 'Failed to download the Node.js runtime archive.'
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  if ! tar -xf "$archive_path" -C "$tmp_dir"; then
+    warn 'Failed to unpack the Node.js runtime archive.'
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
+  node_dir="$(find "$tmp_dir" -maxdepth 1 -mindepth 1 -type d -name 'node-v*' | head -n 1)"
+  if [[ -z "$node_dir" || ! -x "$node_dir/bin/node" ]]; then
+    warn 'Downloaded Node.js runtime is incomplete.'
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+
+  TEMP_NODE_DIR="$tmp_dir"
+  export PATH="$node_dir/bin:$PATH"
+  hash -r
+  return 0
+}
+
+install_node_runtime_from_package_manager() {
+  if [[ ! -f /etc/os-release ]]; then
+    warn 'Cannot detect Linux distribution. Skipping automatic Node.js / npm installation.'
+    return 1
+  fi
+
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  local family="${ID:-} ${ID_LIKE:-}"
+
+  if [[ "$family" =~ (ubuntu|debian|kali) ]]; then
+    info 'Installing Node.js / npm for Ubuntu / Debian / Kali Linux.'
+    if ! sudo apt-get update; then
+      warn 'apt-get update failed while preparing Node.js / npm.'
+      return 1
+    fi
+    if ! sudo apt-get install -y nodejs npm; then
+      warn 'apt-get install failed while preparing Node.js / npm.'
+      return 1
+    fi
+    return 0
+  fi
+
+  if [[ "$family" =~ (centos|rhel|fedora|almalinux|rocky) ]]; then
+    if [[ "${ID:-}" == "fedora" || "${ID_LIKE:-}" =~ fedora ]]; then
+      info 'Installing Node.js / npm for Fedora.'
+      if ! sudo dnf install -y nodejs npm; then
+        warn 'dnf install failed while preparing Node.js / npm.'
+        return 1
+      fi
+    else
+      info 'Installing Node.js / npm for CentOS / RHEL / AlmaLinux.'
+      if command -v yum >/dev/null 2>&1; then
+        if ! sudo yum install -y nodejs npm; then
+          warn 'yum install failed while preparing Node.js / npm.'
+          return 1
+        fi
+      else
+        if ! sudo dnf install -y nodejs npm; then
+          warn 'dnf install failed while preparing Node.js / npm.'
+          return 1
+        fi
+      fi
+    fi
+    return 0
+  fi
+
+  warn "Unsupported Linux distribution (${ID:-unknown}). Skipping automatic Node.js / npm installation."
+  return 1
+}
+
+install_node_runtime() {
+  if download_node_runtime; then
+    return 0
+  fi
+  install_node_runtime_from_package_manager
+}
+
+ensure_node() {
+  local node_version=""
+  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    node_version="$(current_node_version || true)"
+    if [[ -n "$node_version" ]] && version_gte "$node_version" "$MIN_NODE_VERSION"; then
+      return 0
+    fi
+    if [[ -n "$node_version" ]]; then
+      warn "Node.js $node_version is below the required minimum $MIN_NODE_VERSION. Attempting automatic upgrade."
+    fi
+  fi
+
+  warn 'Node.js / npm are unavailable or too old. Attempting automatic installation.'
+  if ! install_node_runtime; then
+    return 1
+  fi
+
+  if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+    node_version="$(current_node_version || true)"
+    if [[ -z "$node_version" ]]; then
+      warn 'Node.js installation finished but the runtime version could not be determined.'
+      return 1
+    fi
+    if ! version_gte "$node_version" "$MIN_NODE_VERSION"; then
+      warn "Node.js installation finished but the available runtime is still below $MIN_NODE_VERSION."
+      return 1
+    fi
+    info "Node.js environment installed: $(node --version)"
+    return 0
+  fi
+
+  warn 'Node.js installation finished but node/npm are still unavailable.'
+  return 1
 }
 
 install_release() {
@@ -173,9 +369,25 @@ run_install_choice() {
   esac
 }
 
+build_frontend() {
+  local static_index="$ROOT_DIR/static/index.html"
+  if ! ensure_node; then
+    if [[ -f "$static_index" ]]; then
+      warn "Using existing frontend bundle: $static_index"
+      return
+    fi
+    warn 'Node.js / npm could not be prepared and static/index.html is missing.'
+    exit 1
+  fi
+  info "Building frontend assets (Node.js $(node --version), npm $(npm --version))."
+  (cd "$ROOT_DIR/frontend" && npm ci --silent && npm run build)
+  info 'Frontend build complete: static/'
+}
+
 main() {
   ensure_rust
   install_build_deps
+  build_frontend
 
   info 'Building LingClaw release binary.'
   cargo build --release

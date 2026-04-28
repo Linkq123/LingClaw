@@ -11,6 +11,145 @@ use crate::{
 
 use super::{AppState, ChatMessage};
 
+pub(crate) fn subagent_snapshot_storage_key(tool_call_id: &str, occurrence: usize) -> String {
+    format!("{tool_call_id}@{occurrence}")
+}
+
+fn next_tool_occurrence(counts: &mut HashMap<String, usize>, tool_call_id: &str) -> usize {
+    let count = counts.entry(tool_call_id.to_string()).or_insert(0);
+    *count += 1;
+    *count
+}
+
+fn canonicalize_subagent_snapshots_for_messages(
+    messages: &[ChatMessage],
+    snapshots: &HashMap<String, crate::SubagentHistorySnapshot>,
+) -> HashMap<String, crate::SubagentHistorySnapshot> {
+    let mut totals: HashMap<String, usize> = HashMap::new();
+    for message in messages.iter().filter(|message| message.role == "tool") {
+        if let Some(tool_call_id) = message
+            .tool_call_id
+            .as_deref()
+            .filter(|tool_call_id| !tool_call_id.is_empty())
+        {
+            *totals.entry(tool_call_id.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    let mut occurrences: HashMap<String, usize> = HashMap::new();
+    let mut out = HashMap::new();
+    for message in messages.iter().filter(|message| message.role == "tool") {
+        let Some(tool_call_id) = message
+            .tool_call_id
+            .as_deref()
+            .filter(|tool_call_id| !tool_call_id.is_empty())
+        else {
+            continue;
+        };
+        let occurrence = next_tool_occurrence(&mut occurrences, tool_call_id);
+        let key = subagent_snapshot_storage_key(tool_call_id, occurrence);
+        if let Some(snapshot) = snapshots.get(&key).cloned() {
+            out.insert(key, snapshot);
+            continue;
+        }
+        if occurrence == totals.get(tool_call_id).copied().unwrap_or(0)
+            && let Some(snapshot) = snapshots.get(tool_call_id).cloned()
+        {
+            out.insert(key, snapshot);
+        }
+    }
+
+    out
+}
+
+fn tool_messages_match(old_message: &ChatMessage, new_message: &ChatMessage) -> bool {
+    old_message.role == "tool"
+        && new_message.role == "tool"
+        && old_message.tool_call_id == new_message.tool_call_id
+        && old_message.content == new_message.content
+        && old_message.timestamp == new_message.timestamp
+}
+
+pub(crate) fn remap_subagent_snapshots_for_message_rewrite(
+    old_messages: &[ChatMessage],
+    new_messages: &[ChatMessage],
+    old_snapshots: &HashMap<String, crate::SubagentHistorySnapshot>,
+) -> HashMap<String, crate::SubagentHistorySnapshot> {
+    let canonical_old = canonicalize_subagent_snapshots_for_messages(old_messages, old_snapshots);
+
+    let mut old_occurrences: HashMap<String, usize> = HashMap::new();
+    let mut old_tool_entries: Vec<(&ChatMessage, Option<crate::SubagentHistorySnapshot>)> =
+        Vec::new();
+    for message in old_messages.iter().filter(|message| message.role == "tool") {
+        let snapshot = message
+            .tool_call_id
+            .as_deref()
+            .filter(|tool_call_id| !tool_call_id.is_empty())
+            .and_then(|tool_call_id| {
+                let occurrence = next_tool_occurrence(&mut old_occurrences, tool_call_id);
+                canonical_old
+                    .get(&subagent_snapshot_storage_key(tool_call_id, occurrence))
+                    .cloned()
+            });
+        old_tool_entries.push((message, snapshot));
+    }
+
+    let mut new_occurrences: HashMap<String, usize> = HashMap::new();
+    let mut out = HashMap::new();
+    let mut cursor = 0usize;
+
+    for message in new_messages.iter().filter(|message| message.role == "tool") {
+        while cursor < old_tool_entries.len()
+            && !tool_messages_match(old_tool_entries[cursor].0, message)
+        {
+            cursor += 1;
+        }
+        let matched_snapshot = if cursor < old_tool_entries.len() {
+            let snapshot = old_tool_entries[cursor].1.clone();
+            cursor += 1;
+            snapshot
+        } else {
+            None
+        };
+
+        let Some(tool_call_id) = message
+            .tool_call_id
+            .as_deref()
+            .filter(|tool_call_id| !tool_call_id.is_empty())
+        else {
+            continue;
+        };
+        let occurrence = next_tool_occurrence(&mut new_occurrences, tool_call_id);
+        if let Some(snapshot) = matched_snapshot {
+            out.insert(
+                subagent_snapshot_storage_key(tool_call_id, occurrence),
+                snapshot,
+            );
+        }
+    }
+
+    out
+}
+
+pub(crate) fn normalize_subagent_snapshots(session: &mut Session) {
+    session.subagent_snapshots = remap_subagent_snapshots_for_message_rewrite(
+        &session.messages,
+        &session.messages,
+        &session.subagent_snapshots,
+    );
+}
+
+pub(crate) fn replace_session_messages(session: &mut Session, new_messages: Vec<ChatMessage>) {
+    let old_messages = session.messages.clone();
+    session.subagent_snapshots = remap_subagent_snapshots_for_message_rewrite(
+        &old_messages,
+        &new_messages,
+        &session.subagent_snapshots,
+    );
+    session.messages = new_messages;
+    retain_failed_tool_results(session);
+}
+
 pub(crate) fn sessions_dir() -> PathBuf {
     let dir = config_dir_path()
         .unwrap_or_else(|| PathBuf::from(".lingclaw"))
@@ -24,6 +163,7 @@ pub(crate) async fn save_session_to_disk(session: &Session) -> Result<(), String
     let tmp_path = sessions_dir().join(format!("{}.json.tmp", session.id));
     let mut session = session.clone();
     sanitize_session_messages(&mut session.messages);
+    normalize_subagent_snapshots(&mut session);
     retain_failed_tool_results(&mut session);
     let data = serde_json::to_string(&session).map_err(|e| e.to_string())?;
     tokio::fs::write(&tmp_path, data)
@@ -80,9 +220,21 @@ pub(crate) fn trim_incomplete_tool_calls(messages: &mut Vec<ChatMessage>) {
     sanitize_session_messages(messages);
 }
 
+pub(crate) fn trim_incomplete_tool_calls_in_session(session: &mut Session) {
+    let old_messages = session.messages.clone();
+    trim_incomplete_tool_calls(&mut session.messages);
+    session.subagent_snapshots = remap_subagent_snapshots_for_message_rewrite(
+        &old_messages,
+        &session.messages,
+        &session.subagent_snapshots,
+    );
+    retain_failed_tool_results(session);
+}
+
 pub(crate) fn normalize_session(session: &mut Session) {
     super::migrate_session(session);
-    trim_incomplete_tool_calls(&mut session.messages);
+    trim_incomplete_tool_calls_in_session(session);
+    normalize_subagent_snapshots(session);
     retain_failed_tool_results(session);
 }
 
@@ -254,6 +406,12 @@ pub(crate) fn build_history_payload_with_s3(
     s3_cfg: Option<&crate::config::S3Config>,
 ) -> serde_json::Value {
     let mut msgs = Vec::new();
+    let snapshot_lookup = remap_subagent_snapshots_for_message_rewrite(
+        &session.messages,
+        &session.messages,
+        &session.subagent_snapshots,
+    );
+    let mut tool_occurrences: HashMap<String, usize> = HashMap::new();
     for msg in &session.messages {
         match msg.role.as_str() {
             "system" => {}
@@ -280,10 +438,18 @@ pub(crate) fn build_history_payload_with_s3(
                 }
             }
             "assistant" => {
-                if let Some(c) = &msg.content
-                    && !c.is_empty()
-                {
-                    msgs.push(json!({"role":"assistant","content":c,"timestamp":msg.timestamp}));
+                let has_content = msg.content.as_deref().is_some_and(|c| !c.is_empty());
+                let has_thinking = msg.thinking.as_deref().is_some_and(|t| !t.is_empty());
+                if has_content || has_thinking {
+                    let content_str = msg.content.as_deref().unwrap_or("");
+                    let mut entry =
+                        json!({"role":"assistant","content":content_str,"timestamp":msg.timestamp});
+                    if let Some(thinking) = &msg.thinking
+                        && !thinking.is_empty()
+                    {
+                        entry["thinking"] = json!(thinking);
+                    }
+                    msgs.push(entry);
                 }
                 if let Some(tcs) = &msg.tool_calls
                     && session.show_tools
@@ -298,12 +464,26 @@ pub(crate) fn build_history_payload_with_s3(
                     && let Some(c) = &msg.content
                 {
                     let tool_call_id = msg.tool_call_id.as_deref().unwrap_or("");
-                    msgs.push(json!({
+                    let snapshot_key = if tool_call_id.is_empty() {
+                        None
+                    } else {
+                        Some(subagent_snapshot_storage_key(
+                            tool_call_id,
+                            next_tool_occurrence(&mut tool_occurrences, tool_call_id),
+                        ))
+                    };
+                    let mut entry = json!({
                         "role":"tool_result",
                         "result":c,
                         "id":tool_call_id,
                         "is_error": session.failed_tool_results.contains(tool_call_id),
-                    }));
+                    });
+                    if let Some(snapshot_key) = snapshot_key.as_deref()
+                        && let Some(snapshot) = snapshot_lookup.get(snapshot_key)
+                    {
+                        entry["subagent_snapshot"] = json!(snapshot);
+                    }
+                    msgs.push(entry);
                 }
             }
             _ => {}

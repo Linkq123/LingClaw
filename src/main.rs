@@ -87,7 +87,9 @@ use session_store::{
     build_active_session_lines, build_global_today_usage, build_history_payload,
     build_session_status, build_session_usage, build_usage_report, list_saved_session_ids_in_dir,
     list_saved_session_summaries_in_dir, recoverable_session_ids_from_summaries,
-    resolve_session_target, sanitize_session_messages, sessions_dir, trim_incomplete_tool_calls,
+    replace_session_messages, resolve_session_target, sanitize_session_messages, sessions_dir,
+    subagent_snapshot_storage_key, trim_incomplete_tool_calls,
+    trim_incomplete_tool_calls_in_session,
 };
 use std::collections::HashSet;
 
@@ -121,12 +123,66 @@ struct ImageAttachment {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
+struct AnthropicThinkingBlock {
+    #[serde(rename = "type")]
+    block_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signature: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    data: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub(crate) struct SubagentToolHistorySnapshot {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    #[serde(default)]
+    pub is_error: bool,
+    #[serde(default)]
+    pub duration_ms: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub(crate) struct SubagentHistorySnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<SubagentToolHistorySnapshot>,
+    #[serde(default)]
+    pub cycles: usize,
+    #[serde(default)]
+    pub tool_calls: usize,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub input_tokens: u64,
+    #[serde(default)]
+    pub output_tokens: u64,
+    #[serde(default)]
+    pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_excerpt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct ChatMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     images: Option<Vec<ImageAttachment>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    anthropic_thinking_blocks: Option<Vec<AnthropicThinkingBlock>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<ToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -148,8 +204,24 @@ impl ChatMessage {
             .is_some_and(|calls| !calls.is_empty())
     }
 
+    fn has_anthropic_thinking_blocks(&self) -> bool {
+        self.anthropic_thinking_blocks
+            .as_ref()
+            .is_some_and(|blocks| !blocks.is_empty())
+    }
+
+    fn has_nonempty_thinking(&self) -> bool {
+        self.thinking
+            .as_deref()
+            .is_some_and(|thinking| !thinking.is_empty())
+    }
+
     fn is_empty_assistant_message(&self) -> bool {
-        self.role == "assistant" && !self.has_nonempty_content() && !self.has_tool_calls()
+        self.role == "assistant"
+            && !self.has_nonempty_content()
+            && !self.has_nonempty_thinking()
+            && !self.has_tool_calls()
+            && !self.has_anthropic_thinking_blocks()
     }
 }
 
@@ -158,6 +230,8 @@ struct ToolCall {
     id: String,
     #[serde(rename = "type")]
     call_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gemini_thought_signature: Option<String>,
     function: FunctionCall,
 }
 
@@ -225,6 +299,9 @@ struct Session {
     /// Tool call ids whose persisted tool result ended in an error state.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     failed_tool_results: HashSet<String>,
+    /// Compact delegated-task snapshots keyed by parent `task` tool_call_id.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    subagent_snapshots: HashMap<String, SubagentHistorySnapshot>,
     #[serde(default)]
     version: u32,
     #[serde(skip)]
@@ -320,6 +397,7 @@ impl Session {
             show_reasoning: default_show_reasoning(),
             disabled_system_skills: HashSet::new(),
             failed_tool_results: HashSet::new(),
+            subagent_snapshots: HashMap::new(),
             version: SESSION_VERSION,
             workspace,
         }
@@ -350,18 +428,78 @@ struct AppState {
     upload_token: String,
     hooks: HookRegistry,
     /// Background structured memory updater (active when config.structured_memory is true).
-    memory_queue: Option<MemoryUpdateQueue>,
+    memory_queue: std::sync::Mutex<Option<MemoryUpdateQueue>>,
 }
 
 impl AppState {
     /// Return a snapshot of the current runtime config.
     fn config(&self) -> Arc<Config> {
-        self.config.lock().expect("config lock poisoned").clone()
+        match self.config.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                eprintln!("Warning: config lock poisoned; recovering with inner value");
+                poisoned.into_inner().clone()
+            }
+        }
     }
 
     /// Hot-swap the runtime config (called after saving to disk).
     fn replace_config(&self, new: Config) {
-        *self.config.lock().expect("config lock poisoned") = Arc::new(new);
+        match self.config.lock() {
+            Ok(mut guard) => {
+                *guard = Arc::new(new);
+            }
+            Err(poisoned) => {
+                eprintln!("Warning: config lock poisoned during replace; recovering");
+                let mut guard = poisoned.into_inner();
+                *guard = Arc::new(new);
+            }
+        }
+    }
+
+    fn apply_runtime_config(&self, new: Config) {
+        self.sync_memory_queue(&new);
+        runtime_loop::refresh_reflection_runtime(new.daily_reflection);
+        if !new.daily_reflection {
+            runtime_loop::cancel_active_reflections();
+        }
+        self.replace_config(new);
+    }
+
+    fn memory_queue(&self) -> Option<MemoryUpdateQueue> {
+        match self.memory_queue.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => {
+                eprintln!("Warning: memory queue lock poisoned; recovering with inner value");
+                poisoned.into_inner().clone()
+            }
+        }
+    }
+
+    fn sync_memory_queue(&self, config: &Config) {
+        let sessions = self.sessions.clone();
+        let apply = |guard: &mut Option<MemoryUpdateQueue>| match (
+            guard.as_ref(),
+            config.structured_memory,
+        ) {
+            (Some(queue), true) => queue.replace_config(config.clone()),
+            (None, true) => {
+                *guard = Some(MemoryUpdateQueue::spawn(config.clone(), sessions.clone()));
+            }
+            (_, false) => {
+                if let Some(queue) = guard.as_ref() {
+                    queue.shutdown();
+                }
+                *guard = None;
+            }
+        };
+        match self.memory_queue.lock() {
+            Ok(mut guard) => apply(&mut guard),
+            Err(poisoned) => {
+                eprintln!("Warning: memory queue lock poisoned during sync; recovering");
+                apply(&mut poisoned.into_inner());
+            }
+        }
     }
 }
 
@@ -377,6 +515,23 @@ struct SessionClientBinding {
 struct SessionRunBinding {
     connection_id: u64,
     cancel: CancellationToken,
+    stop_requested: Arc<AtomicBool>,
+    deferred_interventions: Arc<Mutex<DeferredInterventionState>>,
+}
+
+#[derive(Default)]
+struct DeferredInterventionState {
+    queue: Vec<String>,
+    accepting: bool,
+}
+
+impl DeferredInterventionState {
+    fn open() -> Self {
+        Self {
+            queue: Vec::new(),
+            accepting: true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -547,14 +702,6 @@ Only read those files if the user explicitly asks to inspect them, if you need t
     let prompt = format!(
         r#"{persona}{structured_memory_section}
 
----
-
-## Environment
-- OS: {os_name}
-- Current system local time: {local_time}
-- Working directory: {cwd}
-- Model: {model}
-
 {prompt_file_note}
 
 ## Agent Behavior
@@ -567,7 +714,16 @@ You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools
 - **Finishing:** When the task is complete, deliver your result. When you are genuinely stuck with no further options, say so honestly. Do not pad with speculative follow-ups.
 
 ## Available Tools
-{tool_lines}{mcp_note}{skills_section}{agents_section}"#,
+{tool_lines}{mcp_note}{skills_section}{agents_section}
+
+---
+
+## Environment
+- OS: {os_name}
+- Current system local time: {local_time}
+- Working directory: {cwd}
+- Model: {model}"#, // The `---\n## Environment\n- OS:` prefix above is used as a cache-split
+        // delimiter by ENV_BLOCK_DELIMITER in providers.rs — keep them in sync.
         model = model,
         local_time = local_time,
         tool_lines = tool_lines,
@@ -583,6 +739,8 @@ You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools
         role: "system".into(),
         content: Some(prompt),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -650,17 +808,37 @@ fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
                 resolved.pop();
             }
             std::path::Component::Normal(part) => {
-                resolved.push(part);
-                if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+                let candidate = resolved.join(part);
+                if let Ok(meta) = std::fs::symlink_metadata(&candidate)
                     && meta.file_type().is_symlink()
                 {
+                    let escaped_workspace = candidate
+                        .canonicalize()
+                        .ok()
+                        .is_some_and(|target| !target.starts_with(&ws_canonical));
                     eprintln!(
-                        "SECURITY: path '{}' traverses symlink '{}', clamped",
+                        "SECURITY: path '{}' traverses symlink '{}'{}clamped",
                         path_str,
-                        resolved.display()
+                        candidate.display(),
+                        if escaped_workspace {
+                            " that escapes workspace, "
+                        } else {
+                            ", "
+                        }
                     );
                     return ws_canonical;
                 }
+                if let Ok(canon) = candidate.canonicalize()
+                    && !canon.starts_with(&ws_canonical)
+                {
+                    eprintln!(
+                        "SECURITY: path '{}' resolves outside workspace via '{}', clamped",
+                        path_str,
+                        candidate.display()
+                    );
+                    return ws_canonical;
+                }
+                resolved = candidate;
             }
             std::path::Component::Prefix(_) | std::path::Component::RootDir => {
                 eprintln!(
@@ -731,17 +909,37 @@ fn resolve_path_checked(path_str: &str, workspace: &Path) -> Result<PathBuf, Str
                 resolved.pop();
             }
             std::path::Component::Normal(part) => {
-                resolved.push(part);
-                if let Ok(meta) = std::fs::symlink_metadata(&resolved)
+                let candidate = resolved.join(part);
+                if let Ok(meta) = std::fs::symlink_metadata(&candidate)
                     && meta.file_type().is_symlink()
                 {
+                    let escaped_workspace = candidate
+                        .canonicalize()
+                        .ok()
+                        .is_some_and(|target| !target.starts_with(&workspace_root));
                     return Err(format!(
-                        "path '{}' traverses symlink '{}' outside the session workspace '{}'",
+                        "path '{}' traverses symlink '{}'{}outside the session workspace '{}'",
                         path_str,
-                        resolved.display(),
+                        candidate.display(),
+                        if escaped_workspace {
+                            " that resolves "
+                        } else {
+                            " "
+                        },
                         workspace_root.display()
                     ));
                 }
+                if let Ok(canon) = candidate.canonicalize()
+                    && !canon.starts_with(&workspace_root)
+                {
+                    return Err(format!(
+                        "path '{}' resolves outside the session workspace '{}' via '{}'",
+                        path_str,
+                        workspace_root.display(),
+                        candidate.display()
+                    ));
+                }
+                resolved = candidate;
             }
             std::path::Component::Prefix(_) | std::path::Component::RootDir => {
                 return Err(format!(
@@ -1033,24 +1231,32 @@ async fn dispatch_live_event(
 ) {
     let event_type = event["type"].as_str().unwrap_or_default();
     let mut delegated_replay_event: Option<serde_json::Value> = None;
+    let active_run_connection_id = {
+        let runs = state.active_runs.lock().await;
+        runs.get(session_id).map(|binding| binding.connection_id)
+    };
+    let live_round_connection_id = {
+        let live_rounds = state.live_rounds.lock().await;
+        live_rounds.get(session_id).map(|round| round.connection_id)
+    };
 
     // Validate connection ownership and update live replay state under a single
-    // critical section. We hold session_clients for the entire block to prevent
-    // unbind/rebind from racing between validation and live_rounds mutation.
-    {
-        let clients_guard = state.session_clients.lock().await;
-        let is_current = clients_guard
+    // critical section. Reconnected pages may receive events from the original
+    // run owner while a newer socket is bound for rendering, including run
+    // teardown after the active_runs entry has already been removed.
+    let binding = {
+        let mut clients_guard = state.session_clients.lock().await;
+        let current_connection_id = clients_guard
             .get(session_id)
-            .map(|b| b.connection_id == connection_id)
-            .unwrap_or(false);
-        if !is_current {
+            .map(|binding| binding.connection_id);
+        let is_current = current_connection_id == Some(connection_id);
+        let is_active_run_source = active_run_connection_id == Some(connection_id);
+        let is_live_round_source = live_round_connection_id == Some(connection_id);
+        if !(is_current || is_active_run_source || is_live_round_source) {
             return;
         }
 
         let mut live_rounds = state.live_rounds.lock().await;
-        // Drop the clients guard now — we've entered the live_rounds critical
-        // section and no longer need the binding check to stay valid.
-        drop(clients_guard);
 
         match event_type {
             "start" => {
@@ -1347,14 +1553,10 @@ async fn dispatch_live_event(
                 }
             }
         }
-    }
 
-    let binding = {
-        let mut clients = state.session_clients.lock().await;
-        if let Some(binding) = clients.get_mut(session_id) {
-            if binding.connection_id != connection_id {
-                return;
-            }
+        drop(live_rounds);
+
+        if let Some(binding) = clients_guard.get_mut(session_id) {
             if !binding.replay_ready {
                 binding.pending_events.push(event.clone());
                 None
@@ -1526,17 +1728,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             },
         );
     }
-    {
-        let active_run = {
-            let runs = state.active_runs.lock().await;
-            runs.get(&current_session_id).cloned()
-        };
-        if let Some(run) = active_run
-            && run.connection_id != connection_id
-        {
-            run.cancel.cancel();
-        }
-    }
 
     bind_session_connection(&state, &current_session_id, connection_id, &tx, false).await;
     replay_live_round(&tx, &state, &current_session_id).await;
@@ -1570,6 +1761,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                 connection_id,
                 &state,
                 &tx,
+                &live_tx,
                 &cancel,
             )
             .await
@@ -1817,6 +2009,18 @@ async fn api_get_config(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_local_request_headers(&headers)?;
+    let workspace = session_workspace_path(MAIN_SESSION_ID);
+    let discovered_agents: Vec<serde_json::Value> =
+        subagents::discovery::discover_all_agents(&workspace)
+            .into_iter()
+            .map(|agent| {
+                json!({
+                    "name": agent.name,
+                    "description": agent.description,
+                    "source": agent.source.label(),
+                })
+            })
+            .collect();
     let path = config_file_path().ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1833,6 +2037,7 @@ async fn api_get_config(
         Ok(value) => Ok(Json(json!({
             "config": value,
             "path": path.display().to_string(),
+            "discoveredAgents": discovered_agents.clone(),
         }))),
         Err(e) => {
             let msg = e.to_string();
@@ -1844,6 +2049,7 @@ async fn api_get_config(
                 "parse_error": msg,
                 "line": line,
                 "column": column,
+                "discoveredAgents": discovered_agents,
             })))
         }
     }
@@ -1933,10 +2139,38 @@ async fn api_put_config(
     // Hot-reload: re-read the saved config into the runtime so that
     // model/MCP changes take effect without a restart.
     let new_config = Config::load();
-    state.replace_config(new_config);
+    state.apply_runtime_config(new_config);
 
     // Release the config file lock before potentially slow MCP I/O.
     drop(_save_guard);
+
+    // Push a refreshed `session` event so that capability flags (e.g. image
+    // support) are reflected in the frontend immediately — without requiring
+    // a page reload.
+    // Acquire each lock separately so we never hold `sessions` while waiting
+    // on `session_clients` (consistent with send_existing_session_payloads).
+    let session_payload = {
+        let sessions = state.sessions.lock().await;
+        let config = state.config();
+        let (name, model, usage) = sessions
+            .get(MAIN_SESSION_ID)
+            .map(|s| {
+                let m = s.effective_model(&config.model).to_string();
+                let u = socket_sync::build_session_usage_payload(s);
+                (s.name.clone(), m, u)
+            })
+            .unwrap_or_else(|| ("Main".to_string(), config.model.clone(), json!({})));
+        socket_sync::build_session_info_payload(MAIN_SESSION_ID, &name, &state, &model, usage)
+    };
+    let tx_opt = state
+        .session_clients
+        .lock()
+        .await
+        .get(MAIN_SESSION_ID)
+        .map(|b| b.tx.clone());
+    if let Some(tx) = tx_opt {
+        ws_send(&tx, &session_payload).await;
+    }
 
     // Invalidate cached MCP tool definitions so the next round picks up
     // any server additions/removals.
@@ -1987,6 +2221,8 @@ async fn api_test_model(
         role: "user".to_string(),
         content: Some("Hi".to_string()),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -2159,9 +2395,11 @@ async fn read_config_file_snapshot(path: &Path) -> std::io::Result<String> {
 
 fn parse_serde_error_position(msg: &str) -> (Option<u64>, Option<u64>) {
     // serde_json errors: "... at line X column Y"
-    static RE: std::sync::LazyLock<regex::Regex> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"line (\d+) column (\d+)").unwrap());
-    if let Some(caps) = RE.captures(msg) {
+    static RE: std::sync::LazyLock<Option<regex::Regex>> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"line (\d+) column (\d+)").ok());
+    if let Some(re) = RE.as_ref()
+        && let Some(caps) = re.captures(msg)
+    {
         let line = caps.get(1).and_then(|m| m.as_str().parse().ok());
         let col = caps.get(2).and_then(|m| m.as_str().parse().ok());
         return (line, col);
@@ -2261,15 +2499,16 @@ async fn main() {
     }
 
     let config = Config::load();
+    runtime_loop::refresh_reflection_runtime(config.daily_reflection);
     let port = port_override.unwrap_or(config.port);
 
     if config.api_key.is_empty()
         && config.providers.is_empty()
-        && config.provider.api_key_env_var().is_some()
+        && config.provider.api_key_env_hint().is_some()
     {
         eprintln!(
             "WARNING: {} is not set and no config file providers found. LLM calls will fail.",
-            config.provider.api_key_env_var().unwrap_or("API key")
+            config.provider.api_key_env_hint().unwrap_or("API key")
         );
     }
 
@@ -2383,7 +2622,7 @@ async fn main() {
         shutdown_token,
         upload_token,
         hooks,
-        memory_queue,
+        memory_queue: std::sync::Mutex::new(memory_queue),
     });
 
     // Ensure main session exists (load from disk or create fresh)

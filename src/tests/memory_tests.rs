@@ -1,5 +1,36 @@
 use super::*;
-use std::path::PathBuf;
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use tokio::sync::Mutex as AsyncMutex;
+
+fn queue_test_config() -> Config {
+    Config {
+        api_key: "test-key".to_string(),
+        api_base: "https://api.openai.com/v1".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        fast_model: None,
+        sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
+        memory_model: None,
+        reflection_model: None,
+        context_model: None,
+        provider: crate::Provider::OpenAI,
+        openai_stream_include_usage: false,
+        anthropic_prompt_caching: false,
+        providers: HashMap::new(),
+        mcp_servers: HashMap::new(),
+        port: crate::DEFAULT_PORT,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+        structured_memory: true,
+        daily_reflection: false,
+        s3: None,
+    }
+}
 
 #[test]
 fn test_structured_memory_default() {
@@ -91,6 +122,8 @@ fn test_build_conversation_excerpt() {
             role: "system".into(),
             content: Some("system prompt".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -99,6 +132,8 @@ fn test_build_conversation_excerpt() {
             role: "user".into(),
             content: Some("Hello".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -107,6 +142,8 @@ fn test_build_conversation_excerpt() {
             role: "assistant".into(),
             content: Some("Hi there".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -115,6 +152,8 @@ fn test_build_conversation_excerpt() {
             role: "tool".into(),
             content: Some("tool output".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -198,6 +237,8 @@ fn test_build_conversation_excerpt_skips_auto_compress_summary() {
                 "## Context Summary (auto-generated)\nPrevious conversation summary...".to_string(),
             ),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -206,6 +247,8 @@ fn test_build_conversation_excerpt_skips_auto_compress_summary() {
             role: "user".into(),
             content: Some("Hello".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -214,6 +257,8 @@ fn test_build_conversation_excerpt_skips_auto_compress_summary() {
             role: "assistant".into(),
             content: Some("Real reply".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -231,6 +276,39 @@ fn test_memory_runtime_status_unavailable_without_queue() {
     let status = memory_runtime_status(None);
     assert!(status.contains("Memory Updater"));
     assert!(status.contains("unavailable"));
+}
+
+#[tokio::test]
+async fn test_memory_queue_replace_config_updates_runtime_snapshot() {
+    let queue = MemoryUpdateQueue::spawn(
+        queue_test_config(),
+        Arc::new(AsyncMutex::new(HashMap::new())),
+    );
+
+    let mut new_config = queue_test_config();
+    new_config.tool_timeout = Duration::from_secs(90);
+    new_config.api_key = "new-key".to_string();
+    queue.replace_config(new_config.clone());
+
+    let snapshot = queue
+        .config
+        .lock()
+        .expect("queue config lock should be available")
+        .clone();
+    assert_eq!(snapshot.tool_timeout, Duration::from_secs(90));
+    assert_eq!(snapshot.api_key, "new-key");
+}
+
+#[tokio::test]
+async fn test_memory_queue_shutdown_cancels_runtime_loop() {
+    let queue = MemoryUpdateQueue::spawn(
+        queue_test_config(),
+        Arc::new(AsyncMutex::new(HashMap::new())),
+    );
+
+    queue.shutdown();
+
+    assert!(queue.cancel.is_cancelled());
 }
 
 #[test]
@@ -301,6 +379,8 @@ fn test_build_conversation_excerpt_includes_tool_calls_and_results() {
             role: "system".into(),
             content: Some("system prompt".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -309,6 +389,8 @@ fn test_build_conversation_excerpt_includes_tool_calls_and_results() {
             role: "user".into(),
             content: Some("Search for files".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -317,9 +399,12 @@ fn test_build_conversation_excerpt_includes_tool_calls_and_results() {
             role: "assistant".into(),
             content: None,
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![crate::ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: crate::FunctionCall {
                     name: "search_files".into(),
                     arguments: "{}".into(),
@@ -332,6 +417,8 @@ fn test_build_conversation_excerpt_includes_tool_calls_and_results() {
             role: "tool".into(),
             content: Some("Found 3 matches in src/".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -340,6 +427,8 @@ fn test_build_conversation_excerpt_includes_tool_calls_and_results() {
             role: "assistant".into(),
             content: Some("I found 3 files.".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -387,6 +476,8 @@ fn test_build_conversation_excerpt_truncates_long_tool_results() {
         role: "tool".into(),
         content: Some(long_content),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: Some("tc1".into()),
         timestamp: None,

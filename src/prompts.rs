@@ -967,7 +967,7 @@ fn format_local_hhmm(date_time: DateTime<FixedOffset>) -> String {
 }
 
 fn format_local_datetime_label(date_time: DateTime<FixedOffset>) -> String {
-    date_time.format("%Y-%m-%d %H:%M:%S %:z").to_string()
+    date_time.format("%Y-%m-%d %H:%M %:z").to_string()
 }
 
 #[cfg(test)]

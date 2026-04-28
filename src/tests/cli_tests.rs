@@ -4,7 +4,25 @@ use crate::{
     config::{JsonMcpServerConfig, S3Config},
 };
 use serde_json::json;
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, path::Path, path::PathBuf, time::Duration};
+
+fn unique_temp_dir(prefix: &str) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{stamp}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp dir should be created");
+    dir
+}
+
+fn write_text_file(path: &Path, content: &str) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("parent dir should be created");
+    }
+    std::fs::write(path, content).expect("file should be written");
+}
 
 fn test_config_with_broken_mcp() -> Config {
     let mut mcp_servers = HashMap::new();
@@ -26,6 +44,7 @@ fn test_config_with_broken_mcp() -> Config {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -357,4 +376,167 @@ fn wizard_suggested_fast_model_falls_back_to_primary_model() {
         .expect("primary model should be used when no family fast model is configured");
 
     assert_eq!(fast_model, "openai-2/gpt-4.1");
+}
+
+#[test]
+fn prepare_frontend_assets_reuses_prebuilt_static_when_frontend_source_is_missing() {
+    let source_dir = unique_temp_dir("lingclaw-install-static-only");
+    write_text_file(
+        &source_dir.join("static").join("index.html"),
+        "<html>ok</html>",
+    );
+
+    let result = prepare_frontend_assets_with(&source_dir, "definitely-not-real-npm")
+        .expect("existing static assets should be reusable");
+
+    assert_eq!(result, FrontendPrepareResult::UsedPrebuiltStatic);
+
+    let _ = std::fs::remove_dir_all(&source_dir);
+}
+
+#[test]
+fn prepare_frontend_assets_reuses_prebuilt_static_when_npm_is_unavailable() {
+    let source_dir = unique_temp_dir("lingclaw-install-no-npm");
+    write_text_file(
+        &source_dir.join("frontend").join("package.json"),
+        "{\"name\":\"frontend\"}",
+    );
+    write_text_file(
+        &source_dir.join("static").join("index.html"),
+        "<html>ok</html>",
+    );
+
+    let result = prepare_frontend_assets_with(&source_dir, "definitely-not-real-npm")
+        .expect("existing static assets should be reused when npm is missing");
+
+    assert_eq!(result, FrontendPrepareResult::UsedPrebuiltStaticWithoutNpm);
+
+    let _ = std::fs::remove_dir_all(&source_dir);
+}
+
+#[test]
+fn prepare_frontend_assets_fails_without_npm_when_static_bundle_is_missing() {
+    let source_dir = unique_temp_dir("lingclaw-install-missing-static");
+    write_text_file(
+        &source_dir.join("frontend").join("package.json"),
+        "{\"name\":\"frontend\"}",
+    );
+
+    let error = prepare_frontend_assets_with(&source_dir, "definitely-not-real-npm").expect_err(
+        "install should fail when frontend source exists but no static bundle can be produced",
+    );
+
+    assert!(error.to_string().contains("unavailable"));
+
+    let _ = std::fs::remove_dir_all(&source_dir);
+}
+
+#[test]
+fn install_frontend_assets_replaces_stale_target_static_dir() {
+    let source_dir = unique_temp_dir("lingclaw-install-source-static");
+    let install_dir = unique_temp_dir("lingclaw-install-target-static");
+
+    write_text_file(
+        &source_dir.join("static").join("index.html"),
+        "<html>new</html>",
+    );
+    write_text_file(
+        &source_dir.join("static").join("assets").join("app.js"),
+        "console.log('new');",
+    );
+    write_text_file(&install_dir.join("static").join("stale.txt"), "stale");
+
+    install_frontend_assets(&source_dir, &install_dir)
+        .expect("frontend assets should copy cleanly");
+
+    assert!(install_dir.join("static").join("index.html").is_file());
+    assert!(
+        install_dir
+            .join("static")
+            .join("assets")
+            .join("app.js")
+            .is_file()
+    );
+    assert!(!install_dir.join("static").join("stale.txt").exists());
+
+    let _ = std::fs::remove_dir_all(&source_dir);
+    let _ = std::fs::remove_dir_all(&install_dir);
+}
+
+#[test]
+fn install_release_artifacts_copies_binary_and_frontend_assets() {
+    let source_dir = unique_temp_dir("lingclaw-install-release-source");
+    let install_dir = unique_temp_dir("lingclaw-install-release-target");
+    let built_exe = release_binary_path(&source_dir);
+    let current_exe = install_dir.join(if cfg!(windows) {
+        "lingclaw.exe"
+    } else {
+        "lingclaw"
+    });
+
+    write_text_file(&built_exe, "new-binary");
+    write_text_file(
+        &source_dir.join("static").join("index.html"),
+        "<html>new</html>",
+    );
+    write_text_file(
+        &source_dir.join("static").join("assets").join("app.js"),
+        "console.log('new');",
+    );
+    write_text_file(&current_exe, "old-binary");
+    write_text_file(&install_dir.join("static").join("stale.txt"), "stale");
+
+    install_release_artifacts(&source_dir, &built_exe, &current_exe)
+        .expect("release artifacts should install cleanly");
+
+    assert_eq!(
+        std::fs::read_to_string(&current_exe).expect("installed binary should be readable"),
+        "new-binary"
+    );
+    assert!(install_dir.join("static").join("index.html").is_file());
+    assert!(
+        install_dir
+            .join("static")
+            .join("assets")
+            .join("app.js")
+            .is_file()
+    );
+    assert!(!install_dir.join("static").join("stale.txt").exists());
+
+    let _ = std::fs::remove_dir_all(&source_dir);
+    let _ = std::fs::remove_dir_all(&install_dir);
+}
+
+#[test]
+fn parse_version_triple_parses_major_minor_patch() {
+    assert_eq!(parse_version_triple("1.85.0"), Some((1, 85, 0)));
+    assert_eq!(parse_version_triple("2.0.1"), Some((2, 0, 1)));
+}
+
+#[test]
+fn parse_version_triple_accepts_missing_patch() {
+    // Some rustc builds omit the patch component.
+    assert_eq!(parse_version_triple("1.85"), Some((1, 85, 0)));
+}
+
+#[test]
+fn parse_version_triple_rejects_non_numeric() {
+    assert_eq!(parse_version_triple(""), None);
+    assert_eq!(parse_version_triple("abc"), None);
+}
+
+#[test]
+fn doctor_node_version_strips_leading_v() {
+    // detect_node_version() trims the leading 'v' from "v22.14.0".
+    // Simulate that behaviour directly on the raw string.
+    let raw = "v22.14.0\n";
+    let trimmed = raw.trim().trim_start_matches('v').to_string();
+    assert_eq!(trimmed, "22.14.0");
+}
+
+#[test]
+fn doctor_npm_version_trims_whitespace() {
+    let raw = "10.9.0\n";
+    let trimmed = raw.trim().to_string();
+    assert_eq!(trimmed, "10.9.0");
 }

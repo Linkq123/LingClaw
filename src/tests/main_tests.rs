@@ -27,6 +27,7 @@ fn test_config() -> Config {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -176,7 +177,7 @@ fn test_app_state() -> AppState {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     }
 }
 
@@ -195,8 +196,31 @@ fn test_app_state_with_config(config: Config) -> AppState {
         shutdown_token: "test-shutdown-token".to_string(),
         upload_token: "test-upload-token".to_string(),
         hooks: HookRegistry::new(),
-        memory_queue: None,
+        memory_queue: std::sync::Mutex::new(None),
     }
+}
+
+#[tokio::test]
+async fn sync_memory_queue_hot_toggles_structured_memory_runtime() {
+    let state = test_app_state();
+    assert!(state.memory_queue().is_none());
+
+    let mut enabled = test_config();
+    enabled.structured_memory = true;
+    state.sync_memory_queue(&enabled);
+
+    let queue = state
+        .memory_queue()
+        .expect("structured memory should create a runtime queue");
+    let status = crate::memory::memory_runtime_status(Some(&queue));
+    assert!(status.contains("Memory Updater"));
+    assert!(!status.contains("unavailable"));
+
+    let mut disabled = enabled;
+    disabled.structured_memory = false;
+    state.sync_memory_queue(&disabled);
+
+    assert!(state.memory_queue().is_none());
 }
 
 fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
@@ -207,6 +231,8 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
             role: "system".into(),
             content: Some("system".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -231,6 +257,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 0,
         workspace: PathBuf::new(),
     }
@@ -241,6 +268,8 @@ fn make_message(role: &str, content: &str) -> ChatMessage {
         role: role.to_string(),
         content: Some(content.to_string()),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -386,6 +415,7 @@ fn resolve_model_uses_config_for_plain_model_id() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -643,6 +673,8 @@ fn build_history_payload_preserves_raw_tool_result_content() {
                 role: "system".into(),
                 content: Some("system".into()),
                 images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -651,6 +683,8 @@ fn build_history_payload_preserves_raw_tool_result_content() {
                 role: "tool".into(),
                 content: Some(long_raw_result.clone()),
                 images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: Some("call_1".into()),
                 timestamp: Some(123),
@@ -676,6 +710,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 0,
         workspace: PathBuf::new(),
     };
@@ -705,6 +740,8 @@ fn build_history_payload_marks_failed_tool_result_with_is_error() {
             role: "tool".into(),
             content: Some("Sub-agent 'coder' timed out after 30s".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("task_1".into()),
             timestamp: Some(123),
@@ -729,6 +766,7 @@ fn build_history_payload_marks_failed_tool_result_with_is_error() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: HashSet::from(["task_1".to_string()]),
+        subagent_snapshots: HashMap::new(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -760,6 +798,8 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
                 cache_path: Some("C:/internal/cache/file.b64".into()),
                 data: Some("aW1hZ2U=".into()),
             }]),
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: Some(123),
@@ -784,6 +824,7 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
         show_reasoning: default_show_reasoning(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -812,6 +853,8 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
                 cache_path: None,
                 data: None,
             }]),
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: Some(123),
@@ -836,6 +879,7 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
         show_reasoning: default_show_reasoning(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -859,6 +903,473 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
         url.starts_with("https://minio.example.test/storage/bucket/lingclaw/images/2026/demo.png?")
     );
     assert!(url.contains("X-Amz-Signature="));
+}
+
+#[test]
+fn build_history_payload_includes_thinking_only_assistant_messages() {
+    // An assistant message that has thinking but no content (e.g., think → tool_call
+    // cycle with no text response) must appear in the history payload so that the
+    // reasoning card is replayed after a page refresh.
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None, // no text — only thinking + tool_calls
+                images: None,
+                thinking: Some("step by step reasoning".into()),
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![crate::ToolCall {
+                    id: "call_abc".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "exec".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(1000),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: Some("done".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: Some(2000),
+            },
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let payload = build_history_payload(&session);
+    let msgs = payload["messages"].as_array().unwrap();
+
+    // The thinking-only assistant entry must appear.
+    let thinking_entry = msgs
+        .iter()
+        .find(|m| m["role"] == "assistant" && m.get("thinking").is_some())
+        .expect("history should contain the thinking-only assistant entry");
+    assert_eq!(
+        thinking_entry["thinking"].as_str(),
+        Some("step by step reasoning")
+    );
+    // Content should be present as an empty string (not omitted).
+    assert_eq!(thinking_entry["content"].as_str(), Some(""));
+
+    // The second assistant entry (with actual content) should also be present.
+    let content_entry = msgs
+        .iter()
+        .find(|m| m["role"] == "assistant" && m["content"] == "done")
+        .expect("history should contain the content assistant entry");
+    assert!(content_entry.get("thinking").is_none());
+}
+
+#[test]
+fn build_history_payload_includes_subagent_snapshot_on_task_results() {
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![crate::ToolCall {
+                    id: "task_call_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "task".into(),
+                        arguments: r#"{"agent":"reviewer","prompt":"Inspect logs"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(1000),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("Found the issue in the logs.".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: Some("task_call_1".into()),
+                timestamp: Some(1001),
+            },
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::from([(
+            subagent_snapshot_storage_key("task_call_1", 1),
+            SubagentHistorySnapshot {
+                reasoning: Some("[Cycle 1]\nInspect logs".into()),
+                tools: vec![SubagentToolHistorySnapshot {
+                    id: "tool-1".into(),
+                    name: "read_file".into(),
+                    arguments: Some(r#"{"path":"logs/app.log"}"#.into()),
+                    result: Some("panic: startup config missing".into()),
+                    is_error: false,
+                    duration_ms: 12,
+                }],
+                cycles: 1,
+                tool_calls: 1,
+                duration_ms: 120,
+                input_tokens: 55,
+                output_tokens: 21,
+                success: true,
+                result_excerpt: Some("Found the issue in the logs.".into()),
+                error: None,
+            },
+        )]),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let payload = build_history_payload(&session);
+    let msgs = payload["messages"]
+        .as_array()
+        .expect("history messages should be an array");
+    let tool_result = msgs
+        .iter()
+        .find(|message| message["role"] == "tool_result" && message["id"] == "task_call_1")
+        .expect("task tool_result should be present");
+
+    assert_eq!(
+        tool_result["subagent_snapshot"]["reasoning"].as_str(),
+        Some("[Cycle 1]\nInspect logs")
+    );
+    assert_eq!(
+        tool_result["subagent_snapshot"]["tools"][0]["name"].as_str(),
+        Some("read_file")
+    );
+    assert_eq!(
+        tool_result["subagent_snapshot"]["result_excerpt"].as_str(),
+        Some("Found the issue in the logs.")
+    );
+}
+
+#[test]
+fn build_history_payload_distinguishes_repeated_task_tool_call_ids() {
+    let first_snapshot = SubagentHistorySnapshot {
+        result_excerpt: Some("First delegated result".into()),
+        success: true,
+        ..Default::default()
+    };
+    let second_snapshot = SubagentHistorySnapshot {
+        result_excerpt: Some("Second delegated result".into()),
+        success: true,
+        ..Default::default()
+    };
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![crate::ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "task".into(),
+                        arguments: r#"{"agent":"reviewer","prompt":"Inspect logs"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(1000),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("First delegated result".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+                timestamp: Some(1001),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![crate::ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "task".into(),
+                        arguments: r#"{"agent":"reviewer","prompt":"Inspect newer logs"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(1002),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("Second delegated result".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+                timestamp: Some(1003),
+            },
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 2,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::from([
+            (
+                subagent_snapshot_storage_key("call_1", 1),
+                first_snapshot.clone(),
+            ),
+            (
+                subagent_snapshot_storage_key("call_1", 2),
+                second_snapshot.clone(),
+            ),
+        ]),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let payload = build_history_payload(&session);
+    let results: Vec<_> = payload["messages"]
+        .as_array()
+        .expect("history messages should be an array")
+        .iter()
+        .filter(|message| message["role"] == "tool_result" && message["id"] == "call_1")
+        .collect();
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(
+        results[0]["subagent_snapshot"]["result_excerpt"].as_str(),
+        Some("First delegated result")
+    );
+    assert_eq!(
+        results[1]["subagent_snapshot"]["result_excerpt"].as_str(),
+        Some("Second delegated result")
+    );
+}
+
+#[test]
+fn replace_session_messages_rekeys_subagent_snapshots_for_remaining_history() {
+    let assistant_first = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: Some(vec![crate::ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: "task".into(),
+                arguments: r#"{"agent":"reviewer","prompt":"Inspect logs"}"#.into(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: Some(1000),
+    };
+    let tool_first = ChatMessage {
+        role: "tool".into(),
+        content: Some("First delegated result".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: Some("call_1".into()),
+        timestamp: Some(1001),
+    };
+    let assistant_second = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: Some(vec![crate::ToolCall {
+            id: "call_1".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: "task".into(),
+                arguments: r#"{"agent":"reviewer","prompt":"Inspect newer logs"}"#.into(),
+            },
+        }]),
+        tool_call_id: None,
+        timestamp: Some(1002),
+    };
+    let tool_second = ChatMessage {
+        role: "tool".into(),
+        content: Some("Second delegated result".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: Some("call_1".into()),
+        timestamp: Some(1003),
+    };
+    let mut session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("sys".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: Some(999),
+            },
+            assistant_first.clone(),
+            tool_first,
+            assistant_second.clone(),
+            tool_second,
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 2,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::from([
+            (
+                subagent_snapshot_storage_key("call_1", 1),
+                SubagentHistorySnapshot {
+                    result_excerpt: Some("First delegated result".into()),
+                    success: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                subagent_snapshot_storage_key("call_1", 2),
+                SubagentHistorySnapshot {
+                    result_excerpt: Some("Second delegated result".into()),
+                    success: true,
+                    ..Default::default()
+                },
+            ),
+        ]),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let kept_system = session.messages[0].clone();
+    let kept_tool = session.messages[4].clone();
+    replace_session_messages(
+        &mut session,
+        vec![
+            kept_system,
+            build_auto_summary_message("compressed summary"),
+            assistant_second,
+            kept_tool,
+        ],
+    );
+
+    assert_eq!(session.subagent_snapshots.len(), 1);
+    assert!(
+        session
+            .subagent_snapshots
+            .contains_key(&subagent_snapshot_storage_key("call_1", 1))
+    );
+    let payload = build_history_payload(&session);
+    let results: Vec<_> = payload["messages"]
+        .as_array()
+        .expect("history messages should be an array")
+        .iter()
+        .filter(|message| message["role"] == "tool_result")
+        .collect();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0]["subagent_snapshot"]["result_excerpt"].as_str(),
+        Some("Second delegated result")
+    );
 }
 
 #[test]
@@ -913,6 +1424,7 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
         model: "llama3.2".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -992,6 +1504,7 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1077,6 +1590,7 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1154,6 +1668,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1231,6 +1746,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_anthropic_provider_type() 
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1308,6 +1824,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_ollama_provider_type() {
         model: "qwen3".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1369,6 +1886,7 @@ fn canonical_model_ref_expands_unique_plain_id() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1445,6 +1963,7 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1523,6 +2042,7 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         model: "shared-model".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1581,6 +2101,7 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1639,6 +2160,7 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1677,6 +2199,7 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1715,6 +2238,7 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1753,6 +2277,7 @@ fn resolve_model_accepts_ollama_prefix_without_provider_config() {
         model: "llama3.2".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -1811,6 +2336,7 @@ fn build_session_status_reports_resolved_target() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -2140,6 +2666,8 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
             role: "system".into(),
             content: Some("system".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -2148,6 +2676,8 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
             role: "user".into(),
             content: Some("a".repeat(500)),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -2156,6 +2686,8 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
             role: "assistant".into(),
             content: Some("b".repeat(500)),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -2164,6 +2696,8 @@ fn prune_messages_removes_complete_turns_without_recomputing_from_scratch() {
             role: "user".into(),
             content: Some("keep".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -2184,6 +2718,8 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
             role: "system".into(),
             content: Some("system".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -2192,6 +2728,8 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
             role: "assistant".into(),
             content: None,
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: Some(1),
@@ -2200,9 +2738,12 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
             role: "assistant".into(),
             content: Some(String::new()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![ToolCall {
                 id: "call-1".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: FunctionCall {
                     name: "exec".into(),
                     arguments: "{}".into(),
@@ -2219,6 +2760,43 @@ fn sanitize_session_messages_removes_empty_assistant_reply() {
     assert_eq!(messages[0].role, "system");
     assert_eq!(messages[1].role, "assistant");
     assert!(messages[1].has_tool_calls());
+}
+
+#[test]
+fn sanitize_session_messages_keeps_assistant_with_anthropic_thinking_blocks() {
+    let mut messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("system".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: Some(vec![AnthropicThinkingBlock {
+                block_type: "thinking".into(),
+                thinking: Some("reasoning".into()),
+                signature: Some("sig_123".into()),
+                data: None,
+            }]),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(1),
+        },
+    ];
+
+    sanitize_session_messages(&mut messages);
+
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[1].role, "assistant");
+    assert!(messages[1].anthropic_thinking_blocks.is_some());
 }
 
 #[test]
@@ -2285,6 +2863,8 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
                 role: "system".into(),
                 content: Some("system".into()),
                 images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -2293,6 +2873,8 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
                 role: "assistant".into(),
                 content: None,
                 images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: Some(1773669433),
@@ -2301,6 +2883,8 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
                 role: "user".into(),
                 content: Some("next".into()),
                 images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -2326,6 +2910,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 0,
         workspace: workspace.clone(),
     };
@@ -2379,6 +2964,8 @@ fn save_session_to_disk_overwrites_existing_file() {
             role: "system".into(),
             content: Some("first".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -2403,6 +2990,7 @@ fn save_session_to_disk_overwrites_existing_file() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 1,
         workspace: workspace.clone(),
     };
@@ -3178,6 +3766,8 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
                 role: "system".into(),
                 content: Some("system".into()),
                 images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,
@@ -3186,9 +3776,12 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
                 role: "assistant".into(),
                 content: Some(String::new()),
                 images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: Some(vec![ToolCall {
                     id: "call_obs".into(),
                     call_type: "function".into(),
+                    gemini_thought_signature: None,
                     function: FunctionCall {
                         name: "exec".into(),
                         arguments: r#"{"command":"ls"}"#.into(),
@@ -3201,6 +3794,8 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
                 role: "tool".into(),
                 content: Some(big_result.clone()),
                 images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: Some("call_obs".into()),
                 timestamp: Some(101),
@@ -3226,6 +3821,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         show_reasoning: true,
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
         version: 0,
         workspace: PathBuf::new(),
     };
@@ -3278,6 +3874,8 @@ fn system_prompt_with_observation_hint_preserves_original_content() {
         role: "system".into(),
         content: Some("You are an assistant.".into()),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -5454,6 +6052,120 @@ fn dispatch_live_event_ignores_stale_connection_after_rebind() {
     );
 }
 
+#[test]
+fn dispatch_live_event_allows_active_run_source_after_rebind() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-run-rebind-{}", now_epoch());
+    let run_cancel = CancellationToken::new();
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(4);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        2,
+        &bound_tx,
+        true,
+    ));
+    {
+        let mut runs = rt.block_on(state.active_runs.lock());
+        runs.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: run_cancel,
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+    }
+
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 1,
+            "phase": "analyze",
+            "cycle": 1,
+            "react_visible": true,
+        }),
+    ));
+
+    let payload = rt
+        .block_on(bound_rx.recv())
+        .expect("rebound client should receive live event from active run source");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload).expect("payload should be valid json");
+    assert_eq!(parsed["type"].as_str(), Some("start"));
+
+    let live_rounds = rt.block_on(state.live_rounds.lock());
+    let round = live_rounds
+        .get(&session_id)
+        .expect("live round should be recorded");
+    assert_eq!(round.connection_id, 1);
+}
+
+#[test]
+fn dispatch_live_event_allows_live_round_source_after_run_teardown() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-round-teardown-{}", now_epoch());
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(4);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        2,
+        &bound_tx,
+        true,
+    ));
+    {
+        let mut live_rounds = rt.block_on(state.live_rounds.lock());
+        live_rounds.insert(
+            session_id.clone(),
+            LiveRoundState {
+                connection_id: 1,
+                round: 1,
+                react_visible: true,
+                phase: Some("finish".into()),
+                cycle: Some(1),
+                has_observation: false,
+                assistant_text: String::new(),
+                reasoning_text: String::new(),
+                reasoning_done: false,
+                tools: Vec::new(),
+                delegated_events: Vec::new(),
+                active_tasks: HashSet::new(),
+                active_orchestrations: HashSet::new(),
+            },
+        );
+    }
+
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "done",
+            "phase": "complete",
+        }),
+    ));
+
+    let payload = rt
+        .block_on(bound_rx.recv())
+        .expect("rebound client should receive terminal event from live round source");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload).expect("payload should be valid json");
+    assert_eq!(parsed["type"].as_str(), Some("done"));
+    assert!(
+        rt.block_on(state.live_rounds.lock())
+            .get(&session_id)
+            .is_none()
+    );
+}
+
 // ── Phase 4: Tool Protocol + Session Recovery ────────────────────────────────
 
 #[test]
@@ -5585,6 +6297,8 @@ fn prune_messages_tracks_removal_count() {
             role: "system".into(),
             content: Some("sys".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -5593,6 +6307,8 @@ fn prune_messages_tracks_removal_count() {
             role: "user".into(),
             content: Some("a".repeat(200_000)),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -5601,6 +6317,8 @@ fn prune_messages_tracks_removal_count() {
             role: "assistant".into(),
             content: Some("b".repeat(200_000)),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -5609,6 +6327,8 @@ fn prune_messages_tracks_removal_count() {
             role: "user".into(),
             content: Some("latest".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -5780,6 +6500,8 @@ fn message_token_len_empty_message() {
         role: "user".into(),
         content: None,
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -5794,6 +6516,8 @@ fn message_token_len_content_only() {
         role: "user".into(),
         content: Some("hello world".into()), // 11 chars
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -5808,9 +6532,12 @@ fn message_token_len_with_tool_calls() {
         role: "assistant".into(),
         content: None,
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
+            gemini_thought_signature: None,
             function: FunctionCall {
                 name: "exec".into(),                 // 4
                 arguments: r#"{"cmd":"ls"}"#.into(), // 12
@@ -5830,6 +6557,8 @@ fn estimate_tokens_sums_messages() {
             role: "system".into(),
             content: Some("sys".into()), // 3
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -5838,6 +6567,8 @@ fn estimate_tokens_sums_messages() {
             role: "user".into(),
             content: Some("hello".into()), // 5
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -5854,6 +6585,8 @@ fn message_token_len_cjk_aware() {
         role: "user".into(),
         content: Some("你好世界测试".into()),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -5865,6 +6598,8 @@ fn message_token_len_cjk_aware() {
         role: "user".into(),
         content: Some("a".repeat(18)),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -5886,9 +6621,12 @@ fn provider_aware_estimate_adds_tool_protocol_overhead() {
             role: "assistant".into(),
             content: None,
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: FunctionCall {
                     name: "exec".into(),
                     arguments: r#"{"cmd":"ls"}"#.into(),
@@ -5901,6 +6639,8 @@ fn provider_aware_estimate_adds_tool_protocol_overhead() {
             role: "tool".into(),
             content: Some("file-a\nfile-b".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -5916,11 +6656,47 @@ fn provider_aware_estimate_adds_tool_protocol_overhead() {
 }
 
 #[test]
+fn anthropic_provider_estimate_counts_structured_thinking_blocks() {
+    let msg = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: Some(vec![
+            AnthropicThinkingBlock {
+                block_type: "thinking".into(),
+                thinking: Some("hidden reasoning".into()),
+                signature: Some("sig_123".into()),
+                data: None,
+            },
+            AnthropicThinkingBlock {
+                block_type: "redacted_thinking".into(),
+                thinking: None,
+                signature: None,
+                data: Some("opaque_blob".into()),
+            },
+        ]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+
+    let base = message_token_len(&msg);
+    let openai = message_token_len_for_provider(Provider::OpenAI, &msg);
+    let anthropic = message_token_len_for_provider(Provider::Anthropic, &msg);
+
+    assert_eq!(openai, base);
+    assert!(anthropic > openai);
+}
+
+#[test]
 fn request_estimate_includes_tool_schema_overhead() {
     let messages = vec![ChatMessage {
         role: "system".into(),
         content: Some("system prompt".into()),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -5955,6 +6731,8 @@ fn openai_request_estimate_includes_builtin_tool_schemas() {
         role: "system".into(),
         content: Some("system prompt".into()),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -5994,6 +6772,7 @@ fn context_input_budget_reserves_headroom() {
         model: "gpt-4o-mini".to_string(),
         fast_model: None,
         sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
         memory_model: None,
 
         reflection_model: None,
@@ -6030,6 +6809,8 @@ fn turn_len_standalone_user() {
         role: "user".into(),
         content: Some("hi".into()),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6044,6 +6825,8 @@ fn turn_len_user_plus_assistant() {
             role: "user".into(),
             content: Some("hi".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6052,6 +6835,8 @@ fn turn_len_user_plus_assistant() {
             role: "assistant".into(),
             content: Some("hello".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6067,6 +6852,8 @@ fn turn_len_user_assistant_with_tool_calls_and_results() {
             role: "user".into(),
             content: Some("list files".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6075,9 +6862,12 @@ fn turn_len_user_assistant_with_tool_calls_and_results() {
             role: "assistant".into(),
             content: None,
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: FunctionCall {
                     name: "list_dir".into(),
                     arguments: "{}".into(),
@@ -6090,6 +6880,8 @@ fn turn_len_user_assistant_with_tool_calls_and_results() {
             role: "tool".into(),
             content: Some("file1.txt\nfile2.txt".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -6106,9 +6898,12 @@ fn turn_len_orphan_assistant_with_tool_results() {
             role: "assistant".into(),
             content: None,
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: FunctionCall {
                     name: "exec".into(),
                     arguments: "{}".into(),
@@ -6121,6 +6916,8 @@ fn turn_len_orphan_assistant_with_tool_results() {
             role: "tool".into(),
             content: Some("ok".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -6129,6 +6926,8 @@ fn turn_len_orphan_assistant_with_tool_results() {
             role: "tool".into(),
             content: Some("ok2".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc2".into()),
             timestamp: None,
@@ -6144,6 +6943,8 @@ fn turn_len_standalone_assistant_text() {
         role: "assistant".into(),
         content: Some("just text".into()),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6159,6 +6960,8 @@ fn chat_message_has_nonempty_content() {
         role: "user".into(),
         content: None,
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6169,6 +6972,8 @@ fn chat_message_has_nonempty_content() {
         role: "user".into(),
         content: Some(String::new()),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6179,6 +6984,8 @@ fn chat_message_has_nonempty_content() {
         role: "user".into(),
         content: Some("hello".into()),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6192,6 +6999,8 @@ fn chat_message_has_tool_calls() {
         role: "assistant".into(),
         content: None,
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6202,6 +7011,8 @@ fn chat_message_has_tool_calls() {
         role: "assistant".into(),
         content: None,
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: Some(vec![]),
         tool_call_id: None,
         timestamp: None,
@@ -6212,9 +7023,12 @@ fn chat_message_has_tool_calls() {
         role: "assistant".into(),
         content: None,
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: Some(vec![ToolCall {
             id: "tc1".into(),
             call_type: "function".into(),
+            gemini_thought_signature: None,
             function: FunctionCall {
                 name: "exec".into(),
                 arguments: "{}".into(),
@@ -6227,11 +7041,29 @@ fn chat_message_has_tool_calls() {
 }
 
 #[test]
+fn chat_message_with_thinking_is_not_empty_assistant_message() {
+    let msg = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: Some("reasoning summary".into()),
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+
+    assert!(!msg.is_empty_assistant_message());
+}
+
+#[test]
 fn chat_message_is_empty_assistant_message() {
     let empty_asst = ChatMessage {
         role: "assistant".into(),
         content: None,
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6242,16 +7074,37 @@ fn chat_message_is_empty_assistant_message() {
         role: "assistant".into(),
         content: Some("reply".into()),
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
     };
     assert!(!with_content.is_empty_assistant_message());
 
+    let with_thinking_blocks = ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: Some(vec![AnthropicThinkingBlock {
+            block_type: "thinking".into(),
+            thinking: Some("reasoning".into()),
+            signature: Some("sig_123".into()),
+            data: None,
+        }]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+    assert!(!with_thinking_blocks.is_empty_assistant_message());
+
     let user_msg = ChatMessage {
         role: "user".into(),
         content: None,
         images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
         tool_calls: None,
         tool_call_id: None,
         timestamp: None,
@@ -6269,6 +7122,8 @@ fn prune_messages_removes_complete_tool_turn() {
             role: "system".into(),
             content: Some("sys".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6277,6 +7132,8 @@ fn prune_messages_removes_complete_tool_turn() {
             role: "user".into(),
             content: Some(big.clone()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6285,9 +7142,12 @@ fn prune_messages_removes_complete_tool_turn() {
             role: "assistant".into(),
             content: None,
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
+                gemini_thought_signature: None,
                 function: FunctionCall {
                     name: "exec".into(),
                     arguments: big.clone(),
@@ -6300,6 +7160,8 @@ fn prune_messages_removes_complete_tool_turn() {
             role: "tool".into(),
             content: Some(big.clone()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -6308,6 +7170,8 @@ fn prune_messages_removes_complete_tool_turn() {
             role: "user".into(),
             content: Some("latest".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6333,6 +7197,8 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
             role: "system".into(),
             content: Some("sys".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6341,6 +7207,8 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
             role: "user".into(),
             content: Some("do something".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6349,10 +7217,13 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
             role: "assistant".into(),
             content: None,
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![
                 ToolCall {
                     id: "tc1".into(),
                     call_type: "function".into(),
+                    gemini_thought_signature: None,
                     function: FunctionCall {
                         name: "exec".into(),
                         arguments: r#"{"cmd":"ls"}"#.into(),
@@ -6361,6 +7232,7 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
                 ToolCall {
                     id: "tc2".into(),
                     call_type: "function".into(),
+                    gemini_thought_signature: None,
                     function: FunctionCall {
                         name: "read_file".into(),
                         arguments: r#"{"path":"a.txt"}"#.into(),
@@ -6374,6 +7246,8 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
             role: "tool".into(),
             content: Some("result1".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -6382,6 +7256,8 @@ fn trim_incomplete_tool_calls_preserves_complete_transaction() {
             role: "tool".into(),
             content: Some("result2".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc2".into()),
             timestamp: None,
@@ -6399,6 +7275,8 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
             role: "system".into(),
             content: Some("sys".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6407,6 +7285,8 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
             role: "user".into(),
             content: Some("do something".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -6415,10 +7295,13 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
             role: "assistant".into(),
             content: None,
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![
                 ToolCall {
                     id: "tc1".into(),
                     call_type: "function".into(),
+                    gemini_thought_signature: None,
                     function: FunctionCall {
                         name: "exec".into(),
                         arguments: "{}".into(),
@@ -6427,6 +7310,7 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
                 ToolCall {
                     id: "tc2".into(),
                     call_type: "function".into(),
+                    gemini_thought_signature: None,
                     function: FunctionCall {
                         name: "read_file".into(),
                         arguments: "{}".into(),
@@ -6441,6 +7325,8 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
             role: "tool".into(),
             content: Some("result1".into()),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: Some("tc1".into()),
             timestamp: None,
@@ -6454,6 +7340,111 @@ fn trim_incomplete_tool_calls_removes_orphaned_assistant_and_partial_results() {
 }
 
 // ───── Phase 5: tool_think ─────
+
+#[test]
+fn trim_incomplete_tool_calls_in_session_drops_orphaned_subagent_snapshots() {
+    let mut session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("sys".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("do something".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![
+                    ToolCall {
+                        id: "tc1".into(),
+                        call_type: "function".into(),
+                        gemini_thought_signature: None,
+                        function: FunctionCall {
+                            name: "task".into(),
+                            arguments: r#"{"agent":"reviewer","prompt":"one"}"#.into(),
+                        },
+                    },
+                    ToolCall {
+                        id: "tc2".into(),
+                        call_type: "function".into(),
+                        gemini_thought_signature: None,
+                        function: FunctionCall {
+                            name: "task".into(),
+                            arguments: r#"{"agent":"reviewer","prompt":"two"}"#.into(),
+                        },
+                    },
+                ]),
+                tool_call_id: None,
+                timestamp: None,
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("partial result".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: Some("tc1".into()),
+                timestamp: None,
+            },
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: HashSet::from(["tc1".to_string()]),
+        subagent_snapshots: HashMap::from([(
+            subagent_snapshot_storage_key("tc1", 1),
+            SubagentHistorySnapshot {
+                result_excerpt: Some("partial result".into()),
+                success: false,
+                ..Default::default()
+            },
+        )]),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    trim_incomplete_tool_calls_in_session(&mut session);
+
+    assert_eq!(session.messages.len(), 2);
+    assert!(session.subagent_snapshots.is_empty());
+    assert!(session.failed_tool_results.is_empty());
+}
 
 #[test]
 fn tool_think_records_thought() {

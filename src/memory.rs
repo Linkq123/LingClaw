@@ -20,6 +20,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     Session,
@@ -467,9 +468,12 @@ const MEMORY_QUEUE_CAPACITY: usize = 16;
 /// Debounced async memory update queue.
 /// Receives update requests from the OnFinish hook and processes them
 /// in the background with debounce to avoid excessive LLM calls.
+#[derive(Clone)]
 pub(crate) struct MemoryUpdateQueue {
     tx: mpsc::Sender<MemoryUpdateRequest>,
     status: SharedMemoryQueueStatus,
+    config: Arc<Mutex<Arc<Config>>>,
+    cancel: CancellationToken,
 }
 
 impl MemoryUpdateQueue {
@@ -483,8 +487,21 @@ impl MemoryUpdateQueue {
             state: "idle".to_string(),
             ..Default::default()
         }));
-        tokio::spawn(memory_updater_loop(rx, config, status.clone(), sessions));
-        Self { tx, status }
+        let config = Arc::new(Mutex::new(Arc::new(config)));
+        let cancel = CancellationToken::new();
+        tokio::spawn(memory_updater_loop(
+            rx,
+            config.clone(),
+            status.clone(),
+            cancel.clone(),
+            sessions,
+        ));
+        Self {
+            tx,
+            status,
+            config,
+            cancel,
+        }
     }
 
     pub(crate) fn status_snapshot(&self) -> MemoryQueueStatusSnapshot {
@@ -492,6 +509,23 @@ impl MemoryUpdateQueue {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn replace_config(&self, new: Config) {
+        match self.config.lock() {
+            Ok(mut guard) => {
+                *guard = Arc::new(new);
+            }
+            Err(poisoned) => {
+                eprintln!("Warning: memory queue config lock poisoned during replace; recovering");
+                let mut guard = poisoned.into_inner();
+                *guard = Arc::new(new);
+            }
+        }
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.cancel.cancel();
     }
 
     /// Enqueue a memory update request (non-blocking).
@@ -502,6 +536,9 @@ impl MemoryUpdateQueue {
         model: String,
         conversation_excerpt: Vec<crate::ChatMessage>,
     ) {
+        if self.cancel.is_cancelled() {
+            return;
+        }
         let req = MemoryUpdateRequest {
             session_id,
             workspace,
@@ -527,21 +564,18 @@ const DEBOUNCE_DURATION: Duration = Duration::from_secs(3);
 /// Background loop that processes memory update requests with debounce.
 async fn memory_updater_loop(
     mut rx: mpsc::Receiver<MemoryUpdateRequest>,
-    config: Config,
+    config: Arc<Mutex<Arc<Config>>>,
     status: SharedMemoryQueueStatus,
+    cancel: CancellationToken,
     sessions: Arc<AsyncMutex<HashMap<String, Session>>>,
 ) {
-    let memory_timeout = config.tool_timeout.max(Duration::from_secs(30));
-    let http = Client::builder()
-        .timeout(memory_timeout)
-        .build()
-        .unwrap_or_else(|_| Client::new());
     let mut pending: Option<MemoryUpdateRequest> = None;
 
     loop {
         if let Some(req) = pending.take() {
             // Debounce: wait for more requests or timeout
             let final_req = tokio::select! {
+                _ = cancel.cancelled() => return,
                 next = rx.recv() => {
                     match next {
                         Some(newer) => {
@@ -573,12 +607,26 @@ async fn memory_updater_loop(
                 snapshot.last_started_at = started_at;
             });
 
-            match tokio::time::timeout(
-                memory_timeout,
-                process_memory_update(&final_req, &config, &http),
-            )
-            .await
-            {
+            let config_snapshot = match config.lock() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => {
+                    eprintln!("Warning: memory queue config lock poisoned; recovering");
+                    poisoned.into_inner().clone()
+                }
+            };
+            let memory_timeout = config_snapshot.tool_timeout.max(Duration::from_secs(30));
+            let http = Client::builder()
+                .timeout(memory_timeout)
+                .build()
+                .unwrap_or_else(|_| Client::new());
+
+            match tokio::select! {
+                _ = cancel.cancelled() => return,
+                result = tokio::time::timeout(
+                    memory_timeout,
+                    process_memory_update(&final_req, &config_snapshot, &http),
+                ) => result,
+            } {
                 Ok(Err(error)) => {
                     let duration_ms = start.elapsed().as_millis() as u64;
                     let now = now_epoch_secs();
@@ -679,7 +727,10 @@ async fn memory_updater_loop(
             }
         } else {
             // Wait for next request
-            match rx.recv().await {
+            match tokio::select! {
+                _ = cancel.cancelled() => return,
+                next = rx.recv() => next,
+            } {
                 Some(req) => {
                     pending = Some(req);
                 }
@@ -844,6 +895,8 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
             role: "system".into(),
             content: Some(system_prompt),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -852,6 +905,8 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
             role: "user".into(),
             content: Some(format!("Conversation to analyze:\n\n{excerpt}")),
             images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: None,
             tool_call_id: None,
             timestamp: None,
@@ -881,6 +936,8 @@ Keep facts concise. Do not store ephemeral task details — only persistent know
                 role: "assistant".into(),
                 content: Some(response.content.clone()),
                 images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
                 tool_calls: None,
                 tool_call_id: None,
                 timestamp: None,

@@ -16,6 +16,7 @@ pub(crate) struct ToolOutcome {
     pub output: String,
     pub is_error: bool,
     pub duration_ms: u64,
+    pub subagent_snapshot: Option<crate::SubagentHistorySnapshot>,
 }
 
 type ToolFuture<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
@@ -442,6 +443,87 @@ pub(crate) fn tool_definitions_ollama() -> serde_json::Value {
     tool_definitions_openai()
 }
 
+pub(crate) fn tool_definitions_gemini() -> serde_json::Value {
+    let tools = tool_specs()
+        .iter()
+        .map(|spec| {
+            json!({
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": gemini_tool_parameters((spec.parameters)()),
+            })
+        })
+        .collect::<Vec<_>>();
+    json!(tools)
+}
+
+pub(crate) fn gemini_tool_parameters(parameters: Value) -> Value {
+    let normalized = normalize_gemini_schema(parameters);
+    if normalized.is_object() {
+        normalized
+    } else {
+        json!({ "type": "object" })
+    }
+}
+
+fn normalize_gemini_schema(value: Value) -> Value {
+    let Value::Object(input) = value else {
+        return value;
+    };
+
+    let mut output = serde_json::Map::new();
+    for (key, value) in input {
+        match key.as_str() {
+            "type" => match value {
+                Value::String(kind) => {
+                    output.insert("type".to_string(), Value::String(kind.to_ascii_lowercase()));
+                }
+                Value::Array(kinds) => {
+                    let mut nullable = false;
+                    let mut selected = None;
+                    for kind in kinds {
+                        if let Some(kind) = kind.as_str() {
+                            if kind.eq_ignore_ascii_case("null") {
+                                nullable = true;
+                            } else if selected.is_none() {
+                                selected = Some(kind.to_ascii_lowercase());
+                            }
+                        }
+                    }
+                    if let Some(kind) = selected {
+                        output.insert("type".to_string(), Value::String(kind));
+                    }
+                    if nullable {
+                        output.insert("nullable".to_string(), Value::Bool(true));
+                    }
+                }
+                _ => {}
+            },
+            "properties" => {
+                if let Value::Object(properties) = value {
+                    let normalized = properties
+                        .into_iter()
+                        .map(|(property, schema)| (property, normalize_gemini_schema(schema)))
+                        .collect();
+                    output.insert("properties".to_string(), Value::Object(normalized));
+                }
+            }
+            "items" => {
+                output.insert("items".to_string(), normalize_gemini_schema(value));
+            }
+            "format" | "description" | "nullable" | "enum" | "maxItems" | "minItems"
+            | "maxLength" | "minLength" | "pattern" | "required" => {
+                output.insert(key, value);
+            }
+            _ => {}
+        }
+    }
+    output
+        .entry("type".to_string())
+        .or_insert_with(|| Value::String("object".to_string()));
+    Value::Object(output)
+}
+
 pub(crate) fn tool_definitions_anthropic() -> serde_json::Value {
     let tools = tool_specs()
         .iter()
@@ -458,6 +540,23 @@ pub(crate) fn tool_definitions_anthropic() -> serde_json::Value {
 
 pub(crate) fn task_tool_definition_ollama(agent_names: &[String]) -> serde_json::Value {
     task_tool_definition_openai(agent_names)
+}
+
+pub(crate) fn task_tool_definition_gemini(agent_names: &[String]) -> serde_json::Value {
+    let catalog = if agent_names.is_empty() {
+        "No sub-agents currently available.".to_string()
+    } else {
+        format!("Available sub-agents: {}", agent_names.join(", "))
+    };
+    json!({
+        "name": "task",
+        "description": format!(
+            "Delegate a sub-task to a specialized sub-agent that runs in an isolated context \
+             with its own tool set and message history. Use this for research, code review, \
+             exploration, or any task that benefits from focused attention. {catalog}"
+        ),
+        "parameters": gemini_tool_parameters(task_tool_parameters()),
+    })
 }
 
 /// Returns true if the named tool performs no side effects (no writes, no exec).
@@ -477,10 +576,25 @@ pub(crate) fn is_task_tool(name: &str) -> bool {
 
 /// Returns true if the named tool can safely run in parallel with other parallelizable tools.
 /// Parent runs share a single workspace, so this is intentionally limited to
-/// read-only tools until delegated tasks gain real filesystem isolation.
-/// Used by `run_act_phase()` to decide between sequential and parallel dispatch.
+/// built-in read-only tools until delegated tasks gain real filesystem isolation.
 pub(crate) fn is_parallelizable_tool(name: &str) -> bool {
     is_read_only_tool(name)
+}
+
+/// Returns true if the named tool call can safely run in a parallel batch.
+/// This includes built-in read-only tools plus cached MCP tools whose
+/// descriptors are conservatively classified as read-only from their
+/// name/description. Cache misses fall back to sequential execution.
+pub(crate) fn is_parallelizable_tool_call(
+    name: &str,
+    config: &Config,
+    workspace: &std::path::Path,
+) -> bool {
+    if is_parallelizable_tool(name) {
+        return true;
+    }
+
+    mcp::is_read_only_tool_name(name, config, workspace)
 }
 
 /// Generate the `task` tool definition for OpenAI format.
@@ -568,11 +682,11 @@ fn orchestrate_tool_description(catalog: &str) -> String {
          Example — parallel exploration then synthesis:\n\
          tasks: [{{\"id\":\"code\",\"agent\":\"explore\",\"prompt\":\"Analyze code...\"}},\n\
           {{\"id\":\"docs\",\"agent\":\"researcher\",\"prompt\":\"Research docs...\"}},\n\
-          {{\"id\":\"plan\",\"agent\":\"coder\",\"prompt\":\"Synthesize: {{{{results.code}}}} and {{{{results.docs}}}}\",\"depends_on\":[\"code\",\"docs\"]}}]\n\n\
+          {{\"id\":\"plan\",\"agent\":\"general-coder\",\"prompt\":\"Synthesize: {{{{results.code}}}} and {{{{results.docs}}}}\",\"depends_on\":[\"code\",\"docs\"]}}]\n\n\
          Example — serial review pipeline:\n\
-         tasks: [{{\"id\":\"impl\",\"agent\":\"coder\",\"prompt\":\"Implement...\"}},\n\
+         tasks: [{{\"id\":\"impl\",\"agent\":\"general-coder\",\"prompt\":\"Implement...\"}},\n\
           {{\"id\":\"review\",\"agent\":\"reviewer\",\"prompt\":\"Review: {{{{results.impl}}}}\",\"depends_on\":[\"impl\"]}},\n\
-          {{\"id\":\"fix\",\"agent\":\"coder\",\"prompt\":\"Fix: {{{{results.review}}}}\",\"depends_on\":[\"review\"]}}]\n\n\
+          {{\"id\":\"fix\",\"agent\":\"general-coder\",\"prompt\":\"Fix: {{{{results.review}}}}\",\"depends_on\":[\"review\"]}}]\n\n\
          {catalog}"
     )
 }
@@ -611,6 +725,20 @@ pub(crate) fn orchestrate_tool_definition_anthropic(agent_names: &[String]) -> s
 /// Generate the `orchestrate` tool definition for Ollama format (reuses OpenAI format).
 pub(crate) fn orchestrate_tool_definition_ollama(agent_names: &[String]) -> serde_json::Value {
     orchestrate_tool_definition_openai(agent_names)
+}
+
+/// Generate the `orchestrate` tool definition for Gemini format.
+pub(crate) fn orchestrate_tool_definition_gemini(agent_names: &[String]) -> serde_json::Value {
+    let catalog = if agent_names.is_empty() {
+        "No sub-agents currently available.".to_string()
+    } else {
+        format!("Available sub-agents: {}", agent_names.join(", "))
+    };
+    json!({
+        "name": "orchestrate",
+        "description": orchestrate_tool_description(&catalog),
+        "parameters": gemini_tool_parameters(orchestrate_tool_parameters()),
+    })
 }
 
 pub(crate) fn orchestrate_tool_parameters() -> serde_json::Value {
@@ -677,6 +805,7 @@ pub(crate) async fn execute_tool(
                 output: format!("{name} error: invalid arguments JSON: {e}"),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
             };
         }
     };
@@ -686,6 +815,7 @@ pub(crate) async fn execute_tool(
             output: format!("Unknown tool: {name}"),
             is_error: true,
             duration_ms: start.elapsed().as_millis() as u64,
+            subagent_snapshot: None,
         };
     };
 
@@ -695,6 +825,7 @@ pub(crate) async fn execute_tool(
             output: err,
             is_error: true,
             duration_ms: start.elapsed().as_millis() as u64,
+            subagent_snapshot: None,
         };
     }
 
@@ -706,6 +837,7 @@ pub(crate) async fn execute_tool(
         output,
         is_error,
         duration_ms,
+        subagent_snapshot: None,
     }
 }
 

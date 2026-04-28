@@ -5,10 +5,10 @@
 //  Tasks without mutual dependencies execute in parallel; dependent tasks
 //  wait for upstream results, which are injected via {{results.<id>}} placeholders.
 //
-//  Example serial:   coder → reviewer → coder
-//  Example parallel: (explore + researcher) → coder  (both run first, coder waits)
-//  Example mixed:    explore → coder → reviewer → coder  (serial chain)
-//                    researcher ──────↗                   (parallel with explore→coder)
+//  Example serial:   general-coder → reviewer → general-coder
+//  Example parallel: (explore + researcher) → general-coder  (both run first, general-coder waits)
+//  Example mixed:    explore → general-coder → reviewer → general-coder  (serial chain)
+//                    researcher ─────────────↗                         (parallel with explore→general-coder)
 // ══════════════════════════════════════════════════════════════════════════════
 
 use std::collections::{HashMap, HashSet};
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use super::executor::run_subagent;
+use super::executor::{augment_subagent_prompt_with_current_time, run_subagent};
 use crate::hooks::HookRegistry;
 use crate::{Config, LiveTx, live_send, truncate};
 
@@ -52,7 +52,9 @@ pub(crate) struct OrchestrationTask {
     /// Task prompt. May contain `{{results.<task_id>}}` placeholders that are
     /// resolved with outputs from completed upstream dependencies.
     pub prompt: String,
-    /// IDs of tasks that must complete before this one starts.
+    /// IDs of tasks that must complete before this one starts. Valid
+    /// `{{results.<task_id>}}` placeholders in `prompt` are also treated as
+    /// implicit dependencies during validation.
     #[serde(default)]
     pub depends_on: Vec<String>,
 }
@@ -157,14 +159,16 @@ impl<'a> OrchestrateTaskEventGuard<'a> {
 
 impl Drop for OrchestrateTaskEventGuard<'_> {
     fn drop(&mut self) {
-        if !self.finished {
-            let _ = self.live_tx.try_send(json!({
+        if !self.finished
+            && let Err(err) = self.live_tx.try_send(json!({
                 "type": "orchestrate_task_failed",
                 "orchestrate_id": self.orchestrate_id,
                 "id": self.task_id,
                 "agent": self.agent,
                 "error": "task aborted (timeout or cancellation)",
-            }));
+            }))
+        {
+            eprintln!("[orchestrate-guard] failed to emit fallback task_failed event: {err}");
         }
     }
 }
@@ -191,8 +195,10 @@ fn generate_orchestrate_id() -> String {
 ///
 /// Checks: unique task IDs, valid agent names, valid dependency references,
 /// no self-dependencies, and no cycles in the dependency graph.
+/// Valid `{{results.<task_id>}}` placeholders that reference tasks in this
+/// plan are automatically merged into each task's dependency list.
 pub(crate) fn validate_plan(
-    tasks: Vec<OrchestrationTask>,
+    mut tasks: Vec<OrchestrationTask>,
     workspace: &Path,
 ) -> Result<OrchestrationPlan, String> {
     if tasks.is_empty() {
@@ -217,7 +223,7 @@ pub(crate) fn validate_plan(
                 task.id
             ));
         }
-        if !ids.insert(&task.id) {
+        if !ids.insert(task.id.clone()) {
             return Err(format!(
                 "orchestrate error: duplicate task id '{}'",
                 task.id
@@ -241,6 +247,13 @@ pub(crate) fn validate_plan(
                 }
             ));
         }
+    }
+
+    // Merge valid `{{results.<id>}}` placeholders that reference real tasks
+    // into the dependency set so prompt wiring and execution layers stay
+    // consistent even when the model omits explicit `depends_on` entries.
+    for task in &mut tasks {
+        merge_prompt_dependencies(task, &ids);
     }
 
     // Valid dependency references (no self-deps, all targets exist)
@@ -267,6 +280,47 @@ pub(crate) fn validate_plan(
     }
 
     Ok(OrchestrationPlan { tasks })
+}
+
+fn merge_prompt_dependencies(task: &mut OrchestrationTask, known_ids: &HashSet<String>) {
+    let inferred = referenced_result_ids(&task.prompt);
+    if inferred.is_empty() {
+        return;
+    }
+
+    let mut seen = HashSet::new();
+    let mut merged = Vec::new();
+    for dep in &task.depends_on {
+        if seen.insert(dep.clone()) {
+            merged.push(dep.clone());
+        }
+    }
+    for dep in inferred {
+        if known_ids.contains(&dep) && seen.insert(dep.clone()) {
+            merged.push(dep);
+        }
+    }
+    task.depends_on = merged;
+}
+
+fn referenced_result_ids(prompt: &str) -> Vec<String> {
+    const OPEN: &str = "{{results.";
+    const CLOSE: &str = "}}";
+
+    let mut ids = Vec::new();
+    let mut rest = prompt;
+    while let Some(start) = rest.find(OPEN) {
+        let after_open = &rest[start + OPEN.len()..];
+        let Some(end) = after_open.find(CLOSE) else {
+            break;
+        };
+        let id = &after_open[..end];
+        if is_valid_task_id(id) {
+            ids.push(id.to_string());
+        }
+        rest = &after_open[end + CLOSE.len()..];
+    }
+    ids
 }
 
 /// DFS-based cycle detection on the dependency graph.
@@ -725,6 +779,7 @@ async fn execute_single_task(
 
     // Interpolate dependency results into prompt
     let resolved_prompt = interpolate_results(&task.prompt, completed_results);
+    let effective_prompt = augment_subagent_prompt_with_current_time(&resolved_prompt);
 
     // Send task started event
     let _ = live_send(
@@ -748,7 +803,7 @@ async fn execute_single_task(
     // Run sub-agent
     let outcome = run_subagent(
         &spec,
-        &resolved_prompt,
+        &effective_prompt,
         config,
         http,
         workspace,
