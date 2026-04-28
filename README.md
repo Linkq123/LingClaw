@@ -607,34 +607,34 @@ handle_socket()
 
 ```text
 src/
-├── main.rs            (~1750 行) — 共享类型, WebSocket/HTTP 处理, 系统提示构建, 安全检查
-├── runtime_loop.rs    (~1900 行) — 阶段执行循环, 工具进度, 运行取消, 干预持久化, orchestrate 执行
-│   └── socket_input.rs (~400 行) — socket 空闲/忙碌输入辅助
-├── agent.rs           (~420 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
-├── commands.rs        (~1460 行) — 斜杠命令处理器 (handle_command, /skills-system install/uninstall 等)
-├── cli.rs             (~2220 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
-├── config.rs          (~840 行)  — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
-├── context.rs         (~350 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
-├── providers.rs       (~1900 行) — OpenAI/Anthropic/Ollama/Gemini 调用, 流式解析, 推理模式, prompt caching
-├── prompts.rs         (~870 行)  — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
-├── hooks.rs           (~660 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
-├── memory.rs          (~970 行)  — structured_memory.json 读写, MemoryUpdateQueue, prompt 注入, /memory 状态
-├── image_uploads.rs   (~670 行)  — S3 签名/上传, PNG/JPEG 校验, 生命周期管理, 附件令牌签发
+├── main.rs            (~2720 行) — 共享类型, WebSocket/HTTP 处理, 系统提示构建, 安全检查
+├── runtime_loop.rs    (~2490 行) — 阶段执行循环, 工具进度, 运行取消, 干预持久化, orchestrate 执行
+│   └── socket_input.rs (~550 行) — socket 空闲/忙碌输入辅助
+├── agent.rs           (~460 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
+├── commands.rs        (~1630 行) — 斜杠命令处理器 (handle_command, /skills-system install/uninstall 等)
+├── cli.rs             (~3030 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
+├── config.rs          (~1490 行) — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
+├── context.rs         (~570 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
+├── providers.rs       (~3030 行) — OpenAI/Anthropic/Ollama/Gemini 调用, 流式解析, 推理模式, prompt caching
+├── prompts.rs         (~980 行)  — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
+├── hooks.rs           (~830 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
+├── memory.rs          (~1190 行) — structured_memory.json 读写, MemoryUpdateQueue, prompt 注入, /memory 状态
+├── image_uploads.rs   (~760 行)  — S3 签名/上传, PNG/JPEG 校验, 生命周期管理, 附件令牌签发
 ├── session_admin.rs   (~10 行)   — 全局用量统计 (仅主会话)
-├── session_store.rs   (~420 行)  — 会话持久化, 迁移, 磁盘 I/O
-├── socket_sync.rs     (~90 行)   — WebSocket 会话声明, 断线监听, 重绑定
-├── socket_tasks.rs    (~130 行)  — WebSocket 读写任务
+├── session_store.rs   (~630 行)  — 会话持久化, 迁移, 磁盘 I/O
+├── socket_sync.rs     (~100 行)  — WebSocket 会话声明, 断线监听, 重绑定
+├── socket_tasks.rs    (~150 行)  — WebSocket 读写任务
 └── tools/
-    ├── mod.rs         (~870 行)  — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验, orchestrate/task 定义
-    ├── fs.rs          (~350 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files + 虚拟 skill 路径
-    ├── net.rs         (~190 行)  — http_fetch, check_ssrf, is_private_ip
-    ├── exec.rs        (~60 行)   — exec (shell), think (scratchpad)
-    └── mcp.rs         (~1400 行) — stdio MCP 工具发现/执行桥接, 会话缓存, preflight
+    ├── mod.rs         (~1070 行) — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验, orchestrate/task 定义
+    ├── fs.rs          (~380 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files + 虚拟 skill 路径
+    ├── net.rs         (~200 行)  — http_fetch, check_ssrf, is_private_ip
+    ├── exec.rs        (~80 行)   — exec (shell), think (scratchpad)
+    └── mcp.rs         (~1780 行) — stdio MCP 工具发现/执行桥接, 会话缓存, preflight
 ├── subagents/
-│   ├── mod.rs         (~260 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, 工具过滤（含 MCP）
-│   ├── executor.rs    (~890 行)  — 隔离 mini-ReAct 执行循环, Hook 集成, MCP 工具调度, 父级事件流
-│   ├── discovery.rs   (~320 行)  — 三层发现 (system/global/session), YAML frontmatter 解析
-│   └── orchestrator.rs (~770 行) — DAG 多代理编排引擎, 分层并行执行, 结果插值, 事件流
+│   ├── mod.rs         (~210 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, 工具过滤（含 MCP）
+│   ├── executor.rs    (~1340 行) — 隔离 mini-ReAct 执行循环, Hook 集成, MCP 工具调度, 父级事件流
+│   ├── discovery.rs   (~350 行)  — 三层发现 (system/global/session), YAML frontmatter 解析
+│   └── orchestrator.rs (~1000 行) — DAG 多代理编排引擎, 分层并行执行, 结果插值, 事件流
 
 frontend/                         — 前端源码 (TypeScript + React, Vite 构建输出到 static/)
 ├── src/
