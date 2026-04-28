@@ -63,7 +63,7 @@ Key files:
 - `src/tools/exec.rs`, `src/tools/fs.rs`, `src/tools/net.rs` — built-in tool implementations
 - `src/tools/mcp.rs` — stdio MCP tool discovery/execution bridge with workspace-safe cwd handling
 - `src/tests/` — module-scoped test files, including MCP/config/runtime coverage
-- `docs/reference/templates/` — 7 prompt template files copied into session workspaces
+- `docs/reference/templates/` — 6 prompt template files copied into session workspaces
 - `static/index.html`, `static/js/`, `static/css/` — WebChat UI with ReAct/tool status rendering, version badge, input history navigation
 - `~/.lingclaw/.lingclaw.json` — user config file, including `settings`, `models.providers`, and optional top-level `mcpServers`
 
