@@ -218,6 +218,11 @@ function markCurrentRoundFirstTokenAt() {
   state.currentRoundFirstTokenAt = performance.now();
 }
 
+function resetRoundTimers() {
+  state.currentRoundStartedAt = 0;
+  state.currentRoundFirstTokenAt = 0;
+}
+
 // ── History lazy-load ──
 
 function createLoadMoreRow(count: number): HTMLElement {
@@ -504,7 +509,7 @@ function handleMessage(data) {
       break;
 
     case 'start': {
-      const isNewTurn = !state.busy;
+      const isNewTurn = !state.busy || state.currentRoundStartedAt === 0;
       setBusy(true);
       if (isNewTurn) {
         state.currentRoundStartedAt = performance.now();
@@ -562,8 +567,7 @@ function handleMessage(data) {
           firstTokenMs,
         );
       }
-      state.currentRoundStartedAt = 0;
-      state.currentRoundFirstTokenAt = 0;
+      resetRoundTimers();
       setBusy(false);
       break;
     }
@@ -777,6 +781,7 @@ function handleMessage(data) {
       clearReactStatus();
       addError(data.content, { dismissible: data.dismissible === true });
       state.reasoningPanel = null;
+      resetRoundTimers();
       setBusy(false);
       break;
   }

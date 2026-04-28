@@ -264,6 +264,7 @@ export function showWelcome() {
 }
 
 export function setBusy(b) {
+  if (state.busy === b) return;
   state.busy = b;
   dom.stopBtn.style.display = b ? 'flex' : 'none';
   dom.stopBtn.disabled = !b;
