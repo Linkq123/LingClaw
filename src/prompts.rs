@@ -513,10 +513,6 @@ const TEMPLATE_FILES: &[(&str, &str)] = &[
         include_str!("../docs/reference/templates/USER.md"),
     ),
     (
-        "TOOLS.md",
-        include_str!("../docs/reference/templates/TOOLS.md"),
-    ),
-    (
         "MEMORY.md",
         include_str!("../docs/reference/templates/MEMORY.md"),
     ),
@@ -799,7 +795,6 @@ const PROMPT_WATCH_FILES: &[&str] = &[
     "IDENTITY.md",
     "USER.md",
     "SOUL.md",
-    "TOOLS.md",
     "MEMORY.md",
 ];
 
@@ -908,7 +903,7 @@ fn load_prompt_files_uncached(workspace: &Path, today: &str, yesterday: &str) ->
         parts.push(format!("<!-- {name} -->\n{content}"));
     }
 
-    for name in &["IDENTITY.md", "USER.md", "SOUL.md", "TOOLS.md"] {
+    for name in &["IDENTITY.md", "USER.md", "SOUL.md"] {
         if let Some(content) = read_nonempty(workspace.join(name)) {
             parts.push(format!("<!-- {name} -->\n{content}"));
         }
