@@ -48,24 +48,46 @@ function disablePlaceholderInteractivity(root: HTMLElement) {
     });
 }
 
-function createModalHostPlaceholder(host: ModalHostElement, config: ModalHostConfig) {
-  if (host.classList.contains('subagent-modal-anchor')) {
-    const spacer = document.createElement('div');
-    spacer.className = config.placeholderClass;
-    spacer.style.height = `${Math.max(host.getBoundingClientRect().height, 1)}px`;
-    return spacer;
-  }
-
-  const placeholder = host.cloneNode(true) as HTMLElement;
-  placeholder.classList.remove(config.hostClass);
-  placeholder.classList.add(config.placeholderClass);
-  placeholder.querySelectorAll('.subagent-body').forEach((node) => node.remove());
-  placeholder.querySelectorAll('.subagent-modal-open').forEach((node) => {
+function trimPlaceholderContent(root: HTMLElement) {
+  root.querySelectorAll('.subagent-body').forEach((node) => node.remove());
+  root.querySelectorAll('.subagent-modal-open').forEach((node) => {
     node.classList.remove('subagent-modal-open');
   });
+  root.querySelectorAll('.subagent-status, .subagent-modal-close, .chevron').forEach((node) => {
+    node.remove();
+  });
+}
+
+function createModalHostPlaceholder(
+  host: ModalHostElement,
+  config: ModalHostConfig,
+  heightPx: string | null = null,
+) {
+  const placeholder = host.cloneNode(true) as HTMLElement;
+  placeholder.classList.remove(config.hostClass);
+  placeholder.classList.remove('subagent-modal-anchor');
+  placeholder.classList.add(config.placeholderClass);
+  placeholder.style.minHeight =
+    heightPx || `${Math.max(host.getBoundingClientRect().height, 1)}px`;
   stripDuplicateIds(placeholder);
+  trimPlaceholderContent(placeholder);
   disablePlaceholderInteractivity(placeholder);
   return placeholder;
+}
+
+export function syncModalHostPlaceholder(host: ModalHostElement | null, config: ModalHostConfig) {
+  if (!host || !host.classList.contains(config.hostClass)) return;
+
+  const currentPlaceholder = host._modalHostPlaceholder;
+  const parent = currentPlaceholder?.parentNode;
+  if (!currentPlaceholder || !parent) return;
+
+  const preservedHeight =
+    currentPlaceholder.style.minHeight ||
+    `${Math.max(currentPlaceholder.getBoundingClientRect().height, 1)}px`;
+  const nextPlaceholder = createModalHostPlaceholder(host, config, preservedHeight);
+  parent.replaceChild(nextPlaceholder, currentPlaceholder);
+  host._modalHostPlaceholder = nextPlaceholder;
 }
 
 export function moveModalHostToBody(host: ModalHostElement | null, config: ModalHostConfig) {

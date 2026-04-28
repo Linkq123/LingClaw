@@ -57,9 +57,20 @@
   max-width: calc(100vw - 40px);
 }
 .subagent-modal-placeholder {
+  display: block;
+  width: 100%;
   min-height: 1px;
   pointer-events: none;
   user-select: none;
+}
+.subagent-modal-placeholder .subagent-panel {
+  opacity: .68;
+}
+.subagent-modal-placeholder .subagent-header {
+  cursor: default;
+}
+.subagent-modal-placeholder .subagent-header:hover {
+  background: transparent;
 }
 .timeline-node:has(+ .timeline-node) {
   background: linear-gradient(var(--_tl-color), var(--_tl-color)) no-repeat 7.5px 18px / 1px calc(100% - 18px);

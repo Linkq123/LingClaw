@@ -84,6 +84,10 @@ describe('orchestrate task modal hosting', () => {
     expect(sharedHost?.classList.contains('subagent-modal-host')).toBe(true);
     expect(sharedHost?.parentElement).toBe(document.body);
     expect(document.querySelector('.subagent-modal-placeholder')).not.toBeNull();
+    expect(
+      (document.querySelector('.subagent-modal-placeholder') as HTMLElement | null)?.style.minHeight,
+    ).not.toBe('');
+    expect(document.querySelector('.subagent-modal-placeholder .subagent-panel')).not.toBeNull();
     expect(sharedPanel?.classList.contains('subagent-modal-open')).toBe(true);
     expect(document.getElementById('subagent-modal-backdrop')?.hidden).toBe(false);
     expect(sharedPanel?.querySelector('.subagent-modal-close')).toBe(document.activeElement);
@@ -186,6 +190,8 @@ describe('orchestrate task modal hosting', () => {
     const sharedPanel = row?.querySelector('.subagent-panel') as HTMLElement | null;
 
     openOrchestrateTaskModal(trigger);
+    const initialPlaceholder = dom.chat?.querySelector('.subagent-modal-placeholder') as HTMLElement | null;
+    const initialPlaceholderHeight = initialPlaceholder?.style.minHeight;
 
     markOrchestrateTask(
       {
@@ -202,6 +208,9 @@ describe('orchestrate task modal hosting', () => {
     const body = sharedPanel?.querySelector('.subagent-body') as HTMLElement | null;
     const summary = sharedPanel?.querySelector('.subagent-summary') as HTMLElement | null;
     const status = sharedPanel?.querySelector('.subagent-status') as HTMLElement | null;
+    const placeholderPanel = dom.chat?.querySelector(
+      '.subagent-modal-placeholder .subagent-panel',
+    ) as HTMLElement | null;
 
     expect(sharedPanel?.classList.contains('subagent-modal-open')).toBe(true);
     expect(body?.classList.contains('show')).toBe(true);
@@ -209,5 +218,10 @@ describe('orchestrate task modal hosting', () => {
     expect(summary?.textContent).toContain('The footer clipping came from a stale overflow rule.');
     expect(status?.textContent).toContain('Completed');
     expect(status?.textContent).toContain('2 cycles');
+    expect(placeholderPanel?.classList.contains('subagent-active')).toBe(false);
+    expect(placeholderPanel?.classList.contains('subagent-done')).toBe(true);
+    expect(
+      (dom.chat?.querySelector('.subagent-modal-placeholder') as HTMLElement | null)?.style.minHeight,
+    ).toBe(initialPlaceholderHeight);
   });
 });

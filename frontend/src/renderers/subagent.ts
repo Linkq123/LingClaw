@@ -13,7 +13,12 @@ import { scrollDown } from '../scroll.js';
 import { wrapInTimeline, animatePanelIn, animateCollapsibleSection } from './timeline.js';
 import { pinReactStatusToBottom } from './react-status.js';
 import { closeToolDrawer, openToolDrawer, syncToolDrawer } from './tools.js';
-import { ensureModalBackdrop, moveModalHostToBody, restoreModalHost } from './modalHost.js';
+import {
+  ensureModalBackdrop,
+  moveModalHostToBody,
+  restoreModalHost,
+  syncModalHostPlaceholder,
+} from './modalHost.js';
 
 type SubagentPanelRef = {
   task_id?: string;
@@ -443,6 +448,14 @@ function ensureSubagentBackdrop() {
 function resolveSubagentModalHost(panel) {
   if (!panel) return null;
   return panel.closest('.timeline-node, .subagent-modal-anchor') as HTMLElement | null;
+}
+
+function syncSubagentModalPlaceholder(panel) {
+  const host = resolveSubagentModalHost(panel);
+  syncModalHostPlaceholder(host, {
+    hostClass: 'subagent-modal-host',
+    placeholderClass: 'subagent-modal-placeholder',
+  });
 }
 
 function syncOwningOrchestrateRowExpansion(panel, expanded) {
@@ -889,6 +902,7 @@ export function finishSubagentPanel(
   renderSummary(panel, success, stats);
   syncToolCount(panel, stats.tool_calls ?? null);
   syncPanelActions(panel);
+  syncSubagentModalPlaceholder(panel);
 
   const collapsePanel = () => {
     const body = panel.querySelector('.subagent-body');

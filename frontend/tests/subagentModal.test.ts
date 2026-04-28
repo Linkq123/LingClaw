@@ -80,8 +80,11 @@ describe('subagent modal hosting', () => {
     expect(wrapper?.classList.contains('subagent-modal-host')).toBe(true);
     expect(wrapper?.parentElement).toBe(document.body);
     expect(placeholder).not.toBeNull();
+    expect(placeholder?.style.minHeight).not.toBe('');
     expect(placeholder?.querySelector('.subagent-panel')).not.toBeNull();
     expect(placeholder?.textContent).toContain('explore');
+    expect(placeholder?.querySelector('.subagent-status')).toBeNull();
+    expect(placeholder?.querySelector('.subagent-body')).toBeNull();
     expect(panel?.classList.contains('subagent-modal-open')).toBe(true);
     expect(
       (panel?.querySelector('.subagent-body') as HTMLElement | null)?.hasAttribute('inert'),
@@ -176,6 +179,33 @@ describe('subagent modal hosting', () => {
     expect(drawer.getAttribute('aria-hidden')).toBe('true');
     expect(staleToolPanel.classList.contains('tool-panel-active')).toBe(false);
     expect(state.activeToolPanel).toBeNull();
+  });
+
+  it('keeps the visible placeholder in sync when the task finishes while open', () => {
+    createSubagentPanel('explore', 'Inspect the current service status.', 'task-3c');
+
+    const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
+    const header = panel?.querySelector('.subagent-header') as HTMLElement | null;
+
+    openSubagentModal(header);
+    const initialPlaceholder = dom.chat?.querySelector('.subagent-modal-placeholder') as HTMLElement | null;
+    const initialPlaceholderHeight = initialPlaceholder?.style.minHeight;
+    finishSubagentPanel(
+      { task_id: 'task-3c', agent: 'explore' },
+      true,
+      { cycles: 2, tool_calls: 1, result_excerpt: 'Service recovered after a restart.' },
+      { immediate: false },
+    );
+
+    const placeholderPanel = dom.chat?.querySelector(
+      '.subagent-modal-placeholder .subagent-panel',
+    ) as HTMLElement | null;
+
+    expect(placeholderPanel?.classList.contains('subagent-active')).toBe(false);
+    expect(placeholderPanel?.classList.contains('subagent-done')).toBe(true);
+    expect(
+      (dom.chat?.querySelector('.subagent-modal-placeholder') as HTMLElement | null)?.style.minHeight,
+    ).toBe(initialPlaceholderHeight);
   });
 
   it('strips delegated runtime context from the displayed prompt', () => {
