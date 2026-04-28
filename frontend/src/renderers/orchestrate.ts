@@ -3,11 +3,9 @@ import {
   escHtml,
   formatToolDuration,
   formatTokenCount,
-  formatDetailText,
   inlinePreview,
   stripDelegatedPromptRuntimeContext,
   pulseFocus,
-  copyButtonText,
 } from '../utils.js';
 import { scrollDown } from '../scroll.js';
 import {
@@ -17,47 +15,46 @@ import {
   removeTimelinePanel,
 } from './timeline.js';
 import { pinReactStatusToBottom } from './react-status.js';
-import { openToolDrawer, syncToolDrawer } from './tools.js';
+import {
+  closeSubagentModal,
+  createDetachedSubagentPanel,
+  finishSubagentPanel,
+  openSubagentPanelModal,
+  updateSubagentPrompt,
+} from './subagent.js';
 
-interface OrchestrateTaskModalHost extends HTMLElement {
-  _orchestrateModalParent?: HTMLElement | null;
-  _orchestrateModalNextSibling?: ChildNode | null;
-  _orchestrateModalPlaceholder?: HTMLElement | null;
-  _orchestrateModalWasExpanded?: boolean;
+type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+
+function ensureRegistry() {
+  return state.activeOrchestrations;
 }
 
-// Parse a composite task_id of the form `<orchestrate_id>:<task_id>` emitted by
-// orchestrator-wrapped sub-agent runs. Returns { orchestrateId, taskId } when
-// the first segment matches a known orchestration, else null.
-export function parseOrchestrateCompositeTaskId(compositeId) {
-  if (typeof compositeId !== 'string' || !compositeId.includes(':')) return null;
-  const idx = compositeId.indexOf(':');
-  const orchestrateId = compositeId.slice(0, idx);
-  const taskId = compositeId.slice(idx + 1);
-  if (!orchestrateId || !taskId) return null;
-  if (!state.activeOrchestrations.has(orchestrateId)) return null;
-  return { orchestrateId, taskId };
+function escapeAttr(value: string) {
+  return typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+    ? CSS.escape(value)
+    : value.replace(/"/g, '\\"');
 }
 
-function getTaskRows(panel): HTMLElement[] {
+function getTaskRows(panel: HTMLElement | null): HTMLElement[] {
   if (!panel) return [];
-  const orchestrateId = (panel as HTMLElement).dataset.orchestrateId;
+
+  const orchestrateId = panel.dataset.orchestrateId || '';
   if (orchestrateId && state.activeOrchestrations.has(orchestrateId)) {
     return Array.from(state.activeOrchestrations.get(orchestrateId)?.taskRows.values() || []);
   }
+
   if (orchestrateId) {
-    const escapedId =
-      typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
-        ? CSS.escape(orchestrateId)
-        : orchestrateId.replace(/"/g, '\\"');
     return Array.from(
-      document.querySelectorAll(`.orchestrate-task[data-orchestrate-id="${escapedId}"]`),
+      document.querySelectorAll(
+        `.orchestrate-task[data-orchestrate-id="${escapeAttr(orchestrateId)}"]`,
+      ),
     ) as HTMLElement[];
   }
-  return Array.from((panel as Element).querySelectorAll('.orchestrate-task')) as HTMLElement[];
+
+  return Array.from(panel.querySelectorAll('.orchestrate-task')) as HTMLElement[];
 }
 
-function summarizeTaskCounts(rows) {
+function summarizeTaskCounts(rows: HTMLElement[]) {
   const total = rows.length;
   const completed = rows.filter((row) =>
     row.classList.contains('orchestrate-task-completed'),
@@ -70,189 +67,9 @@ function summarizeTaskCounts(rows) {
   return { total, completed, failed, running, skipped, pending };
 }
 
-function setTaskExpanded(row, expand) {
-  const host = row as OrchestrateTaskModalHost | null;
-  const details = row?.querySelector('.orchestrate-task-details');
-  const chevron = row?.querySelector('.orchestrate-task-summary .chevron');
-  if (!details) return;
-  if (host?.classList.contains('orchestrate-task-modal-open')) {
-    host._orchestrateModalWasExpanded = expand;
-    details.style.height = 'auto';
-    details.classList.add('show', 'is-open');
-    if (chevron) chevron.classList.add('open');
-    return;
-  }
-  animateCollapsibleSection(details, expand);
-  if (chevron) chevron.classList.toggle('open', expand);
-}
-
-function findPriorityTaskRow(panel) {
-  const rows = getTaskRows(panel);
-  return (
-    rows.find((row) => row.classList.contains('orchestrate-task-running')) ||
-    rows.find((row) => row.classList.contains('orchestrate-task-failed')) ||
-    rows
-      .slice()
-      .reverse()
-      .find((row) => row.classList.contains('orchestrate-task-completed')) ||
-    rows[rows.length - 1] ||
-    null
-  );
-}
-
-function focusTaskRow(row) {
-  if (!row) return;
-  setTaskExpanded(row, true);
-  pulseFocus(row);
-  row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-}
-
-function orchestrationSummaryText(panel) {
-  if (!panel) return '';
-
-  const title = panel.querySelector('.orchestrate-label')?.textContent?.trim();
-  const status = panel.querySelector('.orchestrate-status')?.textContent?.trim();
-  const progress = panel.querySelector('[data-orchestrate-progress-label]')?.textContent?.trim();
-  const tasks = getTaskRows(panel)
-    .map((row) => {
-      const taskId = row.querySelector('.orchestrate-task-id')?.textContent?.trim() || 'task';
-      const agent = row.querySelector('.orchestrate-task-agent')?.textContent?.trim() || '';
-      const taskStatus = row.querySelector('.orchestrate-task-status')?.textContent?.trim() || '';
-      const preview = row.querySelector('.orchestrate-task-preview')?.textContent?.trim() || '';
-      return [`${taskId}${agent ? ` / ${agent}` : ''}`, taskStatus, preview]
-        .filter(Boolean)
-        .join('\n');
-    })
-    .filter(Boolean);
-
-  return [title, status, progress, tasks.join('\n\n')].filter(Boolean).join('\n\n').trim();
-}
-
-function moveTaskHostToBody(row) {
-  const host = row as OrchestrateTaskModalHost;
-  if (host.classList.contains('orchestrate-task-modal-open') || host._orchestrateModalPlaceholder) {
-    return;
-  }
-  const parent = host.parentElement;
-  if (!parent) return;
-
-  const placeholder = document.createElement('div');
-  placeholder.className = 'orchestrate-task-modal-placeholder';
-  placeholder.style.height = `${Math.max(host.getBoundingClientRect().height, 1)}px`;
-
-  host._orchestrateModalParent = parent;
-  host._orchestrateModalNextSibling = host.nextSibling;
-  host._orchestrateModalPlaceholder = placeholder;
-  parent.replaceChild(placeholder, host);
-  document.body.appendChild(host);
-}
-
-function restoreTaskHost(row) {
-  const host = row as OrchestrateTaskModalHost;
-  const parent = host._orchestrateModalParent;
-  const nextSibling = host._orchestrateModalNextSibling;
-  const placeholder = host._orchestrateModalPlaceholder;
-
-  if (placeholder?.parentNode) {
-    placeholder.parentNode.replaceChild(host, placeholder);
-  } else if (parent) {
-    if (nextSibling && nextSibling.parentNode === parent) {
-      parent.insertBefore(host, nextSibling);
-    } else {
-      parent.appendChild(host);
-    }
-  }
-
-  host._orchestrateModalParent = null;
-  host._orchestrateModalNextSibling = null;
-  host._orchestrateModalPlaceholder = null;
-}
-
-function ensureOrchestrateTaskBackdrop() {
-  let backdrop = document.getElementById('orchestrate-task-modal-backdrop');
-  if (backdrop) return backdrop;
-  backdrop = document.createElement('div');
-  backdrop.id = 'orchestrate-task-modal-backdrop';
-  backdrop.className = 'orchestrate-task-modal-backdrop';
-  backdrop.dataset.action = 'close-orchestrate-task-modal';
-  backdrop.hidden = true;
-  document.body.appendChild(backdrop);
-  return backdrop;
-}
-
-export function closeOrchestrateTaskModal() {
-  const row = document.querySelector(
-    '.orchestrate-task.orchestrate-task-modal-open',
-  ) as OrchestrateTaskModalHost | null;
-  if (row) {
-    const restoreExpanded = row._orchestrateModalWasExpanded === true;
-    const details = row.querySelector('.orchestrate-task-details') as HTMLElement | null;
-    const chevron = row.querySelector('.orchestrate-task-summary .chevron');
-    row.classList.remove('orchestrate-task-modal-open');
-    row.querySelector('.orchestrate-task-summary')?.setAttribute('aria-expanded', 'false');
-    row.querySelector('.orchestrate-task-modal-close')?.setAttribute('tabindex', '-1');
-    if (details) {
-      details.style.height = restoreExpanded ? 'auto' : '0px';
-      details.classList.toggle('show', restoreExpanded);
-      details.classList.toggle('is-open', restoreExpanded);
-      details.scrollTop = 0;
-    }
-    if (chevron) chevron.classList.toggle('open', restoreExpanded);
-    restoreTaskHost(row);
-    row._orchestrateModalWasExpanded = undefined;
-  }
-  const backdrop = document.getElementById('orchestrate-task-modal-backdrop');
-  if (backdrop) backdrop.hidden = true;
-}
-
-export function openOrchestrateTaskModal(trigger) {
-  const row = trigger?.closest?.('.orchestrate-task') as OrchestrateTaskModalHost | null;
-  if (!row || row.classList.contains('orchestrate-task-modal-open')) return;
-  closeOrchestrateTaskModal();
-  const backdrop = ensureOrchestrateTaskBackdrop();
-  row._orchestrateModalWasExpanded =
-    row.querySelector('.orchestrate-task-details')?.classList.contains('show') || false;
-  backdrop.hidden = false;
-  moveTaskHostToBody(row);
-  row.classList.add('orchestrate-task-modal-open');
-  row.querySelector('.orchestrate-task-summary')?.setAttribute('aria-expanded', 'true');
-  row.querySelector('.orchestrate-task-modal-close')?.removeAttribute('tabindex');
-  const chevron = row.querySelector('.orchestrate-task-summary .chevron');
-  const details = row.querySelector('.orchestrate-task-details') as HTMLElement | null;
-  if (details) {
-    details.style.height = 'auto';
-    details.classList.add('show', 'is-open');
-    details.scrollTop = 0;
-  }
-  if (chevron) chevron.classList.add('open');
-  (row.querySelector('.orchestrate-task-modal-close') as HTMLElement | null)?.focus();
-}
-
-function syncActionButtons(panel) {
+function syncTaskHighlights(panel: HTMLElement | null) {
   if (!panel) return;
 
-  const rows = getTaskRows(panel);
-  const toggleAllBtn = panel.querySelector('[data-action="orchestrate-toggle-all"]');
-  const focusBtn = panel.querySelector('[data-action="orchestrate-focus-active"]');
-  const copyBtn = panel.querySelector('[data-action="orchestrate-copy-summary"]');
-  const allExpanded =
-    rows.length > 0 &&
-    rows.every((row) => row.querySelector('.orchestrate-task-details')?.classList.contains('show'));
-
-  if (toggleAllBtn) {
-    toggleAllBtn.textContent = rows.length > 0 && allExpanded ? 'Collapse all' : 'Expand all';
-    toggleAllBtn.disabled = rows.length === 0;
-  }
-  if (focusBtn) {
-    focusBtn.disabled = rows.length === 0;
-  }
-  if (copyBtn) {
-    copyBtn.disabled = rows.length === 0;
-  }
-}
-
-function syncTaskHighlights(panel) {
-  if (!panel) return;
   const rows = getTaskRows(panel);
   const hasRunning = rows.some((row) => row.classList.contains('orchestrate-task-running'));
   rows.forEach((row) => {
@@ -271,10 +88,12 @@ function syncProgressVisuals(entry) {
   const total = Math.max(1, counts.total);
   const completionPercent =
     counts.total > 0 ? Math.round((counts.completed / counts.total) * 100) : 0;
-  const progressLabel = panel.querySelector('[data-orchestrate-progress-label]');
+  const progressLabel = panel.querySelector(
+    '[data-orchestrate-progress-label]',
+  ) as HTMLElement | null;
+
   if (progressLabel) {
-    const parts = [`${counts.completed}/${counts.total} completed`];
-    parts.push(`${completionPercent}%`);
+    const parts = [`${counts.completed}/${counts.total} completed`, `${completionPercent}%`];
     if (counts.running) parts.push(`${counts.running} running`);
     if (counts.failed) parts.push(`${counts.failed} failed`);
     if (counts.skipped) parts.push(`${counts.skipped} skipped`);
@@ -289,11 +108,16 @@ function syncProgressVisuals(entry) {
     skipped: counts.skipped,
     pending: counts.pending,
   };
+
   Object.entries(segmentCounts).forEach(([key, value]) => {
-    const segment = panel.querySelector(`[data-orchestrate-progress="${key}"]`);
+    const segment = panel.querySelector(
+      `[data-orchestrate-progress="${key}"]`,
+    ) as HTMLElement | null;
     if (!segment) return;
+
     segment.style.width = `${(value / total) * 100}%`;
     segment.hidden = value === 0;
+
     const segmentLabel =
       {
         completed: 'Completed',
@@ -306,129 +130,14 @@ function syncProgressVisuals(entry) {
   });
 
   syncTaskHighlights(panel);
-  syncActionButtons(panel);
-}
-
-function ensureTaskSection(row, key, title, content, tone = '') {
-  const details = row.querySelector('.orchestrate-task-details');
-  if (!details) return;
-
-  let section = row.querySelector(`[data-orchestrate-section="${key}"]`);
-  const hasContent = typeof content === 'string' && content.trim().length > 0;
-  if (!hasContent) {
-    if (section) section.classList.add('hidden');
-    return;
-  }
-
-  if (!section) {
-    section = document.createElement('div');
-    section.className = 'orchestrate-task-section';
-    section.dataset.orchestrateSection = key;
-    details.appendChild(section);
-  }
-
-  section.classList.remove('hidden');
-  section.innerHTML = `
-    <div class="orchestrate-task-section-title">${escHtml(title)}</div>
-    <pre class="orchestrate-task-code">${escHtml(formatDetailText(content))}</pre>
-  `;
-  const codeEl = section.querySelector('.orchestrate-task-code');
-  if (codeEl && tone) codeEl.classList.add(tone);
-}
-
-function ensureDependencySection(row, deps = []) {
-  const details = row.querySelector('.orchestrate-task-details');
-  if (!details) return;
-  let section = row.querySelector('[data-orchestrate-section="deps"]');
-
-  if (!Array.isArray(deps) || deps.length === 0) {
-    if (section) section.classList.add('hidden');
-    return;
-  }
-
-  if (!section) {
-    section = document.createElement('div');
-    section.className = 'orchestrate-task-section';
-    section.dataset.orchestrateSection = 'deps';
-    details.appendChild(section);
-  }
-
-  section.classList.remove('hidden');
-  section.innerHTML = `
-    <div class="orchestrate-task-section-title">Dependencies</div>
-    <div class="orchestrate-task-deps">
-      ${deps.map((dep) => `<span class="orchestrate-task-dep">${escHtml(dep)}</span>`).join('')}
-    </div>
-  `;
-}
-
-function setTaskPreview(row, text) {
-  const previewEl = row.querySelector('.orchestrate-task-preview');
-  if (!previewEl) return;
-  previewEl.textContent = inlinePreview(text || 'Waiting to run');
-}
-
-function reasoningPreview(rawText, fallback = 'Completed') {
-  const summaryText = (rawText || '').trim().replace(/\n+/g, ' ');
-  const preview = summaryText.slice(0, 60);
-  return preview ? preview + (summaryText.length > 60 ? '...' : '') : fallback;
-}
-
-function setTaskStatusTone(row, status) {
-  row.classList.toggle('orchestrate-task-has-error', status === 'failed');
-  row.classList.toggle('orchestrate-task-has-result', status === 'completed');
-}
-
-function maybeOpenTaskDetails(row, shouldOpen) {
-  setTaskExpanded(row, shouldOpen);
-}
-
-function getTaskReasoningBody(row): HTMLElement | null {
-  return (row as Element | null)?.querySelector(
-    '[data-orchestrate-reasoning-body]',
-  ) as HTMLElement | null;
-}
-
-function getTaskReasoningLabel(row): HTMLElement | null {
-  return (row as Element | null)?.querySelector(
-    '[data-orchestrate-reasoning-label]',
-  ) as HTMLElement | null;
-}
-
-function ensureTaskReasoningSection(row) {
-  const details = row?.querySelector('.orchestrate-task-details');
-  if (!details) return null;
-
-  let section = row.querySelector('[data-orchestrate-section="reasoning"]');
-  if (!section) {
-    section = document.createElement('div');
-    section.className = 'orchestrate-task-section orchestrate-task-reasoning';
-    section.dataset.orchestrateSection = 'reasoning';
-    section.innerHTML = `
-      <div class="orchestrate-task-reasoning-header" data-action="toggle-tool">
-        <span class="orchestrate-task-reasoning-icon">\ud83d\udcad</span>
-        <span class="orchestrate-task-reasoning-label" data-orchestrate-reasoning-label>Reasoning</span>
-        <span class="chevron">\u25b8</span>
-      </div>
-      <pre class="orchestrate-task-reasoning-body" data-orchestrate-reasoning-body></pre>
-    `;
-    const anchor = details.querySelector(
-      '[data-orchestrate-section="tools"], [data-orchestrate-section="result"]',
-    );
-    details.insertBefore(section, anchor || null);
-  }
-
-  section.classList.remove('hidden');
-  return section;
 }
 
 function updateHeaderProgress(entry) {
   syncProgressVisuals(entry);
 
-  const rows = Array.from(entry.taskRows.values());
+  const rows = Array.from(entry.taskRows.values()) as HTMLElement[];
   const { total, completed, failed, running, skipped, pending } = summarizeTaskCounts(rows);
-
-  const statusEl = entry.panel.querySelector('.orchestrate-status');
+  const statusEl = entry.panel.querySelector('.orchestrate-status') as HTMLElement | null;
   if (!statusEl || !entry.panel.classList.contains('orchestrate-active')) return;
 
   const parts = [`${completed}/${total}`];
@@ -439,16 +148,7 @@ function updateHeaderProgress(entry) {
   statusEl.textContent = parts.join(' / ');
 }
 
-/**
- * Return the shared orchestration registry from global state.
- * Keyed by orchestrate_id. Each entry holds:
- *   { panel, taskRows: Map<taskId, HTMLElement>, taskLayer: Map<taskId, layerIdx>, layerCount }
- */
-function ensureRegistry() {
-  return state.activeOrchestrations;
-}
-
-function statusText(status) {
+function statusText(status: TaskStatus) {
   switch (status) {
     case 'running':
       return 'Running';
@@ -464,7 +164,7 @@ function statusText(status) {
   }
 }
 
-function statusIcon(status) {
+function statusIcon(status: TaskStatus) {
   switch (status) {
     case 'running':
       return '\u25cf';
@@ -480,99 +180,217 @@ function statusIcon(status) {
   }
 }
 
-/**
- * Build the DAG layout (layers -> tasks) into the given container.
- * @param {HTMLElement} layersContainer
- * @param {Array<{id:string,agent:string,depends_on:string[],prompt_preview?:string}>} tasks
- * @returns {{ taskRows: Map<string,HTMLElement>, taskLayer: Map<string,number>, layerCount: number }}
- */
-function buildDagLayout(layersContainer, tasks, orchestrateId) {
-  // Compute layers: a task belongs to layer = 1 + max(layer(dep)).
-  const layer = new Map();
-  const deps = new Map();
-  for (const t of tasks) deps.set(t.id, t.depends_on || []);
-  // Iterative Kahn-ish assignment; supports up to tasks.length passes.
+function compositeTaskId(orchestrateId: string, taskId: string) {
+  return `${orchestrateId}:${taskId}`;
+}
+
+function setTaskPreview(row: HTMLElement, text: string) {
+  const previewEl = row.querySelector('.orchestrate-task-preview') as HTMLElement | null;
+  if (!previewEl) return;
+  previewEl.textContent = inlinePreview(text || 'Waiting to run');
+}
+
+function setTaskStatusTone(row: HTMLElement, status: TaskStatus) {
+  row.classList.toggle('orchestrate-task-has-error', status === 'failed');
+  row.classList.toggle('orchestrate-task-has-result', status === 'completed');
+}
+
+function buildDagLayout(layersContainer: HTMLElement, tasks, orchestrateId: string) {
+  const layer = new Map<string, number>();
+  const deps = new Map<string, string[]>();
+
+  for (const task of tasks) {
+    deps.set(task.id, task.depends_on || []);
+  }
+
   let changed = true;
   while (changed) {
     changed = false;
-    for (const t of tasks) {
-      if (layer.has(t.id)) continue;
-      const depLayers = (deps.get(t.id) || []).map((d) => layer.get(d));
-      if (depLayers.some((x) => x === undefined)) continue;
-      const max = depLayers.length ? Math.max(...depLayers) : -1;
-      layer.set(t.id, max + 1);
+    for (const task of tasks) {
+      if (layer.has(task.id)) continue;
+      const depLayers = (deps.get(task.id) || []).map((depId) => layer.get(depId));
+      if (depLayers.some((depLayer) => depLayer === undefined)) continue;
+      const maxLayer = depLayers.length ? Math.max(...depLayers) : -1;
+      layer.set(task.id, maxLayer + 1);
       changed = true;
     }
   }
-  // Anything still unassigned (impossible if plan is a DAG) goes to layer 0.
-  for (const t of tasks) {
-    if (!layer.has(t.id)) layer.set(t.id, 0);
+
+  for (const task of tasks) {
+    if (!layer.has(task.id)) layer.set(task.id, 0);
   }
 
   const layerCount = Math.max(0, ...Array.from(layer.values())) + 1;
-  const buckets = Array.from({ length: layerCount }, () => []);
-  for (const t of tasks) buckets[layer.get(t.id)].push(t);
+  const buckets = Array.from({ length: layerCount }, () => [] as typeof tasks);
+  for (const task of tasks) {
+    buckets[layer.get(task.id) || 0].push(task);
+  }
 
-  const taskRows = new Map();
-  const taskLayer = new Map();
-  for (let li = 0; li < buckets.length; li++) {
+  const taskRows = new Map<string, HTMLElement>();
+  const taskPanels = new Map<string, HTMLElement>();
+  const taskLayer = new Map<string, number>();
+
+  for (let layerIndex = 0; layerIndex < buckets.length; layerIndex += 1) {
     const layerEl = document.createElement('div');
     layerEl.className = 'orchestrate-layer';
-    layerEl.dataset.layerIndex = String(li);
+    layerEl.dataset.layerIndex = String(layerIndex);
 
     const header = document.createElement('div');
     header.className = 'orchestrate-layer-header';
-    header.textContent = `Layer ${li + 1}${buckets[li].length > 1 ? ' (parallel)' : ''}`;
+    header.textContent = `Layer ${layerIndex + 1}${
+      buckets[layerIndex].length > 1 ? ' (parallel)' : ''
+    }`;
     layerEl.appendChild(header);
 
     const taskContainer = document.createElement('div');
     taskContainer.className = 'orchestrate-task-grid';
-    for (const t of buckets[li]) {
-      const displayPrompt = stripDelegatedPromptRuntimeContext(t.prompt_preview || '');
+
+    for (const task of buckets[layerIndex]) {
+      const displayPrompt = stripDelegatedPromptRuntimeContext(task.prompt_preview || '');
       const row = document.createElement('div');
       row.className = 'orchestrate-task orchestrate-task-pending';
       row.dataset.orchestrateId = orchestrateId;
-      row.dataset.taskId = t.id;
+      row.dataset.taskId = task.id;
       if (displayPrompt) row.dataset.promptPreview = displayPrompt;
       row.innerHTML = `
-        <div class="orchestrate-task-summary" data-action="open-orchestrate-task-modal" role="button" tabindex="0" aria-expanded="false">
+        <div
+          class="orchestrate-task-summary"
+          data-action="open-orchestrate-task-modal"
+          role="button"
+          tabindex="0"
+          aria-expanded="false"
+          aria-haspopup="dialog"
+        >
           <span class="orchestrate-task-icon">${statusIcon('pending')}</span>
           <span class="orchestrate-task-main">
             <span class="orchestrate-task-title">
-              <span class="orchestrate-task-id">${escHtml(t.id)}</span>
-              <span class="orchestrate-task-agent">${escHtml(t.agent)}</span>
+              <span class="orchestrate-task-id">${escHtml(task.id)}</span>
+              <span class="orchestrate-task-agent">${escHtml(task.agent)}</span>
             </span>
-            <span class="orchestrate-task-preview">${escHtml(inlinePreview(displayPrompt || 'Waiting to run'))}</span>
+            <span class="orchestrate-task-preview">${escHtml(
+              inlinePreview(displayPrompt || 'Waiting to run'),
+            )}</span>
           </span>
           <span class="orchestrate-task-status">${statusText('pending')}</span>
           <span class="chevron">\u25b8</span>
-          <button type="button" class="orchestrate-task-modal-close" data-action="close-orchestrate-task-modal" aria-label="Close task details" tabindex="-1">&times;</button>
         </div>
-        <div class="orchestrate-task-details"></div>
       `;
-      ensureDependencySection(row, t.depends_on || []);
-      ensureTaskSection(row, 'prompt', 'Task prompt', displayPrompt);
+
+      const panel = createDetachedSubagentPanel(
+        task.agent,
+        displayPrompt,
+        compositeTaskId(orchestrateId, task.id),
+      );
+      panel.dataset.orchestrateId = orchestrateId;
+      panel.dataset.orchestrateTaskId = task.id;
+
+      const anchor = panel.parentElement;
+      if (anchor) row.appendChild(anchor);
+
       taskContainer.appendChild(row);
-      taskRows.set(t.id, row);
-      taskLayer.set(t.id, li);
+      taskRows.set(task.id, row);
+      taskPanels.set(task.id, panel);
+      taskLayer.set(task.id, layerIndex);
     }
+
     layerEl.appendChild(taskContainer);
     layersContainer.appendChild(layerEl);
   }
 
-  return { taskRows, taskLayer, layerCount };
+  return { taskRows, taskPanels, taskLayer, layerCount };
 }
 
-/**
- * Handle `orchestrate_started` event.
- * @param {object} data
- */
+function syncSharedTaskPanel(entry, data, status: Exclude<TaskStatus, 'pending' | 'running'> | 'running') {
+  const panel = entry?.taskPanels.get(data?.id);
+  if (!panel) return;
+  const shouldCollapseImmediately = !panel.classList.contains('subagent-modal-open');
+
+  const ref = {
+    task_id: compositeTaskId(data.orchestrate_id, data.id),
+    agent: panel.dataset.agent || data.agent || '',
+  };
+
+  if (data.prompt) {
+    updateSubagentPrompt(ref, data.prompt);
+  }
+
+  if (status === 'completed') {
+    finishSubagentPanel(
+      ref,
+      true,
+      {
+        cycles: data.cycles,
+        tool_calls: data.tool_calls,
+        duration_ms: data.duration_ms,
+        input_tokens: data.input_tokens,
+        output_tokens: data.output_tokens,
+        result_excerpt: data.result_excerpt,
+        result_preview: data.result_preview,
+      },
+      { immediate: shouldCollapseImmediately },
+    );
+    return;
+  }
+
+  if (status === 'failed') {
+    finishSubagentPanel(
+      ref,
+      false,
+      {
+        cycles: data.cycles,
+        tool_calls: data.tool_calls,
+        duration_ms: data.duration_ms,
+        input_tokens: data.input_tokens,
+        output_tokens: data.output_tokens,
+        error: data.error,
+      },
+      { immediate: shouldCollapseImmediately },
+    );
+    return;
+  }
+
+  if (status === 'skipped') {
+    finishSubagentPanel(
+      ref,
+      true,
+      {
+        cycles: data.cycles,
+        tool_calls: data.tool_calls,
+        duration_ms: data.duration_ms,
+        status_label: 'Skipped',
+        summary_title: 'Skip reason',
+        summary_tone: 'muted',
+        summary_body: data.reason || 'Task skipped.',
+      },
+      { immediate: shouldCollapseImmediately },
+    );
+  }
+}
+
+export function closeOrchestrateTaskModal() {
+  closeSubagentModal();
+}
+
+export function openOrchestrateTaskModal(trigger: HTMLElement | null) {
+  const row = trigger?.closest?.('.orchestrate-task') as HTMLElement | null;
+  if (!row) return;
+
+  const orchestrateId = row.dataset.orchestrateId || '';
+  const taskId = row.dataset.taskId || '';
+  const entry = state.activeOrchestrations.get(orchestrateId);
+  const panel = entry?.taskPanels.get(taskId) || null;
+  if (!panel) return;
+
+  row.querySelector('.orchestrate-task-summary')?.setAttribute('aria-expanded', 'true');
+  openSubagentPanelModal(panel);
+}
+
 export function createOrchestratePanel(data) {
   const registry = ensureRegistry();
-  if (!data || !data.orchestrate_id) return;
+  if (!data?.orchestrate_id) return;
 
   const existing = registry.get(data.orchestrate_id);
-  if (existing && existing.panel) {
+  if (existing?.panel) {
     removeTimelinePanel(existing.panel);
     registry.delete(data.orchestrate_id);
   }
@@ -586,7 +404,9 @@ export function createOrchestratePanel(data) {
   header.dataset.action = 'toggle-tool';
   header.innerHTML = `
     <span class="orchestrate-icon">\u2699</span>
-    <span class="orchestrate-label">Orchestrate / ${data.task_count || 0} tasks / ${data.layer_count || 0} layers</span>
+    <span class="orchestrate-label">Orchestrate / ${data.task_count || 0} tasks / ${
+      data.layer_count || 0
+    } layers</span>
     <span class="orchestrate-status">Running</span>
     <span class="chevron">\u25b8</span>
   `;
@@ -605,12 +425,9 @@ export function createOrchestratePanel(data) {
         <span class="orchestrate-progress-segment is-skipped" data-orchestrate-progress="skipped" hidden></span>
         <span class="orchestrate-progress-segment is-pending" data-orchestrate-progress="pending"></span>
       </div>
-      <div class="orchestrate-progress-label" data-orchestrate-progress-label>0/${Array.isArray(data.tasks) ? data.tasks.length : 0} completed</div>
-    </div>
-    <div class="panel-actions orchestrate-actions">
-      <button type="button" class="panel-action-btn" data-action="orchestrate-toggle-all">Expand all</button>
-      <button type="button" class="panel-action-btn" data-action="orchestrate-focus-active">Focus active</button>
-      <button type="button" class="panel-action-btn" data-action="orchestrate-copy-summary">Copy summary</button>
+      <div class="orchestrate-progress-label" data-orchestrate-progress-label>
+        0/${Array.isArray(data.tasks) ? data.tasks.length : 0} completed
+      </div>
     </div>
   `;
   body.appendChild(overview);
@@ -629,12 +446,11 @@ export function createOrchestratePanel(data) {
   const tasks = Array.isArray(data.tasks) ? data.tasks : [];
   const layout = buildDagLayout(layers, tasks, data.orchestrate_id);
 
-  // Update header with computed layer count when the provided value is 0 or
-  // missing (e.g. during history replay where layer_count isn't available).
   if (!data.layer_count && layout.layerCount) {
-    const label = panel.querySelector('.orchestrate-label');
-    if (label)
+    const label = panel.querySelector('.orchestrate-label') as HTMLElement | null;
+    if (label) {
       label.textContent = `Orchestrate / ${tasks.length} tasks / ${layout.layerCount} layers`;
+    }
   }
 
   const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
@@ -644,6 +460,7 @@ export function createOrchestratePanel(data) {
   } else {
     dom.chat.appendChild(wrapper);
   }
+
   pinReactStatusToBottom();
   animatePanelIn(panel);
   scrollDown();
@@ -651,36 +468,30 @@ export function createOrchestratePanel(data) {
   registry.set(data.orchestrate_id, {
     panel,
     taskRows: layout.taskRows,
+    taskPanels: layout.taskPanels,
     taskLayer: layout.taskLayer,
     layerCount: layout.layerCount,
+    live: true,
   });
 
   updateHeaderProgress(registry.get(data.orchestrate_id));
 }
 
-/**
- * Handle `orchestrate_layer` event - highlight the layer currently running.
- */
 export function updateOrchestrateLayer(data) {
-  const registry = ensureRegistry();
-  const entry = registry.get(data && data.orchestrate_id);
+  const entry = ensureRegistry().get(data?.orchestrate_id);
   if (!entry) return;
-  const layerIdx = (data.layer || 1) - 1;
+
+  const layerIndex = (data.layer || 1) - 1;
   const layers = entry.panel.querySelectorAll('.orchestrate-layer');
-  layers.forEach((layerEl, idx) => {
-    layerEl.classList.toggle('orchestrate-layer-active', idx === layerIdx);
+  layers.forEach((layerEl, index) => {
+    layerEl.classList.toggle('orchestrate-layer-active', index === layerIndex);
   });
 }
 
-/**
- * Handle all per-task status events.
- * @param {object} data
- * @param {'running'|'completed'|'failed'|'skipped'} status
- */
-export function markOrchestrateTask(data, status) {
-  const registry = ensureRegistry();
-  const entry = registry.get(data && data.orchestrate_id);
+export function markOrchestrateTask(data, status: Exclude<TaskStatus, 'pending'>) {
+  const entry = ensureRegistry().get(data?.orchestrate_id);
   if (!entry) return;
+
   const row = entry.taskRows.get(data.id);
   if (!row) return;
 
@@ -694,18 +505,19 @@ export function markOrchestrateTask(data, status) {
   row.classList.add(`orchestrate-task-${status}`);
   setTaskStatusTone(row, status);
 
-  const iconEl = row.querySelector('.orchestrate-task-icon');
+  const iconEl = row.querySelector('.orchestrate-task-icon') as HTMLElement | null;
   if (iconEl) iconEl.textContent = statusIcon(status);
-  const statusEl = row.querySelector('.orchestrate-task-status');
+
+  const statusEl = row.querySelector('.orchestrate-task-status') as HTMLElement | null;
   if (statusEl) {
     const parts = [statusText(status)];
     if (status === 'completed' || status === 'failed') {
       if (data.duration_ms != null) {
-        const dur = formatToolDuration(data.duration_ms);
-        if (dur) parts.push(dur);
+        const duration = formatToolDuration(data.duration_ms);
+        if (duration) parts.push(duration);
       }
       if (data.input_tokens != null || data.output_tokens != null) {
-        const tokens = [];
+        const tokens: string[] = [];
         if (data.input_tokens != null) tokens.push(formatTokenCount(data.input_tokens));
         if (data.output_tokens != null) tokens.push(formatTokenCount(data.output_tokens));
         if (tokens.length) parts.push(`${tokens.join('/')} tok`);
@@ -719,64 +531,59 @@ export function markOrchestrateTask(data, status) {
   const displayPrompt = stripDelegatedPromptRuntimeContext(data.prompt || '');
   if (data.prompt) {
     row.dataset.promptPreview = displayPrompt;
-    ensureTaskSection(row, 'prompt', 'Task prompt', displayPrompt);
   }
 
   if (status === 'running') {
     setTaskPreview(row, displayPrompt || row.dataset.promptPreview || 'Running');
+    row.removeAttribute('title');
     pulseFocus(row);
   } else if (status === 'completed') {
-    ensureTaskSection(row, 'result', 'Result', data.result_excerpt || '', 'is-result');
-    setTaskPreview(row, data.result_excerpt || 'Task completed');
+    setTaskPreview(row, data.result_excerpt || data.result_preview || 'Task completed');
+    row.removeAttribute('title');
   } else if (status === 'failed') {
-    ensureTaskSection(row, 'result', 'Error details', data.error || '', 'is-error');
     setTaskPreview(row, data.error || 'Task failed');
-    maybeOpenTaskDetails(row, true);
+    if (data.error) {
+      row.title = String(data.error).slice(0, 200);
+    } else {
+      row.removeAttribute('title');
+    }
+    pulseFocus(row);
   } else if (status === 'skipped') {
-    ensureTaskSection(row, 'result', 'Skip reason', data.reason || '', 'is-muted');
     setTaskPreview(row, data.reason || 'Task skipped');
+    row.removeAttribute('title');
   }
 
-  if (status === 'failed' && data.error) {
-    row.title = String(data.error).slice(0, 200);
-  }
-
+  syncSharedTaskPanel(entry, data, status);
   updateHeaderProgress(entry);
 }
 
-/**
- * Handle `orchestrate_completed` event - finalize the panel and collapse.
- */
 export function finishOrchestratePanel(data) {
-  const registry = ensureRegistry();
-  const entry = registry.get(data && data.orchestrate_id);
+  const entry = ensureRegistry().get(data?.orchestrate_id);
   if (!entry) return;
-  const { panel } = entry;
 
+  const { panel } = entry;
   panel.classList.remove('orchestrate-active');
   panel.classList.add(data.aborted ? 'orchestrate-aborted' : 'orchestrate-done');
 
-  // Clear any layer highlight.
   panel.querySelectorAll('.orchestrate-layer-active').forEach((el) => {
     el.classList.remove('orchestrate-layer-active');
   });
 
-  const status = panel.querySelector('.orchestrate-status');
+  const status = panel.querySelector('.orchestrate-status') as HTMLElement | null;
   if (status) {
-    const parts = [];
-    parts.push(`${data.completed || 0} completed`);
+    const parts = [`${data.completed || 0} completed`];
     if (data.failed) parts.push(`${data.failed} failed`);
     if (data.skipped) parts.push(`${data.skipped} skipped`);
     if (data.duration_ms != null) {
-      const dur = formatToolDuration(data.duration_ms);
-      if (dur) parts.push(dur);
+      const duration = formatToolDuration(data.duration_ms);
+      if (duration) parts.push(duration);
     }
     status.textContent = data.aborted
       ? `Aborted (${parts.join(' / ')})`
       : `Completed (${parts.join(' / ')})`;
   }
 
-  const summary = panel.querySelector('.orchestrate-summary');
+  const summary = panel.querySelector('.orchestrate-summary') as HTMLElement | null;
   if (summary) {
     const metrics = [
       `${data.completed || 0} completed`,
@@ -786,275 +593,29 @@ export function finishOrchestratePanel(data) {
       data.input_tokens != null ? `In ${formatTokenCount(data.input_tokens)}` : '',
       data.output_tokens != null ? `Out ${formatTokenCount(data.output_tokens)}` : '',
     ].filter(Boolean);
+
     summary.innerHTML = `
       <div class="orchestrate-summary-head">
-        <div class="orchestrate-summary-title">${data.aborted ? 'Execution aborted' : 'Execution summary'}</div>
+        <div class="orchestrate-summary-title">${
+          data.aborted ? 'Execution aborted' : 'Execution summary'
+        }</div>
         <div class="orchestrate-summary-metrics">
-          ${metrics.map((metric) => `<span class="orchestrate-summary-chip">${escHtml(metric)}</span>`).join('')}
+          ${metrics
+            .map((metric) => `<span class="orchestrate-summary-chip">${escHtml(metric)}</span>`)
+            .join('')}
         </div>
       </div>
     `;
     summary.classList.remove('hidden');
   }
 
-  const body = panel.querySelector('.orchestrate-body');
-  const chevron = panel.querySelector('.orchestrate-header .chevron');
+  const body = panel.querySelector('.orchestrate-body') as HTMLElement | null;
+  const chevron = panel.querySelector('.orchestrate-header .chevron') as HTMLElement | null;
   if (body?.classList.contains('show')) {
     animateCollapsibleSection(body, false);
   }
-  if (chevron) chevron.classList.remove('open');
+  chevron?.classList.remove('open');
 
   syncProgressVisuals(entry);
-
-  registry.delete(data.orchestrate_id);
-}
-
-export function toggleOrchestrateTasks(button) {
-  const panel = button.closest('.orchestrate-panel');
-  if (!panel) return;
-
-  const rows = getTaskRows(panel);
-  if (rows.length === 0) return;
-  const shouldExpand = rows.some(
-    (row) => !row.querySelector('.orchestrate-task-details')?.classList.contains('show'),
-  );
-  rows.forEach((row) => setTaskExpanded(row, shouldExpand));
-  syncActionButtons(panel);
-}
-
-export function focusOrchestrateActive(button) {
-  const panel = button.closest('.orchestrate-panel');
-  if (!panel) return;
-
-  const target = findPriorityTaskRow(panel);
-  if (!target) return;
-  focusTaskRow(target);
-}
-
-export function copyOrchestrateSummary(button) {
-  const panel = button.closest('.orchestrate-panel');
-  if (!panel) return;
-  void copyButtonText(button, orchestrationSummaryText(panel), 'Copy summary');
-}
-
-export function focusOrchestrateTool(button) {
-  // button is the pill element itself (it carries data-action).
-  // Open the shared tool drawer using the pill's dataset.
-  openToolDrawer(button);
-}
-
-export function startOrchestrateTaskReasoning(orchestrateId, taskId, agentName = '') {
-  const entry = state.activeOrchestrations.get(orchestrateId);
-  const row = getTaskRow(entry, taskId);
-  if (!row) return;
-
-  const section = ensureTaskReasoningSection(row);
-  const body = getTaskReasoningBody(row);
-  const label = getTaskReasoningLabel(row);
-  if (!section || !body || !label) return;
-
-  if (!body._textNode) {
-    body.textContent = '';
-    body._textNode = document.createTextNode('');
-    body.appendChild(body._textNode);
-  }
-
-  if (body._textNode.nodeValue.trim()) body._textNode.nodeValue += '\n\n';
-  if (agentName) body._textNode.nodeValue += `[${agentName}]\n`;
-
-  label.textContent = agentName
-    ? `Reasoning / ${agentName} thinking...`
-    : 'Reasoning / Thinking...';
-  label.title = label.textContent;
-}
-
-export function appendOrchestrateTaskReasoning(orchestrateId, taskId, content) {
-  if (!content) return;
-
-  const entry = state.activeOrchestrations.get(orchestrateId);
-  const row = getTaskRow(entry, taskId);
-  if (!row) return;
-
-  const section = ensureTaskReasoningSection(row);
-  const body = getTaskReasoningBody(row);
-  if (!section || !body) return;
-
-  if (!body._textNode) {
-    body.textContent = '';
-    body._textNode = document.createTextNode('');
-    body.appendChild(body._textNode);
-  }
-
-  body._textNode.nodeValue += content;
-}
-
-export function finishOrchestrateTaskReasoning(orchestrateId, taskId) {
-  const entry = state.activeOrchestrations.get(orchestrateId);
-  const row = getTaskRow(entry, taskId);
-  if (!row) return;
-
-  const body = getTaskReasoningBody(row);
-  const label = getTaskReasoningLabel(row);
-  if (!body || !label) return;
-
-  const rawText = body._textNode?.nodeValue || body.textContent || '';
-  const preview = reasoningPreview(rawText);
-  label.textContent = `Reasoning / ${preview}`;
-  label.title = rawText.trim() || 'Completed';
-}
-
-/* Inner tool chain (per task row) */
-
-function getTaskRow(entry, taskId) {
-  if (!entry || !taskId) return null;
-  return entry.taskRows.get(taskId) || null;
-}
-
-function ensureToolChainSection(row) {
-  const details = row?.querySelector('.orchestrate-task-details');
-  if (!details) return null;
-  let section = row.querySelector('[data-orchestrate-section="tools"]');
-  if (!section) {
-    section = document.createElement('div');
-    section.className = 'orchestrate-task-section orchestrate-task-tools';
-    section.dataset.orchestrateSection = 'tools';
-    section.innerHTML = `
-      <div class="orchestrate-task-section-title">Tool chain</div>
-      <div class="orchestrate-tool-chain" data-orchestrate-tool-chain></div>
-    `;
-    details.appendChild(section);
-  }
-  section.classList.remove('hidden');
-  return section;
-}
-
-function toolChainContainer(row) {
-  const section = ensureToolChainSection(row);
-  return section ? section.querySelector('[data-orchestrate-tool-chain]') : null;
-}
-
-function findOrchestrateToolPill(row, toolId) {
-  if (!row || !toolId) return null;
-  return row.querySelector(`.orchestrate-tool-pill[data-tool-id="${CSS.escape(toolId)}"]`) || null;
-}
-
-function setToolPillState(pill, stateLabel, tone) {
-  if (!pill) return;
-  pill.classList.remove('is-running', 'is-done', 'is-failed');
-  if (tone) pill.classList.add(tone);
-  const stateEl = pill.querySelector('.orchestrate-tool-pill-state');
-  if (stateEl) stateEl.textContent = stateLabel;
-}
-
-function syncToolPillContent(pill, toolName, toolArgs = '') {
-  if (!pill) return;
-
-  const nameEl = pill.querySelector('.orchestrate-tool-pill-name');
-  if (nameEl) nameEl.textContent = toolName || 'tool';
-
-  const previewText = inlinePreview(formatDetailText(toolArgs || ''), 80);
-  let previewEl = pill.querySelector('.orchestrate-tool-pill-preview');
-  const stateEl = pill.querySelector('.orchestrate-tool-pill-state');
-  if (previewText) {
-    if (!previewEl) {
-      previewEl = document.createElement('span');
-      previewEl.className = 'orchestrate-tool-pill-preview';
-      if (stateEl) pill.insertBefore(previewEl, stateEl);
-      else pill.appendChild(previewEl);
-    }
-    previewEl.textContent = previewText;
-  } else if (previewEl) {
-    previewEl.remove();
-  }
-}
-
-/**
- * Append a tool pill to the task row's inline tool chain.
- * No-op if the task/orchestration is unknown.
- */
-export function addOrchestrateTaskTool(orchestrateId, taskId, toolName, toolId, toolArgs = '') {
-  const entry = state.activeOrchestrations.get(orchestrateId);
-  const row = getTaskRow(entry, taskId);
-  if (!row) return;
-
-  const container = toolChainContainer(row);
-  if (!container) return;
-
-  const formattedArgs = formatDetailText(toolArgs || '');
-  const existingPill = toolId ? findOrchestrateToolPill(row, toolId) : null;
-  if (existingPill) {
-    syncToolPillContent(existingPill, toolName, toolArgs);
-    existingPill.dataset.toolName = toolName || 'tool';
-    existingPill.dataset.toolArgs = formattedArgs;
-    return;
-  }
-
-  const pill = document.createElement('button');
-  pill.type = 'button';
-  pill.className = 'orchestrate-tool-pill is-running';
-  pill.dataset.action = 'orchestrate-focus-tool';
-  pill.dataset.taskId = taskId;
-  pill.dataset.orchestrateId = orchestrateId;
-  if (toolId) pill.dataset.toolId = toolId;
-
-  // Drawer-compatible dataset for openToolDrawer / syncToolDrawer.
-  pill.dataset.toolName = toolName || 'tool';
-  pill.dataset.toolArgs = formattedArgs;
-  pill.dataset.toolResult = '';
-  pill.dataset.toolHasResult = 'false';
-  pill.dataset.toolStatus = 'Running';
-
-  pill.innerHTML = `
-    <span class="orchestrate-tool-pill-index">${container.childElementCount + 1}</span>
-    <span class="orchestrate-tool-pill-name">${escHtml(toolName || 'tool')}</span>
-    <span class="orchestrate-tool-pill-state">Running</span>
-  `;
-  syncToolPillContent(pill, toolName, toolArgs);
-  container.appendChild(pill);
-}
-
-/**
- * Mark an existing tool pill as completed / failed.
- * Updates drawer-compatible dataset and syncs to the tool drawer if active.
- */
-export function updateOrchestrateTaskTool(
-  orchestrateId,
-  taskId,
-  toolId,
-  durationMs,
-  result,
-  isError = false,
-  toolName = '',
-) {
-  const entry = state.activeOrchestrations.get(orchestrateId);
-  const row = getTaskRow(entry, taskId);
-  if (!row) return;
-
-  let pill = findOrchestrateToolPill(row, toolId);
-  if (!pill) {
-    addOrchestrateTaskTool(orchestrateId, taskId, toolName || 'tool', toolId, '');
-    pill = findOrchestrateToolPill(row, toolId);
-  }
-  if (!pill) return;
-
-  const durationLabel = formatToolDuration(durationMs);
-  const stateText = `${isError ? 'Failed' : 'Completed'}${durationLabel ? ` / ${durationLabel}` : ''}`;
-  setToolPillState(pill, stateText, isError ? 'is-failed' : 'is-done');
-
-  // Update drawer-compatible dataset on the pill.
-  const formattedResult = typeof result === 'string' ? formatDetailText(result) : '';
-  pill.dataset.toolResult = formattedResult;
-  pill.dataset.toolHasResult = typeof result === 'string' ? 'true' : 'false';
-  pill.dataset.toolStatus = stateText;
-  if (toolName) pill.dataset.toolName = toolName;
-
-  // Sync to the shared tool drawer if this pill is the active panel.
-  if (state.activeToolPanel === pill) {
-    syncToolDrawer(pill);
-  }
-
-  if (isError) {
-    maybeOpenTaskDetails(row, true);
-    pulseFocus(pill);
-  }
+  entry.live = false;
 }

@@ -87,12 +87,10 @@ import {
   appendSubagentReasoning,
   finishSubagentReasoning,
   restoreSubagentHistorySnapshot,
-  focusSubagentTool,
-  toggleSubagentTools,
-  focusSubagentCurrent,
   copySubagentSummary,
   openSubagentModal,
   closeSubagentModal,
+  openSubagentToolDrawer,
 } from './renderers/subagent.js';
 import {
   createOrchestratePanel,
@@ -101,16 +99,6 @@ import {
   finishOrchestratePanel,
   openOrchestrateTaskModal,
   closeOrchestrateTaskModal,
-  toggleOrchestrateTasks,
-  focusOrchestrateActive,
-  copyOrchestrateSummary,
-  focusOrchestrateTool,
-  parseOrchestrateCompositeTaskId,
-  startOrchestrateTaskReasoning,
-  appendOrchestrateTaskReasoning,
-  finishOrchestrateTaskReasoning,
-  addOrchestrateTaskTool,
-  updateOrchestrateTaskTool,
 } from './renderers/orchestrate.js';
 import {
   openSettingsPage,
@@ -587,11 +575,6 @@ function handleMessage(data) {
     case 'thinking_start': {
       if (!state.showReasoning) break;
       if (data.subagent) {
-        const orchInfo = parseOrchestrateCompositeTaskId(data.task_id);
-        if (orchInfo) {
-          startOrchestrateTaskReasoning(orchInfo.orchestrateId, orchInfo.taskId, data.subagent);
-          break;
-        }
         startSubagentReasoning({ task_id: data.task_id, agent: data.subagent });
         break;
       }
@@ -632,15 +615,6 @@ function handleMessage(data) {
       }
       if (!state.showReasoning) break;
       if (data.subagent) {
-        const orchInfo = parseOrchestrateCompositeTaskId(data.task_id);
-        if (orchInfo) {
-          appendOrchestrateTaskReasoning(
-            orchInfo.orchestrateId,
-            orchInfo.taskId,
-            data.content || '',
-          );
-          break;
-        }
         appendSubagentReasoning(
           { task_id: data.task_id, agent: data.subagent },
           data.content || '',
@@ -660,11 +634,6 @@ function handleMessage(data) {
         break;
       }
       if (data.subagent) {
-        const orchInfo = parseOrchestrateCompositeTaskId(data.task_id);
-        if (orchInfo) {
-          finishOrchestrateTaskReasoning(orchInfo.orchestrateId, orchInfo.taskId);
-          break;
-        }
         finishSubagentReasoning({ task_id: data.task_id, agent: data.subagent });
         break;
       }
@@ -701,19 +670,6 @@ function handleMessage(data) {
 
     case 'tool_result':
       if (data.subagent) {
-        const orchInfo = parseOrchestrateCompositeTaskId(data.task_id);
-        if (orchInfo) {
-          updateOrchestrateTaskTool(
-            orchInfo.orchestrateId,
-            orchInfo.taskId,
-            data.id,
-            data.duration_ms,
-            data.result,
-            data.is_error,
-            data.name,
-          );
-          break;
-        }
         updateSubagentToolResult(
           { task_id: data.task_id, agent: data.subagent },
           data.id,
@@ -737,18 +693,7 @@ function handleMessage(data) {
     case 'task_progress':
       updateSubagentProgress({ task_id: data.task_id, agent: data.agent }, data.cycle);
       break;
-    case 'task_tool': {
-      const orchInfo = parseOrchestrateCompositeTaskId(data.task_id);
-      if (orchInfo) {
-        addOrchestrateTaskTool(
-          orchInfo.orchestrateId,
-          orchInfo.taskId,
-          data.tool,
-          data.id,
-          data.arguments,
-        );
-        break;
-      }
+    case 'task_tool':
       addSubagentTool(
         { task_id: data.task_id, agent: data.agent },
         data.tool,
@@ -756,7 +701,6 @@ function handleMessage(data) {
         data.arguments,
       );
       break;
-    }
     case 'task_completed':
       finishSubagentPanel({ task_id: data.task_id, agent: data.agent }, true, {
         cycles: data.cycles,
@@ -882,10 +826,8 @@ const actionHandlers = {
   'load-earlier': () => loadEarlierMessages(),
   'open-tool-drawer': (el) => openToolDrawerFromHeader(el),
   'toggle-tool': (el) => toggleTool(el),
-  'subagent-toggle-all': (el) => toggleSubagentTools(el),
-  'subagent-focus-current': (el) => focusSubagentCurrent(el),
-  'subagent-focus-tool': (el) => focusSubagentTool(el),
   'subagent-copy-summary': (el) => copySubagentSummary(el),
+  'subagent-open-tool-drawer': (el) => openSubagentToolDrawer(el),
   'open-subagent-modal': (el) => {
     closeOrchestrateTaskModal();
     openSubagentModal(el);
@@ -896,10 +838,6 @@ const actionHandlers = {
     openOrchestrateTaskModal(el);
   },
   'close-orchestrate-task-modal': () => closeOrchestrateTaskModal(),
-  'orchestrate-toggle-all': (el) => toggleOrchestrateTasks(el),
-  'orchestrate-focus-active': (el) => focusOrchestrateActive(el),
-  'orchestrate-focus-tool': (el) => focusOrchestrateTool(el),
-  'orchestrate-copy-summary': (el) => copyOrchestrateSummary(el),
 };
 
 // ── Named global listeners ───────────────────────────────────────────────────

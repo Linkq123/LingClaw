@@ -5,7 +5,6 @@ import {
   formatToolDuration,
   formatTokenCount,
   formatDetailText,
-  inlinePreview,
   stripDelegatedPromptRuntimeContext,
   pulseFocus,
   copyButtonText,
@@ -13,12 +12,8 @@ import {
 import { scrollDown } from '../scroll.js';
 import { wrapInTimeline, animatePanelIn, animateCollapsibleSection } from './timeline.js';
 import { pinReactStatusToBottom } from './react-status.js';
-
-interface SubagentModalHost extends HTMLElement {
-  _subagentModalParent?: HTMLElement | null;
-  _subagentModalNextSibling?: ChildNode | null;
-  _subagentModalPlaceholder?: HTMLElement | null;
-}
+import { closeToolDrawer, openToolDrawer, syncToolDrawer } from './tools.js';
+import { ensureModalBackdrop, moveModalHostToBody, restoreModalHost } from './modalHost.js';
 
 type SubagentPanelRef = {
   task_id?: string;
@@ -34,6 +29,10 @@ type SubagentStats = {
   result_excerpt?: string;
   result_preview?: string;
   error?: string;
+  status_label?: string;
+  summary_title?: string;
+  summary_tone?: 'success' | 'error' | 'muted';
+  summary_body?: string;
 };
 
 type ToolCounts = {
@@ -55,21 +54,13 @@ const LABELS = {
   failed: 'Failed',
   waiting: 'Waiting',
   reasoning: 'Reasoning',
-  expandAll: 'Expand all',
-  collapseAll: 'Collapse all',
-  focusActive: 'Focus active',
   copySummary: 'Copy summary',
   taskPrompt: 'Task prompt',
   toolChain: 'Tool chain',
-  toolDetails: 'Tool details',
-  toolDetailsHint: 'Expand to inspect arguments and output',
   noToolCallsYet: 'No tool calls yet',
   noToolCallsInHistory: 'Tool details were not saved for this history replay.',
   noArguments: 'No arguments',
-  noOutput: 'No output',
   toolFailedNoOutput: 'Tool failed without returning displayable output.',
-  arguments: 'Arguments',
-  output: 'Output',
   executionSummary: 'Execution summary',
   failureDetails: 'Failure details',
   duration: 'Duration',
@@ -101,6 +92,28 @@ function getReasoningMeta(panel): HTMLElement | null {
 
 function getReasoningBody(panel): TextNodeHost | null {
   return (panel as Element).querySelector('[data-subagent-reasoning-body]') as TextNodeHost | null;
+}
+
+function ensurePromptCard(panel) {
+  if (!panel) return null;
+
+  const body = panel.querySelector('.subagent-body');
+  if (!body) return null;
+
+  let card = body.querySelector('[data-subagent-prompt-card]');
+  if (card) return card;
+
+  card = document.createElement('div');
+  card.className = 'subagent-section-card';
+  card.dataset.subagentPromptCard = 'true';
+  card.innerHTML = `
+    <div class="subagent-section-title">${LABELS.taskPrompt}</div>
+    <div class="subagent-prompt"></div>
+  `;
+
+  const toolOverview = body.querySelector('.subagent-tools-overview');
+  body.insertBefore(card, toolOverview || body.querySelector('.subagent-summary') || null);
+  return card;
 }
 
 function ensureReasoningCard(panel) {
@@ -143,43 +156,74 @@ function setChipText(panel, key, value, extraClass = '') {
   if (extraClass) chip.classList.add(extraClass);
 }
 
-function getToolRows(panel): HTMLElement[] {
-  return Array.from((panel as Element).querySelectorAll('.subagent-tool-row')) as HTMLElement[];
-}
-
-function findToolRowById(panel, toolId) {
-  if (!panel || !toolId) return null;
-  for (const row of getToolRows(panel)) {
-    if (row.dataset.toolId === toolId) return row;
-  }
-  return null;
-}
-
 function getToolBadges(panel): HTMLButtonElement[] {
   const trail = getToolTrail(panel);
   if (!trail) return [];
   return Array.from(trail.querySelectorAll<HTMLButtonElement>('.subagent-tool-pill'));
 }
 
-function findToolBadge(panel, toolId): HTMLButtonElement | null {
-  if (!panel || !toolId) return null;
-  return getToolBadges(panel).find((badge) => badge.dataset.toolId === toolId) || null;
+function hasStableToolId(toolId) {
+  return typeof toolId === 'string' && toolId.trim().length > 0;
 }
 
-function setToolRowExpanded(row, expand) {
-  const details = row?.querySelector('.subagent-tool-details');
-  const chevron = row?.querySelector('.subagent-tool-summary .chevron');
-  if (!details) return;
-  animateCollapsibleSection(details, expand);
-  if (chevron) chevron.classList.toggle('open', expand);
+function findPendingEmptyIdToolBadge(panel, toolName = ''): HTMLButtonElement | null {
+  if (!panel) return null;
+
+  const badges = getToolBadges(panel);
+  const matchesToolName = (badge) =>
+    !toolName || (badge.dataset.toolName || '') === toolName;
+
+  return (
+    badges.find(
+      (badge) =>
+        !hasStableToolId(badge.dataset.toolId) &&
+        badge.classList.contains('is-running') &&
+        matchesToolName(badge),
+    ) ||
+    badges.find(
+      (badge) => !hasStableToolId(badge.dataset.toolId) && badge.classList.contains('is-running'),
+    ) ||
+    null
+  );
+}
+
+function findToolBadge(panel, toolId, { allowPendingEmptyId = false, toolName = '' } = {}): HTMLButtonElement | null {
+  if (!panel) return null;
+  if (hasStableToolId(toolId)) {
+    return getToolBadges(panel).find((badge) => badge.dataset.toolId === toolId) || null;
+  }
+  if (allowPendingEmptyId) {
+    return findPendingEmptyIdToolBadge(panel, toolName);
+  }
+  return null;
 }
 
 function updateToolBadgeState(badge, stateLabel, tone) {
   if (!badge) return;
   badge.classList.remove('is-running', 'is-done', 'is-failed');
   if (tone) badge.classList.add(tone);
+  badge.dataset.toolStatus = stateLabel;
   const status = badge.querySelector('.subagent-tool-pill-state');
   if (status) status.textContent = stateLabel;
+}
+
+function syncToolBadgeDataset(
+  badge,
+  toolName,
+  toolArgs = '',
+  toolResult = '',
+  toolStatus: string = LABELS.running,
+  hasResult: boolean = false,
+) {
+  if (!badge) return;
+  const formattedArgs = formatDetailText(toolArgs || '');
+  const formattedResult = formatDetailText(toolResult || '');
+  badge.dataset.toolName = toolName || 'tool';
+  badge.dataset.toolArgs = formattedArgs || LABELS.noArguments;
+  badge.dataset.toolResult = formattedResult;
+  badge.dataset.toolHasResult = hasResult ? 'true' : 'false';
+  badge.dataset.toolStatus = toolStatus;
+  badge.title = [toolName || 'tool', toolStatus].filter(Boolean).join(' / ');
 }
 
 function ensureToolBadge(panel, toolId, toolName) {
@@ -196,13 +240,14 @@ function ensureToolBadge(panel, toolId, toolName) {
   badge = document.createElement('button');
   badge.type = 'button';
   badge.className = 'subagent-tool-pill is-running';
-  badge.dataset.action = 'subagent-focus-tool';
+  badge.dataset.action = 'subagent-open-tool-drawer';
   badge.dataset.toolId = toolId || '';
   badge.innerHTML = `
     <span class="subagent-tool-pill-index">${trail.childElementCount + 1}</span>
     <span class="subagent-tool-pill-name">${escHtml(toolName)}</span>
     <span class="subagent-tool-pill-state">${LABELS.running}</span>
   `;
+  syncToolBadgeDataset(badge, toolName, '', '', LABELS.running, false);
   trail.appendChild(badge);
   return badge;
 }
@@ -210,17 +255,20 @@ function ensureToolBadge(panel, toolId, toolName) {
 function syncToolOverview(panel, fallbackTotal: number | null = null, counts: ToolCounts | null = null) {
   if (!panel) return;
 
-  const rows = counts ? null : getToolRows(panel);
-  const total = counts ? counts.total : rows.length;
+  const badges = counts ? null : getToolBadges(panel);
+  const total = counts ? counts.total : badges.length;
   const settled = counts
     ? counts.settled
-    : rows.filter((row) => row.classList.contains('subagent-tool-done')).length;
+    : badges.filter(
+        (badge) =>
+          badge.classList.contains('is-done') || badge.classList.contains('is-failed'),
+      ).length;
   const failed = counts
     ? counts.failed
-    : rows.filter((row) => row.classList.contains('subagent-tool-failed')).length;
+    : badges.filter((badge) => badge.classList.contains('is-failed')).length;
   const running = counts
     ? counts.running
-    : rows.filter((row) => row.classList.contains('subagent-tool-running')).length;
+    : badges.filter((badge) => badge.classList.contains('is-running')).length;
   const succeeded = Math.max(0, settled - failed);
 
   const meta = getToolTrailMeta(panel);
@@ -253,23 +301,6 @@ function syncToolOverview(panel, fallbackTotal: number | null = null, counts: To
   if (trail) trail.hidden = total === 0;
 }
 
-function findPriorityToolRow(panel) {
-  const rows = getToolRows(panel);
-  return (
-    rows.find((row) => row.classList.contains('subagent-tool-running')) ||
-    rows.find((row) => row.classList.contains('subagent-tool-failed')) ||
-    rows[rows.length - 1] ||
-    null
-  );
-}
-
-function focusToolRow(row) {
-  if (!row) return;
-  setToolRowExpanded(row, true);
-  pulseFocus(row);
-  row.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-}
-
 function summaryCopyText(panel) {
   if (!panel) return '';
 
@@ -285,20 +316,22 @@ function summaryCopyText(panel) {
     .join(' / ');
   const summaryBody = panel
     .querySelector(
-      '.subagent-summary:not(.hidden) .subagent-preview, .subagent-summary:not(.hidden) .subagent-error',
+      '.subagent-summary:not(.hidden) .subagent-preview, .subagent-summary:not(.hidden) .subagent-error, .subagent-summary:not(.hidden) .subagent-note',
     )
     ?.textContent?.trim();
-  const latestOutput = (
-    Array.from((panel as Element).querySelectorAll('.subagent-tool-output-code')) as HTMLElement[]
-  )
-    .map((node) => node.textContent?.trim() || '')
+  const badges = getToolBadges(panel);
+  const latestOutput = badges
+    .map((badge) => badge.dataset.toolResult?.trim() || '')
     .filter(Boolean)
     .slice(-1)[0];
-  const toolsUsed = getToolBadges(panel)
+  const toolsUsed = badges
     .map((badge) => {
       const index = badge.querySelector('.subagent-tool-pill-index')?.textContent?.trim();
-      const name = badge.querySelector('.subagent-tool-pill-name')?.textContent?.trim();
-      return [index, name].filter(Boolean).join('. ');
+      const name = badge.dataset.toolName?.trim() || '';
+      const statusText = badge.dataset.toolStatus?.trim() || '';
+      return [index ? `${index}.` : '', name, statusText ? `(${statusText})` : '']
+        .filter(Boolean)
+        .join(' ');
     })
     .filter(Boolean)
     .join('\n');
@@ -314,76 +347,23 @@ function summaryCopyText(panel) {
   return parts.join('\n\n').trim();
 }
 
-function movePanelHostToBody(panel) {
-  const wrapper = panel?.closest('.timeline-node') as SubagentModalHost | null;
-  if (!wrapper || wrapper.classList.contains('subagent-modal-host')) return;
-  const parent = wrapper.parentElement;
-  if (!parent) return;
-
-  const placeholder = document.createElement('div');
-  placeholder.className = 'subagent-modal-placeholder';
-  placeholder.style.height = `${Math.max(wrapper.getBoundingClientRect().height, 1)}px`;
-
-  wrapper._subagentModalParent = parent;
-  wrapper._subagentModalNextSibling = wrapper.nextSibling;
-  wrapper._subagentModalPlaceholder = placeholder;
-  parent.replaceChild(placeholder, wrapper);
-  wrapper.classList.add('subagent-modal-host');
-  document.body.appendChild(wrapper);
-}
-
-function restorePanelHost(panel) {
-  const wrapper = panel?.closest('.timeline-node') as SubagentModalHost | null;
-  if (!wrapper || !wrapper.classList.contains('subagent-modal-host')) return;
-
-  const parent = wrapper._subagentModalParent;
-  const nextSibling = wrapper._subagentModalNextSibling;
-  const placeholder = wrapper._subagentModalPlaceholder;
-  if (placeholder?.parentNode) {
-    placeholder.parentNode.replaceChild(wrapper, placeholder);
-  } else if (parent) {
-    if (nextSibling && nextSibling.parentNode === parent) {
-      parent.insertBefore(wrapper, nextSibling);
-    } else {
-      parent.appendChild(wrapper);
-    }
-  }
-
-  wrapper.classList.remove('subagent-modal-host');
-  wrapper._subagentModalParent = null;
-  wrapper._subagentModalNextSibling = null;
-  wrapper._subagentModalPlaceholder = null;
-}
-
 function syncPanelActions(panel) {
   if (!panel) return;
 
-  const rows = getToolRows(panel);
-  const toggleAllBtn = panel.querySelector('[data-action="subagent-toggle-all"]');
-  const focusBtn = panel.querySelector('[data-action="subagent-focus-current"]');
   const copyBtn = panel.querySelector('[data-action="subagent-copy-summary"]');
-  const allExpanded =
-    rows.length > 0 &&
-    rows.every((row) => row.querySelector('.subagent-tool-details')?.classList.contains('show'));
-
-  if (toggleAllBtn) {
-    toggleAllBtn.textContent = rows.length > 0 && allExpanded ? LABELS.collapseAll : LABELS.expandAll;
-    toggleAllBtn.disabled = rows.length === 0;
-  }
-  if (focusBtn) {
-    focusBtn.disabled = rows.length === 0;
-  }
   if (copyBtn) {
     copyBtn.disabled = !summaryCopyText(panel);
   }
 }
 
 function syncToolCount(panel, fallbackTotal: number | null = null) {
-  const rows = getToolRows(panel);
-  const total = rows.length;
-  const settled = rows.filter((row) => row.classList.contains('subagent-tool-done')).length;
-  const failed = rows.filter((row) => row.classList.contains('subagent-tool-failed')).length;
-  const running = rows.filter((row) => row.classList.contains('subagent-tool-running')).length;
+  const badges = getToolBadges(panel);
+  const total = badges.length;
+  const settled = badges.filter(
+    (badge) => badge.classList.contains('is-done') || badge.classList.contains('is-failed'),
+  ).length;
+  const failed = badges.filter((badge) => badge.classList.contains('is-failed')).length;
+  const running = badges.filter((badge) => badge.classList.contains('is-running')).length;
   const displayText = total
     ? `${settled}/${total} tools`
     : fallbackTotal != null
@@ -411,16 +391,20 @@ function renderSummary(panel, success, stats: SubagentStats = {}) {
     if (tokens.length) metrics.push(tokens.join(' / '));
   }
 
-  const bodyText = success
-    ? (stats.result_excerpt || stats.result_preview || '').trim()
-    : (stats.error || '').trim();
+  const bodyText = String(
+    stats.summary_body ??
+      (success ? stats.result_excerpt || stats.result_preview || '' : stats.error || ''),
+  ).trim();
+  const titleText =
+    stats.summary_title || (success ? LABELS.executionSummary : LABELS.failureDetails);
+  const tone = stats.summary_tone || (success ? 'success' : 'error');
+  const contentClass =
+    tone === 'error' ? 'subagent-error' : tone === 'muted' ? 'subagent-note' : 'subagent-preview';
 
   const metricHtml = metrics
     .map((metric) => `<span class="subagent-summary-chip">${escHtml(metric)}</span>`)
     .join('');
-  const contentHtml = bodyText
-    ? `<pre class="${success ? 'subagent-preview' : 'subagent-error'}">${escHtml(bodyText)}</pre>`
-    : '';
+  const contentHtml = bodyText ? `<pre class="${contentClass}">${escHtml(bodyText)}</pre>` : '';
 
   if (!metricHtml && !contentHtml) {
     summary.classList.add('hidden');
@@ -430,7 +414,7 @@ function renderSummary(panel, success, stats: SubagentStats = {}) {
 
   summary.innerHTML = `
     <div class="subagent-summary-head">
-      <div class="subagent-summary-title">${success ? LABELS.executionSummary : LABELS.failureDetails}</div>
+      <div class="subagent-summary-title">${escHtml(titleText)}</div>
       <div class="subagent-summary-metrics">${metricHtml}</div>
     </div>
     ${contentHtml}
@@ -449,20 +433,40 @@ function resolvePanel(ref: SubagentPanelRef) {
 }
 
 function ensureSubagentBackdrop() {
-  let backdrop = document.getElementById('subagent-modal-backdrop');
-  if (backdrop) return backdrop;
-  backdrop = document.createElement('div');
-  backdrop.id = 'subagent-modal-backdrop';
-  backdrop.className = 'subagent-modal-backdrop';
-  backdrop.dataset.action = 'close-subagent-modal';
-  backdrop.hidden = true;
-  document.body.appendChild(backdrop);
-  return backdrop;
+  return ensureModalBackdrop({
+    id: 'subagent-modal-backdrop',
+    className: 'subagent-modal-backdrop',
+    closeAction: 'close-subagent-modal',
+  });
+}
+
+function resolveSubagentModalHost(panel) {
+  if (!panel) return null;
+  return panel.closest('.timeline-node, .subagent-modal-anchor') as HTMLElement | null;
+}
+
+function syncOwningOrchestrateRowExpansion(panel, expanded) {
+  const orchestrateId = panel?.dataset?.orchestrateId || '';
+  const taskId = panel?.dataset?.orchestrateTaskId || '';
+  if (!orchestrateId || !taskId) return;
+
+  const escapeAttr = (value) =>
+    typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+      ? CSS.escape(value)
+      : String(value).replace(/"/g, '\\"');
+
+  const row = document.querySelector(
+    `.orchestrate-task[data-orchestrate-id="${escapeAttr(orchestrateId)}"][data-task-id="${escapeAttr(taskId)}"] .orchestrate-task-summary`,
+  ) as HTMLElement | null;
+  row?.setAttribute('aria-expanded', expanded ? 'true' : 'false');
 }
 
 export function closeSubagentModal() {
   const panel = document.querySelector('.subagent-panel.subagent-modal-open');
   if (panel) {
+    if (state.activeToolPanel && panel.contains(state.activeToolPanel)) {
+      closeToolDrawer();
+    }
     panel.classList.remove('subagent-modal-open');
     panel.querySelector('.subagent-header')?.setAttribute('aria-expanded', 'false');
     panel.querySelector('.subagent-modal-close')?.setAttribute('tabindex', '-1');
@@ -472,21 +476,28 @@ export function closeSubagentModal() {
       body.style.height = '';
       body.setAttribute('inert', '');
     }
-    restorePanelHost(panel);
+    const host = resolveSubagentModalHost(panel);
+    restoreModalHost(host, { hostClass: 'subagent-modal-host' });
+    syncOwningOrchestrateRowExpansion(panel, false);
   }
   const backdrop = document.getElementById('subagent-modal-backdrop');
   if (backdrop) backdrop.hidden = true;
 }
 
-export function openSubagentModal(trigger) {
-  const panel = trigger?.closest?.('.subagent-panel');
+export function openSubagentPanelModal(panel) {
   if (!panel) return;
   closeSubagentModal();
+  closeToolDrawer();
   const backdrop = ensureSubagentBackdrop();
   backdrop.hidden = false;
-  movePanelHostToBody(panel);
+  const host = resolveSubagentModalHost(panel);
+  moveModalHostToBody(host, {
+    hostClass: 'subagent-modal-host',
+    placeholderClass: 'subagent-modal-placeholder',
+  });
   panel.classList.add('subagent-modal-open');
   panel.querySelector('.subagent-header')?.setAttribute('aria-expanded', 'true');
+  syncOwningOrchestrateRowExpansion(panel, true);
   panel.querySelector('.subagent-modal-close')?.removeAttribute('tabindex');
   const body = panel.querySelector('.subagent-body') as HTMLElement | null;
   if (body) {
@@ -498,12 +509,21 @@ export function openSubagentModal(trigger) {
   panel.querySelector('.subagent-modal-close')?.focus();
 }
 
+export function openSubagentModal(trigger) {
+  const panel = trigger?.closest?.('.subagent-panel');
+  openSubagentPanelModal(panel);
+}
+
 function panelKey(ref: SubagentPanelRef) {
   if (ref && ref.task_id) return ref.task_id;
   return (ref && ref.agent) || '';
 }
 
-export function createSubagentPanel(agentName, prompt, taskId) {
+function registerSubagentPanel(panel, taskId, agentName) {
+  state.activeSubagentPanels.set(panelKey({ task_id: taskId, agent: agentName }), panel);
+}
+
+function buildSubagentPanel(agentName, prompt, taskId) {
   const displayPrompt = stripDelegatedPromptRuntimeContext(prompt);
   const panel = document.createElement('div');
   panel.className = 'subagent-panel subagent-active';
@@ -543,21 +563,9 @@ export function createSubagentPanel(agentName, prompt, taskId) {
   const actions = document.createElement('div');
   actions.className = 'panel-actions subagent-actions';
   actions.innerHTML = `
-    <button type="button" class="panel-action-btn" data-action="subagent-toggle-all">${LABELS.expandAll}</button>
-    <button type="button" class="panel-action-btn" data-action="subagent-focus-current">${LABELS.focusActive}</button>
     <button type="button" class="panel-action-btn" data-action="subagent-copy-summary" disabled>${LABELS.copySummary}</button>
   `;
   body.appendChild(actions);
-
-  if (prompt) {
-    const promptCard = document.createElement('div');
-    promptCard.className = 'subagent-section-card';
-    promptCard.innerHTML = `
-      <div class="subagent-section-title">${LABELS.taskPrompt}</div>
-      <div class="subagent-prompt">${escHtml(displayPrompt)}</div>
-    `;
-    body.appendChild(promptCard);
-  }
 
   const toolOverview = document.createElement('div');
   toolOverview.className = 'subagent-section-card subagent-tools-overview';
@@ -571,26 +579,35 @@ export function createSubagentPanel(agentName, prompt, taskId) {
   `;
   body.appendChild(toolOverview);
 
-  const toolListSection = document.createElement('div');
-  toolListSection.className = 'subagent-section-card subagent-tool-list-section';
-  toolListSection.innerHTML = `
-    <div class="subagent-section-head">
-      <div class="subagent-section-title">${LABELS.toolDetails}</div>
-      <div class="subagent-section-meta">${LABELS.toolDetailsHint}</div>
-    </div>
-  `;
-  body.appendChild(toolListSection);
-
-  const toolList = document.createElement('div');
-  toolList.className = 'subagent-tool-list';
-  toolListSection.appendChild(toolList);
-
   const summary = document.createElement('div');
   summary.className = 'subagent-summary hidden';
   body.appendChild(summary);
 
   panel.appendChild(header);
   panel.appendChild(body);
+
+  if (prompt) {
+    const promptCard = ensurePromptCard(panel);
+    const promptEl = promptCard?.querySelector('.subagent-prompt');
+    if (promptEl) promptEl.textContent = displayPrompt;
+  }
+
+  syncToolOverview(panel);
+  syncPanelActions(panel);
+  return panel;
+}
+
+export function createDetachedSubagentPanel(agentName, prompt, taskId) {
+  const panel = buildSubagentPanel(agentName, prompt, taskId);
+  const anchor = document.createElement('div');
+  anchor.className = 'subagent-modal-anchor';
+  anchor.appendChild(panel);
+  registerSubagentPanel(panel, taskId, agentName);
+  return panel;
+}
+
+export function createSubagentPanel(agentName, prompt, taskId) {
+  const panel = buildSubagentPanel(agentName, prompt, taskId);
 
   const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
   const wrapper = wrapInTimeline(panel, 'subagent');
@@ -603,46 +620,28 @@ export function createSubagentPanel(agentName, prompt, taskId) {
   animatePanelIn(panel);
   scrollDown();
 
-  state.activeSubagentPanels.set(panelKey({ task_id: taskId, agent: agentName }), panel);
-  syncToolOverview(panel);
-  syncPanelActions(panel);
+  registerSubagentPanel(panel, taskId, agentName);
+}
+
+export function updateSubagentPrompt(ref: SubagentPanelRef, prompt) {
+  const panel = resolvePanel(ref);
+  if (!panel) return;
+
+  const displayPrompt = stripDelegatedPromptRuntimeContext(prompt || '');
+  if (!displayPrompt) return;
+
+  const promptCard = ensurePromptCard(panel);
+  const promptEl = promptCard?.querySelector('.subagent-prompt');
+  if (promptEl) promptEl.textContent = displayPrompt;
 }
 
 export function addSubagentTool(ref: SubagentPanelRef, toolName, toolId, toolArgs = '') {
   const panel = resolvePanel(ref);
   if (!panel) return;
 
-  const toolList = panel.querySelector('.subagent-tool-list');
-  if (!toolList) return;
-
   const formattedArgs = formatDetailText(toolArgs);
-  const row = document.createElement('div');
-  row.className = 'subagent-tool-row subagent-tool-running';
-  if (toolId) row.dataset.toolId = toolId;
-  row.dataset.toolName = toolName;
-  row.innerHTML = `
-    <div class="subagent-tool-summary" data-action="toggle-tool">
-      <span class="subagent-tool-icon">&#9881;</span>
-      <span class="subagent-tool-main">
-        <span class="subagent-tool-name">${escHtml(toolName)}</span>
-        <span class="subagent-tool-preview">${escHtml(inlinePreview(formattedArgs || LABELS.noArguments))}</span>
-      </span>
-      <span class="subagent-tool-status">${LABELS.running}</span>
-      <span class="chevron">&#9656;</span>
-    </div>
-    <div class="subagent-tool-details">
-      <div class="subagent-tool-section">
-        <div class="subagent-tool-section-title">${LABELS.arguments}</div>
-        <pre class="subagent-tool-code">${escHtml(formattedArgs || LABELS.noArguments)}</pre>
-      </div>
-      <div class="subagent-tool-section subagent-tool-output" hidden>
-        <div class="subagent-tool-section-title">${LABELS.output}</div>
-        <pre class="subagent-tool-code subagent-tool-output-code"></pre>
-      </div>
-    </div>
-  `;
-  toolList.appendChild(row);
   const badge = ensureToolBadge(panel, toolId, toolName);
+  syncToolBadgeDataset(badge, toolName, formattedArgs, '', LABELS.running, false);
   updateToolBadgeState(badge, LABELS.running, 'is-running');
   syncToolCount(panel);
   syncPanelActions(panel);
@@ -786,61 +785,47 @@ export function updateSubagentToolResult(
   const panel = resolvePanel(ref);
   if (!panel) return;
 
-  let row = null;
-  for (const candidate of panel.querySelectorAll('.subagent-tool-row')) {
-    if ((candidate as HTMLElement).dataset.toolId === toolId) {
-      row = candidate as HTMLElement;
-      break;
-    }
-  }
-
-  if (!row) {
+  let badge = findToolBadge(panel, toolId, {
+    allowPendingEmptyId: true,
+    toolName,
+  });
+  if (!badge) {
     addSubagentTool(ref, toolName || 'tool', toolId);
-    row =
-      Array.from(panel.querySelectorAll('.subagent-tool-row')).find(
-        (candidate) => (candidate as HTMLElement).dataset.toolId === toolId,
-      ) || null;
+    badge = findToolBadge(panel, toolId, {
+      allowPendingEmptyId: true,
+      toolName,
+    });
   }
-  if (!row) return;
+  if (!badge) return;
 
-  row.classList.remove('subagent-tool-running');
-  row.classList.add('subagent-tool-done');
-  row.classList.toggle('subagent-tool-failed', isError);
-
-  const statusEl = row.querySelector('.subagent-tool-status');
-  if (statusEl) {
-    const label = formatToolDuration(durationMs);
-    statusEl.textContent = `${isError ? LABELS.failed : LABELS.completed}${label ? ` / ${label}` : ''}`;
-  }
-
-  const hasResult = typeof result === 'string';
-  const formattedResult = hasResult ? formatDetailText(result) : '';
-  const previewEl = row.querySelector('.subagent-tool-preview');
-  if (previewEl && formattedResult) {
-    previewEl.textContent = inlinePreview(formattedResult, 120);
-  }
-
-  const outputSection = row.querySelector('.subagent-tool-output');
-  const outputCode = row.querySelector('.subagent-tool-output-code');
-  if (outputSection && outputCode && (hasResult || isError)) {
-    outputCode.textContent =
-      formattedResult || (isError ? LABELS.toolFailedNoOutput : LABELS.noOutput);
-    (outputSection as HTMLElement).hidden = false;
-  }
-
-  const badge = findToolBadge(panel, toolId);
+  const durationLabel = formatToolDuration(durationMs);
+  const stateLabel = `${isError ? LABELS.failed : LABELS.completed}${durationLabel ? ` / ${durationLabel}` : ''}`;
+  const hasResult = typeof result === 'string' && result.trim().length > 0;
+  const displayResult = hasResult ? result : isError ? LABELS.toolFailedNoOutput : '';
+  const showResult = hasResult || isError;
+  syncToolBadgeDataset(
+    badge,
+    toolName || badge.dataset.toolName || 'tool',
+    badge.dataset.toolArgs || '',
+    displayResult,
+    stateLabel,
+    showResult,
+  );
   updateToolBadgeState(
     badge,
-    isError ? LABELS.failed : LABELS.completed,
+    stateLabel,
     isError ? 'is-failed' : 'is-done',
   );
+
+  if (state.activeToolPanel === badge) {
+    syncToolDrawer(badge);
+  }
 
   syncToolCount(panel);
   syncPanelActions(panel);
 
   if (isError) {
-    setToolRowExpanded(row, true);
-    pulseFocus(row);
+    pulseFocus(badge);
   }
 
   scrollDown();
@@ -856,11 +841,28 @@ export function finishSubagentPanel(
   if (!panel) return;
 
   panel.classList.remove('subagent-active');
-  panel.classList.add(success ? 'subagent-done' : 'subagent-failed');
+  panel.classList.remove('subagent-done', 'subagent-failed', 'subagent-skipped');
+  const normalizedStatusLabel = stats.status_label?.trim().toLowerCase();
+  if (normalizedStatusLabel === 'skipped') {
+    panel.classList.add('subagent-skipped');
+  } else {
+    panel.classList.add(success ? 'subagent-done' : 'subagent-failed');
+  }
 
   const status = panel.querySelector('.subagent-status');
   if (status) {
-    if (success) {
+    if (stats.status_label) {
+      const parts: string[] = [];
+      if (stats.cycles != null) parts.push(`${stats.cycles} cycles`);
+      if (stats.tool_calls != null) parts.push(`${stats.tool_calls} tools`);
+      if (stats.duration_ms != null) {
+        const dur = formatToolDuration(stats.duration_ms);
+        if (dur) parts.push(dur);
+      }
+      status.textContent = parts.length
+        ? `${stats.status_label} (${parts.join(', ')})`
+        : stats.status_label;
+    } else if (success) {
       const parts: string[] = [];
       if (stats.cycles != null) parts.push(`${stats.cycles} cycles`);
       if (stats.tool_calls != null) parts.push(`${stats.tool_calls} tools`);
@@ -878,7 +880,10 @@ export function finishSubagentPanel(
     }
   }
 
-  setChipText(panel, 'state', success ? LABELS.completed : LABELS.failed, success ? 'is-success' : 'is-error');
+  const chipLabel = stats.status_label || (success ? LABELS.completed : LABELS.failed);
+  const chipClass =
+    normalizedStatusLabel === 'skipped' ? 'is-muted' : success ? 'is-success' : 'is-error';
+  setChipText(panel, 'state', chipLabel, chipClass);
   if (stats.cycles != null) setChipText(panel, 'cycle', `Cycle ${stats.cycles}`);
 
   renderSummary(panel, success, stats);
@@ -900,39 +905,14 @@ export function finishSubagentPanel(
   if (ref && ref.agent) state.activeSubagentPanels.delete(ref.agent);
 }
 
-export function toggleSubagentTools(button) {
-  const panel = button.closest('.subagent-panel');
-  if (!panel) return;
-
-  const rows = getToolRows(panel);
-  if (rows.length === 0) return;
-  const shouldExpand = rows.some(
-    (row) => !row.querySelector('.subagent-tool-details')?.classList.contains('show'),
-  );
-  rows.forEach((row) => setToolRowExpanded(row, shouldExpand));
-  syncPanelActions(panel);
-}
-
-export function focusSubagentCurrent(button) {
-  const panel = button.closest('.subagent-panel');
-  if (!panel) return;
-
-  const target = findPriorityToolRow(panel);
-  if (!target) return;
-  focusToolRow(target);
-}
-
 export function copySubagentSummary(button) {
   const panel = button.closest('.subagent-panel');
   if (!panel) return;
   void copyButtonText(button, summaryCopyText(panel), LABELS.copySummary);
 }
 
-export function focusSubagentTool(button) {
-  const panel = button.closest('.subagent-panel');
-  if (!panel) return;
-
-  const row = findToolRowById(panel, button.dataset.toolId || '');
-  if (!row) return;
-  focusToolRow(row);
+export function openSubagentToolDrawer(button) {
+  if (!button) return;
+  pulseFocus(button);
+  openToolDrawer(button);
 }

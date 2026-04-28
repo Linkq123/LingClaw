@@ -134,7 +134,6 @@
   }
   .subagent-header,
   .orchestrate-header,
-  .subagent-tool-summary,
   .orchestrate-task-summary,
   .orchestrate-task-title {
     flex-wrap: wrap;
@@ -150,14 +149,14 @@
   }
   .subagent-header .subagent-status,
   .orchestrate-status,
-  .subagent-tool-status,
   .orchestrate-task-status {
     margin-left: 0;
   }
   .subagent-summary-head {
     align-items: stretch;
   }
-  .timeline-node.subagent-modal-host {
+  .timeline-node.subagent-modal-host,
+  .subagent-modal-anchor.subagent-modal-host {
     padding: 10px 10px 18px;
   }
   .subagent-panel.subagent-modal-open {

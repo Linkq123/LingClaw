@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  addSubagentTool,
   closeSubagentModal,
   createSubagentPanel,
   finishSubagentPanel,
   openSubagentModal,
   restoreSubagentHistorySnapshot,
+  updateSubagentToolResult,
 } from '../src/renderers/subagent.js';
 import { dom, state } from '../src/state.js';
 import { applyToolsVisibility } from '../src/viewState.js';
@@ -16,6 +18,13 @@ describe('subagent modal hosting', () => {
   beforeEach(() => {
     document.body.innerHTML = '<div id="chat"></div>';
     dom.chat = document.getElementById('chat') as HTMLElement;
+    dom.toolDrawer = null;
+    dom.toolDrawerBackdrop = null;
+    dom.toolDrawerTitle = null;
+    dom.toolDrawerMeta = null;
+    dom.toolDrawerArgs = null;
+    dom.toolDrawerResult = null;
+    dom.toolDrawerResultSection = null;
     state.currentMsg = null;
     state.activeSubagentPanels.clear();
     state.activeToolPanel = null;
@@ -35,6 +44,13 @@ describe('subagent modal hosting', () => {
     state.showTools = true;
     document.body.innerHTML = '';
     dom.chat = null;
+    dom.toolDrawer = null;
+    dom.toolDrawerBackdrop = null;
+    dom.toolDrawerTitle = null;
+    dom.toolDrawerMeta = null;
+    dom.toolDrawerArgs = null;
+    dom.toolDrawerResult = null;
+    dom.toolDrawerResultSection = null;
     if (originalScrollIntoView) {
       Object.defineProperty(Element.prototype, 'scrollIntoView', {
         configurable: true,
@@ -47,7 +63,7 @@ describe('subagent modal hosting', () => {
   });
 
   it('moves the modal host to body while open and restores it on close', () => {
-    createSubagentPanel('explore', '检查服务状态', 'task-1');
+    createSubagentPanel('explore', 'Inspect the current service status.', 'task-1');
 
     const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
     expect(panel).not.toBeNull();
@@ -59,9 +75,13 @@ describe('subagent modal hosting', () => {
 
     openSubagentModal(header);
 
+    const placeholder = dom.chat?.querySelector('.subagent-modal-placeholder') as HTMLElement | null;
+
     expect(wrapper?.classList.contains('subagent-modal-host')).toBe(true);
     expect(wrapper?.parentElement).toBe(document.body);
-    expect(dom.chat?.querySelector('.subagent-modal-placeholder')).not.toBeNull();
+    expect(placeholder).not.toBeNull();
+    expect(placeholder?.querySelector('.subagent-panel')).not.toBeNull();
+    expect(placeholder?.textContent).toContain('explore');
     expect(panel?.classList.contains('subagent-modal-open')).toBe(true);
     expect(
       (panel?.querySelector('.subagent-body') as HTMLElement | null)?.hasAttribute('inert'),
@@ -86,33 +106,27 @@ describe('subagent modal hosting', () => {
   });
 
   it('keeps summary copy enabled for finished panels without tools', () => {
-    createSubagentPanel('explore', '检查服务状态', 'task-2');
+    createSubagentPanel('explore', 'Inspect the current service status.', 'task-2');
 
     finishSubagentPanel(
       { task_id: 'task-2', agent: 'explore' },
       true,
-      { tool_calls: 0, result_excerpt: '服务已启动' },
+      { tool_calls: 0, result_excerpt: 'Service is already online.' },
       { immediate: true },
     );
 
     const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
-    const expandBtn = panel?.querySelector(
-      '[data-action="subagent-toggle-all"]',
-    ) as HTMLButtonElement | null;
-    const focusBtn = panel?.querySelector(
-      '[data-action="subagent-focus-current"]',
-    ) as HTMLButtonElement | null;
     const copyBtn = panel?.querySelector(
       '[data-action="subagent-copy-summary"]',
     ) as HTMLButtonElement | null;
 
-    expect(expandBtn?.disabled).toBe(true);
-    expect(focusBtn?.disabled).toBe(true);
+    expect(panel?.querySelector('[data-action="subagent-toggle-all"]')).toBeNull();
+    expect(panel?.querySelector('[data-action="subagent-focus-current"]')).toBeNull();
     expect(copyBtn?.disabled).toBe(false);
   });
 
   it('closes the modal when tools are hidden', () => {
-    createSubagentPanel('explore', '检查服务状态', 'task-3');
+    createSubagentPanel('explore', 'Inspect the current service status.', 'task-3');
 
     const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
     const wrapper = panel?.closest('.timeline-node') as HTMLElement | null;
@@ -136,6 +150,34 @@ describe('subagent modal hosting', () => {
     expect(dom.chat?.classList.contains('hide-tools')).toBe(true);
     expect(document.getElementById('subagent-modal-backdrop')?.hidden).toBe(true);
   });
+
+  it('closes any stale tool drawer before opening the modal', () => {
+    createSubagentPanel('explore', 'Inspect the current service status.', 'task-3b');
+
+    const drawer = document.createElement('div');
+    drawer.className = 'tool-drawer open';
+    drawer.setAttribute('aria-hidden', 'false');
+    const drawerBackdrop = document.createElement('div');
+    drawerBackdrop.className = 'tool-drawer-backdrop open';
+    const staleToolPanel = document.createElement('button');
+    staleToolPanel.className = 'tool-panel-active';
+    document.body.append(drawer, drawerBackdrop, staleToolPanel);
+    dom.toolDrawer = drawer;
+    dom.toolDrawerBackdrop = drawerBackdrop;
+    state.activeToolPanel = staleToolPanel;
+
+    const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
+    const header = panel?.querySelector('.subagent-header') as HTMLElement | null;
+
+    openSubagentModal(header);
+
+    expect(drawer.classList.contains('open')).toBe(false);
+    expect(drawerBackdrop.classList.contains('open')).toBe(false);
+    expect(drawer.getAttribute('aria-hidden')).toBe('true');
+    expect(staleToolPanel.classList.contains('tool-panel-active')).toBe(false);
+    expect(state.activeToolPanel).toBeNull();
+  });
+
   it('strips delegated runtime context from the displayed prompt', () => {
     createSubagentPanel(
       'explore',
@@ -148,7 +190,7 @@ describe('subagent modal hosting', () => {
     expect(promptEl?.textContent).not.toContain('Delegated Task Context');
   });
 
-  it('uses English labels that match the orchestrate card style', () => {
+  it('uses streamlined labels that match the orchestrate card style', () => {
     createSubagentPanel('explore', 'Inspect the logs and summarize the failure.', 'task-4b');
 
     const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
@@ -161,8 +203,8 @@ describe('subagent modal hosting', () => {
 
     expect(panel?.querySelector('.subagent-status')?.textContent).toBe('Running');
     expect(panel?.querySelector('.subagent-icon')?.textContent).toBe('✦');
-    expect(actionButtons).toEqual(['Expand all', 'Focus active', 'Copy summary']);
-    expect(sectionTitles).toEqual(['Task prompt', 'Tool chain', 'Tool details']);
+    expect(actionButtons).toEqual(['Copy summary']);
+    expect(sectionTitles).toEqual(['Task prompt', 'Tool chain']);
   });
 
   it('keeps history replay empty state consistent when only tool counts were saved', () => {
@@ -215,18 +257,52 @@ describe('subagent modal hosting', () => {
 
     const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
     const reasoningBody = panel?.querySelector('[data-subagent-reasoning-body]') as HTMLElement | null;
-    const toolRows = panel?.querySelectorAll('.subagent-tool-row') || [];
+    const toolBadges = panel?.querySelectorAll('.subagent-tool-pill') || [];
     const summary = panel?.querySelector('.subagent-summary') as HTMLElement | null;
 
     expect(reasoningBody?.textContent).toContain('Check the log file');
-    expect(toolRows).toHaveLength(1);
-    expect((toolRows[0].querySelector('.subagent-tool-name') as HTMLElement | null)?.textContent).toBe(
+    expect(panel?.querySelectorAll('.subagent-tool-row') || []).toHaveLength(0);
+    expect(toolBadges).toHaveLength(1);
+    expect((toolBadges[0].querySelector('.subagent-tool-pill-name') as HTMLElement | null)?.textContent).toBe(
       'read_file',
     );
-    expect((toolRows[0].querySelector('.subagent-tool-output-code') as HTMLElement | null)?.textContent).toContain(
+    expect((toolBadges[0] as HTMLButtonElement).dataset.toolResult).toContain(
       'startup config missing',
     );
     expect(summary?.classList.contains('hidden')).toBe(false);
     expect(summary?.textContent).toContain('Found the root cause in the startup logs.');
+  });
+
+  it('matches empty tool ids to the earliest running badge', () => {
+    createSubagentPanel('reviewer', 'Inspect the logs and summarize the failure.', 'task-6');
+
+    addSubagentTool({ task_id: 'task-6', agent: 'reviewer' }, 'read_file', '', '{"path":"a.log"}');
+    addSubagentTool({ task_id: 'task-6', agent: 'reviewer' }, 'grep', '', '{"pattern":"panic"}');
+
+    updateSubagentToolResult(
+      { task_id: 'task-6', agent: 'reviewer' },
+      '',
+      18,
+      'first result',
+      false,
+      'read_file',
+    );
+    updateSubagentToolResult(
+      { task_id: 'task-6', agent: 'reviewer' },
+      '',
+      24,
+      'second result',
+      true,
+      'grep',
+    );
+
+    const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
+    const badges = Array.from(panel?.querySelectorAll('.subagent-tool-pill') || []) as HTMLButtonElement[];
+
+    expect(badges).toHaveLength(2);
+    expect(badges[0].classList.contains('is-done')).toBe(true);
+    expect(badges[0].dataset.toolResult).toContain('first result');
+    expect(badges[1].classList.contains('is-failed')).toBe(true);
+    expect(badges[1].dataset.toolResult).toContain('second result');
   });
 });

@@ -61,35 +61,43 @@ describe('orchestrate task modal hosting', () => {
     });
   }
 
-  it('moves the task card to body while open and restores it on close', () => {
+  it('reuses the shared sub-agent modal while open and restores it on close', () => {
     mountOrchestration();
 
+    const orchestratePanel = dom.chat?.querySelector('.orchestrate-panel') as HTMLElement | null;
     const row = dom.chat?.querySelector('.orchestrate-task') as HTMLElement | null;
-    const originalParent = row?.parentElement;
     const summary = row?.querySelector('.orchestrate-task-summary') as HTMLElement | null;
-    const details = row?.querySelector('.orchestrate-task-details') as HTMLElement | null;
+    const sharedPanel = row?.querySelector('.subagent-panel') as HTMLElement | null;
+    const sharedHost = sharedPanel?.parentElement as HTMLElement | null;
     const scrollIntoViewSpy = Element.prototype.scrollIntoView as unknown as ReturnType<typeof vi.fn>;
 
-    expect(originalParent).not.toBeNull();
-    expect(details?.classList.contains('show')).toBe(false);
+    expect(orchestratePanel?.querySelector('[data-action="orchestrate-toggle-all"]')).toBeNull();
+    expect(orchestratePanel?.querySelector('[data-action="orchestrate-focus-active"]')).toBeNull();
+    expect(orchestratePanel?.querySelector('[data-action="orchestrate-copy-summary"]')).toBeNull();
+    expect(row?.querySelector('.orchestrate-task-details')).toBeNull();
+    expect(sharedHost?.parentElement).toBe(row);
 
     openOrchestrateTaskModal(summary);
 
-    expect(row?.parentElement).toBe(document.body);
-    expect(document.querySelector('.orchestrate-task-modal-placeholder')).not.toBeNull();
-    expect(row?.classList.contains('orchestrate-task-modal-open')).toBe(true);
-    expect(details?.classList.contains('show')).toBe(true);
-    expect(document.getElementById('orchestrate-task-modal-backdrop')?.hidden).toBe(false);
-    expect(row?.querySelector('.orchestrate-task-modal-close')).toBe(document.activeElement);
+    expect(row?.parentElement?.classList.contains('orchestrate-task-grid')).toBe(true);
+    expect(summary?.isConnected).toBe(true);
+    expect(sharedHost?.classList.contains('subagent-modal-host')).toBe(true);
+    expect(sharedHost?.parentElement).toBe(document.body);
+    expect(document.querySelector('.subagent-modal-placeholder')).not.toBeNull();
+    expect(sharedPanel?.classList.contains('subagent-modal-open')).toBe(true);
+    expect(document.getElementById('subagent-modal-backdrop')?.hidden).toBe(false);
+    expect(sharedPanel?.querySelector('.subagent-modal-close')).toBe(document.activeElement);
+    expect(summary?.getAttribute('aria-expanded')).toBe('true');
     expect(scrollIntoViewSpy).not.toHaveBeenCalled();
 
     closeOrchestrateTaskModal();
 
-    expect(row?.parentElement).toBe(originalParent);
-    expect(document.querySelector('.orchestrate-task-modal-placeholder')).toBeNull();
-    expect(row?.classList.contains('orchestrate-task-modal-open')).toBe(false);
-    expect(details?.classList.contains('show')).toBe(false);
-    expect(document.getElementById('orchestrate-task-modal-backdrop')?.hidden).toBe(true);
+    expect(sharedHost?.classList.contains('subagent-modal-host')).toBe(false);
+    expect(sharedHost?.parentElement).toBe(row);
+    expect(document.querySelector('.subagent-modal-placeholder')).toBeNull();
+    expect(sharedPanel?.classList.contains('subagent-modal-open')).toBe(false);
+    expect(document.getElementById('subagent-modal-backdrop')?.hidden).toBe(true);
+    expect(summary?.getAttribute('aria-expanded')).toBe('false');
   });
 
   it('closes the task modal when tools are hidden', () => {
@@ -97,11 +105,13 @@ describe('orchestrate task modal hosting', () => {
 
     const row = dom.chat?.querySelector('.orchestrate-task') as HTMLElement | null;
     const summary = row?.querySelector('.orchestrate-task-summary') as HTMLElement | null;
+    const sharedPanel = row?.querySelector('.subagent-panel') as HTMLElement | null;
+    const sharedHost = sharedPanel?.parentElement as HTMLElement | null;
     const closeToolDrawer = vi.fn();
     const closeSubagentModal = vi.fn();
 
     openOrchestrateTaskModal(summary);
-    expect(row?.parentElement).toBe(document.body);
+    expect(sharedHost?.parentElement).toBe(document.body);
 
     applyToolsVisibility(false, {
       state,
@@ -113,18 +123,18 @@ describe('orchestrate task modal hosting', () => {
 
     expect(closeToolDrawer).toHaveBeenCalledTimes(1);
     expect(closeSubagentModal).toHaveBeenCalledTimes(1);
-    expect(row?.classList.contains('orchestrate-task-modal-open')).toBe(false);
-    expect(row?.parentElement).not.toBe(document.body);
+    expect(sharedPanel?.classList.contains('subagent-modal-open')).toBe(false);
+    expect(sharedHost?.parentElement).toBe(row);
     expect(dom.chat?.classList.contains('hide-tools')).toBe(true);
-    expect(document.getElementById('orchestrate-task-modal-backdrop')?.hidden).toBe(true);
+    expect(document.getElementById('subagent-modal-backdrop')?.hidden).toBe(true);
   });
 
-  it('keeps failure-triggered details expanded after closing the modal', () => {
+  it('keeps the task row visible and syncs failure details into the shared modal', () => {
     mountOrchestration();
 
     const row = dom.chat?.querySelector('.orchestrate-task') as HTMLElement | null;
     const summary = row?.querySelector('.orchestrate-task-summary') as HTMLElement | null;
-    const details = row?.querySelector('.orchestrate-task-details') as HTMLElement | null;
+    const sharedPanel = row?.querySelector('.subagent-panel') as HTMLElement | null;
 
     openOrchestrateTaskModal(summary);
     markOrchestrateTask(
@@ -138,11 +148,13 @@ describe('orchestrate task modal hosting', () => {
 
     closeOrchestrateTaskModal();
 
-    expect(row?.classList.contains('orchestrate-task-modal-open')).toBe(false);
     expect(row?.classList.contains('orchestrate-task-failed')).toBe(true);
-    expect(details?.classList.contains('show')).toBe(true);
-    expect(details?.classList.contains('is-open')).toBe(true);
+    expect(summary?.isConnected).toBe(true);
+    expect(sharedPanel?.querySelector('.subagent-summary')?.textContent).toContain(
+      'Task failed while the modal was open.',
+    );
   });
+
   it('strips delegated runtime context from task prompts shown in the card', () => {
     mountOrchestration();
 
@@ -159,10 +171,43 @@ describe('orchestrate task modal hosting', () => {
     );
 
     const previewEl = row?.querySelector('.orchestrate-task-preview');
-    const promptSection = row?.querySelector('[data-orchestrate-section="prompt"]');
+    const sharedPrompt = row?.querySelector('.subagent-prompt');
     expect(previewEl?.textContent).toContain('Fix the hidden footer in the expanded card.');
     expect(previewEl?.textContent).not.toContain('Delegated Task Context');
-    expect(promptSection?.textContent).toContain('Fix the hidden footer in the expanded card.');
-    expect(promptSection?.textContent).not.toContain('Delegated Task Context');
+    expect(sharedPrompt?.textContent).toContain('Fix the hidden footer in the expanded card.');
+    expect(sharedPrompt?.textContent).not.toContain('Delegated Task Context');
+  });
+
+  it('syncs completed task summaries into the shared sub-agent modal', () => {
+    mountOrchestration();
+
+    const row = dom.chat?.querySelector('.orchestrate-task') as HTMLElement | null;
+    const trigger = row?.querySelector('.orchestrate-task-summary') as HTMLElement | null;
+    const sharedPanel = row?.querySelector('.subagent-panel') as HTMLElement | null;
+
+    openOrchestrateTaskModal(trigger);
+
+    markOrchestrateTask(
+      {
+        orchestrate_id: 'orch-1',
+        id: 'task-a',
+        cycles: 2,
+        tool_calls: 1,
+        duration_ms: 480,
+        result_excerpt: 'The footer clipping came from a stale overflow rule.',
+      },
+      'completed',
+    );
+
+    const body = sharedPanel?.querySelector('.subagent-body') as HTMLElement | null;
+    const summary = sharedPanel?.querySelector('.subagent-summary') as HTMLElement | null;
+    const status = sharedPanel?.querySelector('.subagent-status') as HTMLElement | null;
+
+    expect(sharedPanel?.classList.contains('subagent-modal-open')).toBe(true);
+    expect(body?.classList.contains('show')).toBe(true);
+    expect(summary?.classList.contains('hidden')).toBe(false);
+    expect(summary?.textContent).toContain('The footer clipping came from a stale overflow rule.');
+    expect(status?.textContent).toContain('Completed');
+    expect(status?.textContent).toContain('2 cycles');
   });
 });

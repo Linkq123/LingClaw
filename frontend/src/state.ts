@@ -91,8 +91,10 @@ export interface AppState {
     {
       panel: HTMLElement;
       taskRows: Map<string, HTMLElement>;
+      taskPanels: Map<string, HTMLElement>;
       taskLayer: Map<string, number>;
       layerCount: number;
+      live: boolean;
     }
   >;
   dailyInputTokens: number;
