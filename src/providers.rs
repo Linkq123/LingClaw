@@ -1720,16 +1720,28 @@ fn anthropic_prompt_caching_enabled(resolved: &ResolvedModel) -> bool {
         && (resolved.api_base.contains("api.anthropic.com") || resolved.anthropic_prompt_caching)
 }
 
+/// Delimiter that separates the stable system-prompt prefix from the per-round
+/// dynamic suffix.  Must match the template in `build_system_prompt_with_query`.
+const ENV_BLOCK_DELIMITER: &str = "\n\n---\n## Environment\n- OS:";
+
 fn anthropic_system_payload(system_prompt: &str, cache_enabled: bool) -> serde_json::Value {
-    if cache_enabled {
-        json!([{
-            "type": "text",
-            "text": system_prompt,
-            "cache_control": {"type": "ephemeral"},
-        }])
-    } else {
-        json!(system_prompt)
+    if !cache_enabled {
+        return json!(system_prompt);
     }
+    let split_pos = system_prompt.rfind(ENV_BLOCK_DELIMITER);
+    let (stable, dynamic) = match split_pos {
+        Some(pos) => (&system_prompt[..pos], Some(&system_prompt[pos..])),
+        None => (system_prompt, None),
+    };
+    let mut blocks: Vec<serde_json::Value> = vec![json!({
+        "type": "text",
+        "text": stable,
+        "cache_control": {"type": "ephemeral"},
+    })];
+    if let Some(dyn_text) = dynamic {
+        blocks.push(json!({"type": "text", "text": dyn_text}));
+    }
+    json!(blocks)
 }
 
 fn maybe_apply_anthropic_tool_cache_control(tools: &mut [serde_json::Value], cache_enabled: bool) {

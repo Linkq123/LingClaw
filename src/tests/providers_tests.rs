@@ -755,6 +755,34 @@ fn anthropic_system_payload_stays_plain_string_when_disabled() {
 }
 
 #[test]
+fn anthropic_system_payload_splits_at_environment_delimiter() {
+    let system_prompt =
+        format!("Stable persona and tools.{delim} Linux\n- Current system local time: 2026-04-28 14:30 +08:00",
+                delim = super::ENV_BLOCK_DELIMITER);
+    let system_val = anthropic_system_payload(&system_prompt, true);
+    let blocks = system_val.as_array().unwrap();
+    assert_eq!(blocks.len(), 2, "should split into stable (cached) and dynamic (uncached) blocks");
+    assert_eq!(blocks[0]["type"], "text");
+    assert_eq!(blocks[0]["text"], "Stable persona and tools.");
+    assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(blocks[1]["type"], "text");
+    assert_eq!(
+        blocks[1]["text"],
+        format!("{delim} Linux\n- Current system local time: 2026-04-28 14:30 +08:00",
+                delim = super::ENV_BLOCK_DELIMITER),
+    );
+    assert!(blocks[1].get("cache_control").is_none());
+}
+
+#[test]
+fn anthropic_system_payload_no_split_without_environment_block() {
+    let system_val = anthropic_system_payload("Just a simple prompt.", true);
+    let blocks = system_val.as_array().unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+}
+
+#[test]
 fn anthropic_tools_last_has_cache_control_when_enabled() {
     let mut tools: Vec<serde_json::Value> = vec![
         json!({"name": "tool_a", "description": "A"}),

@@ -10,7 +10,7 @@ fn test_local_datetime_formatters() {
     assert_eq!(format_local_hhmm(date_time), "00:05");
     assert_eq!(
         format_local_datetime_label(date_time),
-        "2026-03-16 00:05:07 +08:00"
+        "2026-03-16 00:05 +08:00"
     );
 }
 
@@ -23,7 +23,7 @@ fn local_time_snapshot_uses_single_now_across_midnight_boundaries() {
     assert_eq!(snapshot.today(), "2026-03-16");
     assert_eq!(snapshot.yesterday(), "2026-03-15");
     assert_eq!(snapshot.hhmm(), "00:05");
-    assert_eq!(snapshot.datetime_label(), "2026-03-16 00:05:07 +08:00");
+    assert_eq!(snapshot.datetime_label(), "2026-03-16 00:05 +08:00");
 }
 
 #[test]

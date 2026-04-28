@@ -702,14 +702,6 @@ Only read those files if the user explicitly asks to inspect them, if you need t
     let prompt = format!(
         r#"{persona}{structured_memory_section}
 
----
-
-## Environment
-- OS: {os_name}
-- Current system local time: {local_time}
-- Working directory: {cwd}
-- Model: {model}
-
 {prompt_file_note}
 
 ## Agent Behavior
@@ -722,7 +714,16 @@ You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools
 - **Finishing:** When the task is complete, deliver your result. When you are genuinely stuck with no further options, say so honestly. Do not pad with speculative follow-ups.
 
 ## Available Tools
-{tool_lines}{mcp_note}{skills_section}{agents_section}"#,
+{tool_lines}{mcp_note}{skills_section}{agents_section}
+
+---
+
+## Environment
+- OS: {os_name}
+- Current system local time: {local_time}
+- Working directory: {cwd}
+- Model: {model}"#, // The `---\n## Environment\n- OS:` prefix above is used as a cache-split
+        // delimiter by ENV_BLOCK_DELIMITER in providers.rs — keep them in sync.
         model = model,
         local_time = local_time,
         tool_lines = tool_lines,
