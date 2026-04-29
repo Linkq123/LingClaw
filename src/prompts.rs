@@ -785,28 +785,7 @@ pub(crate) fn ensure_session_workspace(workspace: &Path) {
     ensure_bootstrap_baselines(workspace);
 }
 
-// ── Prompt file mtime cache ──────────────────────────────────────────────────
-
-/// All prompt-relevant filenames (relative to workspace) that affect the output.
-const PROMPT_WATCH_FILES: &[&str] = &[
-    "BOOTSTRAP.md",
-    "AGENTS.md",
-    "AGENT.md",
-    "IDENTITY.md",
-    "USER.md",
-    "SOUL.md",
-    "MEMORY.md",
-];
-
-struct PromptCache {
-    workspace: PathBuf,
-    today: String,
-    mtimes: Vec<Option<SystemTime>>,
-    result: PromptFiles,
-}
-
-type PromptCacheLock = OnceLock<Mutex<Option<PromptCache>>>;
-static PROMPT_FILE_CACHE: PromptCacheLock = OnceLock::new();
+// ── Prompt file caches ────────────────────────────────────────────────────────
 
 pub(crate) fn file_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
@@ -832,35 +811,132 @@ pub(crate) fn collect_dir_tree_mtimes(dir: &Path) -> Vec<Option<SystemTime>> {
     mtimes
 }
 
-fn collect_prompt_mtimes(
+// ── Persona cache (stable, invalidates on user edits) ─────────────────────────
+
+const PERSONA_WATCH_FILES: &[&str] = &[
+    "BOOTSTRAP.md",
+    "AGENTS.md",
+    "AGENT.md",
+    "IDENTITY.md",
+    "USER.md",
+    "SOUL.md",
+];
+
+struct PersonaCache {
+    workspace: PathBuf,
+    mtimes: Vec<Option<SystemTime>>,
+    result: String,
+}
+
+type PersonaCacheLock = OnceLock<Mutex<Option<PersonaCache>>>;
+static PERSONA_CACHE: PersonaCacheLock = OnceLock::new();
+
+fn collect_persona_mtimes(workspace: &Path) -> Vec<Option<SystemTime>> {
+    PERSONA_WATCH_FILES
+        .iter()
+        .map(|name| file_mtime(&workspace.join(name)))
+        .collect()
+}
+
+fn load_persona_uncached(workspace: &Path) -> String {
+    let bootstrap = read_nonempty(workspace.join(BOOTSTRAP_FILE));
+
+    if let Some(bs_content) = bootstrap {
+        // Bootstrap mode: first-run identity setup
+        let mut parts = vec![format!("<!-- {BOOTSTRAP_FILE} -->\n{bs_content}")];
+        if let Some((name, agent)) = read_agent_prompt(workspace) {
+            parts.push(format!("<!-- {name} -->\n{agent}"));
+        }
+        return parts.join("\n\n---\n\n");
+    }
+
+    // Normal mode: stable persona files
+    let mut parts = Vec::new();
+    if let Some((name, content)) = read_agent_prompt(workspace) {
+        parts.push(format!("<!-- {name} -->\n{content}"));
+    }
+    for name in &PERSONA_WATCH_FILES[3..] { // IDENTITY.md, USER.md, SOUL.md
+        if let Some(content) = read_nonempty(workspace.join(name)) {
+            parts.push(format!("<!-- {name} -->\n{content}"));
+        }
+    }
+    parts.join("\n\n---\n\n")
+}
+
+fn load_persona(workspace: &Path) -> String {
+    let mtimes = collect_persona_mtimes(workspace);
+    let cache = PERSONA_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref c) = *guard
+            && c.workspace == workspace
+            && c.mtimes == mtimes
+        {
+            return c.result.clone();
+        }
+    }
+    let result = load_persona_uncached(workspace);
+    {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(PersonaCache {
+            workspace: workspace.to_path_buf(),
+            mtimes,
+            result: result.clone(),
+        });
+    }
+    result
+}
+
+// ── Memory cache (invalidates on memory writes or day rollover) ───────────────
+
+struct MemoryCache {
+    workspace: PathBuf,
+    today: String,
+    mtimes: Vec<Option<SystemTime>>,
+    result: String,
+}
+
+type MemoryCacheLock = OnceLock<Mutex<Option<MemoryCache>>>;
+static MEMORY_CACHE: MemoryCacheLock = OnceLock::new();
+
+fn collect_memory_mtimes(
     workspace: &Path,
     today: &str,
     yesterday: &str,
 ) -> Vec<Option<SystemTime>> {
-    let mut mtimes = Vec::with_capacity(PROMPT_WATCH_FILES.len() + 2);
-    for name in PROMPT_WATCH_FILES {
-        mtimes.push(file_mtime(&workspace.join(name)));
-    }
-    mtimes.push(file_mtime(
-        &workspace.join("memory").join(format!("{today}.md")),
-    ));
-    mtimes.push(file_mtime(
-        &workspace.join("memory").join(format!("{yesterday}.md")),
-    ));
-    mtimes
+    vec![
+        file_mtime(&workspace.join("BOOTSTRAP.md")), // bootstrap gate
+        file_mtime(&workspace.join("MEMORY.md")),
+        file_mtime(&workspace.join("memory").join(format!("{today}.md"))),
+        file_mtime(&workspace.join("memory").join(format!("{yesterday}.md"))),
+    ]
 }
 
-pub(crate) fn load_session_prompt_files_with_snapshot(
-    workspace: &Path,
-    snapshot: LocalTimeSnapshot,
-) -> PromptFiles {
-    maybe_complete_bootstrap(workspace);
+fn load_memory_uncached(workspace: &Path, today: &str, yesterday: &str) -> String {
+    // In bootstrap mode memory is always empty.
+    if read_nonempty(workspace.join(BOOTSTRAP_FILE)).is_some() {
+        return String::new();
+    }
 
-    let today = snapshot.today();
-    let yesterday = snapshot.yesterday();
-    let mtimes = collect_prompt_mtimes(workspace, &today, &yesterday);
+    let mut parts = Vec::new();
+    if let Some(content) = read_nonempty(workspace.join("MEMORY.md")) {
+        parts.push(format!("<!-- MEMORY.md -->\n{content}"));
+    }
 
-    let cache = PROMPT_FILE_CACHE.get_or_init(|| Mutex::new(None));
+    const DAILY_MEMORY_CHAR_BUDGET: usize = 4000;
+    for date_str in &[today, yesterday] {
+        let path = workspace.join("memory").join(format!("{date_str}.md"));
+        if let Some(content) = read_nonempty(&path) {
+            let content = crate::truncate(&content, DAILY_MEMORY_CHAR_BUDGET);
+            parts.push(format!("<!-- memory/{date_str}.md -->\n{content}"));
+        }
+    }
+    parts.join("\n\n---\n\n")
+}
+
+fn load_memory(workspace: &Path, today: &str, yesterday: &str) -> String {
+    let mtimes = collect_memory_mtimes(workspace, today, yesterday);
+    let cache = MEMORY_CACHE.get_or_init(|| Mutex::new(None));
     {
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref c) = *guard
@@ -871,13 +947,12 @@ pub(crate) fn load_session_prompt_files_with_snapshot(
             return c.result.clone();
         }
     }
-
-    let result = load_prompt_files_uncached(workspace, &today, &yesterday);
+    let result = load_memory_uncached(workspace, today, yesterday);
     {
         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        *guard = Some(PromptCache {
+        *guard = Some(MemoryCache {
             workspace: workspace.to_path_buf(),
-            today,
+            today: today.to_string(),
             mtimes,
             result: result.clone(),
         });
@@ -885,58 +960,26 @@ pub(crate) fn load_session_prompt_files_with_snapshot(
     result
 }
 
+// ── Public interface ──────────────────────────────────────────────────────────
+
 #[derive(Clone)]
 pub(crate) struct PromptFiles {
     pub persona: String,
     pub memory: String,
 }
 
-fn load_prompt_files_uncached(workspace: &Path, today: &str, yesterday: &str) -> PromptFiles {
-    let bootstrap = read_nonempty(workspace.join(BOOTSTRAP_FILE));
+pub(crate) fn load_session_prompt_files_with_snapshot(
+    workspace: &Path,
+    snapshot: LocalTimeSnapshot,
+) -> PromptFiles {
+    maybe_complete_bootstrap(workspace);
 
-    if let Some(bs_content) = bootstrap {
-        // Bootstrap mode: first-run identity setup — no memory section
-        let mut parts = vec![format!("<!-- {BOOTSTRAP_FILE} -->\n{bs_content}")];
-        if let Some((name, agent)) = read_agent_prompt(workspace) {
-            parts.push(format!("<!-- {name} -->\n{agent}"));
-        }
-        return PromptFiles {
-            persona: parts.join("\n\n---\n\n"),
-            memory: String::new(),
-        };
-    }
-
-    // Normal mode: persona (stable) + memory (dynamic)
-    let mut persona_parts = Vec::new();
-    if let Some((name, content)) = read_agent_prompt(workspace) {
-        persona_parts.push(format!("<!-- {name} -->\n{content}"));
-    }
-
-    for name in &["IDENTITY.md", "USER.md", "SOUL.md"] {
-        if let Some(content) = read_nonempty(workspace.join(name)) {
-            persona_parts.push(format!("<!-- {name} -->\n{content}"));
-        }
-    }
-
-    let mut memory_parts = Vec::new();
-    if let Some(content) = read_nonempty(workspace.join("MEMORY.md")) {
-        memory_parts.push(format!("<!-- MEMORY.md -->\n{content}"));
-    }
-
-    // Daily memory budget: cap each day file to avoid unbounded prompt growth
-    const DAILY_MEMORY_CHAR_BUDGET: usize = 4000;
-
-    for date_str in &[today, yesterday] {
-        let path = workspace.join("memory").join(format!("{date_str}.md"));
-        if let Some(content) = read_nonempty(&path) {
-            let content = crate::truncate(&content, DAILY_MEMORY_CHAR_BUDGET);
-            memory_parts.push(format!("<!-- memory/{date_str}.md -->\n{content}"));
-        }
-    }
+    let today = snapshot.today();
+    let yesterday = snapshot.yesterday();
 
     PromptFiles {
-        persona: persona_parts.join("\n\n---\n\n"),
-        memory: memory_parts.join("\n\n---\n\n"),
+        persona: load_persona(workspace),
+        memory: load_memory(workspace, &today, &yesterday),
     }
 }
 
