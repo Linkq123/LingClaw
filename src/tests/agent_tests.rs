@@ -104,12 +104,153 @@ fn evaluate_finish_returns_correct_reasons() {
 }
 
 #[test]
+fn finish_gate_defers_action_oriented_plan_only_reply_once() {
+    let decision = evaluate_finish_with_gate(
+        true,
+        false,
+        &FinishGateContext {
+            cycles: 0,
+            total_tool_calls: 0,
+            has_observation_history: false,
+            latest_user_query: Some("optimize the repo performance and apply the changes"),
+            consecutive_errors: 0,
+            finish_deferred_once: false,
+            assistant_content: Some(
+                "I would start by reviewing the code and then optimize the hot path.",
+            ),
+        },
+    );
+
+    match decision {
+        FinishDecision::Defer(hint) => {
+            assert!(hint.contains("Finish Check"));
+            assert!(hint.contains("execution-oriented request"));
+        }
+        _ => panic!("expected finish deferral for action-oriented plan-only reply"),
+    }
+}
+
+#[test]
+fn finish_gate_allows_finish_after_single_deferral() {
+    let decision = evaluate_finish_with_gate(
+        true,
+        false,
+        &FinishGateContext {
+            cycles: 0,
+            total_tool_calls: 0,
+            has_observation_history: false,
+            latest_user_query: Some("optimize the repo performance and apply the changes"),
+            consecutive_errors: 0,
+            finish_deferred_once: true,
+            assistant_content: Some("Here is the best answer I can provide."),
+        },
+    );
+
+    assert!(matches!(
+        decision,
+        FinishDecision::Finish(FinishReason::Complete)
+    ));
+}
+
+#[test]
+fn finish_gate_does_not_defer_for_informational_file_question() {
+    let decision = evaluate_finish_with_gate(
+        true,
+        false,
+        &FinishGateContext {
+            cycles: 0,
+            total_tool_calls: 0,
+            has_observation_history: false,
+            latest_user_query: Some("what does main.rs do?"),
+            consecutive_errors: 0,
+            finish_deferred_once: false,
+            assistant_content: Some("main.rs wires together the CLI entrypoints and runtime."),
+        },
+    );
+
+    assert!(matches!(
+        decision,
+        FinishDecision::Finish(FinishReason::Complete)
+    ));
+}
+
+#[test]
+fn finish_gate_allows_brief_answer_for_simple_query_after_observation() {
+    let decision = evaluate_finish_with_gate(
+        true,
+        false,
+        &FinishGateContext {
+            cycles: 1,
+            total_tool_calls: 1,
+            has_observation_history: true,
+            latest_user_query: Some("which file sets the timeout?"),
+            consecutive_errors: 0,
+            finish_deferred_once: false,
+            assistant_content: Some("src/config.rs"),
+        },
+    );
+
+    assert!(matches!(
+        decision,
+        FinishDecision::Finish(FinishReason::Complete)
+    ));
+}
+
+#[test]
+fn finish_gate_still_defers_brief_answer_for_complex_query_after_observation() {
+    let decision = evaluate_finish_with_gate(
+        true,
+        false,
+        &FinishGateContext {
+            cycles: 1,
+            total_tool_calls: 2,
+            has_observation_history: true,
+            latest_user_query: Some("optimize the repo performance and apply the changes"),
+            consecutive_errors: 0,
+            finish_deferred_once: false,
+            assistant_content: Some("Done."),
+        },
+    );
+
+    match decision {
+        FinishDecision::Defer(hint) => {
+            assert!(hint.contains("Use it to produce a fuller result"));
+        }
+        _ => panic!("expected finish deferral for brief post-tool answer on complex query"),
+    }
+}
+
+#[test]
+fn finish_gate_does_not_treat_chinese_recommendation_as_uncertain() {
+    let decision = evaluate_finish_with_gate(
+        true,
+        false,
+        &FinishGateContext {
+            cycles: 1,
+            total_tool_calls: 0,
+            has_observation_history: false,
+            latest_user_query: Some("接下来怎么处理？"),
+            consecutive_errors: 2,
+            finish_deferred_once: false,
+            assistant_content: Some("建议先清理缓存，再重新运行命令并检查第一条报错。"),
+        },
+    );
+
+    assert!(matches!(
+        decision,
+        FinishDecision::Finish(FinishReason::Complete)
+    ));
+}
+
+#[test]
 fn auto_think_level_adapts_by_cycle() {
     // First round: medium (short message, no errors)
     assert_eq!(auto_think_level(0, false, 100, 0), "medium");
     assert_eq!(auto_think_level(0, true, 100, 0), "medium");
     // First round with complex message (>200 chars): high
     assert_eq!(auto_think_level(0, false, 250, 0), "high");
+    // Very large first-round request: xhigh
+    assert_eq!(auto_think_level(0, false, 650, 0), "xhigh");
     // Mid rounds with observation: high
     assert_eq!(auto_think_level(1, true, 100, 0), "high");
     assert_eq!(auto_think_level(5, true, 100, 0), "high");
@@ -129,6 +270,8 @@ fn auto_think_level_escalates_on_errors() {
     // Consecutive errors bump to high regardless of cycle
     assert_eq!(auto_think_level(3, false, 100, 2), "high");
     assert_eq!(auto_think_level(10, false, 100, 3), "high");
+    // Severe repeated failures get the deepest budget.
+    assert_eq!(auto_think_level(2, false, 100, 4), "xhigh");
     // Single error doesn't escalate
     assert_eq!(auto_think_level(6, false, 100, 1), "low");
 }
@@ -247,6 +390,8 @@ fn simple_query_rejects_complex() {
     assert!(!is_simple_query("debug this error message"));
     assert!(!is_simple_query("implement a binary search tree"));
     assert!(!is_simple_query("explain how async/await works in Rust"));
+    assert!(!is_simple_query("review the performance optimization plan"));
+    assert!(!is_simple_query("analyze this:\nfn main() {}"));
     assert!(!is_simple_query(&"a".repeat(200)));
     // Chinese complex keywords
     assert!(!is_simple_query("帮我实现一个排序算法"));

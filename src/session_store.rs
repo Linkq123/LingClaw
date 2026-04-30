@@ -1,7 +1,14 @@
+use serde::Serialize;
 use serde_json::json;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::SystemTime,
 };
 
 use crate::{
@@ -10,6 +17,120 @@ use crate::{
 };
 
 use super::{AppState, ChatMessage};
+
+#[derive(Clone)]
+struct PersistedSessionCacheEntry {
+    payload_hash: u64,
+    payload_len: usize,
+    file_mtime: Option<SystemTime>,
+    file_len: u64,
+}
+
+type PersistedSessionCacheLock = OnceLock<Mutex<HashMap<String, PersistedSessionCacheEntry>>>;
+static PERSISTED_SESSION_CACHE: PersistedSessionCacheLock = OnceLock::new();
+static SESSION_SAVE_WRITES: AtomicU64 = AtomicU64::new(0);
+static SESSION_SAVE_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+fn session_persist_cache() -> &'static Mutex<HashMap<String, PersistedSessionCacheEntry>> {
+    PERSISTED_SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn session_payload_hash(data: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    data.hash(&mut hasher);
+    hasher.finish()
+}
+
+async fn session_file_signature(path: &Path) -> Option<(Option<SystemTime>, u64)> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    Some((metadata.modified().ok(), metadata.len()))
+}
+
+fn should_skip_session_write(
+    session_id: &str,
+    payload_hash: u64,
+    payload_len: usize,
+    file_signature: Option<(Option<SystemTime>, u64)>,
+) -> bool {
+    let Some((file_mtime, file_len)) = file_signature else {
+        return false;
+    };
+    let guard = session_persist_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.get(session_id).is_some_and(|entry| {
+        entry.payload_hash == payload_hash
+            && entry.payload_len == payload_len
+            && entry.file_mtime == file_mtime
+            && entry.file_len == file_len
+    })
+}
+
+fn update_session_persist_cache(
+    session_id: &str,
+    payload_hash: u64,
+    payload_len: usize,
+    file_signature: Option<(Option<SystemTime>, u64)>,
+) {
+    let Some((file_mtime, file_len)) = file_signature else {
+        return;
+    };
+    let mut guard = session_persist_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard.insert(
+        session_id.to_string(),
+        PersistedSessionCacheEntry {
+            payload_hash,
+            payload_len,
+            file_mtime,
+            file_len,
+        },
+    );
+}
+
+#[derive(Serialize)]
+struct PersistedSessionView<'a> {
+    id: &'a str,
+    name: &'a str,
+    messages: Vec<ChatMessage>,
+    created_at: u64,
+    updated_at: u64,
+    tool_calls_count: usize,
+    input_tokens: u64,
+    output_tokens: u64,
+    daily_input_tokens: u64,
+    daily_output_tokens: u64,
+    input_token_source: &'a str,
+    output_token_source: &'a str,
+    token_usage_day: &'a str,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    daily_provider_usage: &'a HashMap<String, [u64; 2]>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    total_label_usage: &'a HashMap<String, [u64; 2]>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    usage_history: &'a Vec<crate::DailyUsageSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_override: Option<&'a str>,
+    think_level: &'a str,
+    show_react: bool,
+    show_tools: bool,
+    show_reasoning: bool,
+    #[serde(skip_serializing_if = "HashSet::is_empty")]
+    disabled_system_skills: &'a HashSet<String>,
+    #[serde(skip_serializing_if = "HashSet::is_empty")]
+    failed_tool_results: HashSet<String>,
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    subagent_snapshots: HashMap<String, crate::SubagentHistorySnapshot>,
+    version: u32,
+}
+
+pub(crate) fn session_persist_metrics() -> (u64, u64) {
+    (
+        SESSION_SAVE_WRITES.load(Ordering::Relaxed),
+        SESSION_SAVE_SKIPS.load(Ordering::Relaxed),
+    )
+}
 
 pub(crate) fn subagent_snapshot_storage_key(tool_call_id: &str, occurrence: usize) -> String {
     format!("{tool_call_id}@{occurrence}")
@@ -68,6 +189,13 @@ fn tool_messages_match(old_message: &ChatMessage, new_message: &ChatMessage) -> 
         && old_message.tool_call_id == new_message.tool_call_id
         && old_message.content == new_message.content
         && old_message.timestamp == new_message.timestamp
+}
+
+fn normalize_subagent_snapshots_for_messages(
+    messages: &[ChatMessage],
+    snapshots: &HashMap<String, crate::SubagentHistorySnapshot>,
+) -> HashMap<String, crate::SubagentHistorySnapshot> {
+    canonicalize_subagent_snapshots_for_messages(messages, snapshots)
 }
 
 pub(crate) fn remap_subagent_snapshots_for_message_rewrite(
@@ -132,11 +260,8 @@ pub(crate) fn remap_subagent_snapshots_for_message_rewrite(
 }
 
 pub(crate) fn normalize_subagent_snapshots(session: &mut Session) {
-    session.subagent_snapshots = remap_subagent_snapshots_for_message_rewrite(
-        &session.messages,
-        &session.messages,
-        &session.subagent_snapshots,
-    );
+    session.subagent_snapshots =
+        normalize_subagent_snapshots_for_messages(&session.messages, &session.subagent_snapshots);
 }
 
 pub(crate) fn replace_session_messages(session: &mut Session, new_messages: Vec<ChatMessage>) {
@@ -161,11 +286,19 @@ pub(crate) fn sessions_dir() -> PathBuf {
 pub(crate) async fn save_session_to_disk(session: &Session) -> Result<(), String> {
     let path = sessions_dir().join(format!("{}.json", session.id));
     let tmp_path = sessions_dir().join(format!("{}.json.tmp", session.id));
-    let mut session = session.clone();
-    sanitize_session_messages(&mut session.messages);
-    normalize_subagent_snapshots(&mut session);
-    retain_failed_tool_results(&mut session);
-    let data = serde_json::to_string(&session).map_err(|e| e.to_string())?;
+    let data = build_session_persist_payload(session)?;
+    let payload_hash = session_payload_hash(&data);
+    let payload_len = data.len();
+    if should_skip_session_write(
+        &session.id,
+        payload_hash,
+        payload_len,
+        session_file_signature(&path).await,
+    ) {
+        SESSION_SAVE_SKIPS.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+
     tokio::fs::write(&tmp_path, data)
         .await
         .map_err(|e| e.to_string())?;
@@ -185,6 +318,13 @@ pub(crate) async fn save_session_to_disk(session: &Session) -> Result<(), String
         let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(e.to_string());
     }
+    SESSION_SAVE_WRITES.fetch_add(1, Ordering::Relaxed);
+    update_session_persist_cache(
+        &session.id,
+        payload_hash,
+        payload_len,
+        session_file_signature(&path).await,
+    );
     Ok(())
 }
 
@@ -239,15 +379,57 @@ pub(crate) fn normalize_session(session: &mut Session) {
 }
 
 fn retain_failed_tool_results(session: &mut Session) {
-    let valid_ids: HashSet<&str> = session
-        .messages
+    retain_failed_tool_results_for_messages(&session.messages, &mut session.failed_tool_results);
+}
+
+fn retain_failed_tool_results_for_messages(
+    messages: &[ChatMessage],
+    failed_tool_results: &mut HashSet<String>,
+) {
+    let valid_ids: HashSet<&str> = messages
         .iter()
         .filter(|message| message.role == "tool")
         .filter_map(|message| message.tool_call_id.as_deref())
         .collect();
-    session
-        .failed_tool_results
-        .retain(|tool_id| valid_ids.contains(tool_id.as_str()));
+    failed_tool_results.retain(|tool_id| valid_ids.contains(tool_id.as_str()));
+}
+
+fn build_session_persist_payload(session: &Session) -> Result<String, String> {
+    let mut messages = session.messages.clone();
+    sanitize_session_messages(&mut messages);
+    let subagent_snapshots =
+        normalize_subagent_snapshots_for_messages(&messages, &session.subagent_snapshots);
+    let mut failed_tool_results = session.failed_tool_results.clone();
+    retain_failed_tool_results_for_messages(&messages, &mut failed_tool_results);
+
+    serde_json::to_string(&PersistedSessionView {
+        id: &session.id,
+        name: &session.name,
+        messages,
+        created_at: session.created_at,
+        updated_at: session.updated_at,
+        tool_calls_count: session.tool_calls_count,
+        input_tokens: session.input_tokens,
+        output_tokens: session.output_tokens,
+        daily_input_tokens: session.daily_input_tokens,
+        daily_output_tokens: session.daily_output_tokens,
+        input_token_source: &session.input_token_source,
+        output_token_source: &session.output_token_source,
+        token_usage_day: &session.token_usage_day,
+        daily_provider_usage: &session.daily_provider_usage,
+        total_label_usage: &session.total_label_usage,
+        usage_history: &session.usage_history,
+        model_override: session.model_override.as_deref(),
+        think_level: &session.think_level,
+        show_react: session.show_react,
+        show_tools: session.show_tools,
+        show_reasoning: session.show_reasoning,
+        disabled_system_skills: &session.disabled_system_skills,
+        failed_tool_results,
+        subagent_snapshots,
+        version: session.version,
+    })
+    .map_err(|e| e.to_string())
 }
 
 pub(crate) fn load_session_snapshot_from_path(path: &Path) -> Option<Session> {
@@ -406,11 +588,8 @@ pub(crate) fn build_history_payload_with_s3(
     s3_cfg: Option<&crate::config::S3Config>,
 ) -> serde_json::Value {
     let mut msgs = Vec::new();
-    let snapshot_lookup = remap_subagent_snapshots_for_message_rewrite(
-        &session.messages,
-        &session.messages,
-        &session.subagent_snapshots,
-    );
+    let snapshot_lookup =
+        normalize_subagent_snapshots_for_messages(&session.messages, &session.subagent_snapshots);
     let mut tool_occurrences: HashMap<String, usize> = HashMap::new();
     for msg in &session.messages {
         match msg.role.as_str() {
@@ -569,6 +748,9 @@ pub(crate) fn build_session_status(session: &Session, config: &Config) -> String
         .max_tokens
         .map(format_token_count)
         .unwrap_or_else(|| "-".into());
+    let (prompt_cache_hits, prompt_cache_misses) = super::system_prompt_cache_metrics();
+    let finish_deferrals = crate::agent::finish_gate_metrics();
+    let (session_save_writes, session_save_skips) = session_persist_metrics();
 
     format!(
         "agent: LingClaw\n\
@@ -582,7 +764,8 @@ pub(crate) fn build_session_status(session: &Session, config: &Config) -> String
          think: {}\n\
          react: {}\n\
          tools: {}\n\
-         reasoning: {}",
+         reasoning: {}\n\
+         runtime_metrics: prompt_cache={}/{} finish_deferrals={} session_saves(write/skip)={}/{}",
         resolved.provider.label(),
         resolved.api_base,
         resolved.model_id,
@@ -595,6 +778,11 @@ pub(crate) fn build_session_status(session: &Session, config: &Config) -> String
         if session.show_react { "on" } else { "off" },
         if session.show_tools { "on" } else { "off" },
         if session.show_reasoning { "on" } else { "off" },
+        prompt_cache_hits,
+        prompt_cache_misses,
+        finish_deferrals,
+        session_save_writes,
+        session_save_skips,
     )
 }
 

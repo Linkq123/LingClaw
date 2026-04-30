@@ -16,6 +16,9 @@
 // ══════════════════════════════════════════════════════════════════════════════
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static FINISH_GATE_DEFERRALS: AtomicU64 = AtomicU64::new(0);
 
 /// The four phases of the agent's ReAct-style decision cycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +288,167 @@ pub(crate) fn evaluate_finish(has_content: bool, has_tool_calls: bool) -> Option
     }
 }
 
+pub(crate) enum FinishDecision {
+    ContinueToAct,
+    Finish(FinishReason),
+    Defer(String),
+}
+
+pub(crate) struct FinishGateContext<'a> {
+    pub cycles: usize,
+    pub total_tool_calls: usize,
+    pub has_observation_history: bool,
+    pub latest_user_query: Option<&'a str>,
+    pub consecutive_errors: usize,
+    pub finish_deferred_once: bool,
+    pub assistant_content: Option<&'a str>,
+}
+
+pub(crate) fn evaluate_finish_with_gate(
+    has_content: bool,
+    has_tool_calls: bool,
+    context: &FinishGateContext<'_>,
+) -> FinishDecision {
+    let Some(reason) = evaluate_finish(has_content, has_tool_calls) else {
+        return FinishDecision::ContinueToAct;
+    };
+    if reason == FinishReason::Empty || context.finish_deferred_once {
+        return FinishDecision::Finish(reason);
+    }
+
+    if should_defer_finish(context) {
+        FINISH_GATE_DEFERRALS.fetch_add(1, Ordering::Relaxed);
+        return FinishDecision::Defer(build_finish_gate_hint(context));
+    }
+
+    FinishDecision::Finish(reason)
+}
+
+pub(crate) fn finish_gate_metrics() -> u64 {
+    FINISH_GATE_DEFERRALS.load(Ordering::Relaxed)
+}
+
+fn should_defer_finish(context: &FinishGateContext<'_>) -> bool {
+    if context.total_tool_calls == 0
+        && context.cycles == 0
+        && query_requires_action(context.latest_user_query)
+    {
+        return true;
+    }
+
+    if context.consecutive_errors >= 2 && response_seems_uncertain(context.assistant_content) {
+        return true;
+    }
+
+    should_defer_brief_observation_answer(context)
+}
+
+fn build_finish_gate_hint(context: &FinishGateContext<'_>) -> String {
+    let mut lines = vec![
+        "## Finish Check".to_string(),
+        "Before finishing, verify that the user's task is genuinely complete.".to_string(),
+    ];
+
+    if context.total_tool_calls == 0 && query_requires_action(context.latest_user_query) {
+        lines.push(
+            "This looks like an execution-oriented request. Inspect the repo, run the needed tools, or make the required change before wrapping up.".to_string(),
+        );
+    }
+
+    if context.consecutive_errors >= 2 {
+        lines.push(
+            "Recent tool errors suggest the current answer may still be incomplete. Re-check whether a different tool or smaller next step would resolve the remaining gap.".to_string(),
+        );
+    }
+
+    if should_defer_brief_observation_answer(context) {
+        lines.push(
+            "You already gathered evidence. Use it to produce a fuller result or confirm what is still missing.".to_string(),
+        );
+    }
+
+    lines.join("\n")
+}
+
+fn query_requires_action(query: Option<&str>) -> bool {
+    let Some(query) = query else {
+        return false;
+    };
+    let lower = query.to_ascii_lowercase();
+    [
+        "implement",
+        "fix",
+        "modify",
+        "edit",
+        "optimize",
+        "performance",
+        "benchmark",
+        "profile",
+        "diagnose",
+        "investigate",
+        "review",
+        "inspect",
+        "analyze code",
+        "refactor",
+        "test",
+        "run",
+        "measure",
+        "repo",
+        "codebase",
+        "file",
+        "实现",
+        "修改",
+        "优化",
+        "性能",
+        "基准",
+        "排查",
+        "诊断",
+        "评审",
+        "检查代码",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn response_seems_uncertain(content: Option<&str>) -> bool {
+    let Some(content) = content else {
+        return false;
+    };
+    let lower = content.to_ascii_lowercase();
+    [
+        "maybe",
+        "might",
+        "could",
+        "perhaps",
+        "not sure",
+        "unable to verify",
+        "cannot verify",
+        "可能",
+        "也许",
+        "不确定",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn should_defer_brief_observation_answer(context: &FinishGateContext<'_>) -> bool {
+    let simple_query = context
+        .latest_user_query
+        .map(is_simple_query)
+        .unwrap_or(false);
+
+    context.has_observation_history
+        && context.total_tool_calls > 0
+        && response_is_too_brief(context.assistant_content)
+        && !simple_query
+}
+
+fn response_is_too_brief(content: Option<&str>) -> bool {
+    content
+        .map(|content| content.chars().count() < 120)
+        .unwrap_or(true)
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 //  Hook System — lifecycle extension points
 // ──────────────────────────────────────────────────────────────────────────────
@@ -354,14 +518,22 @@ pub(crate) fn auto_think_level(
     user_msg_chars: usize,
     consecutive_errors: usize,
 ) -> &'static str {
+    if consecutive_errors >= 4 {
+        return "xhigh";
+    }
     // Consecutive tool failures: escalate to deeper thinking
     if consecutive_errors >= 2 {
         return "high";
     }
 
-    // Complex user request on first cycle: start with higher budget
-    if cycles == 0 && user_msg_chars > 200 {
-        return "high";
+    // Very large first-turn requests usually need a deeper initial pass.
+    if cycles == 0 {
+        if user_msg_chars > 600 {
+            return "xhigh";
+        }
+        if user_msg_chars > 220 {
+            return "high";
+        }
     }
 
     match (cycles, has_observation) {
@@ -404,7 +576,18 @@ pub(crate) fn is_simple_query(query: &str) -> bool {
     if query.chars().count() > MAX_SIMPLE_CHARS {
         return false;
     }
+    if query.contains('\n') {
+        return false;
+    }
     let lower = query.to_ascii_lowercase();
+    if [
+        "```", "`", "{", "}", "=>", "::", ".rs", ".py", ".ts", ".tsx",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        return false;
+    }
     const COMPLEX_KEYWORDS: &[&str] = &[
         "code",
         "implement",
@@ -422,8 +605,19 @@ pub(crate) fn is_simple_query(query: &str) -> bool {
         "explain",
         "analyze",
         "compare",
+        "review",
+        "optimize",
+        "performance",
+        "latency",
+        "memory",
+        "context",
+        "strategy",
+        "plan",
         "design",
         "architect",
+        "diagnose",
+        "investigate",
+        "benchmark",
         "write",
         "create",
         "build",

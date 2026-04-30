@@ -197,6 +197,10 @@ struct AgentPhaseState {
     collected_results: Vec<agent::ToolResultEntry>,
     cycle_workspace: PathBuf,
     last_observation_hint: Option<String>,
+    finish_gate_hint: Option<String>,
+    finish_gate_deferred_once: bool,
+    last_observation_summary_count: usize,
+    last_consecutive_tool_errors: usize,
     pending_interventions: Vec<String>,
     react_ctx: agent::AgentLoopCtx,
     shutting_down: bool,
@@ -223,6 +227,7 @@ struct AnalyzeSnapshot {
     pruned_count: usize,
     /// Character count of latest user message, for complexity-aware think level.
     user_msg_chars: usize,
+    latest_query: Option<String>,
 }
 
 enum ToolRunState {
@@ -531,7 +536,7 @@ async fn prepare_analyze_snapshot(
         context_has_images,
     );
 
-    let mut fresh_system = build_system_prompt_with_query(
+    let mut fresh_system = build_system_prompt_with_query_cached(
         &config,
         &session.workspace,
         &model_str,
@@ -545,6 +550,10 @@ async fn prepare_analyze_snapshot(
     // - Finish nudge for deep loops
     if let Some(ref mut content) = fresh_system.content {
         if let Some(hint) = phase_state.last_observation_hint.take() {
+            content.push_str("\n\n");
+            content.push_str(&hint);
+        }
+        if let Some(hint) = phase_state.finish_gate_hint.take() {
             content.push_str("\n\n");
             content.push_str(&hint);
         }
@@ -583,6 +592,7 @@ async fn prepare_analyze_snapshot(
         think_level: session.think_level.clone(),
         pruned_count,
         user_msg_chars,
+        latest_query,
     })
 }
 
@@ -726,11 +736,21 @@ pub(crate) async fn build_runtime_tools(
         extra_tools.push(orchestrate_def);
     }
 
-    let mut mcp_tools = match provider {
-        Provider::Anthropic => tools::mcp::tool_definitions_anthropic(config, workspace).await,
-        Provider::OpenAI => tools::mcp::tool_definitions_openai(config, workspace).await,
-        Provider::Ollama => tools::mcp::tool_definitions_ollama(config, workspace).await,
-        Provider::Gemini => tools::mcp::tool_definitions_gemini(config, workspace).await,
+    let (cached_servers, enabled_servers) = tools::mcp::cached_server_counts(config, workspace);
+    let mut mcp_tools = match (enabled_servers > 0, cached_servers == enabled_servers) {
+        (false, _) => Vec::new(),
+        (true, true) => match provider {
+            Provider::Anthropic => tools::mcp::cached_tool_definitions_anthropic(config, workspace),
+            Provider::OpenAI => tools::mcp::cached_tool_definitions_openai(config, workspace),
+            Provider::Ollama => tools::mcp::cached_tool_definitions_ollama(config, workspace),
+            Provider::Gemini => tools::mcp::cached_tool_definitions_gemini(config, workspace),
+        },
+        (true, false) => match provider {
+            Provider::Anthropic => tools::mcp::tool_definitions_anthropic(config, workspace).await,
+            Provider::OpenAI => tools::mcp::tool_definitions_openai(config, workspace).await,
+            Provider::Ollama => tools::mcp::tool_definitions_ollama(config, workspace).await,
+            Provider::Gemini => tools::mcp::tool_definitions_gemini(config, workspace).await,
+        },
     };
     extra_tools.append(&mut mcp_tools);
     extra_tools
@@ -787,17 +807,39 @@ async fn advance_after_llm_response(
     live_tx: &LiveTx,
     phase_state: &mut AgentPhaseState,
     message: &ChatMessage,
+    latest_query: Option<&str>,
 ) {
     let has_content = message.has_nonempty_content();
     let has_tools = message.has_tool_calls();
 
-    if let Some(reason) = agent::evaluate_finish(has_content, has_tools) {
-        phase_state.react_ctx.transition_to_finish(reason);
-        send_react_phase_event(live_tx, &phase_state.react_ctx, "finish").await;
-    } else {
-        phase_state.pending_tool_calls = message.tool_calls.clone().unwrap_or_default();
-        phase_state.react_ctx.transition_to_act();
-        send_react_phase_event(live_tx, &phase_state.react_ctx, "act").await;
+    match agent::evaluate_finish_with_gate(
+        has_content,
+        has_tools,
+        &agent::FinishGateContext {
+            cycles: phase_state.react_ctx.cycles,
+            total_tool_calls: phase_state.react_ctx.tool_calls,
+            has_observation_history: phase_state.last_observation_summary_count > 0,
+            latest_user_query: latest_query,
+            consecutive_errors: phase_state.last_consecutive_tool_errors,
+            finish_deferred_once: phase_state.finish_gate_deferred_once,
+            assistant_content: message.content.as_deref(),
+        },
+    ) {
+        agent::FinishDecision::ContinueToAct => {
+            phase_state.pending_tool_calls = message.tool_calls.clone().unwrap_or_default();
+            phase_state.react_ctx.transition_to_act();
+            send_react_phase_event(live_tx, &phase_state.react_ctx, "act").await;
+        }
+        agent::FinishDecision::Finish(reason) => {
+            phase_state.finish_gate_deferred_once = false;
+            phase_state.react_ctx.transition_to_finish(reason);
+            send_react_phase_event(live_tx, &phase_state.react_ctx, "finish").await;
+        }
+        agent::FinishDecision::Defer(hint) => {
+            phase_state.finish_gate_deferred_once = true;
+            phase_state.finish_gate_hint = Some(hint);
+            send_react_phase_event(live_tx, &phase_state.react_ctx, "analyze").await;
+        }
     }
     phase_state.round += 1;
 }
@@ -809,6 +851,7 @@ async fn apply_llm_response(
     provider_name: String,
     usage_role: &'static str,
     request_input_estimate: u64,
+    latest_query: Option<&str>,
     resp: providers::LlmResponse,
 ) {
     update_llm_response_usage(
@@ -821,7 +864,7 @@ async fn apply_llm_response(
     )
     .await;
     persist_assistant_message(ctx, &resp.message).await;
-    advance_after_llm_response(ctx.live_tx, phase_state, &resp.message).await;
+    advance_after_llm_response(ctx.live_tx, phase_state, &resp.message, latest_query).await;
 }
 
 async fn execute_tool(
@@ -1799,6 +1842,7 @@ async fn run_analyze_phase(
                 provider_name,
                 snapshot.usage_role,
                 request_estimate as u64,
+                snapshot.latest_query.as_deref(),
                 resp,
             )
             .await;
@@ -2052,6 +2096,9 @@ async fn run_observe_phase(
         .rev()
         .take_while(|r| r.is_error)
         .count();
+    phase_state.last_observation_summary_count = summaries.len();
+    phase_state.last_consecutive_tool_errors = consecutive_errors;
+    phase_state.finish_gate_deferred_once = false;
     phase_state.last_observation_hint =
         agent::build_observation_context_hint(&summaries, consecutive_errors);
     phase_state.collected_results.clear();
@@ -2336,6 +2383,10 @@ pub(crate) async fn run_agent_session(
         collected_results: Vec::new(),
         cycle_workspace: PathBuf::new(),
         last_observation_hint: None,
+        finish_gate_hint: None,
+        finish_gate_deferred_once: false,
+        last_observation_summary_count: 0,
+        last_consecutive_tool_errors: 0,
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(show_react),
         shutting_down: false,

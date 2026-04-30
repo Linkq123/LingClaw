@@ -14,10 +14,11 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -98,6 +99,40 @@ pub(crate) const MAIN_SESSION_ID: &str = "main";
 const INBOUND_BUFFER_CAPACITY: usize = 128;
 static CONFIG_FILE_LOCK: std::sync::LazyLock<tokio::sync::RwLock<()>> =
     std::sync::LazyLock::new(|| tokio::sync::RwLock::new(()));
+static SYSTEM_PROMPT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_PROMPT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+const SYSTEM_PROMPT_CACHE_MAX_ENTRIES: usize = 64;
+
+type SystemPromptCacheLock =
+    OnceLock<std::sync::Mutex<HashMap<SystemPromptStaticCacheKey, String>>>;
+static SYSTEM_PROMPT_STATIC_CACHE: SystemPromptCacheLock = OnceLock::new();
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SystemPromptStaticCacheKey {
+    workspace: PathBuf,
+    query: Option<String>,
+    disabled_skills_hash: u64,
+    persona_hash: u64,
+    tool_lines_hash: u64,
+    mcp_note_hash: u64,
+    skills_hash: u64,
+    agents_hash: u64,
+}
+
+const PROMPT_FILE_NOTE: &str = "## Preloaded Prompt Files\n\
+These prompt-file contents were already loaded into this system prompt from the session workspace.\n\
+Do not call file tools just to verify or re-read BOOTSTRAP.md, AGENTS.md, AGENT.md, IDENTITY.md, USER.md, or SOUL.md when their content is already present below.\n\
+Only read those files if the user explicitly asks to inspect them, if you need to edit them, or if a task depends on checking whether the on-disk file has changed.";
+
+const AGENT_BEHAVIOR_SECTION: &str = "## Agent Behavior
+
+You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools, **Observe** the results, then either loop or **Finish**.
+
+- **Tool strategy:** Prefer calling tools to gather information over speculating. Batch independent read-only calls together. Run write operations one at a time.
+- **Error recovery:** When a tool fails, diagnose the cause and try a different approach - different arguments, a different tool, or an alternative path. Do not repeat the same failing call.
+- **Delegation:** For complex, self-contained subtasks, delegate to a sub-agent via the `task` tool. Handle simple, quick work yourself.
+- **Finishing:** When the task is complete, deliver your result. When you are genuinely stuck with no further options, say so honestly. Do not pad with speculative follow-ups.";
 
 // ── Data Models ──────────────────────────────────────────────────────────────
 
@@ -633,9 +668,96 @@ fn build_system_prompt(
     model: &str,
     disabled_system_skills: &HashSet<String>,
 ) -> ChatMessage {
-    build_system_prompt_with_query(config, workspace, model, disabled_system_skills, None)
+    build_system_prompt_with_query_cached(config, workspace, model, disabled_system_skills, None)
 }
 
+fn hash_prompt_part<T: Hash>(value: &T) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_disabled_system_skills(disabled_system_skills: &HashSet<String>) -> u64 {
+    let mut items: Vec<&str> = disabled_system_skills.iter().map(String::as_str).collect();
+    items.sort_unstable();
+    hash_prompt_part(&items)
+}
+
+fn build_system_prompt_static_prefix_cached(
+    workspace: &Path,
+    current_query: Option<&str>,
+    disabled_system_skills: &HashSet<String>,
+    persona: &str,
+    tool_lines: &str,
+    mcp_note: &str,
+    skills_section: &str,
+    agents_section: &str,
+) -> String {
+    let query = current_query
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(ToOwned::to_owned);
+    let disabled_skills_hash = hash_disabled_system_skills(disabled_system_skills);
+    let persona_hash = hash_prompt_part(&persona);
+    let tool_lines_hash = hash_prompt_part(&tool_lines);
+    let mcp_note_hash = hash_prompt_part(&mcp_note);
+    let skills_hash = hash_prompt_part(&skills_section);
+    let agents_hash = hash_prompt_part(&agents_section);
+    let key = SystemPromptStaticCacheKey {
+        workspace: workspace.to_path_buf(),
+        query,
+        disabled_skills_hash,
+        persona_hash,
+        tool_lines_hash,
+        mcp_note_hash,
+        skills_hash,
+        agents_hash,
+    };
+    let cache = SYSTEM_PROMPT_STATIC_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(stable_prefix) = guard.get(&key) {
+            SYSTEM_PROMPT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return stable_prefix.clone();
+        }
+    }
+
+    SYSTEM_PROMPT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    let stable_prefix = format!(
+        r#"{persona}
+
+{prompt_file_note}
+
+{agent_behavior_section}
+
+## Available Tools
+{tool_lines}{mcp_note}{skills_section}{agents_section}"#,
+        persona = persona,
+        prompt_file_note = PROMPT_FILE_NOTE,
+        agent_behavior_section = AGENT_BEHAVIOR_SECTION,
+        tool_lines = tool_lines,
+        mcp_note = mcp_note,
+        skills_section = skills_section,
+        agents_section = agents_section,
+    );
+
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.len() >= SYSTEM_PROMPT_CACHE_MAX_ENTRIES {
+        guard.clear();
+    }
+    guard.insert(key, stable_prefix.clone());
+    stable_prefix
+}
+
+pub(crate) fn system_prompt_cache_metrics() -> (u64, u64) {
+    (
+        SYSTEM_PROMPT_CACHE_HITS.load(Ordering::Relaxed),
+        SYSTEM_PROMPT_CACHE_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+#[allow(dead_code)] // Legacy builder retained for compatibility with older tests/helpers.
 fn build_system_prompt_with_query(
     config: &Config,
     workspace: &Path,
@@ -653,14 +775,10 @@ fn build_system_prompt_with_query(
     let cwd = workspace.display();
     let local_snapshot = prompts::current_local_snapshot();
     let local_time = local_snapshot.datetime_label();
-    let tool_lines = tools::render_tool_prompt_lines(config);
+    let tool_lines = tools::render_tool_prompt_lines_with_query(config, current_query);
     let prompt_files = prompts::load_session_prompt_files_with_snapshot(workspace, local_snapshot);
     let persona = prompt_files.persona;
     let memory_files = prompt_files.memory;
-    let prompt_file_note = "## Preloaded Prompt Files\n\
-These prompt-file contents were already loaded into this system prompt from the session workspace.\n\
-Do not call file tools just to verify or re-read BOOTSTRAP.md, AGENTS.md, AGENT.md, IDENTITY.md, USER.md, or SOUL.md when their content is already present below.\n\
-Only read those files if the user explicitly asks to inspect them, if you need to edit them, or if a task depends on checking whether the on-disk file has changed.";
     let mcp_note = tools::mcp::runtime_tool_note(config)
         .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
         .unwrap_or_default();
@@ -696,7 +814,7 @@ Only read those files if the user explicitly asks to inspect them, if you need t
     // Sub-agent catalog (discovered from system/global/session layers)
     let agents_section = {
         let agents = subagents::discovery::discover_all_agents(workspace);
-        subagents::render_agents_catalog(&agents)
+        subagents::render_agents_catalog_with_query(&agents, current_query)
             .map(|s| format!("\n\n{s}"))
             .unwrap_or_default()
     };
@@ -733,7 +851,7 @@ You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools
         local_time = local_time,
         tool_lines = tool_lines,
         persona = persona,
-        prompt_file_note = prompt_file_note,
+        prompt_file_note = PROMPT_FILE_NOTE,
         mcp_note = mcp_note,
         skills_section = skills_section,
         memory_files = memory_files,
@@ -754,6 +872,109 @@ You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools
 }
 
 // ── Security ─────────────────────────────────────────────────────────────────────────────
+
+fn build_system_prompt_with_query_cached(
+    config: &Config,
+    workspace: &Path,
+    model: &str,
+    disabled_system_skills: &HashSet<String>,
+    current_query: Option<&str>,
+) -> ChatMessage {
+    let os_name = if cfg!(windows) {
+        "Windows"
+    } else if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "Linux"
+    };
+    let cwd = workspace.display();
+    let local_snapshot = prompts::current_local_snapshot();
+    let local_time = local_snapshot.datetime_label();
+    let tool_lines = tools::render_tool_prompt_lines_with_query(config, current_query);
+    let prompt_files = prompts::load_session_prompt_files_with_snapshot(workspace, local_snapshot);
+    let persona = prompt_files.persona;
+    let memory_files = prompt_files.memory;
+    let mcp_note = tools::mcp::runtime_tool_note(config)
+        .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
+        .unwrap_or_default();
+
+    let skills_section = prompts::discover_all_skills(workspace);
+    let skills_section: Vec<_> = if disabled_system_skills.is_empty() {
+        skills_section
+    } else {
+        skills_section
+            .into_iter()
+            .filter(|s| {
+                s.source != prompts::SkillSource::System
+                    || !prompts::is_system_skill_disabled(&s.path, disabled_system_skills)
+            })
+            .collect()
+    };
+    let skills_section = prompts::render_skills_catalog(&skills_section, current_query)
+        .map(|s| format!("\n\n{s}"))
+        .unwrap_or_default();
+
+    let structured_memory_section = if config.structured_memory {
+        memory::format_memory_for_injection(
+            &memory::load_structured_memory(workspace),
+            current_query,
+        )
+        .map(|s| format!("\n\n{s}"))
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let agents_section = {
+        let agents = subagents::discovery::discover_all_agents(workspace);
+        subagents::render_agents_catalog_with_query(&agents, current_query)
+            .map(|s| format!("\n\n{s}"))
+            .unwrap_or_default()
+    };
+
+    let stable_prefix = build_system_prompt_static_prefix_cached(
+        workspace,
+        current_query,
+        disabled_system_skills,
+        &persona,
+        &tool_lines,
+        &mcp_note,
+        &skills_section,
+        &agents_section,
+    );
+    let prompt = format!(
+        r#"{stable_prefix}
+
+---
+## Memory
+{memory_files}{structured_memory_section}
+
+## Environment
+- OS: {os_name}
+- Current system local time: {local_time}
+- Working directory: {cwd}
+- Model: {model}"#, // The `---\n## Memory\n` prefix above is used as the cache-split
+        // delimiter by ENV_BLOCK_DELIMITER in providers.rs - keep them in sync.
+        stable_prefix = stable_prefix,
+        memory_files = memory_files,
+        structured_memory_section = structured_memory_section,
+        os_name = os_name,
+        local_time = local_time,
+        cwd = cwd,
+        model = model,
+    );
+
+    ChatMessage {
+        role: "system".into(),
+        content: Some(prompt),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }
+}
 
 const DANGEROUS_PATTERNS: &[&str] = &[
     "rm -rf /",

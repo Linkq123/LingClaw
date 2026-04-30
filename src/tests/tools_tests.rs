@@ -270,3 +270,15 @@ fn validate_tool_args_rejects_non_array_for_array_type() {
         .expect("string should be rejected for array type");
     assert!(err.contains("must be an array"));
 }
+
+#[test]
+fn render_tool_prompt_lines_with_query_compresses_irrelevant_tools() {
+    let rendered = render_tool_prompt_lines_with_query(
+        &test_config(),
+        Some("benchmark and profile build performance"),
+    );
+
+    assert!(rendered.contains("**exec**"));
+    assert!(rendered.contains("**think**"));
+    assert!(rendered.contains("Other available tools:"));
+}

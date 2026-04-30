@@ -68,6 +68,46 @@ fn test_save_and_load_structured_memory() {
 }
 
 #[test]
+fn test_load_structured_memory_refreshes_cache_after_external_write() {
+    let dir = std::env::temp_dir().join("lingclaw_test_memory_cache_refresh");
+    let _ = std::fs::create_dir_all(&dir);
+
+    let original = StructuredMemory {
+        user_context: Some("original".to_string()),
+        facts: vec![MemoryFact {
+            key: "lang".to_string(),
+            value: "Rust".to_string(),
+            recorded_at: 1000,
+        }],
+        updated_at: 1000,
+    };
+    save_structured_memory(&dir, &original).unwrap();
+    let loaded = load_structured_memory(&dir);
+    assert_eq!(loaded.user_context.as_deref(), Some("original"));
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    let updated = StructuredMemory {
+        user_context: Some("updated".to_string()),
+        facts: vec![MemoryFact {
+            key: "lang".to_string(),
+            value: "Go".to_string(),
+            recorded_at: 2000,
+        }],
+        updated_at: 2000,
+    };
+    let path = dir.join("structured_memory.json");
+    let data = serde_json::to_string_pretty(&updated).unwrap();
+    std::fs::write(&path, data).unwrap();
+
+    let refreshed = load_structured_memory(&dir);
+    assert_eq!(refreshed.user_context.as_deref(), Some("updated"));
+    assert_eq!(refreshed.facts[0].value, "Go");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_load_missing_returns_default() {
     let dir = PathBuf::from("/nonexistent/path/lingclaw_test_missing");
     let mem = load_structured_memory(&dir);
@@ -669,6 +709,79 @@ fn test_merge_same_value_is_noop() {
 }
 
 #[test]
+fn test_merge_normalizes_fact_keys_before_update() {
+    let mut mem = StructuredMemory {
+        user_context: None,
+        facts: vec![MemoryFact {
+            key: "preferred_language".into(),
+            value: "Rust".into(),
+            recorded_at: 100,
+        }],
+        updated_at: 100,
+    };
+    let raw: serde_json::Value = serde_json::from_str(
+        r#"{"update_facts": [{"key": "Preferred Language", "value": "Go"}], "delete_facts": []}"#,
+    )
+    .unwrap();
+
+    merge_llm_response_into_memory(&mut mem, &raw, 200);
+
+    assert_eq!(mem.facts.len(), 1);
+    assert_eq!(mem.facts[0].key, "preferred_language");
+    assert_eq!(mem.facts[0].value, "Go");
+}
+
+#[test]
+fn test_merge_normalizes_delete_fact_keys() {
+    let mut mem = StructuredMemory {
+        user_context: None,
+        facts: vec![MemoryFact {
+            key: "preferred_language".into(),
+            value: "Rust".into(),
+            recorded_at: 100,
+        }],
+        updated_at: 100,
+    };
+    let raw: serde_json::Value =
+        serde_json::from_str(r#"{"update_facts": [], "delete_facts": ["Preferred Language"]}"#)
+            .unwrap();
+
+    merge_llm_response_into_memory(&mut mem, &raw, 200);
+
+    assert!(mem.facts.is_empty());
+}
+
+#[test]
+fn test_merge_dedupes_equivalent_fact_keys() {
+    let mut mem = StructuredMemory {
+        user_context: None,
+        facts: vec![
+            MemoryFact {
+                key: "Preferred Language".into(),
+                value: "Rust".into(),
+                recorded_at: 100,
+            },
+            MemoryFact {
+                key: "preferred_language".into(),
+                value: "Go".into(),
+                recorded_at: 200,
+            },
+        ],
+        updated_at: 200,
+    };
+
+    merge_llm_response_into_memory(
+        &mut mem,
+        &serde_json::from_str(r#"{"update_facts": [], "delete_facts": []}"#).unwrap(),
+        300,
+    );
+
+    assert_eq!(mem.facts.len(), 1);
+    assert_eq!(mem.facts[0].key, "preferred_language");
+    assert_eq!(mem.facts[0].value, "Go");
+}
+
+#[test]
 fn test_format_memory_query_aware_sorting() {
     let mem = StructuredMemory {
         user_context: None,
@@ -756,4 +869,93 @@ fn test_query_aware_sorting_with_cjk_query() {
         lang_pos < food_pos,
         "CJK query should rank matching fact higher"
     );
+}
+
+#[test]
+fn test_format_memory_for_injection_limits_irrelevant_facts_with_query() {
+    let mut facts = vec![MemoryFact {
+        key: "language".into(),
+        value: "uses Rust primarily".into(),
+        recorded_at: 100,
+    }];
+    for idx in 0..12 {
+        facts.push(MemoryFact {
+            key: format!("irrelevant_{idx}"),
+            value: "miscellaneous note".into(),
+            recorded_at: 2000 + idx,
+        });
+    }
+    let mem = StructuredMemory {
+        user_context: None,
+        facts,
+        updated_at: 4000,
+    };
+
+    let result = format_memory_for_injection(&mem, Some("How do I compile Rust?")).unwrap();
+    let fact_lines = result
+        .lines()
+        .filter(|line| line.starts_with("- **"))
+        .count();
+
+    assert!(result.contains("language"));
+    assert!(
+        fact_lines <= 4,
+        "query-aware injection should keep relevant facts plus a small fallback set"
+    );
+}
+
+#[test]
+fn test_format_memory_for_injection_limits_recent_facts_without_query() {
+    let facts = (0..12)
+        .map(|idx| MemoryFact {
+            key: format!("fact_{idx}"),
+            value: format!("value_{idx}"),
+            recorded_at: idx as u64,
+        })
+        .collect();
+    let mem = StructuredMemory {
+        user_context: None,
+        facts,
+        updated_at: 12,
+    };
+
+    let result = format_memory_for_injection(&mem, None).unwrap();
+    let fact_lines = result
+        .lines()
+        .filter(|line| line.starts_with("- **"))
+        .count();
+
+    assert_eq!(fact_lines, 8);
+    assert!(result.contains("fact_11"));
+    assert!(!result.contains("fact_0"));
+}
+
+#[test]
+fn test_format_memory_for_injection_skips_fallback_when_relevant_facts_fill_cap() {
+    let mut facts: Vec<MemoryFact> = (0..9)
+        .map(|idx| MemoryFact {
+            key: format!("language_{idx}"),
+            value: "rust workspace".into(),
+            recorded_at: 100 + idx as u64,
+        })
+        .collect();
+    facts.extend((0..4).map(|idx| MemoryFact {
+        key: format!("irrelevant_{idx}"),
+        value: "miscellaneous note".into(),
+        recorded_at: 1000 + idx as u64,
+    }));
+    let mem = StructuredMemory {
+        user_context: None,
+        facts,
+        updated_at: 2000,
+    };
+
+    let result = format_memory_for_injection(&mem, Some("rust workspace")).unwrap();
+    let fact_lines = result
+        .lines()
+        .filter(|line| line.starts_with("- **"))
+        .count();
+
+    assert_eq!(fact_lines, 8);
+    assert!(!result.contains("irrelevant_"));
 }

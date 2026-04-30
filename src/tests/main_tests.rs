@@ -1096,6 +1096,88 @@ fn build_history_payload_includes_subagent_snapshot_on_task_results() {
 }
 
 #[test]
+fn build_history_payload_normalizes_legacy_subagent_snapshot_keys() {
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![crate::ToolCall {
+                    id: "task_call_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "task".into(),
+                        arguments: r#"{"agent":"reviewer","prompt":"Inspect logs"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(1000),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("Found the issue in the logs.".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: Some("task_call_1".into()),
+                timestamp: Some(1001),
+            },
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::from([(
+            "task_call_1".to_string(),
+            SubagentHistorySnapshot {
+                result_excerpt: Some("Found the issue in the logs.".into()),
+                success: true,
+                ..Default::default()
+            },
+        )]),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let payload = build_history_payload(&session);
+    let msgs = payload["messages"]
+        .as_array()
+        .expect("history messages should be an array");
+    let tool_result = msgs
+        .iter()
+        .find(|message| message["role"] == "tool_result" && message["id"] == "task_call_1")
+        .expect("task tool_result should be present");
+
+    assert_eq!(
+        tool_result["subagent_snapshot"]["result_excerpt"].as_str(),
+        Some("Found the issue in the logs.")
+    );
+}
+
+#[test]
 fn build_history_payload_distinguishes_repeated_task_tool_call_ids() {
     let first_snapshot = SubagentHistorySnapshot {
         result_excerpt: Some("First delegated result".into()),
@@ -2375,6 +2457,44 @@ fn build_session_status_reports_resolved_target() {
 }
 
 #[test]
+fn build_system_prompt_uses_cached_static_prefix_on_repeat_query() {
+    let workspace = std::env::temp_dir().join(format!("lingclaw-prompt-cache-{}", now_epoch()));
+    let _ = std::fs::create_dir_all(&workspace);
+    prompts::ensure_session_workspace(&workspace);
+    let config = test_config();
+    let disabled = std::collections::HashSet::new();
+    let before = system_prompt_cache_metrics();
+
+    let _ = build_system_prompt_with_query_cached(
+        &config,
+        &workspace,
+        &config.model,
+        &disabled,
+        Some("review the performance optimization plan"),
+    );
+    let middle = system_prompt_cache_metrics();
+    let _ = build_system_prompt_with_query_cached(
+        &config,
+        &workspace,
+        &config.model,
+        &disabled,
+        Some("review the performance optimization plan"),
+    );
+    let after = system_prompt_cache_metrics();
+
+    assert!(
+        middle.1 >= before.1 + 1,
+        "first render should miss the prompt cache"
+    );
+    assert!(
+        after.0 >= middle.0 + 1,
+        "second render should hit the prompt cache"
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
 fn format_token_count_uses_k_and_m_units() {
     assert_eq!(format_token_count(999), "999");
     assert_eq!(format_token_count(1_200), "1.2K");
@@ -3019,6 +3139,91 @@ fn save_session_to_disk_overwrites_existing_file() {
         .map(PathBuf::from)
         .expect("session dir should exist");
     let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn save_session_to_disk_skips_identical_payload_rewrite() {
+    let session_id = format!("skip-identical-save-{}", now_epoch());
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let workspace = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+
+    let session = Session {
+        id: session_id,
+        name: "Stable".into(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("system".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+            ChatMessage {
+                role: "user".into(),
+                content: Some("hello".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: Some(1),
+            },
+        ],
+        created_at: 1,
+        updated_at: 1,
+        tool_calls_count: 0,
+        input_tokens: 12,
+        output_tokens: 34,
+        daily_input_tokens: 12,
+        daily_output_tokens: 34,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: true,
+        show_tools: true,
+        show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
+        version: SESSION_VERSION,
+        workspace,
+    };
+
+    runtime
+        .block_on(save_session_to_disk(&session))
+        .expect("first save should succeed");
+    let first_modified = std::fs::metadata(&path)
+        .expect("session file should exist")
+        .modified()
+        .expect("session file should have modified time");
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+
+    runtime
+        .block_on(save_session_to_disk(&session))
+        .expect("second identical save should succeed");
+    let second_modified = std::fs::metadata(&path)
+        .expect("session file should still exist")
+        .modified()
+        .expect("session file should have modified time");
+
+    assert_eq!(
+        first_modified, second_modified,
+        "identical persisted payload should not rewrite the session file"
+    );
 }
 
 #[test]

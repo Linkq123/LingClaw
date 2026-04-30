@@ -12,7 +12,7 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -61,6 +61,22 @@ const MEMORY_FILE_NAME: &str = "structured_memory.json";
 const MEMORY_AUDIT_FILE_NAME: &str = "structured_memory.audit.jsonl";
 /// Max audit file size before rotation (trim oldest entries).
 const MEMORY_AUDIT_MAX_BYTES: u64 = 256_000;
+const MEMORY_INJECTION_CHAR_BUDGET: usize = 2_000;
+const MEMORY_INJECTION_MAX_FACTS_WITHOUT_QUERY: usize = 8;
+const MEMORY_INJECTION_MAX_RELEVANT_FACTS: usize = 8;
+const MEMORY_INJECTION_MAX_FALLBACK_FACTS: usize = 3;
+const MAX_MEMORY_FACT_VALUE_CHARS: usize = 240;
+const MAX_MEMORY_USER_CONTEXT_CHARS: usize = 320;
+
+#[derive(Clone)]
+struct StructuredMemoryCacheEntry {
+    workspace: PathBuf,
+    file_mtime: Option<SystemTime>,
+    memory: StructuredMemory,
+}
+
+type StructuredMemoryCacheLock = OnceLock<Mutex<Option<StructuredMemoryCacheEntry>>>;
+static STRUCTURED_MEMORY_CACHE: StructuredMemoryCacheLock = OnceLock::new();
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct MemoryQueueStatusSnapshot {
@@ -353,10 +369,33 @@ pub(crate) fn memory_debug_status(workspace: &Path, queue: Option<&MemoryUpdateQ
 /// Load structured memory from disk. Returns default if missing/corrupt.
 pub(crate) fn load_structured_memory(workspace: &Path) -> StructuredMemory {
     let path = memory_path(workspace);
-    match std::fs::read_to_string(&path) {
+    let file_mtime = std::fs::metadata(&path)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
+    let cache = STRUCTURED_MEMORY_CACHE.get_or_init(|| Mutex::new(None));
+
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref entry) = *guard
+            && entry.workspace == workspace
+            && entry.file_mtime == file_mtime
+        {
+            return entry.memory.clone();
+        }
+    }
+
+    let memory = match std::fs::read_to_string(&path) {
         Ok(data) => serde_json::from_str(&data).unwrap_or_default(),
         Err(_) => StructuredMemory::default(),
-    }
+    };
+
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(StructuredMemoryCacheEntry {
+        workspace: workspace.to_path_buf(),
+        file_mtime,
+        memory: memory.clone(),
+    });
+    memory
 }
 
 /// Persist structured memory to disk atomically (temp + rename).
@@ -374,13 +413,22 @@ pub(crate) fn save_structured_memory(
         std::fs::remove_file(&path).map_err(|e| format!("remove old: {e}"))?;
     }
 
-    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))
+    std::fs::rename(&tmp, &path).map_err(|e| format!("rename: {e}"))?;
+
+    let file_mtime = std::fs::metadata(&path)
+        .ok()
+        .and_then(|meta| meta.modified().ok());
+    let cache = STRUCTURED_MEMORY_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(StructuredMemoryCacheEntry {
+        workspace: workspace.to_path_buf(),
+        file_mtime,
+        memory: mem.clone(),
+    });
+    Ok(())
 }
 
 // ── Prompt injection ────────────────────────────────────────────────────────
-
-/// Max characters for the structured memory block injected into the system prompt.
-const MEMORY_INJECTION_CHAR_BUDGET: usize = 2_000;
 
 /// Format structured memory for injection into the system prompt.
 /// Returns `None` if the memory is empty.
@@ -406,24 +454,9 @@ pub(crate) fn format_memory_for_injection(
     }
 
     if !mem.facts.is_empty() {
-        let mut sorted_facts = mem.facts.clone();
-
-        if let Some(query) = current_query {
-            // Keyword-overlap scoring: tokenize query and score each fact.
-            let query_tokens = crate::tokenize_for_matching(query);
-            sorted_facts.sort_by(|a, b| {
-                let score_a = fact_relevance_score(a, &query_tokens);
-                let score_b = fact_relevance_score(b, &query_tokens);
-                score_b
-                    .cmp(&score_a)
-                    .then(b.recorded_at.cmp(&a.recorded_at))
-            });
-        } else {
-            sorted_facts.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at));
-        }
-
+        let selected_facts = select_facts_for_injection(mem, current_query);
         lines.push("**Remembered facts:**".to_string());
-        for fact in &sorted_facts {
+        for fact in &selected_facts {
             lines.push(format!("- **{}**: {}", fact.key, fact.value));
         }
     }
@@ -437,17 +470,176 @@ pub(crate) fn format_memory_for_injection(
     }
 }
 
+fn select_facts_for_injection(
+    mem: &StructuredMemory,
+    current_query: Option<&str>,
+) -> Vec<MemoryFact> {
+    let mut facts = mem.facts.clone();
+    if facts.is_empty() {
+        return facts;
+    }
+
+    if let Some(query) = current_query
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+    {
+        let query_tokens = crate::tokenize_for_matching(query);
+        let query_lower = query.to_lowercase();
+        let mut scored: Vec<(usize, MemoryFact)> = facts
+            .iter()
+            .cloned()
+            .map(|fact| {
+                let score = fact_relevance_score(&fact, &query_tokens, &query_lower);
+                (score, fact)
+            })
+            .collect();
+        scored.sort_by(|(score_a, fact_a), (score_b, fact_b)| {
+            score_b
+                .cmp(score_a)
+                .then(fact_b.recorded_at.cmp(&fact_a.recorded_at))
+                .then(fact_a.key.cmp(&fact_b.key))
+        });
+
+        let max_score = scored.first().map(|(score, _)| *score).unwrap_or(0);
+        if max_score > 0 {
+            let mut selected: Vec<MemoryFact> = scored
+                .iter()
+                .filter(|(score, _)| *score > 0)
+                .take(MEMORY_INJECTION_MAX_RELEVANT_FACTS)
+                .map(|(_, fact)| fact.clone())
+                .collect();
+            if selected.len() < MEMORY_INJECTION_MAX_RELEVANT_FACTS {
+                let selected_keys: std::collections::HashSet<&str> =
+                    selected.iter().map(|fact| fact.key.as_str()).collect();
+                let mut fallback: Vec<MemoryFact> = scored
+                    .into_iter()
+                    .filter(|(score, fact)| {
+                        *score == 0 && !selected_keys.contains(fact.key.as_str())
+                    })
+                    .map(|(_, fact)| fact)
+                    .collect();
+                fallback.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at).then(a.key.cmp(&b.key)));
+                selected.extend(
+                    fallback
+                        .into_iter()
+                        .take(MEMORY_INJECTION_MAX_FALLBACK_FACTS),
+                );
+            }
+            return selected;
+        }
+    }
+
+    facts.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at).then(a.key.cmp(&b.key)));
+    facts.truncate(MEMORY_INJECTION_MAX_FACTS_WITHOUT_QUERY);
+    facts
+}
+
 /// Score a memory fact's relevance to the query tokens.
 /// Higher score = more relevant.
-fn fact_relevance_score(fact: &MemoryFact, query_tokens: &[String]) -> usize {
+fn fact_relevance_score(fact: &MemoryFact, query_tokens: &[String], query_lower: &str) -> usize {
     if query_tokens.is_empty() {
         return 0;
     }
-    let fact_text = format!("{} {}", fact.key, fact.value).to_lowercase();
-    query_tokens
-        .iter()
-        .filter(|token| fact_text.contains(token.as_str()))
-        .count()
+    let key_lower = fact.key.to_lowercase();
+    let value_lower = fact.value.to_lowercase();
+    let fact_text = format!("{key_lower} {value_lower}");
+    let mut score = 0usize;
+
+    if !query_lower.is_empty() && fact_text.contains(query_lower) {
+        score += 8;
+    }
+
+    for token in query_tokens {
+        if token.is_empty() {
+            continue;
+        }
+        if key_lower == *token {
+            score += 6;
+        } else if key_lower.contains(token) {
+            score += 4;
+        }
+        if value_lower == *token {
+            score += 4;
+        } else if value_lower.contains(token) {
+            score += 2;
+        }
+    }
+
+    score
+}
+
+fn normalize_memory_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_memory_chars(text: String, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text;
+    }
+    text.chars().take(max_chars).collect()
+}
+
+fn normalize_memory_fact_key(key: &str) -> String {
+    let mut out = String::new();
+    let mut previous_was_separator = false;
+    for ch in normalize_memory_whitespace(key).chars() {
+        if ch.is_alphanumeric() {
+            out.extend(ch.to_lowercase());
+            previous_was_separator = false;
+        } else if matches!(ch, ' ' | '_' | '-' | '/' | '.' | ':')
+            && !out.is_empty()
+            && !previous_was_separator
+        {
+            out.push('_');
+            previous_was_separator = true;
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+fn sanitize_memory_fact_value(value: &str) -> String {
+    truncate_memory_chars(
+        normalize_memory_whitespace(value.trim()),
+        MAX_MEMORY_FACT_VALUE_CHARS,
+    )
+    .trim()
+    .to_string()
+}
+
+fn sanitize_user_context_value(value: &str) -> Option<String> {
+    let sanitized = truncate_memory_chars(
+        normalize_memory_whitespace(value.trim()),
+        MAX_MEMORY_USER_CONTEXT_CHARS,
+    );
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+fn dedupe_memory_facts(facts: &mut Vec<MemoryFact>) {
+    let mut deduped: Vec<MemoryFact> = Vec::new();
+    for mut fact in std::mem::take(facts) {
+        fact.key = normalize_memory_fact_key(&fact.key);
+        fact.value = sanitize_memory_fact_value(&fact.value);
+        if fact.key.is_empty() || fact.value.is_empty() {
+            continue;
+        }
+        match deduped.iter_mut().find(|existing| existing.key == fact.key) {
+            Some(existing) if existing.value == fact.value => {
+                existing.recorded_at = existing.recorded_at.max(fact.recorded_at);
+            }
+            Some(existing) if fact.recorded_at >= existing.recorded_at => {
+                *existing = fact;
+            }
+            Some(_) => {}
+            None => {
+                deduped.push(fact);
+            }
+        }
+    }
+    *facts = deduped;
 }
 
 // ── Async update queue ──────────────────────────────────────────────────────
@@ -752,10 +944,16 @@ pub(crate) fn merge_llm_response_into_memory(
     raw: &serde_json::Value,
     now: u64,
 ) {
+    // Normalize any pre-existing facts before incremental deletes/upserts so we
+    // do not merge on top of stale duplicate keys. The final dedupe below still
+    // canonicalizes the finished set, including the legacy full-replacement path.
+    dedupe_memory_facts(&mut memory.facts);
     // Only touch user_context when the key is actually present in the response.
     // null → clear, string → update, absent → preserve existing.
     if raw.get("user_context").is_some() {
-        memory.user_context = raw["user_context"].as_str().map(|s| s.to_string());
+        memory.user_context = raw["user_context"]
+            .as_str()
+            .and_then(sanitize_user_context_value);
     }
 
     let used_incremental = raw.get("update_facts").is_some() || raw.get("delete_facts").is_some();
@@ -763,27 +961,27 @@ pub(crate) fn merge_llm_response_into_memory(
     if used_incremental {
         // Apply deletions first
         if let Some(delete_arr) = raw.get("delete_facts").and_then(|v| v.as_array()) {
-            let delete_keys: Vec<&str> = delete_arr.iter().filter_map(|v| v.as_str()).collect();
-            memory
-                .facts
-                .retain(|f| !delete_keys.contains(&f.key.as_str()));
+            let delete_keys: Vec<String> = delete_arr
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(normalize_memory_fact_key)
+                .filter(|key| !key.is_empty())
+                .collect();
+            memory.facts.retain(|f| !delete_keys.contains(&f.key));
         }
 
         // Apply updates/inserts
         if let Some(update_arr) = raw.get("update_facts").and_then(|v| v.as_array()) {
             for fv in update_arr {
-                let key = fv
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                let value = fv
-                    .get("value")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
+                let key = normalize_memory_fact_key(
+                    fv.get("key").and_then(|v| v.as_str()).unwrap_or("").trim(),
+                );
+                let value = sanitize_memory_fact_value(
+                    fv.get("value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim(),
+                );
                 if key.is_empty() || value.is_empty() {
                     continue;
                 }
@@ -806,18 +1004,15 @@ pub(crate) fn merge_llm_response_into_memory(
         if let Some(facts_arr) = facts_val.as_array() {
             let mut new_facts = Vec::new();
             for fv in facts_arr {
-                let key = fv
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                let value = fv
-                    .get("value")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
+                let key = normalize_memory_fact_key(
+                    fv.get("key").and_then(|v| v.as_str()).unwrap_or("").trim(),
+                );
+                let value = sanitize_memory_fact_value(
+                    fv.get("value")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim(),
+                );
                 if key.is_empty() || value.is_empty() {
                     continue;
                 }
@@ -836,6 +1031,8 @@ pub(crate) fn merge_llm_response_into_memory(
             memory.facts = new_facts;
         }
     }
+
+    dedupe_memory_facts(&mut memory.facts);
 }
 
 /// Core memory update: call LLM to extract memory from conversation,

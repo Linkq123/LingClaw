@@ -45,8 +45,16 @@ fn load_session_prompt_files_uses_same_snapshot_for_today_and_yesterday() {
     );
     let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
 
-    assert!(loaded.memory.contains("<!-- memory/2026-03-16.md -->\ntoday memory"));
-    assert!(loaded.memory.contains("<!-- memory/2026-03-15.md -->\nyesterday memory"));
+    assert!(
+        loaded
+            .memory
+            .contains("<!-- memory/2026-03-16.md -->\ntoday memory")
+    );
+    assert!(
+        loaded
+            .memory
+            .contains("<!-- memory/2026-03-15.md -->\nyesterday memory")
+    );
 
     let _ = fs::remove_dir_all(&workspace);
 }

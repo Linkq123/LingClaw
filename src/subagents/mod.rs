@@ -120,6 +120,13 @@ impl AgentSource {
 /// Render a sub-agent catalog section for injection into the system prompt.
 /// Returns `None` if no agents are discovered.
 pub(crate) fn render_agents_catalog(agents: &[SubAgentSpec]) -> Option<String> {
+    render_agents_catalog_with_query(agents, None)
+}
+
+pub(crate) fn render_agents_catalog_with_query(
+    agents: &[SubAgentSpec],
+    current_query: Option<&str>,
+) -> Option<String> {
     if agents.is_empty() {
         return None;
     }
@@ -136,6 +143,37 @@ pub(crate) fn render_agents_catalog(agents: &[SubAgentSpec]) -> Option<String> {
     );
     lines.push(String::new());
 
+    const AGENT_FULL_DISPLAY_THRESHOLD: usize = 4;
+    const AGENT_TOP_N: usize = 3;
+
+    if agents.len() > AGENT_FULL_DISPLAY_THRESHOLD
+        && let Some(query) = current_query
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+    {
+        let query_tokens = crate::tokenize_for_matching(query);
+        let mut ranked: Vec<(usize, &SubAgentSpec)> = agents
+            .iter()
+            .map(|agent| (agent_relevance(agent, &query_tokens), agent))
+            .collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
+
+        if ranked.first().map(|(score, _)| *score).unwrap_or(0) > 0 {
+            for (idx, (_score, agent)) in ranked.iter().enumerate() {
+                let source_tag = agent.source.label();
+                if idx < AGENT_TOP_N && !agent.description.is_empty() {
+                    lines.push(format!(
+                        "- **{}** [`{}`]: {}",
+                        agent.name, source_tag, agent.description
+                    ));
+                } else {
+                    lines.push(format!("- **{}** [`{}`]", agent.name, source_tag));
+                }
+            }
+            return Some(lines.join("\n"));
+        }
+    }
+
     for agent in agents {
         let source_tag = agent.source.label();
         if agent.description.is_empty() {
@@ -149,6 +187,17 @@ pub(crate) fn render_agents_catalog(agents: &[SubAgentSpec]) -> Option<String> {
     }
 
     Some(lines.join("\n"))
+}
+
+fn agent_relevance(agent: &SubAgentSpec, query_tokens: &[String]) -> usize {
+    if query_tokens.is_empty() {
+        return 0;
+    }
+    let text = format!("{} {}", agent.name, agent.description).to_lowercase();
+    query_tokens
+        .iter()
+        .filter(|token| !token.is_empty() && text.contains(token.as_str()))
+        .count()
 }
 
 /// Filter the built-in tool specs according to sub-agent permissions.

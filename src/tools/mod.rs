@@ -5,9 +5,7 @@ pub(crate) mod net;
 
 use reqwest::Client;
 use serde_json::{Value, json};
-use std::path::Path;
-use std::time::Instant;
-use std::{future::Future, pin::Pin};
+use std::{future::Future, path::Path, pin::Pin, time::Instant};
 
 use crate::Config;
 
@@ -409,13 +407,116 @@ pub(crate) fn tool_specs() -> &'static [ToolSpec] {
     ]
 }
 
+#[allow(dead_code)] // Compatibility wrapper for call sites that still want the full tool list.
 pub(crate) fn render_tool_prompt_lines(config: &Config) -> String {
-    tool_specs()
+    render_tool_prompt_lines_with_query(config, None)
+}
+
+pub(crate) fn render_tool_prompt_lines_with_query(
+    config: &Config,
+    current_query: Option<&str>,
+) -> String {
+    let specs = tool_specs();
+    let prompt_lines: Vec<String> = specs
         .iter()
+        .map(|spec| (spec.prompt_line)(config))
+        .collect();
+
+    const TOOL_FULL_DISPLAY_THRESHOLD: usize = 6;
+    const TOOL_TOP_N: usize = 5;
+
+    if specs.len() > TOOL_FULL_DISPLAY_THRESHOLD
+        && let Some(query) = current_query
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+    {
+        let query_tokens = crate::tokenize_for_matching(query);
+        let mut ranked: Vec<(usize, usize)> = specs
+            .iter()
+            .enumerate()
+            .map(|(idx, spec)| (tool_relevance(spec, &prompt_lines[idx], &query_tokens), idx))
+            .collect();
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+        if ranked.first().map(|(score, _)| *score).unwrap_or(0) > 0 {
+            let mut selected: Vec<usize> = ranked
+                .iter()
+                .take(TOOL_TOP_N)
+                .map(|(_, idx)| *idx)
+                .collect();
+            if !selected.iter().any(|idx| specs[*idx].name == "think") {
+                if let Some(think_idx) = specs.iter().position(|spec| spec.name == "think") {
+                    selected.pop();
+                    selected.push(think_idx);
+                    selected.sort_unstable();
+                }
+            }
+
+            let mut lines = Vec::new();
+            for (display_idx, idx) in selected.iter().enumerate() {
+                lines.push(format!("{}. {}", display_idx + 1, prompt_lines[*idx]));
+            }
+
+            let remaining: Vec<&str> = specs
+                .iter()
+                .enumerate()
+                .filter(|(idx, _)| !selected.contains(idx))
+                .map(|(_, spec)| spec.name)
+                .collect();
+            if !remaining.is_empty() {
+                lines.push(format!(
+                    "Other available tools: {}",
+                    remaining
+                        .iter()
+                        .map(|name| format!("`{name}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+            return lines.join("\n");
+        }
+    }
+
+    prompt_lines
+        .into_iter()
         .enumerate()
-        .map(|(idx, spec)| format!("{}. {}", idx + 1, (spec.prompt_line)(config)))
+        .map(|(idx, line)| format!("{}. {line}", idx + 1))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn tool_relevance(spec: &ToolSpec, prompt_line: &str, query_tokens: &[String]) -> usize {
+    if query_tokens.is_empty() {
+        return 0;
+    }
+    let text = format!(
+        "{} {} {} {}",
+        spec.name,
+        spec.description,
+        prompt_line,
+        tool_relevance_hint(spec.name)
+    )
+    .to_lowercase();
+
+    query_tokens
+        .iter()
+        .filter(|token| !token.is_empty() && text.contains(token.as_str()))
+        .count()
+}
+
+fn tool_relevance_hint(name: &str) -> &'static str {
+    match name {
+        "think" => "plan outline strategy reasoning steps analyze",
+        "exec" => "run shell command build test git benchmark profile compile install",
+        "read_file" => "read inspect open cat file source code contents lines",
+        "write_file" => "create write save generate file content",
+        "patch_file" => "edit modify update patch replace refactor fix file",
+        "list_dir" => "directory folder tree files structure browse workspace",
+        "search_files" => "search grep rg find pattern references symbols codebase",
+        "http_fetch" => "fetch request url api docs website http",
+        "delete_file" => "delete remove cleanup file",
+        _ => "",
+    }
 }
 
 pub(crate) fn tool_definitions() -> serde_json::Value {

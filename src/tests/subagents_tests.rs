@@ -4,7 +4,10 @@ use crate::subagents::orchestrator::{
     compute_execution_layers, execute_orchestration, format_orchestration_result, has_cycle,
     interpolate_results, validate_plan,
 };
-use crate::subagents::{AgentSource, SubAgentSpec, ToolPermissions, render_agents_catalog};
+use crate::subagents::{
+    AgentSource, SubAgentSpec, ToolPermissions, render_agents_catalog,
+    render_agents_catalog_with_query,
+};
 use crate::{ChatMessage, agent};
 use tokio_util::sync::CancellationToken;
 
@@ -92,6 +95,71 @@ fn test_render_agents_catalog_with_agents() {
     assert!(catalog.contains("[`system`]"));
     assert!(catalog.contains("[`global`]"));
     assert!(catalog.contains("Code exploration"));
+}
+
+#[test]
+fn test_render_agents_catalog_with_query_compresses_irrelevant_agents() {
+    let agents = vec![
+        SubAgentSpec {
+            name: "benchmarker".into(),
+            description: "Benchmark and performance profiling specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+        SubAgentSpec {
+            name: "reviewer".into(),
+            description: "Code review and risk analysis specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+        SubAgentSpec {
+            name: "writer".into(),
+            description: "Long-form writing specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+        SubAgentSpec {
+            name: "translator".into(),
+            description: "Translation specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+        SubAgentSpec {
+            name: "planner".into(),
+            description: "Project planning specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+    ];
+
+    let catalog =
+        render_agents_catalog_with_query(&agents, Some("benchmark performance regressions"))
+            .expect("catalog should render");
+    assert!(
+        catalog
+            .contains("**benchmarker** [`system`]: Benchmark and performance profiling specialist")
+    );
+    assert!(catalog.contains("**writer** [`system`]"));
 }
 
 #[test]

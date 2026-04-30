@@ -7,8 +7,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     AppState, ChatMessage, MAIN_SESSION_ID, Session, WsTx, agent, build_system_prompt,
-    build_system_prompt_with_query, default_show_react, default_show_reasoning, default_show_tools,
-    memory, now_epoch, prompts, providers,
+    build_system_prompt_with_query_cached, default_show_react, default_show_reasoning,
+    default_show_tools, memory, now_epoch, prompts, providers,
     session_admin::gather_global_today_usage,
     session_store::{
         build_session_status, build_usage_report, replace_session_messages, save_session_to_disk,
@@ -588,7 +588,7 @@ async fn handle_system_prompt_command(current_session_id: &str, state: &AppState
                 .rev()
                 .find(|message| message.role == "user")
                 .and_then(|message| message.content.as_deref());
-            let system_prompt = build_system_prompt_with_query(
+            let system_prompt = build_system_prompt_with_query_cached(
                 &config,
                 &session.workspace,
                 &model,

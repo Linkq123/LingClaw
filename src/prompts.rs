@@ -855,7 +855,8 @@ fn load_persona_uncached(workspace: &Path) -> String {
     if let Some((name, content)) = read_agent_prompt(workspace) {
         parts.push(format!("<!-- {name} -->\n{content}"));
     }
-    for name in &PERSONA_WATCH_FILES[3..] { // IDENTITY.md, USER.md, SOUL.md
+    for name in &PERSONA_WATCH_FILES[3..] {
+        // IDENTITY.md, USER.md, SOUL.md
         if let Some(content) = read_nonempty(workspace.join(name)) {
             parts.push(format!("<!-- {name} -->\n{content}"));
         }
