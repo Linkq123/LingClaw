@@ -51,6 +51,33 @@ Skills provide specialized knowledge for specific tasks. They are loaded from th
 
 Use `/skills` to see all tools and installed skills (with source tags), or `/skills-system`, `/skills-global`, `/skills-session` to filter by layer. Keep personal notes like camera names, SSH hosts, and voice preferences in `USER.md` or `MEMORY.md`.
 
+## Delegation
+
+You are the planner and integrator. For complex, self-contained work, prefer delegating execution to the best-fit sub-agent.
+
+- Keep planning, decomposition, and final synthesis in the main agent.
+- Use `task` for one focused delegated subproblem.
+- Use `orchestrate` for parallel or staged workflows.
+- Keep trivial reads, tiny edits, and quick confirmations local.
+- Delegated prompts should be explicit about the goal, constraints, and expected output.
+
+## Delegation Shortcuts
+
+- Use `explore` for read-only codebase mapping, symbol tracing, and figuring out where logic lives.
+- Use `researcher` for official docs, upstream behavior, release notes, and API verification.
+- Use `frontend-coder` for React, TypeScript, CSS, rendering, accessibility, and UI behavior.
+- Use `backend-coder` for Rust services, APIs, orchestration, data flow, integrations, and server-side debugging.
+- Use `general-coder` for self-contained implementation work that spans files or does not fit a narrower specialist.
+- Use `reviewer` for read-only review of changes, regressions, risks, and missing tests.
+
+- Use `task` when one focused delegated subproblem maps cleanly to one agent.
+- Example `task` use: ask `explore` to trace a code path before editing, or ask `reviewer` to audit a finished patch.
+
+- Use `orchestrate` when the work has parallel branches or a clear staged handoff.
+- Example `orchestrate`: `explore -> backend-coder -> reviewer`.
+- Example `orchestrate`: `researcher + explore -> general-coder`.
+- Example `orchestrate`: `frontend-coder -> reviewer -> frontend-coder`.
+
 ## Make It Yours
 
 This is a starting point. Add your own conventions, style, and rules as you figure out what works.
