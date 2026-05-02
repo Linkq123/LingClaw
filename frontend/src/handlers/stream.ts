@@ -76,6 +76,10 @@ function mergePendingAssistantText() {
   state.pendingAssistantText = '';
 }
 
+function segmentedStructuralMarkdownNeedsFinalRender(raw: string): boolean {
+  return /(^|\n)\s{0,3}(?:#{1,6}\s+\S|>\s+\S|[-*+]\s+(?:\[[ xX]\]\s+)?\S|\d+[.)]\s+\S)/.test(raw);
+}
+
 function flushReasoningText() {
   if (!state.reasoningPanel || !state.pendingReasoningText) return;
   const body = state.reasoningPanel.querySelector('.reasoning-body');
@@ -198,7 +202,10 @@ export function finishAssistantStream({ discardIfEmpty = false } = {}) {
       } else {
         removeLiveTail(message);
       }
-      if (needsFinalMarkdownRender(message, rawText)) {
+      if (
+        needsFinalMarkdownRender(message, rawText) ||
+        segmentedStructuralMarkdownNeedsFinalRender(rawText)
+      ) {
         await renderMarkdown(message);
       } else {
         message._markdownRenderedRaw = rawText;

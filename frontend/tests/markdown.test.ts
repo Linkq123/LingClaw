@@ -247,6 +247,32 @@ describe('findProgressiveSplitPoint', () => {
 
     expect(findProgressiveSplitPoint(text)).not.toBe(fullWidthColonIndex + 1);
   });
+
+  it('does not soft-split inside a markdown list item after a bold label colon', () => {
+    const prefix = 'Intro paragraph that is already long enough to create a safe boundary.\n\n';
+    const text =
+      prefix +
+      '- **Area:** first stop with a long enough continuation to tempt a mid-line split, plus a second attraction and a third attraction';
+
+    expect(findProgressiveSplitPoint(text)).toBe(prefix.length);
+  });
+
+  it('does not split at the newline before a lazy list continuation', () => {
+    const prefix = 'Intro paragraph that is already long enough to create a safe boundary.\n\n';
+    const text =
+      prefix + '- foo\nbar baz qux quux corge grault garply waldo fred plugh xyzzy thud';
+
+    expect(findProgressiveSplitPoint(text)).toBe(prefix.length);
+  });
+
+  it('does not split at the newline after a blockquoted heading', () => {
+    const prefix = 'Intro paragraph that is already long enough to create a safe boundary.\n\n';
+    const text =
+      prefix +
+      '> # Heading\n> paragraph text that continues long enough to keep streaming active for a while';
+
+    expect(findProgressiveSplitPoint(text)).toBe(prefix.length);
+  });
 });
 
 describe('renderMarkdown memoization', () => {
@@ -464,6 +490,37 @@ describe('finishAssistantStream markdown finalization', () => {
 
     expect(message.querySelector('.markdown-table-wrap table')).not.toBeNull();
     expect(message.querySelectorAll('tbody tr')).toHaveLength(1);
+  });
+
+  it('re-renders a segmented list item label and tail into the same bullet on finish', async () => {
+    await preloadMarkdownEngine();
+
+    const row = document.createElement('div');
+    row.className = 'msg-row assistant';
+    row.hidden = true;
+
+    const message = document.createElement('div');
+    message.className = 'msg assistant';
+    message._rawText =
+      '- **Area:** first stop with a long enough continuation to tempt a mid-line split, plus a second attraction and a third attraction';
+    message._renderedOffset = '- **Area:**'.length;
+    message.innerHTML = '<ul><li><strong>Area:</strong></li></ul>';
+
+    row.appendChild(message);
+    document.body.appendChild(row);
+    state.currentMsg = message;
+
+    const result = finishAssistantStream();
+    expect(result).toBe(message);
+
+    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await Promise.resolve();
+
+    expect(message.querySelectorAll('ul')).toHaveLength(1);
+    expect(message.querySelectorAll('li')).toHaveLength(1);
+    expect(message.querySelector('li')?.textContent).toContain('first stop');
+    expect(message.querySelector('.live-tail')).toBeNull();
   });
 
   it('keeps already-rendered plain text DOM when no final markdown correction is needed', async () => {

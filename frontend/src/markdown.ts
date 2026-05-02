@@ -270,8 +270,23 @@ function isTableRow(text: string, lineStart: number): boolean {
 
 function isReferenceLinkDefinitionLine(text: string, lineStart: number): boolean {
   const line = readLine(text, lineStart);
-  const normalizedLine = line.replace(/^\s{0,3}(?:>\s*)+/, '');
+  const normalizedLine = stripBlockquotePrefixes(line);
   return /^\s{0,3}\[[^\]]+\]:\s+\S/.test(normalizedLine);
+}
+
+function stripBlockquotePrefixes(line: string): string {
+  return line.replace(/^\s{0,3}(?:>\s*)+/, '');
+}
+
+function isHeadingLine(text: string, lineStart: number): boolean {
+  const line = readLine(text, lineStart);
+  if (line !== stripBlockquotePrefixes(line)) return false;
+  return /^\s{0,3}#{1,6}\s+\S/.test(line);
+}
+
+function isListItemLine(text: string, lineStart: number): boolean {
+  const normalizedLine = stripBlockquotePrefixes(readLine(text, lineStart));
+  return /^\s{0,3}(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+)\S/.test(normalizedLine);
 }
 
 export function isSentenceSplitChar(text, index, lineStartOverride?: number) {
@@ -374,6 +389,8 @@ export function findProgressiveSplitPoint(text: string, startFrom = 0): number {
   let charsSinceBoundary = 0;
   const tableLineCache = new Map<number, boolean>();
   const referenceDefinitionLineCache = new Map<number, boolean>();
+  const singleLineMarkdownContainerCache = new Map<number, boolean>();
+  const listItemLineCache = new Map<number, boolean>();
   // Find the true start of the line that contains startFrom so the table-row
   // guard below works correctly when resuming from a mid-line offset.
   let lineStart = startFrom;
@@ -426,7 +443,18 @@ export function findProgressiveSplitPoint(text: string, startFrom = 0): number {
         onReferenceDefinitionLine = isReferenceLinkDefinitionLine(text, lineStart);
         referenceDefinitionLineCache.set(lineStart, onReferenceDefinitionLine);
       }
-      const onAtomicMarkdownLine = onTableRow || onReferenceDefinitionLine;
+      let onSingleLineMarkdownContainer = singleLineMarkdownContainerCache.get(lineStart);
+      if (onSingleLineMarkdownContainer === undefined) {
+        onSingleLineMarkdownContainer = isHeadingLine(text, lineStart);
+        singleLineMarkdownContainerCache.set(lineStart, onSingleLineMarkdownContainer);
+      }
+      let onListItemLine = listItemLineCache.get(lineStart);
+      if (onListItemLine === undefined) {
+        onListItemLine = isListItemLine(text, lineStart);
+        listItemLineCache.set(lineStart, onListItemLine);
+      }
+      const onAtomicMarkdownLine =
+        onTableRow || onReferenceDefinitionLine || onSingleLineMarkdownContainer || onListItemLine;
       if (
         !onAtomicMarkdownLine &&
         charsSinceBoundary >= SOFT_SPLIT_MIN_CHARS &&
@@ -439,6 +467,11 @@ export function findProgressiveSplitPoint(text: string, startFrom = 0): number {
         charsSinceBoundary >= SOFT_SPLIT_MAX_CHARS
       ) {
         lastSoftSplit = i + 1;
+      }
+      if (text[i] === '\n' && onSingleLineMarkdownContainer) {
+        lastSplit = i + 1;
+        lastSoftSplit = -1;
+        charsSinceBoundary = 0;
       }
     }
     if (text[i] === '\n') lineStart = i + 1; // single newline → next line
