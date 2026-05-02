@@ -27,6 +27,7 @@ export interface SettingsConfig {
   maxFileBytes?: number;
   structuredMemory?: boolean;
   dailyReflection?: boolean;
+  enableStateDigest?: boolean;
   enableS3?: boolean;
   openaiStreamIncludeUsage?: boolean;
   anthropicPromptCaching?: boolean;

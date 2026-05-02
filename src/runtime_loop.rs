@@ -195,12 +195,15 @@ struct AgentPhaseState {
     round: usize,
     pending_tool_calls: Vec<ToolCall>,
     collected_results: Vec<agent::ToolResultEntry>,
+    results_origin_query: Option<String>,
+    working_state: agent::WorkingState,
+    retrieved_task_memory: Option<memory::RetrievedTaskMemory>,
+    retrieved_task_memory_key: Option<String>,
+    retrieved_task_memory_cycle: Option<usize>,
     cycle_workspace: PathBuf,
     last_observation_hint: Option<String>,
     finish_gate_hint: Option<String>,
     finish_gate_deferred_once: bool,
-    last_observation_summary_count: usize,
-    last_consecutive_tool_errors: usize,
     pending_interventions: Vec<String>,
     react_ctx: agent::AgentLoopCtx,
     shutting_down: bool,
@@ -214,6 +217,8 @@ struct AgentPhaseState {
 
 /// Minimum interval between observe-phase incremental saves.
 const OBSERVE_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
+const DYNAMIC_PROMPT_INJECTION_CHAR_BUDGET: usize = 4_000;
+const DYNAMIC_PROMPT_TRUNCATION_MARKER: &str = "\n*(additional dynamic context truncated)*";
 
 enum AgentPhaseControl {
     Continue,
@@ -230,9 +235,22 @@ struct AnalyzeSnapshot {
     latest_query: Option<String>,
 }
 
+struct WorkingStateSessionData {
+    latest_query: Option<String>,
+    workspace: PathBuf,
+    fallback_model: String,
+}
+
 enum ToolRunState {
     Completed(tools::ToolOutcome),
     Abort,
+}
+
+#[derive(Clone, Debug)]
+enum WorkingStateDigestIssue {
+    ProviderError(String),
+    Timeout,
+    InvalidJson(String),
 }
 
 /// Drop guard that sends a `task_failed` event when a `task` tool future is
@@ -503,6 +521,97 @@ fn messages_have_images(messages: &[ChatMessage]) -> bool {
     })
 }
 
+fn latest_user_query_from_messages(messages: &[ChatMessage]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .and_then(|message| message.content.clone())
+}
+
+fn refresh_retrieved_task_memory(
+    phase_state: &mut AgentPhaseState,
+    workspace: &Path,
+    structured_memory_enabled: bool,
+    current_query: Option<&str>,
+    prefer_same_cycle_cache: bool,
+) {
+    if !structured_memory_enabled {
+        phase_state.retrieved_task_memory = None;
+        phase_state.retrieved_task_memory_key = None;
+        phase_state.retrieved_task_memory_cycle = None;
+        return;
+    }
+
+    let same_cycle = phase_state.retrieved_task_memory_cycle == Some(phase_state.react_ctx.cycles);
+    if prefer_same_cycle_cache && same_cycle && phase_state.retrieved_task_memory.is_some() {
+        return;
+    }
+
+    let cache_key = memory::task_memory_cache_key(current_query, Some(&phase_state.working_state));
+    let can_reuse =
+        same_cycle && phase_state.retrieved_task_memory_key.as_deref() == Some(cache_key.as_str());
+    if can_reuse {
+        return;
+    }
+
+    let retrieved = memory::retrieve_task_memory(
+        &memory::load_structured_memory(workspace),
+        current_query,
+        Some(&phase_state.working_state),
+    );
+    phase_state.retrieved_task_memory = (!retrieved.is_empty()).then_some(retrieved);
+    phase_state.retrieved_task_memory_key = Some(cache_key);
+    phase_state.retrieved_task_memory_cycle = Some(phase_state.react_ctx.cycles);
+}
+
+fn append_dynamic_prompt_section(
+    content: &mut String,
+    remaining_budget: &mut usize,
+    section: &str,
+) -> bool {
+    let section = section.trim();
+    if section.is_empty() || *remaining_budget == 0 {
+        return false;
+    }
+
+    const SECTION_SEPARATOR: &str = "\n\n";
+    if *remaining_budget <= SECTION_SEPARATOR.len() {
+        return false;
+    }
+
+    let available = *remaining_budget - SECTION_SEPARATOR.len();
+    if section.len() <= available {
+        content.push_str(SECTION_SEPARATOR);
+        content.push_str(section);
+        *remaining_budget -= SECTION_SEPARATOR.len() + section.len();
+        return true;
+    }
+
+    let keep = available.saturating_sub(DYNAMIC_PROMPT_TRUNCATION_MARKER.len());
+    if keep == 0 {
+        return false;
+    }
+    content.push_str(SECTION_SEPARATOR);
+    content.push_str(&crate::truncate(section, keep));
+    content.push_str(DYNAMIC_PROMPT_TRUNCATION_MARKER);
+    *remaining_budget = 0;
+    true
+}
+
+fn append_owned_dynamic_prompt_section(
+    content: &mut String,
+    remaining_budget: &mut usize,
+    slot: &mut Option<String>,
+) {
+    let should_clear = slot
+        .as_deref()
+        .is_some_and(|section| append_dynamic_prompt_section(content, remaining_budget, section));
+    if should_clear {
+        *slot = None;
+    }
+}
+
 async fn prepare_analyze_snapshot(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
@@ -514,12 +623,10 @@ async fn prepare_analyze_snapshot(
     let disabled = session.disabled_system_skills.clone();
 
     // Extract latest user message for query-aware memory retrieval and complexity sensing.
-    let latest_query: Option<String> = session
-        .messages
-        .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .and_then(|m| m.content.clone());
+    let latest_query = latest_user_query_from_messages(&session.messages);
+    phase_state
+        .working_state
+        .seed_from_query(latest_query.as_deref());
     let context_has_images = messages_have_images(&session.messages);
     let user_msg_chars = latest_query
         .as_ref()
@@ -544,29 +651,100 @@ async fn prepare_analyze_snapshot(
         latest_query.as_deref(),
     );
 
+    refresh_retrieved_task_memory(
+        phase_state,
+        &session.workspace,
+        config.structured_memory,
+        latest_query.as_deref(),
+        false,
+    );
+    let discovered_agents = crate::subagents::discovery::discover_all_agents(&session.workspace);
+
     // Dynamic context injections into the system prompt:
     // - Observation hint from previous cycle
     // - Planning nudge on first cycle for multi-step tasks
     // - Finish nudge for deep loops
     if let Some(ref mut content) = fresh_system.content {
-        if let Some(hint) = phase_state.last_observation_hint.take() {
-            content.push_str("\n\n");
-            content.push_str(&hint);
+        let mut remaining_budget = DYNAMIC_PROMPT_INJECTION_CHAR_BUDGET;
+        append_owned_dynamic_prompt_section(
+            content,
+            &mut remaining_budget,
+            &mut phase_state.last_observation_hint,
+        );
+        append_owned_dynamic_prompt_section(
+            content,
+            &mut remaining_budget,
+            &mut phase_state.finish_gate_hint,
+        );
+        if let Some(task_state) = agent::render_task_state_for_prompt(&phase_state.working_state) {
+            let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &task_state);
         }
-        if let Some(hint) = phase_state.finish_gate_hint.take() {
-            content.push_str("\n\n");
-            content.push_str(&hint);
+        if let Some(task_memory) =
+            phase_state
+                .retrieved_task_memory
+                .as_ref()
+                .and_then(|selection| {
+                    memory::format_task_memory_for_prompt(
+                        selection,
+                        phase_state.working_state.intent,
+                    )
+                })
+        {
+            let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &task_memory);
+        }
+        if let Some(tool_hints) = phase_state
+            .retrieved_task_memory
+            .as_ref()
+            .and_then(|selection| {
+                memory::format_task_tool_hints_for_prompt(
+                    selection,
+                    phase_state.working_state.intent,
+                )
+            })
+        {
+            let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &tool_hints);
+        }
+        if let Some(tool_order) = phase_state
+            .retrieved_task_memory
+            .as_ref()
+            .and_then(|selection| {
+                let ranking =
+                    memory::task_tool_ranking_context(selection, phase_state.working_state.intent);
+                tools::render_ranked_tool_recommendations(
+                    config.as_ref(),
+                    latest_query.as_deref(),
+                    &ranking,
+                )
+            })
+        {
+            let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &tool_order);
+        }
+        if let Some(agent_order) = crate::subagents::render_ranked_agent_recommendations(
+            &discovered_agents,
+            latest_query.as_deref(),
+            Some(&phase_state.working_state),
+        ) {
+            let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &agent_order);
+        }
+        if let Some(delegation_guidance) = crate::subagents::render_delegation_guidance(
+            &discovered_agents,
+            latest_query.as_deref(),
+            &phase_state.working_state,
+        ) {
+            let _ =
+                append_dynamic_prompt_section(content, &mut remaining_budget, &delegation_guidance);
         }
         if phase_state.react_ctx.cycles == 0 {
-            content.push_str(
-                "\n\n## Working Method\n\
+            let _ = append_dynamic_prompt_section(
+                content,
+                &mut remaining_budget,
+                "## Working Method\n\
                  For complex multi-step tasks, use the `think` tool first to outline your plan \
                  before executing other tools. For simple questions or single-step tasks, respond directly.",
             );
         }
         if let Some(nudge) = agent::build_finish_nudge(phase_state.react_ctx.cycles) {
-            content.push_str("\n\n");
-            content.push_str(nudge);
+            let _ = append_dynamic_prompt_section(content, &mut remaining_budget, nudge);
         }
     }
 
@@ -811,31 +989,38 @@ async fn advance_after_llm_response(
 ) {
     let has_content = message.has_nonempty_content();
     let has_tools = message.has_tool_calls();
+    let memory_next_actions = phase_state
+        .retrieved_task_memory
+        .as_ref()
+        .map(|selection| {
+            memory::task_memory_next_actions(selection, phase_state.working_state.intent)
+        })
+        .unwrap_or_default();
 
     match agent::evaluate_finish_with_gate(
         has_content,
         has_tools,
         &agent::FinishGateContext {
-            cycles: phase_state.react_ctx.cycles,
-            total_tool_calls: phase_state.react_ctx.tool_calls,
-            has_observation_history: phase_state.last_observation_summary_count > 0,
-            latest_user_query: latest_query,
-            consecutive_errors: phase_state.last_consecutive_tool_errors,
             finish_deferred_once: phase_state.finish_gate_deferred_once,
             assistant_content: message.content.as_deref(),
+            memory_next_actions: &memory_next_actions,
+            working_state: &phase_state.working_state,
         },
     ) {
         agent::FinishDecision::ContinueToAct => {
+            phase_state.results_origin_query = latest_query.map(str::to_string);
             phase_state.pending_tool_calls = message.tool_calls.clone().unwrap_or_default();
             phase_state.react_ctx.transition_to_act();
             send_react_phase_event(live_tx, &phase_state.react_ctx, "act").await;
         }
         agent::FinishDecision::Finish(reason) => {
+            phase_state.results_origin_query = None;
             phase_state.finish_gate_deferred_once = false;
             phase_state.react_ctx.transition_to_finish(reason);
             send_react_phase_event(live_tx, &phase_state.react_ctx, "finish").await;
         }
         agent::FinishDecision::Defer(hint) => {
+            phase_state.results_origin_query = None;
             phase_state.finish_gate_deferred_once = true;
             phase_state.finish_gate_hint = Some(hint);
             send_react_phase_event(live_tx, &phase_state.react_ctx, "analyze").await;
@@ -1520,12 +1705,20 @@ async fn record_tool_result(
         return AgentPhaseControl::Break;
     }
 
+    let trace = tools::build_tool_execution_trace(&tc.function.name, effective_args);
+    let call_summary = trace
+        .as_ref()
+        .and_then(agent::ToolExecutionTrace::summary)
+        .map(str::to_string);
+
     phase_state.collected_results.push(agent::ToolResultEntry {
         id: tc.id.clone(),
         name: tc.function.name.clone(),
         duration_ms: result.duration_ms,
         is_error: result.is_error,
         result: result.output.clone(),
+        call_summary,
+        trace,
     });
 
     {
@@ -1583,9 +1776,343 @@ async fn record_tool_result(
     AgentPhaseControl::Continue
 }
 
+#[cfg(test)]
+fn summarize_effective_tool_args(tool_name: &str, effective_args: Option<&str>) -> Option<String> {
+    tools::build_tool_execution_trace(tool_name, effective_args)
+        .and_then(|trace| trace.summary().map(str::to_string))
+}
+
 async fn finish_act_phase(live_tx: &LiveTx, phase_state: &mut AgentPhaseState, tc_count: usize) {
     phase_state.react_ctx.transition_to_observe(tc_count);
     send_react_phase_event(live_tx, &phase_state.react_ctx, "observe").await;
+}
+
+async fn update_working_state(
+    ctx: &AgentRunCtx<'_>,
+    phase_state: &mut AgentPhaseState,
+    summaries: &[agent::ObservationSummary],
+) {
+    let config = ctx.state.config();
+    let session_data = {
+        let sessions = ctx.state.sessions.lock().await;
+        sessions
+            .get(ctx.current_session_id)
+            .map(|session| WorkingStateSessionData {
+                latest_query: latest_user_query_from_messages(&session.messages),
+                workspace: session.workspace.clone(),
+                fallback_model: session.effective_model(&config.model).to_string(),
+            })
+    };
+
+    let latest_query = session_data
+        .as_ref()
+        .and_then(|session| session.latest_query.clone());
+    let working_query = phase_state
+        .results_origin_query
+        .clone()
+        .or(latest_query.clone());
+    phase_state
+        .working_state
+        .seed_from_query(working_query.as_deref());
+    if let Some(session) = session_data.as_ref() {
+        if !phase_state.collected_results.is_empty() {
+            refresh_retrieved_task_memory(
+                phase_state,
+                &session.workspace,
+                config.structured_memory,
+                working_query.as_deref(),
+                true,
+            );
+        }
+    } else {
+        phase_state.retrieved_task_memory = None;
+        phase_state.retrieved_task_memory_key = None;
+        phase_state.retrieved_task_memory_cycle = None;
+    }
+
+    agent::apply_rule_based_working_state_update_with_memory(
+        &mut phase_state.working_state,
+        &phase_state.collected_results,
+        phase_state.retrieved_task_memory.as_ref(),
+    );
+
+    if !phase_state.collected_results.is_empty()
+        && let Some(session) = session_data.as_ref()
+    {
+        refresh_retrieved_task_memory(
+            phase_state,
+            &session.workspace,
+            config.structured_memory,
+            working_query.as_deref(),
+            false,
+        );
+    }
+
+    if !agent::should_trigger_state_digest(&phase_state.collected_results) {
+        return;
+    }
+
+    let Some(session) = session_data else {
+        return;
+    };
+
+    if config.enable_state_digest {
+        let model = config.fast_model.clone().unwrap_or(session.fallback_model);
+
+        if let Some(delta) = summarize_working_state_with_llm(
+            ctx,
+            config.as_ref(),
+            &phase_state.working_state,
+            working_query.as_deref(),
+            summaries,
+            &phase_state.collected_results,
+            phase_state.retrieved_task_memory.as_ref(),
+            &model,
+            &session.workspace,
+        )
+        .await
+        {
+            agent::merge_state_digest_delta(&mut phase_state.working_state, delta);
+        }
+    }
+}
+
+async fn summarize_working_state_with_llm(
+    ctx: &AgentRunCtx<'_>,
+    config: &Config,
+    state: &agent::WorkingState,
+    latest_query: Option<&str>,
+    summaries: &[agent::ObservationSummary],
+    results: &[agent::ToolResultEntry],
+    task_memory: Option<&memory::RetrievedTaskMemory>,
+    model: &str,
+    workspace: &std::path::Path,
+) -> Option<agent::StateDigestDelta> {
+    let user_prompt = build_working_state_digest_user_prompt(
+        state,
+        latest_query,
+        summaries,
+        results,
+        task_memory,
+    )?;
+
+    let messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some(
+                "You are updating an agent working state after tool observations.\n\
+                 Return ONLY valid JSON matching this schema:\n\
+                 {\"completed_steps\":[\"...\"],\"evidence_add\":[{\"claim\":\"...\",\"source_tool\":\"...\",\"source_ref\":\"...\",\"confidence\":\"Low|Medium|High\"}],\"open_questions\":[\"...\"],\"uncertainties_add\":[{\"topic\":\"...\",\"reason\":\"...\",\"blocking\":true}],\"next_actions\":[\"...\"],\"ready_to_finish\":false}\n\
+                 Rules:\n\
+                 - Keep items concise and specific.\n\
+                 - Only add new evidence or unresolved uncertainties.\n\
+                 - Prefer High confidence for direct tool findings, Medium for strong inferences, Low for tentative ideas.\n\
+                 - Use the same language as the conversation.\n\
+                 - Do not include markdown fences or explanations."
+                    .into(),
+            ),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some(user_prompt),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    ];
+
+    let resolved = config.resolve_model(model);
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        providers::call_llm_simple_with_usage(
+            &ctx.state.http,
+            &resolved,
+            &messages,
+            workspace,
+            config.s3.as_ref(),
+            config.max_llm_retries,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            report_working_state_digest_issue(
+                ctx.live_tx,
+                model,
+                WorkingStateDigestIssue::ProviderError(error.to_string()),
+            )
+            .await;
+            return None;
+        }
+        Err(_) => {
+            report_working_state_digest_issue(ctx.live_tx, model, WorkingStateDigestIssue::Timeout)
+                .await;
+            return None;
+        }
+    };
+
+    let provider_name = config.resolve_provider_name(model);
+    let input_tokens = response.input_tokens.unwrap_or_else(|| {
+        crate::estimate_tokens_for_provider(resolved.provider, &messages) as u64
+    });
+    let output_tokens = response.output_tokens.unwrap_or_else(|| {
+        crate::message_token_len_for_provider(
+            resolved.provider,
+            &ChatMessage {
+                role: "assistant".into(),
+                content: Some(response.content.clone()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+        ) as u64
+    });
+    {
+        let mut sessions = ctx.state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(ctx.current_session_id) {
+            crate::update_session_token_usage_with_provider(
+                session,
+                input_tokens,
+                output_tokens,
+                token_usage_source(response.input_tokens),
+                token_usage_source(response.output_tokens),
+                Some(&provider_name),
+                Some(crate::context::USAGE_ROLE_CONTEXT),
+            );
+        }
+    }
+
+    let content = crate::strip_json_fences(response.content.trim());
+    match serde_json::from_str::<agent::StateDigestDelta>(content) {
+        Ok(delta) => Some(delta),
+        Err(error) => {
+            report_working_state_digest_issue(
+                ctx.live_tx,
+                model,
+                WorkingStateDigestIssue::InvalidJson(format!(
+                    "{error}; content={}",
+                    crate::truncate(content, 200)
+                )),
+            )
+            .await;
+            None
+        }
+    }
+}
+
+async fn report_working_state_digest_issue(
+    live_tx: &LiveTx,
+    model: &str,
+    issue: WorkingStateDigestIssue,
+) {
+    let (reason, detail, content) = match issue {
+        WorkingStateDigestIssue::ProviderError(error) => (
+            "provider_error",
+            Some(error.clone()),
+            format!(
+                "Working state digest failed on `{model}`; continuing with rule-based state tracking."
+            ),
+        ),
+        WorkingStateDigestIssue::Timeout => (
+            "timeout",
+            None,
+            format!(
+                "Working state digest timed out on `{model}`; continuing with rule-based state tracking."
+            ),
+        ),
+        WorkingStateDigestIssue::InvalidJson(error) => (
+            "invalid_json",
+            Some(error.clone()),
+            format!(
+                "Working state digest returned invalid JSON on `{model}`; continuing with rule-based state tracking."
+            ),
+        ),
+    };
+
+    if let Some(detail) = detail.as_deref() {
+        eprintln!("Working state digest {reason} (non-critical): {detail}");
+    } else {
+        eprintln!("Working state digest {reason} (non-critical)");
+    }
+
+    let mut event = json!({
+        "type": "system",
+        "level": "warning",
+        "source": "working_state_digest",
+        "reason": reason,
+        "model": model,
+        "content": content,
+    });
+    if let Some(detail) = detail {
+        event["detail"] = serde_json::Value::String(crate::truncate(&detail, 240));
+    }
+    let _ = live_send(live_tx, event).await;
+}
+
+fn build_working_state_digest_user_prompt(
+    state: &agent::WorkingState,
+    latest_query: Option<&str>,
+    summaries: &[agent::ObservationSummary],
+    results: &[agent::ToolResultEntry],
+    task_memory: Option<&memory::RetrievedTaskMemory>,
+) -> Option<String> {
+    let state_json = serde_json::to_string_pretty(state).ok()?;
+    let summary_text = if summaries.is_empty() {
+        "none".to_string()
+    } else {
+        summaries
+            .iter()
+            .map(|summary| format!("- {}: {}", summary.tool_name, summary.hint))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let result_text = results
+        .iter()
+        .map(|result| {
+            format!(
+                "### {} [{} | {}ms | {}]{}\n{}",
+                result.name,
+                result.id,
+                result.duration_ms,
+                if result.is_error { "error" } else { "ok" },
+                result
+                    .call_summary
+                    .as_deref()
+                    .map(|summary| format!("\nCall: {summary}"))
+                    .unwrap_or_default(),
+                crate::truncate(&result.result, 900)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    let task_memory_text = task_memory
+        .and_then(|selection| memory::format_task_memory_for_prompt(selection, state.intent))
+        .unwrap_or_else(|| "none".to_string());
+
+    Some(crate::truncate(
+        &format!(
+            "Latest user goal:\n{}\n\nRelevant past experience:\n{}\n\nCurrent working state:\n```json\n{}\n```\n\nObservation summaries:\n{}\n\nTool results:\n{}",
+            latest_query.unwrap_or("(none)"),
+            task_memory_text,
+            state_json,
+            summary_text,
+            result_text
+        ),
+        6_000,
+    ))
 }
 
 async fn run_analyze_phase(
@@ -2096,12 +2623,12 @@ async fn run_observe_phase(
         .rev()
         .take_while(|r| r.is_error)
         .count();
-    phase_state.last_observation_summary_count = summaries.len();
-    phase_state.last_consecutive_tool_errors = consecutive_errors;
+    update_working_state(ctx, phase_state, &summaries).await;
     phase_state.finish_gate_deferred_once = false;
     phase_state.last_observation_hint =
         agent::build_observation_context_hint(&summaries, consecutive_errors);
     phase_state.collected_results.clear();
+    phase_state.results_origin_query = None;
 
     // Debounced incremental save: skip if saved recently, finish phase always saves.
     let should_save = phase_state
@@ -2381,12 +2908,15 @@ pub(crate) async fn run_agent_session(
         round: 0,
         pending_tool_calls: Vec::new(),
         collected_results: Vec::new(),
+        results_origin_query: None,
+        working_state: agent::WorkingState::default(),
+        retrieved_task_memory: None,
+        retrieved_task_memory_key: None,
+        retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
         last_observation_hint: None,
         finish_gate_hint: None,
         finish_gate_deferred_once: false,
-        last_observation_summary_count: 0,
-        last_consecutive_tool_errors: 0,
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(show_react),
         shutting_down: false,

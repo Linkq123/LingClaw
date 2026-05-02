@@ -129,6 +129,7 @@ async fn status_command_reports_runtime_request_estimate() {
 
             daily_reflection: false,
             s3: None,
+        enable_state_digest: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -268,6 +269,7 @@ async fn status_command_uses_live_round_for_auto_think_estimate() {
 
             daily_reflection: false,
             s3: None,
+        enable_state_digest: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -381,6 +383,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
 
             daily_reflection: false,
             s3: None,
+        enable_state_digest: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -503,6 +506,7 @@ async fn switch_command_is_blocked_in_single_session_mode() {
 
             daily_reflection: false,
             s3: None,
+        enable_state_digest: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -576,6 +580,7 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
 
             daily_reflection: false,
             s3: None,
+        enable_state_digest: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -691,6 +696,7 @@ async fn memory_command_rejects_unknown_subcommand() {
 
             daily_reflection: false,
             s3: None,
+        enable_state_digest: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -825,6 +831,7 @@ async fn reflection_command_disabled_shows_hint() {
             structured_memory: false,
             daily_reflection: false,
             s3: None,
+        enable_state_digest: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -956,6 +963,7 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
         structured_memory: false,
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let state = AppState {
@@ -1132,6 +1140,7 @@ async fn reflection_command_disabled_allows_read_today() {
             structured_memory: false,
             daily_reflection: false,
             s3: None,
+        enable_state_digest: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1264,6 +1273,7 @@ async fn reflection_command_enabled_shows_status() {
             structured_memory: false,
             daily_reflection: true,
             s3: None,
+        enable_state_digest: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1408,6 +1418,7 @@ async fn reflection_command_today_shows_content() {
             structured_memory: false,
             daily_reflection: true,
             s3: None,
+        enable_state_digest: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1558,6 +1569,7 @@ async fn reflection_command_today_filters_out_new_summaries() {
             structured_memory: false,
             daily_reflection: true,
             s3: None,
+        enable_state_digest: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1711,6 +1723,7 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
             structured_memory: false,
             daily_reflection: true,
             s3: None,
+        enable_state_digest: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -1867,6 +1880,7 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
             structured_memory: false,
             daily_reflection: true,
             s3: None,
+        enable_state_digest: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -2000,6 +2014,7 @@ async fn reflection_command_invalid_arg_shows_usage() {
             structured_memory: false,
             daily_reflection: true,
             s3: None,
+        enable_state_digest: true,
         })),
         http: reqwest::Client::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),

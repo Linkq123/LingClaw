@@ -49,6 +49,7 @@ fn test_config() -> Config {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     }
 }
 
@@ -437,6 +438,7 @@ fn resolve_model_uses_config_for_plain_model_id() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let resolved = config.resolve_model("gpt-4o-mini");
@@ -1528,6 +1530,7 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let resolved = config.resolve_model("llama3.2");
@@ -1608,6 +1611,7 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     assert!(crate::cli::is_default_model_row(
@@ -1694,6 +1698,7 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -1772,6 +1777,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -1850,6 +1856,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_anthropic_provider_type() 
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -1928,6 +1935,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_ollama_provider_type() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let resolved = config.resolve_model("qwen3");
@@ -1990,6 +1998,7 @@ fn canonical_model_ref_expands_unique_plain_id() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let canonical = config
@@ -2067,6 +2076,7 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let err = config
@@ -2146,6 +2156,7 @@ fn available_models_omits_ambiguous_plain_default_alias() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let available = config.available_models();
@@ -2205,6 +2216,7 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let err = config
@@ -2264,6 +2276,7 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let canonical = config
@@ -2303,6 +2316,7 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let canonical = config
@@ -2342,6 +2356,7 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let resolved = config.resolve_model("anthropic/claude-sonnet-4-20250514");
@@ -2381,6 +2396,7 @@ fn resolve_model_accepts_ollama_prefix_without_provider_config() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let resolved = config.resolve_model("ollama/llama3.2");
@@ -2440,6 +2456,7 @@ fn build_session_status_reports_resolved_target() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
     let mut session = test_session("abc", "Test", Some("anthropic/claude-sonnet-4-20250514"));
     session.think_level = "medium".to_string();
@@ -4051,6 +4068,8 @@ fn observation_summaries_are_independent_of_session_messages() {
             result: "short".into(),
             duration_ms: 0,
             is_error: false,
+            call_summary: None,
+            trace: None,
         },
         agent::ToolResultEntry {
             id: "c2".into(),
@@ -4058,6 +4077,8 @@ fn observation_summaries_are_independent_of_session_messages() {
             result: "z\n".repeat(3000),
             duration_ms: 0,
             is_error: false,
+            call_summary: None,
+            trace: None,
         },
     ];
 
@@ -6479,6 +6500,8 @@ fn observation_summary_includes_error_tools() {
             result: "short ok".into(),
             duration_ms: 5,
             is_error: false,
+            call_summary: None,
+            trace: None,
         },
         agent::ToolResultEntry {
             id: "err".into(),
@@ -6486,6 +6509,8 @@ fn observation_summary_includes_error_tools() {
             result: "exec error: command not found".into(),
             duration_ms: 10,
             is_error: true,
+            call_summary: None,
+            trace: None,
         },
     ];
     let summaries = agent::summarize_observations(&results);
@@ -6622,10 +6647,10 @@ fn truncate_ascii_at_boundary() {
 
 #[test]
 fn truncate_utf8_multibyte_boundary() {
-    let s = "\u{4f60}\u{597d}\u{4e16}\u{754c}"; // 12 bytes (3 per char)
+    let s = "你好世界"; // 12 bytes (3 per char)
     let result = truncate(s, 7); // mid-char boundary
     // Should cut at char boundary <= 7, which is 6 (after first 2 chars)
-    assert!(result.starts_with("\u{4f60}\u{597d}"));
+    assert!(result.starts_with("你好"));
     assert!(result.contains("[truncated at 6 bytes"));
 }
 
@@ -6640,9 +6665,9 @@ fn truncate_emoji_boundary() {
 #[test]
 fn truncate_safe_preserves_char_boundary() {
     // CJK: 3 bytes per char. Cutting at 7 must round down to 6.
-    let mut s = "\u{4f60}\u{597d}\u{4e16}".to_string(); // 9 bytes
+    let mut s = "你好世".to_string(); // 9 bytes
     truncate_safe(&mut s, 7);
-    assert_eq!(s, "\u{4f60}\u{597d}");
+    assert_eq!(s, "你好");
 
     // Emoji: 4 bytes per char. Cutting at 5 must round down to 4.
     let mut s = "\u{1F980}\u{1F980}".to_string(); // 8 bytes
@@ -6999,6 +7024,7 @@ fn context_input_budget_reserves_headroom() {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     };
 
     let budget = context_input_budget_for_model(&config, "anthropic/claude-sonnet-4-20250514");

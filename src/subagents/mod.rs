@@ -20,10 +20,11 @@ pub(crate) mod executor;
 pub(crate) mod orchestrator;
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 
-/// Reserved for future task-level workspace isolation work.
-#[allow(dead_code)]
-pub(crate) const MAX_CONCURRENT_SUBAGENTS: usize = 3;
+const AGENT_FULL_DISPLAY_THRESHOLD: usize = 4;
+const AGENT_TOP_N: usize = 3;
+const AGENT_RECOMMENDATION_TOP_N: usize = 3;
 
 /// Hard upper limit on sub-agent max_turns (prevents runaway custom agents).
 pub(crate) const MAX_AGENT_TURNS: usize = 50;
@@ -119,6 +120,7 @@ impl AgentSource {
 
 /// Render a sub-agent catalog section for injection into the system prompt.
 /// Returns `None` if no agents are discovered.
+#[cfg(test)]
 pub(crate) fn render_agents_catalog(agents: &[SubAgentSpec]) -> Option<String> {
     render_agents_catalog_with_query(agents, None)
 }
@@ -142,9 +144,6 @@ pub(crate) fn render_agents_catalog_with_query(
             .to_string(),
     );
     lines.push(String::new());
-
-    const AGENT_FULL_DISPLAY_THRESHOLD: usize = 4;
-    const AGENT_TOP_N: usize = 3;
 
     if agents.len() > AGENT_FULL_DISPLAY_THRESHOLD
         && let Some(query) = current_query
@@ -189,6 +188,258 @@ pub(crate) fn render_agents_catalog_with_query(
     Some(lines.join("\n"))
 }
 
+pub(crate) fn render_ranked_agent_recommendations(
+    agents: &[SubAgentSpec],
+    current_query: Option<&str>,
+    state: Option<&crate::agent::WorkingState>,
+) -> Option<String> {
+    let ranked = ranked_agents(agents, current_query, state);
+    if ranked.is_empty() {
+        return None;
+    }
+
+    let mut lines = vec!["## Suggested Sub-Agents".to_string()];
+    for (idx, (_score, agent)) in ranked.iter().take(AGENT_RECOMMENDATION_TOP_N).enumerate() {
+        let source_tag = agent.source.label();
+        if agent.description.is_empty() {
+            lines.push(format!(
+                "{}. **{}** [`{}`]",
+                idx + 1,
+                agent.name,
+                source_tag
+            ));
+        } else {
+            lines.push(format!(
+                "{}. **{}** [`{}`]: {}",
+                idx + 1,
+                agent.name,
+                source_tag,
+                agent.description
+            ));
+        }
+    }
+    Some(lines.join("\n"))
+}
+
+pub(crate) fn render_delegation_guidance(
+    agents: &[SubAgentSpec],
+    current_query: Option<&str>,
+    state: &crate::agent::WorkingState,
+) -> Option<String> {
+    if agents.is_empty() || state.ready_to_finish {
+        return None;
+    }
+
+    let open_questions = state
+        .open_questions
+        .iter()
+        .filter(|item| !item.trim().is_empty())
+        .count();
+    let next_actions = state
+        .next_actions
+        .iter()
+        .filter(|item| !item.trim().is_empty())
+        .count();
+    let blocking_topics = state
+        .uncertainties
+        .iter()
+        .filter(|item| item.blocking)
+        .filter_map(|item| {
+            let topic = item.topic.trim();
+            (!topic.is_empty()).then_some(topic.to_ascii_lowercase())
+        })
+        .collect::<HashSet<_>>()
+        .len();
+    let work_tracks = distinct_work_tracks(state);
+    let work_track_count = work_tracks.len();
+    let action_oriented = !matches!(state.intent, crate::agent::TaskIntent::Inform);
+    let goal_looks_multi_track = current_query
+        .into_iter()
+        .chain(state.primary_goal.as_deref())
+        .any(text_looks_multi_track);
+    let prefer_orchestrate =
+        action_oriented && agents.len() >= 2 && (blocking_topics >= 2 || work_track_count >= 2);
+    let prefer_task = !prefer_orchestrate
+        && (state.has_blocking_uncertainty() || next_actions > 0 || open_questions > 0);
+    if !prefer_task && !prefer_orchestrate {
+        return None;
+    }
+
+    let ranked = ranked_agents(agents, current_query, Some(state));
+    let mut lines = vec!["## Delegation Guidance".to_string()];
+    if prefer_orchestrate {
+        lines.push(
+            "- Prefer `orchestrate` if you want to split the remaining work into multiple independent or dependent strands."
+                .to_string(),
+        );
+    } else {
+        lines.push(
+            "- Prefer `task` if one focused delegated sub-problem would unblock progress faster than continuing locally."
+                .to_string(),
+        );
+    }
+    if state.has_blocking_uncertainty() {
+        lines.push(
+            "- A blocking uncertainty is still open, so the delegated task should aim to resolve that blocker rather than restating the current status."
+                .to_string(),
+        );
+    }
+    if work_track_count >= 2 {
+        lines.push(format!(
+            "- Distinct remaining work tracks detected: {}.",
+            work_track_count
+        ));
+    } else if goal_looks_multi_track {
+        lines.push(
+            "- The user goal itself looks multi-part, so keep delegated work scoped to one strand unless you truly need fan-out."
+                .to_string(),
+        );
+    }
+    if !ranked.is_empty() {
+        let suggested = ranked
+            .iter()
+            .take(2)
+            .map(|(_, agent)| format!("`{}`", agent.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("- Likely best-fit agents now: {suggested}"));
+    }
+
+    let handoff_items = work_tracks
+        .iter()
+        .take(2)
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    if !handoff_items.is_empty() {
+        lines.push("- Candidate handoffs:".to_string());
+        for item in handoff_items {
+            lines.push(format!("  - {item}"));
+        }
+    }
+
+    Some(lines.join("\n"))
+}
+
+fn text_looks_multi_track(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        " and ",
+        " as well as ",
+        " meanwhile ",
+        "同时",
+        "并且",
+        "以及",
+        "分别",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn distinct_work_tracks(state: &crate::agent::WorkingState) -> Vec<String> {
+    #[derive(Default)]
+    struct WorkTrack {
+        representative: String,
+        tokens: HashSet<String>,
+    }
+
+    let candidates = state
+        .uncertainties
+        .iter()
+        .filter(|item| item.blocking)
+        .filter_map(|item| {
+            let combined = format!("{} {}", item.topic.trim(), item.reason.trim())
+                .trim()
+                .to_string();
+            (!combined.is_empty()).then_some(combined)
+        })
+        .chain(state.open_questions.iter().cloned())
+        .chain(state.next_actions.iter().cloned())
+        .collect::<Vec<_>>();
+
+    let mut tracks: Vec<WorkTrack> = Vec::new();
+    for candidate in candidates {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let tokens = work_track_tokens(trimmed);
+        if tokens.is_empty() {
+            continue;
+        }
+        if let Some(existing) = tracks
+            .iter_mut()
+            .find(|track| work_track_tokens_overlap(&track.tokens, &tokens))
+        {
+            existing.tokens.extend(tokens);
+            continue;
+        }
+        tracks.push(WorkTrack {
+            representative: trimmed.to_string(),
+            tokens,
+        });
+    }
+
+    tracks
+        .into_iter()
+        .map(|track| track.representative)
+        .collect()
+}
+
+fn work_track_tokens(text: &str) -> HashSet<String> {
+    crate::tokenize_for_matching(&text.to_ascii_lowercase())
+        .into_iter()
+        .filter(|token| is_high_signal_work_track_token(token))
+        .collect()
+}
+
+fn is_high_signal_work_track_token(token: &str) -> bool {
+    (token.len() >= 4 || token.chars().any(|ch| !ch.is_ascii()))
+        && !matches!(
+            token,
+            "this"
+                | "that"
+                | "these"
+                | "those"
+                | "with"
+                | "from"
+                | "into"
+                | "onto"
+                | "before"
+                | "after"
+                | "while"
+                | "what"
+                | "when"
+                | "where"
+                | "which"
+                | "should"
+                | "could"
+                | "would"
+                | "retry"
+                | "retried"
+                | "replace"
+                | "replaced"
+                | "relevant"
+                | "smaller"
+                | "inspect"
+                | "first"
+                | "files"
+                | "file"
+                | "path"
+                | "paths"
+                | "command"
+                | "commands"
+                | "again"
+                | "继续"
+                | "接着"
+                | "下一步"
+                | "接下来"
+        )
+}
+
+fn work_track_tokens_overlap(left: &HashSet<String>, right: &HashSet<String>) -> bool {
+    left.iter().filter(|token| right.contains(*token)).count() >= 2
+}
+
 fn agent_relevance(agent: &SubAgentSpec, query_tokens: &[String]) -> usize {
     if query_tokens.is_empty() {
         return 0;
@@ -198,6 +449,137 @@ fn agent_relevance(agent: &SubAgentSpec, query_tokens: &[String]) -> usize {
         .iter()
         .filter(|token| !token.is_empty() && text.contains(token.as_str()))
         .count()
+}
+
+fn ranked_agents<'a>(
+    agents: &'a [SubAgentSpec],
+    current_query: Option<&str>,
+    state: Option<&crate::agent::WorkingState>,
+) -> Vec<(usize, &'a SubAgentSpec)> {
+    let query = build_agent_query(current_query, state);
+    let query_tokens = query
+        .as_deref()
+        .map(crate::tokenize_for_matching)
+        .unwrap_or_default();
+    if query_tokens.is_empty() {
+        return Vec::new();
+    }
+
+    let intent = state.map(|state| state.intent);
+    let mut ranked: Vec<(usize, &SubAgentSpec)> = agents
+        .iter()
+        .map(|agent| {
+            (
+                agent_relevance(agent, &query_tokens) + agent_intent_boost(agent, intent),
+                agent,
+            )
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.name.cmp(&b.1.name)));
+    if ranked.first().map(|(score, _)| *score).unwrap_or(0) == 0 {
+        return Vec::new();
+    }
+    ranked
+}
+
+fn build_agent_query(
+    current_query: Option<&str>,
+    state: Option<&crate::agent::WorkingState>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(query) = current_query
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+    {
+        parts.push(query.to_string());
+    }
+    if let Some(state) = state {
+        if let Some(goal) = state.primary_goal.as_deref()
+            && !goal.trim().is_empty()
+        {
+            parts.push(goal.trim().to_string());
+        }
+        parts.extend(
+            state
+                .open_questions
+                .iter()
+                .rev()
+                .map(|item| item.trim())
+                .filter(|item| !item.is_empty())
+                .take(2)
+                .map(str::to_string),
+        );
+        parts.extend(
+            state
+                .next_actions
+                .iter()
+                .rev()
+                .map(|item| item.trim())
+                .filter(|item| !item.is_empty())
+                .take(2)
+                .map(str::to_string),
+        );
+        parts.extend(
+            state
+                .uncertainties
+                .iter()
+                .rev()
+                .filter(|item| item.blocking)
+                .take(2)
+                .flat_map(|item| [item.topic.trim(), item.reason.trim()])
+                .filter(|item| !item.is_empty())
+                .map(str::to_string),
+        );
+    }
+
+    let combined = parts.join(" ");
+    let combined = combined.trim();
+    if combined.is_empty() {
+        None
+    } else {
+        Some(combined.to_string())
+    }
+}
+
+fn agent_intent_boost(agent: &SubAgentSpec, intent: Option<crate::agent::TaskIntent>) -> usize {
+    let Some(intent) = intent else {
+        return 0;
+    };
+    let text = format!("{} {}", agent.name, agent.description).to_ascii_lowercase();
+    let keywords: &[&str] = match intent {
+        crate::agent::TaskIntent::Inform => &["docs", "writer", "explain", "research"],
+        crate::agent::TaskIntent::Change => &[
+            "code",
+            "coder",
+            "implement",
+            "fix",
+            "patch",
+            "refactor",
+            "edit",
+        ],
+        crate::agent::TaskIntent::Investigate => &[
+            "review",
+            "debug",
+            "investigate",
+            "analy",
+            "inspect",
+            "trace",
+        ],
+        crate::agent::TaskIntent::Execute => &[
+            "run",
+            "ops",
+            "deploy",
+            "benchmark",
+            "build",
+            "release",
+            "test",
+        ],
+    };
+    if keywords.iter().any(|keyword| text.contains(keyword)) {
+        3
+    } else {
+        0
+    }
 }
 
 /// Filter the built-in tool specs according to sub-agent permissions.

@@ -302,7 +302,10 @@ fn deepseek_thinking_replay_needs_tool_turn_repair(message: &ChatMessage) -> boo
             .tool_calls
             .as_ref()
             .is_some_and(|tool_calls| !tool_calls.is_empty())
-        && message.thinking.as_deref().is_none_or(str::is_empty)
+        && match message.thinking.as_deref() {
+            None => true,
+            Some(thinking) => thinking.is_empty(),
+        }
 }
 
 fn deepseek_reasoning_replay_placeholder(has_tool_calls: bool) -> String {

@@ -33,6 +33,7 @@ fn test_config() -> Config {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     }
 }
 
@@ -329,12 +330,15 @@ async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
         round: 0,
         pending_tool_calls: Vec::new(),
         collected_results: Vec::new(),
+        results_origin_query: None,
+        working_state: agent::WorkingState::default(),
+        retrieved_task_memory: None,
+        retrieved_task_memory_key: None,
+        retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
         last_observation_hint: None,
         finish_gate_hint: None,
         finish_gate_deferred_once: false,
-        last_observation_summary_count: 0,
-        last_consecutive_tool_errors: 0,
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
@@ -411,6 +415,967 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
     }
 }
 
+fn temp_workspace(label: &str) -> PathBuf {
+    let unique = format!(
+        "lingclaw-runtime-loop-{label}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    std::env::temp_dir().join(unique)
+}
+
+#[test]
+fn append_dynamic_prompt_section_truncates_to_budget() {
+    let mut content = "system".to_string();
+    let mut remaining_budget = 72;
+    let appended = append_dynamic_prompt_section(
+        &mut content,
+        &mut remaining_budget,
+        "## Big Section\nThis section should be truncated because it is far too long for the remaining budget.",
+    );
+
+    assert!(appended);
+    assert_eq!(remaining_budget, 0);
+    assert!(content.contains("## Big Section"));
+    assert!(content.contains("dynamic context truncated"));
+}
+
+#[tokio::test]
+async fn report_working_state_digest_issue_emits_warning_event() {
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+
+    report_working_state_digest_issue(&live_tx, "fast-model", WorkingStateDigestIssue::Timeout)
+        .await;
+
+    let event = live_rx
+        .recv()
+        .await
+        .expect("digest warning event should be emitted");
+    assert_eq!(event["type"].as_str(), Some("system"));
+    assert_eq!(event["level"].as_str(), Some("warning"));
+    assert_eq!(event["source"].as_str(), Some("working_state_digest"));
+    assert_eq!(event["reason"].as_str(), Some("timeout"));
+    assert_eq!(event["model"].as_str(), Some("fast-model"));
+    assert!(
+        event["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("rule-based state tracking"))
+    );
+}
+
+#[tokio::test]
+async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections() {
+    let state = Arc::new(test_app_state());
+    let session_id = "dynamic-budget-session".to_string();
+    let workspace = temp_workspace("dynamic-budget");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("investigate the timeout path and summarize the result".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = AgentPhaseState {
+        round: 0,
+        pending_tool_calls: Vec::new(),
+        collected_results: Vec::new(),
+        results_origin_query: None,
+        working_state: agent::WorkingState::default(),
+        retrieved_task_memory: None,
+        retrieved_task_memory_key: None,
+        retrieved_task_memory_cycle: None,
+        cycle_workspace: PathBuf::new(),
+        last_observation_hint: Some(format!("## Observation Hint\n{}", "A".repeat(1_400))),
+        finish_gate_hint: Some(format!("## Finish Check\n{}", "B".repeat(1_400))),
+        finish_gate_deferred_once: false,
+        pending_interventions: Vec::new(),
+        react_ctx: agent::AgentLoopCtx::new(false),
+        shutting_down: false,
+        run_stopped: false,
+        run_detached: false,
+        last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
+    };
+
+    phase_state.working_state.seed_from_query(Some(
+        "investigate the timeout path and summarize the result",
+    ));
+    for idx in 0..8 {
+        phase_state
+            .working_state
+            .completed_steps
+            .push(format!("completed step {idx}: {}", "C".repeat(180)));
+        phase_state
+            .working_state
+            .evidence
+            .push(agent::EvidenceItem {
+                claim: format!("evidence item {idx}: {}", "D".repeat(180)),
+                source_tool: "search_files".into(),
+                source_ref: format!("src/runtime_loop_{idx}.rs"),
+                confidence: agent::EvidenceConfidence::High,
+            });
+    }
+    phase_state.working_state.open_questions = vec![
+        format!("open question one: {}", "E".repeat(180)),
+        format!("open question two: {}", "E".repeat(180)),
+        format!("open question three: {}", "E".repeat(180)),
+    ];
+    phase_state.working_state.next_actions = vec![
+        format!("next action one: {}", "F".repeat(180)),
+        format!("next action two: {}", "F".repeat(180)),
+        format!("next action three: {}", "F".repeat(180)),
+    ];
+
+    prepare_analyze_snapshot(&ctx, &mut phase_state)
+        .await
+        .expect("snapshot should be prepared");
+
+    let prompt = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .and_then(|session| session.messages.first())
+            .and_then(|message| message.content.clone())
+            .expect("system prompt should be present")
+    };
+
+    assert!(prompt.contains("## Observation Hint"));
+    assert!(prompt.contains("## Finish Check"));
+    assert!(prompt.contains("## Task State"));
+    assert_eq!(prompt.matches(DYNAMIC_PROMPT_TRUNCATION_MARKER).count(), 1);
+    assert!(!prompt.contains("## Working Method"));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn prepare_analyze_snapshot_preserves_finish_hint_when_budget_skips_it() {
+    let state = Arc::new(test_app_state());
+    let session_id = "finish-hint-budget-session".to_string();
+    let workspace = temp_workspace("finish-hint-budget");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("investigate the timeout path and summarize the result".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = AgentPhaseState {
+        round: 0,
+        pending_tool_calls: Vec::new(),
+        collected_results: Vec::new(),
+        results_origin_query: None,
+        working_state: agent::WorkingState::default(),
+        retrieved_task_memory: None,
+        retrieved_task_memory_key: None,
+        retrieved_task_memory_cycle: None,
+        cycle_workspace: PathBuf::new(),
+        last_observation_hint: Some(format!("## Observation Hint\n{}", "A".repeat(5_000))),
+        finish_gate_hint: Some("## Finish Check\nUse the concrete findings in your answer.".into()),
+        finish_gate_deferred_once: false,
+        pending_interventions: Vec::new(),
+        react_ctx: agent::AgentLoopCtx::new(false),
+        shutting_down: false,
+        run_stopped: false,
+        run_detached: false,
+        last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
+    };
+
+    prepare_analyze_snapshot(&ctx, &mut phase_state)
+        .await
+        .expect("snapshot should be prepared");
+
+    let prompt = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .and_then(|session| session.messages.first())
+            .and_then(|message| message.content.clone())
+            .expect("system prompt should be present")
+    };
+
+    assert!(prompt.contains("## Observation Hint"));
+    assert!(!prompt.contains("## Finish Check"));
+    assert!(phase_state.last_observation_hint.is_none());
+    assert!(phase_state.finish_gate_hint.is_some());
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn update_working_state_keeps_results_attached_to_their_original_query() {
+    let state = Arc::new(test_app_state());
+    let session_id = "result-query-session".to_string();
+    let mut session = test_session(&session_id, "Main", None);
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("inspect the timeout wiring".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("benchmark the timeout path instead".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = AgentPhaseState {
+        round: 0,
+        pending_tool_calls: Vec::new(),
+        collected_results: vec![agent::ToolResultEntry {
+            id: "c1".into(),
+            name: "read_file".into(),
+            result: "timeout_ms = 45".into(),
+            duration_ms: 3,
+            is_error: false,
+            call_summary: Some("read `src/runtime.rs`".into()),
+            trace: None,
+        }],
+        results_origin_query: Some("inspect the timeout wiring".into()),
+        working_state: agent::WorkingState::default(),
+        retrieved_task_memory: None,
+        retrieved_task_memory_key: None,
+        retrieved_task_memory_cycle: None,
+        cycle_workspace: PathBuf::new(),
+        last_observation_hint: None,
+        finish_gate_hint: None,
+        finish_gate_deferred_once: false,
+        pending_interventions: Vec::new(),
+        react_ctx: agent::AgentLoopCtx::new(false),
+        shutting_down: false,
+        run_stopped: false,
+        run_detached: false,
+        last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
+    };
+
+    update_working_state(&ctx, &mut phase_state, &[]).await;
+
+    assert_eq!(
+        phase_state.working_state.primary_goal.as_deref(),
+        Some("inspect the timeout wiring")
+    );
+    assert_eq!(
+        phase_state.working_state.intent,
+        agent::TaskIntent::Investigate
+    );
+    assert!(phase_state.working_state.evidence.iter().any(|item| {
+        item.claim.contains("Observed file content") && item.claim.contains("timeout_ms = 45")
+    }));
+}
+
+#[tokio::test]
+async fn update_working_state_reuses_same_cycle_task_memory_selection() {
+    let state = Arc::new(test_app_state());
+    {
+        let mut guard = state.config.lock().expect("config lock");
+        let mut config = (**guard).clone();
+        config.structured_memory = true;
+        *guard = Arc::new(config);
+    }
+
+    let session_id = "same-cycle-task-memory-session".to_string();
+    let workspace = temp_workspace("same-cycle-task-memory");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+    memory::save_structured_memory(
+        &workspace,
+        &memory::StructuredMemory {
+            lessons: vec![memory::MemoryLesson {
+                title: "Lesson A".into(),
+                recommendation: "Keep the original memory selection".into(),
+                confidence: memory::MemoryConfidence::High,
+                last_seen_at: 10,
+                ..memory::MemoryLesson::default()
+            }],
+            ..memory::StructuredMemory::default()
+        },
+    )
+    .expect("structured memory should save");
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("fix the cargo workspace test flow".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = AgentPhaseState {
+        round: 0,
+        pending_tool_calls: Vec::new(),
+        collected_results: Vec::new(),
+        results_origin_query: None,
+        working_state: agent::WorkingState::default(),
+        retrieved_task_memory: None,
+        retrieved_task_memory_key: None,
+        retrieved_task_memory_cycle: None,
+        cycle_workspace: PathBuf::new(),
+        last_observation_hint: None,
+        finish_gate_hint: None,
+        finish_gate_deferred_once: false,
+        pending_interventions: Vec::new(),
+        react_ctx: agent::AgentLoopCtx::new(false),
+        shutting_down: false,
+        run_stopped: false,
+        run_detached: false,
+        last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
+    };
+
+    prepare_analyze_snapshot(&ctx, &mut phase_state)
+        .await
+        .expect("snapshot should be prepared");
+    let first_retrieved = phase_state
+        .retrieved_task_memory
+        .clone()
+        .expect("task memory should be available");
+    assert!(
+        first_retrieved
+            .lessons
+            .iter()
+            .any(|lesson| lesson.title == "Lesson A")
+    );
+
+    memory::save_structured_memory(
+        &workspace,
+        &memory::StructuredMemory {
+            lessons: vec![memory::MemoryLesson {
+                title: "Lesson B".into(),
+                recommendation: "This should not replace the same-cycle cache".into(),
+                confidence: memory::MemoryConfidence::High,
+                last_seen_at: 20,
+                ..memory::MemoryLesson::default()
+            }],
+            ..memory::StructuredMemory::default()
+        },
+    )
+    .expect("structured memory should save");
+
+    update_working_state(&ctx, &mut phase_state, &[]).await;
+
+    let reused = phase_state
+        .retrieved_task_memory
+        .as_ref()
+        .expect("task memory should still be available");
+    assert!(
+        reused
+            .lessons
+            .iter()
+            .any(|lesson| lesson.title == "Lesson A")
+    );
+    assert!(
+        !reused
+            .lessons
+            .iter()
+            .any(|lesson| lesson.title == "Lesson B")
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn update_working_state_refreshes_task_memory_after_state_changes() {
+    let state = Arc::new(test_app_state());
+    {
+        let mut guard = state.config.lock().expect("config lock");
+        let mut config = (**guard).clone();
+        config.structured_memory = true;
+        *guard = Arc::new(config);
+    }
+
+    let session_id = "post-update-task-memory-session".to_string();
+    let workspace = temp_workspace("post-update-task-memory");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+    memory::save_structured_memory(
+        &workspace,
+        &memory::StructuredMemory {
+            lessons: vec![
+                memory::MemoryLesson {
+                    title: "Entrypoint wiring".into(),
+                    recommendation: "Inspect src/main.rs first".into(),
+                    confidence: memory::MemoryConfidence::High,
+                    last_seen_at: 10,
+                    ..memory::MemoryLesson::default()
+                },
+                memory::MemoryLesson {
+                    title: "Timeout source".into(),
+                    recommendation: "src/runtime.rs owns timeout_ms".into(),
+                    confidence: memory::MemoryConfidence::High,
+                    last_seen_at: 20,
+                    ..memory::MemoryLesson::default()
+                },
+            ],
+            ..memory::StructuredMemory::default()
+        },
+    )
+    .expect("structured memory should save");
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("inspect the entrypoint wiring".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = AgentPhaseState {
+        round: 0,
+        pending_tool_calls: Vec::new(),
+        collected_results: vec![agent::ToolResultEntry {
+            id: "c1".into(),
+            name: "read_file".into(),
+            result: "timeout_ms = 45".into(),
+            duration_ms: 3,
+            is_error: false,
+            call_summary: Some("read `src/runtime.rs`".into()),
+            trace: Some(agent::ToolExecutionTrace {
+                summary: "read `src/runtime.rs`".into(),
+                path: Some("src/runtime.rs".into()),
+                ..agent::ToolExecutionTrace::default()
+            }),
+        }],
+        results_origin_query: Some("inspect the entrypoint wiring".into()),
+        working_state: agent::WorkingState::default(),
+        retrieved_task_memory: None,
+        retrieved_task_memory_key: None,
+        retrieved_task_memory_cycle: None,
+        cycle_workspace: PathBuf::new(),
+        last_observation_hint: None,
+        finish_gate_hint: None,
+        finish_gate_deferred_once: false,
+        pending_interventions: Vec::new(),
+        react_ctx: agent::AgentLoopCtx::new(false),
+        shutting_down: false,
+        run_stopped: false,
+        run_detached: false,
+        last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
+    };
+
+    update_working_state(&ctx, &mut phase_state, &[]).await;
+
+    let refreshed = phase_state
+        .retrieved_task_memory
+        .as_ref()
+        .expect("task memory should still be available");
+    assert!(
+        refreshed
+            .lessons
+            .iter()
+            .any(|lesson| lesson.title == "Timeout source")
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn prepare_analyze_snapshot_injects_fresh_task_state_each_time() {
+    let state = Arc::new(test_app_state());
+    let session_id = "task-state-session".to_string();
+    let workspace = temp_workspace("task-state");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("inspect the timeout wiring".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = AgentPhaseState {
+        round: 0,
+        pending_tool_calls: Vec::new(),
+        collected_results: Vec::new(),
+        results_origin_query: None,
+        working_state: agent::WorkingState::default(),
+        retrieved_task_memory: None,
+        retrieved_task_memory_key: None,
+        retrieved_task_memory_cycle: None,
+        cycle_workspace: PathBuf::new(),
+        last_observation_hint: None,
+        finish_gate_hint: None,
+        finish_gate_deferred_once: false,
+        pending_interventions: Vec::new(),
+        react_ctx: agent::AgentLoopCtx::new(false),
+        shutting_down: false,
+        run_stopped: false,
+        run_detached: false,
+        last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
+    };
+
+    phase_state
+        .working_state
+        .seed_from_query(Some("inspect the timeout wiring"));
+    phase_state
+        .working_state
+        .completed_steps
+        .push("step alpha".into());
+    prepare_analyze_snapshot(&ctx, &mut phase_state)
+        .await
+        .expect("snapshot should be prepared");
+
+    let first_prompt = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .and_then(|session| session.messages.first())
+            .and_then(|message| message.content.clone())
+            .expect("system prompt should be present")
+    };
+    assert!(first_prompt.contains("## Task State"));
+    assert!(first_prompt.contains("step alpha"));
+
+    phase_state.working_state.completed_steps.clear();
+    phase_state
+        .working_state
+        .completed_steps
+        .push("step beta".into());
+    prepare_analyze_snapshot(&ctx, &mut phase_state)
+        .await
+        .expect("snapshot should be prepared again");
+
+    let second_prompt = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .and_then(|session| session.messages.first())
+            .and_then(|message| message.content.clone())
+            .expect("system prompt should be present")
+    };
+    assert!(second_prompt.contains("step beta"));
+    assert!(!second_prompt.contains("step alpha"));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn prepare_analyze_snapshot_injects_retrieved_task_memory() {
+    let state = Arc::new(test_app_state());
+    {
+        let mut guard = state.config.lock().expect("config lock");
+        let mut config = (**guard).clone();
+        config.structured_memory = true;
+        *guard = Arc::new(config);
+    }
+
+    let session_id = "task-memory-session".to_string();
+    let workspace = temp_workspace("task-memory");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    memory::save_structured_memory(
+        &workspace,
+        &memory::StructuredMemory {
+            lessons: vec![memory::MemoryLesson {
+                title: "Rust test loop".into(),
+                when_to_apply: "before a full workspace pass".into(),
+                recommendation: "Run cargo check first".into(),
+                scope: "repo".into(),
+                confidence: memory::MemoryConfidence::High,
+                last_seen_at: 10,
+            }],
+            open_loops: vec![memory::OpenLoop {
+                goal: "stabilize workspace tests".into(),
+                blocker: "command choice is inconsistent".into(),
+                next_step: "standardize on cargo test --workspace".into(),
+                status: memory::OpenLoopStatus::Open,
+                updated_at: 20,
+            }],
+            project_signals: vec![memory::ProjectSignal {
+                key: "test_command".into(),
+                value: "cargo test --workspace".into(),
+                recorded_at: 30,
+            }],
+            command_patterns: vec![memory::CommandPattern {
+                signature: "cargo test --workspace".into(),
+                purpose: "validate the Rust workspace".into(),
+                outcome: "full regression signal".into(),
+                confidence: memory::MemoryConfidence::High,
+                last_seen_at: 40,
+            }],
+            ..memory::StructuredMemory::default()
+        },
+    )
+    .expect("structured memory should save");
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("fix the cargo workspace test flow".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = AgentPhaseState {
+        round: 0,
+        pending_tool_calls: Vec::new(),
+        collected_results: Vec::new(),
+        results_origin_query: None,
+        working_state: agent::WorkingState::default(),
+        retrieved_task_memory: None,
+        retrieved_task_memory_key: None,
+        retrieved_task_memory_cycle: None,
+        cycle_workspace: PathBuf::new(),
+        last_observation_hint: None,
+        finish_gate_hint: None,
+        finish_gate_deferred_once: false,
+        pending_interventions: Vec::new(),
+        react_ctx: agent::AgentLoopCtx::new(false),
+        shutting_down: false,
+        run_stopped: false,
+        run_detached: false,
+        last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
+    };
+
+    prepare_analyze_snapshot(&ctx, &mut phase_state)
+        .await
+        .expect("snapshot should be prepared");
+
+    let prompt = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .and_then(|session| session.messages.first())
+            .and_then(|message| message.content.clone())
+            .expect("system prompt should be present")
+    };
+
+    assert!(prompt.contains("## Relevant Past Experience"));
+    assert!(prompt.contains("Run cargo check first"));
+    assert!(prompt.contains("stabilize workspace tests"));
+    assert!(prompt.contains("## Tool Hints"));
+    assert!(prompt.contains("Prefer `exec`"));
+    assert!(prompt.contains("## Suggested Tool Order"));
+    assert!(prompt.contains("1. **exec**"));
+    assert!(phase_state.retrieved_task_memory.is_some());
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn prepare_analyze_snapshot_injects_agent_recommendations_and_delegation_guidance() {
+    let state = Arc::new(test_app_state());
+    let session_id = "delegation-guidance-session".to_string();
+    let workspace = temp_workspace("delegation-guidance");
+    std::fs::create_dir_all(workspace.join("agents/reviewer"))
+        .expect("reviewer agent dir should be created");
+    std::fs::create_dir_all(workspace.join("agents/benchmarker"))
+        .expect("benchmarker agent dir should be created");
+    prompts::init_session_prompt_files(&workspace);
+    std::fs::write(
+        workspace.join("agents/reviewer/AGENT.md"),
+        "---\nname: reviewer\ndescription: \"Code review and debugging specialist\"\n---\n\nReview code and debug failures.\n",
+    )
+    .expect("reviewer agent should be written");
+    std::fs::write(
+        workspace.join("agents/benchmarker/AGENT.md"),
+        "---\nname: benchmarker\ndescription: \"Benchmark and performance profiling specialist\"\n---\n\nProfile slow paths and compare regressions.\n",
+    )
+    .expect("benchmarker agent should be written");
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("debug the failing tests and profile the runtime timeout path".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = AgentPhaseState {
+        round: 0,
+        pending_tool_calls: Vec::new(),
+        collected_results: Vec::new(),
+        results_origin_query: None,
+        working_state: agent::WorkingState::default(),
+        retrieved_task_memory: None,
+        retrieved_task_memory_key: None,
+        retrieved_task_memory_cycle: None,
+        cycle_workspace: PathBuf::new(),
+        last_observation_hint: None,
+        finish_gate_hint: None,
+        finish_gate_deferred_once: false,
+        pending_interventions: Vec::new(),
+        react_ctx: agent::AgentLoopCtx::new(false),
+        shutting_down: false,
+        run_stopped: false,
+        run_detached: false,
+        last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
+    };
+
+    phase_state.working_state.seed_from_query(Some(
+        "debug the failing tests and profile the runtime timeout path",
+    ));
+    phase_state
+        .working_state
+        .next_actions
+        .push("Inspect the first failing workspace test.".into());
+    phase_state
+        .working_state
+        .next_actions
+        .push("Profile the timeout path in the runtime loop.".into());
+
+    prepare_analyze_snapshot(&ctx, &mut phase_state)
+        .await
+        .expect("snapshot should be prepared");
+
+    let prompt = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .and_then(|session| session.messages.first())
+            .and_then(|message| message.content.clone())
+            .expect("system prompt should be present")
+    };
+
+    assert!(prompt.contains("## Suggested Sub-Agents"));
+    assert!(prompt.contains("**reviewer**"));
+    assert!(prompt.contains("**benchmarker**"));
+    assert!(prompt.contains("## Delegation Guidance"));
+    assert!(prompt.contains("Prefer `orchestrate`"));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn build_working_state_digest_user_prompt_includes_retrieved_memory() {
+    let mut state = agent::WorkingState::default();
+    state.seed_from_query(Some("fix the cargo workspace test flow"));
+    let task_memory = memory::RetrievedTaskMemory {
+        lessons: vec![memory::MemoryLesson {
+            title: "Rust test loop".into(),
+            when_to_apply: "before a full workspace pass".into(),
+            recommendation: "Run cargo check first".into(),
+            scope: "repo".into(),
+            confidence: memory::MemoryConfidence::High,
+            last_seen_at: 10,
+        }],
+        ..memory::RetrievedTaskMemory::default()
+    };
+    let prompt = build_working_state_digest_user_prompt(
+        &state,
+        Some("fix the cargo workspace test flow"),
+        &[],
+        &[agent::ToolResultEntry {
+            id: "c1".into(),
+            name: "exec".into(),
+            result: "ok".into(),
+            duration_ms: 3,
+            is_error: false,
+            call_summary: Some("run `cargo test --workspace`".into()),
+            trace: None,
+        }],
+        Some(&task_memory),
+    )
+    .expect("prompt should build");
+
+    assert!(prompt.contains("Relevant past experience"));
+    assert!(prompt.contains("Rust test loop"));
+    assert!(prompt.contains("Run cargo check first"));
+    assert!(prompt.contains("Call: run `cargo test --workspace`"));
+}
+
+#[test]
+fn summarize_effective_tool_args_formats_exec_and_read_file_context() {
+    let exec = summarize_effective_tool_args(
+        "exec",
+        Some(r#"{"command":"cargo test --workspace","working_dir":"crates/core"}"#),
+    )
+    .expect("exec summary should render");
+    assert_eq!(exec, "run `cargo test --workspace` in `crates/core`");
+
+    let read = summarize_effective_tool_args(
+        "read_file",
+        Some(r#"{"path":"src/main.rs","start_line":10,"end_line":40}"#),
+    )
+    .expect("read_file summary should render");
+    assert_eq!(read, "read `src/main.rs` lines 10-40");
+}
+
 #[tokio::test]
 async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
     let state = Arc::new(test_app_state());
@@ -438,12 +1403,15 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
         round: 0,
         pending_tool_calls: Vec::new(),
         collected_results: Vec::new(),
+        results_origin_query: None,
+        working_state: agent::WorkingState::default(),
+        retrieved_task_memory: None,
+        retrieved_task_memory_key: None,
+        retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
         last_observation_hint: None,
         finish_gate_hint: None,
         finish_gate_deferred_once: false,
-        last_observation_summary_count: 0,
-        last_consecutive_tool_errors: 0,
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,

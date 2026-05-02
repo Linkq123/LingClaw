@@ -103,28 +103,32 @@ fn evaluate_finish_returns_correct_reasons() {
     assert_eq!(evaluate_finish(false, false), Some(FinishReason::Empty));
 }
 
+fn seeded_state(query: &str) -> WorkingState {
+    let mut state = WorkingState::default();
+    state.seed_from_query(Some(query));
+    state
+}
+
 #[test]
 fn finish_gate_defers_action_oriented_plan_only_reply_once() {
+    let state = seeded_state("optimize the repo performance and apply the changes");
     let decision = evaluate_finish_with_gate(
         true,
         false,
         &FinishGateContext {
-            cycles: 0,
-            total_tool_calls: 0,
-            has_observation_history: false,
-            latest_user_query: Some("optimize the repo performance and apply the changes"),
-            consecutive_errors: 0,
             finish_deferred_once: false,
             assistant_content: Some(
                 "I would start by reviewing the code and then optimize the hot path.",
             ),
+            memory_next_actions: &[],
+            working_state: &state,
         },
     );
 
     match decision {
         FinishDecision::Defer(hint) => {
             assert!(hint.contains("Finish Check"));
-            assert!(hint.contains("execution-oriented request"));
+            assert!(hint.contains("confirmed finding"));
         }
         _ => panic!("expected finish deferral for action-oriented plan-only reply"),
     }
@@ -132,17 +136,15 @@ fn finish_gate_defers_action_oriented_plan_only_reply_once() {
 
 #[test]
 fn finish_gate_allows_finish_after_single_deferral() {
+    let state = seeded_state("optimize the repo performance and apply the changes");
     let decision = evaluate_finish_with_gate(
         true,
         false,
         &FinishGateContext {
-            cycles: 0,
-            total_tool_calls: 0,
-            has_observation_history: false,
-            latest_user_query: Some("optimize the repo performance and apply the changes"),
-            consecutive_errors: 0,
             finish_deferred_once: true,
             assistant_content: Some("Here is the best answer I can provide."),
+            memory_next_actions: &[],
+            working_state: &state,
         },
     );
 
@@ -154,17 +156,15 @@ fn finish_gate_allows_finish_after_single_deferral() {
 
 #[test]
 fn finish_gate_does_not_defer_for_informational_file_question() {
+    let state = seeded_state("what does main.rs do?");
     let decision = evaluate_finish_with_gate(
         true,
         false,
         &FinishGateContext {
-            cycles: 0,
-            total_tool_calls: 0,
-            has_observation_history: false,
-            latest_user_query: Some("what does main.rs do?"),
-            consecutive_errors: 0,
             finish_deferred_once: false,
             assistant_content: Some("main.rs wires together the CLI entrypoints and runtime."),
+            memory_next_actions: &[],
+            working_state: &state,
         },
     );
 
@@ -175,18 +175,26 @@ fn finish_gate_does_not_defer_for_informational_file_question() {
 }
 
 #[test]
-fn finish_gate_allows_brief_answer_for_simple_query_after_observation() {
+fn finish_gate_allows_grounded_brief_answer_after_observation() {
+    let mut state = seeded_state("which file sets the timeout?");
+    state
+        .completed_steps
+        .push("search_files succeeded in 4ms (call c1).".into());
+    state.evidence.push(EvidenceItem {
+        claim: "Found code/reference match: src/config.rs: timeout_ms = 30".into(),
+        source_tool: "search_files".into(),
+        source_ref: "c1".into(),
+        confidence: EvidenceConfidence::High,
+    });
+    state.recompute_ready_to_finish();
     let decision = evaluate_finish_with_gate(
         true,
         false,
         &FinishGateContext {
-            cycles: 1,
-            total_tool_calls: 1,
-            has_observation_history: true,
-            latest_user_query: Some("which file sets the timeout?"),
-            consecutive_errors: 0,
             finish_deferred_once: false,
             assistant_content: Some("src/config.rs"),
+            memory_next_actions: &[],
+            working_state: &state,
         },
     );
 
@@ -197,41 +205,50 @@ fn finish_gate_allows_brief_answer_for_simple_query_after_observation() {
 }
 
 #[test]
-fn finish_gate_still_defers_brief_answer_for_complex_query_after_observation() {
+fn finish_gate_defers_generic_wrap_up_when_evidence_is_not_used() {
+    let mut state = seeded_state("optimize the repo performance and apply the changes");
+    state
+        .completed_steps
+        .push("search_files succeeded in 5ms (call c1).".into());
+    state.evidence.push(EvidenceItem {
+        claim: "Found code/reference match: src/runtime_loop.rs hot path allocates every cycle"
+            .into(),
+        source_tool: "search_files".into(),
+        source_ref: "c1".into(),
+        confidence: EvidenceConfidence::High,
+    });
+    state.recompute_ready_to_finish();
     let decision = evaluate_finish_with_gate(
         true,
         false,
         &FinishGateContext {
-            cycles: 1,
-            total_tool_calls: 2,
-            has_observation_history: true,
-            latest_user_query: Some("optimize the repo performance and apply the changes"),
-            consecutive_errors: 0,
             finish_deferred_once: false,
             assistant_content: Some("Done."),
+            memory_next_actions: &[],
+            working_state: &state,
         },
     );
 
     match decision {
         FinishDecision::Defer(hint) => {
-            assert!(hint.contains("Use it to produce a fuller result"));
+            assert!(hint.contains("concrete findings"));
+            assert!(hint.contains("Strongest evidence:"));
+            assert!(hint.contains("runtime_loop.rs"));
         }
-        _ => panic!("expected finish deferral for brief post-tool answer on complex query"),
+        _ => panic!("expected finish deferral for unsupported wrap-up"),
     }
 }
 
 #[test]
 fn finish_gate_does_not_treat_chinese_recommendation_as_uncertain() {
+    let state = seeded_state("next step");
     let decision = evaluate_finish_with_gate(
         true,
         false,
         &FinishGateContext {
-            cycles: 1,
-            total_tool_calls: 0,
-            has_observation_history: false,
-            latest_user_query: Some("接下来怎么处理？"),
-            consecutive_errors: 2,
             finish_deferred_once: false,
+            memory_next_actions: &[],
+            working_state: &state,
             assistant_content: Some("建议先清理缓存，再重新运行命令并检查第一条报错。"),
         },
     );
@@ -240,6 +257,484 @@ fn finish_gate_does_not_treat_chinese_recommendation_as_uncertain() {
         decision,
         FinishDecision::Finish(FinishReason::Complete)
     ));
+}
+
+#[test]
+fn finish_gate_defers_when_blocking_uncertainty_remains() {
+    let mut state = seeded_state("diagnose why the build is failing");
+    state.uncertainties.push(UncertaintyItem {
+        topic: "exec failure".into(),
+        reason: "cargo test failed before the target file was inspected".into(),
+        blocking: true,
+    });
+    state
+        .next_actions
+        .push("Try a smaller command or inspect the relevant files first.".into());
+    state.recompute_ready_to_finish();
+    let decision = evaluate_finish_with_gate(
+        true,
+        false,
+        &FinishGateContext {
+            finish_deferred_once: false,
+            assistant_content: Some("I need another pass."),
+            memory_next_actions: &[],
+            working_state: &state,
+        },
+    );
+
+    match decision {
+        FinishDecision::Defer(hint) => {
+            assert!(hint.contains("blocking uncertainty"));
+            assert!(hint.contains("Top blocker:"));
+            assert!(hint.contains("exec failure"));
+            assert!(hint.contains("cargo test failed before the target file was inspected"));
+            assert!(hint.contains("Suggested next actions"));
+            assert!(hint.contains("Try a smaller command or inspect the relevant files first."));
+        }
+        _ => panic!("expected finish deferral for blocking uncertainty"),
+    }
+}
+
+#[test]
+fn finish_gate_hint_includes_retrieved_memory_follow_ups() {
+    let state = seeded_state("implement a safer test flow");
+    let memory_actions = vec![
+        "Run cargo check before cargo test.".to_string(),
+        "Revisit 'windows install flow': remove the stale helper.".to_string(),
+    ];
+    let decision = evaluate_finish_with_gate(
+        true,
+        false,
+        &FinishGateContext {
+            finish_deferred_once: false,
+            assistant_content: Some("I would start by looking around."),
+            memory_next_actions: &memory_actions,
+            working_state: &state,
+        },
+    );
+
+    match decision {
+        FinishDecision::Defer(hint) => {
+            assert!(hint.contains("Suggested next actions"));
+            assert!(hint.contains("Run cargo check before cargo test."));
+            assert!(hint.contains("Relevant memory follow-ups"));
+            assert!(hint.contains("cargo check before cargo test"));
+        }
+        _ => panic!("expected finish deferral with memory-guided follow-up"),
+    }
+}
+
+#[test]
+fn task_intent_classifies_common_queries() {
+    assert_eq!(
+        TaskIntent::classify(Some("what does main.rs do?")),
+        TaskIntent::Inform
+    );
+    assert_eq!(
+        TaskIntent::classify(Some("implement retry handling in the CLI")),
+        TaskIntent::Change
+    );
+    assert_eq!(
+        TaskIntent::classify(Some("diagnose why cargo test is timing out")),
+        TaskIntent::Investigate
+    );
+    assert_eq!(
+        TaskIntent::classify(Some("run cargo test --workspace")),
+        TaskIntent::Execute
+    );
+}
+
+#[test]
+fn seed_from_query_refreshes_goal_and_intent_for_new_intervention() {
+    let mut state = seeded_state("what does config do?");
+    state
+        .completed_steps
+        .push("read_file succeeded in 2ms (call c1).".into());
+    state.evidence.push(EvidenceItem {
+        claim: "Observed file content: timeout_ms = 30".into(),
+        source_tool: "read_file".into(),
+        source_ref: "c1".into(),
+        confidence: EvidenceConfidence::High,
+    });
+    state.open_questions.push("Why is timeout_ms 30?".into());
+    state
+        .next_actions
+        .push("Check the timeout caller before concluding.".into());
+    state.uncertainties.push(UncertaintyItem {
+        topic: "timeout handling".into(),
+        reason: "the write path was not inspected yet".into(),
+        blocking: true,
+    });
+    state.recompute_ready_to_finish();
+    assert!(!state.ready_to_finish);
+
+    state.seed_from_query(Some("fix the timeout handling"));
+
+    assert_eq!(state.intent, TaskIntent::Change);
+    assert_eq!(
+        state.primary_goal.as_deref(),
+        Some("fix the timeout handling")
+    );
+    assert!(state.completed_steps.is_empty());
+    assert!(state.evidence.is_empty());
+    assert!(state.open_questions.is_empty());
+    assert!(state.next_actions.is_empty());
+    assert!(state.uncertainties.is_empty());
+    assert!(!state.ready_to_finish);
+}
+
+#[test]
+fn seed_from_query_preserves_state_for_follow_up_continuation_query() {
+    let mut state = seeded_state("fix the timeout handling");
+    state
+        .completed_steps
+        .push("execution progress: patch `src/config.rs` via patch_file in 3ms (call c1).".into());
+    state.evidence.push(EvidenceItem {
+        claim: "Observed file content: timeout_ms = 45".into(),
+        source_tool: "read_file".into(),
+        source_ref: "c2".into(),
+        confidence: EvidenceConfidence::High,
+    });
+    state.recompute_ready_to_finish();
+
+    state.seed_from_query(Some("next step"));
+
+    assert_eq!(state.intent, TaskIntent::Change);
+    assert_eq!(
+        state.primary_goal.as_deref(),
+        Some("fix the timeout handling")
+    );
+    assert_eq!(state.completed_steps.len(), 1);
+    assert_eq!(state.evidence.len(), 1);
+}
+
+#[test]
+fn seed_from_query_preserves_state_for_polite_or_particle_continuation_query() {
+    for query in ["continue please", "please continue", "继续一下"] {
+        let mut state = seeded_state("fix the timeout handling");
+        state.completed_steps.push(
+            "execution progress: patch `src/config.rs` via patch_file in 3ms (call c1).".into(),
+        );
+        state.evidence.push(EvidenceItem {
+            claim: "Observed file content: timeout_ms = 45".into(),
+            source_tool: "read_file".into(),
+            source_ref: "c2".into(),
+            confidence: EvidenceConfidence::High,
+        });
+        state.recompute_ready_to_finish();
+
+        state.seed_from_query(Some(query));
+
+        assert_eq!(
+            state.intent,
+            TaskIntent::Change,
+            "{query} should preserve intent"
+        );
+        assert_eq!(
+            state.primary_goal.as_deref(),
+            Some("fix the timeout handling"),
+            "{query} should preserve goal"
+        );
+        assert_eq!(
+            state.completed_steps.len(),
+            1,
+            "{query} should keep progress"
+        );
+        assert_eq!(state.evidence.len(), 1, "{query} should keep evidence");
+    }
+}
+
+#[test]
+fn seed_from_query_updates_goal_for_continuation_phrase_with_redirect() {
+    let mut state = seeded_state("fix the installer");
+    state
+        .completed_steps
+        .push("execution progress: patch `install.ps1` via patch_file in 3ms (call c1).".into());
+    state.uncertainties.push(UncertaintyItem {
+        topic: "installer cleanup".into(),
+        reason: "the timeout path has not been benchmarked yet".into(),
+        blocking: true,
+    });
+    state.recompute_ready_to_finish();
+
+    state.seed_from_query(Some("next step: benchmark the timeout path instead"));
+
+    assert_eq!(state.intent, TaskIntent::Execute);
+    assert_eq!(
+        state.primary_goal.as_deref(),
+        Some("next step: benchmark the timeout path instead")
+    );
+    assert!(state.completed_steps.is_empty());
+    assert!(state.uncertainties.is_empty());
+    assert!(!state.ready_to_finish);
+}
+
+#[test]
+fn seed_from_query_resets_state_for_short_change_redirect() {
+    let mut state = seeded_state("fix the installer");
+    state
+        .completed_steps
+        .push("execution progress: patch `install.ps1` via patch_file in 3ms (call c1).".into());
+    state.evidence.push(EvidenceItem {
+        claim: "Observed file content: install.ps1 writes the helper script".into(),
+        source_tool: "read_file".into(),
+        source_ref: "install.ps1".into(),
+        confidence: EvidenceConfidence::High,
+    });
+    state
+        .open_questions
+        .push("Should install.ps1 be retried?".into());
+    state.uncertainties.push(UncertaintyItem {
+        topic: "installer cleanup".into(),
+        reason: "the helper script still needs verification".into(),
+        blocking: true,
+    });
+    state.recompute_ready_to_finish();
+
+    state.seed_from_query(Some("fix the parser"));
+
+    assert_eq!(state.intent, TaskIntent::Change);
+    assert_eq!(state.primary_goal.as_deref(), Some("fix the parser"));
+    assert!(state.completed_steps.is_empty());
+    assert!(state.evidence.is_empty());
+    assert!(state.open_questions.is_empty());
+    assert!(state.uncertainties.is_empty());
+    assert!(!state.ready_to_finish);
+}
+
+#[test]
+fn text_mentions_short_single_token_anchor() {
+    assert!(text_mentions_anchor(
+        "Please inspect README before editing anything else.",
+        "README"
+    ));
+    assert!(!text_mentions_anchor(
+        "This note mentions timeouts and retries.",
+        "me"
+    ));
+}
+
+#[test]
+fn text_mentions_command_anchor_requires_exact_command_match() {
+    assert!(text_mentions_anchor(
+        "Run `cargo test --workspace -- --nocapture` before wrapping up.",
+        "cargo test --workspace"
+    ));
+    assert!(!text_mentions_anchor(
+        "Run `cargo check --workspace` before wrapping up.",
+        "cargo test --workspace"
+    ));
+}
+
+#[test]
+fn chinese_task_result_counts_as_action_and_change_progress() {
+    let mut change_state = seeded_state("修复安装脚本");
+    apply_rule_based_working_state_update(
+        &mut change_state,
+        &[ToolResultEntry {
+            id: "c1".into(),
+            name: "task".into(),
+            result:
+                "已修复并更新安装配置"
+                    .into(),
+            duration_ms: 20,
+            is_error: false,
+            call_summary: Some("delegate to `reviewer`".into()),
+            trace: Some(ToolExecutionTrace {
+                summary: "delegate to `reviewer`".into(),
+                agent: Some("reviewer".into()),
+                ..ToolExecutionTrace::default()
+            }),
+        }],
+    );
+    assert!(change_state.has_successful_change_trace());
+    assert!(change_state.ready_to_finish);
+
+    let mut execute_state =
+        seeded_state("运行工作区测试");
+    apply_rule_based_working_state_update(
+        &mut execute_state,
+        &[ToolResultEntry {
+            id: "c2".into(),
+            name: "task".into(),
+            result: "已执行并通过验证".into(),
+            duration_ms: 20,
+            is_error: false,
+            call_summary: Some("delegate to `reviewer`".into()),
+            trace: Some(ToolExecutionTrace {
+                summary: "delegate to `reviewer`".into(),
+                agent: Some("reviewer".into()),
+                ..ToolExecutionTrace::default()
+            }),
+        }],
+    );
+    assert!(execute_state.has_successful_execution_trace());
+    assert!(execute_state.ready_to_finish);
+}
+
+#[test]
+fn chinese_exec_success_text_counts_as_execution_progress_without_trace() {
+    let mut state = seeded_state("运行工作区测试");
+    apply_rule_based_working_state_update(
+        &mut state,
+        &[ToolResultEntry {
+            id: "c-exec".into(),
+            name: "exec".into(),
+            result:
+                "已通过测试并构建成功"
+                    .into(),
+            duration_ms: 20,
+            is_error: false,
+            call_summary: None,
+            trace: None,
+        }],
+    );
+
+    assert!(state.has_successful_execution_trace());
+    assert!(!state.has_successful_change_trace());
+    assert!(state.ready_to_finish);
+}
+
+#[test]
+fn token_looks_like_exact_value_rejects_alphanumeric_words() {
+    assert!(token_looks_like_exact_value("45"));
+    assert!(token_looks_like_exact_value("3ms"));
+    assert!(token_looks_like_exact_value("v2"));
+    assert!(!token_looks_like_exact_value("page2"));
+    assert!(!token_looks_like_exact_value("hello1"));
+}
+
+#[test]
+fn push_unique_evidence_dedupes_ephemeral_call_ids() {
+    let mut evidence = Vec::new();
+    push_unique_evidence(
+        &mut evidence,
+        EvidenceItem {
+            claim: "Observed file content: timeout_ms = 45".into(),
+            source_tool: "read_file".into(),
+            source_ref: "tool_call_1234567890_1".into(),
+            confidence: EvidenceConfidence::High,
+        },
+        WORKING_STATE_MAX_ITEMS,
+    );
+    push_unique_evidence(
+        &mut evidence,
+        EvidenceItem {
+            claim: "Observed file content: timeout_ms = 45".into(),
+            source_tool: "read_file".into(),
+            source_ref: "550e8400-e29b-41d4-a716-446655440000".into(),
+            confidence: EvidenceConfidence::High,
+        },
+        WORKING_STATE_MAX_ITEMS,
+    );
+
+    assert_eq!(evidence.len(), 1);
+}
+
+#[test]
+fn push_unique_evidence_keeps_distinct_stable_refs() {
+    let mut evidence = Vec::new();
+    push_unique_evidence(
+        &mut evidence,
+        EvidenceItem {
+            claim: "Observed file content: timeout_ms = 45".into(),
+            source_tool: "read_file".into(),
+            source_ref: "src/config.rs".into(),
+            confidence: EvidenceConfidence::High,
+        },
+        WORKING_STATE_MAX_ITEMS,
+    );
+    push_unique_evidence(
+        &mut evidence,
+        EvidenceItem {
+            claim: "Observed file content: timeout_ms = 45".into(),
+            source_tool: "read_file".into(),
+            source_ref: "src/runtime_loop.rs".into(),
+            confidence: EvidenceConfidence::High,
+        },
+        WORKING_STATE_MAX_ITEMS,
+    );
+
+    assert_eq!(evidence.len(), 2);
+}
+
+#[test]
+fn short_source_ref_does_not_false_positive_ground_finish_grounding() {
+    let mut state = seeded_state("which file sets the timeout?");
+    state.evidence.push(EvidenceItem {
+        claim: "Observed file content: timeout_ms = 45".into(),
+        source_tool: "read_file".into(),
+        source_ref: "c1".into(),
+        confidence: EvidenceConfidence::High,
+    });
+
+    assert!(!answer_is_grounded_in_state(
+        &state,
+        "I think c1 is probably enough to answer this."
+    ));
+}
+
+#[test]
+fn evidence_tokens_do_not_ground_answers_via_substring_overlap() {
+    let mut state = seeded_state("which file sets the timeout?");
+    state.evidence.push(EvidenceItem {
+        claim: "Found code/reference match: src/main.rs reports timeout_ms = 45".into(),
+        source_tool: "search_files".into(),
+        source_ref: "src/main.rs".into(),
+        confidence: EvidenceConfidence::High,
+    });
+
+    assert!(!answer_is_grounded_in_state(
+        &state,
+        "first try the cache and then retry the command"
+    ));
+}
+
+#[test]
+fn short_exact_value_answer_is_grounded_by_confirmed_evidence() {
+    let mut state = seeded_state("what timeout value was observed?");
+    state.evidence.push(EvidenceItem {
+        claim: "Observed file content: timeout_ms = 45".into(),
+        source_tool: "read_file".into(),
+        source_ref: "src/runtime.rs".into(),
+        confidence: EvidenceConfidence::High,
+    });
+
+    assert!(answer_is_grounded_in_state(&state, "45"));
+}
+
+#[test]
+fn long_generic_answer_is_not_grounded_without_evidence_overlap() {
+    let mut state = seeded_state("optimize the repo performance and apply the changes");
+    state.evidence.push(EvidenceItem {
+        claim: "Found code/reference match: src/runtime_loop.rs hot path allocates every cycle"
+            .into(),
+        source_tool: "search_files".into(),
+        source_ref: "src/runtime_loop.rs".into(),
+        confidence: EvidenceConfidence::High,
+    });
+
+    assert!(!answer_is_grounded_in_state(
+        &state,
+        "I reviewed the workspace carefully, compared several broad options, documented a few general ideas, and I think the safest path is to keep iterating methodically before making any final claim."
+    ));
+}
+
+#[test]
+fn merge_state_digest_delta_does_not_trust_optimistic_ready_flag() {
+    let mut state = seeded_state("implement retry handling in the CLI");
+
+    merge_state_digest_delta(
+        &mut state,
+        StateDigestDelta {
+            completed_steps: vec!["read src/retry.rs".into()],
+            ready_to_finish: true,
+            ..StateDigestDelta::default()
+        },
+    );
+
+    assert_eq!(state.completed_steps.len(), 1);
+    assert!(!state.ready_to_finish);
 }
 
 #[test]
@@ -277,6 +772,629 @@ fn auto_think_level_escalates_on_errors() {
 }
 
 #[test]
+fn rule_update_adds_completed_steps_and_evidence() {
+    let mut state = seeded_state("which file sets the timeout?");
+    apply_rule_based_working_state_update(
+        &mut state,
+        &[ToolResultEntry {
+            id: "c1".into(),
+            name: "search_files".into(),
+            result: "src/config.rs: timeout_ms = 30".into(),
+            duration_ms: 4,
+            is_error: false,
+            call_summary: None,
+            trace: None,
+        }],
+    );
+
+    assert_eq!(state.completed_steps.len(), 1);
+    assert_eq!(state.evidence.len(), 1);
+    assert!(state.ready_to_finish);
+}
+
+#[test]
+fn rule_update_does_not_treat_read_only_probe_as_change_completion() {
+    let mut state = seeded_state("implement retry handling in the CLI");
+    apply_rule_based_working_state_update(
+        &mut state,
+        &[ToolResultEntry {
+            id: "c1".into(),
+            name: "read_file".into(),
+            result: "fn retry() {}".into(),
+            duration_ms: 4,
+            is_error: false,
+            call_summary: Some("read `src/retry.rs`".into()),
+            trace: None,
+        }],
+    );
+
+    assert_eq!(state.completed_steps.len(), 1);
+    assert!(state.has_confirmed_evidence());
+    assert!(!state.ready_to_finish);
+}
+
+#[test]
+fn rule_update_does_not_treat_read_only_exec_as_change_completion() {
+    let mut state = seeded_state("implement retry handling in the CLI");
+    apply_rule_based_working_state_update(
+        &mut state,
+        &[ToolResultEntry {
+            id: "c1".into(),
+            name: "exec".into(),
+            result: "E:/work/workspace/vibe-coding/LingClaw".into(),
+            duration_ms: 4,
+            is_error: false,
+            call_summary: Some("run `pwd`".into()),
+            trace: Some(ToolExecutionTrace {
+                summary: "run `pwd`".into(),
+                command: Some("pwd".into()),
+                ..ToolExecutionTrace::default()
+            }),
+        }],
+    );
+
+    assert_eq!(state.completed_steps.len(), 1);
+    assert!(!state.has_successful_execution_trace());
+    assert!(!state.ready_to_finish);
+}
+
+#[test]
+fn rule_update_does_not_treat_validation_exec_alone_as_change_completion() {
+    let mut state = seeded_state("implement retry handling in the CLI");
+    apply_rule_based_working_state_update(
+        &mut state,
+        &[ToolResultEntry {
+            id: "c1".into(),
+            name: "exec".into(),
+            result: "Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.34s".into(),
+            duration_ms: 24,
+            is_error: false,
+            call_summary: Some("run `cargo check`".into()),
+            trace: Some(ToolExecutionTrace {
+                summary: "run `cargo check`".into(),
+                command: Some("cargo check".into()),
+                ..ToolExecutionTrace::default()
+            }),
+        }],
+    );
+
+    assert!(state.has_successful_execution_trace());
+    assert!(!state.has_successful_change_trace());
+    assert!(!state.ready_to_finish);
+}
+
+#[test]
+fn rule_update_does_not_treat_probe_plus_validation_as_change_completion() {
+    let mut state = seeded_state("implement retry handling in the CLI");
+    apply_rule_based_working_state_update(
+        &mut state,
+        &[
+            ToolResultEntry {
+                id: "c1".into(),
+                name: "read_file".into(),
+                result: "fn retry() { /* TODO */ }".into(),
+                duration_ms: 4,
+                is_error: false,
+                call_summary: Some("read `src/retry.rs`".into()),
+                trace: Some(ToolExecutionTrace {
+                    summary: "read `src/retry.rs`".into(),
+                    path: Some("src/retry.rs".into()),
+                    ..ToolExecutionTrace::default()
+                }),
+            },
+            ToolResultEntry {
+                id: "c2".into(),
+                name: "exec".into(),
+                result: "Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.34s"
+                    .into(),
+                duration_ms: 24,
+                is_error: false,
+                call_summary: Some("run `cargo check`".into()),
+                trace: Some(ToolExecutionTrace {
+                    summary: "run `cargo check`".into(),
+                    command: Some("cargo check".into()),
+                    ..ToolExecutionTrace::default()
+                }),
+            },
+        ],
+    );
+
+    assert!(state.has_confirmed_evidence());
+    assert!(state.has_successful_execution_trace());
+    assert!(!state.has_successful_change_trace());
+    assert!(!state.ready_to_finish);
+}
+
+#[test]
+fn rule_update_treats_patch_file_as_change_completion() {
+    let mut state = seeded_state("implement retry handling in the CLI");
+    apply_rule_based_working_state_update(
+        &mut state,
+        &[ToolResultEntry {
+            id: "c1".into(),
+            name: "patch_file".into(),
+            result: "patched successfully".into(),
+            duration_ms: 4,
+            is_error: false,
+            call_summary: Some("patch `src/retry.rs`".into()),
+            trace: Some(ToolExecutionTrace {
+                summary: "patch `src/retry.rs`".into(),
+                path: Some("src/retry.rs".into()),
+                ..ToolExecutionTrace::default()
+            }),
+        }],
+    );
+
+    assert!(state.has_successful_change_trace());
+    assert!(state.ready_to_finish);
+}
+
+#[test]
+fn rule_update_treats_write_and_delete_file_as_change_completion() {
+    for tool_name in ["write_file", "delete_file"] {
+        let mut state = seeded_state("implement retry handling in the CLI");
+        apply_rule_based_working_state_update(
+            &mut state,
+            &[ToolResultEntry {
+                id: format!("{tool_name}-1"),
+                name: tool_name.into(),
+                result: "ok".into(),
+                duration_ms: 4,
+                is_error: false,
+                call_summary: Some(format!("{tool_name} `src/retry.rs`")),
+                trace: Some(ToolExecutionTrace {
+                    summary: format!("{tool_name} `src/retry.rs`"),
+                    path: Some("src/retry.rs".into()),
+                    ..ToolExecutionTrace::default()
+                }),
+            }],
+        );
+
+        assert!(
+            state.has_successful_execution_trace(),
+            "{tool_name} should count as execution progress"
+        );
+        assert!(
+            state.has_successful_change_trace(),
+            "{tool_name} should count as change progress"
+        );
+        assert!(state.ready_to_finish, "{tool_name} should unlock finish");
+    }
+}
+
+#[test]
+fn rule_update_treats_validation_exec_as_execution_progress() {
+    let mut state = seeded_state("run the workspace tests");
+    apply_rule_based_working_state_update(
+        &mut state,
+        &[ToolResultEntry {
+            id: "c1".into(),
+            name: "exec".into(),
+            result: "test result: ok. 42 passed; 0 failed".into(),
+            duration_ms: 24,
+            is_error: false,
+            call_summary: Some("run `cargo test --workspace`".into()),
+            trace: Some(ToolExecutionTrace {
+                summary: "run `cargo test --workspace`".into(),
+                command: Some("cargo test --workspace".into()),
+                ..ToolExecutionTrace::default()
+            }),
+        }],
+    );
+
+    assert!(state.has_successful_execution_trace());
+    assert!(state.ready_to_finish);
+}
+
+#[test]
+fn rule_update_treats_orchestrate_fix_summary_as_change_completion() {
+    let mut state = seeded_state("implement retry handling in the CLI");
+    apply_rule_based_working_state_update(
+        &mut state,
+        &[ToolResultEntry {
+            id: "orch-1".into(),
+            name: "orchestrate".into(),
+            result: "Implemented and validated the retry fix across delegated tasks.".into(),
+            duration_ms: 40,
+            is_error: false,
+            call_summary: Some("orchestrate 2 delegated tasks".into()),
+            trace: Some(ToolExecutionTrace {
+                summary: "orchestrate 2 delegated tasks".into(),
+                task_count: Some(2),
+                ..ToolExecutionTrace::default()
+            }),
+        }],
+    );
+
+    assert!(state.has_successful_execution_trace());
+    assert!(state.has_successful_change_trace());
+    assert!(state.ready_to_finish);
+}
+
+#[test]
+fn rule_update_does_not_treat_metadata_or_version_exec_as_execution_progress() {
+    for command in [
+        "cargo metadata --format-version 1",
+        "cargo fmt --check",
+        "rustc --version",
+        "git rev-parse HEAD",
+    ] {
+        let mut state = seeded_state("implement retry handling in the CLI");
+        apply_rule_based_working_state_update(
+            &mut state,
+            &[ToolResultEntry {
+                id: "c1".into(),
+                name: "exec".into(),
+                result: "ok".into(),
+                duration_ms: 4,
+                is_error: false,
+                call_summary: Some(format!("run `{command}`")),
+                trace: Some(ToolExecutionTrace {
+                    summary: format!("run `{command}`"),
+                    command: Some(command.into()),
+                    ..ToolExecutionTrace::default()
+                }),
+            }],
+        );
+
+        assert!(
+            !state.has_successful_execution_trace(),
+            "{command} should stay read-only"
+        );
+        assert!(!state.ready_to_finish, "{command} should not unlock finish");
+    }
+}
+
+#[test]
+fn rule_update_treats_namespaced_npm_run_scripts_as_execution_progress() {
+    for command in ["npm run build:prod", "npm run test:unit"] {
+        let mut state = seeded_state("run the frontend validation scripts");
+        apply_rule_based_working_state_update(
+            &mut state,
+            &[ToolResultEntry {
+                id: "c1".into(),
+                name: "exec".into(),
+                result: "ok".into(),
+                duration_ms: 4,
+                is_error: false,
+                call_summary: Some(format!("run `{command}`")),
+                trace: Some(ToolExecutionTrace {
+                    summary: format!("run `{command}`"),
+                    command: Some(command.into()),
+                    ..ToolExecutionTrace::default()
+                }),
+            }],
+        );
+
+        assert!(
+            state.has_successful_execution_trace(),
+            "{command} should count as execution progress"
+        );
+        assert!(state.ready_to_finish, "{command} should unlock finish");
+    }
+}
+
+#[test]
+fn rule_update_does_not_treat_research_task_as_change_completion() {
+    let mut state = seeded_state("implement retry handling in the CLI");
+    apply_rule_based_working_state_update(
+        &mut state,
+        &[ToolResultEntry {
+            id: "c1".into(),
+            name: "task".into(),
+            result: "I reviewed the retry path and found the root cause in src/retry.rs.".into(),
+            duration_ms: 40,
+            is_error: false,
+            call_summary: Some("delegate to `reviewer`".into()),
+            trace: Some(ToolExecutionTrace {
+                summary: "delegate to `reviewer`".into(),
+                agent: Some("reviewer".into()),
+                ..ToolExecutionTrace::default()
+            }),
+        }],
+    );
+
+    assert!(!state.has_successful_execution_trace());
+    assert!(!state.ready_to_finish);
+}
+
+#[test]
+fn rule_update_records_blocking_uncertainty_on_error() {
+    let mut state = seeded_state("diagnose why the build is failing");
+    apply_rule_based_working_state_update(
+        &mut state,
+        &[ToolResultEntry {
+            id: "c2".into(),
+            name: "exec".into(),
+            result: "cargo test exited with status 101".into(),
+            duration_ms: 15,
+            is_error: true,
+            call_summary: Some("run `cargo test --workspace`".into()),
+            trace: None,
+        }],
+    );
+
+    assert!(state.has_blocking_uncertainty());
+    assert_eq!(state.open_questions.len(), 1);
+    assert_eq!(state.next_actions.len(), 1);
+    assert!(!state.ready_to_finish);
+}
+
+#[test]
+fn rule_update_with_memory_adds_relevant_recovery_actions_after_failure() {
+    let mut state = seeded_state("run the workspace tests");
+    let task_memory = crate::memory::RetrievedTaskMemory {
+        open_loops: vec![crate::memory::OpenLoop {
+            goal: "workspace test flow".into(),
+            blocker: "command choice is inconsistent".into(),
+            next_step: "standardize on cargo test --workspace".into(),
+            status: crate::memory::OpenLoopStatus::Open,
+            updated_at: 10,
+        }],
+        lessons: vec![crate::memory::MemoryLesson {
+            title: "Rust test loop".into(),
+            when_to_apply: "before a full workspace pass".into(),
+            recommendation: "Run cargo check before cargo test --workspace".into(),
+            scope: "repo".into(),
+            confidence: crate::memory::MemoryConfidence::High,
+            last_seen_at: 20,
+        }],
+        command_patterns: vec![crate::memory::CommandPattern {
+            signature: "cargo test --workspace".into(),
+            purpose: "validate the Rust workspace".into(),
+            outcome: "full regression signal".into(),
+            confidence: crate::memory::MemoryConfidence::High,
+            last_seen_at: 30,
+        }],
+        ..crate::memory::RetrievedTaskMemory::default()
+    };
+
+    apply_rule_based_working_state_update_with_memory(
+        &mut state,
+        &[ToolResultEntry {
+            id: "c2".into(),
+            name: "exec".into(),
+            result: "cargo test exited with status 101".into(),
+            duration_ms: 15,
+            is_error: true,
+            call_summary: Some("run `cargo test --workspace`".into()),
+            trace: None,
+        }],
+        Some(&task_memory),
+    );
+
+    assert!(state.has_blocking_uncertainty());
+    assert!(
+        state
+            .next_actions
+            .iter()
+            .any(|action| action.contains("cargo check before cargo test --workspace"))
+    );
+}
+
+#[test]
+fn unrelated_success_does_not_clear_previous_tool_failure() {
+    let mut state = seeded_state("diagnose why the build is failing");
+    apply_rule_based_working_state_update(
+        &mut state,
+        &[ToolResultEntry {
+            id: "c1".into(),
+            name: "exec".into(),
+            result: "cargo test exited with status 101".into(),
+            duration_ms: 15,
+            is_error: true,
+            call_summary: Some("run `cargo test --workspace`".into()),
+            trace: None,
+        }],
+    );
+    apply_rule_based_working_state_update(
+        &mut state,
+        &[ToolResultEntry {
+            id: "c2".into(),
+            name: "exec".into(),
+            result: "E:/work/workspace/vibe-coding/LingClaw".into(),
+            duration_ms: 3,
+            is_error: false,
+            call_summary: Some("run `pwd`".into()),
+            trace: None,
+        }],
+    );
+
+    assert!(state.has_blocking_uncertainty());
+    assert_eq!(state.open_questions.len(), 1);
+    assert_eq!(state.next_actions.len(), 1);
+    assert!(!state.ready_to_finish);
+}
+
+#[test]
+fn rule_update_with_memory_clears_anchor_matched_blocker_on_success() {
+    let mut state = seeded_state("diagnose why the entrypoint wiring is failing");
+    state.uncertainties.push(UncertaintyItem {
+        topic: "read_file failure".into(),
+        reason: "src/main.rs could not be inspected earlier".into(),
+        blocking: true,
+    });
+    state
+        .open_questions
+        .push("Why was src/main.rs unreadable before?".into());
+    state
+        .next_actions
+        .push("Inspect src/main.rs again before concluding.".into());
+
+    let task_memory = crate::memory::RetrievedTaskMemory {
+        project_signals: vec![crate::memory::ProjectSignal {
+            key: "entrypoint".into(),
+            value: "src/main.rs".into(),
+            recorded_at: 10,
+        }],
+        ..crate::memory::RetrievedTaskMemory::default()
+    };
+
+    apply_rule_based_working_state_update_with_memory(
+        &mut state,
+        &[ToolResultEntry {
+            id: "c3".into(),
+            name: "read_file".into(),
+            result: "fn main() { println!(\"ok\"); }".into(),
+            duration_ms: 4,
+            is_error: false,
+            call_summary: Some("read `src/main.rs`".into()),
+            trace: None,
+        }],
+        Some(&task_memory),
+    );
+
+    assert!(!state.has_blocking_uncertainty());
+    assert!(
+        !state
+            .open_questions
+            .iter()
+            .any(|question| question.contains("src/main.rs"))
+    );
+    assert!(
+        !state
+            .next_actions
+            .iter()
+            .any(|action| action.contains("src/main.rs"))
+    );
+    assert!(state.evidence.iter().any(|item| {
+        item.claim
+            .contains("Validated remembered anchor: src/main.rs")
+    }));
+    assert!(state.ready_to_finish);
+}
+
+#[test]
+fn rule_update_with_memory_keeps_command_blocker_for_different_command() {
+    let mut state = seeded_state("diagnose why the workspace tests are failing");
+    state.uncertainties.push(UncertaintyItem {
+        topic: "exec failure".into(),
+        reason: "cargo test --workspace still exits with status 101".into(),
+        blocking: true,
+    });
+    state
+        .next_actions
+        .push("Retry cargo test --workspace after inspecting the logs.".into());
+
+    let task_memory = crate::memory::RetrievedTaskMemory {
+        command_patterns: vec![crate::memory::CommandPattern {
+            signature: "cargo test --workspace".into(),
+            purpose: "validate the Rust workspace".into(),
+            outcome: "full regression signal".into(),
+            confidence: crate::memory::MemoryConfidence::High,
+            last_seen_at: 10,
+        }],
+        ..crate::memory::RetrievedTaskMemory::default()
+    };
+
+    apply_rule_based_working_state_update_with_memory(
+        &mut state,
+        &[ToolResultEntry {
+            id: "c3".into(),
+            name: "exec".into(),
+            result: "Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.34s".into(),
+            duration_ms: 24,
+            is_error: false,
+            call_summary: Some("run `cargo check --workspace`".into()),
+            trace: Some(ToolExecutionTrace {
+                summary: "run `cargo check --workspace`".into(),
+                command: Some("cargo check --workspace".into()),
+                ..ToolExecutionTrace::default()
+            }),
+        }],
+        Some(&task_memory),
+    );
+
+    assert!(state.has_blocking_uncertainty());
+    assert!(
+        state
+            .next_actions
+            .iter()
+            .any(|action| action.contains("cargo test --workspace"))
+    );
+    assert!(!state.evidence.iter().any(|item| {
+        item.claim
+            .contains("Validated remembered anchor: cargo test --workspace")
+    }));
+}
+
+#[test]
+fn summarize_result_snippets_skips_filtered_prefix_lines() {
+    let snippets = summarize_result_snippets("\n   \nuseful line\nsecond useful line", 1);
+
+    assert_eq!(snippets, vec!["useful line".to_string()]);
+}
+
+#[test]
+fn state_digest_trigger_matches_large_error_or_multi_tool_batches() {
+    let short_ok = ToolResultEntry {
+        id: "c1".into(),
+        name: "read_file".into(),
+        result: "ok".into(),
+        duration_ms: 1,
+        is_error: false,
+        call_summary: None,
+        trace: None,
+    };
+    assert!(!should_trigger_state_digest(std::slice::from_ref(
+        &short_ok
+    )));
+
+    let big = ToolResultEntry {
+        result: "x".repeat(OBSERVATION_SUMMARY_THRESHOLD + 1),
+        ..short_ok.clone()
+    };
+    assert!(should_trigger_state_digest(std::slice::from_ref(&big)));
+
+    let error = ToolResultEntry {
+        is_error: true,
+        ..short_ok.clone()
+    };
+    assert!(should_trigger_state_digest(std::slice::from_ref(&error)));
+
+    assert!(should_trigger_state_digest(&[
+        short_ok.clone(),
+        short_ok.clone(),
+        short_ok
+    ]));
+}
+
+#[test]
+fn render_task_state_for_prompt_applies_budget_and_ordering() {
+    let mut state = seeded_state("investigate the timeout path and summarize the result");
+    for idx in 0..8 {
+        state.completed_steps.push(format!("completed step {idx}"));
+        state.evidence.push(EvidenceItem {
+            claim: format!("evidence item {idx}"),
+            source_tool: "search_files".into(),
+            source_ref: format!("c{idx}"),
+            confidence: EvidenceConfidence::High,
+        });
+    }
+    state.open_questions = vec![
+        "question one".into(),
+        "question two".into(),
+        "question three".into(),
+        "question four".into(),
+    ];
+    state.next_actions = vec![
+        "next action one".into(),
+        "next action two".into(),
+        "next action three".into(),
+        "next action four".into(),
+    ];
+
+    let rendered = render_task_state_for_prompt(&state).expect("task state should render");
+    assert!(rendered.starts_with("## Task State"));
+    assert!(rendered.contains("- Goal:"));
+    assert!(rendered.contains("- Completed:"));
+    assert!(rendered.contains("- Evidence:"));
+    assert!(rendered.contains("- Open Questions:"));
+    assert!(rendered.contains("- Next Actions:"));
+    assert!(rendered.len() <= 1_200);
+}
+
+#[test]
 fn summarize_observations_empty_when_short() {
     let results = vec![ToolResultEntry {
         id: "c1".into(),
@@ -284,6 +1402,8 @@ fn summarize_observations_empty_when_short() {
         result: "short output".into(),
         duration_ms: 0,
         is_error: false,
+        call_summary: Some("run `cargo test -q`".into()),
+        trace: None,
     }];
     assert!(summarize_observations(&results).is_empty());
 }
@@ -298,6 +1418,8 @@ fn summarize_observations_produces_summary_for_large() {
             result: big.clone(),
             duration_ms: 0,
             is_error: false,
+            call_summary: Some("read `src/main.rs`".into()),
+            trace: None,
         },
         ToolResultEntry {
             id: "c2".into(),
@@ -305,6 +1427,8 @@ fn summarize_observations_produces_summary_for_large() {
             result: "ok".into(),
             duration_ms: 0,
             is_error: false,
+            call_summary: None,
+            trace: None,
         },
     ];
     let summaries = summarize_observations(&results);
@@ -312,6 +1436,7 @@ fn summarize_observations_produces_summary_for_large() {
     assert_eq!(summaries[0].tool_name, "read_file");
     assert_eq!(summaries[0].byte_size, big.len());
     assert!(summaries[0].hint.contains("3000 lines"));
+    assert!(summaries[0].hint.contains("read `src/main.rs`"));
 }
 
 #[test]

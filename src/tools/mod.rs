@@ -20,14 +20,38 @@ pub(crate) struct ToolOutcome {
 type ToolFuture<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
 type ToolHandler =
     for<'a> fn(&'a serde_json::Value, &'a Config, &'a Client, &'a Path) -> ToolFuture<'a>;
+type ToolTraceBuilder = fn(&serde_json::Value) -> Option<crate::agent::ToolExecutionTrace>;
+
+pub(crate) const TOOL_NAME_THINK: &str = "think";
+pub(crate) const TOOL_NAME_EXEC: &str = "exec";
+pub(crate) const TOOL_NAME_READ_FILE: &str = "read_file";
+pub(crate) const TOOL_NAME_WRITE_FILE: &str = "write_file";
+pub(crate) const TOOL_NAME_PATCH_FILE: &str = "patch_file";
+pub(crate) const TOOL_NAME_LIST_DIR: &str = "list_dir";
+pub(crate) const TOOL_NAME_SEARCH_FILES: &str = "search_files";
+pub(crate) const TOOL_NAME_HTTP_FETCH: &str = "http_fetch";
+pub(crate) const TOOL_NAME_DELETE_FILE: &str = "delete_file";
+pub(crate) const TOOL_NAME_TASK: &str = "task";
+pub(crate) const TOOL_NAME_ORCHESTRATE: &str = "orchestrate";
 
 pub(crate) struct ToolSpec {
     pub(crate) name: &'static str,
     pub(crate) description: &'static str,
+    relevance_hint: &'static str,
     prompt_line: fn(&Config) -> String,
     pub(crate) parameters: fn() -> serde_json::Value,
     handler: ToolHandler,
+    trace_builder: ToolTraceBuilder,
 }
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ToolRankingContext {
+    pub preferred_tools: Vec<String>,
+}
+
+const TOOL_FULL_DISPLAY_THRESHOLD: usize = 6;
+const TOOL_TOP_N: usize = 5;
+const TOOL_PREFERENCE_BOOST: usize = 4;
 
 fn tool_parameters_think() -> serde_json::Value {
     json!({
@@ -339,72 +363,261 @@ fn tool_handler_delete_file<'a>(
     Box::pin(async move { fs::tool_delete_file(args, workspace).await })
 }
 
+fn trace_builder_none(_: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
+    None
+}
+
+fn trace_builder_exec(args: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
+    let command = tool_arg_str(args, "command")?;
+    let working_dir = tool_arg_str(args, "working_dir")
+        .filter(|dir| !dir.is_empty() && *dir != ".")
+        .map(str::to_string);
+    let summary = match working_dir.as_deref() {
+        Some(dir) => format!("run `{command}` in `{dir}`"),
+        None => format!("run `{command}`"),
+    };
+    Some(crate::agent::ToolExecutionTrace {
+        summary: compact_tool_call_summary(&summary),
+        command: Some(command.to_string()),
+        working_dir,
+        ..crate::agent::ToolExecutionTrace::default()
+    })
+}
+
+fn trace_builder_read_file(args: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
+    let path = tool_arg_str(args, "path")?;
+    let lines = format_line_window(args);
+    let summary = match lines {
+        Some(lines) => format!("read `{path}` {lines}"),
+        None => format!("read `{path}`"),
+    };
+    Some(crate::agent::ToolExecutionTrace {
+        summary: compact_tool_call_summary(&summary),
+        path: Some(path.to_string()),
+        start_line: tool_arg_u64(args, "start_line").map(|value| value as usize),
+        end_line: tool_arg_u64(args, "end_line").map(|value| value as usize),
+        ..crate::agent::ToolExecutionTrace::default()
+    })
+}
+
+fn trace_builder_write_file(args: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
+    let path = tool_arg_str(args, "path")?;
+    Some(crate::agent::ToolExecutionTrace {
+        summary: compact_tool_call_summary(&format!("write `{path}`")),
+        path: Some(path.to_string()),
+        ..crate::agent::ToolExecutionTrace::default()
+    })
+}
+
+fn trace_builder_patch_file(args: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
+    let path = tool_arg_str(args, "path")?;
+    Some(crate::agent::ToolExecutionTrace {
+        summary: compact_tool_call_summary(&format!("patch `{path}`")),
+        path: Some(path.to_string()),
+        ..crate::agent::ToolExecutionTrace::default()
+    })
+}
+
+fn trace_builder_delete_file(args: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
+    let path = tool_arg_str(args, "path")?;
+    Some(crate::agent::ToolExecutionTrace {
+        summary: compact_tool_call_summary(&format!("delete `{path}`")),
+        path: Some(path.to_string()),
+        ..crate::agent::ToolExecutionTrace::default()
+    })
+}
+
+fn trace_builder_list_dir(args: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
+    let path = tool_arg_str(args, "path").unwrap_or(".");
+    Some(crate::agent::ToolExecutionTrace {
+        summary: compact_tool_call_summary(&format!("list `{path}`")),
+        path: Some(path.to_string()),
+        ..crate::agent::ToolExecutionTrace::default()
+    })
+}
+
+fn trace_builder_search_files(
+    args: &serde_json::Value,
+) -> Option<crate::agent::ToolExecutionTrace> {
+    let pattern = tool_arg_str(args, "pattern")?;
+    let scope = tool_arg_str(args, "path").unwrap_or(".");
+    let glob = tool_arg_str(args, "file_glob");
+    let summary = match glob {
+        Some(glob) => format!("search `{pattern}` in `{scope}` with `{glob}`"),
+        None => format!("search `{pattern}` in `{scope}`"),
+    };
+    Some(crate::agent::ToolExecutionTrace {
+        summary: compact_tool_call_summary(&summary),
+        path: Some(scope.to_string()),
+        pattern: Some(pattern.to_string()),
+        file_glob: glob.map(str::to_string),
+        ..crate::agent::ToolExecutionTrace::default()
+    })
+}
+
+fn trace_builder_http_fetch(args: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
+    let url = tool_arg_str(args, "url")?;
+    Some(crate::agent::ToolExecutionTrace {
+        summary: compact_tool_call_summary(&format!("fetch `{url}`")),
+        url: Some(url.to_string()),
+        ..crate::agent::ToolExecutionTrace::default()
+    })
+}
+
+fn trace_builder_task(args: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
+    let agent_name = tool_arg_str(args, "agent")?;
+    Some(crate::agent::ToolExecutionTrace {
+        summary: compact_tool_call_summary(&format!("delegate to `{agent_name}`")),
+        agent: Some(agent_name.to_string()),
+        ..crate::agent::ToolExecutionTrace::default()
+    })
+}
+
+fn trace_builder_orchestrate(args: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
+    let task_count = args
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .map(std::vec::Vec::len)?;
+    Some(crate::agent::ToolExecutionTrace {
+        summary: compact_tool_call_summary(&format!("orchestrate {task_count} delegated tasks")),
+        task_count: Some(task_count),
+        ..crate::agent::ToolExecutionTrace::default()
+    })
+}
+
 pub(crate) fn tool_specs() -> &'static [ToolSpec] {
     &[
         ToolSpec {
-            name: "think",
+            name: TOOL_NAME_THINK,
             description: "Plan your approach step by step before acting on complex tasks. Use this to organize your thoughts before a series of tool calls.",
+            relevance_hint: "plan outline strategy reasoning steps analyze",
             prompt_line: tool_prompt_line_think,
             parameters: tool_parameters_think,
             handler: tool_handler_think,
+            trace_builder: trace_builder_none,
         },
         ToolSpec {
-            name: "exec",
+            name: TOOL_NAME_EXEC,
             description: "Execute a shell command and return stdout + stderr. Use for running programs, builds, git, file management, etc.",
+            relevance_hint: "run shell command build test git benchmark profile compile install",
             prompt_line: tool_prompt_line_exec,
             parameters: tool_parameters_exec,
             handler: tool_handler_exec,
+            trace_builder: trace_builder_exec,
         },
         ToolSpec {
-            name: "read_file",
+            name: TOOL_NAME_READ_FILE,
             description: "Read a file's contents. Supports optional line range for large files.",
+            relevance_hint: "read inspect open cat file source code contents lines",
             prompt_line: tool_prompt_line_read_file,
             parameters: tool_parameters_read_file,
             handler: tool_handler_read_file,
+            trace_builder: trace_builder_read_file,
         },
         ToolSpec {
-            name: "write_file",
+            name: TOOL_NAME_WRITE_FILE,
             description: "Create a new file or overwrite an existing file with the given content.",
+            relevance_hint: "create write save generate file content",
             prompt_line: tool_prompt_line_write_file,
             parameters: tool_parameters_write_file,
             handler: tool_handler_write_file,
+            trace_builder: trace_builder_write_file,
         },
         ToolSpec {
-            name: "patch_file",
+            name: TOOL_NAME_PATCH_FILE,
             description: "Find and replace a specific string in a file. The old_string must match exactly.",
+            relevance_hint: "edit modify update patch replace refactor fix file",
             prompt_line: tool_prompt_line_patch_file,
             parameters: tool_parameters_patch_file,
             handler: tool_handler_patch_file,
+            trace_builder: trace_builder_patch_file,
         },
         ToolSpec {
-            name: "list_dir",
+            name: TOOL_NAME_LIST_DIR,
             description: "List the contents of a directory with file type and size information.",
+            relevance_hint: "directory folder tree files structure browse workspace",
             prompt_line: tool_prompt_line_list_dir,
             parameters: tool_parameters_list_dir,
             handler: tool_handler_list_dir,
+            trace_builder: trace_builder_list_dir,
         },
         ToolSpec {
-            name: "search_files",
+            name: TOOL_NAME_SEARCH_FILES,
             description: "Search for a regex pattern in files. Returns matching lines with file paths and line numbers, like grep.",
+            relevance_hint: "search grep rg find pattern references symbols codebase",
             prompt_line: tool_prompt_line_search_files,
             parameters: tool_parameters_search_files,
             handler: tool_handler_search_files,
+            trace_builder: trace_builder_search_files,
         },
         ToolSpec {
-            name: "http_fetch",
+            name: TOOL_NAME_HTTP_FETCH,
             description: "Fetch content from a URL using HTTP GET. Returns status code and response body.",
+            relevance_hint: "fetch request url api docs website http",
             prompt_line: tool_prompt_line_http_fetch,
             parameters: tool_parameters_http_fetch,
             handler: tool_handler_http_fetch,
+            trace_builder: trace_builder_http_fetch,
         },
         ToolSpec {
-            name: "delete_file",
+            name: TOOL_NAME_DELETE_FILE,
             description: "Delete a file from the workspace. The path must be inside the session workspace.",
+            relevance_hint: "delete remove cleanup file",
             prompt_line: tool_prompt_line_delete_file,
             parameters: tool_parameters_delete_file,
             handler: tool_handler_delete_file,
+            trace_builder: trace_builder_delete_file,
         },
     ]
+}
+
+fn find_tool_spec(name: &str) -> Option<&'static ToolSpec> {
+    tool_specs().iter().find(|spec| spec.name == name)
+}
+
+pub(crate) fn build_tool_execution_trace(
+    tool_name: &str,
+    effective_args: Option<&str>,
+) -> Option<crate::agent::ToolExecutionTrace> {
+    let args = effective_args
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    if let Some(spec) = find_tool_spec(tool_name) {
+        return (spec.trace_builder)(&args);
+    }
+
+    match tool_name {
+        TOOL_NAME_TASK => trace_builder_task(&args),
+        TOOL_NAME_ORCHESTRATE => trace_builder_orchestrate(&args),
+        _ => None,
+    }
+}
+
+fn tool_arg_str<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    args.get(key)?
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn tool_arg_u64(args: &serde_json::Value, key: &str) -> Option<u64> {
+    args.get(key)?.as_u64()
+}
+
+fn format_line_window(args: &serde_json::Value) -> Option<String> {
+    let start = args.get("start_line").and_then(serde_json::Value::as_u64);
+    let end = args.get("end_line").and_then(serde_json::Value::as_u64);
+    match (start, end) {
+        (Some(start), Some(end)) => Some(format!("lines {start}-{end}")),
+        (Some(start), None) => Some(format!("from line {start}")),
+        (None, Some(end)) => Some(format!("through line {end}")),
+        (None, None) => None,
+    }
+}
+
+fn compact_tool_call_summary(text: &str) -> String {
+    crate::truncate(&text.split_whitespace().collect::<Vec<_>>().join(" "), 180)
 }
 
 #[allow(dead_code)] // Compatibility wrapper for call sites that still want the full tool list.
@@ -422,59 +635,32 @@ pub(crate) fn render_tool_prompt_lines_with_query(
         .map(|spec| (spec.prompt_line)(config))
         .collect();
 
-    const TOOL_FULL_DISPLAY_THRESHOLD: usize = 6;
-    const TOOL_TOP_N: usize = 5;
+    if let Some(selected) = select_ranked_tool_indices(&specs, &prompt_lines, current_query, None) {
+        let mut display_order = selected.clone();
+        display_order.sort_unstable();
 
-    if specs.len() > TOOL_FULL_DISPLAY_THRESHOLD
-        && let Some(query) = current_query
-            .map(str::trim)
-            .filter(|query| !query.is_empty())
-    {
-        let query_tokens = crate::tokenize_for_matching(query);
-        let mut ranked: Vec<(usize, usize)> = specs
+        let mut lines = Vec::new();
+        for (display_idx, idx) in display_order.iter().enumerate() {
+            lines.push(format!("{}. {}", display_idx + 1, prompt_lines[*idx]));
+        }
+
+        let remaining: Vec<&str> = specs
             .iter()
             .enumerate()
-            .map(|(idx, spec)| (tool_relevance(spec, &prompt_lines[idx], &query_tokens), idx))
+            .filter(|(idx, _)| !display_order.contains(idx))
+            .map(|(_, spec)| spec.name)
             .collect();
-        ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-
-        if ranked.first().map(|(score, _)| *score).unwrap_or(0) > 0 {
-            let mut selected: Vec<usize> = ranked
-                .iter()
-                .take(TOOL_TOP_N)
-                .map(|(_, idx)| *idx)
-                .collect();
-            if !selected.iter().any(|idx| specs[*idx].name == "think") {
-                if let Some(think_idx) = specs.iter().position(|spec| spec.name == "think") {
-                    selected.pop();
-                    selected.push(think_idx);
-                    selected.sort_unstable();
-                }
-            }
-
-            let mut lines = Vec::new();
-            for (display_idx, idx) in selected.iter().enumerate() {
-                lines.push(format!("{}. {}", display_idx + 1, prompt_lines[*idx]));
-            }
-
-            let remaining: Vec<&str> = specs
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| !selected.contains(idx))
-                .map(|(_, spec)| spec.name)
-                .collect();
-            if !remaining.is_empty() {
-                lines.push(format!(
-                    "Other available tools: {}",
-                    remaining
-                        .iter()
-                        .map(|name| format!("`{name}`"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ));
-            }
-            return lines.join("\n");
+        if !remaining.is_empty() {
+            lines.push(format!(
+                "Other available tools: {}",
+                remaining
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
+        return lines.join("\n");
     }
 
     prompt_lines
@@ -485,16 +671,101 @@ pub(crate) fn render_tool_prompt_lines_with_query(
         .join("\n")
 }
 
+pub(crate) fn render_ranked_tool_recommendations(
+    config: &Config,
+    current_query: Option<&str>,
+    ranking: &ToolRankingContext,
+) -> Option<String> {
+    let specs = tool_specs();
+    let prompt_lines: Vec<String> = specs
+        .iter()
+        .map(|spec| (spec.prompt_line)(config))
+        .collect();
+    let selected = select_ranked_tool_indices(&specs, &prompt_lines, current_query, Some(ranking))?;
+
+    let mut lines = vec!["## Suggested Tool Order".to_string()];
+    for (display_idx, idx) in selected.iter().enumerate() {
+        lines.push(format!("{}. {}", display_idx + 1, prompt_lines[*idx]));
+    }
+    Some(lines.join("\n"))
+}
+
+fn select_ranked_tool_indices(
+    specs: &[ToolSpec],
+    prompt_lines: &[String],
+    current_query: Option<&str>,
+    ranking: Option<&ToolRankingContext>,
+) -> Option<Vec<usize>> {
+    if specs.len() <= TOOL_FULL_DISPLAY_THRESHOLD {
+        return None;
+    }
+
+    let query_tokens = current_query
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(crate::tokenize_for_matching)
+        .unwrap_or_default();
+    let mut ranked: Vec<(usize, usize)> = specs
+        .iter()
+        .enumerate()
+        .map(|(idx, spec)| {
+            (
+                tool_relevance(spec, &prompt_lines[idx], &query_tokens)
+                    + tool_preference_boost(spec.name, ranking),
+                idx,
+            )
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+    if ranked.first().map(|(score, _)| *score).unwrap_or(0) == 0 {
+        return None;
+    }
+
+    let ranked_indices: Vec<usize> = ranked.iter().map(|(_, idx)| *idx).collect();
+    let mut selected: Vec<usize> = ranked
+        .iter()
+        .take(TOOL_TOP_N)
+        .map(|(_, idx)| *idx)
+        .collect();
+    ensure_think_tool(specs, &ranked_indices, &mut selected);
+    Some(selected)
+}
+
+fn ensure_think_tool(specs: &[ToolSpec], ranked_indices: &[usize], selected: &mut Vec<usize>) {
+    if selected
+        .iter()
+        .any(|idx| specs[*idx].name == TOOL_NAME_THINK)
+    {
+        return;
+    }
+    if let Some(think_idx) = specs.iter().position(|spec| spec.name == TOOL_NAME_THINK) {
+        if selected.len() >= TOOL_TOP_N {
+            selected.pop();
+        }
+        let insert_at = ranked_indices
+            .iter()
+            .position(|idx| *idx == think_idx)
+            .and_then(|think_rank| {
+                selected.iter().position(|idx| {
+                    ranked_indices
+                        .iter()
+                        .position(|candidate| candidate == idx)
+                        .is_some_and(|rank| rank > think_rank)
+                })
+            })
+            .unwrap_or(selected.len());
+        selected.insert(insert_at, think_idx);
+    }
+}
+
 fn tool_relevance(spec: &ToolSpec, prompt_line: &str, query_tokens: &[String]) -> usize {
     if query_tokens.is_empty() {
         return 0;
     }
     let text = format!(
         "{} {} {} {}",
-        spec.name,
-        spec.description,
-        prompt_line,
-        tool_relevance_hint(spec.name)
+        spec.name, spec.description, prompt_line, spec.relevance_hint
     )
     .to_lowercase();
 
@@ -504,19 +775,17 @@ fn tool_relevance(spec: &ToolSpec, prompt_line: &str, query_tokens: &[String]) -
         .count()
 }
 
-fn tool_relevance_hint(name: &str) -> &'static str {
-    match name {
-        "think" => "plan outline strategy reasoning steps analyze",
-        "exec" => "run shell command build test git benchmark profile compile install",
-        "read_file" => "read inspect open cat file source code contents lines",
-        "write_file" => "create write save generate file content",
-        "patch_file" => "edit modify update patch replace refactor fix file",
-        "list_dir" => "directory folder tree files structure browse workspace",
-        "search_files" => "search grep rg find pattern references symbols codebase",
-        "http_fetch" => "fetch request url api docs website http",
-        "delete_file" => "delete remove cleanup file",
-        _ => "",
-    }
+fn tool_preference_boost(name: &str, ranking: Option<&ToolRankingContext>) -> usize {
+    ranking
+        .map(|ranking| {
+            ranking
+                .preferred_tools
+                .iter()
+                .filter(|preferred| preferred.eq_ignore_ascii_case(name))
+                .count()
+                * TOOL_PREFERENCE_BOOST
+        })
+        .unwrap_or(0)
 }
 
 pub(crate) fn tool_definitions() -> serde_json::Value {
@@ -665,14 +934,18 @@ pub(crate) fn task_tool_definition_gemini(agent_names: &[String]) -> serde_json:
 pub(crate) fn is_read_only_tool(name: &str) -> bool {
     matches!(
         name,
-        "think" | "read_file" | "list_dir" | "search_files" | "http_fetch"
+        TOOL_NAME_THINK
+            | TOOL_NAME_READ_FILE
+            | TOOL_NAME_LIST_DIR
+            | TOOL_NAME_SEARCH_FILES
+            | TOOL_NAME_HTTP_FETCH
     )
 }
 
 /// Returns true if the named tool is the sub-agent `task` tool.
 /// This tool is handled specially by the runtime loop, not the standard execute path.
 pub(crate) fn is_task_tool(name: &str) -> bool {
-    name == "task"
+    name == TOOL_NAME_TASK
 }
 
 /// Returns true if the named tool can safely run in parallel with other parallelizable tools.
@@ -709,7 +982,7 @@ pub(crate) fn task_tool_definition_openai(agent_names: &[String]) -> serde_json:
     json!({
         "type": "function",
         "function": {
-            "name": "task",
+            "name": TOOL_NAME_TASK,
             "description": format!(
                 "Delegate a sub-task to a specialized sub-agent that runs in an isolated context \
                  with its own tool set and message history. Use this for research, code review, \
@@ -728,7 +1001,7 @@ pub(crate) fn task_tool_definition_anthropic(agent_names: &[String]) -> serde_js
         format!("Available sub-agents: {}", agent_names.join(", "))
     };
     json!({
-        "name": "task",
+        "name": TOOL_NAME_TASK,
         "description": format!(
             "Delegate a sub-task to a specialized sub-agent that runs in an isolated context \
              with its own tool set and message history. Use this for research, code review, \
@@ -762,7 +1035,7 @@ pub(crate) fn task_tool_parameters() -> serde_json::Value {
 /// Returns true if the named tool is the multi-agent `orchestrate` tool.
 /// Like `task`, this tool is handled specially by the runtime loop.
 pub(crate) fn is_orchestrate_tool(name: &str) -> bool {
-    name == "orchestrate"
+    name == TOOL_NAME_ORCHESTRATE
 }
 
 /// Shared description body for the `orchestrate` tool. Used by both the
@@ -802,7 +1075,7 @@ pub(crate) fn orchestrate_tool_definition_openai(agent_names: &[String]) -> serd
     json!({
         "type": "function",
         "function": {
-            "name": "orchestrate",
+            "name": TOOL_NAME_ORCHESTRATE,
             "description": orchestrate_tool_description(&catalog),
             "parameters": orchestrate_tool_parameters(),
         }
@@ -817,7 +1090,7 @@ pub(crate) fn orchestrate_tool_definition_anthropic(agent_names: &[String]) -> s
         format!("Available sub-agents: {}", agent_names.join(", "))
     };
     json!({
-        "name": "orchestrate",
+        "name": TOOL_NAME_ORCHESTRATE,
         "description": orchestrate_tool_description(&catalog),
         "input_schema": orchestrate_tool_parameters(),
     })
@@ -836,7 +1109,7 @@ pub(crate) fn orchestrate_tool_definition_gemini(agent_names: &[String]) -> serd
         format!("Available sub-agents: {}", agent_names.join(", "))
     };
     json!({
-        "name": "orchestrate",
+        "name": TOOL_NAME_ORCHESTRATE,
         "description": orchestrate_tool_description(&catalog),
         "parameters": gemini_tool_parameters(orchestrate_tool_parameters()),
     })

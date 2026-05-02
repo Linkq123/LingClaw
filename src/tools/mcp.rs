@@ -513,6 +513,7 @@ pub(crate) async fn test_mcp_server(
         max_file_bytes: 200 * 1024,
         structured_memory: false,
         daily_reflection: false,
+        enable_state_digest: true,
         s3: None,
     };
     let tools = list_server_tools_uncached(server_name, &temp_config, workspace).await?;

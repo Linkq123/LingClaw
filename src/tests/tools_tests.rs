@@ -30,6 +30,7 @@ fn test_config() -> Config {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     }
 }
 
@@ -281,4 +282,79 @@ fn render_tool_prompt_lines_with_query_compresses_irrelevant_tools() {
     assert!(rendered.contains("**exec**"));
     assert!(rendered.contains("**think**"));
     assert!(rendered.contains("Other available tools:"));
+}
+
+#[test]
+fn render_ranked_tool_recommendations_respects_memory_preferences() {
+    let rendered = render_ranked_tool_recommendations(
+        &test_config(),
+        None,
+        &ToolRankingContext {
+            preferred_tools: vec!["exec".into(), "read_file".into(), "search_files".into()],
+        },
+    )
+    .expect("memory-aware tool ranking should render");
+
+    assert!(rendered.starts_with("## Suggested Tool Order"));
+    assert!(rendered.contains("1. **exec**"));
+    assert!(rendered.contains("**read_file**"));
+    assert!(rendered.contains("**search_files**"));
+}
+
+#[test]
+fn ensure_think_tool_preserves_rank_order_when_inserted() {
+    let specs = tool_specs();
+    let find_idx = |name: &str| {
+        specs
+            .iter()
+            .position(|spec| spec.name == name)
+            .expect("tool should exist")
+    };
+    let think_idx = find_idx(TOOL_NAME_THINK);
+    let exec_idx = find_idx(TOOL_NAME_EXEC);
+    let read_idx = find_idx(TOOL_NAME_READ_FILE);
+    let search_idx = find_idx(TOOL_NAME_SEARCH_FILES);
+    let list_idx = find_idx(TOOL_NAME_LIST_DIR);
+    let write_idx = find_idx(TOOL_NAME_WRITE_FILE);
+
+    let ranked_indices = vec![
+        exec_idx, think_idx, read_idx, search_idx, list_idx, write_idx,
+    ];
+    let mut selected = vec![exec_idx, read_idx, search_idx, list_idx, write_idx];
+    ensure_think_tool(specs, &ranked_indices, &mut selected);
+
+    assert_eq!(
+        selected,
+        vec![exec_idx, think_idx, read_idx, search_idx, list_idx]
+    );
+}
+
+#[test]
+fn build_tool_execution_trace_covers_builtins_and_special_tools() {
+    let exec = build_tool_execution_trace(
+        TOOL_NAME_EXEC,
+        Some(r#"{"command":"cargo test --workspace","working_dir":"crates/core"}"#),
+    )
+    .expect("exec trace should exist");
+    assert_eq!(
+        exec.summary(),
+        Some("run `cargo test --workspace` in `crates/core`")
+    );
+    assert_eq!(exec.command.as_deref(), Some("cargo test --workspace"));
+
+    let task = build_tool_execution_trace(
+        TOOL_NAME_TASK,
+        Some(r#"{"agent":"reviewer","prompt":"Inspect the failure"}"#),
+    )
+    .expect("task trace should exist");
+    assert_eq!(task.summary(), Some("delegate to `reviewer`"));
+    assert_eq!(task.agent.as_deref(), Some("reviewer"));
+
+    let orchestrate = build_tool_execution_trace(
+        TOOL_NAME_ORCHESTRATE,
+        Some(r#"{"tasks":[{"id":"a","agent":"reviewer","prompt":"one"},{"id":"b","agent":"benchmarker","prompt":"two"}]}"#),
+    )
+    .expect("orchestrate trace should exist");
+    assert_eq!(orchestrate.summary(), Some("orchestrate 2 delegated tasks"));
+    assert_eq!(orchestrate.task_count, Some(2));
 }

@@ -34,6 +34,7 @@ fn runtime_alignment_config(
         structured_memory: false,
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     }
 }
 

@@ -757,7 +757,8 @@ pub(crate) fn system_prompt_cache_metrics() -> (u64, u64) {
     )
 }
 
-#[allow(dead_code)] // Legacy builder retained for compatibility with older tests/helpers.
+#[cfg(test)]
+#[allow(dead_code)]
 fn build_system_prompt_with_query(
     config: &Config,
     workspace: &Path,
@@ -1309,6 +1310,33 @@ fn truncate(s: &str, max: usize) -> String {
             s.len()
         )
     }
+}
+
+pub(crate) fn strip_json_fences(content: &str) -> &str {
+    let trimmed = content.trim();
+    let Some(without_ticks) = trimmed.strip_prefix("```") else {
+        return trimmed;
+    };
+
+    let body = if let Some((first_line, rest)) = without_ticks.split_once('\n') {
+        let language = first_line.trim();
+        if language.is_empty()
+            || language
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+        {
+            rest
+        } else {
+            without_ticks
+        }
+    } else {
+        without_ticks
+    };
+
+    body.trim()
+        .strip_suffix("```")
+        .unwrap_or(body.trim())
+        .trim()
 }
 
 /// Tokenize a string into lowercase words for keyword matching.

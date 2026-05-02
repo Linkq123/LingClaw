@@ -31,8 +31,8 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **Daily Reflection（可选）**：启用 `dailyReflection` 后，多步任务完成时会在 Finish 后台异步生成简短 reflection，追加到 workspace 下的 `memory/YYYY-MM-DD.md`；`/reflection`、`/reflection today`、`/reflection yesterday`、`/reflection list` 可查看状态和已过滤的 reflection 条目
 - **更细粒度的 Token 统计**：Primary、Fast、Sub-Agent、Memory、Reflection、Context 六类模型角色都会分别累计 token；`/new` 压缩、自动上下文压缩、Structured Memory 和 Daily Reflection 的非流式调用也会计入 Usage
 - **可关闭的 Slash Command 卡片**：聊天页中由斜杠命令返回的 `success`、`system`、`error` 卡片支持点击关闭；运行进度和自动压缩通知仍保持常驻提示
-- **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环，`evaluate_finish()` 结构化完成判定，`auto_think_level()` 按循环深度动态调整推理预算
-- **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留；错误工具标记 `[FAILED]` 并附带耗时
+- **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环；运行时维护每轮临时 `WorkingState`，基于 `TaskIntent`、证据、blocker 和下一步动作做状态驱动的 finish gate，而不是只看回复文本启发式
+- **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留；错误工具标记 `[FAILED]` 并附带耗时；在多工具、错误或超长结果场景下，还会触发轻量状态摘要来更新当前 `WorkingState`
 - **推理可见性控制**：默认开启 ReAct 阶段转换 WS 事件（`react_phase`），可通过 `/react on|off` 手动切换；浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
 - **结构化工具结果**：`ToolOutcome`（output + is_error + duration_ms），前缀式错误检测，schema 约束校验（required/type/range/length），`tool_result` WS 事件携带耗时和错误标记
 - **原子持久化**：会话存档先写 `.tmp` 再 rename（Windows 兼容），加载时自动修剪不完整工具调用
@@ -551,6 +551,13 @@ Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的
 | **Observe** | 消化工具结果 | 工具结果以原始内容写入对话历史。大结果 (>4KB) 生成非破坏性摘要：WS `observation` 事件 + 系统提示注入。 |
 | **Finish** | 完成回答 | 显式判定任务已完成：请求已回答、修改已执行、验证已通过、无剩余 blocker。退出循环。 |
 
+#### 运行时认知层
+
+- **每轮携带临时 WorkingState**：挂在 `AgentPhaseState` 上，只在当前 run 内存在；核心字段包括 `intent`、`primary_goal`、`completed_steps`、`evidence`、`open_questions`、`uncertainties`、`next_actions`、`ready_to_finish`
+- **Observe 先规则更新，再按需轻量摘要**：成功工具写入完成步骤/证据，失败工具写入 blocker；只有在工具报错、结果超长或本轮工具数大于 2 时，才会调用 fast model 生成 JSON `StateDigestDelta`
+- **Analyze 动态注入任务上下文**：除基础 system prompt 外，还会按预算注入 `## Task State`、Relevant Past Experience、Tool Hints、Suggested Tool Order、Suggested Sub-Agents、Delegation Guidance；这些内容不进入静态 system prompt cache
+- **Finish gate 改为状态驱动**：`Inform / Change / Investigate / Execute` 四类任务分别检查 blocker、confirmed evidence、执行痕迹和 change 痕迹；若仍存在 blocker，最多 defer 一次，然后允许 honest finish，避免空转
+
 **关键设计决策：**
 
 - **不回退到文本协议**：保留 OpenAI/Anthropic/Ollama/Gemini 原生结构化 tool calling，不使用文本版 `Action: tool_name\nAction Input: {...}` 解析
@@ -603,35 +610,37 @@ handle_socket()
   └─ 返回控制权给 WebSocket 读循环
 ```
 
+注：上面的流程图是简化视图。当前实现里，`Observe` 阶段还会同步更新 `WorkingState`、对齐 task memory 命中项，并在满足条件时触发轻量 state digest；下一轮 `Analyze` 会再把 `Task State`、任务记忆、工具排序建议和子代理/委托建议按预算动态注入。
+
 ### 模块地图
 
 ```text
 src/
-├── main.rs            (~2720 行) — 共享类型, WebSocket/HTTP 处理, 系统提示构建, 安全检查
-├── runtime_loop.rs    (~2490 行) — 阶段执行循环, 工具进度, 运行取消, 干预持久化, orchestrate 执行
-│   └── socket_input.rs (~550 行) — socket 空闲/忙碌输入辅助
-├── agent.rs           (~460 行)  — AgentPhase 状态机, FinishReason, evaluate_finish, auto_think_level, Observation 摘要
+├── main.rs            (~2970 行) — 共享类型, WebSocket/HTTP 处理, 系统提示构建, 安全检查, JSON fence/分词等通用辅助
+├── runtime_loop.rs    (~3060 行) — 阶段执行循环, WorkingState/session 协调, 动态 prompt 注入, 轻量 state digest, 干预持久化, orchestrate 执行
+│   └── runtime_loop/socket_input.rs (~550 行) — socket 空闲/忙碌输入辅助
+├── agent.rs           (~2340 行) — AgentPhase 状态机, TaskIntent/WorkingState, finish gate, 证据/不确定性归并, 观察结果摘要
 ├── commands.rs        (~1630 行) — 斜杠命令处理器 (handle_command, /skills-system install/uninstall 等)
 ├── cli.rs             (~3030 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
 ├── config.rs          (~1490 行) — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
 ├── context.rs         (~570 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
 ├── providers.rs       (~3030 行) — OpenAI/Anthropic/Ollama/Gemini 调用, 流式解析, 推理模式, prompt caching
-├── prompts.rs         (~980 行)  — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
+├── prompts.rs         (~1030 行) — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
 ├── hooks.rs           (~830 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
-├── memory.rs          (~1190 行) — structured_memory.json 读写, MemoryUpdateQueue, prompt 注入, /memory 状态
+├── memory.rs          (~3020 行) — structured_memory.json 读写, task memory 检索/排序, prompt 注入, MemoryUpdateQueue, /memory 状态
 ├── image_uploads.rs   (~760 行)  — S3 签名/上传, PNG/JPEG 校验, 生命周期管理, 附件令牌签发
 ├── session_admin.rs   (~10 行)   — 全局用量统计 (仅主会话)
 ├── session_store.rs   (~630 行)  — 会话持久化, 迁移, 磁盘 I/O
 ├── socket_sync.rs     (~100 行)  — WebSocket 会话声明, 断线监听, 重绑定
 ├── socket_tasks.rs    (~150 行)  — WebSocket 读写任务
 └── tools/
-    ├── mod.rs         (~1070 行) — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验, orchestrate/task 定义
+    ├── mod.rs         (~1450 行) — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验, trace/ranking 推荐, orchestrate/task 定义
     ├── fs.rs          (~380 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files + 虚拟 skill 路径
     ├── net.rs         (~200 行)  — http_fetch, check_ssrf, is_private_ip
     ├── exec.rs        (~80 行)   — exec (shell), think (scratchpad)
     └── mcp.rs         (~1780 行) — stdio MCP 工具发现/执行桥接, 会话缓存, preflight
 ├── subagents/
-│   ├── mod.rs         (~210 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, 工具过滤（含 MCP）
+│   ├── mod.rs         (~640 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, agent 排序/委托建议, 工具过滤（含 MCP）
 │   ├── executor.rs    (~1340 行) — 隔离 mini-ReAct 执行循环, Hook 集成, MCP 工具调度, 父级事件流
 │   ├── discovery.rs   (~350 行)  — 三层发现 (system/global/session), YAML frontmatter 解析
 │   └── orchestrator.rs (~1000 行) — DAG 多代理编排引擎, 分层并行执行, 结果插值, 事件流
@@ -726,6 +735,19 @@ struct StructuredMemory {
   user_context: Option<String>,
   facts: Vec<MemoryFact>,
   updated_at: u64,
+}
+
+enum TaskIntent { Inform, Change, Investigate, Execute }
+
+struct WorkingState {
+    intent: TaskIntent,
+    primary_goal: Option<String>,
+    completed_steps: Vec<String>,
+    evidence: Vec<EvidenceItem>,
+    open_questions: Vec<String>,
+    uncertainties: Vec<UncertaintyItem>,
+    next_actions: Vec<String>,
+    ready_to_finish: bool,
 }
 
 // Agent 状态机 (src/agent.rs)

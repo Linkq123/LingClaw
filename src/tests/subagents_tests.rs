@@ -6,7 +6,8 @@ use crate::subagents::orchestrator::{
 };
 use crate::subagents::{
     AgentSource, SubAgentSpec, ToolPermissions, render_agents_catalog,
-    render_agents_catalog_with_query,
+    render_agents_catalog_with_query, render_delegation_guidance,
+    render_ranked_agent_recommendations,
 };
 use crate::{ChatMessage, agent};
 use tokio_util::sync::CancellationToken;
@@ -160,6 +161,349 @@ fn test_render_agents_catalog_with_query_compresses_irrelevant_agents() {
             .contains("**benchmarker** [`system`]: Benchmark and performance profiling specialist")
     );
     assert!(catalog.contains("**writer** [`system`]"));
+}
+
+#[test]
+fn test_render_ranked_agent_recommendations_prefers_investigation_agent() {
+    let agents = vec![
+        SubAgentSpec {
+            name: "reviewer".into(),
+            description: "Code review and debugging specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+        SubAgentSpec {
+            name: "writer".into(),
+            description: "Long-form writing specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+    ];
+    let mut state = agent::WorkingState::default();
+    state.seed_from_query(Some("investigate why cargo test is failing"));
+    state
+        .open_questions
+        .push("Which failing test introduced the regression?".into());
+
+    let rendered = render_ranked_agent_recommendations(
+        &agents,
+        Some("debug the failing Rust tests"),
+        Some(&state),
+    )
+    .expect("agent recommendations should render");
+
+    assert!(rendered.starts_with("## Suggested Sub-Agents"));
+    assert!(rendered.contains("1. **reviewer**"));
+    assert!(rendered.contains("Code review and debugging specialist"));
+}
+
+#[test]
+fn test_render_ranked_agent_recommendations_prefers_latest_open_tracks() {
+    let agents = vec![
+        SubAgentSpec {
+            name: "parser".into(),
+            description: "Parser and syntax debugging specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+        SubAgentSpec {
+            name: "benchmarker".into(),
+            description: "Benchmark and performance profiling specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+    ];
+    let mut state = agent::WorkingState::default();
+    state.seed_from_query(Some("continue"));
+    state
+        .open_questions
+        .push("Which parser branch rejects the fixture?".into());
+    state
+        .open_questions
+        .push("Where does parser syntax normalization diverge?".into());
+    state
+        .open_questions
+        .push("Should the parser tokenizer be traced first?".into());
+    state
+        .open_questions
+        .push("Which parser error path changed most recently?".into());
+    state
+        .next_actions
+        .push("Benchmark the cancellation path under load.".into());
+    state
+        .next_actions
+        .push("Profile the timeout regression in the runtime loop.".into());
+
+    let rendered = render_ranked_agent_recommendations(&agents, None, Some(&state))
+        .expect("agent recommendations should render");
+
+    assert!(rendered.contains("1. **benchmarker**"));
+}
+
+#[test]
+fn test_render_delegation_guidance_prefers_orchestrate_for_multiple_tracks() {
+    let agents = vec![
+        SubAgentSpec {
+            name: "reviewer".into(),
+            description: "Debugging specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+        SubAgentSpec {
+            name: "benchmarker".into(),
+            description: "Benchmark and performance profiling specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+    ];
+    let mut state = agent::WorkingState::default();
+    state.seed_from_query(Some("fix the flaky test and inspect the perf regression"));
+    state
+        .next_actions
+        .push("Inspect the failing workspace test and isolate the first error.".into());
+    state
+        .next_actions
+        .push("Profile the slow path in the runtime loop.".into());
+    state.uncertainties.push(agent::UncertaintyItem {
+        topic: "test failure".into(),
+        reason: "cargo test still exits with status 101".into(),
+        blocking: true,
+    });
+    state.recompute_ready_to_finish();
+
+    let rendered = render_delegation_guidance(&agents, Some("split the remaining work"), &state)
+        .expect("delegation guidance should render");
+
+    assert!(rendered.starts_with("## Delegation Guidance"));
+    assert!(rendered.contains("Prefer `orchestrate`"));
+    assert!(rendered.contains("Likely best-fit agents now"));
+    assert!(rendered.contains("reviewer"));
+}
+
+#[test]
+fn test_render_delegation_guidance_prefers_task_for_single_blocker() {
+    let agents = vec![
+        SubAgentSpec {
+            name: "reviewer".into(),
+            description: "Debugging specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+        SubAgentSpec {
+            name: "benchmarker".into(),
+            description: "Benchmark and performance profiling specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+    ];
+    let mut state = agent::WorkingState::default();
+    state.seed_from_query(Some("fix the flaky test"));
+    state
+        .open_questions
+        .push("How should exec be retried or replaced after the failing test command?".into());
+    state
+        .next_actions
+        .push("Try a smaller command or inspect the relevant files first.".into());
+    state.uncertainties.push(agent::UncertaintyItem {
+        topic: "exec failure".into(),
+        reason: "cargo test exited with status 101".into(),
+        blocking: true,
+    });
+    state.recompute_ready_to_finish();
+
+    let rendered = render_delegation_guidance(&agents, Some("what should I do next"), &state)
+        .expect("delegation guidance should render");
+
+    assert!(rendered.contains("Prefer `task`"));
+    assert!(!rendered.contains("Prefer `orchestrate`"));
+}
+
+#[test]
+fn test_render_delegation_guidance_keeps_single_blocker_on_task_with_extra_actions() {
+    let agents = vec![
+        SubAgentSpec {
+            name: "reviewer".into(),
+            description: "Debugging specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+        SubAgentSpec {
+            name: "benchmarker".into(),
+            description: "Benchmark and performance profiling specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+    ];
+    let mut state = agent::WorkingState::default();
+    state.seed_from_query(Some("fix the flaky test"));
+    state
+        .open_questions
+        .push("How should exec be retried or replaced after the failing test command?".into());
+    state
+        .next_actions
+        .push("Try a smaller command or inspect the relevant files first.".into());
+    state
+        .next_actions
+        .push("Run cargo check before retrying cargo test --workspace.".into());
+    state
+        .next_actions
+        .push("Standardize on cargo test --workspace once the failing file is isolated.".into());
+    state.uncertainties.push(agent::UncertaintyItem {
+        topic: "exec failure".into(),
+        reason: "cargo test exited with status 101".into(),
+        blocking: true,
+    });
+    state.recompute_ready_to_finish();
+
+    let rendered = render_delegation_guidance(&agents, Some("what should I do next"), &state)
+        .expect("delegation guidance should render");
+
+    assert!(rendered.contains("Prefer `task`"));
+    assert!(!rendered.contains("Prefer `orchestrate`"));
+}
+
+#[test]
+fn test_render_delegation_guidance_does_not_fan_out_single_track_multi_part_goal() {
+    let agents = vec![
+        SubAgentSpec {
+            name: "reviewer".into(),
+            description: "Debugging specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+        SubAgentSpec {
+            name: "benchmarker".into(),
+            description: "Benchmark and performance profiling specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+    ];
+    let mut state = agent::WorkingState::default();
+    state.seed_from_query(Some(
+        "fix the flaky test and then retry the same cargo workspace command",
+    ));
+    state
+        .open_questions
+        .push("How should exec be retried after cargo test exited with status 101?".into());
+    state
+        .next_actions
+        .push("Run cargo check before retrying cargo test --workspace.".into());
+    state.uncertainties.push(agent::UncertaintyItem {
+        topic: "exec failure".into(),
+        reason: "cargo test exited with status 101".into(),
+        blocking: true,
+    });
+    state.recompute_ready_to_finish();
+
+    let rendered = render_delegation_guidance(
+        &agents,
+        Some("fix the flaky test and then retry the same cargo workspace command"),
+        &state,
+    )
+    .expect("delegation guidance should render");
+
+    assert!(rendered.contains("Prefer `task`"));
+    assert!(!rendered.contains("Prefer `orchestrate`"));
+}
+
+#[test]
+fn test_render_delegation_guidance_keeps_distinct_tracks_with_shared_repo_anchor() {
+    let agents = vec![
+        SubAgentSpec {
+            name: "reviewer".into(),
+            description: "Debugging specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+        SubAgentSpec {
+            name: "benchmarker".into(),
+            description: "Benchmark and performance profiling specialist".into(),
+            system_prompt: String::new(),
+            max_turns: 10,
+            tools: ToolPermissions::default(),
+            mcp_policy: None,
+            source: AgentSource::System,
+            path: String::new(),
+        },
+    ];
+    let mut state = agent::WorkingState::default();
+    state.seed_from_query(Some(
+        "patch runtime_loop timeout handling and benchmark runtime_loop cancellation path",
+    ));
+    state
+        .next_actions
+        .push("Patch runtime_loop timeout handling in the installer retry flow.".into());
+    state
+        .next_actions
+        .push("Benchmark runtime_loop cancellation path under repeated interrupts.".into());
+    state.uncertainties.push(agent::UncertaintyItem {
+        topic: "timeout handling".into(),
+        reason: "the retry path still stalls".into(),
+        blocking: true,
+    });
+    state.recompute_ready_to_finish();
+
+    let rendered = render_delegation_guidance(
+        &agents,
+        Some("split the runtime_loop follow-up work"),
+        &state,
+    )
+    .expect("delegation guidance should render");
+
+    assert!(rendered.contains("Prefer `orchestrate`"));
+    assert!(rendered.contains("Distinct remaining work tracks detected: 2."));
 }
 
 #[test]
@@ -587,6 +931,7 @@ fn base_config() -> Config {
 
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     }
 }
 

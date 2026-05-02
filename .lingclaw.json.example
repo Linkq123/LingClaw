@@ -10,6 +10,7 @@
     "maxFileBytes": 204800,
     "structuredMemory": false,
     "dailyReflection": false,
+    "enableStateDigest": true,
     "enableS3": true
   },
   "models": {

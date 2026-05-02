@@ -1,6 +1,28 @@
 use super::*;
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::sync::Mutex as AsyncMutex;
+
+static NEXT_TEMP_DIR_ID: AtomicU64 = AtomicU64::new(1);
+
+fn unique_temp_dir(label: &str) -> PathBuf {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let serial = NEXT_TEMP_DIR_ID.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "lingclaw-{label}-{}-{suffix}-{serial}",
+        std::process::id()
+    ))
+}
 
 fn queue_test_config() -> Config {
     Config {
@@ -29,6 +51,7 @@ fn queue_test_config() -> Config {
         structured_memory: true,
         daily_reflection: false,
         s3: None,
+        enable_state_digest: true,
     }
 }
 
@@ -37,12 +60,16 @@ fn test_structured_memory_default() {
     let mem = StructuredMemory::default();
     assert!(mem.user_context.is_none());
     assert!(mem.facts.is_empty());
+    assert!(mem.lessons.is_empty());
+    assert!(mem.open_loops.is_empty());
+    assert!(mem.command_patterns.is_empty());
+    assert!(mem.project_signals.is_empty());
     assert_eq!(mem.updated_at, 0);
 }
 
 #[test]
 fn test_save_and_load_structured_memory() {
-    let dir = std::env::temp_dir().join("lingclaw_test_memory");
+    let dir = unique_temp_dir("test-memory");
     let _ = std::fs::create_dir_all(&dir);
 
     let mem = StructuredMemory {
@@ -52,6 +79,10 @@ fn test_save_and_load_structured_memory() {
             value: "Rust".to_string(),
             recorded_at: 1000,
         }],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 1000,
     };
 
@@ -69,7 +100,7 @@ fn test_save_and_load_structured_memory() {
 
 #[test]
 fn test_load_structured_memory_refreshes_cache_after_external_write() {
-    let dir = std::env::temp_dir().join("lingclaw_test_memory_cache_refresh");
+    let dir = unique_temp_dir("test-memory-cache-refresh");
     let _ = std::fs::create_dir_all(&dir);
 
     let original = StructuredMemory {
@@ -79,6 +110,10 @@ fn test_load_structured_memory_refreshes_cache_after_external_write() {
             value: "Rust".to_string(),
             recorded_at: 1000,
         }],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 1000,
     };
     save_structured_memory(&dir, &original).unwrap();
@@ -94,6 +129,10 @@ fn test_load_structured_memory_refreshes_cache_after_external_write() {
             value: "Go".to_string(),
             recorded_at: 2000,
         }],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 2000,
     };
     let path = dir.join("structured_memory.json");
@@ -137,6 +176,10 @@ fn test_format_memory_for_injection_with_facts() {
                 recorded_at: 0,
             },
         ],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 100,
     };
 
@@ -150,9 +193,20 @@ fn test_format_memory_for_injection_with_facts() {
 
 #[test]
 fn test_strip_json_fences() {
-    assert_eq!(strip_json_fences("```json\n{\"a\":1}\n```"), "{\"a\":1}");
-    assert_eq!(strip_json_fences("```\n{\"a\":1}\n```"), "{\"a\":1}");
-    assert_eq!(strip_json_fences("{\"a\":1}"), "{\"a\":1}");
+    assert_eq!(
+        crate::strip_json_fences("```json\n{\"a\":1}\n```"),
+        "{\"a\":1}"
+    );
+    assert_eq!(
+        crate::strip_json_fences("```JSON\n{\"a\":1}\n```"),
+        "{\"a\":1}"
+    );
+    assert_eq!(
+        crate::strip_json_fences("```Json\n{\"a\":1}\n```"),
+        "{\"a\":1}"
+    );
+    assert_eq!(crate::strip_json_fences("```\n{\"a\":1}\n```"), "{\"a\":1}");
+    assert_eq!(crate::strip_json_fences("{\"a\":1}"), "{\"a\":1}");
 }
 
 #[test]
@@ -210,7 +264,7 @@ fn test_build_conversation_excerpt() {
 
 #[test]
 fn test_memory_status_empty() {
-    let dir = std::env::temp_dir().join("lingclaw_test_mem_status_empty");
+    let dir = unique_temp_dir("test-mem-status-empty");
     let _ = std::fs::create_dir_all(&dir);
 
     let status = memory_status(&dir);
@@ -221,7 +275,7 @@ fn test_memory_status_empty() {
 
 #[test]
 fn test_memory_status_with_data() {
-    let dir = std::env::temp_dir().join("lingclaw_test_mem_status_data");
+    let dir = unique_temp_dir("test-mem-status-data");
     let _ = std::fs::create_dir_all(&dir);
 
     let mem = StructuredMemory {
@@ -231,6 +285,10 @@ fn test_memory_status_with_data() {
             value: "value".to_string(),
             recorded_at: 0,
         }],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: crate::now_epoch(),
     };
     save_structured_memory(&dir, &mem).unwrap();
@@ -244,7 +302,7 @@ fn test_memory_status_with_data() {
 
 #[test]
 fn test_memory_status_utf8_multibyte_no_panic() {
-    let dir = std::env::temp_dir().join("lingclaw_test_mem_status_utf8");
+    let dir = unique_temp_dir("test-mem-status-utf8");
     let _ = std::fs::create_dir_all(&dir);
 
     // user_context with >100 bytes of Chinese chars (3 bytes each)
@@ -256,6 +314,10 @@ fn test_memory_status_utf8_multibyte_no_panic() {
             value: "🦀".repeat(30), // 120 bytes of 4-byte chars
             recorded_at: 0,
         }],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: crate::now_epoch(),
     };
     save_structured_memory(&dir, &mem).unwrap();
@@ -382,7 +444,7 @@ fn test_format_queue_status_includes_counters_and_error() {
 
 #[tokio::test]
 async fn test_memory_debug_status_includes_recent_audit_entries() {
-    let dir = std::env::temp_dir().join("lingclaw_test_mem_debug_status");
+    let dir = unique_temp_dir("test-mem-debug-status");
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::create_dir_all(&dir);
 
@@ -396,6 +458,8 @@ async fn test_memory_debug_status_includes_recent_audit_entries() {
             duration_ms: 77,
             facts_before: 1,
             facts_after: 2,
+            entries_before: 1,
+            entries_after: 2,
             had_user_context_before: false,
             had_user_context_after: true,
             changed: true,
@@ -499,6 +563,10 @@ fn test_format_memory_for_injection_sorts_by_recency() {
                 recorded_at: 2000,
             },
         ],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 2000,
     };
 
@@ -540,6 +608,10 @@ fn test_merge_incremental_update_adds_new_fact() {
             value: "Rust".into(),
             recorded_at: 100,
         }],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 100,
     };
     let raw: serde_json::Value = serde_json::from_str(
@@ -566,6 +638,10 @@ fn test_merge_incremental_update_modifies_existing() {
             value: "Python".into(),
             recorded_at: 100,
         }],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 100,
     };
     let raw: serde_json::Value = serde_json::from_str(
@@ -594,6 +670,10 @@ fn test_merge_incremental_delete_removes_fact() {
                 recorded_at: 100,
             },
         ],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 100,
     };
     let raw: serde_json::Value =
@@ -624,6 +704,10 @@ fn test_merge_incremental_preserves_untouched_facts() {
                 recorded_at: 30,
             },
         ],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 30,
     };
     // Only update "b", leave "a" and "c" alone
@@ -654,6 +738,10 @@ fn test_merge_legacy_full_replacement_still_works() {
                 recorded_at: 100,
             },
         ],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 100,
     };
     // Legacy format: just "facts" key
@@ -678,6 +766,10 @@ fn test_merge_empty_response_preserves_memory() {
             value: "Rust".into(),
             recorded_at: 100,
         }],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 100,
     };
     let raw: serde_json::Value =
@@ -696,6 +788,10 @@ fn test_merge_same_value_is_noop() {
             value: "Rust".into(),
             recorded_at: 100,
         }],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 100,
     };
     let raw: serde_json::Value = serde_json::from_str(
@@ -717,6 +813,10 @@ fn test_merge_normalizes_fact_keys_before_update() {
             value: "Rust".into(),
             recorded_at: 100,
         }],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 100,
     };
     let raw: serde_json::Value = serde_json::from_str(
@@ -740,6 +840,10 @@ fn test_merge_normalizes_delete_fact_keys() {
             value: "Rust".into(),
             recorded_at: 100,
         }],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 100,
     };
     let raw: serde_json::Value =
@@ -767,6 +871,10 @@ fn test_merge_dedupes_equivalent_fact_keys() {
                 recorded_at: 200,
             },
         ],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 200,
     };
 
@@ -797,6 +905,10 @@ fn test_format_memory_query_aware_sorting() {
                 recorded_at: 100, // older but relevant
             },
         ],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 200,
     };
     // With query about Rust, the "language" fact should come first
@@ -860,6 +972,10 @@ fn test_query_aware_sorting_with_cjk_query() {
                 recorded_at: 100,
             },
         ],
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 200,
     };
     let result = format_memory_for_injection(&mem, Some("Rust编程")).unwrap();
@@ -888,6 +1004,10 @@ fn test_format_memory_for_injection_limits_irrelevant_facts_with_query() {
     let mem = StructuredMemory {
         user_context: None,
         facts,
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 4000,
     };
 
@@ -916,6 +1036,10 @@ fn test_format_memory_for_injection_limits_recent_facts_without_query() {
     let mem = StructuredMemory {
         user_context: None,
         facts,
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 12,
     };
 
@@ -947,6 +1071,10 @@ fn test_format_memory_for_injection_skips_fallback_when_relevant_facts_fill_cap(
     let mem = StructuredMemory {
         user_context: None,
         facts,
+        lessons: Vec::new(),
+        open_loops: Vec::new(),
+        command_patterns: Vec::new(),
+        project_signals: Vec::new(),
         updated_at: 2000,
     };
 
@@ -958,4 +1086,831 @@ fn test_format_memory_for_injection_skips_fallback_when_relevant_facts_fill_cap(
 
     assert_eq!(fact_lines, 8);
     assert!(!result.contains("irrelevant_"));
+}
+
+#[test]
+fn test_load_structured_memory_backfills_new_typed_fields_from_legacy_json() {
+    let dir = unique_temp_dir("test-memory-legacy-schema");
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::create_dir_all(&dir);
+
+    let legacy = r#"{
+  "user_context": "prefers rust",
+  "facts": [{"key": "language", "value": "Rust", "recorded_at": 123}],
+  "updated_at": 123
+}"#;
+    std::fs::write(dir.join("structured_memory.json"), legacy).unwrap();
+
+    let loaded = load_structured_memory(&dir);
+    assert_eq!(loaded.user_context.as_deref(), Some("prefers rust"));
+    assert_eq!(loaded.facts.len(), 1);
+    assert!(loaded.lessons.is_empty());
+    assert!(loaded.open_loops.is_empty());
+    assert!(loaded.command_patterns.is_empty());
+    assert!(loaded.project_signals.is_empty());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_merge_incremental_updates_typed_memory_categories() {
+    let mut mem = StructuredMemory {
+        lessons: vec![
+            MemoryLesson {
+                title: "Prefer cargo check".into(),
+                when_to_apply: "before a full test pass".into(),
+                recommendation: "Run cargo check first".into(),
+                scope: "workflow".into(),
+                confidence: MemoryConfidence::Medium,
+                last_seen_at: 10,
+            },
+            MemoryLesson {
+                title: "Old lesson".into(),
+                when_to_apply: "legacy flow".into(),
+                recommendation: "Ignore this".into(),
+                scope: "general".into(),
+                confidence: MemoryConfidence::Low,
+                last_seen_at: 11,
+            },
+        ],
+        open_loops: vec![
+            OpenLoop {
+                goal: "stabilize windows install".into(),
+                blocker: "installer path unknown".into(),
+                next_step: "inspect helper".into(),
+                status: OpenLoopStatus::Open,
+                updated_at: 10,
+            },
+            OpenLoop {
+                goal: "remove flaky test".into(),
+                blocker: "still reproduces".into(),
+                next_step: "collect logs".into(),
+                status: OpenLoopStatus::Open,
+                updated_at: 11,
+            },
+        ],
+        command_patterns: vec![
+            CommandPattern {
+                signature: "cargo test -- --nocapture".into(),
+                purpose: "debug a failing test".into(),
+                outcome: "verbose output".into(),
+                confidence: MemoryConfidence::Medium,
+                last_seen_at: 12,
+            },
+            CommandPattern {
+                signature: "cargo clean".into(),
+                purpose: "force a rebuild".into(),
+                outcome: "slow but sometimes useful".into(),
+                confidence: MemoryConfidence::Low,
+                last_seen_at: 13,
+            },
+        ],
+        project_signals: vec![
+            ProjectSignal {
+                key: "build_system".into(),
+                value: "single crate".into(),
+                recorded_at: 14,
+            },
+            ProjectSignal {
+                key: "old_entry".into(),
+                value: "remove me".into(),
+                recorded_at: 15,
+            },
+        ],
+        ..StructuredMemory::default()
+    };
+
+    let raw: serde_json::Value = serde_json::from_str(
+        r#"{
+          "update_lessons": [
+            {
+              "title": "Prefer cargo check",
+              "when_to_apply": "before a full test pass",
+              "recommendation": "Run cargo check before cargo test",
+              "scope": "workflow",
+              "confidence": "high"
+            }
+          ],
+          "delete_lessons": ["Old lesson"],
+          "update_open_loops": [
+            {
+              "goal": "stabilize windows install",
+              "blocker": "warning still noisy",
+              "next_step": "remove dead helper",
+              "status": "in_progress"
+            }
+          ],
+          "delete_open_loops": ["remove flaky test"],
+          "update_command_patterns": [
+            {
+              "signature": "cargo test -- --nocapture",
+              "purpose": "debug a failing test",
+              "outcome": "captures detailed failure output",
+              "confidence": "high"
+            }
+          ],
+          "delete_command_patterns": ["cargo clean"],
+          "update_project_signals": [
+            {
+              "key": "Build System",
+              "value": "Cargo workspace"
+            }
+          ],
+          "delete_project_signals": ["old_entry"]
+        }"#,
+    )
+    .unwrap();
+
+    merge_llm_response_into_memory(&mut mem, &raw, 200);
+
+    assert_eq!(mem.lessons.len(), 1);
+    assert_eq!(mem.lessons[0].title, "Prefer cargo check");
+    assert_eq!(
+        mem.lessons[0].recommendation,
+        "Run cargo check before cargo test"
+    );
+    assert_eq!(mem.lessons[0].confidence, MemoryConfidence::High);
+
+    assert_eq!(mem.open_loops.len(), 1);
+    assert_eq!(mem.open_loops[0].goal, "stabilize windows install");
+    assert_eq!(mem.open_loops[0].status, OpenLoopStatus::InProgress);
+    assert_eq!(mem.open_loops[0].next_step, "remove dead helper");
+
+    assert_eq!(mem.command_patterns.len(), 1);
+    assert_eq!(
+        mem.command_patterns[0].signature,
+        "cargo test -- --nocapture"
+    );
+    assert_eq!(
+        mem.command_patterns[0].outcome,
+        "captures detailed failure output"
+    );
+    assert_eq!(mem.command_patterns[0].confidence, MemoryConfidence::High);
+
+    assert_eq!(mem.project_signals.len(), 1);
+    assert_eq!(mem.project_signals[0].key, "build_system");
+    assert_eq!(mem.project_signals[0].value, "Cargo workspace");
+}
+
+#[test]
+fn test_merge_incremental_updates_refresh_typed_memory_timestamps_on_same_content() {
+    let mut mem = StructuredMemory {
+        lessons: vec![MemoryLesson {
+            title: "Prefer cargo check".into(),
+            when_to_apply: "before a full test pass".into(),
+            recommendation: "Run cargo check first".into(),
+            scope: "workflow".into(),
+            confidence: MemoryConfidence::Medium,
+            last_seen_at: 10,
+        }],
+        open_loops: vec![OpenLoop {
+            goal: "stabilize windows install".into(),
+            blocker: "installer path unknown".into(),
+            next_step: "inspect helper".into(),
+            status: OpenLoopStatus::Open,
+            updated_at: 20,
+        }],
+        command_patterns: vec![CommandPattern {
+            signature: "cargo test -- --nocapture".into(),
+            purpose: "debug a failing test".into(),
+            outcome: "verbose output".into(),
+            confidence: MemoryConfidence::Medium,
+            last_seen_at: 30,
+        }],
+        project_signals: vec![ProjectSignal {
+            key: "build_system".into(),
+            value: "single crate".into(),
+            recorded_at: 40,
+        }],
+        ..StructuredMemory::default()
+    };
+
+    let raw: serde_json::Value = serde_json::from_str(
+        r#"{
+          "update_lessons": [
+            {
+              "title": "Prefer cargo check",
+              "when_to_apply": "before a full test pass",
+              "recommendation": "Run cargo check first",
+              "scope": "workflow",
+              "confidence": "medium"
+            }
+          ],
+          "update_open_loops": [
+            {
+              "goal": "stabilize windows install",
+              "blocker": "installer path unknown",
+              "next_step": "inspect helper",
+              "status": "open"
+            }
+          ],
+          "update_command_patterns": [
+            {
+              "signature": "cargo test -- --nocapture",
+              "purpose": "debug a failing test",
+              "outcome": "verbose output",
+              "confidence": "medium"
+            }
+          ],
+          "update_project_signals": [
+            {
+              "key": "build_system",
+              "value": "single crate"
+            }
+          ]
+        }"#,
+    )
+    .unwrap();
+
+    merge_llm_response_into_memory(&mut mem, &raw, 200);
+
+    assert_eq!(mem.lessons[0].last_seen_at, 200);
+    assert_eq!(mem.open_loops[0].updated_at, 200);
+    assert_eq!(mem.command_patterns[0].last_seen_at, 200);
+    assert_eq!(mem.project_signals[0].recorded_at, 200);
+}
+
+#[test]
+fn test_format_memory_for_injection_includes_typed_sections_in_order() {
+    let mem = StructuredMemory {
+        user_context: Some("prefers focused diffs".into()),
+        facts: vec![MemoryFact {
+            key: "language".into(),
+            value: "Rust".into(),
+            recorded_at: 50,
+        }],
+        lessons: vec![MemoryLesson {
+            title: "Check first".into(),
+            when_to_apply: "before a long test run".into(),
+            recommendation: "Run cargo check first".into(),
+            scope: "workflow".into(),
+            confidence: MemoryConfidence::High,
+            last_seen_at: 60,
+        }],
+        open_loops: vec![OpenLoop {
+            goal: "stabilize install flow".into(),
+            blocker: "helper warning still present".into(),
+            next_step: "remove dead helper".into(),
+            status: OpenLoopStatus::InProgress,
+            updated_at: 70,
+        }],
+        command_patterns: vec![CommandPattern {
+            signature: "cargo test -q".into(),
+            purpose: "quick regression pass".into(),
+            outcome: "fast smoke coverage".into(),
+            confidence: MemoryConfidence::Medium,
+            last_seen_at: 80,
+        }],
+        project_signals: vec![ProjectSignal {
+            key: "entrypoint".into(),
+            value: "src/main.rs".into(),
+            recorded_at: 90,
+        }],
+        updated_at: 100,
+    };
+
+    let injected = format_memory_for_injection(&mem, None).unwrap();
+    let open_loops_pos = injected.find("**Open loops:**").unwrap();
+    let lessons_pos = injected.find("**Lessons:**").unwrap();
+    let project_signals_pos = injected.find("**Project signals:**").unwrap();
+    let command_patterns_pos = injected.find("**Command patterns:**").unwrap();
+    let facts_pos = injected.find("**Remembered facts:**").unwrap();
+
+    assert!(injected.contains("prefers focused diffs"));
+    assert!(injected.contains("stabilize install flow"));
+    assert!(injected.contains("Check first"));
+    assert!(injected.contains("entrypoint"));
+    assert!(injected.contains("cargo test -q"));
+    assert!(injected.contains("language"));
+    assert!(open_loops_pos < lessons_pos);
+    assert!(lessons_pos < project_signals_pos);
+    assert!(project_signals_pos < command_patterns_pos);
+    assert!(command_patterns_pos < facts_pos);
+}
+
+#[test]
+fn test_format_memory_for_injection_query_ranks_typed_items_by_relevance() {
+    let mem = StructuredMemory {
+        lessons: vec![
+            MemoryLesson {
+                title: "Rebase carefully".into(),
+                when_to_apply: "before rewriting git history".into(),
+                recommendation: "Create a backup branch first".into(),
+                scope: "workflow".into(),
+                confidence: MemoryConfidence::Medium,
+                last_seen_at: 200,
+            },
+            MemoryLesson {
+                title: "Rust test loop".into(),
+                when_to_apply: "when validating a cargo workspace".into(),
+                recommendation: "Run cargo test --workspace after cargo check".into(),
+                scope: "repo".into(),
+                confidence: MemoryConfidence::High,
+                last_seen_at: 100,
+            },
+        ],
+        project_signals: vec![
+            ProjectSignal {
+                key: "frontend_framework".into(),
+                value: "solidjs".into(),
+                recorded_at: 200,
+            },
+            ProjectSignal {
+                key: "test_command".into(),
+                value: "cargo test --workspace".into(),
+                recorded_at: 100,
+            },
+        ],
+        ..StructuredMemory::default()
+    };
+
+    let injected =
+        format_memory_for_injection(&mem, Some("How do I test this cargo workspace?")).unwrap();
+    let relevant_lesson_pos = injected.find("Rust test loop").unwrap();
+    let irrelevant_lesson_pos = injected.find("Rebase carefully").unwrap();
+    let relevant_signal_pos = injected.find("test_command").unwrap();
+    let irrelevant_signal_pos = injected.find("frontend_framework").unwrap();
+
+    assert!(relevant_lesson_pos < irrelevant_lesson_pos);
+    assert!(relevant_signal_pos < irrelevant_signal_pos);
+}
+
+#[test]
+fn test_retrieve_task_memory_uses_working_state_and_intent() {
+    let mem = StructuredMemory {
+        lessons: vec![
+            MemoryLesson {
+                title: "Rust test loop".into(),
+                when_to_apply: "when validating a cargo workspace".into(),
+                recommendation: "Run cargo check before cargo test --workspace".into(),
+                scope: "repo".into(),
+                confidence: MemoryConfidence::High,
+                last_seen_at: 100,
+            },
+            MemoryLesson {
+                title: "Git cleanup".into(),
+                when_to_apply: "before force-pushing".into(),
+                recommendation: "Create a backup branch first".into(),
+                scope: "workflow".into(),
+                confidence: MemoryConfidence::Medium,
+                last_seen_at: 200,
+            },
+        ],
+        open_loops: vec![
+            OpenLoop {
+                goal: "stabilize workspace tests".into(),
+                blocker: "command choice is inconsistent".into(),
+                next_step: "standardize on cargo test --workspace".into(),
+                status: OpenLoopStatus::Open,
+                updated_at: 150,
+            },
+            OpenLoop {
+                goal: "refresh screenshots".into(),
+                blocker: "missing latest assets".into(),
+                next_step: "rerun the capture tool".into(),
+                status: OpenLoopStatus::Open,
+                updated_at: 250,
+            },
+        ],
+        command_patterns: vec![
+            CommandPattern {
+                signature: "cargo test --workspace -- --nocapture".into(),
+                purpose: "debug the full Rust workspace".into(),
+                outcome: "shows verbose test failures".into(),
+                confidence: MemoryConfidence::High,
+                last_seen_at: 300,
+            },
+            CommandPattern {
+                signature: "git push --force-with-lease".into(),
+                purpose: "update a rewritten branch".into(),
+                outcome: "safer than a plain force push".into(),
+                confidence: MemoryConfidence::Medium,
+                last_seen_at: 400,
+            },
+        ],
+        project_signals: vec![
+            ProjectSignal {
+                key: "test_command".into(),
+                value: "cargo test --workspace".into(),
+                recorded_at: 120,
+            },
+            ProjectSignal {
+                key: "frontend_framework".into(),
+                value: "solidjs".into(),
+                recorded_at: 220,
+            },
+        ],
+        facts: vec![
+            MemoryFact {
+                key: "workspace_kind".into(),
+                value: "cargo workspace".into(),
+                recorded_at: 100,
+            },
+            MemoryFact {
+                key: "deployment_env".into(),
+                value: "staging".into(),
+                recorded_at: 200,
+            },
+        ],
+        ..StructuredMemory::default()
+    };
+
+    let mut state = crate::agent::WorkingState::default();
+    state.seed_from_query(Some("zzzxxyyqq unreachabletoken"));
+    state
+        .open_questions
+        .push("Which workspace test command should I use?".into());
+
+    let retrieved = retrieve_task_memory(&mem, Some("zzzxxyyqq unreachabletoken"), Some(&state));
+
+    assert_eq!(
+        retrieved.command_patterns[0].signature,
+        "cargo test --workspace -- --nocapture"
+    );
+    assert_eq!(retrieved.project_signals[0].key, "test_command");
+    assert_eq!(retrieved.open_loops[0].goal, "stabilize workspace tests");
+    assert!(
+        retrieved
+            .lessons
+            .iter()
+            .any(|lesson| lesson.title == "Rust test loop")
+    );
+    assert_eq!(retrieved.facts[0].key, "workspace_kind");
+}
+
+#[test]
+fn test_retrieve_task_memory_uses_completed_steps_and_evidence_from_state() {
+    let mem = StructuredMemory {
+        lessons: vec![
+            MemoryLesson {
+                title: "Entrypoint wiring".into(),
+                when_to_apply: "when tracing startup flow".into(),
+                recommendation: "Inspect src/main.rs first".into(),
+                scope: "repo".into(),
+                confidence: MemoryConfidence::High,
+                last_seen_at: 100,
+            },
+            MemoryLesson {
+                title: "Timeout source".into(),
+                when_to_apply: "when a timeout value appears in src/runtime.rs".into(),
+                recommendation: "src/runtime.rs owns timeout_ms".into(),
+                scope: "repo".into(),
+                confidence: MemoryConfidence::High,
+                last_seen_at: 200,
+            },
+        ],
+        ..StructuredMemory::default()
+    };
+
+    let mut state = crate::agent::WorkingState::default();
+    state.seed_from_query(Some("inspect the entrypoint wiring"));
+    state
+        .completed_steps
+        .push("read_file succeeded: read `src/runtime.rs` in 4ms (call c1).".into());
+    state.evidence.push(crate::agent::EvidenceItem {
+        claim: "Observed file content: timeout_ms = 45".into(),
+        source_tool: "read_file".into(),
+        source_ref: "src/runtime.rs".into(),
+        confidence: crate::agent::EvidenceConfidence::High,
+    });
+
+    let retrieved = retrieve_task_memory(&mem, Some("inspect the entrypoint wiring"), Some(&state));
+
+    assert!(
+        retrieved
+            .lessons
+            .iter()
+            .any(|lesson| lesson.title == "Timeout source")
+    );
+}
+
+#[test]
+fn test_build_task_memory_query_keeps_blockers_ahead_of_long_evidence() {
+    let mut state = crate::agent::WorkingState::default();
+    state.seed_from_query(Some("inspect the runtime loop"));
+    state.completed_steps.push(format!(
+        "read_file succeeded: {}",
+        "src/runtime_loop.rs timeout observation ".repeat(12)
+    ));
+    state.completed_steps.push(format!(
+        "search_code succeeded: {}",
+        "runtime_loop cancellation trace ".repeat(12)
+    ));
+    state.evidence.push(crate::agent::EvidenceItem {
+        claim: format!(
+            "Observed timeout-related context {}",
+            "runtime_loop timeout path ".repeat(12)
+        ),
+        source_tool: "read_file".into(),
+        source_ref: "src/runtime_loop.rs".into(),
+        confidence: crate::agent::EvidenceConfidence::High,
+    });
+    state
+        .open_questions
+        .push("Which path still triggers blockerterm after the refactor?".into());
+    state.uncertainties.push(crate::agent::UncertaintyItem {
+        topic: "blockerterm".into(),
+        reason: "still unresolved after the first runtime probe".into(),
+        blocking: true,
+    });
+    state
+        .next_actions
+        .push("Reproduce blockerterm with a smaller runtime command.".into());
+
+    let query = build_task_memory_query(Some("inspect the runtime loop"), Some(&state))
+        .expect("task memory query should be built");
+
+    assert!(query.contains("blockerterm"));
+}
+
+#[test]
+fn test_build_task_memory_query_prefers_latest_blockers() {
+    let mut state = crate::agent::WorkingState::default();
+    state.seed_from_query(Some("continue the investigation"));
+    state
+        .open_questions
+        .push("oldquestionalpha needs another pass".into());
+    state
+        .open_questions
+        .push("newquestionomega is now the main blocker".into());
+    state.uncertainties.push(crate::agent::UncertaintyItem {
+        topic: "olduncertaintyalpha".into(),
+        reason: "first blocker is no longer the active one".into(),
+        blocking: true,
+    });
+    state.uncertainties.push(crate::agent::UncertaintyItem {
+        topic: "newuncertaintyomega".into(),
+        reason: "latest blocker still needs resolution".into(),
+        blocking: true,
+    });
+    state
+        .next_actions
+        .push("retry oldactionalpha after the initial probe".into());
+    state
+        .next_actions
+        .push("focus on newactionomega before revisiting older work".into());
+
+    let query = build_task_memory_query(Some("continue the investigation"), Some(&state))
+        .expect("task memory query should be built");
+
+    assert!(query.contains("newquestionomega"));
+    assert!(query.contains("newuncertaintyomega"));
+    assert!(query.contains("newactionomega"));
+}
+
+#[test]
+fn test_format_task_memory_for_prompt_renders_relevant_sections() {
+    let selected = RetrievedTaskMemory {
+        open_loops: vec![OpenLoop {
+            goal: "stabilize install flow".into(),
+            blocker: "warning still appears".into(),
+            next_step: "remove the stale helper".into(),
+            status: OpenLoopStatus::InProgress,
+            updated_at: 10,
+        }],
+        lessons: vec![MemoryLesson {
+            title: "Check first".into(),
+            when_to_apply: "before a long test run".into(),
+            recommendation: "Run cargo check first".into(),
+            scope: "workflow".into(),
+            confidence: MemoryConfidence::High,
+            last_seen_at: 20,
+        }],
+        project_signals: vec![ProjectSignal {
+            key: "entrypoint".into(),
+            value: "src/main.rs".into(),
+            recorded_at: 30,
+        }],
+        command_patterns: vec![CommandPattern {
+            signature: "cargo test -q".into(),
+            purpose: "quick regression pass".into(),
+            outcome: "fast smoke coverage".into(),
+            confidence: MemoryConfidence::Medium,
+            last_seen_at: 40,
+        }],
+        facts: vec![MemoryFact {
+            key: "language".into(),
+            value: "Rust".into(),
+            recorded_at: 50,
+        }],
+    };
+
+    let rendered =
+        format_task_memory_for_prompt(&selected, crate::agent::TaskIntent::Change).unwrap();
+
+    assert!(rendered.starts_with("## Relevant Past Experience"));
+    assert!(rendered.contains("Open loops to revisit"));
+    assert!(rendered.contains("Relevant lessons"));
+    assert!(rendered.contains("Project signals"));
+    assert!(rendered.contains("Command patterns"));
+    assert!(rendered.contains("Relevant facts"));
+    assert!(rendered.contains("cargo check first"));
+}
+
+#[test]
+fn test_format_task_tool_hints_for_prompt_reuses_commands_and_anchors() {
+    let selected = RetrievedTaskMemory {
+        open_loops: vec![OpenLoop {
+            goal: "stabilize install flow".into(),
+            blocker: "warning still appears".into(),
+            next_step: "remove the stale helper".into(),
+            status: OpenLoopStatus::Open,
+            updated_at: 10,
+        }],
+        command_patterns: vec![CommandPattern {
+            signature: "cargo test --workspace".into(),
+            purpose: "validate the Rust workspace".into(),
+            outcome: "full regression signal".into(),
+            confidence: MemoryConfidence::High,
+            last_seen_at: 20,
+        }],
+        project_signals: vec![ProjectSignal {
+            key: "entrypoint".into(),
+            value: "src/main.rs".into(),
+            recorded_at: 30,
+        }],
+        ..RetrievedTaskMemory::default()
+    };
+
+    let rendered =
+        format_task_tool_hints_for_prompt(&selected, crate::agent::TaskIntent::Change).unwrap();
+
+    assert!(rendered.starts_with("## Tool Hints"));
+    assert!(rendered.contains("Prefer `exec`"));
+    assert!(rendered.contains("cargo test --workspace"));
+    assert!(rendered.contains("Prefer `read_file` or `search_files`"));
+    assert!(rendered.contains("src/main.rs"));
+}
+
+#[test]
+fn test_task_tool_ranking_context_prefers_exec_and_file_tools() {
+    let selected = RetrievedTaskMemory {
+        open_loops: vec![OpenLoop {
+            goal: "stabilize install flow".into(),
+            blocker: "warning still appears".into(),
+            next_step: "remove the stale helper".into(),
+            status: OpenLoopStatus::Open,
+            updated_at: 10,
+        }],
+        command_patterns: vec![CommandPattern {
+            signature: "cargo test --workspace".into(),
+            purpose: "validate the Rust workspace".into(),
+            outcome: "full regression signal".into(),
+            confidence: MemoryConfidence::High,
+            last_seen_at: 20,
+        }],
+        project_signals: vec![ProjectSignal {
+            key: "entrypoint".into(),
+            value: "src/main.rs".into(),
+            recorded_at: 30,
+        }],
+        ..RetrievedTaskMemory::default()
+    };
+
+    let ranking = task_tool_ranking_context(&selected, crate::agent::TaskIntent::Change);
+
+    assert!(ranking.preferred_tools.contains(&"exec".to_string()));
+    assert!(ranking.preferred_tools.contains(&"read_file".to_string()));
+    assert!(
+        ranking
+            .preferred_tools
+            .contains(&"search_files".to_string())
+    );
+    assert!(ranking.preferred_tools.contains(&"think".to_string()));
+}
+
+#[test]
+fn test_task_memory_resolution_anchors_collects_concrete_paths_commands_and_urls() {
+    let selected = RetrievedTaskMemory {
+        open_loops: vec![OpenLoop {
+            goal: "stabilize install flow".into(),
+            blocker: "warning still appears".into(),
+            next_step: "inspect Cargo.toml before retrying".into(),
+            status: OpenLoopStatus::Open,
+            updated_at: 10,
+        }],
+        command_patterns: vec![CommandPattern {
+            signature: "cargo test --workspace".into(),
+            purpose: "validate the Rust workspace".into(),
+            outcome: "full regression signal".into(),
+            confidence: MemoryConfidence::High,
+            last_seen_at: 20,
+        }],
+        project_signals: vec![ProjectSignal {
+            key: "entrypoint".into(),
+            value: "src/main.rs".into(),
+            recorded_at: 30,
+        }],
+        facts: vec![MemoryFact {
+            key: "docs".into(),
+            value: "https://example.com/spec".into(),
+            recorded_at: 40,
+        }],
+        ..RetrievedTaskMemory::default()
+    };
+
+    let anchors = task_memory_resolution_anchors(&selected);
+
+    assert!(
+        anchors
+            .iter()
+            .any(|anchor| anchor == "cargo test --workspace")
+    );
+    assert!(anchors.iter().any(|anchor| anchor == "src/main.rs"));
+    assert!(anchors.iter().any(|anchor| anchor == "Cargo.toml"));
+    assert!(
+        anchors
+            .iter()
+            .any(|anchor| anchor == "https://example.com/spec")
+    );
+}
+
+#[test]
+fn test_task_memory_next_actions_prefers_open_loops_and_lessons() {
+    let selected = RetrievedTaskMemory {
+        open_loops: vec![OpenLoop {
+            goal: "windows install flow".into(),
+            blocker: "helper warning remains".into(),
+            next_step: "remove the stale helper".into(),
+            status: OpenLoopStatus::Open,
+            updated_at: 10,
+        }],
+        lessons: vec![MemoryLesson {
+            title: "Rust test loop".into(),
+            when_to_apply: "before a full workspace pass".into(),
+            recommendation: "Run cargo check before cargo test --workspace".into(),
+            scope: "repo".into(),
+            confidence: MemoryConfidence::High,
+            last_seen_at: 20,
+        }],
+        command_patterns: vec![CommandPattern {
+            signature: "cargo test --workspace".into(),
+            purpose: "validate the full Rust workspace".into(),
+            outcome: "full regression signal".into(),
+            confidence: MemoryConfidence::High,
+            last_seen_at: 30,
+        }],
+        ..RetrievedTaskMemory::default()
+    };
+
+    let actions = task_memory_next_actions(&selected, crate::agent::TaskIntent::Execute);
+
+    assert!(actions[0].contains("windows install flow"));
+    assert!(
+        actions
+            .iter()
+            .any(|action| action.contains("cargo check before cargo test --workspace"))
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|action| action.contains("cargo test --workspace"))
+    );
+}
+
+#[test]
+fn test_retrieve_task_memory_skips_irrelevant_recent_entries_when_query_misses() {
+    let mem = StructuredMemory {
+        lessons: vec![MemoryLesson {
+            title: "Git cleanup".into(),
+            when_to_apply: "before force-pushing".into(),
+            recommendation: "Create a backup branch first".into(),
+            scope: "workflow".into(),
+            confidence: MemoryConfidence::Medium,
+            last_seen_at: 200,
+        }],
+        command_patterns: vec![CommandPattern {
+            signature: "git push --force-with-lease".into(),
+            purpose: "update a rewritten branch".into(),
+            outcome: "safer than a plain force push".into(),
+            confidence: MemoryConfidence::High,
+            last_seen_at: 300,
+        }],
+        project_signals: vec![ProjectSignal {
+            key: "frontend_framework".into(),
+            value: "solidjs".into(),
+            recorded_at: 400,
+        }],
+        facts: vec![MemoryFact {
+            key: "deployment_env".into(),
+            value: "staging".into(),
+            recorded_at: 500,
+        }],
+        ..StructuredMemory::default()
+    };
+
+    let mut state = crate::agent::WorkingState::default();
+    state.seed_from_query(Some("zzzxxyyqq unreachabletoken"));
+    let query_tokens = crate::tokenize_for_matching("zzzxxyyqq unreachabletoken");
+    assert_eq!(
+        lesson_relevance_score(&mem.lessons[0], &query_tokens, "zzzxxyyqq unreachabletoken"),
+        0
+    );
+
+    let retrieved = retrieve_task_memory(&mem, Some("zzzxxyyqq unreachabletoken"), Some(&state));
+
+    assert!(retrieved.lessons.is_empty());
+    assert!(retrieved.command_patterns.is_empty());
+    assert!(retrieved.project_signals.is_empty());
+    assert!(retrieved.facts.is_empty());
 }
