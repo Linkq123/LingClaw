@@ -651,6 +651,7 @@ fn convert_messages_to_anthropic(messages: &[ChatMessage]) -> (String, Vec<serde
             _ => {}
         }
     }
+
     (system, out)
 }
 
@@ -1504,10 +1505,11 @@ pub(crate) async fn call_llm_simple_with_usage(
         }
         Provider::Anthropic => {
             let url = format!("{}/v1/messages", resolved.api_base);
-            let messages = materialize_image_urls(messages, s3_cfg)?;
-            let (system, msgs) = convert_messages_to_anthropic(&messages);
-            let max_tokens = resolved.max_tokens.unwrap_or(4096);
             let cache_enabled = anthropic_prompt_caching_enabled(resolved);
+            let messages = materialize_image_urls(messages, s3_cfg)?;
+            let (system, mut msgs) = convert_messages_to_anthropic(&messages);
+            maybe_apply_anthropic_message_cache_control(&mut msgs, cache_enabled);
+            let max_tokens = resolved.max_tokens.unwrap_or(4096);
             let mut body = json!({
                 "model": resolved.model_id,
                 "messages": msgs,
@@ -1534,10 +1536,16 @@ pub(crate) async fn call_llm_simple_with_usage(
                 .and_then(|b| b["text"].as_str())
                 .unwrap_or("")
                 .to_string();
-            Ok(SimpleLlmResponse {
-                content,
+            let usage = AnthropicUsage {
                 input_tokens: data["usage"]["input_tokens"].as_u64(),
                 output_tokens: data["usage"]["output_tokens"].as_u64(),
+                cache_creation_input_tokens: data["usage"]["cache_creation_input_tokens"].as_u64(),
+                cache_read_input_tokens: data["usage"]["cache_read_input_tokens"].as_u64(),
+            };
+            Ok(SimpleLlmResponse {
+                content,
+                input_tokens: anthropic_input_tokens(&usage),
+                output_tokens: usage.output_tokens,
             })
         }
         Provider::Ollama => {
@@ -1747,12 +1755,51 @@ fn anthropic_system_payload(system_prompt: &str, cache_enabled: bool) -> serde_j
     json!(blocks)
 }
 
+const CACHE_CONTROL_EPHEMERAL: &str = "ephemeral";
+
 fn maybe_apply_anthropic_tool_cache_control(tools: &mut [serde_json::Value], cache_enabled: bool) {
     if !cache_enabled {
         return;
     }
     if let Some(last_tool) = tools.last_mut() {
-        last_tool["cache_control"] = json!({"type": "ephemeral"});
+        last_tool["cache_control"] = json!({"type": CACHE_CONTROL_EPHEMERAL});
+    }
+}
+
+/// Place a cache breakpoint on the last tool_result in the messages array
+/// or any later cacheable message block so the reusable prefix extends as far
+/// forward as possible.
+fn maybe_apply_anthropic_message_cache_control(
+    msgs: &mut [serde_json::Value],
+    cache_enabled: bool,
+) {
+    if !cache_enabled {
+        return;
+    }
+    for msg in msgs.iter_mut().rev() {
+        if let Some(content) = msg.get_mut("content") {
+            if let Some(text) = content.as_str() {
+                if !text.is_empty() {
+                    let text = text.to_string();
+                    *content = json!([{
+                        "type": "text",
+                        "text": text,
+                        "cache_control": {"type": CACHE_CONTROL_EPHEMERAL},
+                    }]);
+                    return;
+                }
+                continue;
+            }
+            let Some(content_blocks) = content.as_array_mut() else {
+                continue;
+            };
+            for block in content_blocks.iter_mut().rev() {
+                if anthropic_block_is_cacheable(block) {
+                    block["cache_control"] = json!({"type": CACHE_CONTROL_EPHEMERAL});
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -1984,7 +2031,9 @@ async fn process_anthropic_sse_line(line: &str, tx: &LiveTx, state: &mut Anthrop
                     && let Some(message) = evt.message.as_ref()
                     && let Some(usage) = message.usage.as_ref()
                 {
-                    state.input_tokens = Some(total_anthropic_input_tokens(usage));
+                    if let Some(value) = anthropic_input_tokens(usage) {
+                        state.input_tokens = Some(value);
+                    }
                     state.output_tokens = usage.output_tokens;
                 }
             }
@@ -1992,7 +2041,9 @@ async fn process_anthropic_sse_line(line: &str, tx: &LiveTx, state: &mut Anthrop
                 if let Ok(evt) = serde_json::from_str::<AnthropicEvent>(data)
                     && let Some(usage) = evt.usage.as_ref()
                 {
-                    state.input_tokens = Some(total_anthropic_input_tokens(usage));
+                    if let Some(value) = anthropic_input_tokens(usage) {
+                        state.input_tokens = Some(value);
+                    }
                     if let Some(value) = usage.output_tokens {
                         state.output_tokens = Some(value);
                     }
@@ -2455,8 +2506,10 @@ fn build_anthropic_stream_body(
     include_builtin_tools: bool,
 ) -> Result<serde_json::Value, String> {
     let thinking_on = think_level != "off";
+    let cache_enabled = anthropic_prompt_caching_enabled(resolved);
     let messages = materialize_image_urls(messages, s3_cfg)?;
-    let (system_prompt, anthropic_msgs) = convert_messages_to_anthropic(&messages);
+    let (system_prompt, mut anthropic_msgs) = convert_messages_to_anthropic(&messages);
+    maybe_apply_anthropic_message_cache_control(&mut anthropic_msgs, cache_enabled);
     let base_max = resolved.max_tokens.unwrap_or(16_000);
     let mut all_tools: Vec<serde_json::Value> = if include_builtin_tools {
         serde_json::from_value(tools::tool_definitions_anthropic()).unwrap_or_default()
@@ -2464,7 +2517,6 @@ fn build_anthropic_stream_body(
         Vec::new()
     };
     all_tools.extend_from_slice(extra_tools);
-    let cache_enabled = anthropic_prompt_caching_enabled(resolved);
     maybe_apply_anthropic_tool_cache_control(&mut all_tools, cache_enabled);
     let mut body = json!({
         "model": resolved.model_id,
@@ -3022,6 +3074,24 @@ fn total_anthropic_input_tokens(usage: &AnthropicUsage) -> u64 {
     usage.input_tokens.unwrap_or(0)
         + usage.cache_creation_input_tokens.unwrap_or(0)
         + usage.cache_read_input_tokens.unwrap_or(0)
+}
+
+fn anthropic_block_is_cacheable(block: &serde_json::Value) -> bool {
+    let Some(block_type) = block["type"].as_str() else {
+        return false;
+    };
+    match block_type {
+        "thinking" | "redacted_thinking" => false,
+        "text" => block["text"].as_str().is_some_and(|text| !text.is_empty()),
+        _ => true,
+    }
+}
+
+fn anthropic_input_tokens(usage: &AnthropicUsage) -> Option<u64> {
+    (usage.input_tokens.is_some()
+        || usage.cache_creation_input_tokens.is_some()
+        || usage.cache_read_input_tokens.is_some())
+    .then(|| total_anthropic_input_tokens(usage))
 }
 
 #[cfg(test)]

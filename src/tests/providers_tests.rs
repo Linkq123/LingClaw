@@ -492,6 +492,149 @@ fn convert_messages_to_anthropic_empty_assistant_gets_placeholder() {
 }
 
 #[test]
+fn convert_messages_to_anthropic_cache_control_moves_to_latest_cacheable_block() {
+    let messages = vec![
+        ChatMessage {
+            role: "user".into(),
+            content: Some("do something".into()),
+            images: None, thinking: None, anthropic_thinking_blocks: None,
+            tool_calls: None, tool_call_id: None, timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("let me check".into()),
+            images: None, thinking: None, anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "tc1".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "search".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None, timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("result A".into()),
+            images: None, thinking: None, anthropic_thinking_blocks: None,
+            tool_calls: None, tool_call_id: Some("tc1".into()), timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("result B".into()),
+            images: None, thinking: None, anthropic_thinking_blocks: None,
+            tool_calls: None, tool_call_id: Some("tc2".into()), timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("follow-up question".into()),
+            images: None, thinking: None, anthropic_thinking_blocks: None,
+            tool_calls: None, tool_call_id: None, timestamp: None,
+        },
+    ];
+
+    let (_, mut out) = convert_messages_to_anthropic(&messages);
+    maybe_apply_anthropic_message_cache_control(&mut out, true);
+
+    // The final user message should be promoted to text blocks and own the breakpoint.
+    let final_user_msg = &out[4];
+    assert_eq!(final_user_msg["role"], "user");
+    let final_blocks = final_user_msg["content"].as_array().unwrap();
+    assert_eq!(final_blocks[0]["type"], "text");
+    assert_eq!(final_blocks[0]["text"], "follow-up question");
+    assert_eq!(final_blocks[0]["cache_control"]["type"], "ephemeral");
+
+    // The preceding tool_result should remain untagged once a later block exists.
+    let tool_user_msg = &out[3];
+    assert_eq!(tool_user_msg["role"], "user");
+    let content = tool_user_msg["content"].as_array().unwrap();
+    let last_block = content.last().unwrap();
+    assert_eq!(last_block["type"], "tool_result");
+    assert!(last_block.get("cache_control").is_none());
+}
+
+#[test]
+fn convert_messages_to_anthropic_cache_control_skips_thinking_blocks() {
+    let messages = vec![
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("final answer".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: Some(vec![
+                crate::AnthropicThinkingBlock {
+                    block_type: "thinking".into(),
+                    thinking: Some("hidden reasoning".into()),
+                    signature: Some("sig_123".into()),
+                    data: None,
+                },
+                crate::AnthropicThinkingBlock {
+                    block_type: "redacted_thinking".into(),
+                    thinking: None,
+                    signature: None,
+                    data: Some("opaque_blob".into()),
+                },
+            ]),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    ];
+
+    let (_, mut out) = convert_messages_to_anthropic(&messages);
+    maybe_apply_anthropic_message_cache_control(&mut out, true);
+
+    let blocks = out[0]["content"].as_array().unwrap();
+    assert_eq!(blocks[0]["type"], "thinking");
+    assert!(blocks[0].get("cache_control").is_none());
+    assert_eq!(blocks[1]["type"], "redacted_thinking");
+    assert!(blocks[1].get("cache_control").is_none());
+    assert_eq!(blocks[2]["type"], "text");
+    assert_eq!(blocks[2]["cache_control"]["type"], "ephemeral");
+}
+
+#[test]
+fn convert_messages_to_anthropic_no_cache_control_when_disabled() {
+    let messages = vec![
+        ChatMessage {
+            role: "user".into(),
+            content: Some("q".into()),
+            images: None, thinking: None, anthropic_thinking_blocks: None,
+            tool_calls: None, tool_call_id: None, timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("result".into()),
+            images: None, thinking: None, anthropic_thinking_blocks: None,
+            tool_calls: None, tool_call_id: Some("tc1".into()), timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("follow-up".into()),
+            images: None, thinking: None, anthropic_thinking_blocks: None,
+            tool_calls: None, tool_call_id: None, timestamp: None,
+        },
+    ];
+
+    let (_, mut out) = convert_messages_to_anthropic(&messages);
+    maybe_apply_anthropic_message_cache_control(&mut out, false);
+
+    // No cache_control should be present anywhere.
+    for msg in &out {
+        if let Some(content) = msg["content"].as_array() {
+            for block in content {
+                assert!(
+                    block.get("cache_control").is_none(),
+                    "cache_control should not appear when caching is disabled"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn convert_messages_to_ollama_all_roles() {
     let messages = vec![
         ChatMessage {
@@ -2675,6 +2818,64 @@ fn call_llm_simple_gemini_sends_key_header_and_expected_path() {
     assert_eq!(body["contents"][0]["parts"][0]["text"], "hi");
     assert_eq!(body["generationConfig"]["maxOutputTokens"], 64);
     assert!(body.get("tools").is_none());
+}
+
+#[test]
+fn call_llm_simple_anthropic_preserves_missing_usage() {
+    let response_body =
+        r#"{"content":[{"type":"text","text":"hello from anthropic"}]}"#.to_string();
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server("application/json", response_body);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::Anthropic,
+        api_base,
+        api_key: "anthropic-secret".into(),
+        model_id: "claude-sonnet-test".into(),
+        reasoning: false,
+        thinking_format: None,
+        max_tokens: Some(64),
+        context_window: 200_000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hi".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let workspace = unique_temp_dir("lingclaw-call-anthropic-simple");
+
+    let response = runtime
+        .block_on(async {
+            call_llm_simple_with_usage(&http, &resolved, &messages, &workspace, None, 2).await
+        })
+        .expect("anthropic simple call should succeed");
+
+    let request = request_rx.recv().expect("captured request should exist");
+    handle.join().expect("server thread should join");
+
+    assert_eq!(response.content, "hello from anthropic");
+    assert_eq!(response.input_tokens, None);
+    assert_eq!(response.output_tokens, None);
+    assert_eq!(request.request_line, "POST /v1/messages HTTP/1.1");
+    assert_eq!(
+        request.headers.get("x-api-key").map(String::as_str),
+        Some("anthropic-secret")
+    );
+    assert_eq!(
+        request
+            .headers
+            .get("anthropic-version")
+            .map(String::as_str),
+        Some("2023-06-01")
+    );
 }
 
 #[test]
