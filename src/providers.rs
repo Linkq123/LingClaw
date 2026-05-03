@@ -1641,7 +1641,7 @@ fn think_level_to_reasoning_effort(level: &str) -> &str {
 /// DeepSeek-v4 only supports "high" and "max"; lower levels map to "high".
 fn think_level_to_deepseek_reasoning_effort(level: &str) -> &str {
     match level {
-        "xhigh" => "max",
+        "xhigh" | "max" => "max",
         _ => "high",
     }
 }

@@ -150,6 +150,7 @@ fn think_level_to_deepseek_reasoning_effort_all_levels() {
     assert_eq!(think_level_to_deepseek_reasoning_effort("medium"), "high");
     assert_eq!(think_level_to_deepseek_reasoning_effort("high"), "high");
     assert_eq!(think_level_to_deepseek_reasoning_effort("xhigh"), "max");
+    assert_eq!(think_level_to_deepseek_reasoning_effort("max"), "max");
     assert_eq!(think_level_to_deepseek_reasoning_effort("unknown"), "high");
     assert_eq!(think_level_to_deepseek_reasoning_effort("auto"), "high");
 }
