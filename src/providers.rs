@@ -1638,15 +1638,15 @@ fn think_level_to_deepseek_reasoning_effort(level: &str) -> &str {
     }
 }
 
-/// Map think_level to Anthropic thinking budget_tokens.
-fn think_level_to_budget(level: &str) -> u64 {
+/// Map think_level to Anthropic effort string.
+fn think_level_to_anthropic_effort(level: &str) -> &str {
     match level {
-        "minimal" => 1024,
-        "low" => 4096,
-        "medium" => 10240,
-        "high" => 16384,
-        "xhigh" => 32768,
-        _ => 10240,
+        "minimal" | "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        "xhigh" => "xhigh",
+        "max" => "max",
+        _ => "medium",
     }
 }
 
@@ -2457,7 +2457,7 @@ fn build_anthropic_stream_body(
     let thinking_on = think_level != "off";
     let messages = materialize_image_urls(messages, s3_cfg)?;
     let (system_prompt, anthropic_msgs) = convert_messages_to_anthropic(&messages);
-    let base_max = resolved.max_tokens.unwrap_or(8192);
+    let base_max = resolved.max_tokens.unwrap_or(16_000);
     let mut all_tools: Vec<serde_json::Value> = if include_builtin_tools {
         serde_json::from_value(tools::tool_definitions_anthropic()).unwrap_or_default()
     } else {
@@ -2474,16 +2474,13 @@ fn build_anthropic_stream_body(
         "stream": true,
     });
     if thinking_on {
-        // Anthropic requires: 1024 <= budget_tokens < max_tokens.
-        // Clamp to leave at least 1024 tokens for actual text output.
-        let raw_budget = think_level_to_budget(think_level);
-        let budget_tokens = raw_budget.min(base_max.saturating_sub(1024));
-        if budget_tokens >= 1024 {
-            body["thinking"] = json!({
-                "type": "enabled",
-                "budget_tokens": budget_tokens,
-            });
-        }
+        body["thinking"] = json!({
+            "type": "adaptive",
+            "display": "summarized",
+        });
+        body["output_config"] = json!({
+            "effort": think_level_to_anthropic_effort(think_level),
+        });
     }
     if !system_prompt.is_empty() {
         body["system"] = anthropic_system_payload(&system_prompt, cache_enabled);

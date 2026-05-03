@@ -767,6 +767,9 @@ fn auto_think_level_escalates_on_errors() {
     assert_eq!(auto_think_level(10, false, 100, 3), "high");
     // Severe repeated failures get the deepest budget.
     assert_eq!(auto_think_level(2, false, 100, 4), "xhigh");
+    // Extreme repeated failures: unleash unconstrained reasoning.
+    assert_eq!(auto_think_level(5, false, 100, 6), "max");
+    assert_eq!(auto_think_level(5, false, 100, 10), "max");
     // Single error doesn't escalate
     assert_eq!(auto_think_level(6, false, 100, 1), "low");
 }

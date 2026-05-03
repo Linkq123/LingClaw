@@ -88,13 +88,13 @@
         "api": "anthropic",
         "models": [
           {
-            "id": "claude-sonnet-4-20250514",
-            "name": "claude-sonnet-4-20250514",
-            "reasoning": false,
+            "id": "claude-opus-4-7",
+            "name": "claude-opus-4-7",
+            "reasoning": true,
             "input": ["text", "image"],
             "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 200000,
-            "maxTokens": 8192
+            "contextWindow": 1000000,
+            "maxTokens": 64000
           }
         ]
       },
@@ -104,22 +104,22 @@
         "api": "anthropic",
         "models": [
           {
-            "id": "claude-sonnet-4-20250514",
-            "name": "claude-sonnet-4-20250514",
-            "reasoning": false,
+            "id": "claude-opus-4-7",
+            "name": "claude-opus-4-7",
+            "reasoning": true,
             "input": ["text", "image"],
             "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 200000,
-            "maxTokens": 8192
+            "contextWindow": 1000000,
+            "maxTokens": 64000
           },
           {
-            "id": "claude-haiku-3-20250306",
-            "name": "claude-haiku-3-20250306",
+            "id": "claude-haiku-4-5",
+            "name": "claude-haiku-4-5",
             "reasoning": false,
             "input": ["text", "image"],
             "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
             "contextWindow": 200000,
-            "maxTokens": 8192
+            "maxTokens": 64000
           }
         ]
       },
@@ -191,14 +191,14 @@
         "fast": "openai-2/gpt-4o-mini",
         "sub-agent": "openai-2/gpt-4o-mini",
         "sub-agent-frontend-coder": "openai/gpt-4o",
-        "sub-agent-backend-coder": "anthropic/claude-sonnet-4-20250514",
+        "sub-agent-backend-coder": "anthropic/claude-opus-4-7",
         "sub-agent-general-coder": "openai/gpt-4o",
         "sub-agent-explore": "openai-2/gpt-4o-mini",
-        "sub-agent-researcher": "anthropic/claude-sonnet-4-20250514",
-        "sub-agent-reviewer": "anthropic/claude-sonnet-4-20250514",
+        "sub-agent-researcher": "anthropic/claude-opus-4-7",
+        "sub-agent-reviewer": "anthropic/claude-opus-4-7",
         "memory": "openai-2/gpt-4o-mini",
-        "reflection": "anthropic/claude-sonnet-4-20250514",
-        "context": "anthropic-2/claude-haiku-3-20250306"
+        "reflection": "anthropic/claude-opus-4-7",
+        "context": "anthropic-2/claude-haiku-4-5"
       }
     }
   },

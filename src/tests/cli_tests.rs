@@ -345,17 +345,17 @@ fn wizard_suggested_fast_model_prefers_known_family_fast_model() {
             "apiKey": "sk-ant-test",
             "api": "anthropic",
             "models": [
-                { "id": "claude-sonnet-4-20250514" },
-                { "id": "claude-haiku-3-20250306" }
+                { "id": "claude-opus-4-7" },
+                { "id": "claude-haiku-4-5" }
             ]
         }),
     );
 
     let fast_model =
-        wizard_suggested_fast_model(&providers, Some("anthropic-2/claude-sonnet-4-20250514"))
+        wizard_suggested_fast_model(&providers, Some("anthropic-2/claude-opus-4-7"))
             .expect("fast model should be suggested");
 
-    assert_eq!(fast_model, "anthropic-2/claude-haiku-3-20250306");
+    assert_eq!(fast_model, "anthropic-2/claude-haiku-4-5");
 }
 
 #[test]

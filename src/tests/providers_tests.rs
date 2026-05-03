@@ -133,13 +133,14 @@ fn think_level_to_reasoning_effort_all_levels() {
 }
 
 #[test]
-fn think_level_to_budget_all_levels() {
-    assert_eq!(think_level_to_budget("minimal"), 1024);
-    assert_eq!(think_level_to_budget("low"), 4096);
-    assert_eq!(think_level_to_budget("medium"), 10240);
-    assert_eq!(think_level_to_budget("high"), 16384);
-    assert_eq!(think_level_to_budget("xhigh"), 32768);
-    assert_eq!(think_level_to_budget("unknown"), 10240);
+fn think_level_to_anthropic_effort_all_levels() {
+    assert_eq!(think_level_to_anthropic_effort("minimal"), "low");
+    assert_eq!(think_level_to_anthropic_effort("low"), "low");
+    assert_eq!(think_level_to_anthropic_effort("medium"), "medium");
+    assert_eq!(think_level_to_anthropic_effort("high"), "high");
+    assert_eq!(think_level_to_anthropic_effort("xhigh"), "xhigh");
+    assert_eq!(think_level_to_anthropic_effort("max"), "max");
+    assert_eq!(think_level_to_anthropic_effort("unknown"), "medium");
 }
 
 #[test]
@@ -851,22 +852,22 @@ fn anthropic_thinking_does_not_inflate_max_tokens() {
         .expect("body should build");
 
     assert_eq!(body["max_tokens"].as_u64(), Some(128_000));
-    assert_eq!(body["thinking"]["budget_tokens"].as_u64(), Some(10_240));
+    assert_eq!(body["thinking"]["type"].as_str(), Some("adaptive"));
+    assert_eq!(body["thinking"]["display"].as_str(), Some("summarized"));
+    assert_eq!(body["output_config"]["effort"].as_str(), Some("medium"));
 }
 
-/// When max_tokens is smaller than the raw thinking budget, budget_tokens must be
-/// clamped to (max_tokens - 1024) so that max_tokens > budget_tokens holds.
 #[test]
-fn anthropic_thinking_clamps_budget_when_max_tokens_is_small() {
+fn anthropic_thinking_uses_latest_adaptive_shape_for_low_level() {
     let resolved = ResolvedModel {
         provider: Provider::Anthropic,
         api_base: "https://api.anthropic.com".into(),
         api_key: "test-key".into(),
-        model_id: "claude-sonnet-test".into(),
+        model_id: "claude-opus-4-7".into(),
         reasoning: true,
         thinking_format: None,
-        max_tokens: Some(4_096), // smaller than medium budget (10240)
-        context_window: 200_000,
+        max_tokens: Some(4_096),
+        context_window: 1_000_000,
         stream_include_usage: false,
         anthropic_prompt_caching: false,
     };
@@ -881,27 +882,27 @@ fn anthropic_thinking_clamps_budget_when_max_tokens_is_small() {
         timestamp: None,
     }];
 
-    let body = build_anthropic_stream_body(&resolved, &messages, None, "medium", &[], true)
+    let body = build_anthropic_stream_body(&resolved, &messages, None, "low", &[], true)
         .expect("body should build");
 
     assert_eq!(body["max_tokens"].as_u64(), Some(4_096));
-    // budget clamped to 4096 - 1024 = 3072, which is >= 1024 so thinking stays enabled
-    assert_eq!(body["thinking"]["budget_tokens"].as_u64(), Some(3_072));
+    assert_eq!(body["thinking"]["type"].as_str(), Some("adaptive"));
+    assert_eq!(body["thinking"]["display"].as_str(), Some("summarized"));
+    assert_eq!(body["output_config"]["effort"].as_str(), Some("low"));
+    assert!(body["thinking"].get("budget_tokens").is_none());
 }
 
-/// When max_tokens is too small to accommodate even the minimum 1024-token thinking
-/// budget, the thinking block must be omitted entirely to avoid an Anthropic 400.
 #[test]
-fn anthropic_thinking_disabled_when_max_tokens_too_small() {
+fn anthropic_thinking_disabled_when_think_level_is_off() {
     let resolved = ResolvedModel {
         provider: Provider::Anthropic,
         api_base: "https://api.anthropic.com".into(),
         api_key: "test-key".into(),
-        model_id: "claude-sonnet-test".into(),
+        model_id: "claude-opus-4-7".into(),
         reasoning: true,
         thinking_format: None,
-        max_tokens: Some(1_024), // 1024 - 1024 = 0 < 1024 minimum
-        context_window: 200_000,
+        max_tokens: Some(16_000),
+        context_window: 1_000_000,
         stream_include_usage: false,
         anthropic_prompt_caching: false,
     };
@@ -916,12 +917,12 @@ fn anthropic_thinking_disabled_when_max_tokens_too_small() {
         timestamp: None,
     }];
 
-    let body = build_anthropic_stream_body(&resolved, &messages, None, "medium", &[], true)
+    let body = build_anthropic_stream_body(&resolved, &messages, None, "off", &[], true)
         .expect("body should build");
 
-    assert_eq!(body["max_tokens"].as_u64(), Some(1_024));
-    // thinking block must be absent — budget would be 0 which violates the >=1024 minimum
+    assert_eq!(body["max_tokens"].as_u64(), Some(16_000));
     assert!(body["thinking"].is_null());
+    assert!(body["output_config"].is_null());
 }
 
 #[test]

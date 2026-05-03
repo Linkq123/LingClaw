@@ -103,7 +103,7 @@ fn align_runtime_provider_config_updates_provider_family_from_primary_model() {
             api_key: "sk-ant-secondary".to_string(),
             api: "anthropic".to_string(),
             models: vec![JsonModelEntry {
-                id: "claude-haiku-3-20250306".to_string(),
+                id: "claude-haiku-4-5".to_string(),
                 name: None,
                 reasoning: Some(false),
                 input: None,
@@ -119,7 +119,7 @@ fn align_runtime_provider_config_updates_provider_family_from_primary_model() {
         Provider::OpenAI,
         Provider::OpenAI.default_api_base(),
         "env-openai-key",
-        "anthropic-2/claude-haiku-3-20250306",
+        "anthropic-2/claude-haiku-4-5",
         providers,
     );
 

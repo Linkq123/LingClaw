@@ -1025,7 +1025,7 @@ async fn handle_think_command(
     current_session_id: &str,
     state: &AppState,
 ) -> CommandResult {
-    const VALID_LEVELS: &[&str] = &["auto", "off", "minimal", "low", "medium", "high", "xhigh"];
+    const VALID_LEVELS: &[&str] = &["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
     if arg.is_empty() {
         let sessions = state.sessions.lock().await;
@@ -1034,7 +1034,7 @@ async fn handle_think_command(
             .map(|s| s.think_level.as_str())
             .unwrap_or("auto");
         return command_result(
-            format!("think: {level}\nUsage: /think <auto|off|minimal|low|medium|high|xhigh>"),
+            format!("think: {level}\nUsage: /think <auto|off|minimal|low|medium|high|xhigh|max>"),
             "system",
             false,
         );
@@ -1044,7 +1044,7 @@ async fn handle_think_command(
     if !VALID_LEVELS.contains(&level.as_str()) {
         return command_result(
             format!(
-                "Invalid think level: {arg}\nValid: auto, off, minimal, low, medium, high, xhigh"
+                "Invalid think level: {arg}\nValid: auto, off, minimal, low, medium, high, xhigh, max"
             ),
             "system",
             false,
@@ -1245,7 +1245,7 @@ Commands:
     /mcp [refresh]   Show MCP load status or refresh cache
     /usage           Show session token usage
     /model [name]    Show or switch model
-    /think [level]   Set thinking mode (auto|off|minimal|low|medium|high|xhigh)
+    /think [level]   Set thinking mode (auto|off|minimal|low|medium|high|xhigh|max)
     /react [on|off]  Toggle ReAct phase visibility
     /tool [on|off]   Toggle tool card visibility
     /reasoning [on|off] Toggle reasoning visibility

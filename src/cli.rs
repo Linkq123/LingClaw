@@ -2538,7 +2538,7 @@ impl WizardProviderKind {
     fn fallback_model_id(self) -> &'static str {
         match self {
             Self::OpenAI => "gpt-4o-mini",
-            Self::Anthropic => "claude-sonnet-4-20250514",
+            Self::Anthropic => "claude-opus-4-7",
             Self::Ollama => "qwen3",
             Self::Gemini => "gemini-2.5-flash",
         }
@@ -2547,7 +2547,7 @@ impl WizardProviderKind {
     fn preferred_fast_model_id(self) -> Option<&'static str> {
         match self {
             Self::OpenAI => Some("gpt-4o-mini"),
-            Self::Anthropic => Some("claude-haiku-3-20250306"),
+            Self::Anthropic => Some("claude-haiku-4-5"),
             Self::Ollama | Self::Gemini => None,
         }
     }

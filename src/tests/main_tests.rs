@@ -1460,7 +1460,7 @@ fn replace_session_messages_rekeys_subagent_snapshots_for_remaining_history() {
 fn provider_detect_accepts_provider_prefixed_model_refs() {
     assert_eq!(
         Provider::detect(
-            "anthropic/claude-sonnet-4-20250514",
+            "anthropic/claude-opus-4-7",
             "https://api.openai.com/v1",
             None,
         ),
@@ -1645,8 +1645,8 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
                 reasoning: Some(false),
                 input: None,
                 cost: None,
-                context_window: Some(200000),
-                max_tokens: Some(8192),
+                context_window: Some(1_000_000),
+                max_tokens: Some(64_000),
                 compat: None,
             }],
         },
@@ -1803,8 +1803,8 @@ fn resolve_model_prefers_exact_runtime_match_for_same_anthropic_provider_type() 
                 reasoning: Some(false),
                 input: None,
                 cost: None,
-                context_window: Some(200000),
-                max_tokens: Some(8192),
+                context_window: Some(1_000_000),
+                max_tokens: Some(64_000),
                 compat: None,
             }],
         },
@@ -1958,13 +1958,13 @@ fn canonical_model_ref_expands_unique_plain_id() {
             api_key: "anthropic-key".to_string(),
             api: "anthropic".to_string(),
             models: vec![JsonModelEntry {
-                id: "claude-sonnet-4-20250514".to_string(),
+                id: "claude-opus-4-7".to_string(),
                 name: None,
                 reasoning: Some(false),
                 input: None,
                 cost: None,
-                context_window: Some(200000),
-                max_tokens: Some(8192),
+                context_window: Some(1_000_000),
+                max_tokens: Some(64_000),
                 compat: None,
             }],
         },
@@ -2002,10 +2002,10 @@ fn canonical_model_ref_expands_unique_plain_id() {
     };
 
     let canonical = config
-        .canonical_model_ref("claude-sonnet-4-20250514")
+        .canonical_model_ref("claude-opus-4-7")
         .expect("unique model id should expand to provider/model");
 
-    assert_eq!(canonical, "anthropic/claude-sonnet-4-20250514");
+    assert_eq!(canonical, "anthropic/claude-opus-4-7");
 }
 
 #[test]
@@ -2359,11 +2359,11 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         enable_state_digest: true,
     };
 
-    let resolved = config.resolve_model("anthropic/claude-sonnet-4-20250514");
+    let resolved = config.resolve_model("anthropic/claude-opus-4-7");
 
     assert_eq!(resolved.provider, Provider::Anthropic);
     assert_eq!(resolved.api_base, "https://api.anthropic.com");
-    assert_eq!(resolved.model_id, "claude-sonnet-4-20250514");
+    assert_eq!(resolved.model_id, "claude-opus-4-7");
 }
 
 #[test]
@@ -2416,13 +2416,13 @@ fn build_session_status_reports_resolved_target() {
             api_key: "anthropic-key".to_string(),
             api: "anthropic".to_string(),
             models: vec![JsonModelEntry {
-                id: "claude-sonnet-4-20250514".to_string(),
+                id: "claude-opus-4-7".to_string(),
                 name: None,
                 reasoning: Some(false),
                 input: None,
                 cost: None,
-                context_window: Some(200000),
-                max_tokens: Some(8192),
+                context_window: Some(1_000_000),
+                max_tokens: Some(64_000),
                 compat: None,
             }],
         },
@@ -2458,17 +2458,17 @@ fn build_session_status_reports_resolved_target() {
         s3: None,
         enable_state_digest: true,
     };
-    let mut session = test_session("abc", "Test", Some("anthropic/claude-sonnet-4-20250514"));
+    let mut session = test_session("abc", "Test", Some("anthropic/claude-opus-4-7"));
     session.think_level = "medium".to_string();
 
     let status = build_session_status(&session, &config);
 
-    assert!(status.contains("model: anthropic/claude-sonnet-4-20250514"));
+    assert!(status.contains("model: anthropic/claude-opus-4-7"));
     assert!(status.contains("resolved_provider: anthropic"));
     assert!(status.contains("resolved_api_base: https://api.anthropic.com"));
-    assert!(status.contains("resolved_model_id: claude-sonnet-4-20250514"));
-    assert!(status.contains("max_tokens: 8.2K"));
-    assert!(status.contains("context_est: 4/180K (limit 200K)"));
+    assert!(status.contains("resolved_model_id: claude-opus-4-7"));
+    assert!(status.contains("max_tokens: 64K"));
+    assert!(status.contains("context_est: 4/900K (limit 1M)"));
     assert!(status.contains("token_usage_source: input=estimated output=estimated"));
     assert!(status.contains("think: medium"));
 }
@@ -6984,13 +6984,13 @@ fn context_input_budget_reserves_headroom() {
             api_key: "anthropic-key".to_string(),
             api: "anthropic".to_string(),
             models: vec![JsonModelEntry {
-                id: "claude-sonnet-4-20250514".to_string(),
+                id: "claude-opus-4-7".to_string(),
                 name: None,
                 reasoning: Some(false),
                 input: None,
                 cost: None,
-                context_window: Some(200000),
-                max_tokens: Some(8192),
+                context_window: Some(1_000_000),
+                max_tokens: Some(64_000),
                 compat: None,
             }],
         },
@@ -7027,9 +7027,9 @@ fn context_input_budget_reserves_headroom() {
         enable_state_digest: true,
     };
 
-    let budget = context_input_budget_for_model(&config, "anthropic/claude-sonnet-4-20250514");
+    let budget = context_input_budget_for_model(&config, "anthropic/claude-opus-4-7");
 
-    assert_eq!(budget, 180_000);
+    assert_eq!(budget, 900_000);
 }
 
 // ───── Phase 5: turn_len ─────

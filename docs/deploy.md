@@ -347,15 +347,15 @@ volumes:
         "baseUrl": "https://api.anthropic.com",
         "apiKey": "sk-ant-xxx",
         "api": "anthropic",
-        "models": [{ "id": "claude-sonnet-4-20250514" }]
+        "models": [{ "id": "claude-opus-4-7" }]
       }
     }
   },
   "agents": {
     "defaults": {
       "model": {
-        "primary": "anthropic/claude-sonnet-4-20250514",
-        "fast": "anthropic/claude-haiku-3-20250306"
+        "primary": "anthropic/claude-opus-4-7",
+        "fast": "anthropic/claude-haiku-4-5"
       }
     }
   }

@@ -559,7 +559,7 @@ You are a test agent.
 fn test_parse_agent_frontmatter_ignores_legacy_model_field() {
     let content = r#"---
 name: legacy-agent
-model: anthropic/claude-sonnet-4-20250514
+model: anthropic/claude-opus-4-7
 max_turns: 7
 ---
 
@@ -1305,11 +1305,11 @@ fn test_model_resolution_prefers_specific_sub_agent_override() {
     config.sub_agent_model = Some("openai/gpt-4o-mini".to_string());
     config.sub_agent_model_overrides.insert(
         "reviewer".to_string(),
-        "anthropic/claude-sonnet-4-20250514".to_string(),
+        "anthropic/claude-opus-4-7".to_string(),
     );
     assert_eq!(
         resolve_subagent_model(&config, "reviewer"),
-        "anthropic/claude-sonnet-4-20250514"
+        "anthropic/claude-opus-4-7"
     );
     assert_eq!(
         resolve_subagent_model(&config, "coder"),

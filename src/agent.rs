@@ -2209,6 +2209,10 @@ pub(crate) fn auto_think_level(
     user_msg_chars: usize,
     consecutive_errors: usize,
 ) -> &'static str {
+    // Extreme consecutive failures: unleash unconstrained reasoning
+    if consecutive_errors >= 6 {
+        return "max";
+    }
     if consecutive_errors >= 4 {
         return "xhigh";
     }
