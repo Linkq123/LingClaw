@@ -15,6 +15,7 @@ use crate::{Config, DEFAULT_PORT, VERSION, config_dir_path, config_file_path, pr
 
 static MCP_PREFLIGHT_ID: AtomicU64 = AtomicU64::new(1);
 const MCP_PREFLIGHT_TIMEOUT_SECS: u64 = 5;
+const LOCK_PROBE_SUFFIX: &str = ".lock_probe";
 
 // ── Interactive Helpers ──────────────────────────────────────────────────────
 
@@ -840,11 +841,25 @@ Get-Process lingclaw -ErrorAction SilentlyContinue |
 #[cfg(not(windows))]
 fn stop_lingclaw_processes_for_paths(_paths: &[PathBuf]) {}
 
+/// Check whether a file is free to be overwritten.
+/// On Windows this means no process holds an exclusive lock.
+/// On Linux/macOS running binaries are normally writable, but on WSL with
+/// files on a Windows drive the Windows locking semantics apply.  We use a
+/// rename probe (atomic and non-destructive) which fails when the file is
+/// genuinely locked by another process.
 fn file_write_available(path: &Path) -> bool {
-    if !path.exists() {
-        return true;
+    // Rename probe: works on native Linux even for running executables,
+    // fails on Windows and WSL/Windows-drive when the file is in use.
+    let mut probe = path.to_path_buf();
+    probe.as_mut_os_string().push(LOCK_PROBE_SUFFIX);
+    match std::fs::rename(path, &probe) {
+        Ok(()) => {
+            let _ = std::fs::rename(&probe, path);
+            true
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(_) => std::fs::OpenOptions::new().write(true).open(path).is_ok(),
     }
-    std::fs::OpenOptions::new().write(true).open(path).is_ok()
 }
 
 fn wait_for_paths_to_be_released(paths: &[PathBuf], attempts: usize, delay: Duration) -> bool {
