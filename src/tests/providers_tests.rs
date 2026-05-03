@@ -127,7 +127,8 @@ fn think_level_to_reasoning_effort_all_levels() {
     assert_eq!(think_level_to_reasoning_effort("low"), "low");
     assert_eq!(think_level_to_reasoning_effort("medium"), "medium");
     assert_eq!(think_level_to_reasoning_effort("high"), "high");
-    assert_eq!(think_level_to_reasoning_effort("xhigh"), "high");
+    assert_eq!(think_level_to_reasoning_effort("xhigh"), "xhigh");
+    assert_eq!(think_level_to_reasoning_effort("max"), "xhigh");
     assert_eq!(think_level_to_reasoning_effort("unknown"), "medium");
     assert_eq!(think_level_to_reasoning_effort("auto"), "medium");
 }

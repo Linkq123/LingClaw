@@ -1632,7 +1632,8 @@ fn think_level_to_reasoning_effort(level: &str) -> &str {
     match level {
         "minimal" | "low" => "low",
         "medium" => "medium",
-        "high" | "xhigh" => "high",
+        "high" => "high",
+        "xhigh" | "max" => "xhigh",
         _ => "medium",
     }
 }
