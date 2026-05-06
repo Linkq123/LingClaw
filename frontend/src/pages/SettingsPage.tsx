@@ -63,6 +63,27 @@ function numInputToValue(s: string): number | undefined {
   return isNaN(n) ? undefined : n;
 }
 
+function asPlainRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  return value as Record<string, unknown>;
+}
+
+function modelThinkingFormat(model: ModelFormEntry): string {
+  const compat = asPlainRecord(model.compat);
+  return typeof compat?.thinkingFormat === 'string' ? compat.thinkingFormat : '';
+}
+
+function updateModelThinkingFormat(model: ModelFormEntry, value: string): ModelFormEntry {
+  const trimmed = value.trim();
+  const compat = { ...(asPlainRecord(model.compat) || {}) };
+  if (trimmed) compat.thinkingFormat = trimmed;
+  else delete compat.thinkingFormat;
+  return {
+    ...model,
+    compat: Object.keys(compat).length > 0 ? compat : undefined,
+  };
+}
+
 // Stable role list — extracted to module scope to preserve referential identity
 // across AgentsTab renders (prevents unnecessary ModelSelect re-renders).
 const AGENT_ROLES: ReadonlyArray<{ key: string; label: string }> = [
@@ -566,6 +587,26 @@ function ModelEntryRow({
             onChange={(e) => onChange({ ...model, maxTokens: numInputToValue(e.target.value) })}
           />
         </label>
+        <label
+          style={{
+            fontSize: 11,
+            color: 'var(--dim)',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 4,
+          }}
+        >
+          Thinking Format
+          <input
+            type="text"
+            aria-label="Thinking Format"
+            value={modelThinkingFormat(model)}
+            placeholder="openai"
+            title="Examples: openai, qwen, deepseek-v4, ollama, gpt-oss"
+            style={{ width: 120 }}
+            onChange={(e) => onChange(updateModelThinkingFormat(model, e.target.value))}
+          />
+        </label>
         <span
           style={{
             fontSize: 11,
@@ -789,9 +830,16 @@ function ModelsTab({
   );
 
   const updateProvider = useCallback((p: ProviderFormData) => {
-    setProviders((prev) => prev.map((old) => (old._key === p._key ? p : old)));
+    setProviders((prev) => {
+      const nextProviders = prev.map((old) => (old._key === p._key ? p : old));
+      const newModels = serializeProviderForms(nextProviders);
+      if (JSON.stringify(newModels) !== JSON.stringify(config.models)) {
+        onChange({ ...config, models: newModels });
+      }
+      return nextProviders;
+    });
     setFormDirty(true);
-  }, []);
+  }, [config, onChange]);
 
   const deleteProvider = useCallback(
     (rowKey: string) => {

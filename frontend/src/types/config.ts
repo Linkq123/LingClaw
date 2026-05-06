@@ -1,5 +1,10 @@
 // TypeScript interfaces for the LingClaw JSON config shape
 
+export interface ModelCompat {
+  thinkingFormat?: string;
+  [key: string]: unknown;
+}
+
 export interface ModelEntry {
   id: string;
   name?: string;
@@ -7,6 +12,7 @@ export interface ModelEntry {
   input?: string[];
   contextWindow?: number;
   maxTokens?: number;
+  compat?: ModelCompat;
 }
 
 export interface ProviderConfig {

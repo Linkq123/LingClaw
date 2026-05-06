@@ -21,6 +21,26 @@ export interface ProviderFormData {
 let providerFormKeyCounter = 0;
 let modelFormKeyCounter = 0;
 
+function asPlainRecord(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  return { ...(value as Record<string, unknown>) };
+}
+
+function normalizeModelCompat(compat: unknown): Record<string, unknown> | undefined {
+  const next = asPlainRecord(compat);
+  if (!next) return undefined;
+
+  if (typeof next.thinkingFormat === 'string') {
+    const trimmed = next.thinkingFormat.trim();
+    if (trimmed) next.thinkingFormat = trimmed;
+    else delete next.thinkingFormat;
+  } else if (next.thinkingFormat == null || next.thinkingFormat === '') {
+    delete next.thinkingFormat;
+  }
+
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
 function nextProviderFormKey(name: string): string {
   providerFormKeyCounter += 1;
   return `${name}-${providerFormKeyCounter}`;
@@ -116,6 +136,9 @@ export function serializeProviderForms(providers: ProviderFormData[]): AppConfig
         if (model.contextWindow == null) delete entry.contextWindow;
         if (model.maxTokens == null) delete entry.maxTokens;
         if (!model.input || model.input.length === 0) delete entry.input;
+        const compat = normalizeModelCompat(model.compat);
+        if (compat) entry.compat = compat;
+        else delete entry.compat;
         return entry;
       });
 

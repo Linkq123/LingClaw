@@ -33,6 +33,27 @@ describe('settings validation', () => {
     ).not.toThrow();
   });
 
+  it('accepts compat.thinkingFormat as a string', () => {
+    expect(() =>
+      validateModelsConfigDraftShape({
+        providers: {
+          openai: {
+            api: 'openai-completions',
+            baseUrl: 'https://gateway.example/v1',
+            apiKey: 'test-key',
+            models: [
+              {
+                id: 'gpt-5.4',
+                input: ['text'],
+                compat: { thinkingFormat: 'openai' },
+              },
+            ],
+          },
+        },
+      }),
+    ).not.toThrow();
+  });
+
   it('rejects providers that omit apiKey', () => {
     expect(() =>
       validateModelsConfigDraftShape({
@@ -60,5 +81,33 @@ describe('settings validation', () => {
         },
       }),
     ).toThrow('baseUrl');
+  });
+
+  it('rejects non-object compat and non-string compat.thinkingFormat', () => {
+    expect(() =>
+      validateModelsConfigDraftShape({
+        providers: {
+          openai: {
+            api: 'openai-completions',
+            baseUrl: 'https://gateway.example/v1',
+            apiKey: 'test-key',
+            models: [{ id: 'gpt-5.4', compat: 'openai' }],
+          },
+        },
+      }),
+    ).toThrow('compat');
+
+    expect(() =>
+      validateModelsConfigDraftShape({
+        providers: {
+          openai: {
+            api: 'openai-completions',
+            baseUrl: 'https://gateway.example/v1',
+            apiKey: 'test-key',
+            models: [{ id: 'gpt-5.4', compat: { thinkingFormat: 123 } }],
+          },
+        },
+      }),
+    ).toThrow('thinkingFormat');
   });
 });

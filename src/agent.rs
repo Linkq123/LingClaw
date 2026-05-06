@@ -240,6 +240,15 @@ impl TaskIntent {
         Self::Inform
     }
 
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Inform => "inform",
+            Self::Change => "change",
+            Self::Investigate => "investigate",
+            Self::Execute => "execute",
+        }
+    }
+
     fn is_action_oriented(self) -> bool {
         !matches!(self, Self::Inform)
     }
@@ -332,17 +341,21 @@ pub(crate) struct WorkingState {
 }
 
 impl WorkingState {
-    pub(crate) fn seed_from_query(&mut self, query: Option<&str>) {
+    /// Seed state from the latest user query.
+    ///
+    /// Returns `true` when the query redirects the agent to a new goal and the
+    /// task state is reset before reseeding.
+    pub(crate) fn seed_from_query(&mut self, query: Option<&str>) -> bool {
         let Some(query) =
             query.and_then(|query| sanitize_state_text(query, WORKING_STATE_MAX_TEXT_CHARS))
         else {
-            return;
+            return false;
         };
         if self.last_seeded_query.as_deref() == Some(query.as_str()) {
-            return;
+            return false;
         }
         if self.last_seeded_query.is_some() && query_is_follow_up_continuation(&query) {
-            return;
+            return false;
         }
         let represents_new_goal = self
             .last_seeded_query
@@ -355,6 +368,7 @@ impl WorkingState {
         self.primary_goal = Some(query.clone());
         self.last_seeded_query = Some(query);
         self.recompute_ready_to_finish();
+        represents_new_goal
     }
 
     pub(crate) fn has_blocking_uncertainty(&self) -> bool {
@@ -1686,6 +1700,8 @@ pub(crate) struct ToolExecutionTrace {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub start_line: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_line: Option<usize>,
@@ -1714,6 +1730,30 @@ impl ToolExecutionTrace {
             .or(self.command.as_deref())
             .or(self.agent.as_deref())
             .or(self.summary())
+    }
+
+    fn retry_key_ref(&self) -> Option<&str> {
+        self.retry_key.as_deref()
+    }
+
+    fn fallback_retry_key(&self) -> Option<String> {
+        let has_structured_args = self.command.is_some()
+            || self.working_dir.is_some()
+            || self.path.is_some()
+            || self.secondary_path.is_some()
+            || self.pattern.is_some()
+            || self.file_glob.is_some()
+            || self.url.is_some()
+            || self.agent.is_some()
+            || self.task_count.is_some()
+            || self.start_line.is_some()
+            || self.end_line.is_some()
+            || self.max_results.is_some()
+            || self.summary().is_some();
+        if !has_structured_args {
+            return None;
+        }
+        serde_json::to_string(self).ok()
     }
 
     fn anchor_values(&self) -> Vec<&str> {
@@ -2196,47 +2236,751 @@ impl std::fmt::Display for HookPoint {
     }
 }
 
-/// Compute effective think level when session mode is "auto".
-/// Adapts reasoning budget based on cycle depth, observation context,
-/// user message complexity, and consecutive tool errors.
-/// Called only for auto-mode sessions with reasoning-capable models.
-///
-/// `user_msg_chars` is the **character** count (not byte length) of the
-/// latest user message, so CJK text is not unfairly penalised.
-pub(crate) fn auto_think_level(
-    cycles: usize,
-    has_observation: bool,
-    user_msg_chars: usize,
-    consecutive_errors: usize,
-) -> &'static str {
-    // Extreme consecutive failures: unleash unconstrained reasoning
-    if consecutive_errors >= 6 {
-        return "max";
-    }
-    if consecutive_errors >= 4 {
-        return "xhigh";
-    }
-    // Consecutive tool failures: escalate to deeper thinking
-    if consecutive_errors >= 2 {
-        return "high";
-    }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AutoObservationStrength {
+    #[default]
+    None,
+    Light,
+    Medium,
+    Strong,
+}
 
-    // Very large first-turn requests usually need a deeper initial pass.
-    if cycles == 0 {
-        if user_msg_chars > 600 {
-            return "xhigh";
-        }
-        if user_msg_chars > 220 {
-            return "high";
+impl AutoObservationStrength {
+    fn pressure(self) -> usize {
+        match self {
+            Self::None => 0,
+            Self::Light => 1,
+            Self::Medium => 2,
+            Self::Strong => 3,
         }
     }
 
-    match (cycles, has_observation) {
-        (0, _) => "medium",
-        (_, true) if cycles <= 5 => "high",
-        (1..=5, false) => "medium",
-        // Efficiency mode for deep loops
-        _ => "low",
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Light => "light",
+            Self::Medium => "medium",
+            Self::Strong => "strong",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum AutoThinkLevel {
+    #[default]
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl AutoThinkLevel {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    fn score(self) -> i32 {
+        match self {
+            Self::Low => 0,
+            Self::Medium => 1,
+            Self::High => 2,
+            Self::Xhigh => 3,
+            Self::Max => 4,
+        }
+    }
+
+    fn from_score(score: i32) -> Self {
+        match score.clamp(0, 4) {
+            0 => Self::Low,
+            1 => Self::Medium,
+            2 => Self::High,
+            3 => Self::Xhigh,
+            _ => Self::Max,
+        }
+    }
+
+    fn at_least(self, minimum: Self) -> Self {
+        if self.score() < minimum.score() {
+            minimum
+        } else {
+            self
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum AutoRetryPattern {
+    #[default]
+    None,
+    SameTool,
+    SameArgs,
+}
+
+impl AutoRetryPattern {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::SameTool => "same_tool",
+            Self::SameArgs => "same_args",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum AutoErrorKind {
+    #[default]
+    None,
+    Timeout,
+    Permission,
+    Validation,
+    MissingInput,
+    Environment,
+    Unknown,
+}
+
+impl AutoErrorKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Timeout => "timeout",
+            Self::Permission => "permission",
+            Self::Validation => "validation",
+            Self::MissingInput => "missing_input",
+            Self::Environment => "environment",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum AutoEvidenceDeltaQuality {
+    #[default]
+    None,
+    MoreEvidence,
+    BetterEvidence,
+    ResolvedBlocker,
+    NoMeaningfulProgress,
+}
+
+impl AutoEvidenceDeltaQuality {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::MoreEvidence => "more_evidence",
+            Self::BetterEvidence => "better_evidence",
+            Self::ResolvedBlocker => "resolved_blocker",
+            Self::NoMeaningfulProgress => "no_meaningful_progress",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AutoThinkTraceSignals {
+    #[serde(default)]
+    pub(crate) intent: String,
+    #[serde(default)]
+    pub(crate) user_msg_chars: usize,
+    #[serde(default)]
+    pub(crate) observation_strength: String,
+    #[serde(default)]
+    pub(crate) tool_results_count: usize,
+    #[serde(default)]
+    pub(crate) tool_error_count: usize,
+    #[serde(default)]
+    pub(crate) summary_count: usize,
+    #[serde(default)]
+    pub(crate) summary_bytes: usize,
+    #[serde(default)]
+    pub(crate) stagnation_streak: usize,
+    #[serde(default)]
+    pub(crate) error_streak: usize,
+    #[serde(default)]
+    pub(crate) task_pressure: usize,
+    #[serde(default)]
+    pub(crate) ready_to_finish: bool,
+    #[serde(default)]
+    pub(crate) action_oriented: bool,
+    #[serde(default)]
+    pub(crate) has_blocking_uncertainty: bool,
+    #[serde(default)]
+    pub(crate) finish_deferral_count: usize,
+    #[serde(default)]
+    pub(crate) progress_made: bool,
+    #[serde(default)]
+    pub(crate) retry_pattern: String,
+    #[serde(default)]
+    pub(crate) error_kind: String,
+    #[serde(default)]
+    pub(crate) evidence_delta_quality: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AutoThinkDecision {
+    pub(crate) selected_level: AutoThinkLevel,
+    pub(crate) baseline_level: AutoThinkLevel,
+    pub(crate) baseline_reason: String,
+    pub(crate) escalators: Vec<String>,
+    pub(crate) dampeners: Vec<String>,
+    pub(crate) clamps: Vec<String>,
+    pub(crate) signals: AutoThinkTraceSignals,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AutoThinkTrace {
+    #[serde(default)]
+    pub(crate) round: usize,
+    #[serde(default)]
+    pub(crate) cycle: usize,
+    #[serde(default)]
+    pub(crate) phase: String,
+    #[serde(default)]
+    pub(crate) model: String,
+    #[serde(default)]
+    pub(crate) provider: String,
+    #[serde(default)]
+    pub(crate) selected_think: String,
+    #[serde(default)]
+    pub(crate) baseline_level: String,
+    #[serde(default)]
+    pub(crate) baseline_reason: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) escalators: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) dampeners: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) clamps: Vec<String>,
+    #[serde(default)]
+    pub(crate) signals: AutoThinkTraceSignals,
+}
+
+impl AutoThinkDecision {
+    pub(crate) fn into_trace(
+        self,
+        round: usize,
+        cycle: usize,
+        phase: &str,
+        model: &str,
+        provider: &str,
+    ) -> AutoThinkTrace {
+        AutoThinkTrace {
+            round,
+            cycle,
+            phase: phase.to_string(),
+            model: model.to_string(),
+            provider: provider.to_string(),
+            selected_think: self.selected_level.label().to_string(),
+            baseline_level: self.baseline_level.label().to_string(),
+            baseline_reason: self.baseline_reason,
+            escalators: self.escalators,
+            dampeners: self.dampeners,
+            clamps: self.clamps,
+            signals: self.signals,
+        }
+    }
+
+    pub(crate) fn into_trace_with_selected_think(
+        self,
+        round: usize,
+        cycle: usize,
+        phase: &str,
+        model: &str,
+        provider: &str,
+        selected_think: &str,
+    ) -> AutoThinkTrace {
+        let mut trace = self.into_trace(round, cycle, phase, model, provider);
+        if trace.selected_think != selected_think {
+            trace.selected_think = selected_think.to_string();
+            if !trace
+                .clamps
+                .iter()
+                .any(|item| item == "hook_think_override")
+            {
+                trace.clamps.push("hook_think_override".to_string());
+            }
+        }
+        trace
+    }
+}
+
+impl AutoThinkTrace {
+    pub(crate) fn to_live_event(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "auto_trace",
+            "round": self.round,
+            "cycle": self.cycle,
+            "phase": self.phase,
+            "model": self.model,
+            "provider": self.provider,
+            "selected_think": self.selected_think,
+            "baseline_level": self.baseline_level,
+            "baseline_reason": self.baseline_reason,
+            "escalators": self.escalators,
+            "dampeners": self.dampeners,
+            "clamps": self.clamps,
+            "signals": self.signals,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct AutoThinkRuntimeSignals {
+    pub(crate) intent: TaskIntent,
+    pub(crate) cycles: usize,
+    pub(crate) observation_strength: AutoObservationStrength,
+    pub(crate) user_msg_chars: usize,
+    pub(crate) tool_results_count: usize,
+    pub(crate) tool_error_count: usize,
+    pub(crate) summary_count: usize,
+    pub(crate) summary_bytes: usize,
+    pub(crate) stagnation_streak: usize,
+    pub(crate) error_streak: usize,
+    pub(crate) task_pressure: usize,
+    pub(crate) ready_to_finish: bool,
+    pub(crate) action_oriented: bool,
+    pub(crate) has_blocking_uncertainty: bool,
+    pub(crate) finish_deferral_count: usize,
+    pub(crate) progress_made: bool,
+    pub(crate) retry_pattern: AutoRetryPattern,
+    pub(crate) error_kind: AutoErrorKind,
+    pub(crate) evidence_delta_quality: AutoEvidenceDeltaQuality,
+}
+
+impl AutoThinkRuntimeSignals {
+    fn to_trace_signals(self) -> AutoThinkTraceSignals {
+        AutoThinkTraceSignals {
+            intent: self.intent.label().to_string(),
+            user_msg_chars: self.user_msg_chars,
+            observation_strength: self.observation_strength.label().to_string(),
+            tool_results_count: self.tool_results_count,
+            tool_error_count: self.tool_error_count,
+            summary_count: self.summary_count,
+            summary_bytes: self.summary_bytes,
+            stagnation_streak: self.stagnation_streak,
+            error_streak: self.error_streak,
+            task_pressure: self.task_pressure,
+            ready_to_finish: self.ready_to_finish,
+            action_oriented: self.action_oriented,
+            has_blocking_uncertainty: self.has_blocking_uncertainty,
+            finish_deferral_count: self.finish_deferral_count,
+            progress_made: self.progress_made,
+            retry_pattern: self.retry_pattern.label().to_string(),
+            error_kind: self.error_kind.label().to_string(),
+            evidence_delta_quality: self.evidence_delta_quality.label().to_string(),
+        }
+    }
+}
+
+pub(crate) fn auto_observation_strength(
+    results: &[ToolResultEntry],
+    summaries: &[ObservationSummary],
+) -> AutoObservationStrength {
+    if results.is_empty() {
+        return AutoObservationStrength::None;
+    }
+
+    let error_count = results.iter().filter(|result| result.is_error).count();
+    let summary_count = summaries.len();
+    let total_bytes = summaries
+        .iter()
+        .map(|summary| summary.byte_size)
+        .sum::<usize>();
+
+    if error_count >= 2
+        || (error_count >= 1 && summary_count >= 1)
+        || summary_count >= 3
+        || total_bytes >= 24_000
+    {
+        AutoObservationStrength::Strong
+    } else if error_count >= 1 || summary_count >= 1 || results.len() >= 2 {
+        AutoObservationStrength::Medium
+    } else {
+        AutoObservationStrength::Light
+    }
+}
+
+pub(crate) fn auto_think_progress_made(before: &WorkingState, after: &WorkingState) -> bool {
+    after.completed_steps.len() > before.completed_steps.len()
+        || after.evidence.len() > before.evidence.len()
+        || after.open_questions.len() < before.open_questions.len()
+        || after.uncertainties.len() < before.uncertainties.len()
+        || after.next_actions.len() < before.next_actions.len()
+        || (!before.ready_to_finish && after.ready_to_finish)
+        || (!before.has_successful_execution_trace() && after.has_successful_execution_trace())
+        || (!before.has_successful_change_trace() && after.has_successful_change_trace())
+}
+
+fn confirmed_evidence_count(state: &WorkingState) -> usize {
+    state
+        .evidence
+        .iter()
+        .filter(|item| item.confidence.is_confirmed())
+        .count()
+}
+
+pub(crate) fn auto_evidence_delta_quality(
+    before: &WorkingState,
+    after: &WorkingState,
+    progress_made: bool,
+) -> AutoEvidenceDeltaQuality {
+    if before.has_blocking_uncertainty() && !after.has_blocking_uncertainty() {
+        return AutoEvidenceDeltaQuality::ResolvedBlocker;
+    }
+    if confirmed_evidence_count(after) > confirmed_evidence_count(before) {
+        return AutoEvidenceDeltaQuality::BetterEvidence;
+    }
+    if after.evidence.len() > before.evidence.len() {
+        return AutoEvidenceDeltaQuality::MoreEvidence;
+    }
+    if !progress_made {
+        return AutoEvidenceDeltaQuality::NoMeaningfulProgress;
+    }
+    AutoEvidenceDeltaQuality::None
+}
+
+fn tool_result_retry_key(result: &ToolResultEntry) -> Option<String> {
+    result
+        .trace
+        .as_ref()
+        .and_then(|trace| {
+            trace
+                .retry_key_ref()
+                .map(str::to_string)
+                .or_else(|| trace.fallback_retry_key())
+        })
+        .or_else(|| result.call_summary.clone())
+        .or_else(|| result.trace_summary().map(str::to_string))
+}
+
+pub(crate) fn auto_retry_pattern(history: &[ToolResultEntry]) -> AutoRetryPattern {
+    let Some(last) = history.last() else {
+        return AutoRetryPattern::None;
+    };
+
+    let same_tool_streak = history
+        .iter()
+        .rev()
+        .take_while(|result| result.name == last.name)
+        .count();
+    if same_tool_streak < 2 {
+        return AutoRetryPattern::None;
+    }
+
+    let Some(last_key) = tool_result_retry_key(last) else {
+        return AutoRetryPattern::SameTool;
+    };
+    let same_args_streak = history
+        .iter()
+        .rev()
+        .take_while(|result| {
+            result.name == last.name
+                && tool_result_retry_key(result).as_deref() == Some(last_key.as_str())
+        })
+        .count();
+    if same_args_streak >= 2 {
+        AutoRetryPattern::SameArgs
+    } else {
+        AutoRetryPattern::SameTool
+    }
+}
+
+pub(crate) fn auto_error_kind(results: &[ToolResultEntry]) -> AutoErrorKind {
+    let Some(last_error) = results.iter().rev().find(|result| result.is_error) else {
+        return AutoErrorKind::None;
+    };
+
+    let lower = last_error.result.to_ascii_lowercase();
+    if lower.contains("timed out") || lower.contains("timeout") {
+        return AutoErrorKind::Timeout;
+    }
+    if lower.contains("permission denied")
+        || lower.contains("access is denied")
+        || lower.contains("not permitted")
+        || lower.contains("forbidden")
+        || lower.contains("unauthorized")
+    {
+        return AutoErrorKind::Permission;
+    }
+    if lower.contains("missing required parameter")
+        || lower.contains("missing or invalid")
+        || lower.contains("missing required")
+    {
+        return AutoErrorKind::MissingInput;
+    }
+    if lower.contains("invalid arguments")
+        || lower.contains("arguments must")
+        || lower.contains("cannot be null")
+        || lower.contains("invalid parameter")
+        || lower.contains("parameter '")
+    {
+        return AutoErrorKind::Validation;
+    }
+    if lower.contains("command not found")
+        || lower.contains("failed to spawn")
+        || lower.contains("connection refused")
+        || lower.contains("not installed")
+        || lower.contains("no such file")
+        || lower.contains("not found")
+        || lower.contains("unreachable")
+    {
+        return AutoErrorKind::Environment;
+    }
+    AutoErrorKind::Unknown
+}
+
+pub(crate) fn auto_think_task_pressure(state: &WorkingState) -> usize {
+    let mut pressure = 0;
+    if state.intent.is_action_oriented() && !state.ready_to_finish {
+        pressure += 1;
+    }
+    if state.has_blocking_uncertainty() {
+        pressure += 2;
+    }
+    if !state.open_questions.is_empty() {
+        pressure += 1;
+    }
+    if state.next_actions.len() > 1 {
+        pressure += 1;
+    }
+    if state.has_confirmed_evidence() && !state.ready_to_finish {
+        pressure += 1;
+    }
+    pressure
+}
+
+fn auto_baseline_runtime(signals: AutoThinkRuntimeSignals) -> (AutoThinkLevel, &'static str) {
+    match signals.cycles {
+        0 => match signals.intent {
+            TaskIntent::Inform => (AutoThinkLevel::Medium, "initial_inform"),
+            TaskIntent::Investigate => (AutoThinkLevel::Medium, "initial_investigate"),
+            TaskIntent::Change => (AutoThinkLevel::High, "initial_change"),
+            TaskIntent::Execute => (AutoThinkLevel::High, "initial_execute"),
+        },
+        1..=5 => match signals.intent {
+            TaskIntent::Inform => (AutoThinkLevel::Medium, "mid_loop_inform"),
+            TaskIntent::Investigate => (AutoThinkLevel::Medium, "mid_loop_investigate"),
+            TaskIntent::Change => (AutoThinkLevel::High, "mid_loop_change"),
+            TaskIntent::Execute => (AutoThinkLevel::High, "mid_loop_execute"),
+        },
+        6..=10 => match signals.intent {
+            TaskIntent::Inform => (AutoThinkLevel::Low, "late_loop_inform"),
+            TaskIntent::Investigate => (AutoThinkLevel::Medium, "late_loop_investigate"),
+            TaskIntent::Change => (AutoThinkLevel::Medium, "late_loop_change"),
+            TaskIntent::Execute => (AutoThinkLevel::Medium, "late_loop_execute"),
+        },
+        _ => match signals.intent {
+            TaskIntent::Inform => (AutoThinkLevel::Low, "deep_loop_inform"),
+            TaskIntent::Investigate => (AutoThinkLevel::Low, "deep_loop_investigate"),
+            TaskIntent::Change => (AutoThinkLevel::Medium, "deep_loop_change"),
+            TaskIntent::Execute => (AutoThinkLevel::Medium, "deep_loop_execute"),
+        },
+    }
+}
+
+fn push_auto_reason(reasons: &mut Vec<String>, reason: &str) {
+    if !reasons.iter().any(|item| item == reason) {
+        reasons.push(reason.to_string());
+    }
+}
+
+pub(crate) fn auto_think_decision_runtime(signals: AutoThinkRuntimeSignals) -> AutoThinkDecision {
+    let (baseline_level, baseline_reason) = auto_baseline_runtime(signals);
+    let mut score = baseline_level.score();
+    let mut escalators = Vec::new();
+    let mut dampeners = Vec::new();
+    let mut clamps = Vec::new();
+    let mut minimum_level = baseline_level;
+
+    if signals.error_streak >= 6 || (signals.error_streak >= 4 && signals.stagnation_streak >= 2) {
+        minimum_level = AutoThinkLevel::Max;
+        push_auto_reason(&mut clamps, "severe_error_loop");
+    } else {
+        if signals.error_streak >= 4 {
+            minimum_level = minimum_level.at_least(AutoThinkLevel::Xhigh);
+            push_auto_reason(&mut clamps, "error_streak_xhigh");
+        }
+        if signals.stagnation_streak >= 5 {
+            minimum_level = minimum_level.at_least(AutoThinkLevel::Xhigh);
+            push_auto_reason(&mut clamps, "severe_stagnation");
+        }
+    }
+
+    if signals.cycles == 0 {
+        if signals.user_msg_chars > 600 {
+            minimum_level = minimum_level.at_least(AutoThinkLevel::Xhigh);
+            push_auto_reason(&mut clamps, "large_initial_request");
+        } else if signals.user_msg_chars > 220 {
+            minimum_level = minimum_level.at_least(AutoThinkLevel::High);
+            push_auto_reason(&mut clamps, "complex_initial_request");
+        }
+    }
+
+    if signals.error_streak >= 2 {
+        score += 1;
+        push_auto_reason(&mut escalators, "error_streak");
+    }
+    if signals.stagnation_streak >= 3 {
+        score += 1;
+        push_auto_reason(&mut escalators, "stagnation_streak");
+    }
+    if signals.has_blocking_uncertainty {
+        score += 1;
+        push_auto_reason(&mut escalators, "blocking_uncertainty");
+    }
+    if signals.task_pressure >= 4 {
+        score += 2;
+        push_auto_reason(&mut escalators, "task_pressure_high");
+    } else if signals.task_pressure >= 2 {
+        score += 1;
+        push_auto_reason(&mut escalators, "task_pressure");
+    }
+
+    match signals.observation_strength {
+        AutoObservationStrength::Strong => {
+            score += 1;
+            push_auto_reason(&mut escalators, "strong_observation");
+        }
+        AutoObservationStrength::Medium if signals.action_oriented || signals.cycles <= 5 => {
+            score += 1;
+            push_auto_reason(&mut escalators, "medium_observation");
+        }
+        _ => {}
+    }
+
+    if signals.finish_deferral_count >= 3 {
+        score += 2;
+        push_auto_reason(&mut escalators, "repeated_finish_deferrals");
+    } else if signals.finish_deferral_count >= 1 {
+        score += 1;
+        push_auto_reason(&mut escalators, "finish_deferral");
+    }
+
+    if !signals.progress_made {
+        match signals.retry_pattern {
+            AutoRetryPattern::SameArgs => {
+                score += 2;
+                push_auto_reason(&mut escalators, "retry_same_args");
+            }
+            AutoRetryPattern::SameTool => {
+                score += 1;
+                push_auto_reason(&mut escalators, "retry_same_tool");
+            }
+            AutoRetryPattern::None => {}
+        }
+    }
+
+    match signals.error_kind {
+        AutoErrorKind::Timeout => {
+            score += 1;
+            push_auto_reason(&mut escalators, "timeout_errors");
+        }
+        AutoErrorKind::Permission => {
+            score += 1;
+            push_auto_reason(&mut escalators, "permission_errors");
+        }
+        AutoErrorKind::Environment => {
+            score += 1;
+            push_auto_reason(&mut escalators, "environment_errors");
+        }
+        AutoErrorKind::Validation | AutoErrorKind::MissingInput
+            if signals.error_streak >= 1
+                || matches!(signals.retry_pattern, AutoRetryPattern::SameArgs) =>
+        {
+            score += 1;
+            push_auto_reason(&mut escalators, "input_shape_errors");
+        }
+        _ => {}
+    }
+
+    if matches!(
+        signals.evidence_delta_quality,
+        AutoEvidenceDeltaQuality::NoMeaningfulProgress
+    ) && signals.cycles > 0
+    {
+        score += 1;
+        push_auto_reason(&mut escalators, "no_meaningful_progress");
+    }
+
+    if signals.ready_to_finish {
+        score -= 1;
+        push_auto_reason(&mut dampeners, "ready_to_finish");
+    }
+    if signals.progress_made {
+        score -= 1;
+        push_auto_reason(&mut dampeners, "recent_progress");
+    }
+    if matches!(
+        signals.evidence_delta_quality,
+        AutoEvidenceDeltaQuality::ResolvedBlocker
+    ) {
+        score -= 1;
+        push_auto_reason(&mut dampeners, "resolved_blocker");
+    }
+    if matches!(
+        signals.evidence_delta_quality,
+        AutoEvidenceDeltaQuality::BetterEvidence
+    ) && signals.ready_to_finish
+    {
+        score -= 1;
+        push_auto_reason(&mut dampeners, "better_evidence");
+    }
+    if !signals.action_oriented && signals.task_pressure == 0 && signals.cycles >= 4 {
+        score -= 1;
+        push_auto_reason(&mut dampeners, "informational_low_pressure");
+    }
+    let converging_for_decay = signals.ready_to_finish
+        || signals.progress_made
+        || matches!(
+            signals.evidence_delta_quality,
+            AutoEvidenceDeltaQuality::BetterEvidence | AutoEvidenceDeltaQuality::ResolvedBlocker
+        );
+    if signals.cycles >= 6
+        && converging_for_decay
+        && !signals.has_blocking_uncertainty
+        && signals.stagnation_streak == 0
+        && signals.error_streak == 0
+        && signals.finish_deferral_count == 0
+        && signals.task_pressure <= 1
+        && signals.observation_strength.pressure() <= 1
+        && matches!(signals.retry_pattern, AutoRetryPattern::None)
+    {
+        score -= 1;
+        push_auto_reason(&mut dampeners, "late_loop_decay");
+    }
+
+    let mut selected_level = AutoThinkLevel::from_score(score).at_least(minimum_level);
+    if signals.cycles >= 8
+        && signals.ready_to_finish
+        && signals.progress_made
+        && !signals.has_blocking_uncertainty
+        && signals.finish_deferral_count == 0
+        && signals.task_pressure <= 1
+    {
+        let converging_cap = if signals.action_oriented {
+            AutoThinkLevel::Medium
+        } else {
+            AutoThinkLevel::Low
+        };
+        if selected_level.score() > converging_cap.score() {
+            selected_level = converging_cap;
+            push_auto_reason(&mut clamps, "converging_late_loop_cap");
+        }
+    }
+
+    AutoThinkDecision {
+        selected_level,
+        baseline_level,
+        baseline_reason: baseline_reason.to_string(),
+        escalators,
+        dampeners,
+        clamps,
+        signals: signals.to_trace_signals(),
     }
 }
 

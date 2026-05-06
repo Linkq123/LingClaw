@@ -351,9 +351,8 @@ fn wizard_suggested_fast_model_prefers_known_family_fast_model() {
         }),
     );
 
-    let fast_model =
-        wizard_suggested_fast_model(&providers, Some("anthropic-2/claude-opus-4-7"))
-            .expect("fast model should be suggested");
+    let fast_model = wizard_suggested_fast_model(&providers, Some("anthropic-2/claude-opus-4-7"))
+        .expect("fast model should be suggested");
 
     assert_eq!(fast_model, "anthropic-2/claude-haiku-4-5");
 }

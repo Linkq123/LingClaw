@@ -591,6 +591,17 @@ struct LiveRoundState {
     react_visible: bool,
     phase: Option<String>,
     cycle: Option<usize>,
+    effective_model: Option<String>,
+    effective_think: Option<String>,
+    auto_observation_strength: Option<String>,
+    auto_stagnation_streak: Option<usize>,
+    auto_error_streak: Option<usize>,
+    auto_task_pressure: Option<usize>,
+    auto_action_oriented: Option<bool>,
+    auto_ready_to_finish: Option<bool>,
+    auto_has_blocking_uncertainty: Option<bool>,
+    auto_finish_deferred_once: Option<bool>,
+    latest_auto_trace: Option<agent::AutoThinkTrace>,
     has_observation: bool,
     assistant_text: String,
     reasoning_text: String,
@@ -1515,24 +1526,46 @@ async fn dispatch_live_event(
 
         match event_type {
             "start" => {
-                live_rounds.insert(
-                    session_id.to_string(),
-                    LiveRoundState {
-                        connection_id,
-                        round: event["round"].as_u64().unwrap_or(1) as usize,
-                        react_visible: event["react_visible"].as_bool().unwrap_or(false),
-                        phase: event["phase"].as_str().map(str::to_string),
-                        cycle: event["cycle"].as_u64().map(|value| value as usize),
-                        has_observation: false,
-                        assistant_text: String::new(),
-                        reasoning_text: String::new(),
-                        reasoning_done: false,
-                        tools: Vec::new(),
-                        delegated_events: Vec::new(),
-                        active_tasks: HashSet::new(),
-                        active_orchestrations: HashSet::new(),
-                    },
-                );
+                if !is_subagent_live_event(&event) {
+                    live_rounds.insert(
+                        session_id.to_string(),
+                        LiveRoundState {
+                            connection_id,
+                            round: event["round"].as_u64().unwrap_or(1) as usize,
+                            react_visible: event["react_visible"].as_bool().unwrap_or(false),
+                            phase: event["phase"].as_str().map(str::to_string),
+                            cycle: event["cycle"].as_u64().map(|value| value as usize),
+                            effective_model: event["model"].as_str().map(str::to_string),
+                            effective_think: event["think_level"].as_str().map(str::to_string),
+                            auto_observation_strength: event["auto_observation_strength"]
+                                .as_str()
+                                .map(str::to_string),
+                            auto_stagnation_streak: event["auto_stagnation_streak"]
+                                .as_u64()
+                                .map(|value| value as usize),
+                            auto_error_streak: event["auto_error_streak"]
+                                .as_u64()
+                                .map(|value| value as usize),
+                            auto_task_pressure: event["auto_task_pressure"]
+                                .as_u64()
+                                .map(|value| value as usize),
+                            auto_action_oriented: event["auto_action_oriented"].as_bool(),
+                            auto_ready_to_finish: event["auto_ready_to_finish"].as_bool(),
+                            auto_has_blocking_uncertainty: event["auto_has_blocking_uncertainty"]
+                                .as_bool(),
+                            auto_finish_deferred_once: event["auto_finish_deferred_once"].as_bool(),
+                            latest_auto_trace: None,
+                            has_observation: false,
+                            assistant_text: String::new(),
+                            reasoning_text: String::new(),
+                            reasoning_done: false,
+                            tools: Vec::new(),
+                            delegated_events: Vec::new(),
+                            active_tasks: HashSet::new(),
+                            active_orchestrations: HashSet::new(),
+                        },
+                    );
+                }
             }
             "delta" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
@@ -1543,6 +1576,17 @@ async fn dispatch_live_event(
                 {
                     round.assistant_text.push_str(content);
                     truncate_safe(&mut round.assistant_text, LIVE_REPLAY_CAP);
+                }
+            }
+            "auto_trace" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
+                    && let Ok(trace) =
+                        serde_json::from_value::<agent::AutoThinkTrace>(event.clone())
+                {
+                    round.effective_think = Some(trace.selected_think.clone());
+                    round.latest_auto_trace = Some(trace);
                 }
             }
             "thinking_start" => {
@@ -1640,6 +1684,7 @@ async fn dispatch_live_event(
             "react_phase" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
                 {
                     round.phase = event["phase"].as_str().map(str::to_string);
                     round.cycle = event["cycle"].as_u64().map(|value| value as usize);
@@ -1835,17 +1880,48 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
         return;
     };
 
-    ws_send(
-        tx,
-        &json!({
-            "type":"start",
-            "round": live_round.round,
-            "phase": live_round.phase.as_deref().unwrap_or("analyze"),
-            "cycle": live_round.cycle,
-            "react_visible": live_round.react_visible,
-        }),
-    )
-    .await;
+    let mut start_event = json!({
+        "type":"start",
+        "round": live_round.round,
+        "phase": live_round.phase.as_deref().unwrap_or("analyze"),
+        "cycle": live_round.cycle,
+        "think_level": live_round.effective_think,
+        "react_visible": live_round.react_visible,
+    });
+    if let Some(start_obj) = start_event.as_object_mut() {
+        if let Some(value) = live_round.effective_model.as_ref() {
+            start_obj.insert("model".to_string(), json!(value));
+        }
+        if let Some(value) = live_round.auto_observation_strength.as_ref() {
+            start_obj.insert("auto_observation_strength".to_string(), json!(value));
+        }
+        if let Some(value) = live_round.auto_stagnation_streak {
+            start_obj.insert("auto_stagnation_streak".to_string(), json!(value));
+        }
+        if let Some(value) = live_round.auto_error_streak {
+            start_obj.insert("auto_error_streak".to_string(), json!(value));
+        }
+        if let Some(value) = live_round.auto_task_pressure {
+            start_obj.insert("auto_task_pressure".to_string(), json!(value));
+        }
+        if let Some(value) = live_round.auto_action_oriented {
+            start_obj.insert("auto_action_oriented".to_string(), json!(value));
+        }
+        if let Some(value) = live_round.auto_ready_to_finish {
+            start_obj.insert("auto_ready_to_finish".to_string(), json!(value));
+        }
+        if let Some(value) = live_round.auto_has_blocking_uncertainty {
+            start_obj.insert("auto_has_blocking_uncertainty".to_string(), json!(value));
+        }
+        if let Some(value) = live_round.auto_finish_deferred_once {
+            start_obj.insert("auto_finish_deferred_once".to_string(), json!(value));
+        }
+    }
+
+    ws_send(tx, &start_event).await;
+    if let Some(trace) = live_round.latest_auto_trace.as_ref() {
+        ws_send(tx, &trace.to_live_event()).await;
+    }
 
     if !live_round.reasoning_text.is_empty() {
         ws_send(tx, &json!({"type":"thinking_start"})).await;

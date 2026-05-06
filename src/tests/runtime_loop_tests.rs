@@ -56,8 +56,74 @@ fn test_app_state() -> AppState {
     }
 }
 
+fn test_app_state_with_hooks(hooks: HookRegistry) -> AppState {
+    AppState {
+        config: std::sync::Mutex::new(Arc::new(test_config())),
+        http: reqwest::Client::new(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
+        hooks,
+        memory_queue: std::sync::Mutex::new(None),
+    }
+}
+
+struct ThinkOverrideHook {
+    new_level: String,
+}
+
+impl crate::hooks::AgentHook for ThinkOverrideHook {
+    fn name(&self) -> &'static str {
+        "test_think_override"
+    }
+
+    fn point(&self) -> agent::HookPoint {
+        agent::HookPoint::BeforeLlmCall
+    }
+
+    fn should_run(&self, _: &[ChatMessage], _: Provider, _: usize, _: usize) -> bool {
+        false
+    }
+
+    fn run<'a>(
+        &'a self,
+        _: crate::hooks::HookInput,
+        _: &'a Config,
+        _: &'a reqwest::Client,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::hooks::HookOutput> + Send + 'a>>
+    {
+        Box::pin(async { crate::hooks::HookOutput::NoOp })
+    }
+
+    fn should_run_llm(&self, _cycle: usize) -> bool {
+        true
+    }
+
+    fn run_llm<'a>(
+        &'a self,
+        _: LlmHookInput,
+        _: &'a Config,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::hooks::HookOutput> + Send + 'a>>
+    {
+        let new_level = self.new_level.clone();
+        Box::pin(async move {
+            crate::hooks::HookOutput::ModifyLlmParams {
+                extra_system: None,
+                think_override: Some(new_level),
+            }
+        })
+    }
+}
+
 #[test]
-fn effective_think_level_auto_treats_gemini3_as_reasoning_capable() {
+fn auto_think_support_treats_gemini3_as_reasoning_capable() {
     let resolved = providers::ResolvedModel {
         provider: Provider::Gemini,
         api_base: Provider::Gemini.default_api_base().into(),
@@ -71,10 +137,7 @@ fn effective_think_level_auto_treats_gemini3_as_reasoning_capable() {
         anthropic_prompt_caching: false,
     };
 
-    assert_eq!(
-        effective_think_level("auto", &resolved, 0, false, 10, 0),
-        "medium"
-    );
+    assert!(providers::auto_think_supported(&resolved));
 }
 
 #[tokio::test]
@@ -337,8 +400,20 @@ async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
         last_observation_hint: None,
+        last_observation_strength: agent::AutoObservationStrength::None,
+        last_tool_results_count: 0,
+        last_tool_error_count: 0,
+        last_summary_count: 0,
+        last_summary_bytes: 0,
+        last_progress_made: false,
+        last_error_kind: agent::AutoErrorKind::None,
+        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
+        stagnation_streak: 0,
+        error_streak: 0,
         finish_gate_hint: None,
         finish_gate_deferred_once: false,
+        finish_gate_deferral_count: 0,
+        recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
@@ -426,6 +501,68 @@ fn temp_workspace(label: &str) -> PathBuf {
     std::env::temp_dir().join(unique)
 }
 
+fn phase_state_for_analyze_test() -> AgentPhaseState {
+    AgentPhaseState {
+        round: 0,
+        pending_tool_calls: Vec::new(),
+        collected_results: Vec::new(),
+        results_origin_query: None,
+        working_state: agent::WorkingState::default(),
+        retrieved_task_memory: None,
+        retrieved_task_memory_key: None,
+        retrieved_task_memory_cycle: None,
+        cycle_workspace: PathBuf::new(),
+        last_observation_hint: None,
+        last_observation_strength: agent::AutoObservationStrength::None,
+        last_tool_results_count: 0,
+        last_tool_error_count: 0,
+        last_summary_count: 0,
+        last_summary_bytes: 0,
+        last_progress_made: false,
+        last_error_kind: agent::AutoErrorKind::None,
+        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
+        stagnation_streak: 0,
+        error_streak: 0,
+        finish_gate_hint: None,
+        finish_gate_deferred_once: false,
+        finish_gate_deferral_count: 0,
+        recent_tool_history: Vec::new(),
+        pending_interventions: Vec::new(),
+        react_ctx: agent::AgentLoopCtx::new(true),
+        shutting_down: false,
+        run_stopped: false,
+        run_detached: false,
+        last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
+    }
+}
+
+fn install_openai_model(state: &Arc<AppState>, model_id: &str, reasoning: bool) {
+    let mut guard = state.config.lock().expect("config lock");
+    let mut config = (**guard).clone();
+    config.model = format!("openai/{model_id}");
+    config.providers.insert(
+        "openai".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "openai-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: model_id.to_string(),
+                name: None,
+                reasoning: Some(reasoning),
+                input: None,
+                cost: None,
+                context_window: Some(8192),
+                max_tokens: Some(2048),
+                compat: None,
+            }],
+        },
+    );
+    *guard = Arc::new(config);
+}
+
 #[test]
 fn append_dynamic_prompt_section_truncates_to_budget() {
     let mut content = "system".to_string();
@@ -463,6 +600,263 @@ async fn report_working_state_digest_issue_emits_warning_event() {
             .as_str()
             .is_some_and(|content| content.contains("rule-based state tracking"))
     );
+}
+
+#[tokio::test]
+async fn run_analyze_phase_emits_start_then_auto_trace_for_auto_rounds() {
+    let state = Arc::new(test_app_state());
+    install_openai_model(&state, "gpt-4o-reasoner", true);
+
+    let session_id = "auto-trace-analyze-order".to_string();
+    let workspace = temp_workspace("auto-trace-analyze-order");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut session = test_session(&session_id, "Main", Some("openai/gpt-4o-reasoner"));
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some(format!(
+            "investigate the timeout loop and explain the blockers {}",
+            "A".repeat(12_000)
+        )),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(8);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.working_state.seed_from_query(Some(
+        "investigate the timeout loop and explain the blockers",
+    ));
+
+    let control = run_analyze_phase(&ctx, &mut phase_state).await;
+    assert!(matches!(control, AgentPhaseControl::Break));
+
+    let start = live_rx.recv().await.expect("start event should be emitted");
+    let auto_trace = live_rx.recv().await.expect("auto trace should follow");
+    let error = live_rx
+        .recv()
+        .await
+        .expect("budget error should stop the round");
+
+    assert_eq!(start["type"].as_str(), Some("start"));
+    assert_eq!(auto_trace["type"].as_str(), Some("auto_trace"));
+    assert_eq!(auto_trace["round"].as_u64(), Some(1));
+    assert_eq!(auto_trace["cycle"].as_u64(), Some(0));
+    assert_eq!(auto_trace["model"].as_str(), Some("openai/gpt-4o-reasoner"));
+    assert_eq!(auto_trace["provider"].as_str(), Some("openai"));
+    assert!(auto_trace["selected_think"].as_str().is_some());
+    assert_eq!(error["type"].as_str(), Some("error"));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_analyze_phase_emits_post_hook_think_in_auto_trace() {
+    let mut hooks = HookRegistry::new();
+    hooks.register(Box::new(ThinkOverrideHook {
+        new_level: "off".to_string(),
+    }));
+
+    let state = Arc::new(test_app_state_with_hooks(hooks));
+    install_openai_model(&state, "gpt-4o-reasoner", true);
+
+    let session_id = "auto-trace-think-override".to_string();
+    let workspace = temp_workspace("auto-trace-think-override");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut session = test_session(&session_id, "Main", Some("openai/gpt-4o-reasoner"));
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some(format!(
+            "investigate the timeout loop and explain the blockers {}",
+            "D".repeat(12_000)
+        )),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(8);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.working_state.seed_from_query(Some(
+        "investigate the timeout loop and explain the blockers",
+    ));
+
+    let control = run_analyze_phase(&ctx, &mut phase_state).await;
+    assert!(matches!(control, AgentPhaseControl::Break));
+
+    let start = live_rx.recv().await.expect("start event should be emitted");
+    let auto_trace = live_rx.recv().await.expect("auto trace should follow");
+    let error = live_rx
+        .recv()
+        .await
+        .expect("budget error should stop the round");
+
+    assert_eq!(start["type"].as_str(), Some("start"));
+    assert_eq!(start["think_level"].as_str(), Some("off"));
+    assert_eq!(auto_trace["type"].as_str(), Some("auto_trace"));
+    assert_eq!(auto_trace["selected_think"].as_str(), Some("off"));
+    assert!(auto_trace["clamps"].as_array().is_some_and(|clamps| {
+        clamps
+            .iter()
+            .any(|value| value.as_str() == Some("hook_think_override"))
+    }));
+    assert_eq!(error["type"].as_str(), Some("error"));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_analyze_phase_skips_auto_trace_for_manual_think_levels() {
+    let state = Arc::new(test_app_state());
+    install_openai_model(&state, "gpt-4o-reasoner", true);
+
+    let session_id = "manual-think-no-auto-trace".to_string();
+    let workspace = temp_workspace("manual-think-no-auto-trace");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut session = test_session(&session_id, "Main", Some("openai/gpt-4o-reasoner"));
+    session.workspace = workspace.clone();
+    session.think_level = "high".to_string();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some(format!("change the runtime loop {}", "B".repeat(12_000))),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(8);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state
+        .working_state
+        .seed_from_query(Some("change the runtime loop"));
+
+    let control = run_analyze_phase(&ctx, &mut phase_state).await;
+    assert!(matches!(control, AgentPhaseControl::Break));
+
+    let first = live_rx.recv().await.expect("start event should be emitted");
+    let second = live_rx
+        .recv()
+        .await
+        .expect("round should end with budget error");
+
+    assert_eq!(first["type"].as_str(), Some("start"));
+    assert_ne!(second["type"].as_str(), Some("auto_trace"));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_analyze_phase_skips_auto_trace_for_unsupported_models() {
+    let state = Arc::new(test_app_state());
+    install_openai_model(&state, "gpt-4o-mini", false);
+
+    let session_id = "unsupported-auto-no-trace".to_string();
+    let workspace = temp_workspace("unsupported-auto-no-trace");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut session = test_session(&session_id, "Main", Some("openai/gpt-4o-mini"));
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some(format!("summarize the runtime loop {}", "C".repeat(12_000))),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(8);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state
+        .working_state
+        .seed_from_query(Some("summarize the runtime loop"));
+
+    let control = run_analyze_phase(&ctx, &mut phase_state).await;
+    assert!(matches!(control, AgentPhaseControl::Break));
+
+    let first = live_rx.recv().await.expect("start event should be emitted");
+    let second = live_rx
+        .recv()
+        .await
+        .expect("round should end with budget error");
+
+    assert_eq!(first["type"].as_str(), Some("start"));
+    assert_ne!(second["type"].as_str(), Some("auto_trace"));
+    assert_eq!(first["think_level"].as_str(), Some("off"));
+
+    let _ = std::fs::remove_dir_all(&workspace);
 }
 
 #[tokio::test]
@@ -511,8 +905,20 @@ async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections(
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
         last_observation_hint: Some(format!("## Observation Hint\n{}", "A".repeat(1_400))),
+        last_observation_strength: agent::AutoObservationStrength::None,
+        last_tool_results_count: 0,
+        last_tool_error_count: 0,
+        last_summary_count: 0,
+        last_summary_bytes: 0,
+        last_progress_made: false,
+        last_error_kind: agent::AutoErrorKind::None,
+        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
+        stagnation_streak: 0,
+        error_streak: 0,
         finish_gate_hint: Some(format!("## Finish Check\n{}", "B".repeat(1_400))),
         finish_gate_deferred_once: false,
+        finish_gate_deferral_count: 0,
+        recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
@@ -620,8 +1026,20 @@ async fn prepare_analyze_snapshot_preserves_finish_hint_when_budget_skips_it() {
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
         last_observation_hint: Some(format!("## Observation Hint\n{}", "A".repeat(5_000))),
+        last_observation_strength: agent::AutoObservationStrength::None,
+        last_tool_results_count: 0,
+        last_tool_error_count: 0,
+        last_summary_count: 0,
+        last_summary_bytes: 0,
+        last_progress_made: false,
+        last_error_kind: agent::AutoErrorKind::None,
+        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
+        stagnation_streak: 0,
+        error_streak: 0,
         finish_gate_hint: Some("## Finish Check\nUse the concrete findings in your answer.".into()),
         finish_gate_deferred_once: false,
+        finish_gate_deferral_count: 0,
+        recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
@@ -649,6 +1067,142 @@ async fn prepare_analyze_snapshot_preserves_finish_hint_when_budget_skips_it() {
     assert!(!prompt.contains("## Finish Check"));
     assert!(phase_state.last_observation_hint.is_none());
     assert!(phase_state.finish_gate_hint.is_some());
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
+    let state = Arc::new(test_app_state());
+    let session_id = "snapshot-new-goal-reset".to_string();
+    let workspace = temp_workspace("snapshot-new-goal-reset");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("investigate the timeout path".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("fix the parser instead".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = AgentPhaseState {
+        round: 0,
+        pending_tool_calls: Vec::new(),
+        collected_results: Vec::new(),
+        results_origin_query: None,
+        working_state: agent::WorkingState::default(),
+        retrieved_task_memory: None,
+        retrieved_task_memory_key: None,
+        retrieved_task_memory_cycle: None,
+        cycle_workspace: PathBuf::new(),
+        last_observation_hint: Some("## Observation Hint\nlegacy observation context".into()),
+        last_observation_strength: agent::AutoObservationStrength::Strong,
+        last_tool_results_count: 3,
+        last_tool_error_count: 2,
+        last_summary_count: 1,
+        last_summary_bytes: 4096,
+        last_progress_made: true,
+        last_error_kind: agent::AutoErrorKind::Timeout,
+        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::NoMeaningfulProgress,
+        stagnation_streak: 4,
+        error_streak: 3,
+        finish_gate_hint: Some("## Finish Check\nlegacy finish gate hint".into()),
+        finish_gate_deferred_once: true,
+        finish_gate_deferral_count: 2,
+        recent_tool_history: vec![agent::ToolResultEntry {
+            id: "tool-1".into(),
+            name: "read_file".into(),
+            duration_ms: 7,
+            is_error: true,
+            result: "timed out".into(),
+            call_summary: Some("read `src/runtime_loop.rs`".into()),
+            trace: None,
+        }],
+        pending_interventions: Vec::new(),
+        react_ctx: agent::AgentLoopCtx::new(false),
+        shutting_down: false,
+        run_stopped: false,
+        run_detached: false,
+        last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
+    };
+    phase_state
+        .working_state
+        .seed_from_query(Some("investigate the timeout path"));
+    phase_state.react_ctx.cycles = 6;
+
+    prepare_analyze_snapshot(&ctx, &mut phase_state)
+        .await
+        .expect("snapshot should be prepared");
+
+    assert_eq!(
+        phase_state.working_state.primary_goal.as_deref(),
+        Some("fix the parser instead")
+    );
+    assert_eq!(phase_state.working_state.intent, agent::TaskIntent::Change);
+    assert_eq!(
+        phase_state.last_observation_strength,
+        agent::AutoObservationStrength::None
+    );
+    assert_eq!(phase_state.last_tool_results_count, 0);
+    assert_eq!(phase_state.last_tool_error_count, 0);
+    assert_eq!(phase_state.last_summary_count, 0);
+    assert_eq!(phase_state.last_summary_bytes, 0);
+    assert!(!phase_state.last_progress_made);
+    assert_eq!(phase_state.last_error_kind, agent::AutoErrorKind::None);
+    assert_eq!(
+        phase_state.last_evidence_delta_quality,
+        agent::AutoEvidenceDeltaQuality::None
+    );
+    assert_eq!(phase_state.stagnation_streak, 0);
+    assert_eq!(phase_state.error_streak, 0);
+    assert_eq!(phase_state.react_ctx.cycles, 0);
+    assert!(!phase_state.finish_gate_deferred_once);
+    assert_eq!(phase_state.finish_gate_deferral_count, 0);
+    assert!(phase_state.recent_tool_history.is_empty());
+
+    let prompt = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .and_then(|session| session.messages.first())
+            .and_then(|message| message.content.clone())
+            .expect("system prompt should be present")
+    };
+    assert!(!prompt.contains("legacy observation context"));
+    assert!(!prompt.contains("legacy finish gate hint"));
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -712,8 +1266,20 @@ async fn update_working_state_keeps_results_attached_to_their_original_query() {
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
         last_observation_hint: None,
+        last_observation_strength: agent::AutoObservationStrength::None,
+        last_tool_results_count: 0,
+        last_tool_error_count: 0,
+        last_summary_count: 0,
+        last_summary_bytes: 0,
+        last_progress_made: false,
+        last_error_kind: agent::AutoErrorKind::None,
+        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
+        stagnation_streak: 0,
+        error_streak: 0,
         finish_gate_hint: None,
         finish_gate_deferred_once: false,
+        finish_gate_deferral_count: 0,
+        recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
@@ -806,8 +1372,20 @@ async fn update_working_state_reuses_same_cycle_task_memory_selection() {
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
         last_observation_hint: None,
+        last_observation_strength: agent::AutoObservationStrength::None,
+        last_tool_results_count: 0,
+        last_tool_error_count: 0,
+        last_summary_count: 0,
+        last_summary_bytes: 0,
+        last_progress_made: false,
+        last_error_kind: agent::AutoErrorKind::None,
+        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
+        stagnation_streak: 0,
+        error_streak: 0,
         finish_gate_hint: None,
         finish_gate_deferred_once: false,
+        finish_gate_deferral_count: 0,
+        recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
@@ -957,8 +1535,20 @@ async fn update_working_state_refreshes_task_memory_after_state_changes() {
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
         last_observation_hint: None,
+        last_observation_strength: agent::AutoObservationStrength::None,
+        last_tool_results_count: 0,
+        last_tool_error_count: 0,
+        last_summary_count: 0,
+        last_summary_bytes: 0,
+        last_progress_made: false,
+        last_error_kind: agent::AutoErrorKind::None,
+        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
+        stagnation_streak: 0,
+        error_streak: 0,
         finish_gate_hint: None,
         finish_gate_deferred_once: false,
+        finish_gate_deferral_count: 0,
+        recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
@@ -1032,8 +1622,20 @@ async fn prepare_analyze_snapshot_injects_fresh_task_state_each_time() {
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
         last_observation_hint: None,
+        last_observation_strength: agent::AutoObservationStrength::None,
+        last_tool_results_count: 0,
+        last_tool_error_count: 0,
+        last_summary_count: 0,
+        last_summary_bytes: 0,
+        last_progress_made: false,
+        last_error_kind: agent::AutoErrorKind::None,
+        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
+        stagnation_streak: 0,
+        error_streak: 0,
         finish_gate_hint: None,
         finish_gate_deferred_once: false,
+        finish_gate_deferral_count: 0,
+        recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
@@ -1178,8 +1780,20 @@ async fn prepare_analyze_snapshot_injects_retrieved_task_memory() {
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
         last_observation_hint: None,
+        last_observation_strength: agent::AutoObservationStrength::None,
+        last_tool_results_count: 0,
+        last_tool_error_count: 0,
+        last_summary_count: 0,
+        last_summary_bytes: 0,
+        last_progress_made: false,
+        last_error_kind: agent::AutoErrorKind::None,
+        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
+        stagnation_streak: 0,
+        error_streak: 0,
         finish_gate_hint: None,
         finish_gate_deferred_once: false,
+        finish_gate_deferral_count: 0,
+        recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
@@ -1275,8 +1889,20 @@ async fn prepare_analyze_snapshot_injects_agent_recommendations_and_delegation_g
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
         last_observation_hint: None,
+        last_observation_strength: agent::AutoObservationStrength::None,
+        last_tool_results_count: 0,
+        last_tool_error_count: 0,
+        last_summary_count: 0,
+        last_summary_bytes: 0,
+        last_progress_made: false,
+        last_error_kind: agent::AutoErrorKind::None,
+        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
+        stagnation_streak: 0,
+        error_streak: 0,
         finish_gate_hint: None,
         finish_gate_deferred_once: false,
+        finish_gate_deferral_count: 0,
+        recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
@@ -1410,8 +2036,20 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
         last_observation_hint: None,
+        last_observation_strength: agent::AutoObservationStrength::None,
+        last_tool_results_count: 0,
+        last_tool_error_count: 0,
+        last_summary_count: 0,
+        last_summary_bytes: 0,
+        last_progress_made: false,
+        last_error_kind: agent::AutoErrorKind::None,
+        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
+        stagnation_streak: 0,
+        error_streak: 0,
         finish_gate_hint: None,
         finish_gate_deferred_once: false,
+        finish_gate_deferral_count: 0,
+        recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
@@ -1546,7 +2184,7 @@ fn select_analyze_model_keeps_primary_for_image_turn_when_fast_lacks_image_suppo
         config.fast_model.as_deref(),
         0,
         false,
-        Some("杩欏紶鍥鹃噷鏄粈涔堬紵"),
+        Some("鏉╂瑥绱堕崶楣冨櫡閺勵垯绮堟稊鍫吹"),
         true,
     );
 
@@ -2145,11 +2783,11 @@ fn try_claim_reflection_respects_cooldown() {
     let _guard = reflection_test_guard().blocking_lock();
     let now = epoch_secs_now();
 
-    // Last reflection was just now 鈥?should be blocked.
+    // Last reflection was just now 閳?should be blocked.
     LAST_REFLECTION_EPOCH.store(now, std::sync::atomic::Ordering::Relaxed);
     assert!(try_claim_reflection(5, 5).is_none());
 
-    // Last reflection was long ago 鈥?should be allowed.
+    // Last reflection was long ago 閳?should be allowed.
     LAST_REFLECTION_EPOCH.store(
         now - REFLECTION_COOLDOWN_SECS - 1,
         std::sync::atomic::Ordering::Relaxed,
@@ -2159,7 +2797,7 @@ fn try_claim_reflection_respects_cooldown() {
     let (prev_epoch, claimed_epoch) = prev.unwrap();
     rollback_reflection_claim(prev_epoch, claimed_epoch);
 
-    // Exactly at the boundary 鈥?should be allowed.
+    // Exactly at the boundary 閳?should be allowed.
     LAST_REFLECTION_EPOCH.store(
         now - REFLECTION_COOLDOWN_SECS,
         std::sync::atomic::Ordering::Relaxed,
@@ -2204,7 +2842,7 @@ fn rollback_reflection_claim_is_noop_when_slot_already_reclaimed() {
     let newer_epoch = claimed_epoch + REFLECTION_COOLDOWN_SECS + 1;
     LAST_REFLECTION_EPOCH.store(newer_epoch, std::sync::atomic::Ordering::Relaxed);
 
-    // The first run's rollback should be a no-op 鈥?CAS fails because the
+    // The first run's rollback should be a no-op 閳?CAS fails because the
     // stored value (newer_epoch) != claimed_epoch.
     rollback_reflection_claim(prev_epoch, claimed_epoch);
     assert_eq!(
@@ -2216,15 +2854,15 @@ fn rollback_reflection_claim_is_noop_when_slot_already_reclaimed() {
 
 #[test]
 fn reflection_model_or_fallback_chain() {
-    // No reflection_model, no memory_model 鈫?use fallback.
+    // No reflection_model, no memory_model 閳?use fallback.
     let mut config = test_config();
     assert_eq!(config.reflection_model_or("primary-model"), "primary-model");
 
-    // memory_model set 鈫?reflection inherits from memory.
+    // memory_model set 閳?reflection inherits from memory.
     config.memory_model = Some("memory-llm".to_string());
     assert_eq!(config.reflection_model_or("primary-model"), "memory-llm");
 
-    // reflection_model set 鈫?overrides memory_model.
+    // reflection_model set 閳?overrides memory_model.
     config.reflection_model = Some("reflection-llm".to_string());
     assert_eq!(
         config.reflection_model_or("primary-model"),

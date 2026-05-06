@@ -499,13 +499,19 @@ fn convert_messages_to_anthropic_cache_control_moves_to_latest_cacheable_block()
         ChatMessage {
             role: "user".into(),
             content: Some("do something".into()),
-            images: None, thinking: None, anthropic_thinking_blocks: None,
-            tool_calls: None, tool_call_id: None, timestamp: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
         },
         ChatMessage {
             role: "assistant".into(),
             content: Some("let me check".into()),
-            images: None, thinking: None, anthropic_thinking_blocks: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
             tool_calls: Some(vec![ToolCall {
                 id: "tc1".into(),
                 call_type: "function".into(),
@@ -515,25 +521,38 @@ fn convert_messages_to_anthropic_cache_control_moves_to_latest_cacheable_block()
                     arguments: "{}".into(),
                 },
             }]),
-            tool_call_id: None, timestamp: None,
+            tool_call_id: None,
+            timestamp: None,
         },
         ChatMessage {
             role: "tool".into(),
             content: Some("result A".into()),
-            images: None, thinking: None, anthropic_thinking_blocks: None,
-            tool_calls: None, tool_call_id: Some("tc1".into()), timestamp: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("tc1".into()),
+            timestamp: None,
         },
         ChatMessage {
             role: "tool".into(),
             content: Some("result B".into()),
-            images: None, thinking: None, anthropic_thinking_blocks: None,
-            tool_calls: None, tool_call_id: Some("tc2".into()), timestamp: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("tc2".into()),
+            timestamp: None,
         },
         ChatMessage {
             role: "user".into(),
             content: Some("follow-up question".into()),
-            images: None, thinking: None, anthropic_thinking_blocks: None,
-            tool_calls: None, tool_call_id: None, timestamp: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
         },
     ];
 
@@ -559,31 +578,29 @@ fn convert_messages_to_anthropic_cache_control_moves_to_latest_cacheable_block()
 
 #[test]
 fn convert_messages_to_anthropic_cache_control_skips_thinking_blocks() {
-    let messages = vec![
-        ChatMessage {
-            role: "assistant".into(),
-            content: Some("final answer".into()),
-            images: None,
-            thinking: None,
-            anthropic_thinking_blocks: Some(vec![
-                crate::AnthropicThinkingBlock {
-                    block_type: "thinking".into(),
-                    thinking: Some("hidden reasoning".into()),
-                    signature: Some("sig_123".into()),
-                    data: None,
-                },
-                crate::AnthropicThinkingBlock {
-                    block_type: "redacted_thinking".into(),
-                    thinking: None,
-                    signature: None,
-                    data: Some("opaque_blob".into()),
-                },
-            ]),
-            tool_calls: None,
-            tool_call_id: None,
-            timestamp: None,
-        },
-    ];
+    let messages = vec![ChatMessage {
+        role: "assistant".into(),
+        content: Some("final answer".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: Some(vec![
+            crate::AnthropicThinkingBlock {
+                block_type: "thinking".into(),
+                thinking: Some("hidden reasoning".into()),
+                signature: Some("sig_123".into()),
+                data: None,
+            },
+            crate::AnthropicThinkingBlock {
+                block_type: "redacted_thinking".into(),
+                thinking: None,
+                signature: None,
+                data: Some("opaque_blob".into()),
+            },
+        ]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
 
     let (_, mut out) = convert_messages_to_anthropic(&messages);
     maybe_apply_anthropic_message_cache_control(&mut out, true);
@@ -603,20 +620,32 @@ fn convert_messages_to_anthropic_no_cache_control_when_disabled() {
         ChatMessage {
             role: "user".into(),
             content: Some("q".into()),
-            images: None, thinking: None, anthropic_thinking_blocks: None,
-            tool_calls: None, tool_call_id: None, timestamp: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
         },
         ChatMessage {
             role: "tool".into(),
             content: Some("result".into()),
-            images: None, thinking: None, anthropic_thinking_blocks: None,
-            tool_calls: None, tool_call_id: Some("tc1".into()), timestamp: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("tc1".into()),
+            timestamp: None,
         },
         ChatMessage {
             role: "user".into(),
             content: Some("follow-up".into()),
-            images: None, thinking: None, anthropic_thinking_blocks: None,
-            tool_calls: None, tool_call_id: None, timestamp: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
         },
     ];
 
@@ -2872,10 +2901,7 @@ fn call_llm_simple_anthropic_preserves_missing_usage() {
         Some("anthropic-secret")
     );
     assert_eq!(
-        request
-            .headers
-            .get("anthropic-version")
-            .map(String::as_str),
+        request.headers.get("anthropic-version").map(String::as_str),
         Some("2023-06-01")
     );
 }

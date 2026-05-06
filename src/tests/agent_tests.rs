@@ -534,9 +534,7 @@ fn chinese_task_result_counts_as_action_and_change_progress() {
         &[ToolResultEntry {
             id: "c1".into(),
             name: "task".into(),
-            result:
-                "已修复并更新安装配置"
-                    .into(),
+            result: "已修复并更新安装配置".into(),
             duration_ms: 20,
             is_error: false,
             call_summary: Some("delegate to `reviewer`".into()),
@@ -550,8 +548,7 @@ fn chinese_task_result_counts_as_action_and_change_progress() {
     assert!(change_state.has_successful_change_trace());
     assert!(change_state.ready_to_finish);
 
-    let mut execute_state =
-        seeded_state("运行工作区测试");
+    let mut execute_state = seeded_state("运行工作区测试");
     apply_rule_based_working_state_update(
         &mut execute_state,
         &[ToolResultEntry {
@@ -580,9 +577,7 @@ fn chinese_exec_success_text_counts_as_execution_progress_without_trace() {
         &[ToolResultEntry {
             id: "c-exec".into(),
             name: "exec".into(),
-            result:
-                "已通过测试并构建成功"
-                    .into(),
+            result: "已通过测试并构建成功".into(),
             duration_ms: 20,
             is_error: false,
             call_summary: None,
@@ -738,40 +733,358 @@ fn merge_state_digest_delta_does_not_trust_optimistic_ready_flag() {
 }
 
 #[test]
-fn auto_think_level_adapts_by_cycle() {
-    // First round: medium (short message, no errors)
-    assert_eq!(auto_think_level(0, false, 100, 0), "medium");
-    assert_eq!(auto_think_level(0, true, 100, 0), "medium");
-    // First round with complex message (>200 chars): high
-    assert_eq!(auto_think_level(0, false, 250, 0), "high");
-    // Very large first-round request: xhigh
-    assert_eq!(auto_think_level(0, false, 650, 0), "xhigh");
-    // Mid rounds with observation: high
-    assert_eq!(auto_think_level(1, true, 100, 0), "high");
-    assert_eq!(auto_think_level(5, true, 100, 0), "high");
-    // Mid rounds without observation: medium
-    assert_eq!(auto_think_level(1, false, 100, 0), "medium");
-    assert_eq!(auto_think_level(5, false, 100, 0), "medium");
-    // Late rounds: low regardless
-    assert_eq!(auto_think_level(6, false, 100, 0), "low");
-    assert_eq!(auto_think_level(6, true, 100, 0), "low");
-    assert_eq!(auto_think_level(100, true, 100, 0), "low");
-    // Exactly at boundary: still medium
-    assert_eq!(auto_think_level(0, false, 200, 0), "medium");
+fn auto_think_level_runtime_uses_observation_strength_and_task_pressure() {
+    assert_eq!(
+        auto_think_decision_runtime(AutoThinkRuntimeSignals {
+            cycles: 1,
+            observation_strength: AutoObservationStrength::Strong,
+            user_msg_chars: 80,
+            ..AutoThinkRuntimeSignals::default()
+        })
+        .selected_level
+        .label(),
+        "high"
+    );
+
+    assert_eq!(
+        auto_think_decision_runtime(AutoThinkRuntimeSignals {
+            cycles: 0,
+            user_msg_chars: 80,
+            task_pressure: 2,
+            action_oriented: true,
+            ..AutoThinkRuntimeSignals::default()
+        })
+        .selected_level
+        .label(),
+        "high"
+    );
 }
 
 #[test]
-fn auto_think_level_escalates_on_errors() {
-    // Consecutive errors bump to high regardless of cycle
-    assert_eq!(auto_think_level(3, false, 100, 2), "high");
-    assert_eq!(auto_think_level(10, false, 100, 3), "high");
-    // Severe repeated failures get the deepest budget.
-    assert_eq!(auto_think_level(2, false, 100, 4), "xhigh");
-    // Extreme repeated failures: unleash unconstrained reasoning.
-    assert_eq!(auto_think_level(5, false, 100, 6), "max");
-    assert_eq!(auto_think_level(5, false, 100, 10), "max");
-    // Single error doesn't escalate
-    assert_eq!(auto_think_level(6, false, 100, 1), "low");
+fn auto_think_level_runtime_uses_progress_sensitive_late_loop_decay() {
+    assert_eq!(
+        auto_think_decision_runtime(AutoThinkRuntimeSignals {
+            intent: TaskIntent::Investigate,
+            cycles: 8,
+            task_pressure: 1,
+            ready_to_finish: false,
+            action_oriented: true,
+            ..AutoThinkRuntimeSignals::default()
+        })
+        .selected_level
+        .label(),
+        "medium"
+    );
+
+    assert_eq!(
+        auto_think_decision_runtime(AutoThinkRuntimeSignals {
+            intent: TaskIntent::Investigate,
+            cycles: 8,
+            task_pressure: 3,
+            ready_to_finish: false,
+            action_oriented: true,
+            has_blocking_uncertainty: true,
+            ..AutoThinkRuntimeSignals::default()
+        })
+        .selected_level
+        .label(),
+        "xhigh"
+    );
+
+    assert_eq!(
+        auto_think_decision_runtime(AutoThinkRuntimeSignals {
+            cycles: 8,
+            ready_to_finish: true,
+            progress_made: true,
+            evidence_delta_quality: AutoEvidenceDeltaQuality::BetterEvidence,
+            ..AutoThinkRuntimeSignals::default()
+        })
+        .selected_level
+        .label(),
+        "low"
+    );
+}
+
+#[test]
+fn auto_think_level_runtime_escalates_on_stagnation_and_error_streak() {
+    assert_eq!(
+        auto_think_decision_runtime(AutoThinkRuntimeSignals {
+            intent: TaskIntent::Investigate,
+            cycles: 7,
+            stagnation_streak: 3,
+            ready_to_finish: false,
+            action_oriented: true,
+            ..AutoThinkRuntimeSignals::default()
+        })
+        .selected_level
+        .label(),
+        "high"
+    );
+
+    assert_eq!(
+        auto_think_decision_runtime(AutoThinkRuntimeSignals {
+            intent: TaskIntent::Investigate,
+            cycles: 7,
+            error_streak: 4,
+            stagnation_streak: 2,
+            ready_to_finish: false,
+            action_oriented: true,
+            ..AutoThinkRuntimeSignals::default()
+        })
+        .selected_level
+        .label(),
+        "max"
+    );
+}
+
+#[test]
+fn auto_think_level_runtime_escalates_on_repeated_finish_deferrals() {
+    let one_deferral = auto_think_decision_runtime(AutoThinkRuntimeSignals {
+        intent: TaskIntent::Change,
+        cycles: 7,
+        task_pressure: 1,
+        action_oriented: true,
+        finish_deferral_count: 1,
+        ..AutoThinkRuntimeSignals::default()
+    });
+    assert_eq!(one_deferral.selected_level.label(), "high");
+    assert!(
+        one_deferral
+            .escalators
+            .contains(&"finish_deferral".to_string())
+    );
+    assert!(
+        !one_deferral
+            .dampeners
+            .contains(&"late_loop_decay".to_string())
+    );
+
+    let repeated_deferrals = auto_think_decision_runtime(AutoThinkRuntimeSignals {
+        intent: TaskIntent::Change,
+        cycles: 7,
+        task_pressure: 1,
+        action_oriented: true,
+        finish_deferral_count: 3,
+        ..AutoThinkRuntimeSignals::default()
+    });
+    assert_eq!(repeated_deferrals.selected_level.label(), "xhigh");
+    assert!(
+        repeated_deferrals
+            .escalators
+            .contains(&"repeated_finish_deferrals".to_string())
+    );
+}
+
+#[test]
+fn auto_think_level_runtime_escalates_on_low_value_retries() {
+    let repeated_retry = auto_think_decision_runtime(AutoThinkRuntimeSignals {
+        intent: TaskIntent::Investigate,
+        cycles: 6,
+        action_oriented: true,
+        retry_pattern: AutoRetryPattern::SameArgs,
+        ..AutoThinkRuntimeSignals::default()
+    });
+
+    assert_eq!(repeated_retry.selected_level.label(), "xhigh");
+    assert!(
+        repeated_retry
+            .escalators
+            .contains(&"retry_same_args".to_string())
+    );
+    assert!(
+        !repeated_retry
+            .dampeners
+            .contains(&"late_loop_decay".to_string())
+    );
+}
+
+#[test]
+fn auto_retry_pattern_treats_distinct_task_prompts_as_same_tool() {
+    let first_trace = crate::tools::build_tool_execution_trace(
+        "task",
+        Some(r#"{"agent":"reviewer","prompt":"inspect the parser timeout path"}"#),
+    )
+    .expect("task trace should be built");
+    let second_trace = crate::tools::build_tool_execution_trace(
+        "task",
+        Some(r#"{"agent":"reviewer","prompt":"inspect the runtime reconnect logic"}"#),
+    )
+    .expect("task trace should be built");
+
+    let pattern = auto_retry_pattern(&[
+        ToolResultEntry {
+            id: "task-1".into(),
+            name: "task".into(),
+            result: "delegated".into(),
+            duration_ms: 3,
+            is_error: false,
+            call_summary: Some("delegate to `reviewer`".into()),
+            trace: Some(first_trace),
+        },
+        ToolResultEntry {
+            id: "task-2".into(),
+            name: "task".into(),
+            result: "delegated".into(),
+            duration_ms: 3,
+            is_error: false,
+            call_summary: Some("delegate to `reviewer`".into()),
+            trace: Some(second_trace),
+        },
+    ]);
+
+    assert_eq!(pattern, AutoRetryPattern::SameTool);
+}
+
+#[test]
+fn auto_retry_pattern_treats_identical_task_prompts_as_same_args() {
+    let first_trace = crate::tools::build_tool_execution_trace(
+        "task",
+        Some(r#"{"agent":"reviewer","prompt":"inspect the parser timeout path"}"#),
+    )
+    .expect("task trace should be built");
+    let second_trace = crate::tools::build_tool_execution_trace(
+        "task",
+        Some(r#"{"agent":"reviewer","prompt":"inspect the parser timeout path"}"#),
+    )
+    .expect("task trace should be built");
+
+    let pattern = auto_retry_pattern(&[
+        ToolResultEntry {
+            id: "task-1".into(),
+            name: "task".into(),
+            result: "delegated".into(),
+            duration_ms: 3,
+            is_error: false,
+            call_summary: Some("delegate to `reviewer`".into()),
+            trace: Some(first_trace),
+        },
+        ToolResultEntry {
+            id: "task-2".into(),
+            name: "task".into(),
+            result: "delegated".into(),
+            duration_ms: 3,
+            is_error: false,
+            call_summary: Some("delegate to `reviewer`".into()),
+            trace: Some(second_trace),
+        },
+    ]);
+
+    assert_eq!(pattern, AutoRetryPattern::SameArgs);
+}
+
+#[test]
+fn auto_retry_pattern_treats_distinct_orchestrations_with_same_width_as_same_tool() {
+    let first_trace = crate::tools::build_tool_execution_trace(
+        "orchestrate",
+        Some(
+            r#"{"tasks":[{"id":"a","agent":"reviewer","prompt":"trace startup"},{"id":"b","agent":"coder","prompt":"trace shutdown","depends_on":["a"]}]}"#,
+        ),
+    )
+    .expect("orchestrate trace should be built");
+    let second_trace = crate::tools::build_tool_execution_trace(
+        "orchestrate",
+        Some(
+            r#"{"tasks":[{"id":"a","agent":"reviewer","prompt":"trace websocket"},{"id":"b","agent":"coder","prompt":"trace reconnect","depends_on":["a"]}]}"#,
+        ),
+    )
+    .expect("orchestrate trace should be built");
+
+    let pattern = auto_retry_pattern(&[
+        ToolResultEntry {
+            id: "orch-1".into(),
+            name: "orchestrate".into(),
+            result: "delegated".into(),
+            duration_ms: 3,
+            is_error: false,
+            call_summary: Some("orchestrate 2 delegated tasks".into()),
+            trace: Some(first_trace),
+        },
+        ToolResultEntry {
+            id: "orch-2".into(),
+            name: "orchestrate".into(),
+            result: "delegated".into(),
+            duration_ms: 3,
+            is_error: false,
+            call_summary: Some("orchestrate 2 delegated tasks".into()),
+            trace: Some(second_trace),
+        },
+    ]);
+
+    assert_eq!(pattern, AutoRetryPattern::SameTool);
+}
+
+#[test]
+fn auto_retry_pattern_treats_distinct_exec_commands_in_same_dir_as_same_tool() {
+    let first_trace = crate::tools::build_tool_execution_trace(
+        "exec",
+        Some(r#"{"command":"cargo test auto_trace","working_dir":"src"}"#),
+    )
+    .expect("exec trace should be built");
+    let second_trace = crate::tools::build_tool_execution_trace(
+        "exec",
+        Some(r#"{"command":"cargo test replay_live_round","working_dir":"src"}"#),
+    )
+    .expect("exec trace should be built");
+
+    let pattern = auto_retry_pattern(&[
+        ToolResultEntry {
+            id: "exec-1".into(),
+            name: "exec".into(),
+            result: "done".into(),
+            duration_ms: 3,
+            is_error: false,
+            call_summary: Some("run `cargo test auto_trace` in `src`".into()),
+            trace: Some(first_trace),
+        },
+        ToolResultEntry {
+            id: "exec-2".into(),
+            name: "exec".into(),
+            result: "done".into(),
+            duration_ms: 3,
+            is_error: false,
+            call_summary: Some("run `cargo test replay_live_round` in `src`".into()),
+            trace: Some(second_trace),
+        },
+    ]);
+
+    assert_eq!(pattern, AutoRetryPattern::SameTool);
+}
+
+#[test]
+fn auto_retry_pattern_treats_distinct_read_windows_on_same_file_as_same_tool() {
+    let first_trace = crate::tools::build_tool_execution_trace(
+        "read_file",
+        Some(r#"{"path":"src/main.rs","start_line":1,"end_line":40}"#),
+    )
+    .expect("read_file trace should be built");
+    let second_trace = crate::tools::build_tool_execution_trace(
+        "read_file",
+        Some(r#"{"path":"src/main.rs","start_line":80,"end_line":120}"#),
+    )
+    .expect("read_file trace should be built");
+
+    let pattern = auto_retry_pattern(&[
+        ToolResultEntry {
+            id: "read-1".into(),
+            name: "read_file".into(),
+            result: "fn first() {}".into(),
+            duration_ms: 3,
+            is_error: false,
+            call_summary: Some("read `src/main.rs` lines 1-40".into()),
+            trace: Some(first_trace),
+        },
+        ToolResultEntry {
+            id: "read-2".into(),
+            name: "read_file".into(),
+            result: "fn second() {}".into(),
+            duration_ms: 3,
+            is_error: false,
+            call_summary: Some("read `src/main.rs` lines 80-120".into()),
+            trace: Some(second_trace),
+        },
+    ]);
+
+    assert_eq!(pattern, AutoRetryPattern::SameTool);
 }
 
 #[test]

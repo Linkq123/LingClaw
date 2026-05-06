@@ -202,8 +202,20 @@ struct AgentPhaseState {
     retrieved_task_memory_cycle: Option<usize>,
     cycle_workspace: PathBuf,
     last_observation_hint: Option<String>,
+    last_observation_strength: agent::AutoObservationStrength,
+    last_tool_results_count: usize,
+    last_tool_error_count: usize,
+    last_summary_count: usize,
+    last_summary_bytes: usize,
+    last_progress_made: bool,
+    last_error_kind: agent::AutoErrorKind,
+    last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality,
+    stagnation_streak: usize,
+    error_streak: usize,
     finish_gate_hint: Option<String>,
     finish_gate_deferred_once: bool,
+    finish_gate_deferral_count: usize,
+    recent_tool_history: Vec<agent::ToolResultEntry>,
     pending_interventions: Vec<String>,
     react_ctx: agent::AgentLoopCtx,
     shutting_down: bool,
@@ -217,6 +229,7 @@ struct AgentPhaseState {
 
 /// Minimum interval between observe-phase incremental saves.
 const OBSERVE_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
+const AUTO_TOOL_HISTORY_CAP: usize = 12;
 const DYNAMIC_PROMPT_INJECTION_CHAR_BUDGET: usize = 4_000;
 const DYNAMIC_PROMPT_TRUNCATION_MARKER: &str = "\n*(additional dynamic context truncated)*";
 
@@ -624,9 +637,12 @@ async fn prepare_analyze_snapshot(
 
     // Extract latest user message for query-aware memory retrieval and complexity sensing.
     let latest_query = latest_user_query_from_messages(&session.messages);
-    phase_state
+    let redirected_to_new_goal = phase_state
         .working_state
         .seed_from_query(latest_query.as_deref());
+    if redirected_to_new_goal {
+        reset_runtime_auto_state_for_new_goal(phase_state);
+    }
     let context_has_images = messages_have_images(&session.messages);
     let user_msg_chars = latest_query
         .as_ref()
@@ -852,28 +868,64 @@ async fn send_before_analyze_events(
     Some(final_messages)
 }
 
-fn effective_think_level(
-    think_level: &str,
-    resolved: &providers::ResolvedModel,
-    cycles: usize,
-    had_observation_hint: bool,
+fn runtime_auto_think_signals(
+    phase_state: &AgentPhaseState,
     user_msg_chars: usize,
-    consecutive_errors: usize,
-) -> String {
-    if think_level == "auto" {
-        if providers::auto_think_supported(resolved) {
-            agent::auto_think_level(
-                cycles,
-                had_observation_hint,
-                user_msg_chars,
-                consecutive_errors,
-            )
-            .to_owned()
-        } else {
-            "off".to_owned()
-        }
-    } else {
-        think_level.to_owned()
+) -> agent::AutoThinkRuntimeSignals {
+    agent::AutoThinkRuntimeSignals {
+        intent: phase_state.working_state.intent,
+        cycles: phase_state.react_ctx.cycles,
+        observation_strength: phase_state.last_observation_strength,
+        user_msg_chars,
+        tool_results_count: phase_state.last_tool_results_count,
+        tool_error_count: phase_state.last_tool_error_count,
+        summary_count: phase_state.last_summary_count,
+        summary_bytes: phase_state.last_summary_bytes,
+        stagnation_streak: phase_state.stagnation_streak,
+        error_streak: phase_state.error_streak,
+        task_pressure: agent::auto_think_task_pressure(&phase_state.working_state),
+        ready_to_finish: phase_state.working_state.ready_to_finish,
+        action_oriented: matches!(
+            phase_state.working_state.intent,
+            agent::TaskIntent::Change | agent::TaskIntent::Investigate | agent::TaskIntent::Execute
+        ),
+        has_blocking_uncertainty: phase_state.working_state.has_blocking_uncertainty(),
+        finish_deferral_count: phase_state.finish_gate_deferral_count,
+        progress_made: phase_state.last_progress_made,
+        retry_pattern: agent::auto_retry_pattern(&phase_state.recent_tool_history),
+        error_kind: phase_state.last_error_kind,
+        evidence_delta_quality: phase_state.last_evidence_delta_quality,
+    }
+}
+
+fn reset_runtime_auto_state_for_new_goal(phase_state: &mut AgentPhaseState) {
+    phase_state.react_ctx.cycles = 0;
+    phase_state.last_observation_hint = None;
+    phase_state.last_observation_strength = agent::AutoObservationStrength::None;
+    phase_state.last_tool_results_count = 0;
+    phase_state.last_tool_error_count = 0;
+    phase_state.last_summary_count = 0;
+    phase_state.last_summary_bytes = 0;
+    phase_state.last_progress_made = false;
+    phase_state.last_error_kind = agent::AutoErrorKind::None;
+    phase_state.last_evidence_delta_quality = agent::AutoEvidenceDeltaQuality::None;
+    phase_state.stagnation_streak = 0;
+    phase_state.error_streak = 0;
+    phase_state.finish_gate_hint = None;
+    phase_state.finish_gate_deferred_once = false;
+    phase_state.finish_gate_deferral_count = 0;
+    phase_state.recent_tool_history.clear();
+}
+
+fn auto_observation_strength_label(strength: agent::AutoObservationStrength) -> &'static str {
+    strength.label()
+}
+
+fn record_recent_tool_result(phase_state: &mut AgentPhaseState, result: &agent::ToolResultEntry) {
+    phase_state.recent_tool_history.push(result.clone());
+    if phase_state.recent_tool_history.len() > AUTO_TOOL_HISTORY_CAP {
+        let overflow = phase_state.recent_tool_history.len() - AUTO_TOOL_HISTORY_CAP;
+        phase_state.recent_tool_history.drain(0..overflow);
     }
 }
 
@@ -1022,6 +1074,8 @@ async fn advance_after_llm_response(
         agent::FinishDecision::Defer(hint) => {
             phase_state.results_origin_query = None;
             phase_state.finish_gate_deferred_once = true;
+            phase_state.finish_gate_deferral_count =
+                phase_state.finish_gate_deferral_count.saturating_add(1);
             phase_state.finish_gate_hint = Some(hint);
             send_react_phase_event(live_tx, &phase_state.react_ctx, "analyze").await;
         }
@@ -1711,7 +1765,7 @@ async fn record_tool_result(
         .and_then(agent::ToolExecutionTrace::summary)
         .map(str::to_string);
 
-    phase_state.collected_results.push(agent::ToolResultEntry {
+    let result_entry = agent::ToolResultEntry {
         id: tc.id.clone(),
         name: tc.function.name.clone(),
         duration_ms: result.duration_ms,
@@ -1719,7 +1773,9 @@ async fn record_tool_result(
         result: result.output.clone(),
         call_summary,
         trace,
-    });
+    };
+    record_recent_tool_result(phase_state, &result_entry);
+    phase_state.collected_results.push(result_entry);
 
     {
         let mut sessions = ctx.state.sessions.lock().await;
@@ -2143,7 +2199,6 @@ async fn run_analyze_phase(
         return AgentPhaseControl::Break;
     }
 
-    let had_observation_hint = phase_state.last_observation_hint.is_some();
     persist_pending_interventions(
         ctx.state,
         ctx.current_session_id,
@@ -2156,23 +2211,20 @@ async fn run_analyze_phase(
     };
 
     let resolved = config.resolve_model(&snapshot.model);
-
-    // Complexity signals for adaptive think level.
-    let consecutive_errors = phase_state
-        .collected_results
-        .iter()
-        .rev()
-        .take_while(|r| r.is_error)
-        .count();
-
-    let effective_think = effective_think_level(
-        &snapshot.think_level,
-        &resolved,
-        phase_state.react_ctx.cycles,
-        had_observation_hint,
-        snapshot.user_msg_chars,
-        consecutive_errors,
-    );
+    let auto_signals = runtime_auto_think_signals(phase_state, snapshot.user_msg_chars);
+    let auto_decision =
+        if snapshot.think_level == "auto" && providers::auto_think_supported(&resolved) {
+            Some(agent::auto_think_decision_runtime(auto_signals))
+        } else {
+            None
+        };
+    let effective_think = if let Some(decision) = auto_decision.as_ref() {
+        decision.selected_level.label().to_owned()
+    } else if snapshot.think_level == "auto" {
+        "off".to_owned()
+    } else {
+        snapshot.think_level.clone()
+    };
     let extra_tools = build_cycle_tools(ctx, phase_state, &resolved).await;
 
     // Run BeforeAnalyze hooks (including auto-compress) BEFORE the fine prune
@@ -2278,16 +2330,67 @@ async fn run_analyze_phase(
         );
     }
 
-    if !live_send(
-        ctx.live_tx,
-        json!({
-            "type":"start",
-            "round": phase_state.round + 1,
-            "phase": phase_state.react_ctx.phase().label(),
-            "react_visible": phase_state.react_ctx.show_react,
-        }),
-    )
-    .await
+    let mut start_event = json!({
+        "type":"start",
+        "round": phase_state.round + 1,
+        "phase": phase_state.react_ctx.phase().label(),
+        "cycle": phase_state.react_ctx.cycles,
+        "model": snapshot.model.clone(),
+        "think_level": effective_think.clone(),
+        "react_visible": phase_state.react_ctx.show_react,
+    });
+    if let Some(start_obj) = start_event.as_object_mut()
+        && auto_decision.is_some()
+    {
+        start_obj.insert(
+            "auto_observation_strength".to_string(),
+            json!(auto_observation_strength_label(
+                auto_signals.observation_strength
+            )),
+        );
+        start_obj.insert(
+            "auto_stagnation_streak".to_string(),
+            json!(auto_signals.stagnation_streak),
+        );
+        start_obj.insert(
+            "auto_error_streak".to_string(),
+            json!(auto_signals.error_streak),
+        );
+        start_obj.insert(
+            "auto_task_pressure".to_string(),
+            json!(auto_signals.task_pressure),
+        );
+        start_obj.insert(
+            "auto_action_oriented".to_string(),
+            json!(auto_signals.action_oriented),
+        );
+        start_obj.insert(
+            "auto_ready_to_finish".to_string(),
+            json!(auto_signals.ready_to_finish),
+        );
+        start_obj.insert(
+            "auto_has_blocking_uncertainty".to_string(),
+            json!(auto_signals.has_blocking_uncertainty),
+        );
+        start_obj.insert(
+            "auto_finish_deferred_once".to_string(),
+            json!(auto_signals.finish_deferral_count > 0),
+        );
+    }
+
+    if !live_send(ctx.live_tx, start_event).await {
+        return AgentPhaseControl::Break;
+    }
+    if let Some(auto_trace) = auto_decision.clone().map(|decision| {
+        decision.into_trace_with_selected_think(
+            phase_state.round + 1,
+            phase_state.react_ctx.cycles,
+            phase_state.react_ctx.phase().label(),
+            &snapshot.model,
+            resolved.provider.label(),
+            &effective_think,
+        )
+    }) && !live_send(ctx.live_tx, auto_trace.to_live_event()).await
     {
         return AgentPhaseControl::Break;
     }
@@ -2603,6 +2706,7 @@ async fn run_observe_phase(
 ) -> AgentPhaseControl {
     let config = ctx.state.config();
     let summaries = agent::summarize_observations(&phase_state.collected_results);
+    let state_before_observe = phase_state.working_state.clone();
     for summary in &summaries {
         let _ = live_send(
             ctx.live_tx,
@@ -2623,7 +2727,54 @@ async fn run_observe_phase(
         .rev()
         .take_while(|r| r.is_error)
         .count();
+    let tool_results_count = phase_state.collected_results.len();
+    let tool_error_count = phase_state
+        .collected_results
+        .iter()
+        .filter(|result| result.is_error)
+        .count();
+    let summary_count = summaries.len();
+    let summary_bytes = summaries
+        .iter()
+        .map(|summary| summary.byte_size)
+        .sum::<usize>();
+    let finish_deferred_once = phase_state.finish_gate_deferred_once;
     update_working_state(ctx, phase_state, &summaries).await;
+    let progress_made =
+        agent::auto_think_progress_made(&state_before_observe, &phase_state.working_state);
+    let evidence_delta_quality = agent::auto_evidence_delta_quality(
+        &state_before_observe,
+        &phase_state.working_state,
+        progress_made,
+    );
+    phase_state.last_observation_strength =
+        agent::auto_observation_strength(&phase_state.collected_results, &summaries);
+    phase_state.last_tool_results_count = tool_results_count;
+    phase_state.last_tool_error_count = tool_error_count;
+    phase_state.last_summary_count = summary_count;
+    phase_state.last_summary_bytes = summary_bytes;
+    phase_state.last_progress_made = progress_made;
+    phase_state.last_error_kind = agent::auto_error_kind(&phase_state.collected_results);
+    phase_state.last_evidence_delta_quality = evidence_delta_quality;
+    phase_state.error_streak = if consecutive_errors == 0 {
+        0
+    } else if progress_made {
+        consecutive_errors
+    } else {
+        phase_state.error_streak.saturating_add(consecutive_errors)
+    };
+    let should_count_stagnation = !phase_state.collected_results.is_empty()
+        || phase_state.working_state.has_blocking_uncertainty()
+        || finish_deferred_once;
+    if progress_made {
+        phase_state.stagnation_streak = 0;
+    } else if should_count_stagnation {
+        phase_state.stagnation_streak = phase_state.stagnation_streak.saturating_add(1);
+    }
+    if progress_made {
+        phase_state.finish_gate_deferral_count = 0;
+        phase_state.recent_tool_history.clear();
+    }
     phase_state.finish_gate_deferred_once = false;
     phase_state.last_observation_hint =
         agent::build_observation_context_hint(&summaries, consecutive_errors);
@@ -2915,8 +3066,20 @@ pub(crate) async fn run_agent_session(
         retrieved_task_memory_cycle: None,
         cycle_workspace: PathBuf::new(),
         last_observation_hint: None,
+        last_observation_strength: agent::AutoObservationStrength::None,
+        last_tool_results_count: 0,
+        last_tool_error_count: 0,
+        last_summary_count: 0,
+        last_summary_bytes: 0,
+        last_progress_made: false,
+        last_error_kind: agent::AutoErrorKind::None,
+        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
+        stagnation_streak: 0,
+        error_streak: 0,
         finish_gate_hint: None,
         finish_gate_deferred_once: false,
+        finish_gate_deferral_count: 0,
+        recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(show_react),
         shutting_down: false,

@@ -179,6 +179,47 @@ describe('settings model helpers', () => {
     });
   });
 
+  it('drops blank compat.thinkingFormat while preserving other compat metadata', () => {
+    const providers = buildProviderForms({
+      openai: {
+        api: 'openai-completions',
+        baseUrl: 'https://gateway.example/v1',
+        apiKey: 'sk-test',
+        models: [
+          {
+            id: 'gpt-5.4',
+            input: ['text'],
+            compat: {
+              thinkingFormat: '   ',
+              gatewayMode: 'strict',
+            },
+          },
+        ],
+      },
+    });
+
+    const serialized = serializeProviderForms(providers);
+
+    expect(serialized).toEqual({
+      providers: {
+        openai: {
+          api: 'openai-completions',
+          baseUrl: 'https://gateway.example/v1',
+          apiKey: 'sk-test',
+          models: [
+            {
+              id: 'gpt-5.4',
+              input: ['text'],
+              compat: {
+                gatewayMode: 'strict',
+              },
+            },
+          ],
+        },
+      },
+    });
+  });
+
   it('normalizes missing provider auth fields to backend-compatible empty strings', () => {
     const normalized = normalizeModelsConfig({
       providers: {

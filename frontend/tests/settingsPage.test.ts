@@ -309,3 +309,74 @@ describe('SettingsPage sub-agent model overrides', () => {
     expect(savedConfig?.agents?.defaults?.model?.['sub-agent-reviewer']).toBe('openai/gpt-4o-mini');
   });
 });
+
+describe('SettingsPage model compat thinking format', () => {
+  let root: Root | null = null;
+
+  beforeEach(() => {
+    (
+      globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
+    ).IS_REACT_ACT_ENVIRONMENT = true;
+  });
+
+  afterEach(async () => {
+    if (root) {
+      await act(async () => {
+        root?.unmount();
+        await flushMicrotasks();
+      });
+      root = null;
+    }
+    document.body.innerHTML = '';
+    delete (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
+      .IS_REACT_ACT_ENVIRONMENT;
+    vi.unstubAllGlobals();
+  });
+
+  it('shows compat.thinkingFormat in the Models tab', async () => {
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config' && (!init || !('method' in init) || !init.method)) {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              models: {
+                providers: {
+                  openai: {
+                    api: 'openai-completions',
+                    baseUrl: 'https://gateway.example/v1',
+                    apiKey: 'sk-test',
+                    models: [
+                      {
+                        id: 'gpt-5.4',
+                        input: ['text'],
+                        compat: { thinkingFormat: 'qwen' },
+                      },
+                    ],
+                  },
+                },
+              },
+            },
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      findButtonByText('Models').click();
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      const input = document.querySelector('input[aria-label="Thinking Format"]');
+      if (!(input instanceof HTMLInputElement)) throw new Error('Thinking Format input not found');
+      expect(input.value).toBe('qwen');
+    });
+  });
+});

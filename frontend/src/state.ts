@@ -1,4 +1,4 @@
-import type { ImageAttachment, HistoryMessage, ReactPhase } from './types.js';
+import type { AutoTraceEvent, ImageAttachment, HistoryMessage, ReactPhase } from './types.js';
 
 // ── DOM refs ──
 
@@ -18,6 +18,7 @@ export interface DomRefs {
   headerVersionEl: HTMLElement | null;
   toggleToolsBtn: HTMLButtonElement | null;
   toggleReasoningBtn: HTMLButtonElement | null;
+  toggleAutoDebugBtn: HTMLButtonElement | null;
   usageBadge: HTMLElement | null;
   toolDrawer: HTMLElement | null;
   toolDrawerBackdrop: HTMLElement | null;
@@ -68,6 +69,9 @@ export interface AppState {
   activeToolPanel: HTMLElement | null;
   showTools: boolean;
   showReasoning: boolean;
+  autoDebugEnabled: boolean;
+  latestAutoTrace: AutoTraceEvent | null;
+  autoDebugRow: HTMLElement | null;
   autoFollowChat: boolean;
   hasBufferedChatUpdates: boolean;
   unreadMessageCount: number;
@@ -131,6 +135,9 @@ export const state: AppState = {
   activeToolPanel: null,
   showTools: true,
   showReasoning: true,
+  autoDebugEnabled: false,
+  latestAutoTrace: null,
+  autoDebugRow: null,
   autoFollowChat: true,
   hasBufferedChatUpdates: false,
   unreadMessageCount: 0,
@@ -178,6 +185,9 @@ export function initDomRefs() {
   dom.toggleToolsBtn = document.getElementById('toggle-tools-btn') as HTMLButtonElement | null;
   dom.toggleReasoningBtn = document.getElementById(
     'toggle-reasoning-btn',
+  ) as HTMLButtonElement | null;
+  dom.toggleAutoDebugBtn = document.getElementById(
+    'toggle-auto-debug-btn',
   ) as HTMLButtonElement | null;
   dom.usageBadge = document.getElementById('usage-badge');
   dom.toolDrawer = document.getElementById('tool-drawer');

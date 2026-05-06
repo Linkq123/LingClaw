@@ -112,6 +112,12 @@ import {
   buildHistoryReasoningPanel,
   finalizeOrDiscardLiveReasoningPanel,
 } from './renderers/reasoning.js';
+import {
+  applyTopLevelAutoTrace,
+  clearActiveAutoTrace,
+  toggleAutoDebug,
+  updateAutoDebugToggleButton,
+} from './renderers/auto-trace.js';
 
 // ── Initialize DOM ──
 initDomRefs();
@@ -131,6 +137,7 @@ function updateViewToggleButtons() {
     dom.toggleReasoningBtn.textContent = `Reasoning: ${state.showReasoning ? 'On' : 'Off'}`;
     dom.toggleReasoningBtn.classList.toggle('is-active', state.showReasoning);
   }
+  updateAutoDebugToggleButton();
 }
 
 function applyViewState(viewState) {
@@ -455,6 +462,7 @@ function handleMessage(data) {
       closeSubagentModal();
       closeOrchestrateTaskModal();
       clearReactStatus();
+      clearActiveAutoTrace();
       clearBufferedChatUpdates();
       setAutoFollowChat(true);
       // replaceChildren() avoids the extra HTML parser invocation of
@@ -509,6 +517,8 @@ function handleMessage(data) {
       break;
 
     case 'start': {
+      if (data.subagent) break;
+      clearActiveAutoTrace();
       const isNewTurn = !state.busy || state.currentRoundStartedAt === 0;
       setBusy(true);
       if (isNewTurn) {
@@ -522,6 +532,10 @@ function handleMessage(data) {
       }
       break;
     }
+
+    case 'auto_trace':
+      applyTopLevelAutoTrace(data);
+      break;
 
     case 'delta':
       if (data.subagent) break;
@@ -792,6 +806,7 @@ function handleMessage(data) {
 const actionHandlers = {
   'toggle-tools': () => toggleToolsVisibility(),
   'toggle-reasoning': () => toggleReasoningVisibility(),
+  'toggle-auto-debug': () => toggleAutoDebug(),
   'nav-settings': () => {
     closeMobileMenu();
     openSettingsPage();

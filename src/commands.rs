@@ -95,43 +95,260 @@ fn parse_toggle_value(arg: &str, command_name: &str) -> Result<bool, String> {
     }
 }
 
-async fn status_effective_think_level(
+fn status_effective_think_level(
     session: &Session,
-    state: &AppState,
     resolved: &providers::ResolvedModel,
+    live_round: Option<&crate::LiveRoundState>,
 ) -> String {
+    if let Some(think_level) = live_round
+        .and_then(|round| round.latest_auto_trace.as_ref())
+        .map(|trace| trace.selected_think.as_str())
+        .filter(|level| !level.is_empty())
+    {
+        return think_level.to_string();
+    }
+    if let Some(think_level) = live_round
+        .and_then(|round| round.effective_think.as_deref())
+        .filter(|level| !level.is_empty())
+    {
+        return think_level.to_string();
+    }
     if session.think_level != "auto" {
         return session.think_level.clone();
     }
     if !providers::auto_think_supported(resolved) {
         return "off".to_string();
     }
+    status_estimated_auto_decision(session, resolved, live_round)
+        .map(|decision| decision.selected_level.label().to_string())
+        .unwrap_or_else(|| "off".to_string())
+}
 
-    let live_round = { state.live_rounds.lock().await.get(&session.id).cloned() };
-    let cycles = live_round
-        .as_ref()
-        .and_then(|round| round.cycle)
-        .unwrap_or(0);
-    let has_observation = live_round
-        .as_ref()
-        .map(|round| round.has_observation)
-        .unwrap_or(false);
-    let user_msg_chars = session
+fn status_auto_signal_flag(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+fn status_auto_reason_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "none".to_string()
+    } else {
+        values.join(",")
+    }
+}
+
+fn status_latest_user_query(session: &Session) -> Option<&str> {
+    session
         .messages
         .iter()
         .rev()
-        .find(|m| m.role == "user")
-        .and_then(|m| m.content.as_ref())
-        .map(|c| c.chars().count())
-        .unwrap_or(0);
-    agent::auto_think_level(cycles, has_observation, user_msg_chars, 0).to_string()
+        .find(|message| message.role == "user")
+        .and_then(|message| message.content.as_deref())
+}
+
+fn format_status_auto_decision(
+    selected: &str,
+    baseline: &str,
+    reason: &str,
+    escalators: &[String],
+    dampeners: &[String],
+    clamps: &[String],
+    signals: &agent::AutoThinkTraceSignals,
+) -> String {
+    format!(
+        "auto_decision: selected={} baseline={} reason={} escalators={} dampeners={} clamps={}\nauto_signals: intent={} chars={} obs={} results={} tool_errors={} summaries={} bytes={} stagnation={} error_streak={} pressure={} ready={} action={} blocked={} finish_deferrals={} progress={} retry={} error_kind={} evidence_delta={}",
+        selected,
+        baseline,
+        reason,
+        status_auto_reason_list(escalators),
+        status_auto_reason_list(dampeners),
+        status_auto_reason_list(clamps),
+        signals.intent,
+        signals.user_msg_chars,
+        signals.observation_strength,
+        signals.tool_results_count,
+        signals.tool_error_count,
+        signals.summary_count,
+        signals.summary_bytes,
+        signals.stagnation_streak,
+        signals.error_streak,
+        signals.task_pressure,
+        status_auto_signal_flag(signals.ready_to_finish),
+        status_auto_signal_flag(signals.action_oriented),
+        status_auto_signal_flag(signals.has_blocking_uncertainty),
+        signals.finish_deferral_count,
+        status_auto_signal_flag(signals.progress_made),
+        signals.retry_pattern,
+        signals.error_kind,
+        signals.evidence_delta_quality,
+    )
+}
+
+fn status_estimated_auto_decision(
+    session: &Session,
+    resolved: &providers::ResolvedModel,
+    live_round: Option<&crate::LiveRoundState>,
+) -> Option<agent::AutoThinkDecision> {
+    if session.think_level != "auto" || !providers::auto_think_supported(resolved) {
+        return None;
+    }
+
+    let latest_user_query = status_latest_user_query(session);
+    let mut working_state = agent::WorkingState::default();
+    let _ = working_state.seed_from_query(latest_user_query);
+    let intent = working_state.intent;
+    let signals = agent::AutoThinkRuntimeSignals {
+        intent,
+        cycles: live_round.and_then(|round| round.cycle).unwrap_or(0),
+        observation_strength: if live_round
+            .map(|round| round.has_observation)
+            .unwrap_or(false)
+        {
+            agent::AutoObservationStrength::Light
+        } else {
+            agent::AutoObservationStrength::None
+        },
+        user_msg_chars: latest_user_query
+            .map(|query| query.chars().count())
+            .unwrap_or(0),
+        tool_results_count: 0,
+        tool_error_count: 0,
+        summary_count: 0,
+        summary_bytes: 0,
+        stagnation_streak: 0,
+        error_streak: 0,
+        task_pressure: agent::auto_think_task_pressure(&working_state),
+        ready_to_finish: working_state.ready_to_finish,
+        action_oriented: matches!(
+            intent,
+            agent::TaskIntent::Change | agent::TaskIntent::Investigate | agent::TaskIntent::Execute
+        ),
+        has_blocking_uncertainty: working_state.has_blocking_uncertainty(),
+        finish_deferral_count: 0,
+        progress_made: false,
+        retry_pattern: agent::AutoRetryPattern::None,
+        error_kind: agent::AutoErrorKind::None,
+        evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
+    };
+    Some(agent::auto_think_decision_runtime(signals))
+}
+
+fn status_auto_signals_line(
+    session: &Session,
+    resolved: &providers::ResolvedModel,
+    live_round: Option<&crate::LiveRoundState>,
+) -> Option<String> {
+    if session.think_level != "auto" {
+        return None;
+    }
+    if let Some(trace) = live_round.and_then(|round| round.latest_auto_trace.as_ref()) {
+        return Some(format_status_auto_decision(
+            &trace.selected_think,
+            &trace.baseline_level,
+            &trace.baseline_reason,
+            &trace.escalators,
+            &trace.dampeners,
+            &trace.clamps,
+            &trace.signals,
+        ));
+    }
+    if let Some(round) = live_round
+        && let (
+            Some(observation_strength),
+            Some(stagnation_streak),
+            Some(error_streak),
+            Some(task_pressure),
+            Some(action_oriented),
+            Some(ready_to_finish),
+            Some(has_blocking_uncertainty),
+            Some(finish_deferred_once),
+        ) = (
+            round.auto_observation_strength.as_deref(),
+            round.auto_stagnation_streak,
+            round.auto_error_streak,
+            round.auto_task_pressure,
+            round.auto_action_oriented,
+            round.auto_ready_to_finish,
+            round.auto_has_blocking_uncertainty,
+            round.auto_finish_deferred_once,
+        )
+    {
+        return Some(format!(
+            "auto_signals: live cycles={} obs={} stagnation={} errors={} pressure={} action={} ready={} blocked={} finish_deferred={}",
+            round.cycle.unwrap_or(0),
+            observation_strength,
+            stagnation_streak,
+            error_streak,
+            task_pressure,
+            status_auto_signal_flag(action_oriented),
+            status_auto_signal_flag(ready_to_finish),
+            status_auto_signal_flag(has_blocking_uncertainty),
+            status_auto_signal_flag(finish_deferred_once),
+        ));
+    }
+    if !providers::auto_think_supported(resolved) {
+        return Some(
+            "auto_signals: unavailable (reasoning effort is not supported by the current model)"
+                .to_string(),
+        );
+    }
+    status_estimated_auto_decision(session, resolved, live_round).map(|decision| {
+        format_status_auto_decision(
+            decision.selected_level.label(),
+            decision.baseline_level.label(),
+            &decision.baseline_reason,
+            &decision.escalators,
+            &decision.dampeners,
+            &decision.clamps,
+            &decision.signals,
+        )
+    })
+}
+
+fn status_runtime_target_block(
+    config: &crate::Config,
+    active_model: &str,
+    resolved: &providers::ResolvedModel,
+    effective_think: &str,
+    live_round: Option<&crate::LiveRoundState>,
+) -> String {
+    let Some(live_round) = live_round else {
+        return String::new();
+    };
+
+    let canonical_model = config
+        .canonical_model_ref(active_model)
+        .unwrap_or_else(|_| active_model.to_string());
+    let max_tokens = resolved
+        .max_tokens
+        .map(crate::format_token_count)
+        .unwrap_or_else(|| "-".to_string());
+    let phase = live_round.phase.as_deref().unwrap_or("analyze");
+    let cycle = live_round.cycle.unwrap_or(0);
+
+    format!(
+        "\nruntime_model: {canonical_model}\n\
+         runtime_provider: {}\n\
+         runtime_model_id: {}\n\
+         runtime_max_tokens: {max_tokens}\n\
+         runtime_phase: {phase}\n\
+         runtime_cycle: {cycle}\n\
+         runtime_think: {effective_think}",
+        resolved.provider.label(),
+        resolved.model_id,
+    )
 }
 
 async fn build_runtime_status(session: &Session, state: &AppState) -> String {
     let config = state.config();
-    let model = session.effective_model(&config.model).to_string();
-    let resolved = config.resolve_model(&model);
-    let effective_think = status_effective_think_level(session, state, &resolved).await;
+    let live_round = { state.live_rounds.lock().await.get(&session.id).cloned() };
+    let active_model = live_round
+        .as_ref()
+        .and_then(|round| round.effective_model.as_deref())
+        .filter(|model| !model.is_empty())
+        .unwrap_or_else(|| session.effective_model(&config.model))
+        .to_string();
+    let resolved = config.resolve_model(&active_model);
+    let effective_think = status_effective_think_level(session, &resolved, live_round.as_ref());
     let mut extra_tools = Vec::new();
     let mut cached_mcp_tools = match resolved.provider {
         crate::Provider::Anthropic => {
@@ -151,7 +368,7 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
     let (cached_mcp_servers, enabled_mcp_servers) =
         tools::mcp::cached_server_counts(&config, &session.workspace);
     let request_budget =
-        crate::context::context_input_budget_for_runtime(&config, &model, &effective_think);
+        crate::context::context_input_budget_for_runtime(&config, &active_model, &effective_think);
     let tool_estimate =
         crate::context::estimate_tool_schema_tokens_for_provider(resolved.provider, &extra_tools);
 
@@ -159,7 +376,7 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
     let fresh_system = build_system_prompt(
         &config,
         &session.workspace,
-        &model,
+        &active_model,
         &session.disabled_system_skills,
     );
     if let Some(first) = request_messages.first_mut()
@@ -174,35 +391,47 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
         &extra_tools,
     );
 
-    let mcp_cache_line = if enabled_mcp_servers > 0 {
-        format!(
-            "\nmcp_schema_cache: {}/{} enabled server(s) cached",
-            cached_mcp_servers, enabled_mcp_servers
-        )
-    } else {
-        String::new()
-    };
     let request_note = if enabled_mcp_servers > cached_mcp_servers {
         format!(
-            "includes refreshed system prompt, built-in tool schemas, cached runtime tool schemas, and runtime reasoning reserve; uncached MCP servers are excluded from this estimate ({cached_mcp_servers}/{enabled_mcp_servers} cached)"
+            "includes refreshed system prompt, built-in tool schemas, cached runtime tool schemas, and runtime reply reserve; uncached MCP servers are excluded from this estimate ({cached_mcp_servers}/{enabled_mcp_servers} cached)"
         )
     } else {
-        "includes refreshed system prompt, built-in/runtime tool schemas, and runtime reasoning reserve".to_string()
+        "includes refreshed system prompt, built-in/runtime tool schemas, and runtime reply reserve"
+            .to_string()
     };
-
-    format!(
-        "{}\nrequest_est: {}/{} (tools {} think {})\nrequest_status: {}{}\nrequest_note: {}",
-        build_session_status(session, &config),
-        crate::format_token_count(request_estimate as u64),
-        crate::format_token_count(request_budget as u64),
-        crate::format_token_count(tool_estimate as u64),
-        effective_think,
+    let mut status_lines = vec![format!(
+        "request_status: {}",
         if request_estimate > request_budget {
             "over budget"
         } else {
             "ok"
-        },
-        mcp_cache_line,
+        }
+    )];
+    if let Some(auto_line) = status_auto_signals_line(session, &resolved, live_round.as_ref()) {
+        status_lines.push(auto_line);
+    }
+    if enabled_mcp_servers > 0 {
+        status_lines.push(format!(
+            "mcp_schema_cache: {}/{} enabled server(s) cached",
+            cached_mcp_servers, enabled_mcp_servers
+        ));
+    }
+
+    format!(
+        "{}{}\nrequest_est: {}/{} (tools {} think {})\n{}\nrequest_note: {}",
+        build_session_status(session, &config),
+        status_runtime_target_block(
+            &config,
+            &active_model,
+            &resolved,
+            &effective_think,
+            live_round.as_ref(),
+        ),
+        crate::format_token_count(request_estimate as u64),
+        crate::format_token_count(request_budget as u64),
+        crate::format_token_count(tool_estimate as u64),
+        effective_think,
+        status_lines.join("\n"),
         request_note,
     )
 }
@@ -1025,7 +1254,9 @@ async fn handle_think_command(
     current_session_id: &str,
     state: &AppState,
 ) -> CommandResult {
-    const VALID_LEVELS: &[&str] = &["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    const VALID_LEVELS: &[&str] = &[
+        "auto", "off", "minimal", "low", "medium", "high", "xhigh", "max",
+    ];
 
     if arg.is_empty() {
         let sessions = state.sessions.lock().await;

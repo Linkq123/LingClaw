@@ -160,6 +160,18 @@ export function validateModelsConfigDraftShape(parsed: unknown): void {
           m['maxTokens'],
           `Models JSON field "providers.${name}.models[${index}].maxTokens"`,
         );
+        if (!isAbsent(m['compat'])) {
+          if (!isPlainObject(m['compat'])) {
+            throw new Error(
+              `Models JSON field "providers.${name}.models[${index}].compat" must be an object.`,
+            );
+          }
+          const compat = m['compat'] as Record<string, unknown>;
+          ensureOptionalString(
+            compat['thinkingFormat'],
+            `Models JSON field "providers.${name}.models[${index}].compat.thinkingFormat"`,
+          );
+        }
       });
     }
   }

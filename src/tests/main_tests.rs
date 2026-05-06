@@ -4135,47 +4135,6 @@ fn finish_reason_label_appears_in_done_event_shape() {
 }
 
 #[test]
-fn auto_think_adapts_in_agent_loop_context() {
-    // Simulate the pattern used in the Analyze arm:
-    // auto mode + reasoning model —phase-adapted level
-    let think_level = "auto";
-    let model_supports_reasoning = true;
-
-    // Cycle 0, no observation
-    let effective = if think_level == "auto" && model_supports_reasoning {
-        agent::auto_think_level(0, false, 0, 0).to_owned()
-    } else {
-        think_level.to_owned()
-    };
-    assert_eq!(effective, "medium");
-
-    // Cycle 2, has observation
-    let effective = if think_level == "auto" && model_supports_reasoning {
-        agent::auto_think_level(2, true, 0, 0).to_owned()
-    } else {
-        think_level.to_owned()
-    };
-    assert_eq!(effective, "high");
-
-    // Cycle 10, late round
-    let effective = if think_level == "auto" && model_supports_reasoning {
-        agent::auto_think_level(10, false, 0, 0).to_owned()
-    } else {
-        think_level.to_owned()
-    };
-    assert_eq!(effective, "low");
-
-    // Explicit level —no adaptation
-    let think_level = "high";
-    let effective = if think_level == "auto" && model_supports_reasoning {
-        agent::auto_think_level(5, true, 0, 0).to_owned()
-    } else {
-        think_level.to_owned()
-    };
-    assert_eq!(effective, "high");
-}
-
-#[test]
 fn show_react_field_defaults_to_true_in_deserialized_session() {
     let json_str = r#"{
         "id": "test",
@@ -4908,6 +4867,45 @@ fn replay_live_round_rehydrates_inflight_round_state() {
         &state,
         &session_id,
         1,
+        json!({
+            "type": "auto_trace",
+            "round": 3,
+            "cycle": 2,
+            "phase": "act",
+            "model": "openai/gpt-4o-reasoner",
+            "provider": "openai",
+            "selected_think": "high",
+            "baseline_level": "medium",
+            "baseline_reason": "mid_loop_investigate",
+            "escalators": ["stagnation_streak"],
+            "dampeners": [],
+            "clamps": [],
+            "signals": {
+                "intent": "investigate",
+                "user_msg_chars": 96,
+                "observation_strength": "medium",
+                "tool_results_count": 2,
+                "tool_error_count": 0,
+                "summary_count": 1,
+                "summary_bytes": 4096,
+                "stagnation_streak": 1,
+                "error_streak": 0,
+                "task_pressure": 2,
+                "ready_to_finish": false,
+                "action_oriented": true,
+                "has_blocking_uncertainty": false,
+                "finish_deferral_count": 0,
+                "progress_made": false,
+                "retry_pattern": "none",
+                "error_kind": "none",
+                "evidence_delta_quality": "more_evidence"
+            }
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
         json!({"type": "thinking_start"}),
     ));
     rt.block_on(dispatch_live_event(
@@ -4955,7 +4953,7 @@ fn replay_live_round_rehydrates_inflight_round_state() {
 
     rt.block_on(finish_session_replay(&state, &session_id, 1));
 
-    for _ in 0..7 {
+    for _ in 0..8 {
         let _ = rt
             .block_on(async { tokio::time::timeout(Duration::from_secs(2), bound_rx.recv()).await })
             .expect("bound replay event should arrive before timeout")
@@ -4965,7 +4963,7 @@ fn replay_live_round_rehydrates_inflight_round_state() {
     let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
     rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
 
-    let replayed = (0..7)
+    let replayed = (0..8)
         .map(|_| {
             let raw = rt
                 .block_on(async {
@@ -4983,16 +4981,20 @@ fn replay_live_round_rehydrates_inflight_round_state() {
     assert_eq!(replayed[0]["phase"], "act");
     assert_eq!(replayed[0]["cycle"], 2);
     assert_eq!(replayed[0]["react_visible"], true);
-    assert_eq!(replayed[1]["type"], "thinking_start");
-    assert_eq!(replayed[2]["type"], "thinking_delta");
-    assert_eq!(replayed[2]["content"], "step-1");
-    assert_eq!(replayed[3]["type"], "thinking_done");
-    assert_eq!(replayed[4]["type"], "tool_call");
-    assert_eq!(replayed[4]["id"], "tool-1");
-    assert_eq!(replayed[5]["type"], "tool_result");
-    assert_eq!(replayed[5]["result"], "file contents");
-    assert_eq!(replayed[6]["type"], "delta");
-    assert_eq!(replayed[6]["content"], "final answer");
+    assert_eq!(replayed[1]["type"], "auto_trace");
+    assert_eq!(replayed[1]["selected_think"], "high");
+    assert_eq!(replayed[1]["baseline_reason"], "mid_loop_investigate");
+    assert_eq!(replayed[1]["signals"]["intent"], "investigate");
+    assert_eq!(replayed[2]["type"], "thinking_start");
+    assert_eq!(replayed[3]["type"], "thinking_delta");
+    assert_eq!(replayed[3]["content"], "step-1");
+    assert_eq!(replayed[4]["type"], "thinking_done");
+    assert_eq!(replayed[5]["type"], "tool_call");
+    assert_eq!(replayed[5]["id"], "tool-1");
+    assert_eq!(replayed[6]["type"], "tool_result");
+    assert_eq!(replayed[6]["result"], "file contents");
+    assert_eq!(replayed[7]["type"], "delta");
+    assert_eq!(replayed[7]["content"], "final answer");
 
     rt.block_on(dispatch_live_event(
         &state,
@@ -5005,6 +5007,327 @@ fn replay_live_round_rehydrates_inflight_round_state() {
             .get(&session_id)
             .is_none()
     );
+}
+
+#[test]
+fn dispatch_live_event_ignores_subagent_start_for_parent_round() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-parent-start-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 3,
+            "phase": "analyze",
+            "cycle": 2,
+            "model": "openai/gpt-4o-reasoner",
+            "think_level": "medium",
+            "react_visible": true,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "delta",
+            "content": "parent output"
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "auto_trace",
+            "round": 3,
+            "cycle": 2,
+            "phase": "analyze",
+            "model": "openai/gpt-4o-reasoner",
+            "provider": "openai",
+            "selected_think": "high",
+            "baseline_level": "medium",
+            "baseline_reason": "mid_loop_investigate",
+            "escalators": ["stagnation_streak"],
+            "dampeners": [],
+            "clamps": [],
+            "signals": {
+                "intent": "investigate",
+                "user_msg_chars": 96,
+                "observation_strength": "medium",
+                "tool_results_count": 2,
+                "tool_error_count": 0,
+                "summary_count": 1,
+                "summary_bytes": 4096,
+                "stagnation_streak": 1,
+                "error_streak": 0,
+                "task_pressure": 2,
+                "ready_to_finish": false,
+                "action_oriented": true,
+                "has_blocking_uncertainty": false,
+                "finish_deferral_count": 0,
+                "progress_made": false,
+                "retry_pattern": "none",
+                "error_kind": "none",
+                "evidence_delta_quality": "more_evidence"
+            }
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 1,
+            "phase": "analyze",
+            "cycle": 0,
+            "model": "openai/gpt-4o-mini",
+            "think_level": "low",
+            "react_visible": true,
+            "subagent": "coder",
+            "task_id": "task-1",
+        }),
+    ));
+
+    let live_round = rt.block_on(async {
+        state
+            .live_rounds
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("live round should exist")
+    });
+
+    assert_eq!(live_round.round, 3);
+    assert_eq!(live_round.cycle, Some(2));
+    assert_eq!(
+        live_round.effective_model.as_deref(),
+        Some("openai/gpt-4o-reasoner")
+    );
+    assert_eq!(live_round.effective_think.as_deref(), Some("high"));
+    assert_eq!(live_round.assistant_text, "parent output");
+    assert_eq!(
+        live_round
+            .latest_auto_trace
+            .as_ref()
+            .map(|trace| trace.selected_think.as_str()),
+        Some("high")
+    );
+}
+
+#[test]
+fn dispatch_live_event_ignores_subagent_auto_trace_for_parent_round() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-parent-trace-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 3,
+            "phase": "analyze",
+            "cycle": 2,
+            "model": "openai/gpt-4o-reasoner",
+            "think_level": "medium",
+            "react_visible": true,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "auto_trace",
+            "round": 3,
+            "cycle": 2,
+            "phase": "analyze",
+            "model": "openai/gpt-4o-reasoner",
+            "provider": "openai",
+            "selected_think": "high",
+            "baseline_level": "medium",
+            "baseline_reason": "mid_loop_investigate",
+            "escalators": ["stagnation_streak"],
+            "dampeners": [],
+            "clamps": [],
+            "signals": {
+                "intent": "investigate",
+                "user_msg_chars": 96,
+                "observation_strength": "medium",
+                "tool_results_count": 2,
+                "tool_error_count": 0,
+                "summary_count": 1,
+                "summary_bytes": 4096,
+                "stagnation_streak": 1,
+                "error_streak": 0,
+                "task_pressure": 2,
+                "ready_to_finish": false,
+                "action_oriented": true,
+                "has_blocking_uncertainty": false,
+                "finish_deferral_count": 0,
+                "progress_made": false,
+                "retry_pattern": "none",
+                "error_kind": "none",
+                "evidence_delta_quality": "more_evidence"
+            }
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "auto_trace",
+            "round": 1,
+            "cycle": 0,
+            "phase": "analyze",
+            "model": "openai/gpt-4o-mini",
+            "provider": "openai",
+            "selected_think": "low",
+            "baseline_level": "low",
+            "baseline_reason": "initial_inform",
+            "escalators": [],
+            "dampeners": [],
+            "clamps": [],
+            "subagent": "coder",
+            "task_id": "task-1",
+            "signals": {
+                "intent": "inform",
+                "user_msg_chars": 12,
+                "observation_strength": "none",
+                "tool_results_count": 0,
+                "tool_error_count": 0,
+                "summary_count": 0,
+                "summary_bytes": 0,
+                "stagnation_streak": 0,
+                "error_streak": 0,
+                "task_pressure": 0,
+                "ready_to_finish": false,
+                "action_oriented": false,
+                "has_blocking_uncertainty": false,
+                "finish_deferral_count": 0,
+                "progress_made": false,
+                "retry_pattern": "none",
+                "error_kind": "none",
+                "evidence_delta_quality": "none"
+            }
+        }),
+    ));
+
+    let live_round = rt.block_on(async {
+        state
+            .live_rounds
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("live round should exist")
+    });
+
+    assert_eq!(live_round.effective_think.as_deref(), Some("high"));
+    assert_eq!(
+        live_round
+            .latest_auto_trace
+            .as_ref()
+            .map(|trace| trace.selected_think.as_str()),
+        Some("high")
+    );
+    assert_eq!(
+        live_round
+            .latest_auto_trace
+            .as_ref()
+            .map(|trace| trace.model.as_str()),
+        Some("openai/gpt-4o-reasoner")
+    );
+}
+
+#[test]
+fn dispatch_live_event_ignores_subagent_react_phase_for_parent_round() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-parent-phase-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 3,
+            "phase": "analyze",
+            "cycle": 2,
+            "model": "openai/gpt-4o-reasoner",
+            "think_level": "high",
+            "react_visible": true,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "react_phase",
+            "phase": "act",
+            "cycle": 3,
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "react_phase",
+            "phase": "observe",
+            "cycle": 7,
+            "subagent": "coder",
+            "task_id": "task-1",
+        }),
+    ));
+
+    let live_round = rt.block_on(async {
+        state
+            .live_rounds
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("live round should exist")
+    });
+
+    assert_eq!(live_round.phase.as_deref(), Some("act"));
+    assert_eq!(live_round.cycle, Some(3));
 }
 
 #[test]
@@ -6357,6 +6680,17 @@ fn dispatch_live_event_allows_live_round_source_after_run_teardown() {
                 react_visible: true,
                 phase: Some("finish".into()),
                 cycle: Some(1),
+                effective_model: None,
+                effective_think: None,
+                auto_observation_strength: None,
+                auto_stagnation_streak: None,
+                auto_error_streak: None,
+                auto_task_pressure: None,
+                auto_action_oriented: None,
+                auto_ready_to_finish: None,
+                auto_has_blocking_uncertainty: None,
+                auto_finish_deferred_once: None,
+                latest_auto_trace: None,
                 has_observation: false,
                 assistant_text: String::new(),
                 reasoning_text: String::new(),

@@ -143,6 +143,43 @@ export interface ContextCompressedEvent {
   type: 'context_compressed';
 }
 
+export interface AutoTraceSignals {
+  intent: string;
+  user_msg_chars: number;
+  observation_strength: string;
+  tool_results_count: number;
+  tool_error_count: number;
+  summary_count: number;
+  summary_bytes: number;
+  stagnation_streak: number;
+  error_streak: number;
+  task_pressure: number;
+  ready_to_finish: boolean;
+  action_oriented: boolean;
+  has_blocking_uncertainty: boolean;
+  finish_deferral_count: number;
+  progress_made: boolean;
+  retry_pattern: string;
+  error_kind: string;
+  evidence_delta_quality: string;
+}
+
+export interface AutoTraceEvent {
+  type: 'auto_trace';
+  round: number;
+  cycle: number;
+  phase: string;
+  model: string;
+  provider: string;
+  selected_think: string;
+  baseline_level: string;
+  baseline_reason: string;
+  escalators: string[];
+  dampeners: string[];
+  clamps: string[];
+  signals: AutoTraceSignals;
+}
+
 export interface UsageEvent {
   type: 'usage';
   daily_input_tokens?: number;
@@ -204,6 +241,7 @@ export type WebSocketMessage =
   | ThinkingStartEvent
   | ThinkingDeltaEvent
   | ThinkingDoneEvent
+  | AutoTraceEvent
   | ContextCompressedEvent
   | UsageEvent
   | OrchestrateStartedEvent

@@ -5,6 +5,7 @@ pub(crate) mod net;
 
 use reqwest::Client;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{future::Future, path::Path, pin::Pin, time::Instant};
 
 use crate::Config;
@@ -466,14 +467,22 @@ fn trace_builder_http_fetch(args: &serde_json::Value) -> Option<crate::agent::To
 
 fn trace_builder_task(args: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
     let agent_name = tool_arg_str(args, "agent")?;
+    let retry_key = tool_arg_str(args, "prompt").map(|prompt| {
+        trace_retry_key_from_str(
+            "task",
+            &format!("{agent_name}\u{1f}|{}", normalize_retry_text(prompt)),
+        )
+    });
     Some(crate::agent::ToolExecutionTrace {
         summary: compact_tool_call_summary(&format!("delegate to `{agent_name}`")),
         agent: Some(agent_name.to_string()),
+        retry_key,
         ..crate::agent::ToolExecutionTrace::default()
     })
 }
 
 fn trace_builder_orchestrate(args: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
+    let tasks = args.get("tasks")?;
     let task_count = args
         .get("tasks")
         .and_then(serde_json::Value::as_array)
@@ -481,8 +490,30 @@ fn trace_builder_orchestrate(args: &serde_json::Value) -> Option<crate::agent::T
     Some(crate::agent::ToolExecutionTrace {
         summary: compact_tool_call_summary(&format!("orchestrate {task_count} delegated tasks")),
         task_count: Some(task_count),
+        retry_key: trace_retry_key_from_value("orchestrate", tasks),
         ..crate::agent::ToolExecutionTrace::default()
     })
+}
+
+fn normalize_retry_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn trace_retry_key_from_value(prefix: &str, value: &serde_json::Value) -> Option<String> {
+    serde_json::to_string(value)
+        .ok()
+        .map(|json| trace_retry_key_from_str(prefix, &json))
+}
+
+fn trace_retry_key_from_str(prefix: &str, value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(value.as_bytes());
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        let _ = write!(&mut hex, "{byte:02x}");
+    }
+    format!("{prefix}:{hex}")
 }
 
 pub(crate) fn tool_specs() -> &'static [ToolSpec] {

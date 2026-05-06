@@ -266,7 +266,9 @@
               "contextWindow": 128000,
               "maxTokens": 16384,
               "cost": {},
-              "compat": {}
+              "compat": {
+                "thinkingFormat": "openai"
+              }
             }
           ]
         }
@@ -347,7 +349,9 @@
       "contextWindow": 128000,
       "maxTokens": 8192,
       "cost": {},
-      "compat": {}
+      "compat": {
+        "thinkingFormat": "string?"
+      }
     }
   ]
 }
@@ -366,6 +370,8 @@
   - `gemini`
 - `baseUrl` 不能为空
 - `models[].id` 不能为空
+- `models[].compat` 如提供，必须是对象
+- `models[].compat.thinkingFormat` 如提供，必须是字符串；用于显式声明 OpenAI-compatible 的 thinking / reasoning 方言（例如 `openai`、`qwen`、`deepseek-v4`、`ollama`、`gpt-oss`）
 
 #### agents.defaults.model
 
@@ -948,9 +954,76 @@ ws://127.0.0.1:18989/ws
 
 ```json
 {
-  "type": "start"
+  "type": "start",
+  "round": 3,
+  "phase": "analyze",
+  "cycle": 1,
+  "model": "openai/gpt-4o-reasoner",
+  "think_level": "high",
+  "react_visible": true,
+  "auto_observation_strength": "medium",
+  "auto_stagnation_streak": 1,
+  "auto_error_streak": 0,
+  "auto_task_pressure": 2,
+  "auto_action_oriented": true,
+  "auto_ready_to_finish": false,
+  "auto_has_blocking_uncertainty": true,
+  "auto_finish_deferred_once": false
 }
 ```
+
+补充说明：
+
+- `model` / `think_level` 表示本轮实际使用的模型与思维级别；它们可能与静态配置不同，例如被运行时路由或 Hook 覆盖
+- `phase` / `cycle` 为当前顶层主代理的 live runtime 状态
+- 以 `auto_*` 开头的字段仅在 `/think auto` 且当前模型支持 reasoning effort 时出现，用于给 `/status` 与重连回放提供实时摘要
+
+### `auto_trace`
+
+`think=auto` 的顶层决策轨迹。该事件只针对主代理当前 round 发送；子代理即使内部也使用 auto 策略，其轨迹也不会污染顶层面板或主会话 live state。
+
+```json
+{
+  "type": "auto_trace",
+  "round": 3,
+  "cycle": 1,
+  "phase": "analyze",
+  "model": "openai/gpt-4o-reasoner",
+  "provider": "openai",
+  "selected_think": "high",
+  "baseline_level": "medium",
+  "baseline_reason": "action_oriented_first_turn",
+  "escalators": ["blocking_uncertainty"],
+  "dampeners": [],
+  "clamps": [],
+  "signals": {
+    "intent": "change",
+    "user_msg_chars": 148,
+    "observation_strength": "medium",
+    "tool_results_count": 2,
+    "tool_error_count": 0,
+    "summary_count": 1,
+    "summary_bytes": 1024,
+    "stagnation_streak": 1,
+    "error_streak": 0,
+    "task_pressure": 2,
+    "ready_to_finish": false,
+    "action_oriented": true,
+    "has_blocking_uncertainty": true,
+    "finish_deferral_count": 0,
+    "progress_made": true,
+    "retry_pattern": "same_tool",
+    "error_kind": "none",
+    "evidence_delta_quality": "better_evidence"
+  }
+}
+```
+
+补充说明：
+
+- `selected_think` 为最终发送给模型的思维级别；若 `BeforeLlmCall` Hook 覆盖了 think，trace 会直接反映覆盖后的值，并在 `clamps` 中加入 `hook_think_override`
+- `baseline_*` 描述本轮 runtime auto policy 在未叠加 escalator / dampener / clamp 之前的基线判断
+- `signals` 是用于决策的实时输入快照，也是 `/status` 中 `auto_signals` / `auto_decision` 摘要的来源
 
 ### `delta`
 
