@@ -606,7 +606,7 @@ async fn handle_new_command(
                 false,
             ));
         }
-        result = providers::call_llm_simple_with_usage(&state.http, &resolved, &compress_prompt, &workspace, config.s3.as_ref(), config.max_llm_retries) => {
+        result = providers::call_llm_simple_with_usage(&state.http, &resolved, &compress_prompt, &workspace, config.s3.as_ref(), "off", config.max_llm_retries) => {
             match result {
                 Ok(s) => s,
                 Err(e) => {

@@ -2662,6 +2662,7 @@ Keep durable knowledge only; skip ephemeral task details."#
         &messages,
         &req.workspace,
         config.s3.as_ref(),
+        "off",
         config.max_llm_retries,
     )
     .await

@@ -444,6 +444,7 @@ impl AgentHook for AutoCompressContextHook {
                 &prompt,
                 &input.workspace,
                 config.s3.as_ref(),
+                "off",
                 config.max_llm_retries,
             )
             .await

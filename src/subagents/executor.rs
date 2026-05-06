@@ -385,6 +385,7 @@ async fn request_forced_final_response(
         &final_messages,
         workspace,
         config.s3.as_ref(),
+        "off",
         config.max_llm_retries,
     )
     .await?;

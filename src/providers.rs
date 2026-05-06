@@ -32,7 +32,7 @@ pub(crate) struct ResolvedModel {
     pub(crate) api_key: String,
     pub(crate) model_id: String,
     pub(crate) reasoning: bool,
-    /// From model config `compat.thinkingFormat`: "qwen", "openai", "anthropic", "ollama", etc.
+    /// From model config `compat.thinkingFormat`: "qwen", "openai", "doubao", "anthropic", "ollama", etc.
     pub(crate) thinking_format: Option<String>,
     /// From model config `maxTokens`.
     pub(crate) max_tokens: Option<u64>,
@@ -1400,6 +1400,7 @@ fn build_openai_simple_body(
     resolved: &ResolvedModel,
     messages: &[ChatMessage],
     s3_cfg: Option<&crate::config::S3Config>,
+    think_level: &str,
 ) -> Result<serde_json::Value, String> {
     let messages = materialize_image_urls(messages, s3_cfg)?;
     let prepared_messages = prepare_openai_messages_for_request(
@@ -1416,6 +1417,9 @@ fn build_openai_simple_body(
         "model": resolved.model_id,
         "messages": api_messages,
     });
+    if think_level != "off" || resolved.thinking_format.as_deref() == Some("doubao") {
+        apply_openai_thinking_controls(&mut body, resolved, think_level);
+    }
     if let Some(mt) = resolved.max_tokens {
         body["max_tokens"] = json!(mt);
     }
@@ -1479,12 +1483,13 @@ pub(crate) async fn call_llm_simple_with_usage(
     messages: &[ChatMessage],
     workspace: &Path,
     s3_cfg: Option<&crate::config::S3Config>,
+    think_level: &str,
     max_retries: usize,
 ) -> Result<SimpleLlmResponse, String> {
     match resolved.provider {
         Provider::OpenAI => {
             let url = format!("{}/chat/completions", resolved.api_base);
-            let body = build_openai_simple_body(resolved, messages, s3_cfg)?;
+            let body = build_openai_simple_body(resolved, messages, s3_cfg, think_level)?;
             let resp = send_with_retry(http, max_retries, || {
                 http.post(&url).bearer_auth(&resolved.api_key).json(&body)
             })
@@ -1622,9 +1627,17 @@ pub(crate) async fn call_llm_simple(
     s3_cfg: Option<&crate::config::S3Config>,
     max_retries: usize,
 ) -> Result<String, String> {
-    call_llm_simple_with_usage(http, resolved, messages, workspace, s3_cfg, max_retries)
-        .await
-        .map(|resp| resp.content)
+    call_llm_simple_with_usage(
+        http,
+        resolved,
+        messages,
+        workspace,
+        s3_cfg,
+        "off",
+        max_retries,
+    )
+    .await
+    .map(|resp| resp.content)
 }
 
 /// Map think_level to OpenAI reasoning_effort string.
@@ -1644,6 +1657,50 @@ fn think_level_to_deepseek_reasoning_effort(level: &str) -> &str {
     match level {
         "xhigh" | "max" => "max",
         _ => "high",
+    }
+}
+
+/// Map think_level to Doubao reasoning_effort string.
+/// Doubao only supports "low", "medium", and "high"; higher levels collapse to "high".
+fn think_level_to_doubao_reasoning_effort(level: &str) -> &str {
+    match level {
+        "minimal" | "low" => "low",
+        "medium" => "medium",
+        "high" | "xhigh" | "max" => "high",
+        _ => "medium",
+    }
+}
+
+fn apply_openai_thinking_controls(
+    body: &mut serde_json::Value,
+    resolved: &ResolvedModel,
+    think_level: &str,
+) {
+    let thinking_on = think_level != "off";
+    if thinking_on {
+        match resolved.thinking_format.as_deref().unwrap_or("openai") {
+            "qwen" => {
+                body["enable_thinking"] = json!(true);
+            }
+            "doubao" => {
+                body["reasoning_effort"] =
+                    json!(think_level_to_doubao_reasoning_effort(think_level));
+                body["thinking"] = json!({"type": "enabled"});
+            }
+            "deepseek-v4" => {
+                body["reasoning_effort"] =
+                    json!(think_level_to_deepseek_reasoning_effort(think_level));
+                body["thinking"] = json!({"type": "enabled"});
+            }
+            _ => {
+                body["reasoning_effort"] = json!(think_level_to_reasoning_effort(think_level));
+            }
+        }
+    } else if matches!(
+        resolved.thinking_format.as_deref(),
+        Some("deepseek-v4" | "doubao")
+    ) {
+        body["thinking"] = json!({"type": "disabled"});
     }
 }
 
@@ -2399,24 +2456,7 @@ fn build_openai_stream_body(
     {
         body["stream_options"] = json!({ "include_usage": true });
     }
-    if thinking_on {
-        match resolved.thinking_format.as_deref().unwrap_or("openai") {
-            "qwen" => {
-                body["enable_thinking"] = json!(true);
-            }
-            "deepseek-v4" => {
-                body["reasoning_effort"] =
-                    json!(think_level_to_deepseek_reasoning_effort(think_level));
-                body["thinking"] = json!({"type": "enabled"});
-            }
-            _ => {
-                body["reasoning_effort"] = json!(think_level_to_reasoning_effort(think_level));
-            }
-        }
-    } else if resolved.thinking_format.as_deref() == Some("deepseek-v4") {
-        // DeepSeek defaults to thinking enabled; explicitly disable it.
-        body["thinking"] = json!({"type": "disabled"});
-    }
+    apply_openai_thinking_controls(&mut body, resolved, think_level);
     if let Some(max_tokens) = resolved.max_tokens {
         body["max_tokens"] = json!(max_tokens);
     }

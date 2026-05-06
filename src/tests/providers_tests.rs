@@ -157,6 +157,18 @@ fn think_level_to_deepseek_reasoning_effort_all_levels() {
 }
 
 #[test]
+fn think_level_to_doubao_reasoning_effort_all_levels() {
+    assert_eq!(think_level_to_doubao_reasoning_effort("minimal"), "low");
+    assert_eq!(think_level_to_doubao_reasoning_effort("low"), "low");
+    assert_eq!(think_level_to_doubao_reasoning_effort("medium"), "medium");
+    assert_eq!(think_level_to_doubao_reasoning_effort("high"), "high");
+    assert_eq!(think_level_to_doubao_reasoning_effort("xhigh"), "high");
+    assert_eq!(think_level_to_doubao_reasoning_effort("max"), "high");
+    assert_eq!(think_level_to_doubao_reasoning_effort("unknown"), "medium");
+    assert_eq!(think_level_to_doubao_reasoning_effort("auto"), "medium");
+}
+
+#[test]
 fn drain_sse_lines_preserves_partial_tail() {
     let mut partial = String::new();
 
@@ -1951,6 +1963,72 @@ fn build_openai_stream_body_deepseek_v4_off_sends_thinking_disabled() {
 }
 
 #[test]
+fn build_openai_stream_body_doubao_caps_xhigh_to_high() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://ark.cn-beijing.volces.com/api/v3".into(),
+        api_key: "doubao-key".into(),
+        model_id: "doubao-thinking".into(),
+        reasoning: true,
+        thinking_format: Some("doubao".into()),
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+
+    let body =
+        build_openai_stream_body(&resolved, &[], None, "xhigh", &[], true).expect("body builds");
+
+    assert_eq!(body["reasoning_effort"], "high");
+    assert_eq!(body["thinking"]["type"], "enabled");
+}
+
+#[test]
+fn build_openai_stream_body_doubao_preserves_medium() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://ark.cn-beijing.volces.com/api/v3".into(),
+        api_key: "doubao-key".into(),
+        model_id: "doubao-thinking".into(),
+        reasoning: true,
+        thinking_format: Some("doubao".into()),
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+
+    let body =
+        build_openai_stream_body(&resolved, &[], None, "medium", &[], true).expect("body builds");
+
+    assert_eq!(body["reasoning_effort"], "medium");
+    assert_eq!(body["thinking"]["type"], "enabled");
+}
+
+#[test]
+fn build_openai_stream_body_doubao_off_sends_thinking_disabled() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://ark.cn-beijing.volces.com/api/v3".into(),
+        api_key: "doubao-key".into(),
+        model_id: "doubao-thinking".into(),
+        reasoning: true,
+        thinking_format: Some("doubao".into()),
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+
+    let body =
+        build_openai_stream_body(&resolved, &[], None, "off", &[], true).expect("body builds");
+
+    assert!(body.get("reasoning_effort").is_none());
+    assert_eq!(body["thinking"]["type"], "disabled");
+}
+
+#[test]
 fn build_openai_simple_body_deepseek_v4_includes_reasoning_content_in_messages() {
     let resolved = ResolvedModel {
         provider: Provider::OpenAI,
@@ -1983,7 +2061,7 @@ fn build_openai_simple_body_deepseek_v4_includes_reasoning_content_in_messages()
         timestamp: None,
     }];
 
-    let body = build_openai_simple_body(&resolved, &messages, None).expect("body builds");
+    let body = build_openai_simple_body(&resolved, &messages, None, "off").expect("body builds");
 
     assert_eq!(
         body["messages"][0]["reasoning_content"].as_str(),
@@ -1992,6 +2070,48 @@ fn build_openai_simple_body_deepseek_v4_includes_reasoning_content_in_messages()
     // Simple body does not include thinking control fields
     assert!(body.get("reasoning_effort").is_none());
     assert!(body.get("thinking").is_none());
+}
+
+#[test]
+fn build_openai_simple_body_doubao_explicit_medium_reasoning_controls() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://ark.cn-beijing.volces.com/api/v3".into(),
+        api_key: "doubao-key".into(),
+        model_id: "doubao-thinking".into(),
+        reasoning: true,
+        thinking_format: Some("doubao".into()),
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+
+    let body = build_openai_simple_body(&resolved, &[], None, "medium").expect("body builds");
+
+    assert_eq!(body["reasoning_effort"], "medium");
+    assert_eq!(body["thinking"]["type"], "enabled");
+}
+
+#[test]
+fn build_openai_simple_body_doubao_off_sends_thinking_disabled() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base: "https://ark.cn-beijing.volces.com/api/v3".into(),
+        api_key: "doubao-key".into(),
+        model_id: "doubao-thinking".into(),
+        reasoning: true,
+        thinking_format: Some("doubao".into()),
+        max_tokens: None,
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+
+    let body = build_openai_simple_body(&resolved, &[], None, "off").expect("body builds");
+
+    assert!(body.get("reasoning_effort").is_none());
+    assert_eq!(body["thinking"]["type"], "disabled");
 }
 
 #[test]
@@ -2049,7 +2169,7 @@ fn build_openai_simple_body_deepseek_v4_replays_missing_reasoning_tool_turn_as_t
         },
     ];
 
-    let body = build_openai_simple_body(&resolved, &messages, None).expect("body builds");
+    let body = build_openai_simple_body(&resolved, &messages, None, "off").expect("body builds");
     let body_messages = body["messages"]
         .as_array()
         .expect("messages should serialize as an array");
@@ -2126,7 +2246,7 @@ fn build_openai_simple_body_non_deepseek_keeps_reasoningless_tool_turn_structure
         },
     ];
 
-    let body = build_openai_simple_body(&resolved, &messages, None).expect("body builds");
+    let body = build_openai_simple_body(&resolved, &messages, None, "off").expect("body builds");
     let body_messages = body["messages"]
         .as_array()
         .expect("messages should serialize as an array");
@@ -2175,7 +2295,7 @@ fn build_openai_simple_body_uses_null_tool_call_content_for_official_api() {
         timestamp: None,
     }];
 
-    let body = build_openai_simple_body(&resolved, &messages, None).expect("body builds");
+    let body = build_openai_simple_body(&resolved, &messages, None, "off").expect("body builds");
 
     assert!(body["messages"][0]["content"].is_null());
 }
@@ -2213,7 +2333,7 @@ fn build_openai_simple_body_keeps_string_tool_call_content_for_compatible_api() 
         timestamp: None,
     }];
 
-    let body = build_openai_simple_body(&resolved, &messages, None).expect("body builds");
+    let body = build_openai_simple_body(&resolved, &messages, None, "off").expect("body builds");
 
     assert_eq!(body["messages"][0]["content"], "");
 }
@@ -2826,7 +2946,8 @@ fn call_llm_simple_gemini_sends_key_header_and_expected_path() {
 
     let response = runtime
         .block_on(async {
-            call_llm_simple_with_usage(&http, &resolved, &messages, &workspace, None, 2).await
+            call_llm_simple_with_usage(&http, &resolved, &messages, &workspace, None, "off", 2)
+                .await
         })
         .expect("gemini simple call should succeed");
 
@@ -2885,7 +3006,8 @@ fn call_llm_simple_anthropic_preserves_missing_usage() {
 
     let response = runtime
         .block_on(async {
-            call_llm_simple_with_usage(&http, &resolved, &messages, &workspace, None, 2).await
+            call_llm_simple_with_usage(&http, &resolved, &messages, &workspace, None, "off", 2)
+                .await
         })
         .expect("anthropic simple call should succeed");
 

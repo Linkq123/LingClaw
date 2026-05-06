@@ -371,7 +371,9 @@
 - `baseUrl` 不能为空
 - `models[].id` 不能为空
 - `models[].compat` 如提供，必须是对象
-- `models[].compat.thinkingFormat` 如提供，必须是字符串；用于显式声明 OpenAI-compatible 的 thinking / reasoning 方言（例如 `openai`、`qwen`、`deepseek-v4`、`ollama`、`gpt-oss`）
+- `models[].compat.thinkingFormat` 如提供，必须是字符串；用于显式声明 OpenAI-compatible 的 thinking / reasoning 方言（例如 `openai`、`qwen`、`doubao`、`deepseek-v4`、`ollama`、`gpt-oss`）
+- `models[].compat.thinkingFormat = "deepseek-v4"` 时，请求会显式发送 `thinking.type=enabled|disabled`；开启 thinking 时，`reasoning_effort` 仅使用 `high` / `max`
+- `models[].compat.thinkingFormat = "doubao"` 时，请求会显式发送 `thinking.type=enabled|disabled`；开启 thinking 时，`reasoning_effort` 仅使用 `low` / `medium` / `high`
 
 #### agents.defaults.model
 

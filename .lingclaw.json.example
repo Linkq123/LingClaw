@@ -56,6 +56,23 @@
           }
         ]
       },
+      "doubao": {
+        "baseUrl": "https://your-doubao-openai-compatible-endpoint/v1",
+        "apiKey": "your-doubao-key",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "doubao-thinking-model",
+            "name": "doubao-thinking-model",
+            "reasoning": true,
+            "input": ["text"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 128000,
+            "maxTokens": 16384,
+            "compat": { "thinkingFormat": "doubao" }
+          }
+        ]
+      },
       "deepseek": {
         "baseUrl": "https://api.deepseek.com/v1",
         "apiKey": "sk-your-deepseek-key",

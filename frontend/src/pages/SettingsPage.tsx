@@ -602,7 +602,7 @@ function ModelEntryRow({
             aria-label="Thinking Format"
             value={modelThinkingFormat(model)}
             placeholder="openai"
-            title="Examples: openai, qwen, deepseek-v4, ollama, gpt-oss"
+            title="Examples: openai, qwen, doubao, deepseek-v4, ollama, gpt-oss"
             style={{ width: 120 }}
             onChange={(e) => onChange(updateModelThinkingFormat(model, e.target.value))}
           />

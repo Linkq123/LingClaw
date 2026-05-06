@@ -399,6 +399,7 @@ async fn run_post_execution_reflection(
         &prompt_messages,
         &workspace,
         config.s3.as_ref(),
+        "off",
         config.max_llm_retries,
     )
     .await
@@ -1995,6 +1996,7 @@ async fn summarize_working_state_with_llm(
             &messages,
             workspace,
             config.s3.as_ref(),
+            "off",
             config.max_llm_retries,
         ),
     )
