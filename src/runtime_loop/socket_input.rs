@@ -139,6 +139,13 @@ pub(crate) async fn handle_idle_socket_input(
             return IdleSocketInputAction::Continue;
         }
 
+        if let Some(events) = build_busy_command_events(trimmed, current_session_id, state).await {
+            for event in events {
+                let _ = ws_send(tx, &event).await;
+            }
+            return IdleSocketInputAction::Continue;
+        }
+
         if let Some((intervention_text, had_images)) = extract_busy_intervention(trimmed) {
             if enqueue_shared_intervention(&run.deferred_interventions, intervention_text).await {
                 ws_send(
@@ -497,6 +504,76 @@ async fn enqueue_shared_intervention(
     true
 }
 
+fn parse_busy_allowlisted_command(trimmed: &str) -> Option<(&str, &str)> {
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("");
+    let arg = parts.next().map(str::trim).unwrap_or("");
+    if cmd.eq_ignore_ascii_case("/think") {
+        Some(("/think", arg))
+    } else {
+        None
+    }
+}
+
+async fn build_busy_command_events(
+    trimmed: &str,
+    current_session_id: &str,
+    state: &Arc<AppState>,
+) -> Option<Vec<serde_json::Value>> {
+    let (cmd, arg) = parse_busy_allowlisted_command(trimmed)?;
+    let result = match cmd {
+        "/think" => crate::commands::handle_think_command(arg, current_session_id, state).await,
+        _ => return None,
+    };
+
+    let hook_input = CommandHookInput {
+        command: cmd.to_string(),
+        args: arg.to_string(),
+        result_type: result.response_type.to_string(),
+        session_id: current_session_id.to_string(),
+    };
+    let config = state.config();
+    let mut events = run_command_hooks(&state.hooks, &hook_input, &config).await;
+
+    let response = if result.sessions_changed {
+        format!(
+            "{}\nWill apply on the next reasoning cycle if this run continues.",
+            result.response
+        )
+    } else {
+        result.response
+    };
+    events.push(json!({
+        "type": result.response_type,
+        "content": response,
+        "dismissible": result.dismissible,
+    }));
+
+    if result.sessions_changed {
+        let payload = {
+            let sessions = state.sessions.lock().await;
+            let (name, model) = sessions
+                .get(current_session_id)
+                .map(|s| (s.name.clone(), s.effective_model(&config.model).to_string()))
+                .unwrap_or_else(|| ("Main".to_string(), config.model.clone()));
+            let usage = sessions
+                .get(current_session_id)
+                .map(crate::socket_sync::build_session_usage_payload)
+                .unwrap_or_else(|| json!({}));
+            crate::socket_sync::build_session_info_payload(
+                current_session_id,
+                &name,
+                state,
+                &model,
+                usage,
+            )
+        };
+        events.push(payload);
+    }
+
+    Some(events)
+}
+
 fn extract_busy_intervention(trimmed: &str) -> Option<(String, bool)> {
     if trimmed.is_empty() || trimmed.starts_with('/') {
         return None;
@@ -524,6 +601,8 @@ fn busy_intervention_notice(had_images: bool) -> &'static str {
 const MAX_DRAIN_PER_TICK: usize = 64;
 
 pub(super) async fn drain_busy_socket_messages(
+    state: &Arc<AppState>,
+    current_session_id: &str,
     inbound_rx: &mut mpsc::Receiver<String>,
     pending_interventions: &mut Vec<String>,
     live_tx: &LiveTx,
@@ -540,6 +619,12 @@ pub(super) async fn drain_busy_socket_messages(
         if trimmed.eq_ignore_ascii_case("/stop") {
             run_cancel.cancel();
             return true;
+        }
+        if let Some(events) = build_busy_command_events(trimmed, current_session_id, state).await {
+            for event in events {
+                let _ = live_send(live_tx, event).await;
+            }
+            continue;
         }
         if let Some((intervention_text, had_images)) = extract_busy_intervention(trimmed) {
             pending_interventions.push(intervention_text);

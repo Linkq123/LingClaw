@@ -267,6 +267,76 @@ async fn handle_idle_socket_input_queues_new_prompt_while_reconnected_run_active
 }
 
 #[tokio::test]
+async fn handle_idle_socket_input_allows_think_command_while_reconnected_run_active() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
+    let deferred_interventions = Arc::new(Mutex::new(DeferredInterventionState::open()));
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+    }
+    {
+        let mut runs = state.active_runs.lock().await;
+        runs.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: deferred_interventions.clone(),
+            },
+        );
+    }
+
+    let action = handle_idle_socket_input(
+        "/think high".into(),
+        &mut current_session_id,
+        &current_session_ref,
+        2,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+
+    let payload = rx.recv().await.expect("think response should be sent");
+    let parsed: serde_json::Value = serde_json::from_str(&payload).expect("payload json");
+    assert_eq!(parsed["type"].as_str(), Some("system"));
+    assert!(
+        parsed["content"]
+            .as_str()
+            .is_some_and(|value| value.contains("Think mode set to: high"))
+    );
+    assert!(
+        parsed["content"]
+            .as_str()
+            .is_some_and(|value| value.contains("next reasoning cycle"))
+    );
+
+    let updated_think = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .expect("session should exist")
+            .think_level
+            .clone()
+    };
+    assert_eq!(updated_think, "high");
+
+    let queued = deferred_interventions.lock().await;
+    assert!(queued.queue.is_empty());
+}
+
+#[tokio::test]
 async fn handle_idle_socket_input_rejects_intervention_when_reconnected_run_is_finishing() {
     let state = Arc::new(test_app_state());
     let session_id = MAIN_SESSION_ID.to_string();
@@ -2293,12 +2363,19 @@ fn messages_have_images_detects_historical_image_context() {
 #[test]
 fn drain_busy_socket_messages_collects_interventions_and_stops_run() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = std::sync::Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
     let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
     let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(8);
     let run_cancel = CancellationToken::new();
     let mut pending = Vec::new();
 
     rt.block_on(async {
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), test_session(&session_id, "Main", None));
         inbound_tx
             .send("follow-up detail".to_string())
             .await
@@ -2312,8 +2389,15 @@ fn drain_busy_socket_messages_collects_interventions_and_stops_run() {
             .await
             .expect("stop should be queued");
 
-        let stopped =
-            drain_busy_socket_messages(&mut inbound_rx, &mut pending, &live_tx, &run_cancel).await;
+        let stopped = drain_busy_socket_messages(
+            &state,
+            &session_id,
+            &mut inbound_rx,
+            &mut pending,
+            &live_tx,
+            &run_cancel,
+        )
+        .await;
 
         assert!(stopped);
     });
@@ -2331,6 +2415,86 @@ fn drain_busy_socket_messages_collects_interventions_and_stops_run() {
             .is_some_and(|value| value.contains("Intervention received"))
     );
     assert!(live_rx.try_recv().is_err());
+}
+
+#[test]
+fn drain_busy_socket_messages_applies_think_command_without_queueing_it() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = std::sync::Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(8);
+    let run_cancel = CancellationToken::new();
+    let mut pending = Vec::new();
+
+    rt.block_on(async {
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), test_session(&session_id, "Main", None));
+
+        inbound_tx
+            .send("/think high".to_string())
+            .await
+            .expect("think command should be queued");
+        inbound_tx
+            .send("follow-up detail".to_string())
+            .await
+            .expect("intervention should be queued");
+
+        let stopped = drain_busy_socket_messages(
+            &state,
+            &session_id,
+            &mut inbound_rx,
+            &mut pending,
+            &live_tx,
+            &run_cancel,
+        )
+        .await;
+
+        assert!(!stopped);
+    });
+
+    assert_eq!(pending, vec!["follow-up detail".to_string()]);
+    assert!(!run_cancel.is_cancelled());
+
+    let think_event = live_rx.try_recv().expect("think event should be emitted");
+    assert_eq!(think_event["type"], "system");
+    assert!(
+        think_event["content"]
+            .as_str()
+            .is_some_and(|value| value.contains("Think mode set to: high"))
+    );
+    assert!(
+        think_event["content"]
+            .as_str()
+            .is_some_and(|value| value.contains("next reasoning cycle"))
+    );
+
+    let session_event = live_rx.try_recv().expect("session event should be emitted");
+    assert_eq!(session_event["type"], "session");
+
+    let progress_event = live_rx
+        .try_recv()
+        .expect("progress event should be emitted");
+    assert_eq!(progress_event["type"], "progress");
+    assert!(
+        progress_event["content"]
+            .as_str()
+            .is_some_and(|value| value.contains("Intervention received"))
+    );
+    assert!(live_rx.try_recv().is_err());
+
+    let updated_think = rt.block_on(async {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .expect("session should exist")
+            .think_level
+            .clone()
+    });
+    assert_eq!(updated_think, "high");
 }
 
 #[test]

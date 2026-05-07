@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     AppState, LiveTx, MAIN_SESSION_ID, WsTx,
-    session_store::{save_session_to_disk, trim_incomplete_tool_calls_in_session},
+    session_store::{save_current_session_to_disk, trim_incomplete_tool_calls_in_session},
 };
 
 pub(crate) struct SocketTaskHandles {
@@ -92,40 +92,34 @@ pub(crate) async fn finalize_connection(
 
     super::unbind_session_connection_if_matches(state, session_id, connection_id).await;
 
-    let snapshot = {
-        let sessions = state.sessions.lock().await;
-        sessions.get(session_id).cloned()
-    };
-
-    if let Some(ref session) = snapshot {
-        match save_session_to_disk(session).await {
-            Ok(()) => {
-                let has_active_connection = state
-                    .active_connections
-                    .lock()
-                    .await
-                    .contains_key(session_id);
-                if !has_active_connection && session_id != MAIN_SESSION_ID {
-                    let mut sessions = state.sessions.lock().await;
-                    sessions.remove(session_id);
-                }
-            }
-            Err(error) => {
-                eprintln!(
-                    "Warning: failed to save session {} on disconnect: {error}; keeping in memory",
-                    session.id
-                );
+    match save_current_session_to_disk(state, session_id).await {
+        Ok(()) => {
+            let has_active_connection = state
+                .active_connections
+                .lock()
+                .await
+                .contains_key(session_id);
+            if !has_active_connection && session_id != MAIN_SESSION_ID {
+                let mut sessions = state.sessions.lock().await;
+                sessions.remove(session_id);
             }
         }
-    } else {
-        let has_active_connection = state
-            .active_connections
-            .lock()
-            .await
-            .contains_key(session_id);
-        if !has_active_connection && session_id != MAIN_SESSION_ID {
-            let mut sessions = state.sessions.lock().await;
-            sessions.remove(session_id);
+        Err(error) if error == "Session not found" => {
+            let has_active_connection = state
+                .active_connections
+                .lock()
+                .await
+                .contains_key(session_id);
+            if !has_active_connection && session_id != MAIN_SESSION_ID {
+                let mut sessions = state.sessions.lock().await;
+                sessions.remove(session_id);
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "Warning: failed to save session {} on disconnect: {error}; keeping in memory",
+                session_id
+            );
         }
     }
 

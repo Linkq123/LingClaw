@@ -3074,20 +3074,23 @@ async fn main() {
         .ok();
 
     // Flush all in-memory sessions to disk before exiting
-    let sessions: Vec<Session> = {
+    let session_ids: Vec<String> = {
         let guard = state.sessions.lock().await;
-        guard.values().cloned().collect()
+        guard
+            .iter()
+            .filter_map(|(session_id, session)| {
+                (session.messages.len() > 1).then(|| session_id.clone())
+            })
+            .collect()
     };
-    for s in &sessions {
-        if s.messages.len() > 1 {
-            let _ = save_session_to_disk(s).await;
-        }
+    for session_id in &session_ids {
+        let _ = session_store::save_current_session_to_disk(&state, session_id).await;
     }
     // Clean up shutdown token file
     if let Some(dir) = config_dir_path() {
         let _ = std::fs::remove_file(dir.join(format!("shutdown-{port}.token")));
     }
-    eprintln!("Server shut down, {} session(s) saved.", sessions.len());
+    eprintln!("Server shut down, {} session(s) saved.", session_ids.len());
 }
 
 #[cfg(test)]

@@ -2789,16 +2789,12 @@ async fn run_observe_phase(
         .map(|t| t.elapsed() >= OBSERVE_SAVE_DEBOUNCE)
         .unwrap_or(true);
     if should_save {
-        let snapshot = {
-            let sessions = ctx.state.sessions.lock().await;
-            sessions.get(ctx.current_session_id).cloned()
-        };
-        if let Some(ref session) = snapshot {
-            if let Err(e) = save_session_to_disk(session).await {
-                eprintln!("Warning: failed to save session after observe phase: {e}");
-            } else {
-                phase_state.last_save_instant = Some(std::time::Instant::now());
-            }
+        if let Err(e) =
+            session_store::save_current_session_to_disk(ctx.state, ctx.current_session_id).await
+        {
+            eprintln!("Warning: failed to save session after observe phase: {e}");
+        } else {
+            phase_state.last_save_instant = Some(std::time::Instant::now());
         }
     }
 
@@ -2827,15 +2823,16 @@ async fn run_finish_phase(
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
     let config = ctx.state.config();
+    if let Err(e) =
+        session_store::save_current_session_to_disk(ctx.state, ctx.current_session_id).await
+    {
+        eprintln!("Warning: failed to save session at finish phase: {e}");
+    }
+
     let snapshot = {
         let sessions = ctx.state.sessions.lock().await;
         sessions.get(ctx.current_session_id).cloned()
     };
-    if let Some(ref session) = snapshot
-        && let Err(e) = save_session_to_disk(session).await
-    {
-        eprintln!("Warning: failed to save session at finish phase: {e}");
-    }
 
     let on_finish_events = run_hooks(
         &ctx.state.hooks,
@@ -3119,6 +3116,8 @@ pub(crate) async fn run_agent_session(
             phase_state.run_stopped = true;
             break;
         } else if drain_busy_socket_messages(
+            state,
+            current_session_id,
             inbound_rx,
             &mut phase_state.pending_interventions,
             live_tx,

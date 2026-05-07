@@ -5,7 +5,7 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::{
-        Mutex, OnceLock,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
     time::SystemTime,
@@ -30,9 +30,25 @@ type PersistedSessionCacheLock = OnceLock<Mutex<HashMap<String, PersistedSession
 static PERSISTED_SESSION_CACHE: PersistedSessionCacheLock = OnceLock::new();
 static SESSION_SAVE_WRITES: AtomicU64 = AtomicU64::new(0);
 static SESSION_SAVE_SKIPS: AtomicU64 = AtomicU64::new(0);
+type SessionPersistGateLock = OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+static SESSION_PERSIST_GATES: SessionPersistGateLock = OnceLock::new();
 
 fn session_persist_cache() -> &'static Mutex<HashMap<String, PersistedSessionCacheEntry>> {
     PERSISTED_SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn session_persist_gates() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>> {
+    SESSION_PERSIST_GATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn session_persist_gate(session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let mut guard = session_persist_gates()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(session_id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 fn session_payload_hash(data: &str) -> u64 {
@@ -283,7 +299,7 @@ pub(crate) fn sessions_dir() -> PathBuf {
     dir
 }
 
-pub(crate) async fn save_session_to_disk(session: &Session) -> Result<(), String> {
+async fn save_session_to_disk_inner(session: &Session) -> Result<(), String> {
     let path = sessions_dir().join(format!("{}.json", session.id));
     let tmp_path = sessions_dir().join(format!("{}.json.tmp", session.id));
     let data = build_session_persist_payload(session)?;
@@ -326,6 +342,30 @@ pub(crate) async fn save_session_to_disk(session: &Session) -> Result<(), String
         session_file_signature(&path).await,
     );
     Ok(())
+}
+
+pub(crate) async fn save_session_to_disk_locked(session: &Session) -> Result<(), String> {
+    save_session_to_disk_inner(session).await
+}
+
+pub(crate) async fn save_session_to_disk(session: &Session) -> Result<(), String> {
+    let persist_gate = session_persist_gate(&session.id);
+    let _persist_guard = persist_gate.lock().await;
+    save_session_to_disk_inner(session).await
+}
+
+pub(crate) async fn save_current_session_to_disk(
+    state: &AppState,
+    session_id: &str,
+) -> Result<(), String> {
+    let persist_gate = session_persist_gate(session_id);
+    let _persist_guard = persist_gate.lock().await;
+    let snapshot = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(session_id).cloned()
+    };
+    let session = snapshot.ok_or_else(|| "Session not found".to_string())?;
+    save_session_to_disk_inner(&session).await
 }
 
 pub(crate) fn sanitize_session_messages(messages: &mut Vec<ChatMessage>) {

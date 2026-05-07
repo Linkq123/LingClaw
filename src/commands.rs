@@ -11,7 +11,8 @@ use crate::{
     default_show_tools, memory, now_epoch, prompts, providers,
     session_admin::gather_global_today_usage,
     session_store::{
-        build_session_status, build_usage_report, replace_session_messages, save_session_to_disk,
+        build_session_status, build_usage_report, replace_session_messages,
+        save_session_to_disk_locked, session_persist_gate,
     },
     tools, truncate, ws_send,
 };
@@ -63,6 +64,8 @@ where
     Apply: FnOnce(&mut Session),
     Restore: FnOnce(&mut Session, T),
 {
+    let persist_gate = session_persist_gate(current_session_id);
+    let _persist_guard = persist_gate.lock().await;
     let (captured, session_to_save) = {
         let mut sessions = state.sessions.lock().await;
         let session = sessions
@@ -74,7 +77,7 @@ where
         (captured, session.clone())
     };
 
-    if let Err(err) = save_session_to_disk(&session_to_save).await {
+    if let Err(err) = save_session_to_disk_locked(&session_to_save).await {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(current_session_id) {
             restore(session, captured);
@@ -1249,7 +1252,7 @@ async fn handle_mcp_command_with_arg(
     }
 }
 
-async fn handle_think_command(
+pub(crate) async fn handle_think_command(
     arg: &str,
     current_session_id: &str,
     state: &AppState,

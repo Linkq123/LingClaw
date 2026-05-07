@@ -15,6 +15,151 @@ fn unique_temp_workspace(prefix: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("{prefix}-{unique}"))
 }
 
+fn unique_session_id(prefix: &str) -> String {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    format!("{prefix}-{unique}")
+}
+
+#[tokio::test]
+async fn think_command_waits_for_session_persist_gate_before_mutating_session() {
+    let workspace = unique_temp_workspace("lingclaw-think-persist-gate");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let session_id = unique_session_id("think-persist-gate");
+    let state = Arc::new(AppState {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
+            api_key: "env-key".to_string(),
+            api_base: "https://fallback.example/v1".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            fast_model: None,
+            sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
+            memory_model: None,
+
+            reflection_model: None,
+            context_model: None,
+            provider: crate::Provider::OpenAI,
+            anthropic_prompt_caching: false,
+            providers: HashMap::new(),
+            mcp_servers: HashMap::new(),
+            port: crate::DEFAULT_PORT,
+            max_context_tokens: 32000,
+            exec_timeout: Duration::from_secs(30),
+            tool_timeout: Duration::from_secs(30),
+            sub_agent_timeout: Duration::from_secs(300),
+            max_llm_retries: 2,
+            max_output_bytes: 50 * 1024,
+            max_file_bytes: 200 * 1024,
+            openai_stream_include_usage: false,
+            structured_memory: false,
+
+            daily_reflection: false,
+            s3: None,
+            enable_state_digest: true,
+        })),
+        http: reqwest::Client::new(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+        memory_queue: std::sync::Mutex::new(None),
+    });
+
+    state.sessions.lock().await.insert(
+        session_id.clone(),
+        Session {
+            id: session_id.clone(),
+            name: "Persist Gate".to_string(),
+            messages: Vec::new(),
+            created_at: 0,
+            updated_at: 0,
+            tool_calls_count: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            daily_input_tokens: 0,
+            daily_output_tokens: 0,
+            input_token_source: "estimated".to_string(),
+            output_token_source: "estimated".to_string(),
+            token_usage_day: prompts::current_local_snapshot().today(),
+            daily_provider_usage: HashMap::new(),
+            total_label_usage: HashMap::new(),
+            usage_history: Vec::new(),
+            model_override: None,
+            think_level: "auto".to_string(),
+            show_react: true,
+            show_tools: true,
+            show_reasoning: true,
+            disabled_system_skills: HashSet::new(),
+            failed_tool_results: Default::default(),
+            subagent_snapshots: HashMap::new(),
+            version: 4,
+            workspace: workspace.clone(),
+        },
+    );
+
+    let persist_gate = crate::session_store::session_persist_gate(&session_id);
+    let persist_guard = persist_gate.lock().await;
+
+    let task_state = state.clone();
+    let task_session_id = session_id.clone();
+    let think_task = tokio::spawn(async move {
+        handle_think_command("high", &task_session_id, task_state.as_ref()).await
+    });
+
+    tokio::task::yield_now().await;
+
+    let current_think = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .expect("session should exist")
+            .think_level
+            .clone()
+    };
+    assert_eq!(current_think, "auto");
+    assert!(crate::session_store::load_session_from_disk(&session_id).is_none());
+
+    drop(persist_guard);
+
+    let result = think_task.await.expect("think task should complete");
+    assert_eq!(result.response_type, "system");
+    assert_eq!(result.response, "Think mode set to: high");
+
+    let current_think = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .expect("session should exist")
+            .think_level
+            .clone()
+    };
+    assert_eq!(current_think, "high");
+
+    let persisted =
+        crate::session_store::load_session_from_disk(&session_id).expect("session should persist");
+    assert_eq!(persisted.think_level, "high");
+
+    let _ = tokio::fs::remove_file(
+        crate::session_store::sessions_dir().join(format!("{session_id}.json")),
+    )
+    .await;
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
 #[tokio::test]
 async fn append_daily_memory_entry_creates_new_file_with_header() {
     let workspace = unique_temp_workspace("lingclaw-command-memory-new");
