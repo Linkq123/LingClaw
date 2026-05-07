@@ -698,6 +698,173 @@ fn validate_json_provider_names_allows_case_insensitive_api_kind() {
 }
 
 #[test]
+fn validate_json_provider_names_allows_env_placeholders() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-work".to_string(),
+        JsonProviderConfig {
+            base_url: "${LINGCLAW_TEST_PROVIDER_BASE_URL}".to_string(),
+            api_key: "${LINGCLAW_TEST_PROVIDER_API_KEY}".to_string(),
+            api: "openai-completions".to_string(),
+            models: Vec::new(),
+        },
+    );
+
+    validate_json_provider_names(&JsonConfig {
+        settings: None,
+        models: Some(JsonModelsConfig {
+            providers: Some(providers),
+        }),
+        agents: None,
+        mcp_servers: None,
+        s3: None,
+    })
+    .expect("exact ${ENV_NAME} placeholders should be accepted in provider config");
+}
+
+#[test]
+fn sanitize_loaded_json_config_resolves_provider_env_placeholders() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-work".to_string(),
+        JsonProviderConfig {
+            base_url: "${LINGCLAW_TEST_PROVIDER_BASE_URL}".to_string(),
+            api_key: "${LINGCLAW_TEST_PROVIDER_API_KEY}".to_string(),
+            api: "openai-completions".to_string(),
+            models: Vec::new(),
+        },
+    );
+
+    let mut env = HashMap::new();
+    env.insert(
+        "LINGCLAW_TEST_PROVIDER_BASE_URL".to_string(),
+        "https://gateway-from-env.example/v1".to_string(),
+    );
+    env.insert(
+        "LINGCLAW_TEST_PROVIDER_API_KEY".to_string(),
+        "env-provider-key".to_string(),
+    );
+    let sanitized = sanitize_loaded_json_config_with_lookup(
+        JsonConfig {
+            settings: None,
+            models: Some(JsonModelsConfig {
+                providers: Some(providers),
+            }),
+            agents: None,
+            mcp_servers: None,
+            s3: None,
+        },
+        &mut |env_name| env.get(env_name).cloned(),
+    );
+
+    let provider = sanitized
+        .models
+        .as_ref()
+        .and_then(|models| models.providers.as_ref())
+        .and_then(|providers| providers.get("openai-work"))
+        .expect("provider should remain after env resolution");
+    assert_eq!(provider.base_url, "https://gateway-from-env.example/v1");
+    assert_eq!(provider.api_key, "env-provider-key");
+}
+
+#[test]
+fn sanitize_loaded_json_config_drops_provider_when_base_url_env_is_unset() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-work".to_string(),
+        JsonProviderConfig {
+            base_url: "${LINGCLAW_TEST_PROVIDER_BASE_URL}".to_string(),
+            api_key: "${LINGCLAW_TEST_PROVIDER_API_KEY}".to_string(),
+            api: "openai-completions".to_string(),
+            models: Vec::new(),
+        },
+    );
+
+    let mut env = HashMap::new();
+    env.insert(
+        "LINGCLAW_TEST_PROVIDER_API_KEY".to_string(),
+        "env-provider-key".to_string(),
+    );
+    let sanitized = sanitize_loaded_json_config_with_lookup(
+        JsonConfig {
+            settings: None,
+            models: Some(JsonModelsConfig {
+                providers: Some(providers),
+            }),
+            agents: None,
+            mcp_servers: None,
+            s3: None,
+        },
+        &mut |env_name| env.get(env_name).cloned(),
+    );
+
+    assert!(
+        sanitized
+            .models
+            .as_ref()
+            .and_then(|models| models.providers.as_ref())
+            .is_none(),
+        "providers with unresolved baseUrl placeholders should be dropped at runtime"
+    );
+}
+
+#[test]
+fn resolve_config_env_placeholder_with_lookup_resolves_exact_placeholders() {
+    let mut env = HashMap::new();
+    env.insert(
+        "LINGCLAW_TEST_OPENAI_API_BASE".to_string(),
+        "https://resolved.example/v1".to_string(),
+    );
+
+    let resolved = resolve_config_env_placeholder_with_lookup(
+        "api.config.test-model.baseUrl",
+        "${LINGCLAW_TEST_OPENAI_API_BASE}",
+        &mut |env_name| env.get(env_name).cloned(),
+    );
+
+    assert_eq!(resolved, "https://resolved.example/v1");
+}
+
+#[test]
+fn provider_request_matches_saved_config_requires_exact_saved_values() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-work".to_string(),
+        JsonProviderConfig {
+            base_url: "${LINGCLAW_TEST_PROVIDER_BASE_URL}".to_string(),
+            api_key: "${LINGCLAW_TEST_PROVIDER_API_KEY}".to_string(),
+            api: "openai-completions".to_string(),
+            models: Vec::new(),
+        },
+    );
+
+    let json_cfg = JsonConfig {
+        settings: None,
+        models: Some(JsonModelsConfig {
+            providers: Some(providers),
+        }),
+        agents: None,
+        mcp_servers: None,
+        s3: None,
+    };
+
+    assert!(provider_request_matches_saved_config(
+        &json_cfg,
+        "openai-work",
+        "openai-completions",
+        "${LINGCLAW_TEST_PROVIDER_BASE_URL}",
+        "${LINGCLAW_TEST_PROVIDER_API_KEY}",
+    ));
+    assert!(!provider_request_matches_saved_config(
+        &json_cfg,
+        "openai-work",
+        "openai-completions",
+        "https://evil.example/v1",
+        "${LINGCLAW_TEST_PROVIDER_API_KEY}",
+    ));
+}
+
+#[test]
 fn validate_json_provider_models_rejects_empty_model_id() {
     let mut providers = HashMap::new();
     providers.insert(

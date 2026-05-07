@@ -908,6 +908,7 @@ function ModelsTab({
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+            providerName: prov.name,
             baseUrl: prov.baseUrl,
             apiKey: prov.apiKey,
             api: prov.api || 'openai-completions',

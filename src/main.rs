@@ -2517,6 +2517,9 @@ async fn api_test_model(
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    const PLACEHOLDER_SAVE_REQUIRED: &str =
+        "Save config before testing providers that use ${ENV} placeholders.";
+
     validate_local_request_headers(&headers)?;
 
     let base_url = body["baseUrl"].as_str().unwrap_or_default().to_string();
@@ -2525,6 +2528,11 @@ async fn api_test_model(
         .as_str()
         .unwrap_or("openai-completions")
         .to_string();
+    let provider_name = body["providerName"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let model_id = body["modelId"].as_str().unwrap_or_default().to_string();
 
     if base_url.is_empty() || model_id.is_empty() {
@@ -2534,18 +2542,58 @@ async fn api_test_model(
         ));
     }
 
-    let provider = Provider::from_api_kind(&api);
-    let resolved = providers::ResolvedModel {
-        provider,
-        api_base: base_url,
-        api_key,
-        model_id,
-        reasoning: false,
-        thinking_format: None,
-        max_tokens: Some(16),
-        context_window: 4096,
-        stream_include_usage: false,
-        anthropic_prompt_caching: false,
+    let uses_placeholder =
+        config::is_config_env_placeholder(&base_url) || config::is_config_env_placeholder(&api_key);
+
+    let resolved = if uses_placeholder {
+        let Some(provider_name) = provider_name else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": PLACEHOLDER_SAVE_REQUIRED})),
+            ));
+        };
+
+        let raw_cfg = config::load_config_file();
+        if !config::provider_request_matches_saved_config(
+            &raw_cfg,
+            &provider_name,
+            &api,
+            &base_url,
+            &api_key,
+        ) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": PLACEHOLDER_SAVE_REQUIRED})),
+            ));
+        }
+
+        let runtime_config = state.config();
+        if !runtime_config.providers.contains_key(&provider_name) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!(
+                        "Configured provider '{provider_name}' is unavailable at runtime. Check that referenced environment variables are set."
+                    )
+                })),
+            ));
+        }
+
+        runtime_config.resolve_model(&format!("{provider_name}/{model_id}"))
+    } else {
+        let provider = Provider::from_api_kind(&api);
+        providers::ResolvedModel {
+            provider,
+            api_base: base_url,
+            api_key,
+            model_id,
+            reasoning: false,
+            thinking_format: None,
+            max_tokens: Some(16),
+            context_window: 4096,
+            stream_include_usage: false,
+            anthropic_prompt_caching: false,
+        }
     };
 
     let messages = vec![ChatMessage {

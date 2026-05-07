@@ -41,8 +41,8 @@
         ]
       },
       "openai-2": {
-        "baseUrl": "https://openai-gateway.example/v1",
-        "apiKey": "sk-your-openai-compatible-key",
+        "baseUrl": "${OPENAI_COMPAT_BASE_URL}",
+        "apiKey": "${OPENAI_COMPAT_API_KEY}",
         "api": "openai-completions",
         "models": [
           {

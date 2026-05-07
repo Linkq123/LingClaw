@@ -3511,6 +3511,32 @@ async fn api_usage_rolls_over_stale_daily_usage_before_serializing() {
 }
 
 #[tokio::test]
+async fn api_test_model_rejects_placeholder_requests_without_saved_provider_context() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let state = Arc::new(test_app_state());
+    let result = api_test_model(
+        headers,
+        State(state),
+        Json(json!({
+            "baseUrl": "${LINGCLAW_TEST_UNSET_BASE_URL_DO_NOT_SET}",
+            "apiKey": "${LINGCLAW_TEST_UNSET_API_KEY_DO_NOT_SET}",
+            "api": "openai-completions",
+            "modelId": "gpt-4o-mini"
+        })),
+    )
+    .await;
+
+    let (status, body) = result.expect_err("missing placeholder env should fail validation");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body.0["error"].as_str(),
+        Some("Save config before testing providers that use ${ENV} placeholders.")
+    );
+}
+
+#[tokio::test]
 async fn api_put_config_rejects_invalid_provider_names() {
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));

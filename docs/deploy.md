@@ -418,6 +418,8 @@ volumes:
 > 优先级：JSON 配置文件 > 环境变量 > 内置默认值
 
 > 新配置建议：用 `models.providers` 定义 provider 实例，用 `agents.defaults.model.primary` 选择默认模型。Setup Wizard 已不再写入 `settings.provider`、`settings.apiKey`、`settings.apiBase`。
+>
+> `models.providers.*.baseUrl` / `models.providers.*.apiKey` 也支持精确的 `${ENV_NAME}` 占位符，服务启动时会按环境变量展开。
 
 ### agents.defaults.model 字段
 

@@ -369,6 +369,7 @@
   - `ollama`
   - `gemini`
 - `baseUrl` 不能为空
+- `baseUrl` / `apiKey` 可以直接写字面值，也可以写成精确的 `${ENV_NAME}` 占位符；运行时会按环境变量展开
 - `models[].id` 不能为空
 - `models[].compat` 如提供，必须是对象
 - `models[].compat.thinkingFormat` 如提供，必须是字符串；用于显式声明 OpenAI-compatible 的 thinking / reasoning 方言（例如 `openai`、`qwen`、`doubao`、`deepseek-v4`、`ollama`、`gpt-oss`）
@@ -486,6 +487,7 @@
 
 ```json
 {
+  "providerName": "openai",
   "baseUrl": "https://api.openai.com/v1",
   "apiKey": "sk-...",
   "api": "openai-completions",
@@ -495,8 +497,10 @@
 
 ### 字段说明
 
+- `providerName`: 可选；当 `baseUrl` / `apiKey` 使用 `${ENV_NAME}` 占位符时，后端只会在该 provider 已保存且请求值与已保存配置完全一致时，使用当前运行配置进行测试
 - `baseUrl`: 必填
 - `apiKey`: 可为空，是否必需由 provider 决定
+- `baseUrl` / `apiKey`: 在配置文件中也可以写成 `${ENV_NAME}`，例如 `${OPENAI_API_BASE}` / `${OPENAI_API_KEY}`
 - `api`: 默认 `openai-completions`
 - `modelId`: 必填
 

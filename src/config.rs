@@ -226,6 +226,76 @@ pub(crate) fn parse_boolish_env(name: &str) -> Option<bool> {
         })
 }
 
+fn parse_env_placeholder(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    let name = trimmed.strip_prefix("${")?.strip_suffix('}')?.trim();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+pub(crate) fn is_config_env_placeholder(raw: &str) -> bool {
+    parse_env_placeholder(raw).is_some()
+}
+
+fn resolve_config_env_placeholder_with_lookup<F>(
+    field_path: &str,
+    raw: &str,
+    lookup: &mut F,
+) -> String
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let Some(env_name) = parse_env_placeholder(raw) else {
+        return raw.to_string();
+    };
+
+    match lookup(env_name) {
+        Some(value) => value,
+        None => {
+            eprintln!("WARNING: {field_path} references unset environment variable '{env_name}'.");
+            String::new()
+        }
+    }
+}
+
+pub(crate) fn provider_request_matches_saved_config(
+    json_cfg: &JsonConfig,
+    provider_name: &str,
+    api: &str,
+    base_url: &str,
+    api_key: &str,
+) -> bool {
+    let Some(provider) = json_cfg
+        .models
+        .as_ref()
+        .and_then(|models| models.providers.as_ref())
+        .and_then(|providers| providers.get(provider_name))
+    else {
+        return false;
+    };
+
+    provider.api == api && provider.base_url == base_url && provider.api_key == api_key
+}
+
+fn resolve_provider_env_placeholders_with_lookup<F>(
+    providers: &mut HashMap<String, JsonProviderConfig>,
+    lookup: &mut F,
+) where
+    F: FnMut(&str) -> Option<String>,
+{
+    for (name, provider) in providers.iter_mut() {
+        provider.base_url = resolve_config_env_placeholder_with_lookup(
+            &format!("models.providers.{name}.baseUrl"),
+            &provider.base_url,
+            lookup,
+        );
+        provider.api_key = resolve_config_env_placeholder_with_lookup(
+            &format!("models.providers.{name}.apiKey"),
+            &provider.api_key,
+            lookup,
+        );
+    }
+}
+
 pub(crate) fn effective_enable_s3(
     settings_enable_s3: Option<bool>,
     env_enable_s3: Option<bool>,
@@ -1087,7 +1157,10 @@ impl Config {
     }
 }
 
-fn sanitize_loaded_json_config(json_cfg: JsonConfig) -> JsonConfig {
+fn sanitize_loaded_json_config_with_lookup<F>(json_cfg: JsonConfig, lookup: &mut F) -> JsonConfig
+where
+    F: FnMut(&str) -> Option<String>,
+{
     let mut json_cfg = json_cfg;
 
     let mut providers = json_cfg
@@ -1096,6 +1169,8 @@ fn sanitize_loaded_json_config(json_cfg: JsonConfig) -> JsonConfig {
         .and_then(|models| models.providers.as_ref())
         .cloned()
         .unwrap_or_default();
+
+    resolve_provider_env_placeholders_with_lookup(&mut providers, lookup);
 
     providers.retain(
         |name, provider| match validate_provider_entry(name, provider) {
@@ -1188,6 +1263,10 @@ fn sanitize_loaded_json_config(json_cfg: JsonConfig) -> JsonConfig {
     }
 
     json_cfg
+}
+
+fn sanitize_loaded_json_config(json_cfg: JsonConfig) -> JsonConfig {
+    sanitize_loaded_json_config_with_lookup(json_cfg, &mut |env_name| std::env::var(env_name).ok())
 }
 
 // ── Config File (lingclaw.json) ──────────────────────────────────────────────

@@ -228,6 +228,7 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 - OpenAI/Anthropic 直接使用现签 URL，因此 `s3.endpoint` 必须能被远端 provider 访问；Gemini/Ollama 路径会在本地预取并转成 base64/inlineData，可用于私网、localhost 或 VPN-only 网关
 - 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容，但 Setup Wizard 不再生成它们；新配置应省略这些字段
 - `models.providers.*.api` 目前支持 `openai-completions`、`anthropic`、`ollama`、`gemini`
+- `models.providers.*.baseUrl` 和 `models.providers.*.apiKey` 支持精确的 `${ENV_NAME}` 占位符；运行时会按环境变量展开，例如 `"baseUrl": "${OPENAI_API_BASE}"`、`"apiKey": "${OPENAI_API_KEY}"`
 - `models.providers.*.models[].compat.thinkingFormat` 为可选字符串，用于显式指定 OpenAI-compatible 的 thinking / reasoning 方言；常见值包括 `openai`、`qwen`、`doubao`、`deepseek-v4`、`ollama`、`gpt-oss`。Settings → Models 的 `Thinking Format` 输入框会直接读写这个字段
 - `compat.thinkingFormat = "deepseek-v4"` 时，会额外发送 `thinking.type=enabled|disabled`；开启 thinking 时，`reasoning_effort` 仅使用 `high` / `max` 两档，其中 `minimal` / `low` / `medium` / `high` 都会收敛到 `high`，`xhigh` / `max` 会收敛到 `max`
 - `compat.thinkingFormat = "doubao"` 时，会显式发送 `thinking.type=enabled|disabled`；开启 thinking 时，`reasoning_effort` 仅支持 `low` / `medium` / `high` 三档，`minimal` 会收敛到 `low`，`xhigh` / `max` 会收敛到 `high`
