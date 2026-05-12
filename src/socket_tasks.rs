@@ -30,7 +30,8 @@ pub(crate) fn spawn_connection_tasks(
     current_session_ref: Arc<Mutex<String>>,
     connection_id: u64,
 ) -> (LiveTx, SocketTaskHandles) {
-    let (live_tx, mut live_rx) = mpsc::channel::<serde_json::Value>(256);
+    let (live_tx, mut live_rx) =
+        mpsc::channel::<serde_json::Value>(crate::LIVE_EVENT_CHANNEL_CAPACITY);
 
     let live_state = state.clone();
     let live_session_ref = current_session_ref.clone();

@@ -299,6 +299,37 @@ pub(crate) fn sessions_dir() -> PathBuf {
     dir
 }
 
+pub(crate) fn replace_session_file_from_temp(path: &Path, tmp_path: &Path) -> Result<(), String> {
+    let backup_path = path.with_extension("json.lingclaw-save-backup");
+    match std::fs::remove_file(&backup_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.to_string()),
+    }
+
+    match std::fs::rename(tmp_path, path) {
+        Ok(()) => return Ok(()),
+        Err(first_err) => {
+            if !path.exists() {
+                return Err(first_err.to_string());
+            }
+        }
+    }
+
+    std::fs::rename(path, &backup_path).map_err(|e| e.to_string())?;
+
+    match std::fs::rename(tmp_path, path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&backup_path);
+            Ok(())
+        }
+        Err(final_err) => {
+            let _ = std::fs::rename(&backup_path, path);
+            Err(final_err.to_string())
+        }
+    }
+}
+
 async fn save_session_to_disk_inner(session: &Session) -> Result<(), String> {
     let path = sessions_dir().join(format!("{}.json", session.id));
     let tmp_path = sessions_dir().join(format!("{}.json.tmp", session.id));
@@ -319,20 +350,9 @@ async fn save_session_to_disk_inner(session: &Session) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
 
-    #[cfg(windows)]
-    if tokio::fs::try_exists(&path)
-        .await
-        .map_err(|e| e.to_string())?
-    {
-        tokio::fs::remove_file(&path)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-
-    if let Err(e) = tokio::fs::rename(&tmp_path, &path).await {
-        // Best-effort cleanup of the orphaned temp file.
+    if let Err(e) = replace_session_file_from_temp(&path, &tmp_path) {
         let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e.to_string());
+        return Err(e);
     }
     SESSION_SAVE_WRITES.fetch_add(1, Ordering::Relaxed);
     update_session_persist_cache(
@@ -414,6 +434,7 @@ pub(crate) fn trim_incomplete_tool_calls_in_session(session: &mut Session) {
 pub(crate) fn normalize_session(session: &mut Session) {
     super::migrate_session(session);
     trim_incomplete_tool_calls_in_session(session);
+    sanitize_exec_tool_args_in_session(session);
     normalize_subagent_snapshots(session);
     retain_failed_tool_results(session);
 }
@@ -437,8 +458,17 @@ fn retain_failed_tool_results_for_messages(
 fn build_session_persist_payload(session: &Session) -> Result<String, String> {
     let mut messages = session.messages.clone();
     sanitize_session_messages(&mut messages);
+    for message in &mut messages {
+        crate::tools::sanitize_chat_message_tool_calls_in_place(message);
+    }
     let subagent_snapshots =
-        normalize_subagent_snapshots_for_messages(&messages, &session.subagent_snapshots);
+        normalize_subagent_snapshots_for_messages(&messages, &session.subagent_snapshots)
+            .into_iter()
+            .map(|(key, mut snapshot)| {
+                crate::tools::sanitize_subagent_snapshot_tool_args_in_place(&mut snapshot);
+                (key, snapshot)
+            })
+            .collect();
     let mut failed_tool_results = session.failed_tool_results.clone();
     retain_failed_tool_results_for_messages(&messages, &mut failed_tool_results);
 
@@ -674,7 +704,15 @@ pub(crate) fn build_history_payload_with_s3(
                     && session.show_tools
                 {
                     for tc in tcs {
-                        msgs.push(json!({"role":"tool_call","name":tc.function.name,"arguments":tc.function.arguments,"id":tc.id}));
+                        msgs.push(json!({
+                            "role":"tool_call",
+                            "name":tc.function.name,
+                            "arguments":crate::tools::display_tool_arguments(
+                                &tc.function.name,
+                                &tc.function.arguments
+                            ),
+                            "id":tc.id
+                        }));
                     }
                 }
             }
@@ -700,7 +738,8 @@ pub(crate) fn build_history_payload_with_s3(
                     if let Some(snapshot_key) = snapshot_key.as_deref()
                         && let Some(snapshot) = snapshot_lookup.get(snapshot_key)
                     {
-                        entry["subagent_snapshot"] = json!(snapshot);
+                        entry["subagent_snapshot"] =
+                            json!(sanitize_subagent_snapshot_for_history(snapshot));
                     }
                     msgs.push(entry);
                 }
@@ -709,6 +748,23 @@ pub(crate) fn build_history_payload_with_s3(
         }
     }
     json!({"type":"history","messages":msgs})
+}
+
+fn sanitize_subagent_snapshot_for_history(
+    snapshot: &crate::SubagentHistorySnapshot,
+) -> crate::SubagentHistorySnapshot {
+    let mut sanitized = snapshot.clone();
+    crate::tools::sanitize_subagent_snapshot_tool_args_in_place(&mut sanitized);
+    sanitized
+}
+
+fn sanitize_exec_tool_args_in_session(session: &mut Session) {
+    for message in &mut session.messages {
+        crate::tools::sanitize_chat_message_tool_calls_in_place(message);
+    }
+    for snapshot in session.subagent_snapshots.values_mut() {
+        crate::tools::sanitize_subagent_snapshot_tool_args_in_place(snapshot);
+    }
 }
 
 pub(crate) fn build_view_state_payload(session: &Session) -> serde_json::Value {

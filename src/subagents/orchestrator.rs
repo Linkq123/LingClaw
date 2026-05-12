@@ -132,7 +132,7 @@ impl OrchestrationOutcome {
 
 /// Drop guard that sends an `orchestrate_task_failed` event if a task future is
 /// dropped after `orchestrate_task_started` but before a terminal task event.
-/// Uses `try_send` because `Drop` cannot await.
+/// Uses `send` on the unbounded live queue because `Drop` cannot await.
 struct OrchestrateTaskEventGuard<'a> {
     live_tx: &'a LiveTx,
     orchestrate_id: String,
@@ -159,16 +159,24 @@ impl<'a> OrchestrateTaskEventGuard<'a> {
 
 impl Drop for OrchestrateTaskEventGuard<'_> {
     fn drop(&mut self) {
-        if !self.finished
-            && let Err(err) = self.live_tx.try_send(json!({
+        if !self.finished {
+            let event = json!({
                 "type": "orchestrate_task_failed",
                 "orchestrate_id": self.orchestrate_id,
                 "id": self.task_id,
                 "agent": self.agent,
                 "error": "task aborted (timeout or cancellation)",
-            }))
-        {
-            eprintln!("[orchestrate-guard] failed to emit fallback task_failed event: {err}");
+            });
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let live_tx = self.live_tx.clone();
+                handle.spawn(async move {
+                    if let Err(err) = live_tx.send(event).await {
+                        eprintln!("[orchestrate-guard] failed to emit fallback task_failed event: {err}");
+                    }
+                });
+            } else if let Err(err) = self.live_tx.try_send(event) {
+                eprintln!("[orchestrate-guard] failed to emit fallback task_failed event: {err}");
+            }
         }
     }
 }
@@ -477,6 +485,7 @@ pub(crate) async fn execute_orchestration(
     live_tx: &LiveTx,
     cancel: CancellationToken,
     hooks: &HookRegistry,
+    replay_ctx: Option<crate::LiveOutputReplayCtx>,
 ) -> OrchestrationOutcome {
     let orchestration_start = std::time::Instant::now();
     let orchestrate_id = generate_orchestrate_id();
@@ -592,6 +601,7 @@ pub(crate) async fn execute_orchestration(
                 live_tx,
                 cancel.child_token(),
                 hooks,
+                replay_ctx.clone(),
                 &completed_results,
                 &orchestrate_id,
             )
@@ -607,6 +617,7 @@ pub(crate) async fn execute_orchestration(
                 live_tx,
                 &cancel,
                 hooks,
+                replay_ctx.clone(),
                 &completed_results,
                 &orchestrate_id,
             )
@@ -742,6 +753,7 @@ async fn execute_single_task(
     live_tx: &LiveTx,
     cancel: CancellationToken,
     hooks: &HookRegistry,
+    replay_ctx: Option<crate::LiveOutputReplayCtx>,
     completed_results: &HashMap<String, String>,
     orchestrate_id: &str,
 ) -> TaskResult {
@@ -810,6 +822,7 @@ async fn execute_single_task(
         live_tx,
         cancel,
         hooks,
+        replay_ctx,
         &composite_task_id,
     )
     .await;
@@ -893,6 +906,7 @@ async fn execute_parallel_tasks(
     live_tx: &LiveTx,
     cancel: &CancellationToken,
     hooks: &HookRegistry,
+    replay_ctx: Option<crate::LiveOutputReplayCtx>,
     completed_results: &HashMap<String, String>,
     orchestrate_id: &str,
 ) -> Vec<(usize, TaskResult)> {
@@ -901,6 +915,7 @@ async fn execute_parallel_tasks(
         .map(|&idx| {
             let task = &plan.tasks[idx];
             let child_cancel = cancel.child_token();
+            let replay_ctx = replay_ctx.clone();
             async move {
                 let result = execute_single_task(
                     task,
@@ -910,6 +925,7 @@ async fn execute_parallel_tasks(
                     live_tx,
                     child_cancel,
                     hooks,
+                    replay_ctx,
                     completed_results,
                     orchestrate_id,
                 )

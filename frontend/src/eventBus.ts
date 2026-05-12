@@ -49,18 +49,48 @@ export interface SubagentEvents {
 }
 
 export interface OrchestrateEvents {
-  orchestrate_started: { orchestrateId: string; goal: string };
-  orchestrate_layer: { orchestrateId: string; layer: number; taskIds: string[] };
+  orchestrate_started: {
+    orchestrateId: string;
+    taskCount?: number;
+    layerCount?: number;
+    tasks: Array<{
+      id: string;
+      agent: string;
+      dependsOn?: string[];
+      promptPreview?: string;
+    }>;
+  };
+  orchestrate_layer: {
+    orchestrateId: string;
+    layer: number;
+    totalLayers?: number;
+    tasks: string[];
+  };
   orchestrate_task_started: {
     orchestrateId: string;
-    taskId: string;
+    id: string;
     agent: string;
-    prompt: string;
+    prompt?: string;
   };
-  orchestrate_task_completed: { orchestrateId: string; taskId: string; result: string };
-  orchestrate_task_failed: { orchestrateId: string; taskId: string; error: string };
-  orchestrate_task_skipped: { orchestrateId: string; taskId: string; reason: string };
-  orchestrate_completed: { orchestrateId: string; summary: string; durationMs?: number };
+  orchestrate_task_completed: {
+    orchestrateId: string;
+    id: string;
+    resultPreview?: string;
+    resultExcerpt?: string;
+  };
+  orchestrate_task_failed: { orchestrateId: string; id: string; error?: string };
+  orchestrate_task_skipped: { orchestrateId: string; id: string; reason?: string };
+  orchestrate_completed: {
+    orchestrateId: string;
+    completed?: number;
+    failed?: number;
+    skipped?: number;
+    totalTasks?: number;
+    inputTokens?: number;
+    outputTokens?: number;
+    durationMs?: number;
+    aborted?: boolean;
+  };
 }
 
 // ── Exported buses ────────────────────────────────────────────────────────────

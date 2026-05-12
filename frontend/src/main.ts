@@ -54,6 +54,7 @@ import {
 } from './renderers/react-status.js';
 import {
   addToolCall,
+  appendToolOutput,
   updateToolProgress,
   addToolResult,
   openToolDrawerFromHeader,
@@ -80,6 +81,7 @@ import { applyToolsVisibility } from './viewState.js';
 import {
   createSubagentPanel,
   addSubagentTool,
+  appendSubagentToolOutput,
   updateSubagentProgress,
   updateSubagentToolResult,
   finishSubagentPanel,
@@ -684,6 +686,20 @@ function handleMessage(data) {
       if (data.subagent) break;
       setReactActTool(data.name, data.elapsed_ms || 0);
       updateToolProgress(data.id, data.elapsed_ms || 0);
+      break;
+
+    case 'tool_output':
+      if (data.subagent) {
+        appendSubagentToolOutput(
+          { task_id: data.task_id, agent: data.subagent },
+          data.id,
+          data.stream,
+          data.chunk,
+          data.name,
+        );
+        break;
+      }
+      appendToolOutput(data.id, data.stream, data.chunk);
       break;
 
     case 'tool_result':

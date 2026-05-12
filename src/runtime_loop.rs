@@ -266,9 +266,9 @@ enum WorkingStateDigestIssue {
     InvalidJson(String),
 }
 
-/// Drop guard that sends a `task_failed` event when a `task` tool future is
-/// dropped after `task_started` was emitted but before the terminal event fired
-/// (e.g. on timeout or cancellation). Uses `try_send` (non-async, best-effort).
+/// Drop guard that sends a best-effort `task_failed` event when a `task` tool
+/// future is dropped after `task_started` was emitted but before the terminal
+/// event fired (e.g. on timeout or cancellation).
 struct TaskEventGuard<'a> {
     live_tx: &'a LiveTx,
     agent_name: String,
@@ -298,12 +298,20 @@ impl Drop for TaskEventGuard<'_> {
                 "[task-guard] sub-agent '{}' dropped before terminal event — sending task_failed",
                 self.agent_name
             );
-            if let Err(err) = self.live_tx.try_send(json!({
+            let event = json!({
                 "type": "task_failed",
                 "task_id": self.task_id,
                 "agent": self.agent_name,
                 "error": "task aborted (timeout or cancellation)",
-            })) {
+            });
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let live_tx = self.live_tx.clone();
+                handle.spawn(async move {
+                    if let Err(err) = live_tx.send(event).await {
+                        eprintln!("[task-guard] failed to emit fallback task_failed event: {err}");
+                    }
+                });
+            } else if let Err(err) = self.live_tx.try_send(event) {
                 eprintln!("[task-guard] failed to emit fallback task_failed event: {err}");
             }
         }
@@ -1027,9 +1035,12 @@ async fn persist_assistant_message(ctx: &AgentRunCtx<'_>, message: &ChatMessage)
         return;
     }
 
+    let mut sanitized_message = message.clone();
+    tools::sanitize_chat_message_tool_calls_in_place(&mut sanitized_message);
+
     let mut sessions = ctx.state.sessions.lock().await;
     if let Some(session) = sessions.get_mut(ctx.current_session_id) {
-        session.messages.push(message.clone());
+        session.messages.push(sanitized_message);
         session.updated_at = now_epoch();
     }
 }
@@ -1114,6 +1125,7 @@ async fn execute_tool(
     http: &Client,
     workspace: &Path,
     isolated_mcp_session: bool,
+    event_tx: Option<tools::ToolEventSender>,
 ) -> tools::ToolOutcome {
     let mcp_result = if isolated_mcp_session {
         tools::mcp::execute_tool_isolated(name, args_str, config, workspace).await
@@ -1124,7 +1136,102 @@ async fn execute_tool(
     if let Some(result) = mcp_result {
         result
     } else {
-        tools::execute_tool(name, args_str, config, http, workspace).await
+        tools::execute_tool(name, args_str, config, http, workspace, event_tx).await
+    }
+}
+
+async fn execute_tool_with_live_output(
+    live_tx: &LiveTx,
+    tool_id: &str,
+    name: &str,
+    args_str: &str,
+    config: &Config,
+    http: &Client,
+    workspace: &Path,
+    isolated_mcp_session: bool,
+    replay_ctx: Option<crate::LiveOutputReplayCtx>,
+) -> tools::ToolOutcome {
+    if name != tools::TOOL_NAME_EXEC {
+        return execute_tool(
+            name,
+            args_str,
+            config,
+            http,
+            workspace,
+            isolated_mcp_session,
+            None,
+        )
+        .await;
+    }
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let tool_future = execute_tool(
+        name,
+        args_str,
+        config,
+        http,
+        workspace,
+        isolated_mcp_session,
+        Some(event_tx),
+    );
+    tokio::pin!(tool_future);
+    let mut pending_result: Option<tools::ToolOutcome> = None;
+    let mut event_rx_open = true;
+
+    loop {
+        if let Some(result) = pending_result.take() {
+            if event_rx_open {
+                while let Ok(event) = event_rx.try_recv() {
+                    let tools::ToolLiveEvent::ExecOutput { stream, chunk } = event;
+                    crate::forward_tool_output_event_best_effort(
+                        live_tx,
+                        json!({
+                            "type": "tool_output",
+                            "id": tool_id,
+                            "name": name,
+                            "stream": stream,
+                            "chunk": chunk,
+                        }),
+                        replay_ctx.as_ref(),
+                    )
+                    .await;
+                }
+            }
+            return result;
+        }
+
+        if !event_rx_open {
+            return tool_future.as_mut().await;
+        }
+
+        tokio::select! {
+            biased;
+            result = &mut tool_future => {
+                pending_result = Some(result);
+            }
+            maybe_event = event_rx.recv() => {
+                match maybe_event {
+                    Some(event) => {
+                        let tools::ToolLiveEvent::ExecOutput { stream, chunk } = event;
+                        crate::forward_tool_output_event_best_effort(
+                            live_tx,
+                            json!({
+                                "type": "tool_output",
+                                "id": tool_id,
+                                "name": name,
+                                "stream": stream,
+                                "chunk": chunk,
+                            }),
+                            replay_ctx.as_ref(),
+                        )
+                        .await;
+                    }
+                    None => {
+                        event_rx_open = false;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1257,6 +1364,10 @@ async fn execute_task_tool(
         live_tx,
         cancel,
         hooks,
+        Some(crate::LiveOutputReplayCtx {
+            state: Arc::clone(state),
+            session_id: session_id.to_string(),
+        }),
         &task_id,
     )
     .await;
@@ -1408,7 +1519,17 @@ async fn execute_orchestrate_tool(
     };
 
     let outcome = crate::subagents::orchestrator::execute_orchestration(
-        &plan, config, http, workspace, live_tx, cancel, hooks,
+        &plan,
+        config,
+        http,
+        workspace,
+        live_tx,
+        cancel,
+        hooks,
+        Some(crate::LiveOutputReplayCtx {
+            state: Arc::clone(state),
+            session_id: session_id.to_string(),
+        }),
     )
     .await;
 
@@ -1555,6 +1676,10 @@ where
     }
 }
 
+fn runtime_timeout_for_tool(tool_name: &str, config: &Config) -> Option<Duration> {
+    tools::tool_runtime_timeout(tool_name, config)
+}
+
 /// Returns `(outcome, effective_args)` where `effective_args` is `None` when
 /// the tool was rejected by a BeforeToolExec hook (signals record_tool_result
 /// to skip AfterToolExec), or `Some(args_json)` with the actually-executed args.
@@ -1564,7 +1689,6 @@ async fn execute_tool_call(
     tc: &ToolCall,
 ) -> Result<(tools::ToolOutcome, Option<String>), AgentPhaseControl> {
     let config = ctx.state.config();
-    let tool_timeout = config.tool_timeout;
 
     // ── BeforeToolExec hook (evaluated before the WS event so the frontend
     //    always sees the arguments that will actually be executed) ─────────
@@ -1590,13 +1714,15 @@ async fn execute_tool_call(
     let effective_args = match hook_output {
         hooks::HookOutput::Reject { reason, events } => {
             // Still send the tool_call event so the frontend sees the attempted call.
+            let display_args =
+                tools::display_tool_arguments(&tc.function.name, &tc.function.arguments);
             let _ = live_send(
                 ctx.live_tx,
                 json!({
                     "type":"tool_call",
                     "id": tc.id,
                     "name": tc.function.name,
-                    "arguments": tc.function.arguments,
+                    "arguments": display_args,
                 }),
             )
             .await;
@@ -1618,6 +1744,7 @@ async fn execute_tool_call(
         }
         _ => tc.function.arguments.clone(),
     };
+    let display_args = tools::display_tool_arguments(&tc.function.name, &effective_args);
 
     // Send tool_call event with the effective (possibly hook-modified) arguments.
     if !live_send(
@@ -1626,7 +1753,7 @@ async fn execute_tool_call(
             "type":"tool_call",
             "id": tc.id,
             "name": tc.function.name,
-            "arguments": effective_args,
+            "arguments": display_args,
         }),
     )
     .await
@@ -1686,14 +1813,20 @@ async fn execute_tool_call(
             ctx.run_cancel,
             &tc.id,
             &tc.function.name,
-            Some(tool_timeout),
-            execute_tool(
+            runtime_timeout_for_tool(&tc.function.name, &config),
+            execute_tool_with_live_output(
+                ctx.live_tx,
+                &tc.id,
                 &tc.function.name,
                 &effective_args,
                 &config,
                 &ctx.state.http,
                 &phase_state.cycle_workspace,
                 false,
+                Some(crate::LiveOutputReplayCtx {
+                    state: Arc::clone(ctx.state),
+                    session_id: ctx.current_session_id.to_string(),
+                }),
             ),
         )
         .await
@@ -1796,9 +1929,11 @@ async fn record_tool_result(
                     })
                     .count()
                     + 1;
+                let mut sanitized_snapshot = snapshot;
+                tools::sanitize_subagent_snapshot_tool_args_in_place(&mut sanitized_snapshot);
                 session.subagent_snapshots.insert(
                     session_store::subagent_snapshot_storage_key(&tc.id, occurrence),
-                    snapshot,
+                    sanitized_snapshot,
                 );
             } else {
                 let occurrence = session
@@ -2602,6 +2737,7 @@ async fn run_act_phase(
                     .as_deref()
                     .unwrap_or(&tc.function.arguments)
             };
+            let display_args = tools::display_tool_arguments(&tc.function.name, display_args);
             if !live_send(
                 ctx.live_tx,
                 json!({
@@ -2622,7 +2758,6 @@ async fn run_act_phase(
         }
 
         // 3. Launch non-rejected tool futures concurrently.
-        let tool_timeout = config.tool_timeout;
         let futures: Vec<_> = tool_calls
             .iter()
             .zip(hook_results.iter())
@@ -2647,14 +2782,20 @@ async fn run_act_phase(
                     ctx.run_cancel,
                     &tc.id,
                     &tc.function.name,
-                    Some(tool_timeout),
-                    execute_tool(
+                    runtime_timeout_for_tool(&tc.function.name, &config),
+                    execute_tool_with_live_output(
+                        ctx.live_tx,
+                        &tc.id,
                         &tc.function.name,
                         args,
                         &config,
                         &ctx.state.http,
                         &phase_state.cycle_workspace,
                         true,
+                        Some(crate::LiveOutputReplayCtx {
+                            state: Arc::clone(ctx.state),
+                            session_id: ctx.current_session_id.to_string(),
+                        }),
                     ),
                 ))
             })
@@ -3176,18 +3317,18 @@ pub(crate) async fn run_agent_session(
     };
 
     if phase_state.run_stopped {
-        persist_pending_interventions(
-            state,
-            current_session_id,
-            &mut phase_state.pending_interventions,
-        )
-        .await;
         {
             let mut sessions = state.sessions.lock().await;
             if let Some(session) = sessions.get_mut(current_session_id) {
                 session_store::trim_incomplete_tool_calls_in_session(session);
             }
         }
+        persist_pending_interventions(
+            state,
+            current_session_id,
+            &mut phase_state.pending_interventions,
+        )
+        .await;
         let usage = build_done_usage(
             state,
             current_session_id,

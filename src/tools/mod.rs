@@ -6,7 +6,13 @@ pub(crate) mod net;
 use reqwest::Client;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::{future::Future, path::Path, pin::Pin, time::Instant};
+use std::{
+    future::Future,
+    path::Path,
+    pin::Pin,
+    time::{Duration, Instant},
+};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::Config;
 
@@ -18,9 +24,42 @@ pub(crate) struct ToolOutcome {
     pub subagent_snapshot: Option<crate::SubagentHistorySnapshot>,
 }
 
-type ToolFuture<'a> = Pin<Box<dyn Future<Output = String> + Send + 'a>>;
-type ToolHandler =
-    for<'a> fn(&'a serde_json::Value, &'a Config, &'a Client, &'a Path) -> ToolFuture<'a>;
+pub(super) struct ToolHandlerOutput {
+    output: String,
+    is_error: Option<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum ToolLiveEvent {
+    ExecOutput { stream: &'static str, chunk: String },
+}
+
+pub(crate) type ToolEventSender = UnboundedSender<ToolLiveEvent>;
+
+impl ToolHandlerOutput {
+    fn inferred(output: String) -> Self {
+        Self {
+            output,
+            is_error: None,
+        }
+    }
+
+    fn explicit(output: String, is_error: bool) -> Self {
+        Self {
+            output,
+            is_error: Some(is_error),
+        }
+    }
+}
+
+type ToolFuture<'a> = Pin<Box<dyn Future<Output = ToolHandlerOutput> + Send + 'a>>;
+type ToolHandler = for<'a> fn(
+    &'a serde_json::Value,
+    &'a Config,
+    &'a Client,
+    &'a Path,
+    Option<ToolEventSender>,
+) -> ToolFuture<'a>;
 type ToolTraceBuilder = fn(&serde_json::Value) -> Option<crate::agent::ToolExecutionTrace>;
 
 pub(crate) const TOOL_NAME_THINK: &str = "think";
@@ -34,6 +73,14 @@ pub(crate) const TOOL_NAME_HTTP_FETCH: &str = "http_fetch";
 pub(crate) const TOOL_NAME_DELETE_FILE: &str = "delete_file";
 pub(crate) const TOOL_NAME_TASK: &str = "task";
 pub(crate) const TOOL_NAME_ORCHESTRATE: &str = "orchestrate";
+
+pub(crate) fn tool_runtime_timeout(tool_name: &str, config: &Config) -> Option<Duration> {
+    if tool_name == TOOL_NAME_EXEC {
+        None
+    } else {
+        Some(config.tool_timeout)
+    }
+}
 
 pub(crate) struct ToolSpec {
     pub(crate) name: &'static str,
@@ -77,15 +124,44 @@ fn tool_parameters_exec() -> serde_json::Value {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 20000,
-                "description": "Shell command to execute"
+                "description": "Shell command to execute. Prefer 'program' + 'args' when a shell is not required."
+            },
+            "program": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
+                "description": "Executable to run directly without a shell"
+            },
+            "args": {
+                "type": "array",
+                "maxItems": 256,
+                "description": "Argument vector for direct execution mode",
+                "items": {
+                    "type": "string",
+                    "maxLength": 20000
+                }
             },
             "working_dir": {
                 "type": "string",
                 "maxLength": 4096,
                 "description": "Working directory (default: workspace root)"
+            },
+            "env": {
+                "type": "object",
+                "description": "Additional environment variables to set for the process",
+                "additionalProperties": {
+                    "type": "string",
+                    "maxLength": 20000
+                }
+            },
+            "stdin": {
+                "type": "string",
+                "maxLength": 200000,
+                "description": "Text to pipe to the process standard input"
             }
         },
-        "required": ["command"]
+        "required": [],
+        "additionalProperties": false
     })
 }
 
@@ -250,7 +326,7 @@ fn tool_prompt_line_think(_: &Config) -> String {
 
 fn tool_prompt_line_exec(config: &Config) -> String {
     format!(
-        "**exec** — Execute shell commands (timeout: {}s). Supports custom working_dir.",
+        "**exec** — Execute commands (timeout: {}s). Prefer `program` + `args`; use `command` for shell-only workflows. Supports working_dir, env, stdin.",
         config.exec_timeout.as_secs()
     )
 }
@@ -288,8 +364,9 @@ fn tool_handler_think<'a>(
     _: &'a Config,
     _: &'a Client,
     _: &'a Path,
+    _: Option<ToolEventSender>,
 ) -> ToolFuture<'a> {
-    Box::pin(async move { exec::tool_think(args) })
+    Box::pin(async move { ToolHandlerOutput::explicit(exec::tool_think(args), false) })
 }
 
 fn tool_handler_exec<'a>(
@@ -297,8 +374,9 @@ fn tool_handler_exec<'a>(
     config: &'a Config,
     _: &'a Client,
     workspace: &'a Path,
+    event_tx: Option<ToolEventSender>,
 ) -> ToolFuture<'a> {
-    Box::pin(async move { exec::tool_exec(args, config, workspace).await })
+    Box::pin(async move { exec::tool_exec(args, config, workspace, event_tx).await })
 }
 
 fn tool_handler_read_file<'a>(
@@ -306,8 +384,11 @@ fn tool_handler_read_file<'a>(
     config: &'a Config,
     _: &'a Client,
     workspace: &'a Path,
+    _: Option<ToolEventSender>,
 ) -> ToolFuture<'a> {
-    Box::pin(async move { fs::tool_read_file(args, config, workspace).await })
+    Box::pin(async move {
+        ToolHandlerOutput::inferred(fs::tool_read_file(args, config, workspace).await)
+    })
 }
 
 fn tool_handler_write_file<'a>(
@@ -315,8 +396,11 @@ fn tool_handler_write_file<'a>(
     config: &'a Config,
     _: &'a Client,
     workspace: &'a Path,
+    _: Option<ToolEventSender>,
 ) -> ToolFuture<'a> {
-    Box::pin(async move { fs::tool_write_file(args, config, workspace).await })
+    Box::pin(async move {
+        ToolHandlerOutput::inferred(fs::tool_write_file(args, config, workspace).await)
+    })
 }
 
 fn tool_handler_patch_file<'a>(
@@ -324,8 +408,11 @@ fn tool_handler_patch_file<'a>(
     config: &'a Config,
     _: &'a Client,
     workspace: &'a Path,
+    _: Option<ToolEventSender>,
 ) -> ToolFuture<'a> {
-    Box::pin(async move { fs::tool_patch_file(args, config, workspace).await })
+    Box::pin(async move {
+        ToolHandlerOutput::inferred(fs::tool_patch_file(args, config, workspace).await)
+    })
 }
 
 fn tool_handler_list_dir<'a>(
@@ -333,8 +420,11 @@ fn tool_handler_list_dir<'a>(
     config: &'a Config,
     _: &'a Client,
     workspace: &'a Path,
+    _: Option<ToolEventSender>,
 ) -> ToolFuture<'a> {
-    Box::pin(async move { fs::tool_list_dir(args, config, workspace).await })
+    Box::pin(async move {
+        ToolHandlerOutput::inferred(fs::tool_list_dir(args, config, workspace).await)
+    })
 }
 
 fn tool_handler_search_files<'a>(
@@ -342,8 +432,11 @@ fn tool_handler_search_files<'a>(
     config: &'a Config,
     _: &'a Client,
     workspace: &'a Path,
+    _: Option<ToolEventSender>,
 ) -> ToolFuture<'a> {
-    Box::pin(async move { fs::tool_search_files(args, config, workspace).await })
+    Box::pin(async move {
+        ToolHandlerOutput::inferred(fs::tool_search_files(args, config, workspace).await)
+    })
 }
 
 fn tool_handler_http_fetch<'a>(
@@ -351,8 +444,11 @@ fn tool_handler_http_fetch<'a>(
     config: &'a Config,
     http: &'a Client,
     _: &'a Path,
+    _: Option<ToolEventSender>,
 ) -> ToolFuture<'a> {
-    Box::pin(async move { net::tool_http_fetch(args, http, config).await })
+    Box::pin(
+        async move { ToolHandlerOutput::inferred(net::tool_http_fetch(args, http, config).await) },
+    )
 }
 
 fn tool_handler_delete_file<'a>(
@@ -360,8 +456,11 @@ fn tool_handler_delete_file<'a>(
     _: &'a Config,
     _: &'a Client,
     workspace: &'a Path,
+    _: Option<ToolEventSender>,
 ) -> ToolFuture<'a> {
-    Box::pin(async move { fs::tool_delete_file(args, workspace).await })
+    Box::pin(
+        async move { ToolHandlerOutput::inferred(fs::tool_delete_file(args, workspace).await) },
+    )
 }
 
 fn trace_builder_none(_: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
@@ -369,7 +468,7 @@ fn trace_builder_none(_: &serde_json::Value) -> Option<crate::agent::ToolExecuti
 }
 
 fn trace_builder_exec(args: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
-    let command = tool_arg_str(args, "command")?;
+    let command = exec::summarize_exec_request(args)?;
     let working_dir = tool_arg_str(args, "working_dir")
         .filter(|dir| !dir.is_empty() && *dir != ".")
         .map(str::to_string);
@@ -379,7 +478,7 @@ fn trace_builder_exec(args: &serde_json::Value) -> Option<crate::agent::ToolExec
     };
     Some(crate::agent::ToolExecutionTrace {
         summary: compact_tool_call_summary(&summary),
-        command: Some(command.to_string()),
+        command: Some(command),
         working_dir,
         ..crate::agent::ToolExecutionTrace::default()
     })
@@ -529,8 +628,8 @@ pub(crate) fn tool_specs() -> &'static [ToolSpec] {
         },
         ToolSpec {
             name: TOOL_NAME_EXEC,
-            description: "Execute a shell command and return stdout + stderr. Use for running programs, builds, git, file management, etc.",
-            relevance_hint: "run shell command build test git benchmark profile compile install",
+            description: "Execute a command and return stdout + stderr. Prefer direct program + args execution when a shell is not required; use shell command mode for pipelines and shell builtins.",
+            relevance_hint: "run shell command program args build test git benchmark profile compile install",
             prompt_line: tool_prompt_line_exec,
             parameters: tool_parameters_exec,
             handler: tool_handler_exec,
@@ -623,6 +722,137 @@ pub(crate) fn build_tool_execution_trace(
         TOOL_NAME_ORCHESTRATE => trace_builder_orchestrate(&args),
         _ => None,
     }
+}
+
+pub(crate) fn display_tool_arguments(tool_name: &str, raw_args: &str) -> String {
+    if tool_name != TOOL_NAME_EXEC {
+        return raw_args.to_string();
+    }
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_args) else {
+        return exec::sanitize_exec_command_for_display(raw_args);
+    };
+    serde_json::to_string(&sanitize_exec_argument_value(None, &value))
+        .unwrap_or_else(|_| exec::sanitize_exec_command_for_display(raw_args))
+}
+
+pub(crate) fn sanitize_chat_message_tool_calls_in_place(message: &mut crate::ChatMessage) {
+    if let Some(tool_calls) = message.tool_calls.as_mut() {
+        for tool_call in tool_calls {
+            tool_call.function.arguments =
+                display_tool_arguments(&tool_call.function.name, &tool_call.function.arguments);
+        }
+    }
+}
+
+pub(crate) fn sanitize_subagent_snapshot_tool_args_in_place(
+    snapshot: &mut crate::SubagentHistorySnapshot,
+) {
+    for tool in &mut snapshot.tools {
+        if let Some(arguments) = tool.arguments.as_deref() {
+            tool.arguments = Some(display_tool_arguments(&tool.name, arguments));
+        }
+    }
+}
+
+fn sanitize_exec_argument_value(
+    key_hint: Option<&str>,
+    value: &serde_json::Value,
+) -> serde_json::Value {
+    if key_hint.is_some_and(is_exec_secret_field_name) {
+        return serde_json::Value::String(exec::REDACTED_VALUE.to_string());
+    }
+
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), sanitize_exec_argument_value(Some(key), value)))
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(sanitize_exec_argument_array(values))
+        }
+        serde_json::Value::String(text) => {
+            let sanitized = exec::sanitize_exec_command_for_display(text);
+            let rendered = if sanitized == text.as_str() && looks_like_bare_secret(text) {
+                exec::REDACTED_VALUE.to_string()
+            } else {
+                sanitized
+            };
+            serde_json::Value::String(rendered)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn sanitize_exec_argument_array(values: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    let mut sanitized = Vec::with_capacity(values.len());
+    let mut redact_next_string = false;
+
+    for value in values {
+        let sanitized_value = if redact_next_string {
+            value
+                .as_str()
+                .map(|_| serde_json::Value::String(exec::REDACTED_VALUE.to_string()))
+                .unwrap_or_else(|| sanitize_exec_argument_value(None, value))
+        } else {
+            sanitize_exec_argument_value(None, value)
+        };
+
+        redact_next_string = value.as_str().is_some_and(is_exec_secret_flag_token);
+        sanitized.push(sanitized_value);
+    }
+
+    sanitized
+}
+
+fn is_exec_secret_field_name(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect();
+    normalized == "authorization"
+        || normalized == "apikey"
+        || normalized.ends_with("apikey")
+        || normalized == "token"
+        || normalized.ends_with("token")
+        || normalized == "accesstoken"
+        || normalized.ends_with("accesstoken")
+        || normalized == "password"
+        || normalized.ends_with("password")
+        || normalized == "passwd"
+        || normalized.ends_with("passwd")
+        || normalized == "secret"
+        || normalized.ends_with("secret")
+}
+
+fn is_exec_secret_flag_token(token: &str) -> bool {
+    let trimmed = token.trim();
+    let Some(flag) = trimmed
+        .strip_prefix("--")
+        .or_else(|| trimmed.strip_prefix('-'))
+    else {
+        return false;
+    };
+
+    if flag.contains('=') {
+        return false;
+    }
+
+    is_exec_secret_field_name(flag)
+}
+
+fn looks_like_bare_secret(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.chars().any(char::is_whitespace) {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+    ["sk-", "ghp_", "github_pat_", "hf_", "xox", "ya29.", "eyj"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
 }
 
 fn tool_arg_str<'a>(args: &'a serde_json::Value, key: &str) -> Option<&'a str> {
@@ -1157,6 +1387,7 @@ pub(crate) fn orchestrate_tool_parameters() -> serde_json::Value {
                 "description": "Array of orchestration tasks forming a DAG. Each task specifies a sub-agent and prompt, with optional dependencies on other tasks.",
                 "items": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "id": {
                             "type": "string",
@@ -1200,6 +1431,7 @@ pub(crate) async fn execute_tool(
     config: &Config,
     http: &Client,
     workspace: &Path,
+    event_tx: Option<ToolEventSender>,
 ) -> ToolOutcome {
     let start = Instant::now();
 
@@ -1234,12 +1466,14 @@ pub(crate) async fn execute_tool(
         };
     }
 
-    let output = (spec.handler)(&args, config, http, workspace).await;
+    let handler_output = (spec.handler)(&args, config, http, workspace, event_tx).await;
     let duration_ms = start.elapsed().as_millis() as u64;
-    let is_error = is_tool_error_output(name, &output);
+    let is_error = handler_output
+        .is_error
+        .unwrap_or_else(|| is_tool_error_output(name, &handler_output.output));
 
     ToolOutcome {
-        output,
+        output: handler_output.output,
         is_error,
         duration_ms,
         subagent_snapshot: None,
@@ -1283,36 +1517,68 @@ pub(crate) fn validate_tool_args(tool_name: &str, args: &Value, schema: &Value) 
         return Some(error);
     }
 
-    let properties = schema.get("properties").and_then(Value::as_object)?;
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
 
-    for (key, property_schema) in properties {
+    if schema
+        .get("additionalProperties")
+        .and_then(Value::as_bool)
+        .is_some_and(|allowed| !allowed)
+    {
+        for key in obj.keys() {
+            if !properties.contains_key(key) {
+                return Some(format!("{tool_name} error: unexpected parameter '{key}'"));
+            }
+        }
+    }
+
+    for (key, property_schema) in &properties {
         let Some(value) = obj.get(key) else {
             continue;
         };
 
-        if value.is_null() {
-            return Some(format!(
-                "{tool_name} error: parameter '{key}' cannot be null"
-            ));
-        }
-
-        if let Some(error) = validate_property(tool_name, key, value, property_schema) {
+        if let Some(error) = validate_value_against_schema(tool_name, key, value, property_schema) {
             return Some(error);
+        }
+    }
+
+    if let Some(additional_schema) = schema
+        .get("additionalProperties")
+        .filter(|value| value.is_object())
+    {
+        for (key, value) in obj {
+            if properties.contains_key(key) {
+                continue;
+            }
+            if let Some(error) =
+                validate_value_against_schema(tool_name, key, value, additional_schema)
+            {
+                return Some(error);
+            }
         }
     }
 
     None
 }
 
-fn validate_property(
+fn validate_value_against_schema(
     tool_name: &str,
     key: &str,
     value: &Value,
-    property_schema: &Value,
+    schema: &Value,
 ) -> Option<String> {
-    match property_schema.get("type").and_then(Value::as_str) {
-        Some("string") => validate_string_property(tool_name, key, value, property_schema),
-        Some("integer") => validate_integer_property(tool_name, key, value, property_schema),
+    if value.is_null() {
+        return Some(format!(
+            "{tool_name} error: parameter '{key}' cannot be null"
+        ));
+    }
+
+    match schema.get("type").and_then(Value::as_str) {
+        Some("string") => validate_string_property(tool_name, key, value, schema),
+        Some("integer") => validate_integer_property(tool_name, key, value, schema),
         Some("boolean") => {
             if value.is_boolean() {
                 None
@@ -1323,19 +1589,91 @@ fn validate_property(
                 ))
             }
         }
-        Some("object") => {
-            if value.is_object() {
-                None
-            } else {
-                Some(format!(
-                    "{tool_name} error: parameter '{key}' must be an object, got {}",
-                    json_type_name(value)
-                ))
-            }
-        }
-        Some("array") => validate_array_property(tool_name, key, value, property_schema),
+        Some("object") => validate_object_property(tool_name, key, value, schema),
+        Some("array") => validate_array_property(tool_name, key, value, schema),
         _ => None,
     }
+}
+
+fn validate_object_property(
+    tool_name: &str,
+    key: &str,
+    value: &Value,
+    schema: &Value,
+) -> Option<String> {
+    let Some(obj) = value.as_object() else {
+        return Some(format!(
+            "{tool_name} error: parameter '{key}' must be an object, got {}",
+            json_type_name(value)
+        ));
+    };
+
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for required_key in required {
+            let Some(required_key) = required_key.as_str() else {
+                continue;
+            };
+            if !obj.contains_key(required_key) {
+                return Some(format!(
+                    "{tool_name} error: missing required parameter '{key}.{required_key}'"
+                ));
+            }
+        }
+    }
+
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+
+    if schema
+        .get("additionalProperties")
+        .and_then(Value::as_bool)
+        .is_some_and(|allowed| !allowed)
+    {
+        for nested_key in obj.keys() {
+            if !properties.contains_key(nested_key) {
+                return Some(format!(
+                    "{tool_name} error: parameter '{key}.{nested_key}' is not allowed"
+                ));
+            }
+        }
+    }
+
+    for (nested_key, nested_schema) in &properties {
+        let Some(nested_value) = obj.get(nested_key) else {
+            continue;
+        };
+        let compound_key = format!("{key}.{nested_key}");
+        if let Some(error) =
+            validate_value_against_schema(tool_name, &compound_key, nested_value, nested_schema)
+        {
+            return Some(error);
+        }
+    }
+
+    if let Some(additional_schema) = schema
+        .get("additionalProperties")
+        .filter(|value| value.is_object())
+    {
+        for (nested_key, nested_value) in obj {
+            if properties.contains_key(nested_key) {
+                continue;
+            }
+            let compound_key = format!("{key}.{nested_key}");
+            if let Some(error) = validate_value_against_schema(
+                tool_name,
+                &compound_key,
+                nested_value,
+                additional_schema,
+            ) {
+                return Some(error);
+            }
+        }
+    }
+
+    None
 }
 
 fn validate_string_property(
@@ -1406,6 +1744,17 @@ fn validate_array_property(
         return Some(format!(
             "{tool_name} error: parameter '{key}' must have at most {max} items"
         ));
+    }
+
+    if let Some(item_schema) = property_schema.get("items") {
+        for (index, item) in arr.iter().enumerate() {
+            let item_key = format!("{key}[{index}]");
+            if let Some(error) =
+                validate_value_against_schema(tool_name, &item_key, item, item_schema)
+            {
+                return Some(error);
+            }
+        }
     }
 
     None

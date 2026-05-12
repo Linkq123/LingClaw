@@ -9,7 +9,8 @@ use crate::subagents::{
     render_agents_catalog_with_query, render_delegation_guidance,
     render_ranked_agent_recommendations,
 };
-use crate::{ChatMessage, agent};
+use crate::{ChatMessage, agent, tools};
+use reqwest::Client;
 use tokio_util::sync::CancellationToken;
 
 #[test]
@@ -1354,6 +1355,11 @@ struct ObservedTimeoutHook {
     called: Arc<AtomicBool>,
 }
 
+struct ExecTimeoutObservedHook {
+    expected_command: String,
+    called: Arc<AtomicBool>,
+}
+
 struct RecordingAfterToolHook {
     seen_tools: Arc<std::sync::Mutex<Vec<String>>>,
 }
@@ -1405,6 +1411,56 @@ impl AgentHook for TimeoutMarkerHook {
                         .expect("timeout output should be present")
                 ),
             }
+        })
+    }
+}
+
+impl AgentHook for ExecTimeoutObservedHook {
+    fn name(&self) -> &'static str {
+        "exec_timeout_observed"
+    }
+
+    fn point(&self) -> agent::HookPoint {
+        agent::HookPoint::AfterToolExec
+    }
+
+    fn should_run(&self, _: &[ChatMessage], _: Provider, _: usize, _: usize) -> bool {
+        false
+    }
+
+    fn run<'a>(
+        &'a self,
+        _: HookInput,
+        _: &'a Config,
+        _: &'a reqwest::Client,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async { HookOutput::NoOp })
+    }
+
+    fn should_run_tool(&self, tool_name: &str, point: agent::HookPoint) -> bool {
+        point == agent::HookPoint::AfterToolExec && tool_name == "exec"
+    }
+
+    fn run_tool<'a>(
+        &'a self,
+        input: ToolHookInput,
+        _: &'a Config,
+    ) -> Pin<Box<dyn Future<Output = HookOutput> + Send + 'a>> {
+        Box::pin(async move {
+            self.called.store(true, Ordering::SeqCst);
+            assert_eq!(input.outcome_is_error, Some(true));
+            assert_eq!(
+                input.tool_args["command"].as_str(),
+                Some(self.expected_command.as_str())
+            );
+            assert!(input.outcome_duration_ms.is_some());
+            assert!(
+                input
+                    .outcome_output
+                    .as_deref()
+                    .is_some_and(|text| text.contains("command timed out"))
+            );
+            HookOutput::NoOp
         })
     }
 }
@@ -1647,7 +1703,7 @@ async fn run_subagent_multi_read_only_batch_executes_after_tool_exec_hooks() {
         seen_tools: seen_tools.clone(),
     }));
 
-    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(16);
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let http = reqwest::Client::new();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
@@ -1658,6 +1714,7 @@ async fn run_subagent_multi_read_only_batch_executes_after_tool_exec_hooks() {
         &live_tx,
         tokio_util::sync::CancellationToken::new(),
         &hooks,
+        None,
         "test-task-1",
     )
     .await;
@@ -1712,7 +1769,7 @@ async fn run_subagent_emits_tool_result_event_for_completed_tool() {
         path: String::new(),
     };
 
-    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(16);
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let http = reqwest::Client::new();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
@@ -1723,6 +1780,7 @@ async fn run_subagent_emits_tool_result_event_for_completed_tool() {
         &live_tx,
         tokio_util::sync::CancellationToken::new(),
         &HookRegistry::new(),
+        None,
         "test-task-tool-result",
     )
     .await;
@@ -1732,6 +1790,8 @@ async fn run_subagent_emits_tool_result_event_for_completed_tool() {
     assert!(!outcome.aborted);
     assert_eq!(outcome.cycles, 1);
     assert_eq!(outcome.tool_calls, 1);
+    assert!(outcome.result.contains("alpha"));
+    assert!(!outcome.result.contains("produced no final output"));
 
     let mut saw_task_tool = false;
     let mut saw_tool_result = false;
@@ -1768,6 +1828,178 @@ async fn run_subagent_emits_tool_result_event_for_completed_tool() {
 
     assert!(saw_task_tool);
     assert!(saw_tool_result);
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_subagent_emits_tool_output_event_for_exec() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-tool-output-event");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+
+    let exec_args = if cfg!(windows) {
+        serde_json::json!({
+            "program": "cmd",
+            "args": ["/C", "echo subagent-live"]
+        })
+    } else {
+        serde_json::json!({
+            "program": "sh",
+            "args": ["-c", "printf 'subagent-live'"]
+        })
+    };
+    let response_body = build_openai_tool_call_stream("exec", exec_args);
+    let (api_base, handle) = spawn_one_shot_http_server("text/event-stream", response_body);
+
+    let mut config = base_config();
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+
+    let spec = SubAgentSpec {
+        name: "tool-output-agent".into(),
+        description: String::new(),
+        system_prompt: "Run the delegated command.".into(),
+        max_turns: 1,
+        tools: ToolPermissions {
+            allow: vec!["exec".into()],
+            deny: vec![],
+        },
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+    let http = reqwest::Client::new();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Print a live marker.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &HookRegistry::new(),
+        None,
+        "test-task-tool-output",
+    )
+    .await;
+
+    handle.join().expect("server thread should join");
+
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.cycles, 1);
+    assert_eq!(outcome.tool_calls, 1);
+
+    let mut saw_task_tool = false;
+    let mut saw_tool_output = false;
+    let mut saw_tool_result = false;
+    while let Ok(event) = live_rx.try_recv() {
+        match event["type"].as_str() {
+            Some("task_tool") => {
+                saw_task_tool = true;
+                assert_eq!(event["task_id"].as_str(), Some("test-task-tool-output"));
+                assert_eq!(event["agent"].as_str(), Some("tool-output-agent"));
+                assert_eq!(event["tool"].as_str(), Some("exec"));
+                assert_eq!(event["id"].as_str(), Some("call_1"));
+            }
+            Some("tool_output") => {
+                saw_tool_output = true;
+                assert_eq!(event["task_id"].as_str(), Some("test-task-tool-output"));
+                assert_eq!(event["subagent"].as_str(), Some("tool-output-agent"));
+                assert_eq!(event["name"].as_str(), Some("exec"));
+                assert_eq!(event["id"].as_str(), Some("call_1"));
+                assert_eq!(event["stream"].as_str(), Some("stdout"));
+                assert!(
+                    event["chunk"]
+                        .as_str()
+                        .is_some_and(|chunk| chunk.contains("subagent-live"))
+                );
+            }
+            Some("tool_result") => {
+                saw_tool_result = true;
+                assert_eq!(event["task_id"].as_str(), Some("test-task-tool-output"));
+                assert_eq!(event["subagent"].as_str(), Some("tool-output-agent"));
+                assert_eq!(event["name"].as_str(), Some("exec"));
+                assert_eq!(event["id"].as_str(), Some("call_1"));
+                assert_eq!(event["is_error"].as_bool(), Some(false));
+            }
+            _ => {}
+        }
+    }
+
+    assert!(saw_task_tool);
+    assert!(saw_tool_output);
+    assert!(saw_tool_result);
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_subagent_history_snapshot_redacts_exec_arguments() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-redacted-exec-snapshot");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should exist");
+
+    let command = if cfg!(windows) {
+        r#"echo done & rem --api-key "key-123" TOKEN="value""#
+    } else {
+        r#"echo done # --api-key "key-123" TOKEN="value""#
+    };
+    let stream_body =
+        build_openai_tool_call_stream("exec", serde_json::json!({ "command": command }));
+    let summary_body = build_openai_simple_text_response("done");
+    let (api_base, handle) = spawn_http_server_with_responses(vec![
+        ("text/event-stream", stream_body),
+        ("application/json", summary_body),
+    ]);
+
+    let mut config = base_config();
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+
+    let spec = SubAgentSpec {
+        name: "snapshot-redaction-agent".into(),
+        description: String::new(),
+        system_prompt: "Run the delegated command and report back.".into(),
+        max_turns: 1,
+        tools: ToolPermissions {
+            allow: vec!["exec".into()],
+            deny: vec![],
+        },
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+    let http = reqwest::Client::new();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Run the command.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &HookRegistry::new(),
+        None,
+        "test-task-redacted-snapshot",
+    )
+    .await;
+
+    handle.join().expect("server thread should join");
+
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.tool_calls, 1);
+    let arguments = outcome.history_snapshot.tools[0]
+        .arguments
+        .as_deref()
+        .expect("snapshot tool arguments should be present");
+    assert!(arguments.contains("[REDACTED]"));
+    assert!(!arguments.contains("key-123"));
+    assert!(!arguments.contains("TOKEN=\"value\""));
 
     let _ = fs::remove_dir_all(&workspace);
 }
@@ -1813,7 +2045,7 @@ async fn run_subagent_forces_final_summary_after_tool_only_last_turn() {
         path: String::new(),
     };
 
-    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(16);
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let http = reqwest::Client::new();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
@@ -1824,6 +2056,7 @@ async fn run_subagent_forces_final_summary_after_tool_only_last_turn() {
         &live_tx,
         tokio_util::sync::CancellationToken::new(),
         &HookRegistry::new(),
+        None,
         "test-task-forced-summary",
     )
     .await;
@@ -1886,7 +2119,7 @@ async fn run_subagent_configured_openai_gateway_auto_disables_reasoning_controls
         path: String::new(),
     };
 
-    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(16);
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let http = reqwest::Client::new();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
@@ -1897,6 +2130,7 @@ async fn run_subagent_configured_openai_gateway_auto_disables_reasoning_controls
         &live_tx,
         tokio_util::sync::CancellationToken::new(),
         &HookRegistry::new(),
+        None,
         "test-task-configured-openai-auto-think",
     )
     .await;
@@ -1969,7 +2203,7 @@ async fn run_subagent_sequential_tools_emit_interleaved_tool_events() {
         path: String::new(),
     };
 
-    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(16);
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let http = reqwest::Client::new();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
@@ -1980,6 +2214,7 @@ async fn run_subagent_sequential_tools_emit_interleaved_tool_events() {
         &live_tx,
         tokio_util::sync::CancellationToken::new(),
         &HookRegistry::new(),
+        None,
         "test-task-sequential-events",
     )
     .await;
@@ -2113,7 +2348,7 @@ async fn parallel_batch_interrupt_fires_hooks_only_for_completed_tools() {
     )
     .await;
 
-    // Slot 1: list_dir (interrupted — None)
+    // Slot 1: list_dir (interrupted - None)
     let outcome1 = crate::subagents::executor::finalize_parallel_batch_outcome(
         &hooks,
         &config,
@@ -2152,6 +2387,158 @@ async fn parallel_batch_interrupt_fires_hooks_only_for_completed_tools() {
 }
 
 #[tokio::test]
+async fn execute_subagent_tool_with_live_output_returns_on_cancellation() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-live-output-cancelled");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let args = if cfg!(windows) {
+        serde_json::json!({
+            "program": "cmd",
+            "args": ["/C", "ping -n 6 127.0.0.1 > NUL"],
+        })
+    } else {
+        serde_json::json!({
+            "program": "sh",
+            "args": ["-c", "sleep 5"],
+        })
+    };
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel_clone.cancel();
+    });
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        crate::subagents::executor::execute_subagent_tool_with_live_output(
+            &live_tx,
+            &cancel,
+            "task-1",
+            "agent-1",
+            tools::TOOL_NAME_EXEC,
+            "call-1",
+            &serde_json::to_string(&args).expect("args should serialize"),
+            &base_config(),
+            &Client::new(),
+            &workspace,
+            false,
+            None,
+        ),
+    )
+    .await
+    .expect("cancelled subagent exec wrapper should return promptly");
+
+    assert!(outcome.is_error);
+    assert!(outcome.output.contains("sub-agent cancelled"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_subagent_tool_with_live_output_prefers_completed_result_over_cancellation() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-live-output-complete-before-cancel");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let args = serde_json::json!({
+        "thought": "finished before cancellation"
+    });
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let outcome = crate::subagents::executor::execute_subagent_tool_with_live_output(
+        &live_tx,
+        &cancel,
+        "task-1",
+        "agent-1",
+        tools::TOOL_NAME_THINK,
+        "call-1",
+        &serde_json::to_string(&args).expect("args should serialize"),
+        &base_config(),
+        &Client::new(),
+        &workspace,
+        false,
+        None,
+    )
+    .await;
+
+    assert!(!outcome.is_error);
+    assert!(outcome.output.contains("Thought recorded"));
+    assert!(outcome.output.contains("finished before cancellation"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn run_subagent_exec_respects_exec_timeout_before_subagent_deadline() {
+    let command = slow_tool_command();
+    let response_body =
+        build_openai_tool_call_stream("exec", serde_json::json!({ "command": command.clone() }));
+    let (api_base, handle) = spawn_one_shot_http_server("text/event-stream", response_body);
+
+    let mut config = base_config();
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+    config.exec_timeout = Duration::from_secs(1);
+    config.sub_agent_timeout = Duration::from_secs(5);
+
+    let spec = SubAgentSpec {
+        name: "exec-timeout-agent".into(),
+        description: String::new(),
+        system_prompt: "Run the delegated command.".into(),
+        max_turns: 1,
+        tools: ToolPermissions {
+            allow: vec!["exec".into()],
+            deny: vec![],
+        },
+        mcp_policy: None,
+        source: AgentSource::System,
+        path: String::new(),
+    };
+
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+    let called = Arc::new(AtomicBool::new(false));
+    let mut hooks = HookRegistry::new();
+    hooks.register(Box::new(ExecTimeoutObservedHook {
+        expected_command: command,
+        called: called.clone(),
+    }));
+
+    let http = reqwest::Client::new();
+    let workspace = std::env::temp_dir();
+    let outcome = crate::subagents::executor::run_subagent(
+        &spec,
+        "Run the slow command.",
+        &config,
+        &http,
+        &workspace,
+        &live_tx,
+        tokio_util::sync::CancellationToken::new(),
+        &hooks,
+        None,
+        "test-task-exec-timeout",
+    )
+    .await;
+
+    handle.join().expect("server thread should join");
+
+    assert!(called.load(Ordering::SeqCst));
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.cycles, 1);
+    assert_eq!(outcome.tool_calls, 1);
+    assert!(outcome.result.contains("timed out after"));
+    assert!(!outcome.result.contains("deadline exceeded"));
+}
+
+#[tokio::test]
 async fn run_subagent_timeout_during_tool_exec_still_runs_after_tool_exec_hook() {
     let command = slow_tool_command();
     let response_body =
@@ -2178,7 +2565,7 @@ async fn run_subagent_timeout_during_tool_exec_still_runs_after_tool_exec_hook()
         path: String::new(),
     };
 
-    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(16);
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let called = Arc::new(AtomicBool::new(false));
     let mut hooks = HookRegistry::new();
     hooks.register(Box::new(ObservedTimeoutHook {
@@ -2197,6 +2584,7 @@ async fn run_subagent_timeout_during_tool_exec_still_runs_after_tool_exec_hook()
         &live_tx,
         tokio_util::sync::CancellationToken::new(),
         &hooks,
+        None,
         "test-task-timeout",
     )
     .await;
@@ -2251,7 +2639,7 @@ async fn run_subagent_executes_mcp_tool_allowed_by_policy() {
         path: String::new(),
     };
 
-    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(16);
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let http = reqwest::Client::new();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
@@ -2262,6 +2650,7 @@ async fn run_subagent_executes_mcp_tool_allowed_by_policy() {
         &live_tx,
         tokio_util::sync::CancellationToken::new(),
         &HookRegistry::new(),
+        None,
         "test-task-mcp",
     )
     .await;
@@ -2636,7 +3025,7 @@ fn test_validate_plan_rejects_non_placeholder_compatible_task_id() {
 fn test_validate_plan_rejects_cycle_introduced_by_prompt_placeholders() {
     let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     // task_a implicitly depends on task_b via placeholder,
-    // and task_b implicitly depends on task_a — a cycle.
+    // and task_b implicitly depends on task_a - a cycle.
     let tasks = vec![
         OrchestrationTask {
             id: "task_a".into(),
@@ -2677,7 +3066,7 @@ async fn test_execute_orchestration_cancelled_emits_skipped_events_for_remaining
     };
     let cancel = CancellationToken::new();
     cancel.cancel();
-    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(32);
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let workspace = std::env::temp_dir();
     let http = reqwest::Client::new();
     let hooks = HookRegistry::new();
@@ -2690,6 +3079,7 @@ async fn test_execute_orchestration_cancelled_emits_skipped_events_for_remaining
         &live_tx,
         cancel,
         &hooks,
+        None,
     )
     .await;
 
@@ -2752,7 +3142,7 @@ Run the requested command.
         }],
     };
 
-    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(64);
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let http = reqwest::Client::new();
     let hooks = HookRegistry::new();
     let outcome = execute_orchestration(
@@ -2763,6 +3153,7 @@ Run the requested command.
         &live_tx,
         CancellationToken::new(),
         &hooks,
+        None,
     )
     .await;
 
@@ -2778,6 +3169,103 @@ Run the requested command.
             failed_error = event["error"].as_str().map(|value| value.to_string());
         }
     }
+    let failed_error = failed_error.expect("expected orchestrate_task_failed event");
+    assert!(failed_error.contains("timed out after") || failed_error.contains("deadline exceeded"));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn orchestrate_task_failure_fallback_survives_full_live_queue() {
+    let workspace = unique_temp_workspace("lingclaw-orchestrate-fallback-queue-full");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(workspace.join("agents/runner")).expect("agent dir should exist");
+    fs::write(
+        workspace.join("agents/runner/AGENT.md"),
+        r#"---
+name: runner
+description: "Runs commands"
+max_turns: 1
+tools:
+  allow: [exec]
+  deny: []
+---
+
+Run the requested command.
+"#,
+    )
+    .expect("agent file should be written");
+
+    let command = slow_tool_command();
+    let response_body =
+        build_openai_tool_call_stream("exec", serde_json::json!({ "command": command }));
+    let (api_base, handle) = spawn_one_shot_http_server("text/event-stream", response_body);
+
+    let mut config = base_config();
+    config.api_base = api_base;
+    config.api_key = "test-key".to_string();
+    config.exec_timeout = Duration::from_secs(5);
+    config.sub_agent_timeout = Duration::from_secs(1);
+
+    let plan = OrchestrationPlan {
+        tasks: vec![OrchestrationTask {
+            id: "task-1".into(),
+            agent: "runner".into(),
+            prompt: "Run the slow command.".into(),
+            depends_on: vec![],
+        }],
+    };
+
+    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(1);
+    live_tx
+        .send(serde_json::json!({"type":"sentinel"}))
+        .await
+        .expect("sentinel should saturate live queue");
+
+    let outcome_task = tokio::spawn({
+        let config = config.clone();
+        let workspace = workspace.clone();
+        let live_tx = live_tx.clone();
+        async move {
+            execute_orchestration(
+                &plan,
+                &config,
+                &reqwest::Client::new(),
+                &workspace,
+                &live_tx,
+                CancellationToken::new(),
+                &HookRegistry::new(),
+                None,
+            )
+            .await
+        }
+    });
+
+    let sentinel = live_rx.recv().await.expect("sentinel should remain queued first");
+    assert_eq!(sentinel["type"], "sentinel");
+
+    let mut failed_error = None;
+    let mut saw_started = false;
+    while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(2), live_rx.recv()).await {
+        match event["type"].as_str() {
+            Some("orchestrate_task_started") => saw_started = true,
+            Some("orchestrate_task_failed") => {
+                failed_error = event["error"].as_str().map(|value| value.to_string());
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    let outcome = outcome_task
+        .await
+        .expect("orchestration task should complete");
+    handle.join().expect("server thread should join");
+
+    assert!(saw_started);
+    assert!(!outcome.aborted);
+    assert_eq!(outcome.task_results.len(), 1);
+    assert_eq!(outcome.task_results[0].status, TaskStatus::Failed);
     let failed_error = failed_error.expect("expected orchestrate_task_failed event");
     assert!(failed_error.contains("timed out after") || failed_error.contains("deadline exceeded"));
 

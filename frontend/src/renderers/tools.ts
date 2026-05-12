@@ -4,6 +4,8 @@ import { scrollDown, syncToolDrawerBounds } from '../scroll.js';
 import { wrapInTimeline, animatePanelIn, animateCollapsibleSection } from './timeline.js';
 import { pinReactStatusToBottom } from './react-status.js';
 
+const TOOL_LIVE_OUTPUT_MAX_CHARS = 60000;
+
 function findToolPanel(id) {
   const panels = Array.from(dom.chat.querySelectorAll('.tool-panel'));
   let fallback = null;
@@ -25,17 +27,31 @@ function findToolPanel(id) {
 }
 
 export function addToolCall(name, args, id) {
-  const panel = document.createElement('div');
-  panel.className = 'tool-panel';
-  panel.dataset.toolId = id;
-
   let argsDisplay = args;
   try {
     argsDisplay = JSON.stringify(JSON.parse(args), null, 2);
   } catch {}
+
+  const existing = findToolPanel(id);
+  if (existing && existing.dataset.toolHasResult !== 'true') {
+    existing.dataset.toolId = id;
+    existing.dataset.toolName = name;
+    existing.dataset.toolArgs = argsDisplay;
+    const nameEl = existing.querySelector('.tool-name');
+    if (nameEl) nameEl.textContent = name;
+    const argsPreviewEl = existing.querySelector('.tool-args-preview');
+    if (argsPreviewEl) argsPreviewEl.textContent = truncateStr(args, 80);
+    return existing;
+  }
+
+  const panel = document.createElement('div');
+  panel.className = 'tool-panel';
+  panel.dataset.toolId = id;
+
   panel.dataset.toolName = name;
   panel.dataset.toolArgs = argsDisplay;
   panel.dataset.toolResult = '';
+  panel.dataset.toolLiveOutput = '';
   panel.dataset.toolHasResult = 'false';
   panel.dataset.toolStatus = '执行中';
 
@@ -60,6 +76,7 @@ export function addToolCall(name, args, id) {
   animatePanelIn(panel);
   hideWelcome();
   scrollDown();
+  return panel;
 }
 
 export function updateToolProgress(id, elapsedMs) {
@@ -77,10 +94,28 @@ export function updateToolProgress(id, elapsedMs) {
   }
 }
 
+function mergeLiveOutput(current, stream, chunk) {
+  const prefix = stream === 'stderr' ? '\n[stderr]\n' : '';
+  let next = `${current || ''}${prefix}${chunk || ''}`;
+  if (next.length <= TOOL_LIVE_OUTPUT_MAX_CHARS) return next;
+  next = next.slice(next.length - TOOL_LIVE_OUTPUT_MAX_CHARS);
+  return `[live output truncated]\n${next}`;
+}
+
+export function appendToolOutput(id, stream, chunk) {
+  const panel = findToolPanel(id);
+  if (!panel || panel.dataset.toolHasResult === 'true' || !chunk) return;
+  panel.dataset.toolLiveOutput = mergeLiveOutput(panel.dataset.toolLiveOutput || '', stream, chunk);
+  if (state.activeToolPanel === panel) {
+    syncToolDrawer(panel);
+  }
+}
+
 export function addToolResult(name, result, id, durationMs = null) {
   const panel = findToolPanel(id);
   if (panel) {
     panel.dataset.toolResult = result;
+    panel.dataset.toolLiveOutput = '';
     panel.dataset.toolHasResult = 'true';
     const durationLabel = formatToolDuration(durationMs);
     panel.dataset.toolStatus = durationLabel ? `已返回结果 (${durationLabel})` : '已返回结果';
@@ -129,14 +164,17 @@ export function syncToolDrawer(panel) {
   const toolName = panel.dataset.toolName || 'Tool';
   const toolArgs = panel.dataset.toolArgs || '';
   const toolResult = panel.dataset.toolResult || '';
+  const toolLiveOutput = panel.dataset.toolLiveOutput || '';
   const hasResult = panel.dataset.toolHasResult === 'true';
+  const detailText = hasResult ? toolResult : toolLiveOutput;
+  const hasDetail = detailText.trim().length > 0;
   const statusText = panel.dataset.toolStatus || (hasResult ? '已返回结果' : '执行中');
 
   if (dom.toolDrawerTitle) dom.toolDrawerTitle.textContent = toolName;
   if (dom.toolDrawerMeta) dom.toolDrawerMeta.textContent = statusText;
   if (dom.toolDrawerArgs) dom.toolDrawerArgs.textContent = toolArgs || '(empty)';
-  if (dom.toolDrawerResult) dom.toolDrawerResult.textContent = toolResult;
-  if (dom.toolDrawerResultSection) dom.toolDrawerResultSection.hidden = !hasResult;
+  if (dom.toolDrawerResult) dom.toolDrawerResult.textContent = detailText;
+  if (dom.toolDrawerResultSection) dom.toolDrawerResultSection.hidden = !hasDetail;
 }
 
 export function openToolDrawer(panel) {

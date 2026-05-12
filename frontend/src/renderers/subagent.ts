@@ -23,6 +23,7 @@ import {
 type SubagentPanelRef = {
   task_id?: string;
   agent?: string;
+  allowAgentFallback?: boolean;
 };
 
 type SubagentStats = {
@@ -71,6 +72,8 @@ const LABELS = {
   duration: 'Duration',
 } as const;
 
+const SUBAGENT_TOOL_LIVE_OUTPUT_MAX_CHARS = 60000;
+
 function pluralize(count: number, singular: string, plural = `${singular}s`) {
   return count === 1 ? singular : plural;
 }
@@ -99,7 +102,7 @@ function getReasoningBody(panel): TextNodeHost | null {
   return (panel as Element).querySelector('[data-subagent-reasoning-body]') as TextNodeHost | null;
 }
 
-function ensurePromptCard(panel) {
+export function ensurePromptCard(panel) {
   if (!panel) return null;
 
   const body = panel.querySelector('.subagent-body');
@@ -226,9 +229,18 @@ function syncToolBadgeDataset(
   badge.dataset.toolName = toolName || 'tool';
   badge.dataset.toolArgs = formattedArgs || LABELS.noArguments;
   badge.dataset.toolResult = formattedResult;
+  badge.dataset.toolLiveOutput = badge.dataset.toolLiveOutput || '';
   badge.dataset.toolHasResult = hasResult ? 'true' : 'false';
   badge.dataset.toolStatus = toolStatus;
   badge.title = [toolName || 'tool', toolStatus].filter(Boolean).join(' / ');
+}
+
+function mergeSubagentToolLiveOutput(current, stream, chunk) {
+  const prefix = stream === 'stderr' ? '\n[stderr]\n' : '';
+  let next = `${current || ''}${prefix}${chunk || ''}`;
+  if (next.length <= SUBAGENT_TOOL_LIVE_OUTPUT_MAX_CHARS) return next;
+  next = next.slice(next.length - SUBAGENT_TOOL_LIVE_OUTPUT_MAX_CHARS);
+  return `[live output truncated]\n${next}`;
 }
 
 function ensureToolBadge(panel, toolId, toolName) {
@@ -431,7 +443,7 @@ function resolvePanel(ref: SubagentPanelRef) {
   if (ref && ref.task_id && state.activeSubagentPanels.has(ref.task_id)) {
     return state.activeSubagentPanels.get(ref.task_id);
   }
-  if (ref && ref.agent && state.activeSubagentPanels.has(ref.agent)) {
+  if (ref && ref.allowAgentFallback !== false && ref.agent && state.activeSubagentPanels.has(ref.agent)) {
     return state.activeSubagentPanels.get(ref.agent);
   }
   return null;
@@ -620,6 +632,16 @@ export function createDetachedSubagentPanel(agentName, prompt, taskId) {
 }
 
 export function createSubagentPanel(agentName, prompt, taskId) {
+  const existing = resolvePanel({
+    task_id: taskId,
+    agent: agentName,
+    allowAgentFallback: !taskId,
+  });
+  if (existing) {
+    updateSubagentPrompt({ task_id: taskId, agent: agentName }, prompt);
+    return existing;
+  }
+
   const panel = buildSubagentPanel(agentName, prompt, taskId);
 
   const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
@@ -634,14 +656,15 @@ export function createSubagentPanel(agentName, prompt, taskId) {
   scrollDown();
 
   registerSubagentPanel(panel, taskId, agentName);
+  return panel;
 }
 
-export function updateSubagentPrompt(ref: SubagentPanelRef, prompt) {
+export function updateSubagentPrompt(ref: SubagentPanelRef, prompt, { allowBlank = false } = {}) {
   const panel = resolvePanel(ref);
   if (!panel) return;
 
   const displayPrompt = stripDelegatedPromptRuntimeContext(prompt || '');
-  if (!displayPrompt) return;
+  if (!displayPrompt && !allowBlank) return;
 
   const promptCard = ensurePromptCard(panel);
   const promptEl = promptCard?.querySelector('.subagent-prompt');
@@ -670,6 +693,42 @@ export function updateSubagentProgress(ref: SubagentPanelRef, cycle) {
     status.textContent = `${LABELS.running} (cycle ${cycle})`;
   }
   setChipText(panel, 'cycle', `Cycle ${cycle}`);
+}
+
+export function appendSubagentToolOutput(
+  ref: SubagentPanelRef,
+  toolId,
+  stream,
+  chunk,
+  toolName = '',
+) {
+  if (!chunk) return;
+
+  const panel = resolvePanel(ref);
+  if (!panel) return;
+
+  let badge = findToolBadge(panel, toolId, {
+    allowPendingEmptyId: true,
+    toolName,
+  });
+  if (!badge) {
+    addSubagentTool(ref, toolName || 'tool', toolId);
+    badge = findToolBadge(panel, toolId, {
+      allowPendingEmptyId: true,
+      toolName,
+    });
+  }
+  if (!badge || badge.dataset.toolHasResult === 'true') return;
+
+  badge.dataset.toolLiveOutput = mergeSubagentToolLiveOutput(
+    badge.dataset.toolLiveOutput || '',
+    stream,
+    chunk,
+  );
+
+  if (state.activeToolPanel === badge) {
+    syncToolDrawer(badge);
+  }
 }
 
 export function startSubagentReasoning(ref: SubagentPanelRef) {
@@ -824,6 +883,7 @@ export function updateSubagentToolResult(
     stateLabel,
     showResult,
   );
+  badge.dataset.toolLiveOutput = '';
   updateToolBadgeState(
     badge,
     stateLabel,

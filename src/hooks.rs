@@ -263,7 +263,13 @@ pub(crate) fn build_compression_source_text(messages: &[ChatMessage]) -> String 
                             "Assistant tool call [{}]: {} {}",
                             tc.id,
                             tc.function.name,
-                            truncate(&tc.function.arguments, 1_500)
+                            truncate(
+                                &crate::tools::display_tool_arguments(
+                                    &tc.function.name,
+                                    &tc.function.arguments,
+                                ),
+                                1_500,
+                            )
                         ));
                     }
                 }

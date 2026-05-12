@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::JsonMcpServerConfig;
+use crate::session_store::replace_session_file_from_temp;
 use axum::http::{HeaderMap, HeaderValue};
 use serde_json::json;
 use std::{collections::HashMap, sync::atomic::AtomicU64};
@@ -386,6 +387,38 @@ fn repeated_compression_excludes_previous_summary() {
     );
     assert!(source.contains("new question"));
     assert!(source.contains("follow up"));
+}
+
+#[test]
+fn compression_source_text_redacts_exec_tool_call_arguments() {
+    let messages = vec![
+        make_message("system", "system"),
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("let me run a command".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "exec_call_1".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "exec".into(),
+                    arguments: r#"{"command":"curl -H \"Authorization: Bearer super-secret\" --api-key \"key-123\" TOKEN=\"value\""}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+    ];
+
+    let source = build_compression_source_text(&messages);
+
+    assert!(source.contains("[REDACTED]"));
+    assert!(!source.contains("super-secret"));
+    assert!(!source.contains("key-123"));
+    assert!(!source.contains("TOKEN=\"value\""));
 }
 
 #[test]
@@ -909,7 +942,7 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
 
 #[test]
 fn build_history_payload_includes_thinking_only_assistant_messages() {
-    // An assistant message that has thinking but no content (e.g., think → tool_call
+    // An assistant message that has thinking but no content (e.g., think -> tool_call
     // cycle with no text response) must appear in the history payload so that the
     // reasoning card is replayed after a page refresh.
     let session = Session {
@@ -918,7 +951,7 @@ fn build_history_payload_includes_thinking_only_assistant_messages() {
         messages: vec![
             ChatMessage {
                 role: "assistant".into(),
-                content: None, // no text — only thinking + tool_calls
+                content: None, // no text - only thinking + tool_calls
                 images: None,
                 thinking: Some("step by step reasoning".into()),
                 anthropic_thinking_blocks: None,
@@ -991,6 +1024,71 @@ fn build_history_payload_includes_thinking_only_assistant_messages() {
         .find(|m| m["role"] == "assistant" && m["content"] == "done")
         .expect("history should contain the content assistant entry");
     assert!(content_entry.get("thinking").is_none());
+}
+
+#[test]
+fn build_history_payload_redacts_exec_tool_call_arguments() {
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![crate::ToolCall {
+                id: "exec_call_1".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "exec".into(),
+                    arguments: r#"{"command":"curl -H \"Authorization: Bearer super-secret\" --api-key \"key-123\" TOKEN=\"value\"","working_dir":"src"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: Some(1000),
+        }],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let payload = build_history_payload(&session);
+    let tool_call = payload["messages"]
+        .as_array()
+        .expect("history messages should be an array")
+        .iter()
+        .find(|message| message["role"] == "tool_call" && message["id"] == "exec_call_1")
+        .expect("exec tool_call should be present");
+    let arguments = tool_call["arguments"]
+        .as_str()
+        .expect("tool_call arguments should be a string");
+
+    assert!(arguments.contains("[REDACTED]"));
+    assert!(!arguments.contains("super-secret"));
+    assert!(!arguments.contains("key-123"));
+    assert!(!arguments.contains("TOKEN=\"value\""));
 }
 
 #[test]
@@ -1095,6 +1193,107 @@ fn build_history_payload_includes_subagent_snapshot_on_task_results() {
         tool_result["subagent_snapshot"]["result_excerpt"].as_str(),
         Some("Found the issue in the logs.")
     );
+}
+
+#[test]
+fn build_history_payload_redacts_exec_args_in_subagent_snapshot() {
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![crate::ToolCall {
+                    id: "task_call_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "task".into(),
+                        arguments: r#"{"agent":"reviewer","prompt":"Inspect logs"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(1000),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("Found the issue in the logs.".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: Some("task_call_1".into()),
+                timestamp: Some(1001),
+            },
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 1,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::from([(
+            subagent_snapshot_storage_key("task_call_1", 1),
+            SubagentHistorySnapshot {
+                reasoning: Some("[Cycle 1]\nInspect logs".into()),
+                tools: vec![SubagentToolHistorySnapshot {
+                    id: "tool-1".into(),
+                    name: "exec".into(),
+                    arguments: Some(
+                        r#"{"command":"curl -H \"Authorization: Bearer super-secret\" --api-key \"key-123\" TOKEN=\"value\""}"#
+                            .into(),
+                    ),
+                    result: Some("ok".into()),
+                    is_error: false,
+                    duration_ms: 12,
+                }],
+                cycles: 1,
+                tool_calls: 1,
+                duration_ms: 120,
+                input_tokens: 55,
+                output_tokens: 21,
+                success: true,
+                result_excerpt: Some("Found the issue in the logs.".into()),
+                error: None,
+            },
+        )]),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let payload = build_history_payload(&session);
+    let tool_result = payload["messages"]
+        .as_array()
+        .expect("history messages should be an array")
+        .iter()
+        .find(|message| message["role"] == "tool_result" && message["id"] == "task_call_1")
+        .expect("task tool_result should be present");
+    let arguments = tool_result["subagent_snapshot"]["tools"][0]["arguments"]
+        .as_str()
+        .expect("snapshot tool arguments should be a string");
+
+    assert!(arguments.contains("[REDACTED]"));
+    assert!(!arguments.contains("super-secret"));
+    assert!(!arguments.contains("key-123"));
+    assert!(!arguments.contains("TOKEN=\"value\""));
 }
 
 #[test]
@@ -3088,6 +3287,137 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
 }
 
 #[test]
+fn save_session_to_disk_redacts_exec_arguments_in_messages_and_snapshots() {
+    let session_id = format!("redact-exec-save-{}", now_epoch());
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let workspace = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+    let session = Session {
+        id: session_id,
+        name: "Test".into(),
+        messages: vec![
+            ChatMessage {
+                role: "system".into(),
+                content: Some("system".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: None,
+                timestamp: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "exec_call_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "exec".into(),
+                        arguments: r#"{"command":"curl -H \"Authorization: Bearer super-secret\" --api-key \"key-123\"","apiKey":"hook-secret"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(1000),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "task_call_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "task".into(),
+                        arguments: r#"{"agent":"reviewer","prompt":"Inspect logs"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(1001),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("Found the issue in the logs.".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: Some("task_call_1".into()),
+                timestamp: Some(1002),
+            },
+        ],
+        created_at: 1,
+        updated_at: 1,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: false,
+        show_tools: true,
+        show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::from([(
+            subagent_snapshot_storage_key("task_call_1", 1),
+            SubagentHistorySnapshot {
+                tools: vec![SubagentToolHistorySnapshot {
+                    id: "tool-1".into(),
+                    name: "exec".into(),
+                    arguments: Some(
+                        r#"{"command":"curl -H \"Authorization: Bearer nested-secret\"","access_token":"token-456"}"#
+                            .into(),
+                    ),
+                    result: Some("ok".into()),
+                    is_error: false,
+                    duration_ms: 12,
+                }],
+                success: true,
+                result_excerpt: Some("Found the issue in the logs.".into()),
+                ..Default::default()
+            },
+        )]),
+        version: 0,
+        workspace,
+    };
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    runtime
+        .block_on(save_session_to_disk(&session))
+        .expect("session should save");
+
+    let data = std::fs::read_to_string(&path).expect("session file should be readable");
+    let payload: serde_json::Value =
+        serde_json::from_str(&data).expect("session file should contain valid json");
+    let serialized = payload.to_string();
+
+    assert!(serialized.contains("[REDACTED]"));
+    assert!(!serialized.contains("super-secret"));
+    assert!(!serialized.contains("key-123"));
+    assert!(!serialized.contains("hook-secret"));
+    assert!(!serialized.contains("nested-secret"));
+    assert!(!serialized.contains("token-456"));
+}
+
+#[test]
 fn save_session_to_disk_overwrites_existing_file() {
     let session_id = format!("overwrite-save-{}", now_epoch());
     let path = sessions_dir().join(format!("{session_id}.json"));
@@ -3246,6 +3576,10 @@ fn save_session_to_disk_skips_identical_payload_rewrite() {
 #[test]
 fn load_session_from_disk_trims_incomplete_tool_transaction() {
     let session_id = format!("trim-load-{}", now_epoch());
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: session_workspace_path(&session_id),
+    };
     let path = sessions_dir().join(format!("{session_id}.json"));
     let payload = json!({
         "id": session_id,
@@ -4601,7 +4935,7 @@ fn finalize_connection_removes_unbound_session_from_memory() {
 
     let connection_cancel = CancellationToken::new();
     let (tx, _rx) = mpsc::channel::<String>(4);
-    let (live_tx, _live_rx) = mpsc::channel::<serde_json::Value>(4);
+    let (live_tx, _live_rx) = mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let disconnect_watcher = rt.spawn(async {});
     let live_dispatcher = rt.spawn(async {});
     let reader = rt.spawn(async {});
@@ -4667,7 +5001,7 @@ fn finalize_connection_keeps_main_session_loaded_in_memory() {
 
     let connection_cancel = CancellationToken::new();
     let (tx, _rx) = mpsc::channel::<String>(4);
-    let (live_tx, _live_rx) = mpsc::channel::<serde_json::Value>(4);
+    let (live_tx, _live_rx) = mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let disconnect_watcher = rt.spawn(async {});
     let live_dispatcher = rt.spawn(async {});
     let reader = rt.spawn(async {});
@@ -4734,7 +5068,7 @@ fn finalize_connection_does_not_remove_newer_connection_cancel_binding() {
     }
 
     let (tx, _rx) = mpsc::channel::<String>(4);
-    let (live_tx, _live_rx) = mpsc::channel::<serde_json::Value>(4);
+    let (live_tx, _live_rx) = mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let disconnect_watcher = rt.spawn(async {});
     let live_dispatcher = rt.spawn(async {});
     let reader = rt.spawn(async {});
@@ -4864,6 +5198,143 @@ fn handle_command_reports_mcp_load_failures() {
 }
 
 #[test]
+fn finish_session_replay_flushes_pending_events_through_serialized_sender() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-replay-flush-{}", now_epoch());
+    let writer_capacity = 2;
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(writer_capacity);
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        state.as_ref(),
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(dispatch_live_event(
+        state.as_ref(),
+        &session_id,
+        1,
+        json!({"type":"delta","content":"replayed first"}),
+    ));
+
+    rt.block_on(async {
+        for _ in 0..writer_capacity {
+            bound_tx
+                .send(json!({"type":"sentinel"}).to_string())
+                .await
+                .expect("sentinel should fill the writer queue");
+        }
+    });
+
+    rt.block_on(finish_session_replay(state.as_ref(), &session_id, 1));
+
+    rt.block_on(dispatch_live_event(
+        state.as_ref(),
+        &session_id,
+        1,
+        json!({"type":"delta","content":"live second"}),
+    ));
+
+    for _ in 0..writer_capacity {
+        assert_eq!(
+            bound_rx
+                .try_recv()
+                .expect("sentinel should still be queued"),
+            json!({"type":"sentinel"}).to_string()
+        );
+    }
+    assert!(matches!(
+        bound_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    rt.block_on(async {
+        let clients = state.session_clients.lock().await;
+        let binding = clients
+            .get(&session_id)
+            .expect("session client binding should exist");
+        assert!(binding.replay_ready);
+        assert!(binding.live_send_in_progress);
+        assert_eq!(binding.pending_events.len(), 3);
+        assert_eq!(binding.pending_events[0]["type"], "start");
+        assert_eq!(binding.pending_events[1]["content"], "replayed first");
+        assert_eq!(binding.pending_events[2]["content"], "live second");
+    });
+}
+
+#[test]
+fn finish_session_replay_drains_backlog_larger_than_writer_queue() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-replay-drain-{}", now_epoch());
+    let writer_capacity = 2;
+    let backlog_len = 5;
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(writer_capacity);
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+
+    for index in 0..backlog_len {
+        rt.block_on(dispatch_live_event(
+            state.as_ref(),
+            &session_id,
+            1,
+            json!({"type":"delta","content":format!("event-{index}")}),
+        ));
+    }
+
+    let flush_state = Arc::clone(&state);
+    let flush_session_id = session_id.clone();
+    let received = rt.block_on(async move {
+        let flush = tokio::spawn(async move {
+            finish_session_replay(flush_state.as_ref(), &flush_session_id, 1).await;
+        });
+
+        let mut received = Vec::new();
+        for _ in 0..backlog_len {
+            let raw = tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+                .await
+                .expect("replayed event should arrive before timeout")
+                .expect("bound client should receive replayed event");
+            received.push(
+                serde_json::from_str::<serde_json::Value>(&raw)
+                    .expect("payload should be valid json"),
+            );
+        }
+
+        flush.await.expect("replay flush task should complete");
+        received
+    });
+
+    for (index, event) in received.iter().enumerate() {
+        assert_eq!(event["type"], "delta");
+        assert_eq!(event["content"], format!("event-{index}"));
+    }
+
+    rt.block_on(async {
+        let clients = state.session_clients.lock().await;
+        let binding = clients
+            .get(&session_id)
+            .expect("session client binding should exist");
+        assert!(binding.pending_events.is_empty());
+        assert!(!binding.live_send_in_progress);
+    });
+}
+
+#[test]
 fn replay_live_round_rehydrates_inflight_round_state() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = test_app_state();
@@ -4962,6 +5433,18 @@ fn replay_live_round_rehydrates_inflight_round_state() {
         &session_id,
         1,
         json!({
+            "type": "tool_output",
+            "id": "tool-1",
+            "name": "read_file",
+            "stream": "stderr",
+            "chunk": "partial output",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
             "type": "tool_result",
             "id": "tool-1",
             "name": "read_file",
@@ -4979,7 +5462,7 @@ fn replay_live_round_rehydrates_inflight_round_state() {
 
     rt.block_on(finish_session_replay(&state, &session_id, 1));
 
-    for _ in 0..8 {
+    for _ in 0..9 {
         let _ = rt
             .block_on(async { tokio::time::timeout(Duration::from_secs(2), bound_rx.recv()).await })
             .expect("bound replay event should arrive before timeout")
@@ -4989,7 +5472,7 @@ fn replay_live_round_rehydrates_inflight_round_state() {
     let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
     rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
 
-    let replayed = (0..8)
+    let replayed = (0..9)
         .map(|_| {
             let raw = rt
                 .block_on(async {
@@ -5017,10 +5500,14 @@ fn replay_live_round_rehydrates_inflight_round_state() {
     assert_eq!(replayed[4]["type"], "thinking_done");
     assert_eq!(replayed[5]["type"], "tool_call");
     assert_eq!(replayed[5]["id"], "tool-1");
-    assert_eq!(replayed[6]["type"], "tool_result");
-    assert_eq!(replayed[6]["result"], "file contents");
-    assert_eq!(replayed[7]["type"], "delta");
-    assert_eq!(replayed[7]["content"], "final answer");
+    assert_eq!(replayed[6]["type"], "tool_output");
+    assert_eq!(replayed[6]["id"], "tool-1");
+    assert!(replayed[6].get("stream").is_none());
+    assert_eq!(replayed[6]["chunk"], "\n[stderr]\npartial output");
+    assert_eq!(replayed[7]["type"], "tool_result");
+    assert_eq!(replayed[7]["result"], "file contents");
+    assert_eq!(replayed[8]["type"], "delta");
+    assert_eq!(replayed[8]["content"], "final answer");
 
     rt.block_on(dispatch_live_event(
         &state,
@@ -5033,6 +5520,113 @@ fn replay_live_round_rehydrates_inflight_round_state() {
             .get(&session_id)
             .is_none()
     );
+}
+
+#[test]
+fn record_tool_output_event_only_synthesizes_missing_tool_call_once() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-tool-output-synth-{}", now_epoch());
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(&state, &session_id, 1, &bound_tx, true));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    let _ = bound_rx.try_recv();
+
+    rt.block_on(record_tool_output_event_for_replay_and_client(
+        &state,
+        &session_id,
+        json!({
+            "type": "tool_output",
+            "id": "tool-1",
+            "name": "exec",
+            "stream": "stdout",
+            "chunk": "partial",
+        }),
+    ));
+
+    let synthetic_tool_call = serde_json::from_str::<serde_json::Value>(&rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+            .await
+            .expect("synthetic tool_call should arrive before timeout")
+            .expect("synthetic tool_call should be delivered")
+    }))
+    .expect("synthetic tool_call should parse");
+    let tool_output = serde_json::from_str::<serde_json::Value>(&rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+            .await
+            .expect("tool_output should arrive before timeout")
+            .expect("tool_output should be delivered")
+    }))
+    .expect("tool_output should parse");
+
+    assert_eq!(synthetic_tool_call["type"], "tool_call");
+    assert_eq!(synthetic_tool_call["id"], "tool-1");
+    assert_eq!(synthetic_tool_call["arguments"], "");
+    assert_eq!(tool_output["type"], "tool_output");
+
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "tool_call",
+            "id": "tool-1",
+            "name": "exec",
+            "arguments": "{\"command\":\"echo hi\"}",
+        }),
+    ));
+    let real_tool_call = serde_json::from_str::<serde_json::Value>(&rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+            .await
+            .expect("real tool_call should arrive before timeout")
+            .expect("real tool_call should be delivered")
+    }))
+    .expect("real tool_call should parse");
+    assert_eq!(real_tool_call["type"], "tool_call");
+
+    rt.block_on(record_tool_output_event_for_replay_and_client(
+        &state,
+        &session_id,
+        json!({
+            "type": "tool_output",
+            "id": "tool-1",
+            "name": "exec",
+            "stream": "stdout",
+            "chunk": " more",
+        }),
+    ));
+
+    let next_event = serde_json::from_str::<serde_json::Value>(&rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+            .await
+            .expect("follow-up tool_output should arrive before timeout")
+            .expect("follow-up tool_output should be delivered")
+    }))
+    .expect("follow-up tool_output should parse");
+    assert_eq!(next_event["type"], "tool_output");
+    assert!(matches!(bound_rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+
+    let live_round = rt.block_on(async {
+        state
+            .live_rounds
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("live round should exist")
+    });
+    let tool = live_round
+        .tools
+        .iter()
+        .find(|tool| tool.id == "tool-1")
+        .expect("tool state should exist");
+    assert_eq!(tool.arguments, "{\"command\":\"echo hi\"}");
 }
 
 #[test]
@@ -5446,6 +6040,101 @@ fn replay_live_round_rehydrates_active_task_with_task_id() {
 }
 
 #[test]
+fn replay_live_round_replaces_synthetic_task_start_with_real_prompt() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-task-start-replace-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "start",
+            "round": 1,
+            "phase": "act",
+            "cycle": 1,
+            "react_visible": true,
+        }),
+    ));
+    rt.block_on(record_tool_output_event_for_replay_and_client(
+        &state,
+        &session_id,
+        json!({
+            "type": "tool_output",
+            "task_id": "task-123",
+            "subagent": "coder",
+            "id": "tool-a",
+            "name": "read_file",
+            "stream": "stdout",
+            "chunk": "partial subagent output",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "task_started",
+            "task_id": "task-123",
+            "agent": "coder",
+            "prompt": "Implement feature",
+        }),
+    ));
+
+    let live_round = rt.block_on(async {
+        state
+            .live_rounds
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("live round should exist")
+    });
+    assert_eq!(live_round.delegated_events.len(), 2);
+    assert_eq!(live_round.delegated_events[0]["type"], "task_started");
+    assert_eq!(live_round.delegated_events[0]["prompt"], "Implement feature");
+
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let replayed = (0..3)
+        .map(|_| {
+            let raw = rt
+                .block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), replay_rx.recv()).await
+                })
+                .expect("replay event should arrive before timeout")
+                .expect("replay should produce serialized event");
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .expect("replayed event should be valid json")
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(replayed[0]["type"], "start");
+    assert_eq!(replayed[1]["type"], "task_started");
+    assert_eq!(replayed[1]["task_id"], "task-123");
+    assert_eq!(replayed[1]["agent"], "coder");
+    assert_eq!(replayed[1]["prompt"], "Implement feature");
+    assert_eq!(replayed[2]["type"], "tool_output");
+    assert_eq!(replayed[2]["task_id"], "task-123");
+    assert_eq!(replayed[2]["subagent"], "coder");
+    assert_eq!(replayed[2]["chunk"], "partial subagent output");
+    assert!(matches!(
+        replay_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
 fn replay_live_round_scopes_subagent_tool_results_to_task() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = test_app_state();
@@ -5531,6 +6220,20 @@ fn replay_live_round_scopes_subagent_tool_results_to_task() {
         &session_id,
         1,
         json!({
+            "type": "tool_output",
+            "task_id": "task-123",
+            "subagent": "coder",
+            "id": "tool-a",
+            "name": "read_file",
+            "stream": "stdout",
+            "chunk": "partial subagent output",
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
             "type": "tool_result",
             "task_id": "task-123",
             "subagent": "coder",
@@ -5544,7 +6247,7 @@ fn replay_live_round_scopes_subagent_tool_results_to_task() {
     let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
     rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
 
-    let replayed = (0..4)
+    let replayed = (0..7)
         .map(|_| {
             let raw = rt
                 .block_on(async {
@@ -5559,13 +6262,25 @@ fn replay_live_round_scopes_subagent_tool_results_to_task() {
 
     assert_eq!(replayed[0]["type"], "start");
     assert_eq!(replayed[1]["type"], "task_started");
-    assert_eq!(replayed[2]["type"], "task_tool");
+    assert_eq!(replayed[2]["type"], "thinking_start");
     assert_eq!(replayed[2]["task_id"], "task-123");
-    assert_eq!(replayed[3]["type"], "tool_result");
+    assert_eq!(replayed[2]["subagent"], "coder");
+    assert_eq!(replayed[3]["type"], "thinking_delta");
     assert_eq!(replayed[3]["task_id"], "task-123");
     assert_eq!(replayed[3]["subagent"], "coder");
-    assert_eq!(replayed[3]["id"], "tool-a");
-    assert_eq!(replayed[3]["duration_ms"], 42);
+    assert_eq!(replayed[3]["content"], "internal reasoning");
+    assert_eq!(replayed[4]["type"], "task_tool");
+    assert_eq!(replayed[4]["task_id"], "task-123");
+    assert_eq!(replayed[5]["type"], "tool_output");
+    assert_eq!(replayed[5]["task_id"], "task-123");
+    assert_eq!(replayed[5]["subagent"], "coder");
+    assert_eq!(replayed[5]["id"], "tool-a");
+    assert_eq!(replayed[5]["chunk"], "partial subagent output");
+    assert_eq!(replayed[6]["type"], "tool_result");
+    assert_eq!(replayed[6]["task_id"], "task-123");
+    assert_eq!(replayed[6]["subagent"], "coder");
+    assert_eq!(replayed[6]["id"], "tool-a");
+    assert_eq!(replayed[6]["duration_ms"], 42);
     assert!(matches!(
         replay_rx.try_recv(),
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -6628,6 +7343,1194 @@ fn dispatch_live_event_ignores_stale_connection_after_rebind() {
 }
 
 #[test]
+fn best_effort_tool_output_preserves_replay_when_writer_queue_is_full() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-tool-output-backpressure-{}", now_epoch());
+    let writer_capacity = 4;
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(writer_capacity);
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &session_id,
+        1,
+        &bound_tx,
+        true,
+    ));
+    rt.block_on(dispatch_live_event(
+        state.as_ref(),
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(dispatch_live_event(
+        state.as_ref(),
+        &session_id,
+        1,
+        json!({
+            "type":"tool_call",
+            "id":"tool-1",
+            "name":"exec",
+            "arguments":"{\"command\":\"echo hi\"}",
+        }),
+    ));
+
+    rt.block_on(async {
+        state.active_runs.lock().await.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+    });
+
+    rt.block_on(async {
+        let _ = bound_rx
+            .recv()
+            .await
+            .expect("start event should have been queued");
+        let _ = bound_rx
+            .recv()
+            .await
+            .expect("tool_call event should have been queued");
+        for _ in 0..writer_capacity {
+            bound_tx
+                .send(json!({"type":"sentinel"}).to_string())
+                .await
+                .expect("sentinel should fill writer queue");
+        }
+    });
+
+    let (dummy_live_tx, _dummy_live_rx) =
+        mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let replay_ctx = LiveOutputReplayCtx {
+        state: Arc::clone(&state),
+        session_id: session_id.clone(),
+    };
+    rt.block_on(forward_tool_output_event_best_effort(
+        &dummy_live_tx,
+        json!({
+            "type":"tool_output",
+            "id":"tool-1",
+            "name":"exec",
+            "stream":"stdout",
+            "chunk":"queued output",
+        }),
+        Some(&replay_ctx),
+    ));
+
+    for _ in 0..writer_capacity {
+        assert_eq!(
+            bound_rx
+                .try_recv()
+                .expect("only the queued sentinels should remain"),
+            json!({"type":"sentinel"}).to_string()
+        );
+    }
+    assert!(matches!(
+        bound_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    rt.block_on(async {
+        let live_rounds = state.live_rounds.lock().await;
+        let round = live_rounds
+            .get(&session_id)
+            .expect("live round should remain available for replay");
+        let tool = round
+            .tools
+            .iter()
+            .find(|tool| tool.id == "tool-1")
+            .expect("tool replay state should exist");
+        assert_eq!(tool.live_output, "queued output");
+    });
+}
+
+#[test]
+fn best_effort_tool_output_retries_live_send_after_queue_recovers() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-tool-output-retry-{}", now_epoch());
+    let writer_capacity = 2;
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(writer_capacity);
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &session_id,
+        1,
+        &bound_tx,
+        true,
+    ));
+    rt.block_on(dispatch_live_event(
+        state.as_ref(),
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(dispatch_live_event(
+        state.as_ref(),
+        &session_id,
+        1,
+        json!({
+            "type":"tool_call",
+            "id":"tool-1",
+            "name":"exec",
+            "arguments":"{\"command\":\"echo hi\"}",
+        }),
+    ));
+
+    rt.block_on(async {
+        state.active_runs.lock().await.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+        let _ = bound_rx.recv().await.expect("start should be queued");
+        let _ = bound_rx.recv().await.expect("tool_call should be queued");
+        for _ in 0..writer_capacity {
+            bound_tx
+                .send(json!({"type":"sentinel"}).to_string())
+                .await
+                .expect("sentinel should fill the writer queue");
+        }
+    });
+
+    let (dummy_live_tx, _dummy_live_rx) =
+        mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let replay_ctx = LiveOutputReplayCtx {
+        state: Arc::clone(&state),
+        session_id: session_id.clone(),
+    };
+    rt.block_on(forward_tool_output_event_best_effort(
+        &dummy_live_tx,
+        json!({
+            "type":"tool_output",
+            "id":"tool-1",
+            "name":"exec",
+            "stream":"stdout",
+            "chunk":"queued output",
+        }),
+        Some(&replay_ctx),
+    ));
+
+    for _ in 0..writer_capacity {
+        assert_eq!(
+            bound_rx
+                .try_recv()
+                .expect("sentinel should still be queued"),
+            json!({"type":"sentinel"}).to_string()
+        );
+    }
+    assert!(matches!(
+        bound_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    rt.block_on(forward_tool_output_event_best_effort(
+        &dummy_live_tx,
+        json!({
+            "type":"tool_output",
+            "id":"tool-1",
+            "name":"exec",
+            "stream":"stdout",
+            "chunk":"live output",
+        }),
+        Some(&replay_ctx),
+    ));
+
+    let queued_output = serde_json::from_str::<serde_json::Value>(
+        &bound_rx
+            .try_recv()
+            .expect("pending tool output should flush once the writer recovers"),
+    )
+    .expect("queued payload should be valid json");
+    assert_eq!(queued_output["type"], "tool_output");
+    assert_eq!(queued_output["chunk"], "queued output");
+
+    let live_output = serde_json::from_str::<serde_json::Value>(
+        &bound_rx
+            .try_recv()
+            .expect("current tool output should follow the flushed backlog"),
+    )
+    .expect("live payload should be valid json");
+    assert_eq!(live_output["type"], "tool_output");
+    assert_eq!(live_output["chunk"], "live output");
+
+    rt.block_on(async {
+        let clients = state.session_clients.lock().await;
+        let binding = clients
+            .get(&session_id)
+            .expect("session client binding should exist");
+        assert!(binding.pending_events.is_empty());
+        assert!(!binding.live_send_in_progress);
+    });
+}
+
+#[test]
+fn live_dispatch_serializes_normal_events_behind_pending_tool_output_flush() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-tool-output-serialize-{}", now_epoch());
+    let writer_capacity = 2;
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(writer_capacity);
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &session_id,
+        1,
+        &bound_tx,
+        true,
+    ));
+    rt.block_on(dispatch_live_event(
+        state.as_ref(),
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(dispatch_live_event(
+        state.as_ref(),
+        &session_id,
+        1,
+        json!({
+            "type":"tool_call",
+            "id":"tool-1",
+            "name":"exec",
+            "arguments":"{\"command\":\"echo hi\"}",
+        }),
+    ));
+
+    rt.block_on(async {
+        state.active_runs.lock().await.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+        let _ = bound_rx.recv().await.expect("start should be queued");
+        let _ = bound_rx.recv().await.expect("tool_call should be queued");
+        for _ in 0..writer_capacity {
+            bound_tx
+                .send(json!({"type":"sentinel"}).to_string())
+                .await
+                .expect("sentinel should fill the writer queue");
+        }
+    });
+
+    let (dummy_live_tx, _dummy_live_rx) =
+        mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let replay_ctx = LiveOutputReplayCtx {
+        state: Arc::clone(&state),
+        session_id: session_id.clone(),
+    };
+    rt.block_on(forward_tool_output_event_best_effort(
+        &dummy_live_tx,
+        json!({
+            "type":"tool_output",
+            "id":"tool-1",
+            "name":"exec",
+            "stream":"stdout",
+            "chunk":"queued output",
+        }),
+        Some(&replay_ctx),
+    ));
+
+    for _ in 0..writer_capacity {
+        let _ = bound_rx.try_recv().expect("sentinel should still be queued");
+    }
+    assert!(matches!(
+        bound_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"tool_result",
+            "id":"tool-1",
+            "name":"exec",
+            "result":"done",
+            "duration_ms":123,
+        }),
+    ));
+
+    let flushed_output = serde_json::from_str::<serde_json::Value>(
+        &bound_rx
+            .try_recv()
+            .expect("queued tool output should flush before tool_result"),
+    )
+    .expect("flushed payload should be valid json");
+    assert_eq!(flushed_output["type"], "tool_output");
+    assert_eq!(flushed_output["chunk"], "queued output");
+
+    let tool_result = serde_json::from_str::<serde_json::Value>(
+        &bound_rx
+            .try_recv()
+            .expect("tool_result should follow flushed output"),
+    )
+    .expect("tool_result payload should be valid json");
+    assert_eq!(tool_result["type"], "tool_result");
+
+    rt.block_on(async {
+        let clients = state.session_clients.lock().await;
+        let binding = clients
+            .get(&session_id)
+            .expect("session client binding should exist");
+        assert!(binding.pending_events.is_empty());
+        assert!(!binding.live_send_in_progress);
+    });
+}
+
+#[test]
+fn best_effort_subagent_tool_output_preserves_orchestration_context_for_replay() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-subagent-tool-output-orch-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(8);
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(async {
+        state.active_runs.lock().await.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+    });
+
+    let (dummy_live_tx, _dummy_live_rx) =
+        mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let replay_ctx = LiveOutputReplayCtx {
+        state: Arc::clone(&state),
+        session_id: session_id.clone(),
+    };
+    rt.block_on(forward_tool_output_event_best_effort(
+        &dummy_live_tx,
+        json!({
+            "type":"tool_output",
+            "task_id":"orch-1:task-1",
+            "subagent":"agent-1",
+            "id":"tool-1",
+            "name":"exec",
+            "stream":"stdout",
+            "chunk":"delegated output",
+        }),
+        Some(&replay_ctx),
+    ));
+
+    rt.block_on(async {
+        let clients = state.session_clients.lock().await;
+        let binding = clients
+            .get(&session_id)
+            .expect("session client binding should exist");
+        assert_eq!(binding.pending_events.len(), 4);
+        let queued = binding.pending_events.iter().cloned().collect::<Vec<_>>();
+        assert_eq!(queued[1]["type"], "orchestrate_started");
+        assert_eq!(queued[1]["orchestrate_id"], "orch-1");
+        assert_eq!(queued[1]["synthetic"], true);
+        assert_eq!(queued[2]["type"], "orchestrate_task_started");
+        assert_eq!(queued[2]["orchestrate_id"], "orch-1");
+        assert_eq!(queued[2]["id"], "task-1");
+        assert_eq!(queued[3]["type"], "tool_output");
+        assert_eq!(queued[3]["task_id"], "orch-1:task-1");
+    });
+
+    rt.block_on(async {
+        let live_rounds = state.live_rounds.lock().await;
+        let round = live_rounds
+            .get(&session_id)
+            .expect("live round should exist");
+        assert_eq!(round.delegated_events.len(), 3);
+        assert_eq!(round.delegated_events[0]["type"], "orchestrate_started");
+        assert_eq!(round.delegated_events[0]["orchestrate_id"], "orch-1");
+        assert_eq!(round.delegated_events[0]["synthetic"], true);
+        assert_eq!(round.delegated_events[1]["type"], "orchestrate_task_started");
+        assert_eq!(round.delegated_events[1]["orchestrate_id"], "orch-1");
+        assert_eq!(round.delegated_events[1]["id"], "task-1");
+        assert_eq!(round.delegated_events[2]["type"], "tool_output");
+    });
+}
+
+#[test]
+fn synthetic_delegated_task_does_not_mark_active_without_stored_start_event() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-subagent-cap-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(8);
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(async {
+        state.active_runs.lock().await.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+        let mut live_rounds = state.live_rounds.lock().await;
+        let round = live_rounds
+            .get_mut(&session_id)
+            .expect("live round should exist");
+        round.delegated_events = (0..DELEGATED_EVENTS_CAP)
+            .map(|idx| json!({"type":"task_progress","task_id":format!("seed-{idx}")}))
+            .collect();
+    });
+
+    let (dummy_live_tx, _dummy_live_rx) =
+        mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let replay_ctx = LiveOutputReplayCtx {
+        state: Arc::clone(&state),
+        session_id: session_id.clone(),
+    };
+    rt.block_on(forward_tool_output_event_best_effort(
+        &dummy_live_tx,
+        json!({
+            "type":"tool_output",
+            "task_id":"orch-cap:task-1",
+            "subagent":"agent-1",
+            "id":"tool-1",
+            "name":"exec",
+            "stream":"stdout",
+            "chunk":"delegated output",
+        }),
+        Some(&replay_ctx),
+    ));
+
+    rt.block_on(async {
+        let live_rounds = state.live_rounds.lock().await;
+        let round = live_rounds
+            .get(&session_id)
+            .expect("live round should exist");
+        assert!(!round.active_tasks.contains("orch-cap:task-1"));
+        assert_eq!(round.delegated_events.len(), DELEGATED_EVENTS_CAP);
+    });
+}
+
+#[test]
+fn synthetic_orchestration_keeps_replayable_open_state_when_only_panel_fits() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-subagent-orch-cap-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(8);
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(async {
+        state.active_runs.lock().await.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+        let mut live_rounds = state.live_rounds.lock().await;
+        let round = live_rounds
+            .get_mut(&session_id)
+            .expect("live round should exist");
+        round.delegated_events = (0..DELEGATED_EVENTS_CAP - 1)
+            .map(|idx| json!({"type":"task_progress","task_id":format!("seed-{idx}")}))
+            .collect();
+    });
+
+    let (dummy_live_tx, _dummy_live_rx) =
+        mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let replay_ctx = LiveOutputReplayCtx {
+        state: Arc::clone(&state),
+        session_id: session_id.clone(),
+    };
+    rt.block_on(forward_tool_output_event_best_effort(
+        &dummy_live_tx,
+        json!({
+            "type":"tool_output",
+            "task_id":"orch-tight:task-1",
+            "subagent":"agent-1",
+            "id":"tool-1",
+            "name":"exec",
+            "stream":"stdout",
+            "chunk":"delegated output",
+        }),
+        Some(&replay_ctx),
+    ));
+
+    rt.block_on(async {
+        let live_rounds = state.live_rounds.lock().await;
+        let round = live_rounds
+            .get(&session_id)
+            .expect("live round should exist");
+        assert!(round.active_orchestrations.contains("orch-tight"));
+        assert!(round.active_tasks.contains("orch-tight:task-1"));
+        assert_eq!(round.delegated_events.len(), DELEGATED_EVENTS_CAP);
+        assert_eq!(
+            round.delegated_events[DELEGATED_EVENTS_CAP - 1]["type"],
+            "orchestrate_started"
+        );
+        assert_eq!(
+            round.delegated_events[DELEGATED_EVENTS_CAP - 1]["orchestrate_id"],
+            "orch-tight"
+        );
+        assert_eq!(
+            round.delegated_events[DELEGATED_EVENTS_CAP - 1]["tasks"][0]["id"],
+            "task-1"
+        );
+    });
+}
+
+#[test]
+fn best_effort_tool_output_flushes_pending_live_events_on_next_dispatch() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-tool-output-flush-{}", now_epoch());
+    let writer_capacity = 2;
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(writer_capacity);
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &session_id,
+        1,
+        &bound_tx,
+        true,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"tool_call",
+            "id":"tool-1",
+            "name":"exec",
+            "arguments":"{\"command\":\"echo hi\"}",
+        }),
+    ));
+
+    rt.block_on(async {
+        state.active_runs.lock().await.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+        let _ = bound_rx.recv().await.expect("start should be queued");
+        let _ = bound_rx.recv().await.expect("tool_call should be queued");
+        for _ in 0..writer_capacity {
+            bound_tx
+                .send(json!({"type":"sentinel"}).to_string())
+                .await
+                .expect("sentinel should fill the writer queue");
+        }
+    });
+
+    let (dummy_live_tx, _dummy_live_rx) =
+        mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let replay_ctx = LiveOutputReplayCtx {
+        state: Arc::clone(&state),
+        session_id: session_id.clone(),
+    };
+    rt.block_on(forward_tool_output_event_best_effort(
+        &dummy_live_tx,
+        json!({
+            "type":"tool_output",
+            "id":"tool-1",
+            "name":"exec",
+            "stream":"stdout",
+            "chunk":"queued output",
+        }),
+        Some(&replay_ctx),
+    ));
+
+    rt.block_on(async {
+        let clients = state.session_clients.lock().await;
+        let binding = clients
+            .get(&session_id)
+            .expect("session client binding should exist");
+        assert_eq!(binding.pending_events.len(), 1);
+    });
+
+    for _ in 0..writer_capacity {
+        assert_eq!(
+            bound_rx
+                .try_recv()
+                .expect("sentinel should still be queued"),
+            json!({"type":"sentinel"}).to_string()
+        );
+    }
+
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type":"tool_progress",
+            "id":"tool-1",
+            "name":"exec",
+            "elapsed_ms":123,
+        }),
+    ));
+
+    let flushed_output = serde_json::from_str::<serde_json::Value>(
+        &bound_rx
+            .try_recv()
+            .expect("queued tool output should flush before current event"),
+    )
+    .expect("flushed payload should be valid json");
+    assert_eq!(flushed_output["type"], "tool_output");
+    assert_eq!(flushed_output["chunk"], "queued output");
+
+    let current_event = serde_json::from_str::<serde_json::Value>(
+        &bound_rx
+            .try_recv()
+            .expect("current event should follow the flushed backlog"),
+    )
+    .expect("current payload should be valid json");
+    assert_eq!(current_event["type"], "tool_progress");
+}
+
+#[test]
+fn best_effort_tool_output_flushes_after_writer_queue_recovers_without_followup_event() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-tool-output-drain-{}", now_epoch());
+    let writer_capacity = 1;
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(writer_capacity);
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &session_id,
+        1,
+        &bound_tx,
+        true,
+    ));
+    rt.block_on(dispatch_live_event(
+        state.as_ref(),
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+
+    rt.block_on(async {
+        state.active_runs.lock().await.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+        let _ = bound_rx.recv().await.expect("start should be queued");
+        bound_tx
+            .send(json!({"type":"sentinel"}).to_string())
+            .await
+            .expect("sentinel should fill the writer queue");
+    });
+
+    let (dummy_live_tx, _dummy_live_rx) =
+        mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let replay_ctx = LiveOutputReplayCtx {
+        state: Arc::clone(&state),
+        session_id: session_id.clone(),
+    };
+
+    let forward = rt.block_on(async {
+        let state = Arc::clone(&state);
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            forward_tool_output_event_best_effort(
+                &dummy_live_tx,
+                json!({
+                    "type":"tool_output",
+                    "id":"tool-1",
+                    "name":"exec",
+                    "stream":"stdout",
+                    "chunk":"queued output",
+                }),
+                Some(&replay_ctx),
+            )
+            .await;
+            let clients = state.session_clients.lock().await;
+            let binding = clients
+                .get(&session_id)
+                .expect("session client binding should exist");
+            assert!(binding.pending_events.is_empty());
+            assert!(!binding.live_send_in_progress);
+        })
+    });
+
+    let sentinel = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+            .await
+            .expect("sentinel should arrive before timeout")
+            .expect("sentinel should be delivered")
+    });
+    assert_eq!(sentinel, json!({"type":"sentinel"}).to_string());
+
+    let flushed_tool_call = serde_json::from_str::<serde_json::Value>(
+        &rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+                .await
+                .expect("queued tool call should arrive before timeout")
+                .expect("queued tool call should be delivered")
+        }),
+    )
+    .expect("flushed tool call should be valid json");
+    assert_eq!(flushed_tool_call["type"], "tool_call");
+    assert_eq!(flushed_tool_call["id"], "tool-1");
+
+    let flushed_output = serde_json::from_str::<serde_json::Value>(
+        &rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+                .await
+                .expect("queued tool output should arrive before timeout")
+                .expect("queued tool output should be delivered")
+        }),
+    )
+    .expect("flushed payload should be valid json");
+    assert_eq!(flushed_output["type"], "tool_output");
+    assert_eq!(flushed_output["chunk"], "queued output");
+
+    rt.block_on(async {
+        forward.await.expect("forward task should complete");
+    });
+}
+
+#[test]
+fn best_effort_subagent_tool_output_synthesizes_task_started_for_replay() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-subagent-tool-output-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(4);
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(async {
+        state.active_runs.lock().await.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+    });
+
+    let (dummy_live_tx, _dummy_live_rx) =
+        mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let replay_ctx = LiveOutputReplayCtx {
+        state: Arc::clone(&state),
+        session_id: session_id.clone(),
+    };
+    rt.block_on(forward_tool_output_event_best_effort(
+        &dummy_live_tx,
+        json!({
+            "type":"tool_output",
+            "task_id":"task-1",
+            "subagent":"agent-1",
+            "id":"tool-1",
+            "name":"exec",
+            "stream":"stdout",
+            "chunk":"delegated output",
+        }),
+        Some(&replay_ctx),
+    ));
+
+    rt.block_on(async {
+        let clients = state.session_clients.lock().await;
+        let binding = clients
+            .get(&session_id)
+            .expect("session client binding should exist");
+        assert_eq!(binding.pending_events.len(), 3);
+        let queued = binding.pending_events.iter().cloned().collect::<Vec<_>>();
+        assert_eq!(queued[1]["type"], "task_started");
+        assert_eq!(queued[1]["task_id"], "task-1");
+        assert_eq!(queued[2]["type"], "tool_output");
+        assert_eq!(queued[2]["chunk"], "delegated output");
+    });
+
+    rt.block_on(async {
+        let live_rounds = state.live_rounds.lock().await;
+        let round = live_rounds
+            .get(&session_id)
+            .expect("live round should exist");
+        assert_eq!(round.delegated_events.len(), 2);
+        assert_eq!(round.delegated_events[0]["type"], "task_started");
+        assert_eq!(round.delegated_events[1]["type"], "tool_output");
+    });
+}
+
+#[test]
+fn synthetic_orchestration_growth_preserves_existing_task_agents() {
+    let first = json!({
+        "type":"tool_output",
+        "task_id":"orch-1:task-a",
+        "subagent":"agent-1",
+        "id":"tool-1",
+        "name":"exec",
+        "stream":"stdout",
+        "chunk":"output a",
+    });
+    let second = json!({
+        "type":"tool_output",
+        "task_id":"orch-1:task-b",
+        "subagent":"agent-2",
+        "id":"tool-2",
+        "name":"exec",
+        "stream":"stdout",
+        "chunk":"output b",
+    });
+    let delegated_events = vec![
+        json!({
+            "type":"orchestrate_started",
+            "orchestrate_id":"orch-1",
+            "task_count":1,
+            "layer_count":1,
+            "tasks":[{
+                "id":"task-a",
+                "agent":"agent-1",
+                "depends_on":[],
+                "prompt_preview":"",
+            }],
+            "synthetic":true,
+        }),
+        json!({
+            "type":"task_started",
+            "task_id":"orch-1:task-a",
+            "agent":"agent-1",
+            "prompt":"",
+        }),
+        first,
+    ];
+    let active_tasks = HashSet::from([
+        "orch-1:task-a".to_string(),
+        "orch-1:task-b".to_string(),
+    ]);
+
+    let synthetic = synthetic_orchestrate_started_event_for_output(
+        &second,
+        &delegated_events,
+        Some(&active_tasks),
+    )
+    .expect("synthetic orchestrate_started should be generated");
+
+    let tasks = synthetic["tasks"]
+        .as_array()
+        .expect("synthetic tasks should be an array");
+    let task_a = tasks
+        .iter()
+        .find(|task| task["id"] == "task-a")
+        .expect("task-a should be present");
+    let task_b = tasks
+        .iter()
+        .find(|task| task["id"] == "task-b")
+        .expect("task-b should be present");
+    assert_eq!(task_a["agent"], "agent-1");
+    assert_eq!(task_b["agent"], "agent-2");
+}
+
+#[test]
+fn best_effort_subagent_tool_output_replays_updated_synthetic_orchestration_to_client() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-synthetic-orchestrate-client-grow-{}", now_epoch());
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(8);
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &session_id,
+        1,
+        &bound_tx,
+        true,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(async {
+        state.active_runs.lock().await.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+    });
+
+    let (dummy_live_tx, _dummy_live_rx) =
+        mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let replay_ctx = LiveOutputReplayCtx {
+        state: Arc::clone(&state),
+        session_id: session_id.clone(),
+    };
+
+    rt.block_on(forward_tool_output_event_best_effort(
+        &dummy_live_tx,
+        json!({
+            "type":"tool_output",
+            "task_id":"orch-1:task-a",
+            "subagent":"agent-1",
+            "id":"tool-1",
+            "name":"exec",
+            "stream":"stdout",
+            "chunk":"output a",
+        }),
+        Some(&replay_ctx),
+    ));
+    rt.block_on(forward_tool_output_event_best_effort(
+        &dummy_live_tx,
+        json!({
+            "type":"tool_output",
+            "task_id":"orch-1:task-b",
+            "subagent":"agent-2",
+            "id":"tool-2",
+            "name":"exec",
+            "stream":"stdout",
+            "chunk":"output b",
+        }),
+        Some(&replay_ctx),
+    ));
+
+    let start = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+            .await
+            .expect("start event should arrive before timeout")
+            .expect("start event should be queued")
+    });
+    let first_orchestrate_started = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+            .await
+            .expect("first synthetic orchestrate_started should arrive before timeout")
+            .expect("first synthetic orchestrate_started should be queued")
+    });
+    let task_a_started = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+            .await
+            .expect("first synthetic task_started should arrive before timeout")
+            .expect("first synthetic task_started should be queued")
+    });
+    let task_a_output = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+            .await
+            .expect("first tool_output should arrive before timeout")
+            .expect("first tool_output should be queued")
+    });
+    let second_orchestrate_started = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+            .await
+            .expect("updated synthetic orchestrate_started should arrive before timeout")
+            .expect("updated synthetic orchestrate_started should be queued")
+    });
+    let task_b_started = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+            .await
+            .expect("second synthetic task_started should arrive before timeout")
+            .expect("second synthetic task_started should be queued")
+    });
+    let task_b_output = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+            .await
+            .expect("second tool_output should arrive before timeout")
+            .expect("second tool_output should be queued")
+    });
+
+    let start: serde_json::Value = serde_json::from_str(&start).expect("start should be json");
+    let first_orchestrate_started: serde_json::Value =
+        serde_json::from_str(&first_orchestrate_started).expect("first orchestrate_started should be json");
+    let task_a_started: serde_json::Value =
+        serde_json::from_str(&task_a_started).expect("task-a start should be json");
+    let task_a_output: serde_json::Value =
+        serde_json::from_str(&task_a_output).expect("task-a output should be json");
+    let second_orchestrate_started: serde_json::Value =
+        serde_json::from_str(&second_orchestrate_started).expect("second orchestrate_started should be json");
+    let task_b_started: serde_json::Value =
+        serde_json::from_str(&task_b_started).expect("task-b start should be json");
+    let task_b_output: serde_json::Value =
+        serde_json::from_str(&task_b_output).expect("task-b output should be json");
+
+    assert_eq!(start["type"], "start");
+    assert_eq!(first_orchestrate_started["type"], "orchestrate_started");
+    assert_eq!(first_orchestrate_started["task_count"], 1);
+    assert_eq!(task_a_started["type"], "orchestrate_task_started");
+    assert_eq!(task_a_started["orchestrate_id"], "orch-1");
+    assert_eq!(task_a_started["id"], "task-a");
+    assert_eq!(task_a_output["type"], "tool_output");
+    assert_eq!(second_orchestrate_started["type"], "orchestrate_started");
+    assert_eq!(second_orchestrate_started["task_count"], 2);
+    let tasks = second_orchestrate_started["tasks"]
+        .as_array()
+        .expect("updated synthetic tasks should be an array");
+    assert_eq!(tasks.len(), 2);
+    assert!(tasks.iter().any(|task| task["id"] == "task-a"));
+    assert!(tasks.iter().any(|task| task["id"] == "task-b"));
+    assert_eq!(task_b_started["type"], "orchestrate_task_started");
+    assert_eq!(task_b_started["orchestrate_id"], "orch-1");
+    assert_eq!(task_b_started["id"], "task-b");
+    assert_eq!(task_b_output["type"], "tool_output");
+    assert_eq!(task_b_output["task_id"], "orch-1:task-b");
+}
+
+#[test]
+fn best_effort_subagent_tool_output_grows_synthetic_orchestration_for_new_tasks() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-synthetic-orchestrate-grow-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(8);
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({"type":"start","round":1,"phase":"act","cycle":1,"react_visible":true}),
+    ));
+    rt.block_on(async {
+        state.active_runs.lock().await.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+    });
+
+    let (dummy_live_tx, _dummy_live_rx) =
+        mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let replay_ctx = LiveOutputReplayCtx {
+        state: Arc::clone(&state),
+        session_id: session_id.clone(),
+    };
+
+    rt.block_on(forward_tool_output_event_best_effort(
+        &dummy_live_tx,
+        json!({
+            "type":"tool_output",
+            "task_id":"orch-1:task-a",
+            "subagent":"agent-1",
+            "id":"tool-1",
+            "name":"exec",
+            "stream":"stdout",
+            "chunk":"output a",
+        }),
+        Some(&replay_ctx),
+    ));
+    rt.block_on(forward_tool_output_event_best_effort(
+        &dummy_live_tx,
+        json!({
+            "type":"tool_output",
+            "task_id":"orch-1:task-b",
+            "subagent":"agent-2",
+            "id":"tool-2",
+            "name":"exec",
+            "stream":"stdout",
+            "chunk":"output b",
+        }),
+        Some(&replay_ctx),
+    ));
+
+    rt.block_on(async {
+        let live_rounds = state.live_rounds.lock().await;
+        let round = live_rounds
+            .get(&session_id)
+            .expect("live round should exist");
+        let synthetic = round
+            .delegated_events
+            .iter()
+            .find(|event| event["type"] == "orchestrate_started")
+            .expect("synthetic orchestrate_started should exist");
+        let tasks = synthetic["tasks"]
+            .as_array()
+            .expect("synthetic tasks should be an array");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(synthetic["task_count"], 2);
+        assert!(tasks.iter().any(|task| task["id"] == "task-a"));
+        assert!(tasks.iter().any(|task| task["id"] == "task-b"));
+    });
+}
+
+#[test]
 fn dispatch_live_event_allows_active_run_source_after_rebind() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = test_app_state();
@@ -6680,6 +8583,53 @@ fn dispatch_live_event_allows_active_run_source_after_rebind() {
         .get(&session_id)
         .expect("live round should be recorded");
     assert_eq!(round.connection_id, 1);
+}
+
+#[test]
+fn dispatch_live_event_routes_non_tool_output_updates_to_rebound_client() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = test_app_state();
+    let session_id = format!("live-run-rebind-delta-{}", now_epoch());
+    let run_cancel = CancellationToken::new();
+    let (bound_tx, mut bound_rx) = mpsc::channel::<String>(4);
+
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        2,
+        &bound_tx,
+        true,
+    ));
+    {
+        let mut runs = rt.block_on(state.active_runs.lock());
+        runs.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: run_cancel,
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+    }
+
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
+            "type": "delta",
+            "content": "rebound update",
+        }),
+    ));
+
+    let payload = rt
+        .block_on(bound_rx.recv())
+        .expect("rebound client should receive delta from active run source");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&payload).expect("payload should be valid json");
+    assert_eq!(parsed["type"].as_str(), Some("delta"));
+    assert_eq!(parsed["content"].as_str(), Some("rebound update"));
 }
 
 #[test]
@@ -6796,6 +8746,7 @@ fn tool_outcome_error_detection_by_convention() {
         &test_config(),
         &reqwest::Client::new(),
         std::path::Path::new("."),
+        None,
     ));
     assert!(outcome.is_error);
 
@@ -6806,6 +8757,7 @@ fn tool_outcome_error_detection_by_convention() {
         &test_config(),
         &reqwest::Client::new(),
         std::path::Path::new("."),
+        None,
     ));
     assert!(!outcome.is_error);
     assert!(outcome.duration_ms < 1000); // should be near-instant
@@ -6828,6 +8780,7 @@ fn tool_outcome_does_not_treat_raw_tool_output_as_failure() {
         &test_config(),
         &reqwest::Client::new(),
         &workspace,
+        None,
     ));
 
     assert!(!outcome.is_error);
@@ -6846,6 +8799,7 @@ fn tool_outcome_parameter_validation() {
         &test_config(),
         &reqwest::Client::new(),
         std::path::Path::new("."),
+        None,
     ));
     assert!(outcome.is_error);
     assert!(outcome.output.contains("missing required parameter"));
@@ -7038,6 +8992,18 @@ fn truncate_safe_preserves_char_boundary() {
     let mut s = "hello".to_string();
     truncate_safe(&mut s, 100);
     assert_eq!(s, "hello");
+}
+
+#[test]
+fn merge_live_tool_output_keeps_latest_tail() {
+    let mut output = "A".repeat(LIVE_REPLAY_CAP);
+    let tail = "tail-marker".repeat(16);
+
+    merge_live_tool_output(&mut output, None, &tail);
+
+    assert!(output.starts_with("[live output truncated]\n"));
+    assert!(output.ends_with(&tail));
+    assert!(output.len() <= LIVE_REPLAY_CAP);
 }
 
 // ───── Phase 5: format_size ─────
@@ -8065,6 +10031,46 @@ fn parse_serde_error_position_returns_none_for_no_match() {
     let (line, col) = parse_serde_error_position("something went wrong");
     assert_eq!(line, None);
     assert_eq!(col, None);
+}
+
+#[test]
+fn save_session_replace_from_temp_restores_backup_on_failed_swap() {
+    let base = std::env::temp_dir().join(format!("lingclaw-session-replace-{}", now_epoch()));
+    let path = base.join("session.json");
+    let tmp_path = base.join("session.json.tmp");
+    let backup_path = base.join("session.json.lingclaw-save-backup");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(&path, "old-value").unwrap();
+
+    let err = replace_session_file_from_temp(&path, &tmp_path)
+        .expect_err("missing temp file should trigger rollback");
+
+    assert!(!err.is_empty());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "old-value");
+    assert!(!tmp_path.exists());
+    assert!(!backup_path.exists());
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[test]
+fn save_session_replace_from_temp_replaces_existing_file_with_stale_backup() {
+    let base = std::env::temp_dir().join(format!("lingclaw-session-replace-stale-backup-{}", now_epoch()));
+    let path = base.join("session.json");
+    let tmp_path = base.join("session.json.tmp");
+    let backup_path = base.join("session.json.lingclaw-save-backup");
+    std::fs::create_dir_all(&base).unwrap();
+    std::fs::write(&path, "old-value").unwrap();
+    std::fs::write(&tmp_path, "new-value").unwrap();
+    std::fs::write(&backup_path, "stale-backup").unwrap();
+
+    replace_session_file_from_temp(&path, &tmp_path).unwrap();
+
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "new-value");
+    assert!(!tmp_path.exists());
+    assert!(!backup_path.exists());
+
+    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use super::*;
+use crate::tools::exec::forward_live_chunk;
 use std::{collections::HashMap, time::Duration};
 
 fn test_config() -> Config {
@@ -34,6 +35,107 @@ fn test_config() -> Config {
     }
 }
 
+fn exec_test_workspace(name: &str) -> std::path::PathBuf {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("lingclaw-{name}-{unique}"))
+}
+
+fn failing_exec_command() -> &'static str {
+    if cfg!(windows) { "exit /b 7" } else { "exit 7" }
+}
+
+fn direct_exec_success_args() -> serde_json::Value {
+    if cfg!(windows) {
+        json!({
+            "program": "cmd",
+            "args": ["/C", "echo direct-ok"],
+        })
+    } else {
+        json!({
+            "program": "sh",
+            "args": ["-c", "printf 'direct-ok'"],
+        })
+    }
+}
+
+fn direct_exec_env_stdin_args() -> serde_json::Value {
+    if cfg!(windows) {
+        json!({
+            "program": "cmd",
+            "args": ["/V:ON", "/C", "set /p INPUT= & echo !LC_TEST_ENV!:!INPUT!"],
+            "env": {"LC_TEST_ENV": "from-env"},
+            "stdin": "from-stdin\n",
+        })
+    } else {
+        json!({
+            "program": "sh",
+            "args": ["-c", "read INPUT; printf '%s:%s' \"$LC_TEST_ENV\" \"$INPUT\""],
+            "env": {"LC_TEST_ENV": "from-env"},
+            "stdin": "from-stdin\n",
+        })
+    }
+}
+
+fn slow_exec_args() -> serde_json::Value {
+    if cfg!(windows) {
+        json!({
+            "program": "cmd",
+            "args": ["/C", "echo before & ping -n 3 127.0.0.1 >nul"],
+        })
+    } else {
+        json!({
+            "program": "sh",
+            "args": ["-c", "printf 'before\\n'; sleep 2"],
+        })
+    }
+}
+
+fn stdout_burst_args(len: usize) -> serde_json::Value {
+    let payload = "A".repeat(len);
+    if cfg!(windows) {
+        json!({
+            "program": "cmd",
+            "args": ["/C", format!("echo {payload}")],
+        })
+    } else {
+        json!({
+            "program": "sh",
+            "args": ["-c", format!("printf '%s' '{payload}'")],
+        })
+    }
+}
+
+fn stdout_payload_args(payload: &str) -> serde_json::Value {
+    if cfg!(windows) {
+        json!({
+            "program": "cmd",
+            "args": ["/C", format!("echo {payload}")],
+        })
+    } else {
+        json!({
+            "program": "sh",
+            "args": ["-c", format!("printf '%s' '{payload}'")],
+        })
+    }
+}
+
+fn stdout_and_stderr_payload_args(payload: &str) -> serde_json::Value {
+    if cfg!(windows) {
+        json!({
+            "program": "cmd",
+            "args": ["/C", format!("echo {payload} & echo {payload} 1>&2")],
+        })
+    } else {
+        json!({
+            "program": "sh",
+            "args": ["-c", format!("printf '%s' '{payload}'; printf '%s' '{payload}' 1>&2")],
+        })
+    }
+}
+
 #[test]
 fn validate_tool_args_rejects_non_object_arguments() {
     let schema = tool_parameters_read_file();
@@ -61,6 +163,73 @@ fn validate_tool_args_rejects_wrong_type_and_out_of_range() {
     )
     .expect("out-of-range value should be rejected");
     assert!(range_error.contains("must be >= 1"));
+}
+
+#[test]
+fn validate_tool_args_rejects_unexpected_exec_parameter() {
+    let schema = tool_parameters_exec();
+    let error = validate_tool_args(
+        "exec",
+        &json!({"command": "echo ok", "api_key": "secret"}),
+        &schema,
+    )
+    .expect("unexpected parameter should be rejected");
+    assert!(error.contains("unexpected parameter 'api_key'"));
+}
+
+#[test]
+fn validate_tool_args_rejects_non_string_exec_array_items_and_env_values() {
+    let schema = tool_parameters_exec();
+    let arg_error = validate_tool_args(
+        "exec",
+        &json!({"program": "git", "args": ["status", 3]}),
+        &schema,
+    )
+    .expect("non-string array item should be rejected");
+    assert!(arg_error.contains("parameter 'args[1]' must be a string"));
+
+    let env_error = validate_tool_args(
+        "exec",
+        &json!({"program": "git", "env": {"TOKEN": 7}}),
+        &schema,
+    )
+    .expect("non-string env value should be rejected");
+    assert!(env_error.contains("parameter 'env.TOKEN' must be a string"));
+}
+
+#[test]
+fn validate_tool_args_rejects_unexpected_orchestrate_task_field() {
+    let schema = orchestrate_tool_parameters();
+    let error = validate_tool_args(
+        "orchestrate",
+        &json!({
+            "tasks": [{
+                "id": "task-1",
+                "agent": "general-purpose",
+                "prompt": "Do the work.",
+                "dependsOn": ["task-0"]
+            }]
+        }),
+        &schema,
+    )
+    .expect("unexpected nested task parameter should be rejected");
+    assert!(error.contains("parameter 'tasks[0].dependsOn' is not allowed"));
+}
+
+#[test]
+fn validate_tool_args_rejects_missing_nested_required_orchestrate_task_fields() {
+    let schema = orchestrate_tool_parameters();
+    let error = validate_tool_args(
+        "orchestrate",
+        &json!({
+            "tasks": [{
+                "id": "task-1"
+            }]
+        }),
+        &schema,
+    )
+    .expect("missing nested required fields should be rejected");
+    assert!(error.contains("missing required parameter 'tasks[0].agent'"));
 }
 
 #[test]
@@ -104,6 +273,7 @@ async fn execute_tool_rejects_descending_read_file_range() {
         &test_config(),
         &reqwest::Client::new(),
         &workspace,
+        None,
     )
     .await;
 
@@ -131,6 +301,7 @@ async fn execute_tool_rejects_zero_search_results_limit() {
         &test_config(),
         &reqwest::Client::new(),
         &workspace,
+        None,
     )
     .await;
 
@@ -140,6 +311,457 @@ async fn execute_tool_rejects_zero_search_results_limit() {
             .output
             .contains("parameter 'max_results' must be >= 1")
     );
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_marks_non_zero_exec_exit_as_error() {
+    let workspace = exec_test_workspace("exec-nonzero");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let outcome = execute_tool(
+        "exec",
+        &serde_json::to_string(&json!({ "command": failing_exec_command() }))
+            .expect("args should serialize"),
+        &test_config(),
+        &reqwest::Client::new(),
+        &workspace,
+        None,
+    )
+    .await;
+
+    assert!(outcome.is_error, "non-zero exit should be marked as error");
+    assert!(
+        outcome
+            .output
+            .contains("exec error: command exited with code 7")
+    );
+    assert!(outcome.output.contains("exit code: 7"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_marks_blocked_exec_as_error() {
+    let workspace = exec_test_workspace("exec-blocked");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let outcome = execute_tool(
+        "exec",
+        r#"{"command":"rm -rf /"}"#,
+        &test_config(),
+        &reqwest::Client::new(),
+        &workspace,
+        None,
+    )
+    .await;
+
+    assert!(
+        outcome.is_error,
+        "blocked command should be marked as error"
+    );
+    assert!(outcome.output.starts_with("BLOCKED:"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_supports_direct_exec_mode() {
+    let workspace = exec_test_workspace("exec-direct");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let outcome = execute_tool(
+        "exec",
+        &serde_json::to_string(&direct_exec_success_args()).expect("args should serialize"),
+        &test_config(),
+        &reqwest::Client::new(),
+        &workspace,
+        None,
+    )
+    .await;
+
+    assert!(!outcome.is_error, "direct exec should succeed");
+    assert!(outcome.output.contains("direct-ok"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[test]
+fn forward_live_chunk_preserves_utf8_split_across_reads() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut pending = Vec::new();
+    let bytes = "你好".as_bytes();
+
+    forward_live_chunk("stdout", &bytes[..2], &mut pending, Some(tx.clone()));
+    assert!(rx.try_recv().is_err(), "incomplete utf-8 prefix should not emit yet");
+    assert_eq!(pending, bytes[..2]);
+
+    forward_live_chunk("stdout", &bytes[2..], &mut pending, Some(tx));
+    let mut combined = String::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ToolLiveEvent::ExecOutput { chunk, .. } => combined.push_str(&chunk),
+        }
+    }
+
+    assert_eq!(combined, "你好");
+    assert!(pending.is_empty());
+}
+
+#[tokio::test]
+async fn execute_tool_keeps_utf8_live_output_within_byte_budget() {
+    let workspace = exec_test_workspace("exec-live-utf8-budget");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let mut config = test_config();
+    config.max_output_bytes = 4;
+
+    let script = if cfg!(windows) {
+        json!({
+            "program": "python",
+            "args": ["-c", "import sys; sys.stdout.buffer.write('你好'.encode('utf-8')); sys.stdout.flush()"],
+        })
+    } else {
+        json!({
+            "program": "python3",
+            "args": ["-c", "import sys; sys.stdout.buffer.write('你好'.encode('utf-8')); sys.stdout.flush()"],
+        })
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let outcome = execute_tool(
+        "exec",
+        &serde_json::to_string(&script).expect("args should serialize"),
+        &config,
+        &reqwest::Client::new(),
+        &workspace,
+        Some(tx),
+    )
+    .await;
+
+    assert!(!outcome.is_error, "utf8 live-output exec should succeed");
+    let mut combined = String::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ToolLiveEvent::ExecOutput { chunk, .. } => combined.push_str(&chunk),
+        }
+    }
+    assert!(combined.len() <= config.max_output_bytes);
+    assert_eq!(combined, "你");
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_emits_complete_split_utf8_live_output() {
+    let workspace = exec_test_workspace("exec-live-split-utf8");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let script = if cfg!(windows) {
+        json!({
+            "program": "python",
+            "args": [
+                "-c",
+                "import sys, time; sys.stdout.buffer.write('你'.encode('utf-8')); sys.stdout.flush(); time.sleep(0.1); sys.stdout.buffer.write('好'.encode('utf-8')); sys.stdout.flush()"
+            ],
+        })
+    } else {
+        json!({
+            "program": "python3",
+            "args": [
+                "-c",
+                "import sys, time; sys.stdout.buffer.write('你'.encode('utf-8')); sys.stdout.flush(); time.sleep(0.1); sys.stdout.buffer.write('好'.encode('utf-8')); sys.stdout.flush()"
+            ],
+        })
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let outcome = execute_tool(
+        "exec",
+        &serde_json::to_string(&script).expect("args should serialize"),
+        &test_config(),
+        &reqwest::Client::new(),
+        &workspace,
+        Some(tx),
+    )
+    .await;
+
+    assert!(!outcome.is_error, "split utf-8 exec should succeed");
+    assert!(outcome.output.contains("你好"));
+
+    let mut combined = String::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ToolLiveEvent::ExecOutput { chunk, .. } => combined.push_str(&chunk),
+        }
+    }
+
+    assert!(combined.contains("你好"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_emits_live_exec_output_events() {
+    let workspace = exec_test_workspace("exec-live-output");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let outcome = execute_tool(
+        "exec",
+        &serde_json::to_string(&direct_exec_success_args()).expect("args should serialize"),
+        &test_config(),
+        &reqwest::Client::new(),
+        &workspace,
+        Some(tx),
+    )
+    .await;
+
+    assert!(!outcome.is_error, "direct exec should succeed");
+    let mut chunks = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ToolLiveEvent::ExecOutput { chunk, .. } => chunks.push(chunk),
+        }
+    }
+    assert!(
+        chunks.iter().any(|chunk| chunk.contains("direct-ok")),
+        "live output should include command stdout"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_supports_exec_env_and_stdin() {
+    let workspace = exec_test_workspace("exec-env-stdin");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let outcome = execute_tool(
+        "exec",
+        &serde_json::to_string(&direct_exec_env_stdin_args()).expect("args should serialize"),
+        &test_config(),
+        &reqwest::Client::new(),
+        &workspace,
+        None,
+    )
+    .await;
+
+    assert!(!outcome.is_error, "exec with env/stdin should succeed");
+    assert!(outcome.output.contains("from-env:from-stdin"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_rejects_mixed_exec_modes() {
+    let workspace = exec_test_workspace("exec-mixed-modes");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let outcome = execute_tool(
+        "exec",
+        r#"{"command":"echo hi","program":"cmd"}"#,
+        &test_config(),
+        &reqwest::Client::new(),
+        &workspace,
+        None,
+    )
+    .await;
+
+    assert!(outcome.is_error);
+    assert!(outcome.output.contains("use either 'command' or 'program'"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_reports_exec_timeout_with_partial_output() {
+    let workspace = exec_test_workspace("exec-timeout");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let mut config = test_config();
+    config.exec_timeout = Duration::from_millis(200);
+
+    let outcome = execute_tool(
+        "exec",
+        &serde_json::to_string(&slow_exec_args()).expect("args should serialize"),
+        &config,
+        &reqwest::Client::new(),
+        &workspace,
+        None,
+    )
+    .await;
+
+    assert!(outcome.is_error);
+    assert!(outcome.output.contains("command timed out"));
+    assert!(outcome.output.contains("--- stdout ---"));
+    assert!(outcome.output.contains("before"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_caps_live_exec_output_to_budget() {
+    let workspace = exec_test_workspace("exec-live-budget");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let mut config = test_config();
+    config.max_output_bytes = 512;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let outcome = execute_tool(
+        "exec",
+        &serde_json::to_string(&stdout_burst_args(1_500)).expect("args should serialize"),
+        &config,
+        &reqwest::Client::new(),
+        &workspace,
+        Some(tx),
+    )
+    .await;
+
+    assert!(!outcome.is_error, "bounded live-output exec should succeed");
+    let mut combined = String::new();
+    while let Ok(event) = rx.try_recv() {
+        match event {
+            ToolLiveEvent::ExecOutput { chunk, .. } => combined.push_str(&chunk),
+        }
+    }
+    assert!(
+        combined.len() <= config.max_output_bytes,
+        "live output should respect max_output_bytes"
+    );
+    assert!(
+        !combined.is_empty(),
+        "live output should still forward initial bytes"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_uses_full_capture_budget_for_single_stream_output() {
+    let workspace = exec_test_workspace("exec-single-stream-budget");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let mut config = test_config();
+    config.max_output_bytes = 640;
+    let payload = "A".repeat(240);
+    let outcome = execute_tool(
+        "exec",
+        &serde_json::to_string(&stdout_burst_args(payload.len())).expect("args should serialize"),
+        &config,
+        &reqwest::Client::new(),
+        &workspace,
+        None,
+    )
+    .await;
+
+    assert!(!outcome.is_error, "stdout-only exec should succeed");
+    assert!(
+        outcome.output.contains(&payload),
+        "stdout-only exec should use the full shared capture budget"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_keeps_recent_tail_when_capture_budget_is_exceeded() {
+    let workspace = exec_test_workspace("exec-tail-capture-budget");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let mut config = test_config();
+    config.max_output_bytes = 320;
+    let payload = format!("{}TAIL-MARKER", "A".repeat(400));
+    let outcome = execute_tool(
+        "exec",
+        &serde_json::to_string(&stdout_payload_args(&payload)).expect("args should serialize"),
+        &config,
+        &reqwest::Client::new(),
+        &workspace,
+        None,
+    )
+    .await;
+
+    assert!(!outcome.is_error, "stdout-only exec should succeed");
+    let stdout_section = outcome
+        .output
+        .split("--- stdout ---\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n--- stderr ---").next())
+        .expect("stdout section should exist");
+    assert!(stdout_section.contains("[truncated]"));
+    assert!(stdout_section.contains("TAIL-MARKER"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_caps_combined_stdout_and_stderr_output_to_budget() {
+    let workspace = exec_test_workspace("exec-combined-stream-budget");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let mut config = test_config();
+    config.max_output_bytes = 320;
+    let payload = "B".repeat(220);
+    let outcome = execute_tool(
+        "exec",
+        &serde_json::to_string(&stdout_and_stderr_payload_args(&payload)).expect("args should serialize"),
+        &config,
+        &reqwest::Client::new(),
+        &workspace,
+        None,
+    )
+    .await;
+
+    assert!(!outcome.is_error, "dual-stream exec should succeed");
+    assert!(
+        outcome.output.len() <= config.max_output_bytes,
+        "combined exec output should respect max_output_bytes"
+    );
+    assert!(outcome.output.contains("--- stdout ---"));
+    assert!(outcome.output.contains("--- stderr ---"));
+    assert!(outcome.output.contains("[truncated]"));
 
     let _ = tokio::fs::remove_dir_all(&workspace).await;
 }
@@ -357,4 +979,79 @@ fn build_tool_execution_trace_covers_builtins_and_special_tools() {
     .expect("orchestrate trace should exist");
     assert_eq!(orchestrate.summary(), Some("orchestrate 2 delegated tasks"));
     assert_eq!(orchestrate.task_count, Some(2));
+}
+
+#[test]
+fn build_tool_execution_trace_supports_direct_exec_mode() {
+    let exec = build_tool_execution_trace(
+        TOOL_NAME_EXEC,
+        Some(r#"{"program":"cargo","args":["test","--workspace"],"working_dir":"frontend"}"#),
+    )
+    .expect("exec trace should exist");
+    assert_eq!(
+        exec.summary(),
+        Some("run `cargo test --workspace` in `frontend`")
+    );
+    assert_eq!(exec.command.as_deref(), Some("cargo test --workspace"));
+}
+
+#[test]
+fn display_tool_arguments_redacts_exec_secrets() {
+    let rendered = display_tool_arguments(
+        TOOL_NAME_EXEC,
+        r#"{"command":"curl -H \"Authorization: Bearer super-secret\" --api-key \"key-123\" TOKEN=\"value\" --secret 'quoted-secret'","working_dir":"src"}"#,
+    );
+
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("super-secret"));
+    assert!(!rendered.contains("key-123"));
+    assert!(!rendered.contains("TOKEN=\"value\""));
+    assert!(!rendered.contains("quoted-secret"));
+
+    let rendered = display_tool_arguments(
+        TOOL_NAME_EXEC,
+        r#"{"command":"echo ok","apiKey":"key-123","nested":{"access_token":"token-456"},"notes":"Authorization: Bearer super-secret"}"#,
+    );
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("key-123"));
+    assert!(!rendered.contains("token-456"));
+    assert!(!rendered.contains("super-secret"));
+
+    let rendered = display_tool_arguments(
+        TOOL_NAME_EXEC,
+        r#"{"stdin":"sk-live-1234567890abcdefghijklmnop","body":{"token":"ghp_supersecretvalue","note":"keep this note"}}"#,
+    );
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("sk-live-1234567890abcdefghijklmnop"));
+    assert!(!rendered.contains("ghp_supersecretvalue"));
+    assert!(rendered.contains("keep this note"));
+
+    let rendered = display_tool_arguments(
+        TOOL_NAME_EXEC,
+        r#""curl -H \"Authorization: Bearer super-secret\" --api-key \"key-123\"""#,
+    );
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("super-secret"));
+    assert!(!rendered.contains("key-123"));
+
+    let rendered =
+        display_tool_arguments(TOOL_NAME_EXEC, r#""sk-live-1234567890abcdefghijklmnop""#);
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("sk-live-1234567890abcdefghijklmnop"));
+
+    let sha_like = "0123456789abcdef0123456789abcdef01234567";
+    let rendered = display_tool_arguments(TOOL_NAME_EXEC, &format!(r#""{sha_like}""#));
+    assert!(!rendered.contains("[REDACTED]"));
+    assert!(rendered.contains(sha_like));
+
+    let rendered = display_tool_arguments(
+        TOOL_NAME_EXEC,
+        r#"{"program":"curl","args":["-H","Authorization: Bearer super-secret","--api-key","key-123","--token","token-456","--password","quoted-secret","https://example.com"]}"#,
+    );
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("super-secret"));
+    assert!(!rendered.contains("key-123"));
+    assert!(!rendered.contains("token-456"));
+    assert!(!rendered.contains("quoted-secret"));
+    assert!(rendered.contains("https://example.com"));
 }

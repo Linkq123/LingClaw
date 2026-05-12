@@ -50,6 +50,12 @@ export interface SessionEvent {
   id: string;
   name?: string;
   capabilities?: { image?: boolean; s3?: boolean };
+  usage?: {
+    daily_input?: number;
+    daily_output?: number;
+    total_input?: number;
+    total_output?: number;
+  };
   show_tools?: boolean;
   show_reasoning?: boolean;
 }
@@ -78,6 +84,16 @@ export interface ToolProgressEvent {
   elapsed_ms?: number;
 }
 
+export interface ToolOutputEvent {
+  type: 'tool_output';
+  id: string;
+  name?: string;
+  stream?: 'stdout' | 'stderr';
+  chunk: string;
+  subagent?: string;
+  task_id?: string;
+}
+
 export interface ToolResultEvent {
   type: 'tool_result';
   name: string;
@@ -92,6 +108,7 @@ export interface ToolResultEvent {
 export interface TaskEvent {
   type: 'task_started' | 'task_progress' | 'task_tool' | 'task_completed' | 'task_failed';
   agent: string;
+  id?: string;
   task_id?: string;
   prompt?: string;
   cycle?: number;
@@ -131,13 +148,19 @@ export interface ViewStateEvent {
 }
 export interface ThinkingStartEvent {
   type: 'thinking_start';
+  subagent?: string;
+  task_id?: string;
 }
 export interface ThinkingDeltaEvent {
   type: 'thinking_delta';
   content: string;
+  subagent?: string;
+  task_id?: string;
 }
 export interface ThinkingDoneEvent {
   type: 'thinking_done';
+  subagent?: string;
+  task_id?: string;
 }
 export interface ContextCompressedEvent {
   type: 'context_compressed';
@@ -191,14 +214,22 @@ export interface UsageEvent {
 export interface OrchestrateStartedEvent {
   type: 'orchestrate_started';
   orchestrate_id: string;
-  plan: { id: string; agent: string; prompt: string; depends_on?: string[] }[];
+  task_count?: number;
+  layer_count?: number;
+  tasks: {
+    id: string;
+    agent: string;
+    depends_on?: string[];
+    prompt_preview?: string;
+  }[];
 }
 
 export interface OrchestrateLayerEvent {
   type: 'orchestrate_layer';
   orchestrate_id: string;
   layer: number;
-  task_ids: string[];
+  total_layers?: number;
+  tasks: string[];
 }
 
 export interface OrchestrateTaskEvent {
@@ -208,8 +239,10 @@ export interface OrchestrateTaskEvent {
     | 'orchestrate_task_failed'
     | 'orchestrate_task_skipped';
   orchestrate_id: string;
-  task_id: string;
+  id: string;
   agent?: string;
+  prompt?: string;
+  reason?: string;
   result_preview?: string;
   result_excerpt?: string;
   error?: string;
@@ -223,6 +256,14 @@ export interface OrchestrateTaskEvent {
 export interface OrchestrateCompletedEvent {
   type: 'orchestrate_completed';
   orchestrate_id: string;
+  completed?: number;
+  failed?: number;
+  skipped?: number;
+  total_tasks?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+  duration_ms?: number;
+  aborted?: boolean;
 }
 
 export type WebSocketMessage =
@@ -231,6 +272,7 @@ export type WebSocketMessage =
   | DeltaEvent
   | ToolCallEvent
   | ToolProgressEvent
+  | ToolOutputEvent
   | ToolResultEvent
   | TaskEvent
   | SystemEvent

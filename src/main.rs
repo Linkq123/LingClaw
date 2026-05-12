@@ -92,7 +92,7 @@ use session_store::{
     subagent_snapshot_storage_key, trim_incomplete_tool_calls,
     trim_incomplete_tool_calls_in_session,
 };
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const MAIN_SESSION_ID: &str = "main";
@@ -543,7 +543,8 @@ struct SessionClientBinding {
     connection_id: u64,
     tx: WsTx,
     replay_ready: bool,
-    pending_events: Vec<serde_json::Value>,
+    pending_events: VecDeque<serde_json::Value>,
+    live_send_in_progress: bool,
 }
 
 #[derive(Clone)]
@@ -580,6 +581,7 @@ struct LiveToolState {
     id: String,
     name: String,
     arguments: String,
+    live_output: String,
     result: Option<String>,
     elapsed_ms: u64,
 }
@@ -653,6 +655,128 @@ fn truncated_live_tool_result_event(event: &serde_json::Value) -> serde_json::Va
     truncated
 }
 
+fn merge_live_tool_output(current: &mut String, stream: Option<&str>, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+
+    if stream == Some("stderr") {
+        current.push_str("\n[stderr]\n");
+    }
+    current.push_str(chunk);
+    truncate_keep_tail_safe(current, LIVE_REPLAY_CAP, "[live output truncated]\n");
+}
+
+fn synthetic_tool_call_event_for_output(event: &serde_json::Value) -> Option<serde_json::Value> {
+    let tool_id = event["id"].as_str().filter(|value| !value.is_empty())?;
+    let tool_name = event["name"].as_str().unwrap_or_default();
+    Some(json!({
+        "type": "tool_call",
+        "id": tool_id,
+        "name": tool_name,
+        "arguments": "",
+        "synthetic": true,
+    }))
+}
+
+fn synthetic_task_started_event_for_output(event: &serde_json::Value) -> Option<serde_json::Value> {
+    let task_id = event["task_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())?;
+    let agent = event["subagent"]
+        .as_str()
+        .filter(|value| !value.is_empty())?;
+    if let Some((orchestrate_id, orchestrate_task_id)) = task_id.split_once(':')
+        && !orchestrate_id.is_empty()
+        && !orchestrate_task_id.is_empty()
+    {
+        return Some(json!({
+            "type": "orchestrate_task_started",
+            "orchestrate_id": orchestrate_id,
+            "id": orchestrate_task_id,
+            "agent": agent,
+            "prompt": "",
+        }));
+    }
+    Some(json!({
+        "type": "task_started",
+        "task_id": task_id,
+        "agent": agent,
+        "prompt": "",
+    }))
+}
+
+fn synthetic_orchestrate_started_event_for_output(
+    event: &serde_json::Value,
+    delegated_events: &[serde_json::Value],
+    existing_tasks: Option<&HashSet<String>>,
+) -> Option<serde_json::Value> {
+    let task_id = event["task_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())?;
+    let (orchestrate_id, orchestrate_task_id) = task_id.split_once(':')?;
+    if orchestrate_id.is_empty() || orchestrate_task_id.is_empty() {
+        return None;
+    }
+    let agent = event["subagent"]
+        .as_str()
+        .filter(|value| !value.is_empty())?;
+
+    let mut tasks = existing_tasks
+        .into_iter()
+        .flat_map(|items| items.iter())
+        .filter_map(|task_key| {
+            let (existing_orchestrate_id, existing_task_id) = task_key.split_once(':')?;
+            if existing_orchestrate_id != orchestrate_id || existing_task_id.is_empty() {
+                return None;
+            }
+            let existing_agent = delegated_events
+                .iter()
+                .rev()
+                .find(|event| {
+                    (event["type"] == "task_started" || event["type"] == "orchestrate_task_started")
+                        && live_task_key_from_event(event).as_deref() == Some(task_key)
+                })
+                .and_then(|event| event["agent"].as_str())
+                .or_else(|| {
+                    delegated_events
+                        .iter()
+                        .rev()
+                        .find(|event| {
+                            event["type"] == "tool_output"
+                                && live_task_key_from_event(event).as_deref() == Some(task_key)
+                        })
+                        .and_then(|event| event["subagent"].as_str())
+                })
+                .unwrap_or(agent);
+            Some(json!({
+                "id": existing_task_id,
+                "agent": existing_agent,
+                "depends_on": [],
+                "prompt_preview": "",
+            }))
+        })
+        .collect::<Vec<_>>();
+
+    if !tasks.iter().any(|task| task["id"] == orchestrate_task_id) {
+        tasks.push(json!({
+            "id": orchestrate_task_id,
+            "agent": agent,
+            "depends_on": [],
+            "prompt_preview": "",
+        }));
+    }
+
+    Some(json!({
+        "type": "orchestrate_started",
+        "orchestrate_id": orchestrate_id,
+        "task_count": tasks.len(),
+        "layer_count": 1,
+        "tasks": tasks,
+        "synthetic": true,
+    }))
+}
+
 /// Truncate `s` in place at the last valid UTF-8 char boundary ≤ `max`.
 fn truncate_safe(s: &mut String, max: usize) {
     if s.len() > max {
@@ -662,6 +786,29 @@ fn truncate_safe(s: &mut String, max: usize) {
         }
         s.truncate(end);
     }
+}
+
+fn truncate_keep_tail_safe(s: &mut String, max: usize, prefix: &str) {
+    if s.len() <= max {
+        return;
+    }
+
+    let prefix = prefix.as_bytes();
+    if prefix.len() >= max {
+        truncate_safe(s, max);
+        return;
+    }
+
+    let keep = max - prefix.len();
+    let mut start = s.len().saturating_sub(keep);
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+
+    let tail = s[start..].to_string();
+    s.clear();
+    s.push_str(std::str::from_utf8(prefix).unwrap_or_default());
+    s.push_str(&tail);
 }
 
 /// Cap for replay buffer strings (128 KB). Keeps memory bounded for long outputs.
@@ -1414,6 +1561,13 @@ fn matches_glob(name: &str, pattern: &str) -> bool {
 
 pub(crate) type WsTx = mpsc::Sender<String>;
 pub(crate) type LiveTx = mpsc::Sender<serde_json::Value>;
+pub(crate) const LIVE_EVENT_CHANNEL_CAPACITY: usize = 256;
+
+#[derive(Clone)]
+pub(crate) struct LiveOutputReplayCtx {
+    pub(crate) state: Arc<AppState>,
+    pub(crate) session_id: String,
+}
 
 pub(crate) async fn ws_send(tx: &WsTx, data: &serde_json::Value) -> bool {
     tx.send(data.to_string()).await.is_ok()
@@ -1421,6 +1575,328 @@ pub(crate) async fn ws_send(tx: &WsTx, data: &serde_json::Value) -> bool {
 
 pub(crate) async fn live_send(tx: &LiveTx, data: serde_json::Value) -> bool {
     tx.send(data).await.is_ok()
+}
+
+pub(crate) async fn forward_tool_output_event_best_effort(
+    live_tx: &LiveTx,
+    event: serde_json::Value,
+    replay_ctx: Option<&LiveOutputReplayCtx>,
+) {
+    if let Some(replay_ctx) = replay_ctx {
+        record_tool_output_event_for_replay_and_client(
+            replay_ctx.state.as_ref(),
+            &replay_ctx.session_id,
+            event,
+        )
+        .await;
+    } else {
+        let _ = live_tx.try_send(event);
+    }
+}
+
+async fn queue_live_client_events(
+    state: &AppState,
+    session_id: &str,
+    events: Vec<serde_json::Value>,
+) -> Option<(u64, WsTx, Vec<serde_json::Value>)> {
+    let mut clients = state.session_clients.lock().await;
+    let Some(binding) = clients.get_mut(session_id) else {
+        return None;
+    };
+
+    queue_live_client_events_for_binding(binding, events)
+}
+
+fn queue_live_client_events_for_binding(
+    binding: &mut SessionClientBinding,
+    events: Vec<serde_json::Value>,
+) -> Option<(u64, WsTx, Vec<serde_json::Value>)> {
+    if !binding.replay_ready {
+        binding.pending_events.extend(events);
+        return None;
+    }
+
+    if binding.live_send_in_progress {
+        binding.pending_events.extend(events);
+        return None;
+    }
+
+    if binding.pending_events.is_empty() {
+        if events.is_empty() {
+            return None;
+        }
+        binding.live_send_in_progress = true;
+        return Some((binding.connection_id, binding.tx.clone(), events));
+    }
+
+    let mut queued = std::mem::take(&mut binding.pending_events);
+    queued.extend(events);
+    binding.live_send_in_progress = true;
+    Some((binding.connection_id, binding.tx.clone(), queued.into_iter().collect()))
+}
+
+async fn flush_queued_live_client_events(
+    state: &AppState,
+    session_id: &str,
+    connection_id: u64,
+) {
+    loop {
+        let next_batch = {
+            let mut clients = state.session_clients.lock().await;
+            let Some(binding) = clients.get_mut(session_id) else {
+                return;
+            };
+            if binding.connection_id != connection_id {
+                return;
+            }
+            if binding.live_send_in_progress || binding.pending_events.is_empty() || !binding.replay_ready
+            {
+                return;
+            }
+            binding.live_send_in_progress = true;
+            Some((
+                binding.tx.clone(),
+                binding.pending_events.drain(..).collect::<Vec<_>>(),
+            ))
+        };
+
+        let Some((tx, events)) = next_batch else {
+            return;
+        };
+
+        let mut unsent_start = 0usize;
+        while unsent_start < events.len() {
+            let payload = events[unsent_start].to_string();
+            match tx.try_send(payload.clone()) {
+                Ok(()) => {
+                    unsent_start += 1;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    if tx.send(payload).await.is_err() {
+                        unbind_session_connection_if_matches(state, session_id, connection_id).await;
+                        return;
+                    }
+                    unsent_start += 1;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    unbind_session_connection_if_matches(state, session_id, connection_id).await;
+                    return;
+                }
+            }
+        }
+
+        let mut clients = state.session_clients.lock().await;
+        let Some(binding) = clients.get_mut(session_id) else {
+            return;
+        };
+        if binding.connection_id != connection_id {
+            return;
+        }
+        binding.live_send_in_progress = false;
+    }
+}
+
+async fn finish_live_client_send(
+    state: &AppState,
+    session_id: &str,
+    connection_id: u64,
+    unsent_events: Vec<serde_json::Value>,
+) {
+    let should_flush = {
+        let mut clients = state.session_clients.lock().await;
+        let Some(binding) = clients.get_mut(session_id) else {
+            return;
+        };
+        if binding.connection_id != connection_id {
+            return;
+        }
+        binding.live_send_in_progress = false;
+        if !unsent_events.is_empty() {
+            let mut remainder: VecDeque<serde_json::Value> = unsent_events.into();
+            remainder.append(&mut binding.pending_events);
+            binding.pending_events = remainder;
+            false
+        } else {
+            !binding.pending_events.is_empty() && binding.replay_ready
+        }
+    };
+
+    if should_flush {
+        flush_queued_live_client_events(state, session_id, connection_id).await;
+    }
+}
+
+async fn requeue_live_client_events(
+    state: &AppState,
+    session_id: &str,
+    connection_id: u64,
+    events: Vec<serde_json::Value>,
+) {
+    if events.is_empty() {
+        return;
+    }
+
+    finish_live_client_send(state, session_id, connection_id, events).await;
+    flush_queued_live_client_events(state, session_id, connection_id).await;
+}
+
+async fn take_live_client_events_for_send(
+    state: &AppState,
+    session_id: &str,
+    connection_id: u64,
+    event: serde_json::Value,
+) -> Option<(u64, WsTx, Vec<serde_json::Value>)> {
+    let mut clients = state.session_clients.lock().await;
+    let Some(binding) = clients.get_mut(session_id) else {
+        return None;
+    };
+    if binding.connection_id != connection_id {
+        return None;
+    }
+
+    queue_live_client_events_for_binding(binding, vec![event])
+}
+
+async fn record_tool_output_event_for_replay_and_client(
+    state: &AppState,
+    session_id: &str,
+    event: serde_json::Value,
+) {
+    let mut client_events: Vec<serde_json::Value> = Vec::new();
+    let source_connection_id = {
+        let active_runs = state.active_runs.lock().await;
+        active_runs
+            .get(session_id)
+            .map(|binding| binding.connection_id)
+    };
+    let source_connection_id = if source_connection_id.is_some() {
+        source_connection_id
+    } else {
+        let live_rounds = state.live_rounds.lock().await;
+        live_rounds.get(session_id).map(|round| round.connection_id)
+    };
+
+    if let Some(connection_id) = source_connection_id {
+        let mut live_rounds = state.live_rounds.lock().await;
+        if let Some(round) = live_rounds.get_mut(session_id)
+            && round.connection_id == connection_id
+        {
+            if is_subagent_live_event(&event) {
+                if let Some(task_key) = live_task_key_from_event(&event) {
+                    if !round.active_tasks.contains(&task_key) {
+                        let start_event = synthetic_task_started_event_for_output(&event);
+                        let can_store_task_start = round.delegated_events.len() < DELEGATED_EVENTS_CAP;
+                        let mut recorded_orchestrate_start = false;
+                        if let Some(orchestrate_started_event) =
+                            synthetic_orchestrate_started_event_for_output(
+                                &event,
+                                &round.delegated_events,
+                                Some(&round.active_tasks),
+                            )
+                        {
+                            let orchestrate_id = orchestrate_started_event["orchestrate_id"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_string();
+                            if !orchestrate_id.is_empty()
+                                && round.delegated_events.len() + usize::from(can_store_task_start)
+                                    <= DELEGATED_EVENTS_CAP
+                            {
+                                if let Some(existing) = round.delegated_events.iter_mut().rev().find(|existing| {
+                                    existing["type"] == "orchestrate_started"
+                                        && existing["synthetic"].as_bool().unwrap_or(false)
+                                        && existing["orchestrate_id"].as_str() == Some(orchestrate_id.as_str())
+                                }) {
+                                    *existing = orchestrate_started_event.clone();
+                                    client_events.push(orchestrate_started_event);
+                                } else {
+                                    round.active_orchestrations.insert(orchestrate_id);
+                                    round.delegated_events.push(orchestrate_started_event.clone());
+                                    client_events.push(orchestrate_started_event);
+                                    recorded_orchestrate_start = true;
+                                }
+                            }
+                        }
+                        if let Some(start_event) = start_event
+                            && can_store_task_start
+                            && round.delegated_events.len() < DELEGATED_EVENTS_CAP
+                        {
+                            round.active_tasks.insert(task_key.clone());
+                            round.delegated_events.push(start_event.clone());
+                            client_events.push(start_event);
+                        } else if recorded_orchestrate_start {
+                            round.active_tasks.insert(task_key);
+                        }
+                    }
+                    if round.delegated_events.len() < DELEGATED_EVENTS_CAP {
+                        round.delegated_events.push(event.clone());
+                    }
+                }
+            } else if !is_subagent_live_event(&event) {
+                let tool_id = event["id"].as_str().unwrap_or_default();
+                let chunk = event["chunk"].as_str().unwrap_or_default();
+                let stream = event["stream"].as_str();
+                if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
+                    merge_live_tool_output(&mut tool.live_output, stream, chunk);
+                    if tool.arguments.is_empty() {
+                        if let Some(tool_call_event) = synthetic_tool_call_event_for_output(&event) {
+                            client_events.push(tool_call_event);
+                        }
+                    }
+                } else {
+                    if let Some(tool_call_event) = synthetic_tool_call_event_for_output(&event) {
+                        client_events.push(tool_call_event);
+                    }
+                    let mut live_output = String::new();
+                    merge_live_tool_output(&mut live_output, stream, chunk);
+                    round.tools.push(LiveToolState {
+                        id: tool_id.to_string(),
+                        name: event["name"].as_str().unwrap_or_default().to_string(),
+                        arguments: String::new(),
+                        live_output,
+                        result: None,
+                        elapsed_ms: 0,
+                    });
+                }
+            }
+        }
+    }
+
+    client_events.push(event);
+
+    if let Some((connection_id, tx, events)) =
+        queue_live_client_events(state, session_id, client_events).await
+    {
+        let mut unsent_start = 0usize;
+        while unsent_start < events.len() {
+            let payload = events[unsent_start].to_string();
+            match tx.try_send(payload) {
+                Ok(()) => {
+                    unsent_start += 1;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    requeue_live_client_events(
+                        state,
+                        session_id,
+                        connection_id,
+                        events[unsent_start..].to_vec(),
+                    )
+                    .await;
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    unbind_session_connection_if_matches(state, session_id, connection_id).await;
+                    break;
+                }
+            }
+        }
+        if unsent_start == events.len() {
+            finish_live_client_send(state, session_id, connection_id, Vec::new()).await;
+            return;
+        }
+    } else {
+        return;
+    }
 }
 
 async fn bind_session_connection(
@@ -1441,13 +1917,14 @@ async fn bind_session_connection(
             connection_id,
             tx: tx.clone(),
             replay_ready,
-            pending_events: Vec::new(),
+            pending_events: VecDeque::new(),
+            live_send_in_progress: false,
         },
     );
 }
 
 async fn finish_session_replay(state: &AppState, session_id: &str, connection_id: u64) {
-    let (tx, pending_events) = {
+    let should_flush = {
         let mut clients = state.session_clients.lock().await;
         let Some(binding) = clients.get_mut(session_id) else {
             return;
@@ -1457,17 +1934,11 @@ async fn finish_session_replay(state: &AppState, session_id: &str, connection_id
         }
 
         binding.replay_ready = true;
-        (
-            binding.tx.clone(),
-            std::mem::take(&mut binding.pending_events),
-        )
+        !binding.live_send_in_progress && !binding.pending_events.is_empty()
     };
 
-    for event in pending_events {
-        if !ws_send(&tx, &event).await {
-            unbind_session_connection_if_matches(state, session_id, connection_id).await;
-            break;
-        }
+    if should_flush {
+        flush_queued_live_client_events(state, session_id, connection_id).await;
     }
 }
 
@@ -1506,22 +1977,24 @@ async fn dispatch_live_event(
         live_rounds.get(session_id).map(|round| round.connection_id)
     };
 
-    // Validate connection ownership and update live replay state under a single
-    // critical section. Reconnected pages may receive events from the original
-    // run owner while a newer socket is bound for rendering, including run
-    // teardown after the active_runs entry has already been removed.
-    let binding = {
-        let mut clients_guard = state.session_clients.lock().await;
-        let current_connection_id = clients_guard
+    // Validate connection ownership first, then update live replay state.
+    // Keep session_clients and live_rounds lock acquisition ordered and
+    // non-overlapping so live tool-output updates cannot deadlock with normal
+    // websocket event processing.
+    let current_connection_id = {
+        let clients_guard = state.session_clients.lock().await;
+        clients_guard
             .get(session_id)
-            .map(|binding| binding.connection_id);
-        let is_current = current_connection_id == Some(connection_id);
-        let is_active_run_source = active_run_connection_id == Some(connection_id);
-        let is_live_round_source = live_round_connection_id == Some(connection_id);
-        if !(is_current || is_active_run_source || is_live_round_source) {
-            return;
-        }
+            .map(|binding| binding.connection_id)
+    };
+    let is_current = current_connection_id == Some(connection_id);
+    let is_active_run_source = active_run_connection_id == Some(connection_id);
+    let is_live_round_source = live_round_connection_id == Some(connection_id);
+    if !(is_current || is_active_run_source || is_live_round_source) {
+        return;
+    }
 
+    {
         let mut live_rounds = state.live_rounds.lock().await;
 
         match event_type {
@@ -1592,29 +2065,48 @@ async fn dispatch_live_event(
             "thinking_start" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
-                    && !is_subagent_live_event(&event)
                 {
-                    round.reasoning_text.clear();
-                    round.reasoning_done = false;
+                    if is_subagent_live_event(&event)
+                        && let Some(task_key) = live_task_key_from_event(&event)
+                        && round.active_tasks.contains(&task_key)
+                    {
+                        delegated_replay_event = Some(event.clone());
+                    } else if !is_subagent_live_event(&event) {
+                        round.reasoning_text.clear();
+                        round.reasoning_done = false;
+                    }
                 }
             }
             "thinking_delta" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
-                    && !is_subagent_live_event(&event)
-                    && let Some(content) = event["content"].as_str()
-                    && round.reasoning_text.len() < LIVE_REPLAY_CAP
                 {
-                    round.reasoning_text.push_str(content);
-                    truncate_safe(&mut round.reasoning_text, LIVE_REPLAY_CAP);
+                    if is_subagent_live_event(&event)
+                        && let Some(task_key) = live_task_key_from_event(&event)
+                        && round.active_tasks.contains(&task_key)
+                    {
+                        delegated_replay_event = Some(event.clone());
+                    } else if !is_subagent_live_event(&event)
+                        && let Some(content) = event["content"].as_str()
+                        && round.reasoning_text.len() < LIVE_REPLAY_CAP
+                    {
+                        round.reasoning_text.push_str(content);
+                        truncate_safe(&mut round.reasoning_text, LIVE_REPLAY_CAP);
+                    }
                 }
             }
             "thinking_done" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
-                    && !is_subagent_live_event(&event)
                 {
-                    round.reasoning_done = true;
+                    if is_subagent_live_event(&event)
+                        && let Some(task_key) = live_task_key_from_event(&event)
+                        && round.active_tasks.contains(&task_key)
+                    {
+                        delegated_replay_event = Some(event.clone());
+                    } else if !is_subagent_live_event(&event) {
+                        round.reasoning_done = true;
+                    }
                 }
             }
             "tool_call" => {
@@ -1622,13 +2114,54 @@ async fn dispatch_live_event(
                     && round.connection_id == connection_id
                     && !is_subagent_live_event(&event)
                 {
-                    round.tools.push(LiveToolState {
-                        id: event["id"].as_str().unwrap_or_default().to_string(),
-                        name: event["name"].as_str().unwrap_or_default().to_string(),
-                        arguments: event["arguments"].as_str().unwrap_or_default().to_string(),
-                        result: None,
-                        elapsed_ms: 0,
-                    });
+                    let tool_id = event["id"].as_str().unwrap_or_default();
+                    let incoming_arguments = event["arguments"].as_str().unwrap_or_default();
+                    let is_synthetic = event["synthetic"].as_bool().unwrap_or(false);
+                    if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
+                        tool.name = event["name"].as_str().unwrap_or_default().to_string();
+                        if !incoming_arguments.is_empty() || tool.arguments.is_empty() || !is_synthetic {
+                            tool.arguments = incoming_arguments.to_string();
+                        }
+                    } else {
+                        round.tools.push(LiveToolState {
+                            id: tool_id.to_string(),
+                            name: event["name"].as_str().unwrap_or_default().to_string(),
+                            arguments: incoming_arguments.to_string(),
+                            live_output: String::new(),
+                            result: None,
+                            elapsed_ms: 0,
+                        });
+                    }
+                }
+            }
+            "tool_output" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                {
+                    if is_subagent_live_event(&event)
+                        && let Some(task_key) = live_task_key_from_event(&event)
+                        && round.active_tasks.contains(&task_key)
+                    {
+                        delegated_replay_event = Some(event.clone());
+                    } else if !is_subagent_live_event(&event) {
+                        let tool_id = event["id"].as_str().unwrap_or_default();
+                        let chunk = event["chunk"].as_str().unwrap_or_default();
+                        let stream = event["stream"].as_str();
+                        if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
+                            merge_live_tool_output(&mut tool.live_output, stream, chunk);
+                        } else {
+                            let mut live_output = String::new();
+                            merge_live_tool_output(&mut live_output, stream, chunk);
+                            round.tools.push(LiveToolState {
+                                id: tool_id.to_string(),
+                                name: event["name"].as_str().unwrap_or_default().to_string(),
+                                arguments: String::new(),
+                                live_output,
+                                result: None,
+                                elapsed_ms: 0,
+                            });
+                        }
+                    }
                 }
             }
             "tool_progress" => {
@@ -1645,6 +2178,7 @@ async fn dispatch_live_event(
                             id: tool_id.to_string(),
                             name: event["name"].as_str().unwrap_or_default().to_string(),
                             arguments: String::new(),
+                            live_output: String::new(),
                             result: None,
                             elapsed_ms,
                         });
@@ -1674,6 +2208,7 @@ async fn dispatch_live_event(
                                 id: tool_id.to_string(),
                                 name: event["name"].as_str().unwrap_or_default().to_string(),
                                 arguments: String::new(),
+                                live_output: String::new(),
                                 result: Some(result),
                                 elapsed_ms: event["duration_ms"].as_u64().unwrap_or(0),
                             });
@@ -1700,9 +2235,19 @@ async fn dispatch_live_event(
             "task_started" => {
                 if let Some(round) = live_rounds.get_mut(session_id)
                     && round.connection_id == connection_id
-                    && live_task_key_from_event(&event).is_some()
+                    && let Some(task_key) = live_task_key_from_event(&event)
                 {
-                    delegated_replay_event = Some(event.clone());
+                    if round.active_tasks.contains(&task_key) {
+                        if let Some(existing) = round.delegated_events.iter_mut().rev().find(|existing| {
+                            existing["type"] == "task_started"
+                                && live_task_key_from_event(existing).as_deref() == Some(task_key.as_str())
+                                && existing["prompt"].as_str().unwrap_or_default().is_empty()
+                        }) {
+                            *existing = event.clone();
+                        }
+                    } else {
+                        delegated_replay_event = Some(event.clone());
+                    }
                 }
             }
             "task_progress" => {
@@ -1855,22 +2400,23 @@ async fn dispatch_live_event(
         }
 
         drop(live_rounds);
+    }
 
-        if let Some(binding) = clients_guard.get_mut(session_id) {
-            if !binding.replay_ready {
-                binding.pending_events.push(event.clone());
-                None
-            } else {
-                Some(binding.clone())
-            }
-        } else {
-            None
-        }
-    };
-    if let Some(binding) = binding
-        && !ws_send(&binding.tx, &event).await
+    let target_connection_id = current_connection_id.unwrap_or(connection_id);
+    if let Some((connection_id, tx, events)) =
+        take_live_client_events_for_send(state, session_id, target_connection_id, event).await
     {
-        unbind_session_connection_if_matches(state, session_id, binding.connection_id).await;
+        let mut all_sent = true;
+        for pending_event in events {
+            if !ws_send(&tx, &pending_event).await {
+                unbind_session_connection_if_matches(state, session_id, connection_id).await;
+                all_sent = false;
+                break;
+            }
+        }
+        if all_sent {
+            finish_live_client_send(state, session_id, connection_id, Vec::new()).await;
+        }
     }
 }
 
@@ -1946,6 +2492,18 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
             }),
         )
         .await;
+        if !tool.live_output.is_empty() {
+            ws_send(
+                tx,
+                &json!({
+                    "type":"tool_output",
+                    "id": tool.id,
+                    "name": tool.name,
+                    "chunk": tool.live_output,
+                }),
+            )
+            .await;
+        }
         if tool.result.is_none() && tool.elapsed_ms > 0 {
             ws_send(
                 tx,

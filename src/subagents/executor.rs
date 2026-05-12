@@ -11,8 +11,9 @@
 //  - OpenClaw: session-level isolation
 // ══════════════════════════════════════════════════════════════════════════════
 
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, time::Duration};
 
+use futures::FutureExt;
 use reqwest::Client;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -32,6 +33,10 @@ const MAX_SNAPSHOT_TOOL_ARGS_CHARS: usize = 4_000;
 const MAX_SNAPSHOT_TOOL_RESULT_CHARS: usize = 8_000;
 const MAX_SNAPSHOT_RESULT_CHARS: usize = 4_000;
 const DELEGATED_PROMPT_CONTEXT_HEADING: &str = "## Delegated Task Context";
+
+fn runtime_timeout_for_subagent_tool(tool_name: &str, config: &Config) -> Option<Duration> {
+    tools::tool_runtime_timeout(tool_name, config)
+}
 
 fn append_reasoning_snapshot(snapshot: &mut SubagentHistorySnapshot, cycle: usize, text: &str) {
     let trimmed = text.trim();
@@ -286,6 +291,143 @@ async fn emit_subagent_tool_result_event(
     .await;
 }
 
+async fn emit_subagent_tool_output_event(
+    live_tx: &LiveTx,
+    task_id: &str,
+    agent_name: &str,
+    tool_name: &str,
+    tool_id: &str,
+    stream: &'static str,
+    chunk: &str,
+    replay_ctx: Option<&crate::LiveOutputReplayCtx>,
+) {
+    crate::forward_tool_output_event_best_effort(
+        live_tx,
+        json!({
+            "type": "tool_output",
+            "task_id": task_id,
+            "subagent": agent_name,
+            "id": tool_id,
+            "name": tool_name,
+            "stream": stream,
+            "chunk": chunk,
+        }),
+        replay_ctx,
+    )
+    .await;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_subagent_tool_with_live_output(
+    live_tx: &LiveTx,
+    cancel: &CancellationToken,
+    task_id: &str,
+    agent_name: &str,
+    tool_name: &str,
+    tool_id: &str,
+    args_str: &str,
+    config: &Config,
+    http: &Client,
+    workspace: &Path,
+    isolated_mcp_session: bool,
+    replay_ctx: Option<crate::LiveOutputReplayCtx>,
+) -> tools::ToolOutcome {
+    let start = tokio::time::Instant::now();
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let outcome = execute_subagent_tool(
+        tool_name,
+        args_str,
+        config,
+        http,
+        workspace,
+        isolated_mcp_session,
+        Some(event_tx),
+    );
+    let timeout = runtime_timeout_for_subagent_tool(tool_name, config);
+    let has_timeout = timeout.is_some();
+    let timeout_secs = timeout.map(|value| value.as_secs()).unwrap_or(0);
+    let sleep = tokio::time::sleep(timeout.unwrap_or(Duration::ZERO));
+    tokio::pin!(sleep);
+    tokio::pin!(outcome);
+    let mut pending_result: Option<tools::ToolOutcome> = None;
+    let mut event_rx_open = true;
+
+    loop {
+        if let Some(result) = pending_result.take() {
+            if event_rx_open {
+                while let Ok(event) = event_rx.try_recv() {
+                    let tools::ToolLiveEvent::ExecOutput { stream, chunk } = event;
+                    emit_subagent_tool_output_event(
+                        live_tx,
+                        task_id,
+                        agent_name,
+                        tool_name,
+                        tool_id,
+                        stream,
+                        &chunk,
+                        replay_ctx.as_ref(),
+                    )
+                    .await;
+                }
+            }
+            return result;
+        }
+
+        if !event_rx_open {
+            return outcome.as_mut().await;
+        }
+
+        if let Some(result) = outcome.as_mut().now_or_never() {
+            pending_result = Some(result);
+            continue;
+        }
+
+        tokio::select! {
+            biased;
+            result = &mut outcome => {
+                pending_result = Some(result);
+            }
+            maybe_event = event_rx.recv() => {
+                match maybe_event {
+                    Some(event) => {
+                        let tools::ToolLiveEvent::ExecOutput { stream, chunk } = event;
+                        emit_subagent_tool_output_event(
+                            live_tx,
+                            task_id,
+                            agent_name,
+                            tool_name,
+                            tool_id,
+                            stream,
+                            &chunk,
+                            replay_ctx.as_ref(),
+                        )
+                        .await;
+                    }
+                    None => {
+                        event_rx_open = false;
+                    }
+                }
+            }
+            _ = cancel.cancelled() => {
+                return tools::ToolOutcome {
+                    output: format!("Tool '{tool_name}' aborted: sub-agent cancelled"),
+                    is_error: true,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    subagent_snapshot: None,
+                };
+            }
+            _ = &mut sleep, if has_timeout => {
+                return tools::ToolOutcome {
+                    output: format!("{tool_name} error: tool execution timed out ({}s)", timeout_secs),
+                    is_error: true,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    subagent_snapshot: None,
+                };
+            }
+        }
+    }
+}
+
 /// Sub-agent execution outcome.
 pub(crate) struct SubAgentOutcome {
     /// Final text result to inject into parent context.
@@ -343,6 +485,15 @@ fn final_assistant_content(messages: &[ChatMessage]) -> String {
         .iter()
         .rev()
         .find(|message| message.role == "assistant" && message.has_nonempty_content())
+        .and_then(|message| message.content.clone())
+        .unwrap_or_default()
+}
+
+fn final_tool_content(messages: &[ChatMessage]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "tool" && message.has_nonempty_content())
         .and_then(|message| message.content.clone())
         .unwrap_or_default()
 }
@@ -410,6 +561,7 @@ pub(crate) async fn run_subagent(
     parent_live_tx: &LiveTx,
     cancel: CancellationToken,
     hooks: &HookRegistry,
+    replay_ctx: Option<crate::LiveOutputReplayCtx>,
     task_id: &str,
 ) -> SubAgentOutcome {
     let model_id = resolve_subagent_model(config, &spec.name).to_string();
@@ -495,7 +647,7 @@ pub(crate) async fn run_subagent(
 
         // Prune context before each LLM call to stay within budget.
         // Use message_budget_for_tool_defs which accounts for thinking budget,
-        // tool schema tokens, and structural overhead — matching the main loop's
+        // tool schema tokens, and structural overhead - matching the main loop's
         // request_message_budget_for_runtime but using the sub-agent's actual
         // (filtered) tool definitions instead of all builtins + extras.
         // Let provider/model capabilities decide whether delegated runs should
@@ -511,7 +663,9 @@ pub(crate) async fn run_subagent(
         let llm_result = 'llm_call: {
             let mut llm_attempt = 0u8;
             loop {
-                let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(64);
+                let (sub_tx, mut sub_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(
+                    crate::LIVE_EVENT_CHANNEL_CAPACITY,
+                );
                 let parent_tx = parent_live_tx.clone();
                 let agent_name = spec.name.clone();
                 let forward_task_id = task_id.to_string();
@@ -607,14 +761,16 @@ pub(crate) async fn run_subagent(
                     append_reasoning_snapshot(&mut history_snapshot, cycles, thinking);
                 }
 
-                messages.push(resp.message.clone());
+                let mut stored_message = resp.message.clone();
+                crate::tools::sanitize_chat_message_tool_calls_in_place(&mut stored_message);
+                messages.push(stored_message);
 
                 if !has_tools {
-                    // Sub-agent finished — extract content
+                    // Sub-agent finished - extract content
                     break 'react;
                 }
 
-                // Execute tool calls — parallel for read-only batches, sequential otherwise.
+                // Execute tool calls - parallel for read-only batches, sequential otherwise.
                 if let Some(ref tool_calls) = resp.message.tool_calls {
                     let mut all_read_only = tool_calls.len() > 1;
                     if all_read_only {
@@ -713,6 +869,10 @@ pub(crate) async fn run_subagent(
                             };
 
                             // Send tool event to parent
+                            let display_args = crate::tools::display_tool_arguments(
+                                &tc.function.name,
+                                &effective_args,
+                            );
                             let _ = live_send(
                                 parent_live_tx,
                                 json!({
@@ -721,7 +881,7 @@ pub(crate) async fn run_subagent(
                                     "agent": spec.name,
                                     "tool": tc.function.name,
                                     "id": tc.id,
-                                    "arguments": crate::truncate(&effective_args, 4_000),
+                                    "arguments": crate::truncate(&display_args, 4_000),
                                 }),
                             )
                             .await;
@@ -730,26 +890,38 @@ pub(crate) async fn run_subagent(
                             let tool_started = tokio::time::Instant::now();
                             let (outcome, hit_deadline) = if unlimited {
                                 (
-                                    execute_subagent_tool(
+                                    execute_subagent_tool_with_live_output(
+                                        parent_live_tx,
+                                        &cancel,
+                                        task_id,
+                                        &spec.name,
                                         &tc.function.name,
+                                        &tc.id,
                                         &effective_args,
                                         config,
                                         http,
                                         workspace,
                                         false,
+                                        replay_ctx.clone(),
                                     )
                                     .await,
                                     false,
                                 )
                             } else {
                                 tokio::select! {
-                                    res = execute_subagent_tool(
+                                    res = execute_subagent_tool_with_live_output(
+                                        parent_live_tx,
+                                        &cancel,
+                                        task_id,
+                                        &spec.name,
                                         &tc.function.name,
+                                        &tc.id,
                                         &effective_args,
                                         config,
                                         http,
                                         workspace,
                                         false,
+                                        replay_ctx.clone(),
                                     ) => (res, false),
                                     _ = tokio::time::sleep_until(deadline) => {
                                         timed_out = true;
@@ -798,7 +970,7 @@ pub(crate) async fn run_subagent(
                                 id: tc.id.clone(),
                                 name: tc.function.name.clone(),
                                 arguments: truncated_option(
-                                    &effective_args,
+                                    &display_args,
                                     MAX_SNAPSHOT_TOOL_ARGS_CHARS,
                                 ),
                                 result: truncated_option(
@@ -914,6 +1086,12 @@ pub(crate) async fn run_subagent(
                                 }
                                 continue;
                             }
+                            let display_args = crate::tools::display_tool_arguments(
+                                &tc.function.name,
+                                he.effective_args
+                                    .as_deref()
+                                    .unwrap_or(&tc.function.arguments),
+                            );
                             let _ = live_send(
                                 parent_live_tx,
                                 json!({
@@ -922,12 +1100,7 @@ pub(crate) async fn run_subagent(
                                     "agent": spec.name,
                                     "tool": tc.function.name,
                                     "id": tc.id,
-                                    "arguments": crate::truncate(
-                                        he.effective_args
-                                            .as_deref()
-                                            .unwrap_or(&tc.function.arguments),
-                                        4_000,
-                                    ),
+                                    "arguments": crate::truncate(&display_args, 4_000),
                                 }),
                             )
                             .await;
@@ -959,10 +1132,29 @@ pub(crate) async fn run_subagent(
                                 let cfg = config.clone();
                                 let cl = http.clone();
                                 let ws = workspace.to_path_buf();
+                                let parent_live_tx = parent_live_tx.clone();
+                                let task_id = task_id.to_string();
+                                let agent_name = spec.name.clone();
+                                let tool_id = tc.id.clone();
+                                let replay_ctx = replay_ctx.clone();
+                                let cancel = cancel.clone();
                                 Box::pin(async move {
                                     Some(
-                                        execute_subagent_tool(&name, &args, &cfg, &cl, &ws, true)
-                                            .await,
+                                        execute_subagent_tool_with_live_output(
+                                            &parent_live_tx,
+                                            &cancel,
+                                            &task_id,
+                                            &agent_name,
+                                            &name,
+                                            &tool_id,
+                                            &args,
+                                            &cfg,
+                                            &cl,
+                                            &ws,
+                                            true,
+                                            replay_ctx,
+                                        )
+                                        .await,
                                     )
                                 })
                             })
@@ -1029,7 +1221,13 @@ pub(crate) async fn run_subagent(
                             history_snapshot.tools.push(SubagentToolHistorySnapshot {
                                 id: tc.id.clone(),
                                 name: tc.function.name.clone(),
-                                arguments: truncated_option(eff_args, MAX_SNAPSHOT_TOOL_ARGS_CHARS),
+                                arguments: truncated_option(
+                                    &crate::tools::display_tool_arguments(
+                                        &tc.function.name,
+                                        eff_args,
+                                    ),
+                                    MAX_SNAPSHOT_TOOL_ARGS_CHARS,
+                                ),
                                 result: truncated_option(
                                     &outcome.output,
                                     MAX_SNAPSHOT_TOOL_RESULT_CHARS,
@@ -1056,7 +1254,7 @@ pub(crate) async fn run_subagent(
                 }
             }
             Err(error) => {
-                // LLM error — abort sub-agent.
+                // LLM error - abort sub-agent.
                 // Do NOT send task_failed here; execute_task_tool() in
                 // runtime_loop.rs sends the final event based on outcome.aborted.
                 history_snapshot.cycles = cycles;
@@ -1138,6 +1336,7 @@ pub(crate) async fn run_subagent(
     }
 
     let final_content = final_assistant_content(&messages);
+    let final_tool_content = final_tool_content(&messages);
 
     let result = if timed_out {
         let partial = truncate(&final_content, MAX_RESULT_CHARS.saturating_sub(200));
@@ -1159,13 +1358,15 @@ pub(crate) async fn run_subagent(
                 partial
             )
         }
-    } else if final_content.is_empty() {
+    } else if !final_content.is_empty() {
+        truncate(&final_content, MAX_RESULT_CHARS).to_string()
+    } else if !final_tool_content.is_empty() {
+        truncate(&final_tool_content, MAX_RESULT_CHARS).to_string()
+    } else {
         format!(
             "Sub-agent '{}' completed {} cycles with {} tool calls but produced no final output.",
             spec.name, cycles, total_tool_calls
         )
-    } else {
-        truncate(&final_content, MAX_RESULT_CHARS).to_string()
     };
 
     history_snapshot.cycles = cycles;
@@ -1219,7 +1420,7 @@ fn build_subagent_system_prompt(
                     .map(|ts| ts.description)
                     .or_else(|| mcp_desc_map.get(name.as_str()).copied())
                     .unwrap_or("");
-                format!("{}. **{}** — {}", i + 1, name, desc)
+                format!("{}. **{}** - {}", i + 1, name, desc)
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -1230,7 +1431,7 @@ fn build_subagent_system_prompt(
          ## Sub-Agent Context\n\
          You are running as a sub-agent with isolated context. \
          Complete the delegated task and provide your final answer. \
-         Do not ask the user questions — work with what you have.\n\n\
+         Do not ask the user questions - work with what you have.\n\n\
          ## Available Tools\n\
          {}\n\n\
          ## Constraints\n\
@@ -1327,6 +1528,7 @@ async fn execute_subagent_tool(
     http: &Client,
     workspace: &Path,
     isolated_mcp_session: bool,
+    event_tx: Option<tools::ToolEventSender>,
 ) -> tools::ToolOutcome {
     let mcp_result = if isolated_mcp_session {
         tools::mcp::execute_tool_isolated(name, args_str, config, workspace).await
@@ -1337,6 +1539,179 @@ async fn execute_subagent_tool(
     if let Some(result) = mcp_result {
         result
     } else {
-        tools::execute_tool(name, args_str, config, http, workspace).await
+        tools::execute_tool(name, args_str, config, http, workspace, event_tx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Provider;
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        time::{Duration, SystemTime, UNIX_EPOCH},
+    };
+
+    fn test_config() -> Config {
+        Config {
+            api_key: String::new(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            model: "openai/gpt-4o".to_string(),
+            fast_model: None,
+            sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
+            memory_model: None,
+            reflection_model: None,
+            context_model: None,
+            provider: Provider::OpenAI,
+            anthropic_prompt_caching: false,
+            openai_stream_include_usage: false,
+            providers: HashMap::new(),
+            mcp_servers: HashMap::new(),
+            port: 18989,
+            max_context_tokens: 32_000,
+            exec_timeout: Duration::from_secs(30),
+            tool_timeout: Duration::from_secs(30),
+            sub_agent_timeout: Duration::from_secs(300),
+            max_llm_retries: 2,
+            max_output_bytes: 50 * 1024,
+            max_file_bytes: 200 * 1024,
+            structured_memory: false,
+            daily_reflection: false,
+            s3: None,
+            enable_state_digest: true,
+        }
+    }
+
+    fn unique_temp_workspace(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{unique}"))
+    }
+
+    #[tokio::test]
+    async fn execute_subagent_tool_with_live_output_preserves_queued_events() {
+        let workspace = unique_temp_workspace("lingclaw-subagent-live-output-full");
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .expect("workspace should be created");
+
+        let args = if cfg!(windows) {
+            serde_json::json!({
+                "program": "cmd",
+                "args": ["/C", "echo subagent-live-full"],
+            })
+        } else {
+            serde_json::json!({
+                "program": "sh",
+                "args": ["-c", "printf 'subagent-live-full'"],
+            })
+        };
+        let (live_tx, mut live_rx) =
+            tokio::sync::mpsc::channel::<serde_json::Value>(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+        live_tx
+            .send(serde_json::json!({"type":"sentinel"}))
+            .await
+            .expect("sentinel should queue");
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(250),
+            execute_subagent_tool_with_live_output(
+                &live_tx,
+                &CancellationToken::new(),
+                "task-1",
+                "agent-1",
+                tools::TOOL_NAME_EXEC,
+                "call-1",
+                &serde_json::to_string(&args).expect("args should serialize"),
+                &test_config(),
+                &Client::new(),
+                &workspace,
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("subagent exec wrapper should not block when live events are already queued");
+
+        assert!(
+            !outcome.is_error,
+            "subagent exec wrapper should still succeed"
+        );
+        assert_eq!(
+            live_rx.try_recv().expect("sentinel should remain queued")["type"],
+            "sentinel"
+        );
+        let tool_output = live_rx
+            .try_recv()
+            .expect("tool output should remain queued after the sentinel");
+        assert_eq!(tool_output["type"].as_str(), Some("tool_output"));
+        assert_eq!(tool_output["id"].as_str(), Some("call-1"));
+
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+    }
+
+    #[tokio::test]
+    async fn execute_subagent_tool_with_live_output_returns_when_live_queue_is_full() {
+        let workspace = unique_temp_workspace("lingclaw-subagent-live-output-blocked");
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
+        tokio::fs::create_dir_all(&workspace)
+            .await
+            .expect("workspace should be created");
+
+        let args = if cfg!(windows) {
+            serde_json::json!({
+                "program": "cmd",
+                "args": ["/C", "echo subagent-live-blocked"],
+            })
+        } else {
+            serde_json::json!({
+                "program": "sh",
+                "args": ["-c", "printf 'subagent-live-blocked'"],
+            })
+        };
+        let (live_tx, mut live_rx) =
+            tokio::sync::mpsc::channel::<serde_json::Value>(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+        for _ in 0..crate::LIVE_EVENT_CHANNEL_CAPACITY {
+            live_tx
+                .send(serde_json::json!({"type":"sentinel"}))
+                .await
+                .expect("sentinel should queue");
+        }
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(250),
+            execute_subagent_tool_with_live_output(
+                &live_tx,
+                &CancellationToken::new(),
+                "task-1",
+                "agent-1",
+                tools::TOOL_NAME_EXEC,
+                "call-1",
+                &serde_json::to_string(&args).expect("args should serialize"),
+                &test_config(),
+                &Client::new(),
+                &workspace,
+                false,
+                None,
+            ),
+        )
+        .await
+        .expect("subagent exec wrapper should not wait on a full live queue");
+
+        assert!(
+            !outcome.is_error,
+            "subagent exec wrapper should still succeed"
+        );
+        assert_eq!(
+            live_rx.try_recv().expect("sentinel should remain queued")["type"],
+            "sentinel"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&workspace).await;
     }
 }

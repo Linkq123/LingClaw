@@ -150,7 +150,8 @@ async fn handle_idle_socket_input_stop_cancels_reconnected_run() {
     let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
     let cancel = CancellationToken::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
-    let (live_tx, _live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
 
     {
         let mut sessions = state.sessions.lock().await;
@@ -192,6 +193,179 @@ async fn handle_idle_socket_input_stop_cancels_reconnected_run() {
 }
 
 #[tokio::test]
+async fn execute_tool_with_live_output_drains_events_before_return() {
+    let workspace =
+        std::env::temp_dir().join(format!("lingclaw-runtime-live-output-{}", now_epoch()));
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let args = if cfg!(windows) {
+        serde_json::json!({
+            "program": "cmd",
+            "args": ["/C", "echo runtime-live"],
+        })
+    } else {
+        serde_json::json!({
+            "program": "sh",
+            "args": ["-c", "printf 'runtime-live'"],
+        })
+    };
+    let (live_tx, mut live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let outcome = execute_tool_with_live_output(
+        &live_tx,
+        "exec_call_1",
+        tools::TOOL_NAME_EXEC,
+        &serde_json::to_string(&args).expect("args should serialize"),
+        &test_config(),
+        &reqwest::Client::new(),
+        &workspace,
+        false,
+        None,
+    )
+    .await;
+
+    assert!(!outcome.is_error, "exec wrapper should succeed");
+
+    let mut saw_tool_output = false;
+    while let Ok(event) = live_rx.try_recv() {
+        if event["type"].as_str() == Some("tool_output") {
+            saw_tool_output = true;
+            assert_eq!(event["id"].as_str(), Some("exec_call_1"));
+            assert_eq!(event["name"].as_str(), Some(tools::TOOL_NAME_EXEC));
+            assert!(
+                event["chunk"]
+                    .as_str()
+                    .is_some_and(|chunk| chunk.contains("runtime-live"))
+            );
+        }
+    }
+    assert!(
+        saw_tool_output,
+        "live output should be forwarded before return"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_with_live_output_preserves_queued_events() {
+    let workspace =
+        std::env::temp_dir().join(format!("lingclaw-runtime-live-output-full-{}", now_epoch()));
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let args = if cfg!(windows) {
+        serde_json::json!({
+            "program": "cmd",
+            "args": ["/C", "echo runtime-live-full"],
+        })
+    } else {
+        serde_json::json!({
+            "program": "sh",
+            "args": ["-c", "printf 'runtime-live-full'"],
+        })
+    };
+    let (live_tx, mut live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    live_tx
+        .send(serde_json::json!({"type":"sentinel"}))
+        .await
+        .expect("sentinel should queue");
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        execute_tool_with_live_output(
+            &live_tx,
+            "exec_call_full",
+            tools::TOOL_NAME_EXEC,
+            &serde_json::to_string(&args).expect("args should serialize"),
+            &test_config(),
+            &reqwest::Client::new(),
+            &workspace,
+            false,
+            None,
+        ),
+    )
+    .await
+    .expect("exec wrapper should not block when live events are already queued");
+
+    assert!(!outcome.is_error, "exec wrapper should still succeed");
+    assert_eq!(
+        live_rx.try_recv().expect("sentinel should remain queued")["type"],
+        "sentinel"
+    );
+    let tool_output = live_rx
+        .try_recv()
+        .expect("tool output should remain queued after the sentinel");
+    assert_eq!(tool_output["type"].as_str(), Some("tool_output"));
+    assert_eq!(tool_output["id"].as_str(), Some("exec_call_full"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_with_live_output_returns_when_live_queue_is_full() {
+    let workspace = std::env::temp_dir().join(format!(
+        "lingclaw-runtime-live-output-blocked-{}",
+        now_epoch()
+    ));
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let args = if cfg!(windows) {
+        serde_json::json!({
+            "program": "cmd",
+            "args": ["/C", "echo runtime-live-blocked"],
+        })
+    } else {
+        serde_json::json!({
+            "program": "sh",
+            "args": ["-c", "printf 'runtime-live-blocked'"],
+        })
+    };
+    let (live_tx, mut live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    for _ in 0..LIVE_EVENT_CHANNEL_CAPACITY {
+        live_tx
+            .send(serde_json::json!({"type":"sentinel"}))
+            .await
+            .expect("sentinel should queue");
+    }
+
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        execute_tool_with_live_output(
+            &live_tx,
+            "exec_call_blocked",
+            tools::TOOL_NAME_EXEC,
+            &serde_json::to_string(&args).expect("args should serialize"),
+            &test_config(),
+            &reqwest::Client::new(),
+            &workspace,
+            false,
+            None,
+        ),
+    )
+    .await
+    .expect("exec wrapper should not wait on a full live queue");
+
+    assert!(!outcome.is_error, "exec wrapper should still succeed");
+    assert_eq!(
+        live_rx.try_recv().expect("sentinel should remain queued")["type"],
+        "sentinel"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
 async fn handle_idle_socket_input_queues_new_prompt_while_reconnected_run_active() {
     let state = Arc::new(test_app_state());
     let session_id = MAIN_SESSION_ID.to_string();
@@ -199,7 +373,8 @@ async fn handle_idle_socket_input_queues_new_prompt_while_reconnected_run_active
     let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
     let cancel = CancellationToken::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
-    let (live_tx, _live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let deferred_interventions = Arc::new(Mutex::new(DeferredInterventionState::open()));
 
     {
@@ -274,7 +449,8 @@ async fn handle_idle_socket_input_allows_think_command_while_reconnected_run_act
     let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
     let cancel = CancellationToken::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
-    let (live_tx, _live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let deferred_interventions = Arc::new(Mutex::new(DeferredInterventionState::open()));
 
     {
@@ -344,7 +520,8 @@ async fn handle_idle_socket_input_rejects_intervention_when_reconnected_run_is_f
     let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
     let cancel = CancellationToken::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
-    let (live_tx, _live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let deferred_interventions = Arc::new(Mutex::new(DeferredInterventionState {
         queue: Vec::new(),
         accepting: false,
@@ -401,7 +578,8 @@ async fn run_agent_session_emits_user_stop_done_for_shared_stop_request() {
     let session_id = MAIN_SESSION_ID.to_string();
     let cancel = CancellationToken::new();
     let stop_requested = Arc::new(AtomicBool::new(true));
-    let (live_tx, mut live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
+    let (live_tx, mut live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
     let (_inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<String>(4);
 
     {
@@ -430,6 +608,106 @@ async fn run_agent_session_emits_user_stop_done_for_shared_stop_request() {
 }
 
 #[tokio::test]
+async fn run_agent_session_stop_preserves_interventions_after_trimming_incomplete_tools() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let (live_tx, mut live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let (inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<String>(4);
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.messages.push(ChatMessage {
+        role: "assistant".into(),
+        content: None,
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: Some(vec![
+            ToolCall {
+                id: "call-1".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "exec".into(),
+                    arguments: r#"{"command":"echo one"}"#.into(),
+                },
+            },
+            ToolCall {
+                id: "call-2".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "exec".into(),
+                    arguments: r#"{"command":"echo two"}"#.into(),
+                },
+            },
+        ]),
+        tool_call_id: None,
+        timestamp: None,
+    });
+    session.messages.push(ChatMessage {
+        role: "tool".into(),
+        content: Some("one".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: Some("call-1".into()),
+        timestamp: None,
+    });
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+    inbound_tx
+        .send("follow-up detail".into())
+        .await
+        .expect("intervention should queue");
+    inbound_tx
+        .send("/stop".into())
+        .await
+        .expect("stop should queue");
+
+    let outcome = run_agent_session(
+        &state,
+        &session_id,
+        1,
+        &cancel,
+        &live_tx,
+        &mut inbound_rx,
+        &stop_requested,
+    )
+    .await;
+
+    assert!(!outcome.rerun_agent);
+    assert!(!outcome.shutting_down);
+
+    let progress_event = live_rx.recv().await.expect("progress event should be emitted");
+    assert_eq!(progress_event["type"].as_str(), Some("progress"));
+    let done_event = live_rx.recv().await.expect("done event should be emitted");
+    assert_eq!(done_event["type"].as_str(), Some("done"));
+    assert_eq!(done_event["phase"].as_str(), Some("stopped"));
+
+    let persisted = state
+        .sessions
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+        .expect("session should exist");
+    assert_eq!(persisted.messages.len(), 2);
+    assert_eq!(persisted.messages[0].role, "system");
+    assert_eq!(persisted.messages[1].role, "user");
+    assert_eq!(
+        persisted.messages[1].content.as_deref(),
+        Some("follow-up detail")
+    );
+}
+
+#[tokio::test]
 async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
     let state = Arc::new(test_app_state());
     let session_id = MAIN_SESSION_ID.to_string();
@@ -437,7 +715,8 @@ async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
     let run_cancel = CancellationToken::new();
     let stop_requested = Arc::new(AtomicBool::new(true));
     let deferred_interventions = Arc::new(Mutex::new(DeferredInterventionState::open()));
-    let (live_tx, _live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(4);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
 
     {
         let mut runs = state.active_runs.lock().await;
@@ -651,7 +930,8 @@ fn append_dynamic_prompt_section_truncates_to_budget() {
 
 #[tokio::test]
 async fn report_working_state_digest_issue_emits_warning_event() {
-    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
 
     report_working_state_digest_issue(&live_tx, "fast-model", WorkingStateDigestIssue::Timeout)
         .await;
@@ -704,7 +984,8 @@ async fn run_analyze_phase_emits_start_then_auto_trace_for_auto_rounds() {
 
     let cancel = CancellationToken::new();
     let run_cancel = CancellationToken::new();
-    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(8);
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
         current_session_id: &session_id,
@@ -776,7 +1057,8 @@ async fn run_analyze_phase_emits_post_hook_think_in_auto_trace() {
 
     let cancel = CancellationToken::new();
     let run_cancel = CancellationToken::new();
-    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(8);
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
         current_session_id: &session_id,
@@ -843,7 +1125,8 @@ async fn run_analyze_phase_skips_auto_trace_for_manual_think_levels() {
 
     let cancel = CancellationToken::new();
     let run_cancel = CancellationToken::new();
-    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(8);
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
         current_session_id: &session_id,
@@ -900,7 +1183,8 @@ async fn run_analyze_phase_skips_auto_trace_for_unsupported_models() {
 
     let cancel = CancellationToken::new();
     let run_cancel = CancellationToken::new();
-    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(8);
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
         current_session_id: &session_id,
@@ -956,7 +1240,8 @@ async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections(
 
     let cancel = CancellationToken::new();
     let run_cancel = CancellationToken::new();
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
         current_session_id: &session_id,
@@ -1077,7 +1362,8 @@ async fn prepare_analyze_snapshot_preserves_finish_hint_when_budget_skips_it() {
 
     let cancel = CancellationToken::new();
     let run_cancel = CancellationToken::new();
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
         current_session_id: &session_id,
@@ -1178,7 +1464,8 @@ async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
 
     let cancel = CancellationToken::new();
     let run_cancel = CancellationToken::new();
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
         current_session_id: &session_id,
@@ -1309,7 +1596,8 @@ async fn update_working_state_keeps_results_attached_to_their_original_query() {
 
     let cancel = CancellationToken::new();
     let run_cancel = CancellationToken::new();
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
         current_session_id: &session_id,
@@ -1423,7 +1711,8 @@ async fn update_working_state_reuses_same_cycle_task_memory_selection() {
 
     let cancel = CancellationToken::new();
     let run_cancel = CancellationToken::new();
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
         current_session_id: &session_id,
@@ -1574,7 +1863,8 @@ async fn update_working_state_refreshes_task_memory_after_state_changes() {
 
     let cancel = CancellationToken::new();
     let run_cancel = CancellationToken::new();
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
         current_session_id: &session_id,
@@ -1673,7 +1963,8 @@ async fn prepare_analyze_snapshot_injects_fresh_task_state_each_time() {
 
     let cancel = CancellationToken::new();
     let run_cancel = CancellationToken::new();
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
         current_session_id: &session_id,
@@ -1831,7 +2122,8 @@ async fn prepare_analyze_snapshot_injects_retrieved_task_memory() {
 
     let cancel = CancellationToken::new();
     let run_cancel = CancellationToken::new();
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
         current_session_id: &session_id,
@@ -1940,7 +2232,8 @@ async fn prepare_analyze_snapshot_injects_agent_recommendations_and_delegation_g
 
     let cancel = CancellationToken::new();
     let run_cancel = CancellationToken::new();
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
         current_session_id: &session_id,
@@ -2078,7 +2371,8 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
     let session_id = "deepseek-session".to_string();
     let cancel = CancellationToken::new();
     let run_cancel = CancellationToken::new();
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(8);
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
 
     {
         let mut sessions = state.sessions.lock().await;
@@ -2366,7 +2660,8 @@ fn drain_busy_socket_messages_collects_interventions_and_stops_run() {
     let state = std::sync::Arc::new(test_app_state());
     let session_id = MAIN_SESSION_ID.to_string();
     let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
-    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(8);
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let run_cancel = CancellationToken::new();
     let mut pending = Vec::new();
 
@@ -2423,7 +2718,8 @@ fn drain_busy_socket_messages_applies_think_command_without_queueing_it() {
     let state = std::sync::Arc::new(test_app_state());
     let session_id = MAIN_SESSION_ID.to_string();
     let (inbound_tx, mut inbound_rx) = mpsc::channel(8);
-    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(8);
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let run_cancel = CancellationToken::new();
     let mut pending = Vec::new();
 
@@ -2562,7 +2858,8 @@ fn update_llm_response_usage_uses_request_estimate_when_provider_usage_missing()
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = std::sync::Arc::new(test_app_state());
     let session = test_session("usage-session", "Usage Session", None);
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let cancel = CancellationToken::new();
     let run_cancel = cancel.child_token();
 
@@ -2733,7 +3030,8 @@ fn update_llm_response_usage_uses_configured_provider_name() {
     };
     let state = std::sync::Arc::new(test_app_state_with_config(config.clone()));
     let session = test_session("usage-session", "Usage Session", Some(&config.model));
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) = mpsc::channel(4);
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let cancel = CancellationToken::new();
     let run_cancel = cancel.child_token();
 
@@ -2947,11 +3245,11 @@ fn try_claim_reflection_respects_cooldown() {
     let _guard = reflection_test_guard().blocking_lock();
     let now = epoch_secs_now();
 
-    // Last reflection was just now 閳?should be blocked.
+    // Last reflection was just now --?should be blocked.
     LAST_REFLECTION_EPOCH.store(now, std::sync::atomic::Ordering::Relaxed);
     assert!(try_claim_reflection(5, 5).is_none());
 
-    // Last reflection was long ago 閳?should be allowed.
+    // Last reflection was long ago --?should be allowed.
     LAST_REFLECTION_EPOCH.store(
         now - REFLECTION_COOLDOWN_SECS - 1,
         std::sync::atomic::Ordering::Relaxed,
@@ -2961,7 +3259,7 @@ fn try_claim_reflection_respects_cooldown() {
     let (prev_epoch, claimed_epoch) = prev.unwrap();
     rollback_reflection_claim(prev_epoch, claimed_epoch);
 
-    // Exactly at the boundary 閳?should be allowed.
+    // Exactly at the boundary --?should be allowed.
     LAST_REFLECTION_EPOCH.store(
         now - REFLECTION_COOLDOWN_SECS,
         std::sync::atomic::Ordering::Relaxed,
@@ -3006,7 +3304,7 @@ fn rollback_reflection_claim_is_noop_when_slot_already_reclaimed() {
     let newer_epoch = claimed_epoch + REFLECTION_COOLDOWN_SECS + 1;
     LAST_REFLECTION_EPOCH.store(newer_epoch, std::sync::atomic::Ordering::Relaxed);
 
-    // The first run's rollback should be a no-op 閳?CAS fails because the
+    // The first run's rollback should be a no-op --?CAS fails because the
     // stored value (newer_epoch) != claimed_epoch.
     rollback_reflection_claim(prev_epoch, claimed_epoch);
     assert_eq!(
@@ -3018,15 +3316,15 @@ fn rollback_reflection_claim_is_noop_when_slot_already_reclaimed() {
 
 #[test]
 fn reflection_model_or_fallback_chain() {
-    // No reflection_model, no memory_model 閳?use fallback.
+    // No reflection_model, no memory_model --?use fallback.
     let mut config = test_config();
     assert_eq!(config.reflection_model_or("primary-model"), "primary-model");
 
-    // memory_model set 閳?reflection inherits from memory.
+    // memory_model set --?reflection inherits from memory.
     config.memory_model = Some("memory-llm".to_string());
     assert_eq!(config.reflection_model_or("primary-model"), "memory-llm");
 
-    // reflection_model set 閳?overrides memory_model.
+    // reflection_model set --?overrides memory_model.
     config.reflection_model = Some("reflection-llm".to_string());
     assert_eq!(
         config.reflection_model_or("primary-model"),

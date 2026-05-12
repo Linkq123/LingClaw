@@ -6,6 +6,7 @@ import {
   markOrchestrateTask,
   openOrchestrateTaskModal,
 } from '../src/renderers/orchestrate.js';
+import { appendSubagentToolOutput } from '../src/renderers/subagent.js';
 import { dom, state } from '../src/state.js';
 import { applyToolsVisibility } from '../src/viewState.js';
 
@@ -60,6 +61,391 @@ describe('orchestrate task modal hosting', () => {
       ],
     });
   }
+
+  it('preserves streamed task output when a synthetic plan expands into multiple tasks', () => {
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 1,
+      layer_count: 1,
+      synthetic: true,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Fix the hidden footer in the expanded card.',
+          depends_on: [],
+        },
+      ],
+    });
+
+    appendSubagentToolOutput(
+      { task_id: 'orch-1:task-a', agent: 'frontend-coder' },
+      'tool-1',
+      'stdout',
+      'streamed output survives',
+      'exec',
+    );
+
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 2,
+      layer_count: 2,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Fix the hidden footer in the expanded card.',
+          depends_on: [],
+        },
+        {
+          id: 'task-b',
+          agent: 'qa-reviewer',
+          prompt_preview: 'Verify the visual regression fix.',
+          depends_on: ['task-a'],
+        },
+      ],
+    });
+
+    const orchestratePanel = dom.chat?.querySelector('.orchestrate-panel') as HTMLElement | null;
+    const rows = dom.chat?.querySelectorAll('.orchestrate-task') || [];
+    const firstRow = rows[0] as HTMLElement | undefined;
+    const secondRow = rows[1] as HTMLElement | undefined;
+    const firstPanel = firstRow?.querySelector('.subagent-panel') as HTMLElement | null;
+
+    expect(orchestratePanel?.dataset.synthetic).not.toBe('true');
+    expect(rows).toHaveLength(2);
+    expect(firstRow?.dataset.taskId).toBe('task-a');
+    expect(secondRow?.dataset.taskId).toBe('task-b');
+    expect(firstPanel?.querySelector('[data-subagent-tool-trail] .subagent-tool-pill')).not.toBeNull();
+    expect(
+      firstPanel
+        ?.querySelector('[data-subagent-tool-trail] .subagent-tool-pill')
+        ?.getAttribute('data-tool-live-output'),
+    ).toContain('streamed output survives');
+  });
+
+  it('recomputes the header layer count when upgrading a synthetic panel without layer_count', () => {
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 2,
+      layer_count: 1,
+      synthetic: true,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Fix the hidden footer in the expanded card.',
+          depends_on: [],
+        },
+        {
+          id: 'task-b',
+          agent: 'qa-reviewer',
+          prompt_preview: 'Verify the visual regression fix.',
+          depends_on: ['task-a'],
+        },
+      ],
+    });
+
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 2,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Fix the hidden footer in the expanded card.',
+          depends_on: [],
+        },
+        {
+          id: 'task-b',
+          agent: 'qa-reviewer',
+          prompt_preview: 'Verify the visual regression fix.',
+          depends_on: ['task-a'],
+        },
+      ],
+    });
+
+    const label = dom.chat?.querySelector('.orchestrate-label') as HTMLElement | null;
+    expect(label?.textContent).toContain('2 layers');
+  });
+
+  it('rebuilds the task layout when a synthetic plan upgrades with different dependencies', () => {
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 2,
+      layer_count: 1,
+      synthetic: true,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Fix the hidden footer in the expanded card.',
+          depends_on: [],
+        },
+        {
+          id: 'task-b',
+          agent: 'qa-reviewer',
+          prompt_preview: 'Verify the visual regression fix.',
+          depends_on: [],
+        },
+      ],
+    });
+
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 2,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Fix the hidden footer in the expanded card.',
+          depends_on: [],
+        },
+        {
+          id: 'task-b',
+          agent: 'qa-reviewer',
+          prompt_preview: 'Verify the visual regression fix.',
+          depends_on: ['task-a'],
+        },
+      ],
+    });
+
+    const layers = Array.from(dom.chat?.querySelectorAll('.orchestrate-layer') || []);
+    const taskBRow = dom.chat?.querySelector('[data-task-id="task-b"]') as HTMLElement | null;
+    const taskBLayer = taskBRow?.closest('.orchestrate-layer') as HTMLElement | null;
+
+    expect(layers).toHaveLength(2);
+    expect(taskBLayer?.dataset.layerIndex).toBe('1');
+  });
+
+  it('copies real prompt metadata into reused synthetic task rows', () => {
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 1,
+      layer_count: 1,
+      synthetic: true,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: '',
+          depends_on: [],
+        },
+      ],
+    });
+
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 1,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Fix the hidden footer in the expanded card.',
+          depends_on: [],
+        },
+      ],
+    });
+
+    const row = dom.chat?.querySelector('[data-task-id="task-a"]') as HTMLElement | null;
+    const previewEl = row?.querySelector('.orchestrate-task-preview') as HTMLElement | null;
+    const panel = row?.querySelector('.subagent-panel') as HTMLElement | null;
+
+    expect(row?.dataset.promptPreview).toBe('Fix the hidden footer in the expanded card.');
+    expect(previewEl?.textContent).toContain('Fix the hidden footer in the expanded card.');
+    expect(panel?.dataset.taskId).toBe('orch-1:task-a');
+  });
+
+  it('keeps reused task panels registered to the visible row after a synthetic plan upgrades', () => {
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 1,
+      layer_count: 1,
+      synthetic: true,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Initial synthetic prompt.',
+          depends_on: [],
+        },
+      ],
+    });
+
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 1,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Real plan prompt.',
+          depends_on: [],
+        },
+      ],
+    });
+
+    appendSubagentToolOutput(
+      { task_id: 'orch-1:task-a', agent: 'frontend-coder' },
+      'tool-1',
+      'stdout',
+      'visible panel keeps updating',
+      'exec',
+    );
+
+    const row = dom.chat?.querySelector('[data-task-id="task-a"]') as HTMLElement | null;
+    const visiblePanel = row?.querySelector('.subagent-panel') as HTMLElement | null;
+    const registeredPanel = state.activeSubagentPanels.get('orch-1:task-a') as HTMLElement | undefined;
+
+    expect(registeredPanel).toBe(visiblePanel);
+    expect(
+      visiblePanel
+        ?.querySelector('[data-subagent-tool-trail] .subagent-tool-pill')
+        ?.getAttribute('data-tool-live-output'),
+    ).toContain('visible panel keeps updating');
+  });
+
+  it('keeps reused task panels registered when a synthetic plan grows before turning real', () => {
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 1,
+      layer_count: 1,
+      synthetic: true,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Initial synthetic prompt.',
+          depends_on: [],
+        },
+      ],
+    });
+
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 2,
+      layer_count: 1,
+      synthetic: true,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Expanded synthetic prompt.',
+          depends_on: [],
+        },
+        {
+          id: 'task-b',
+          agent: 'qa-reviewer',
+          prompt_preview: 'Second synthetic task.',
+          depends_on: [],
+        },
+      ],
+    });
+
+    appendSubagentToolOutput(
+      { task_id: 'orch-1:task-a', agent: 'frontend-coder' },
+      'tool-1',
+      'stdout',
+      'synthetic growth keeps the visible panel live',
+      'exec',
+    );
+
+    const row = dom.chat?.querySelector('[data-task-id="task-a"]') as HTMLElement | null;
+    const visiblePanel = row?.querySelector('.subagent-panel') as HTMLElement | null;
+    const registeredPanel = state.activeSubagentPanels.get('orch-1:task-a') as HTMLElement | undefined;
+
+    expect(registeredPanel).toBe(visiblePanel);
+    expect(
+      visiblePanel
+        ?.querySelector('[data-subagent-tool-trail] .subagent-tool-pill')
+        ?.getAttribute('data-tool-live-output'),
+    ).toContain('synthetic growth keeps the visible panel live');
+  });
+
+  it('copies real prompt metadata into reused rows when a synthetic plan expands', () => {
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 1,
+      layer_count: 1,
+      synthetic: true,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: '',
+          depends_on: [],
+        },
+      ],
+    });
+
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 2,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Fix the hidden footer in the expanded card.',
+          depends_on: [],
+        },
+        {
+          id: 'task-b',
+          agent: 'qa-reviewer',
+          prompt_preview: 'Verify the visual regression fix.',
+          depends_on: ['task-a'],
+        },
+      ],
+    });
+
+    const row = dom.chat?.querySelector('[data-task-id="task-a"]') as HTMLElement | null;
+    const previewEl = row?.querySelector('.orchestrate-task-preview') as HTMLElement | null;
+    const promptEl = row?.querySelector('.subagent-prompt') as HTMLElement | null;
+
+    expect(row?.dataset.promptPreview).toBe('Fix the hidden footer in the expanded card.');
+    expect(previewEl?.textContent).toContain('Fix the hidden footer in the expanded card.');
+    expect(promptEl?.textContent || '').toContain('Fix the hidden footer in the expanded card.');
+  });
+
+  it('does not reuse another task panel when the same agent appears twice', () => {
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 2,
+      layer_count: 1,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Fix the first issue.',
+          depends_on: [],
+        },
+        {
+          id: 'task-b',
+          agent: 'frontend-coder',
+          prompt_preview: 'Fix the second issue.',
+          depends_on: [],
+        },
+      ],
+    });
+
+    appendSubagentToolOutput(
+      { task_id: 'orch-1:task-b', agent: 'frontend-coder' },
+      'tool-2',
+      'stdout',
+      'belongs to task-b',
+      'exec',
+    );
+
+    const rows = dom.chat?.querySelectorAll('.orchestrate-task') || [];
+    const firstPanel = (rows[0] as HTMLElement | undefined)?.querySelector('.subagent-panel') as HTMLElement | null;
+    const secondPanel = (rows[1] as HTMLElement | undefined)?.querySelector('.subagent-panel') as HTMLElement | null;
+
+    expect(firstPanel?.querySelector('[data-subagent-tool-trail] .subagent-tool-pill')).toBeNull();
+    expect(
+      secondPanel
+        ?.querySelector('[data-subagent-tool-trail] .subagent-tool-pill')
+        ?.getAttribute('data-tool-live-output'),
+    ).toContain('belongs to task-b');
+  });
 
   it('reuses the shared sub-agent modal while open and restores it on close', () => {
     mountOrchestration();

@@ -1114,7 +1114,7 @@ fn anthropic_thinking_disabled_when_think_level_is_off() {
 #[test]
 fn process_openai_data_line_reports_done_marker() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
 
     let done = rt.block_on(async {
@@ -1137,7 +1137,7 @@ fn process_openai_data_line_reports_done_marker() {
 #[test]
 fn process_openai_data_line_keeps_reasoning_open_for_empty_content_delta() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
 
     rt.block_on(async {
@@ -1203,7 +1203,7 @@ fn process_openai_data_line_keeps_reasoning_open_for_empty_content_delta() {
 #[test]
 fn process_anthropic_sse_line_keeps_event_type_between_lines() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
 
     let content = rt.block_on(async {
@@ -1241,7 +1241,7 @@ fn process_anthropic_sse_line_keeps_event_type_between_lines() {
 #[test]
 fn process_anthropic_sse_line_captures_signature_and_redacted_blocks() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (tx, _rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
 
     let state = rt.block_on(async {
@@ -1616,7 +1616,7 @@ fn build_openai_stream_body_deepseek_v4_replays_missing_reasoning_tool_turn_as_t
 
 #[tokio::test]
 async fn build_openai_stream_body_deepseek_v4_keeps_reasoning_after_parallel_tool_calls() {
-    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let (tx, _rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
     let mut state = OpenAiStreamState {
         content_buf: String::new(),
@@ -2693,7 +2693,7 @@ async fn call_llm_stream_gemini_auto_enables_medium_thinking_config() {
         timestamp: None,
     }];
     let workspace = unique_temp_dir("lingclaw-gemini-auto-thinking");
-    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let (tx, _rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
 
     let response = call_llm_stream(
@@ -2726,7 +2726,7 @@ async fn call_llm_stream_gemini_auto_enables_medium_thinking_config() {
 
 #[tokio::test]
 async fn process_gemini_data_line_collects_text_tools_and_usage() {
-    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
     let mut state = OpenAiStreamState {
         content_buf: String::new(),
@@ -2760,7 +2760,7 @@ async fn process_gemini_data_line_collects_text_tools_and_usage() {
 
 #[tokio::test]
 async fn process_gemini_data_line_collects_thought_summary_signature_and_function_call_id() {
-    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
     let mut state = OpenAiStreamState {
         content_buf: String::new(),
@@ -2823,7 +2823,7 @@ async fn call_llm_stream_gemini_closes_thinking_on_thought_only_stream_end() {
         timestamp: None,
     }];
     let workspace = unique_temp_dir("lingclaw-gemini-thinking-end");
-    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
 
     let response = call_llm_stream_gemini(
@@ -2852,7 +2852,7 @@ async fn call_llm_stream_gemini_closes_thinking_on_thought_only_stream_end() {
 
 #[tokio::test]
 async fn process_gemini_data_line_rejects_blocked_prompt() {
-    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let (tx, _rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
     let mut state = OpenAiStreamState {
         content_buf: String::new(),
@@ -3206,7 +3206,7 @@ fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
         tool_call_id: None,
         timestamp: None,
     }];
-    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
 
     let workspace = unique_temp_dir("lingclaw-call-stream");
@@ -3297,7 +3297,7 @@ fn call_llm_stream_openai_reports_html_gateway_response() {
         tool_call_id: None,
         timestamp: None,
     }];
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (tx, _rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
 
     let error = match runtime.block_on(async {
@@ -3365,7 +3365,7 @@ fn call_llm_stream_openai_deepseek_multi_tool_stream_keeps_two_tool_calls_and_th
         tool_call_id: None,
         timestamp: None,
     }];
-    let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
 
     let response = runtime
@@ -3460,7 +3460,7 @@ fn call_llm_stream_openai_auto_skips_reasoning_effort_for_compatible_gateway() {
         tool_call_id: None,
         timestamp: None,
     }];
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (tx, _rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
     let workspace = unique_temp_dir("lingclaw-openai-auto-compatible");
 
@@ -3521,7 +3521,7 @@ fn call_llm_stream_openai_surfaces_json_error_envelope() {
         tool_call_id: None,
         timestamp: None,
     }];
-    let (tx, _rx) = tokio::sync::mpsc::channel(8);
+    let (tx, _rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
 
     let error = match runtime.block_on(async {
@@ -3554,7 +3554,7 @@ fn call_llm_stream_openai_surfaces_json_error_envelope() {
 #[test]
 fn process_ollama_json_line_streams_thinking_content_and_tool_calls() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
-    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let live_tx: LiveTx = tx;
 
     let done = rt.block_on(async {
@@ -3808,7 +3808,7 @@ fn convert_messages_to_openai_strips_images_when_tool_messages_present() {
     let out = convert_messages_to_openai_with_options(&messages, false, None);
     assert_eq!(out.len(), 3);
     // When tool messages are present, user message content must be a plain
-    // string — not an array with image_url — to avoid 400 InvalidParameter
+    // string, not an array with image_url, to avoid 400 InvalidParameter
     // from OpenAI-compatible providers.
     assert_eq!(out[0]["role"], "user");
     assert!(

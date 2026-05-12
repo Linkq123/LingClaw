@@ -385,12 +385,110 @@ export function openOrchestrateTaskModal(trigger: HTMLElement | null) {
   openSubagentPanelModal(panel);
 }
 
+function syncReusedTaskMetadata(existingRow: HTMLElement, existingPanel: HTMLElement, nextRow: HTMLElement, task) {
+  const displayPrompt = stripDelegatedPromptRuntimeContext(task.prompt_preview || '');
+
+  existingRow.dataset.orchestrateId = nextRow.dataset.orchestrateId || existingRow.dataset.orchestrateId || '';
+  existingRow.dataset.taskId = nextRow.dataset.taskId || existingRow.dataset.taskId || '';
+  if (displayPrompt) {
+    existingRow.dataset.promptPreview = displayPrompt;
+  } else {
+    delete existingRow.dataset.promptPreview;
+  }
+
+  setTaskPreview(existingRow, displayPrompt || 'Waiting to run');
+  existingPanel.dataset.orchestrateId = existingRow.dataset.orchestrateId || '';
+  existingPanel.dataset.orchestrateTaskId = existingRow.dataset.taskId || '';
+  state.activeSubagentPanels.set(
+    compositeTaskId(existingRow.dataset.orchestrateId || '', existingRow.dataset.taskId || ''),
+    existingPanel,
+  );
+  updateSubagentPrompt(
+    {
+      task_id: compositeTaskId(existingRow.dataset.orchestrateId || '', existingRow.dataset.taskId || ''),
+      agent: existingPanel.dataset.agent || task.agent || '',
+    },
+    displayPrompt,
+    { allowBlank: true },
+  );
+}
+
+function mergeSyntheticOrchestratePanel(existing, data) {
+  const nextTasks = Array.isArray(data.tasks) ? data.tasks : [];
+  const nextTaskIds = new Set(nextTasks.map((task) => task.id));
+  const currentTaskIds = new Set(existing.taskRows.keys());
+  const sameTasks =
+    nextTaskIds.size === currentTaskIds.size &&
+    Array.from(nextTaskIds).every((taskId) => currentTaskIds.has(taskId));
+
+  existing.panel.dataset.synthetic = data.synthetic === true ? 'true' : 'false';
+  const label = existing.panel.querySelector('.orchestrate-label') as HTMLElement | null;
+
+  const layers = existing.panel.querySelector('.orchestrate-layers') as HTMLElement | null;
+  if (!layers) return false;
+
+  const nextLayers = document.createElement('div');
+  const layout = buildDagLayout(nextLayers, nextTasks, data.orchestrate_id);
+  const nextLayerCount = data.layer_count || layout.layerCount || existing.layerCount;
+  if (label) {
+    label.textContent = `Orchestrate / ${data.task_count || nextTasks.length} tasks / ${nextLayerCount} layers`;
+  }
+
+  if (sameTasks) {
+    for (const task of nextTasks) {
+      const existingRow = existing.taskRows.get(task.id);
+      const existingPanel = existing.taskPanels.get(task.id);
+      const nextRow = layout.taskRows.get(task.id);
+      if (!existingRow || !existingPanel || !nextRow) continue;
+
+      syncReusedTaskMetadata(existingRow, existingPanel, nextRow, task);
+      nextRow.replaceWith(existingRow);
+      layout.taskRows.set(task.id, existingRow);
+      layout.taskPanels.set(task.id, existingPanel);
+    }
+
+    layers.replaceChildren(...Array.from(nextLayers.children));
+    existing.taskRows = layout.taskRows;
+    existing.taskPanels = layout.taskPanels;
+    existing.taskLayer = layout.taskLayer;
+    existing.layerCount = nextLayerCount;
+    updateHeaderProgress(existing);
+    return true;
+  }
+
+  for (const task of nextTasks) {
+    const existingRow = existing.taskRows.get(task.id);
+    const existingPanel = existing.taskPanels.get(task.id);
+    const nextRow = layout.taskRows.get(task.id);
+    if (!existingRow || !existingPanel || !nextRow) continue;
+
+    syncReusedTaskMetadata(existingRow, existingPanel, nextRow, task);
+    nextRow.replaceWith(existingRow);
+    layout.taskRows.set(task.id, existingRow);
+    layout.taskPanels.set(task.id, existingPanel);
+  }
+
+  layers.replaceChildren(...Array.from(nextLayers.children));
+  existing.taskRows = layout.taskRows;
+  existing.taskPanels = layout.taskPanels;
+  existing.taskLayer = layout.taskLayer;
+  existing.layerCount = layout.layerCount;
+  updateHeaderProgress(existing);
+  return true;
+}
+
 export function createOrchestratePanel(data) {
   const registry = ensureRegistry();
   if (!data?.orchestrate_id) return;
 
   const existing = registry.get(data.orchestrate_id);
   if (existing?.panel) {
+    if (existing.panel.dataset.synthetic === 'true') {
+      if (mergeSyntheticOrchestratePanel(existing, data)) {
+        return;
+      }
+    }
+
     removeTimelinePanel(existing.panel);
     registry.delete(data.orchestrate_id);
   }
@@ -398,6 +496,7 @@ export function createOrchestratePanel(data) {
   const panel = document.createElement('div');
   panel.className = 'orchestrate-panel orchestrate-active';
   panel.dataset.orchestrateId = data.orchestrate_id;
+  if (data.synthetic === true) panel.dataset.synthetic = 'true';
 
   const header = document.createElement('div');
   header.className = 'orchestrate-header';
