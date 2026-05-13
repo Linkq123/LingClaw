@@ -1164,38 +1164,42 @@ async fn execute_tool_with_live_output(
         .await;
     }
 
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
-    let tool_future = execute_tool(
+    let (event_tx, mut event_rx) =
+        tokio::sync::mpsc::channel(tools::TOOL_LIVE_EVENT_CHANNEL_CAPACITY);
+    let tool_future = tools::execute_tool_with_bounded_live_events(
         name,
         args_str,
         config,
         http,
         workspace,
-        isolated_mcp_session,
+        None,
         Some(event_tx),
     );
     tokio::pin!(tool_future);
+    let mut forward_event = |stream, chunk: String| {
+        let replay_ctx = replay_ctx.clone();
+        async move {
+            crate::forward_tool_output_event_best_effort(
+                live_tx,
+                json!({
+                    "type": "tool_output",
+                    "id": tool_id,
+                    "name": name,
+                    "stream": stream,
+                    "chunk": chunk,
+                }),
+                replay_ctx.as_ref(),
+            )
+            .await;
+        }
+    };
     let mut pending_result: Option<tools::ToolOutcome> = None;
     let mut event_rx_open = true;
 
     loop {
         if let Some(result) = pending_result.take() {
             if event_rx_open {
-                while let Ok(event) = event_rx.try_recv() {
-                    let tools::ToolLiveEvent::ExecOutput { stream, chunk } = event;
-                    crate::forward_tool_output_event_best_effort(
-                        live_tx,
-                        json!({
-                            "type": "tool_output",
-                            "id": tool_id,
-                            "name": name,
-                            "stream": stream,
-                            "chunk": chunk,
-                        }),
-                        replay_ctx.as_ref(),
-                    )
-                    .await;
-                }
+                tools::drain_bounded_exec_live_events(&mut event_rx, &mut forward_event).await;
             }
             return result;
         }
@@ -1212,19 +1216,7 @@ async fn execute_tool_with_live_output(
             maybe_event = event_rx.recv() => {
                 match maybe_event {
                     Some(event) => {
-                        let tools::ToolLiveEvent::ExecOutput { stream, chunk } = event;
-                        crate::forward_tool_output_event_best_effort(
-                            live_tx,
-                            json!({
-                                "type": "tool_output",
-                                "id": tool_id,
-                                "name": name,
-                                "stream": stream,
-                                "chunk": chunk,
-                            }),
-                            replay_ctx.as_ref(),
-                        )
-                        .await;
+                        tools::forward_exec_live_event(event, &mut forward_event).await;
                     }
                     None => {
                         event_rx_open = false;

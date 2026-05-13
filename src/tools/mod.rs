@@ -12,7 +12,7 @@ use std::{
     pin::Pin,
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 
 use crate::Config;
 
@@ -35,6 +35,30 @@ pub(crate) enum ToolLiveEvent {
 }
 
 pub(crate) type ToolEventSender = UnboundedSender<ToolLiveEvent>;
+pub(crate) type BoundedToolEventSender = Sender<ToolLiveEvent>;
+pub(crate) type BoundedToolEventReceiver = Receiver<ToolLiveEvent>;
+pub(crate) const TOOL_LIVE_EVENT_CHANNEL_CAPACITY: usize = 256;
+
+pub(crate) async fn forward_exec_live_event<F, Fut>(event: ToolLiveEvent, on_event: &mut F)
+where
+    F: FnMut(&'static str, String) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let ToolLiveEvent::ExecOutput { stream, chunk } = event;
+    on_event(stream, chunk).await;
+}
+
+pub(crate) async fn drain_bounded_exec_live_events<F, Fut>(
+    event_rx: &mut BoundedToolEventReceiver,
+    on_event: &mut F,
+) where
+    F: FnMut(&'static str, String) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    while let Ok(event) = event_rx.try_recv() {
+        forward_exec_live_event(event, on_event).await;
+    }
+}
 
 impl ToolHandlerOutput {
     fn inferred(output: String) -> Self {
@@ -59,6 +83,7 @@ type ToolHandler = for<'a> fn(
     &'a Client,
     &'a Path,
     Option<ToolEventSender>,
+    Option<BoundedToolEventSender>,
 ) -> ToolFuture<'a>;
 type ToolTraceBuilder = fn(&serde_json::Value) -> Option<crate::agent::ToolExecutionTrace>;
 
@@ -365,6 +390,7 @@ fn tool_handler_think<'a>(
     _: &'a Client,
     _: &'a Path,
     _: Option<ToolEventSender>,
+    _: Option<BoundedToolEventSender>,
 ) -> ToolFuture<'a> {
     Box::pin(async move { ToolHandlerOutput::explicit(exec::tool_think(args), false) })
 }
@@ -375,8 +401,9 @@ fn tool_handler_exec<'a>(
     _: &'a Client,
     workspace: &'a Path,
     event_tx: Option<ToolEventSender>,
+    bounded_event_tx: Option<BoundedToolEventSender>,
 ) -> ToolFuture<'a> {
-    Box::pin(async move { exec::tool_exec(args, config, workspace, event_tx).await })
+    Box::pin(async move { exec::tool_exec(args, config, workspace, event_tx, bounded_event_tx).await })
 }
 
 fn tool_handler_read_file<'a>(
@@ -385,6 +412,7 @@ fn tool_handler_read_file<'a>(
     _: &'a Client,
     workspace: &'a Path,
     _: Option<ToolEventSender>,
+    _: Option<BoundedToolEventSender>,
 ) -> ToolFuture<'a> {
     Box::pin(async move {
         ToolHandlerOutput::inferred(fs::tool_read_file(args, config, workspace).await)
@@ -397,6 +425,7 @@ fn tool_handler_write_file<'a>(
     _: &'a Client,
     workspace: &'a Path,
     _: Option<ToolEventSender>,
+    _: Option<BoundedToolEventSender>,
 ) -> ToolFuture<'a> {
     Box::pin(async move {
         ToolHandlerOutput::inferred(fs::tool_write_file(args, config, workspace).await)
@@ -409,6 +438,7 @@ fn tool_handler_patch_file<'a>(
     _: &'a Client,
     workspace: &'a Path,
     _: Option<ToolEventSender>,
+    _: Option<BoundedToolEventSender>,
 ) -> ToolFuture<'a> {
     Box::pin(async move {
         ToolHandlerOutput::inferred(fs::tool_patch_file(args, config, workspace).await)
@@ -421,6 +451,7 @@ fn tool_handler_list_dir<'a>(
     _: &'a Client,
     workspace: &'a Path,
     _: Option<ToolEventSender>,
+    _: Option<BoundedToolEventSender>,
 ) -> ToolFuture<'a> {
     Box::pin(async move {
         ToolHandlerOutput::inferred(fs::tool_list_dir(args, config, workspace).await)
@@ -433,6 +464,7 @@ fn tool_handler_search_files<'a>(
     _: &'a Client,
     workspace: &'a Path,
     _: Option<ToolEventSender>,
+    _: Option<BoundedToolEventSender>,
 ) -> ToolFuture<'a> {
     Box::pin(async move {
         ToolHandlerOutput::inferred(fs::tool_search_files(args, config, workspace).await)
@@ -445,6 +477,7 @@ fn tool_handler_http_fetch<'a>(
     http: &'a Client,
     _: &'a Path,
     _: Option<ToolEventSender>,
+    _: Option<BoundedToolEventSender>,
 ) -> ToolFuture<'a> {
     Box::pin(
         async move { ToolHandlerOutput::inferred(net::tool_http_fetch(args, http, config).await) },
@@ -457,6 +490,7 @@ fn tool_handler_delete_file<'a>(
     _: &'a Client,
     workspace: &'a Path,
     _: Option<ToolEventSender>,
+    _: Option<BoundedToolEventSender>,
 ) -> ToolFuture<'a> {
     Box::pin(
         async move { ToolHandlerOutput::inferred(fs::tool_delete_file(args, workspace).await) },
@@ -1433,6 +1467,19 @@ pub(crate) async fn execute_tool(
     workspace: &Path,
     event_tx: Option<ToolEventSender>,
 ) -> ToolOutcome {
+    execute_tool_with_bounded_live_events(name, args_str, config, http, workspace, event_tx, None)
+        .await
+}
+
+pub(crate) async fn execute_tool_with_bounded_live_events(
+    name: &str,
+    args_str: &str,
+    config: &Config,
+    http: &Client,
+    workspace: &Path,
+    event_tx: Option<ToolEventSender>,
+    bounded_event_tx: Option<BoundedToolEventSender>,
+) -> ToolOutcome {
     let start = Instant::now();
 
     let args: serde_json::Value = match serde_json::from_str(args_str) {
@@ -1466,7 +1513,8 @@ pub(crate) async fn execute_tool(
         };
     }
 
-    let handler_output = (spec.handler)(&args, config, http, workspace, event_tx).await;
+    let handler_output =
+        (spec.handler)(&args, config, http, workspace, event_tx, bounded_event_tx).await;
     let duration_ms = start.elapsed().as_millis() as u64;
     let is_error = handler_output
         .is_error

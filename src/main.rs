@@ -1562,6 +1562,7 @@ fn matches_glob(name: &str, pattern: &str) -> bool {
 pub(crate) type WsTx = mpsc::Sender<String>;
 pub(crate) type LiveTx = mpsc::Sender<serde_json::Value>;
 pub(crate) const LIVE_EVENT_CHANNEL_CAPACITY: usize = 256;
+const MAX_PENDING_LIVE_CLIENT_EVENTS: usize = 1_024;
 
 #[derive(Clone)]
 pub(crate) struct LiveOutputReplayCtx {
@@ -1598,7 +1599,7 @@ async fn queue_live_client_events(
     state: &AppState,
     session_id: &str,
     events: Vec<serde_json::Value>,
-) -> Option<(u64, WsTx, Vec<serde_json::Value>)> {
+) -> Option<QueueLiveClientEventsResult> {
     let mut clients = state.session_clients.lock().await;
     let Some(binding) = clients.get_mut(session_id) else {
         return None;
@@ -1607,10 +1608,33 @@ async fn queue_live_client_events(
     queue_live_client_events_for_binding(binding, events)
 }
 
+struct SessionClientSendBatch {
+    connection_id: u64,
+    tx: WsTx,
+    events: Vec<serde_json::Value>,
+}
+
+struct SlowClientDisconnect {
+    connection_id: u64,
+}
+
+enum QueueLiveClientEventsResult {
+    Batch(SessionClientSendBatch),
+    Disconnect(SlowClientDisconnect),
+}
+
 fn queue_live_client_events_for_binding(
     binding: &mut SessionClientBinding,
     events: Vec<serde_json::Value>,
-) -> Option<(u64, WsTx, Vec<serde_json::Value>)> {
+) -> Option<QueueLiveClientEventsResult> {
+    if !events.is_empty()
+        && binding.pending_events.len().saturating_add(events.len()) > MAX_PENDING_LIVE_CLIENT_EVENTS
+    {
+        return Some(QueueLiveClientEventsResult::Disconnect(SlowClientDisconnect {
+            connection_id: binding.connection_id,
+        }));
+    }
+
     if !binding.replay_ready {
         binding.pending_events.extend(events);
         return None;
@@ -1626,13 +1650,21 @@ fn queue_live_client_events_for_binding(
             return None;
         }
         binding.live_send_in_progress = true;
-        return Some((binding.connection_id, binding.tx.clone(), events));
+        return Some(QueueLiveClientEventsResult::Batch(SessionClientSendBatch {
+            connection_id: binding.connection_id,
+            tx: binding.tx.clone(),
+            events,
+        }));
     }
 
     let mut queued = std::mem::take(&mut binding.pending_events);
     queued.extend(events);
     binding.live_send_in_progress = true;
-    Some((binding.connection_id, binding.tx.clone(), queued.into_iter().collect()))
+    Some(QueueLiveClientEventsResult::Batch(SessionClientSendBatch {
+        connection_id: binding.connection_id,
+        tx: binding.tx.clone(),
+        events: queued.into_iter().collect(),
+    }))
 }
 
 async fn flush_queued_live_client_events(
@@ -1745,7 +1777,7 @@ async fn take_live_client_events_for_send(
     session_id: &str,
     connection_id: u64,
     event: serde_json::Value,
-) -> Option<(u64, WsTx, Vec<serde_json::Value>)> {
+) -> Option<QueueLiveClientEventsResult> {
     let mut clients = state.session_clients.lock().await;
     let Some(binding) = clients.get_mut(session_id) else {
         return None;
@@ -1864,38 +1896,45 @@ async fn record_tool_output_event_for_replay_and_client(
 
     client_events.push(event);
 
-    if let Some((connection_id, tx, events)) =
-        queue_live_client_events(state, session_id, client_events).await
-    {
-        let mut unsent_start = 0usize;
-        while unsent_start < events.len() {
-            let payload = events[unsent_start].to_string();
-            match tx.try_send(payload) {
-                Ok(()) => {
-                    unsent_start += 1;
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    requeue_live_client_events(
-                        state,
-                        session_id,
-                        connection_id,
-                        events[unsent_start..].to_vec(),
-                    )
-                    .await;
-                    break;
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    unbind_session_connection_if_matches(state, session_id, connection_id).await;
-                    break;
-                }
+    let Some(SessionClientSendBatch {
+        connection_id,
+        tx,
+        events,
+    }) = take_live_client_send_batch(
+        state,
+        session_id,
+        queue_live_client_events(state, session_id, client_events).await,
+    )
+    .await
+    else {
+        return;
+    };
+
+    let mut unsent_start = 0usize;
+    while unsent_start < events.len() {
+        let payload = events[unsent_start].to_string();
+        match tx.try_send(payload) {
+            Ok(()) => {
+                unsent_start += 1;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                requeue_live_client_events(
+                    state,
+                    session_id,
+                    connection_id,
+                    events[unsent_start..].to_vec(),
+                )
+                .await;
+                break;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                unbind_session_connection_if_matches(state, session_id, connection_id).await;
+                break;
             }
         }
-        if unsent_start == events.len() {
-            finish_live_client_send(state, session_id, connection_id, Vec::new()).await;
-            return;
-        }
-    } else {
-        return;
+    }
+    if unsent_start == events.len() {
+        finish_live_client_send(state, session_id, connection_id, Vec::new()).await;
     }
 }
 
@@ -1957,6 +1996,38 @@ async fn unbind_session_connection_if_matches(
     let mut clients = state.session_clients.lock().await;
     if clients.get(session_id).map(|binding| binding.connection_id) == Some(connection_id) {
         clients.remove(session_id);
+    }
+}
+
+async fn disconnect_session_connection_if_matches(
+    state: &AppState,
+    session_id: &str,
+    connection_id: u64,
+) {
+    let cancel = {
+        let cancels = state.connection_cancels.lock().await;
+        cancels
+            .get(session_id)
+            .filter(|binding| binding.connection_id == connection_id)
+            .map(|binding| binding.cancel.clone())
+    };
+    if let Some(cancel) = cancel {
+        cancel.cancel();
+    }
+    unbind_session_connection_if_matches(state, session_id, connection_id).await;
+}
+
+async fn take_live_client_send_batch(
+    state: &AppState,
+    session_id: &str,
+    result: Option<QueueLiveClientEventsResult>,
+) -> Option<SessionClientSendBatch> {
+    match result? {
+        QueueLiveClientEventsResult::Batch(batch) => Some(batch),
+        QueueLiveClientEventsResult::Disconnect(SlowClientDisconnect { connection_id }) => {
+            disconnect_session_connection_if_matches(state, session_id, connection_id).await;
+            None
+        }
     }
 }
 
@@ -2403,20 +2474,30 @@ async fn dispatch_live_event(
     }
 
     let target_connection_id = current_connection_id.unwrap_or(connection_id);
-    if let Some((connection_id, tx, events)) =
-        take_live_client_events_for_send(state, session_id, target_connection_id, event).await
-    {
-        let mut all_sent = true;
-        for pending_event in events {
-            if !ws_send(&tx, &pending_event).await {
-                unbind_session_connection_if_matches(state, session_id, connection_id).await;
-                all_sent = false;
-                break;
-            }
+    let Some(SessionClientSendBatch {
+        connection_id,
+        tx,
+        events,
+    }) = take_live_client_send_batch(
+        state,
+        session_id,
+        take_live_client_events_for_send(state, session_id, target_connection_id, event).await,
+    )
+    .await
+    else {
+        return;
+    };
+
+    let mut all_sent = true;
+    for pending_event in events {
+        if !ws_send(&tx, &pending_event).await {
+            unbind_session_connection_if_matches(state, session_id, connection_id).await;
+            all_sent = false;
+            break;
         }
-        if all_sent {
-            finish_live_client_send(state, session_id, connection_id, Vec::new()).await;
-        }
+    }
+    if all_sent {
+        finish_live_client_send(state, session_id, connection_id, Vec::new()).await;
     }
 }
 

@@ -5,6 +5,15 @@ import { wrapInTimeline, animatePanelIn, animateCollapsibleSection } from './tim
 import { pinReactStatusToBottom } from './react-status.js';
 
 const TOOL_LIVE_OUTPUT_MAX_CHARS = 60000;
+const TOOL_LIVE_OUTPUT_TRUNCATED_PREFIX = '[live output truncated]\n';
+
+export function mergeToolLiveOutput(current, stream, chunk, maxChars = TOOL_LIVE_OUTPUT_MAX_CHARS) {
+  const prefix = stream === 'stderr' ? '\n[stderr]\n' : '';
+  let next = `${current || ''}${prefix}${chunk || ''}`;
+  if (next.length <= maxChars) return next;
+  next = next.slice(next.length - maxChars);
+  return `${TOOL_LIVE_OUTPUT_TRUNCATED_PREFIX}${next}`;
+}
 
 function findToolPanel(id) {
   const panels = Array.from(dom.chat.querySelectorAll('.tool-panel'));
@@ -94,18 +103,10 @@ export function updateToolProgress(id, elapsedMs) {
   }
 }
 
-function mergeLiveOutput(current, stream, chunk) {
-  const prefix = stream === 'stderr' ? '\n[stderr]\n' : '';
-  let next = `${current || ''}${prefix}${chunk || ''}`;
-  if (next.length <= TOOL_LIVE_OUTPUT_MAX_CHARS) return next;
-  next = next.slice(next.length - TOOL_LIVE_OUTPUT_MAX_CHARS);
-  return `[live output truncated]\n${next}`;
-}
-
 export function appendToolOutput(id, stream, chunk) {
   const panel = findToolPanel(id);
   if (!panel || panel.dataset.toolHasResult === 'true' || !chunk) return;
-  panel.dataset.toolLiveOutput = mergeLiveOutput(panel.dataset.toolLiveOutput || '', stream, chunk);
+  panel.dataset.toolLiveOutput = mergeToolLiveOutput(panel.dataset.toolLiveOutput || '', stream, chunk);
   if (state.activeToolPanel === panel) {
     syncToolDrawer(panel);
   }

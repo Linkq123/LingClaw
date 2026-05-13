@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
   addSubagentTool,
+  appendSubagentToolOutput,
   closeSubagentModal,
   createSubagentPanel,
   finishSubagentPanel,
@@ -256,6 +257,53 @@ describe('subagent modal hosting', () => {
 
     expect(meta?.textContent).toBe('History replay preserved 3 tool calls.');
     expect(empty?.textContent).toBe('Tool details were not saved for this history replay.');
+  });
+
+  it('shares the same live-output merge policy for repeated stdout and stderr chunks', () => {
+    createSubagentPanel('explore', 'Inspect the current service status.', 'task-live-output');
+    addSubagentTool({ task_id: 'task-live-output', agent: 'explore' }, 'exec', 'tool-1');
+
+    appendSubagentToolOutput(
+      { task_id: 'task-live-output', agent: 'explore' },
+      'tool-1',
+      'stdout',
+      'hello',
+      'exec',
+    );
+    appendSubagentToolOutput(
+      { task_id: 'task-live-output', agent: 'explore' },
+      'tool-1',
+      'stderr',
+      'boom',
+      'exec',
+    );
+
+    const badge = dom.chat?.querySelector('.subagent-tool-pill') as HTMLElement | null;
+    expect(badge?.dataset.toolLiveOutput).toBe('hello\n[stderr]\nboom');
+  });
+
+  it('truncates repeated subagent live output with the shared marker', () => {
+    createSubagentPanel('explore', 'Inspect the current service status.', 'task-live-output-trunc');
+    addSubagentTool({ task_id: 'task-live-output-trunc', agent: 'explore' }, 'exec', 'tool-1');
+
+    appendSubagentToolOutput(
+      { task_id: 'task-live-output-trunc', agent: 'explore' },
+      'tool-1',
+      'stdout',
+      'A'.repeat(59000),
+      'exec',
+    );
+    appendSubagentToolOutput(
+      { task_id: 'task-live-output-trunc', agent: 'explore' },
+      'tool-1',
+      'stdout',
+      'B'.repeat(2000),
+      'exec',
+    );
+
+    const badge = dom.chat?.querySelector('.subagent-tool-pill') as HTMLElement | null;
+    expect(badge?.dataset.toolLiveOutput?.startsWith('[live output truncated]\n')).toBe(true);
+    expect(badge?.dataset.toolLiveOutput?.endsWith('B'.repeat(2000))).toBe(true);
   });
 
   it('restores reasoning, tools, and summary from a history snapshot', () => {

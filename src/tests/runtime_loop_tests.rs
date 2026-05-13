@@ -366,6 +366,53 @@ async fn execute_tool_with_live_output_returns_when_live_queue_is_full() {
 }
 
 #[tokio::test]
+async fn execute_tool_with_live_output_drops_extra_events_when_local_live_queue_is_full() {
+    let workspace = std::env::temp_dir().join(format!(
+        "lingclaw-runtime-live-output-local-cap-{}",
+        now_epoch()
+    ));
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+
+    let payload = "X".repeat(12_000);
+    let script = format!("import sys\nsys.stdout.write({payload:?})");
+    let args = if cfg!(windows) {
+        serde_json::json!({
+            "program": "python",
+            "args": ["-c", script],
+        })
+    } else {
+        serde_json::json!({
+            "program": "python3",
+            "args": ["-c", script],
+        })
+    };
+    let (live_tx, mut live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+
+    let outcome = execute_tool_with_live_output(
+        &live_tx,
+        "exec_call_local_cap",
+        tools::TOOL_NAME_EXEC,
+        &serde_json::to_string(&args).expect("args should serialize"),
+        &test_config(),
+        &reqwest::Client::new(),
+        &workspace,
+        false,
+        None,
+    )
+    .await;
+
+    assert!(outcome.output.contains("exit code:"), "{}", outcome.output);
+    let event_count = std::iter::from_fn(|| live_rx.try_recv().ok()).count();
+    assert!(event_count <= tools::TOOL_LIVE_EVENT_CHANNEL_CAPACITY);
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
 async fn handle_idle_socket_input_queues_new_prompt_while_reconnected_run_active() {
     let state = Arc::new(test_app_state());
     let session_id = MAIN_SESSION_ID.to_string();

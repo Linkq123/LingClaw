@@ -12,7 +12,7 @@ import {
 import { scrollDown } from '../scroll.js';
 import { wrapInTimeline, animatePanelIn, animateCollapsibleSection } from './timeline.js';
 import { pinReactStatusToBottom } from './react-status.js';
-import { closeToolDrawer, openToolDrawer, syncToolDrawer } from './tools.js';
+import { closeToolDrawer, openToolDrawer, syncToolDrawer, mergeToolLiveOutput } from './tools.js';
 import {
   ensureModalBackdrop,
   moveModalHostToBody,
@@ -71,8 +71,6 @@ const LABELS = {
   failureDetails: 'Failure details',
   duration: 'Duration',
 } as const;
-
-const SUBAGENT_TOOL_LIVE_OUTPUT_MAX_CHARS = 60000;
 
 function pluralize(count: number, singular: string, plural = `${singular}s`) {
   return count === 1 ? singular : plural;
@@ -233,14 +231,6 @@ function syncToolBadgeDataset(
   badge.dataset.toolHasResult = hasResult ? 'true' : 'false';
   badge.dataset.toolStatus = toolStatus;
   badge.title = [toolName || 'tool', toolStatus].filter(Boolean).join(' / ');
-}
-
-function mergeSubagentToolLiveOutput(current, stream, chunk) {
-  const prefix = stream === 'stderr' ? '\n[stderr]\n' : '';
-  let next = `${current || ''}${prefix}${chunk || ''}`;
-  if (next.length <= SUBAGENT_TOOL_LIVE_OUTPUT_MAX_CHARS) return next;
-  next = next.slice(next.length - SUBAGENT_TOOL_LIVE_OUTPUT_MAX_CHARS);
-  return `[live output truncated]\n${next}`;
 }
 
 function ensureToolBadge(panel, toolId, toolName) {
@@ -720,7 +710,7 @@ export function appendSubagentToolOutput(
   }
   if (!badge || badge.dataset.toolHasResult === 'true') return;
 
-  badge.dataset.toolLiveOutput = mergeSubagentToolLiveOutput(
+  badge.dataset.toolLiveOutput = mergeToolLiveOutput(
     badge.dataset.toolLiveOutput || '',
     stream,
     chunk,

@@ -413,6 +413,30 @@ function syncReusedTaskMetadata(existingRow: HTMLElement, existingPanel: HTMLEle
   );
 }
 
+function reuseSyntheticTaskRows(existing, layout, nextTasks) {
+  for (const task of nextTasks) {
+    const existingRow = existing.taskRows.get(task.id);
+    const existingPanel = existing.taskPanels.get(task.id);
+    const nextRow = layout.taskRows.get(task.id);
+    if (!existingRow || !existingPanel || !nextRow) continue;
+
+    syncReusedTaskMetadata(existingRow, existingPanel, nextRow, task);
+    nextRow.replaceWith(existingRow);
+    layout.taskRows.set(task.id, existingRow);
+    layout.taskPanels.set(task.id, existingPanel);
+  }
+}
+
+function applySyntheticLayoutMerge(existing, layers: HTMLElement, nextLayers: HTMLElement, layout, layerCount: number) {
+  layers.replaceChildren(...Array.from(nextLayers.children));
+  existing.taskRows = layout.taskRows;
+  existing.taskPanels = layout.taskPanels;
+  existing.taskLayer = layout.taskLayer;
+  existing.layerCount = layerCount;
+  updateHeaderProgress(existing);
+  return true;
+}
+
 function mergeSyntheticOrchestratePanel(existing, data) {
   const nextTasks = Array.isArray(data.tasks) ? data.tasks : [];
   const nextTaskIds = new Set(nextTasks.map((task) => task.id));
@@ -434,47 +458,14 @@ function mergeSyntheticOrchestratePanel(existing, data) {
     label.textContent = `Orchestrate / ${data.task_count || nextTasks.length} tasks / ${nextLayerCount} layers`;
   }
 
-  if (sameTasks) {
-    for (const task of nextTasks) {
-      const existingRow = existing.taskRows.get(task.id);
-      const existingPanel = existing.taskPanels.get(task.id);
-      const nextRow = layout.taskRows.get(task.id);
-      if (!existingRow || !existingPanel || !nextRow) continue;
-
-      syncReusedTaskMetadata(existingRow, existingPanel, nextRow, task);
-      nextRow.replaceWith(existingRow);
-      layout.taskRows.set(task.id, existingRow);
-      layout.taskPanels.set(task.id, existingPanel);
-    }
-
-    layers.replaceChildren(...Array.from(nextLayers.children));
-    existing.taskRows = layout.taskRows;
-    existing.taskPanels = layout.taskPanels;
-    existing.taskLayer = layout.taskLayer;
-    existing.layerCount = nextLayerCount;
-    updateHeaderProgress(existing);
-    return true;
-  }
-
-  for (const task of nextTasks) {
-    const existingRow = existing.taskRows.get(task.id);
-    const existingPanel = existing.taskPanels.get(task.id);
-    const nextRow = layout.taskRows.get(task.id);
-    if (!existingRow || !existingPanel || !nextRow) continue;
-
-    syncReusedTaskMetadata(existingRow, existingPanel, nextRow, task);
-    nextRow.replaceWith(existingRow);
-    layout.taskRows.set(task.id, existingRow);
-    layout.taskPanels.set(task.id, existingPanel);
-  }
-
-  layers.replaceChildren(...Array.from(nextLayers.children));
-  existing.taskRows = layout.taskRows;
-  existing.taskPanels = layout.taskPanels;
-  existing.taskLayer = layout.taskLayer;
-  existing.layerCount = layout.layerCount;
-  updateHeaderProgress(existing);
-  return true;
+  reuseSyntheticTaskRows(existing, layout, nextTasks);
+  return applySyntheticLayoutMerge(
+    existing,
+    layers,
+    nextLayers,
+    layout,
+    sameTasks ? nextLayerCount : layout.layerCount,
+  );
 }
 
 export function createOrchestratePanel(data) {

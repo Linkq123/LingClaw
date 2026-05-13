@@ -5271,6 +5271,148 @@ fn finish_session_replay_flushes_pending_events_through_serialized_sender() {
 }
 
 #[test]
+fn take_live_client_events_for_send_drops_slow_client_when_backlog_overflows() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-backlog-overflow-{}", now_epoch());
+    let (bound_tx, _bound_rx) = mpsc::channel::<String>(8);
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &session_id,
+        1,
+        &bound_tx,
+        false,
+    ));
+
+    rt.block_on(async {
+        let mut clients = state.session_clients.lock().await;
+        let binding = clients
+            .get_mut(&session_id)
+            .expect("session client binding should exist");
+        binding.pending_events = (0..MAX_PENDING_LIVE_CLIENT_EVENTS)
+            .map(|idx| json!({"type":"delta","content":format!("queued-{idx}")}))
+            .collect();
+    });
+
+    let next = rt.block_on(take_live_client_events_for_send(
+        state.as_ref(),
+        &session_id,
+        1,
+        json!({"type":"delta","content":"overflow"}),
+    ));
+
+    let Some(QueueLiveClientEventsResult::Disconnect(SlowClientDisconnect { connection_id })) =
+        next
+    else {
+        panic!("overflow should return a disconnect result");
+    };
+    assert_eq!(connection_id, 1);
+}
+
+#[test]
+fn disconnect_session_connection_if_matches_cancels_matching_socket() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("slow-client-disconnect-{}", now_epoch());
+    let cancel = CancellationToken::new();
+
+    rt.block_on(async {
+        state
+            .active_connections
+            .lock()
+            .await
+            .insert(session_id.clone(), 1);
+        let (bound_tx, _bound_rx) = mpsc::channel::<String>(8);
+        state.session_clients.lock().await.insert(
+            session_id.clone(),
+            SessionClientBinding {
+                connection_id: 1,
+                tx: bound_tx,
+                replay_ready: true,
+                pending_events: VecDeque::new(),
+                live_send_in_progress: false,
+            },
+        );
+        state.connection_cancels.lock().await.insert(
+            session_id.clone(),
+            ConnectionCancelBinding {
+                connection_id: 1,
+                cancel: cancel.clone(),
+            },
+        );
+    });
+
+    rt.block_on(disconnect_session_connection_if_matches(
+        state.as_ref(),
+        &session_id,
+        1,
+    ));
+
+    assert!(cancel.is_cancelled());
+    rt.block_on(async {
+        assert!(!state.active_connections.lock().await.contains_key(&session_id));
+        assert!(!state.session_clients.lock().await.contains_key(&session_id));
+    });
+}
+
+#[test]
+fn disconnect_session_connection_if_matches_keeps_newer_socket_alive() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("slow-client-disconnect-newer-{}", now_epoch());
+    let current_cancel = CancellationToken::new();
+    let newer_cancel = CancellationToken::new();
+
+    rt.block_on(async {
+        state
+            .active_connections
+            .lock()
+            .await
+            .insert(session_id.clone(), 2);
+        let (current_tx, _current_rx) = mpsc::channel::<String>(8);
+        state.session_clients.lock().await.insert(
+            session_id.clone(),
+            SessionClientBinding {
+                connection_id: 2,
+                tx: current_tx,
+                replay_ready: true,
+                pending_events: VecDeque::new(),
+                live_send_in_progress: false,
+            },
+        );
+        state.connection_cancels.lock().await.insert(
+            session_id.clone(),
+            ConnectionCancelBinding {
+                connection_id: 2,
+                cancel: newer_cancel.clone(),
+            },
+        );
+    });
+
+    rt.block_on(disconnect_session_connection_if_matches(
+        state.as_ref(),
+        &session_id,
+        1,
+    ));
+
+    assert!(!current_cancel.is_cancelled());
+    assert!(!newer_cancel.is_cancelled());
+    rt.block_on(async {
+        assert_eq!(state.active_connections.lock().await.get(&session_id).copied(), Some(2));
+        assert_eq!(
+            state
+                .session_clients
+                .lock()
+                .await
+                .get(&session_id)
+                .map(|binding| binding.connection_id),
+            Some(2)
+        );
+    });
+}
+
+#[test]
 fn finish_session_replay_drains_backlog_larger_than_writer_queue() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = Arc::new(test_app_state());
@@ -5520,6 +5662,51 @@ fn replay_live_round_rehydrates_inflight_round_state() {
             .get(&session_id)
             .is_none()
     );
+}
+
+#[test]
+fn record_tool_output_event_disconnects_slow_client_socket_on_overflow() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("tool-output-overflow-disconnect-{}", now_epoch());
+    let cancel = CancellationToken::new();
+
+    rt.block_on(async {
+        let (bound_tx, _bound_rx) = mpsc::channel::<String>(8);
+        bind_session_connection(state.as_ref(), &session_id, 1, &bound_tx, false).await;
+        let mut clients = state.session_clients.lock().await;
+        let binding = clients
+            .get_mut(&session_id)
+            .expect("session client binding should exist");
+        binding.pending_events = (0..MAX_PENDING_LIVE_CLIENT_EVENTS)
+            .map(|idx| json!({"type":"delta","content":format!("queued-{idx}")}))
+            .collect();
+        state.connection_cancels.lock().await.insert(
+            session_id.clone(),
+            ConnectionCancelBinding {
+                connection_id: 1,
+                cancel: cancel.clone(),
+            },
+        );
+    });
+
+    rt.block_on(record_tool_output_event_for_replay_and_client(
+        state.as_ref(),
+        &session_id,
+        json!({
+            "type": "tool_output",
+            "id": "tool-1",
+            "name": "exec",
+            "stream": "stdout",
+            "chunk": "overflow",
+        }),
+    ));
+
+    assert!(cancel.is_cancelled());
+    rt.block_on(async {
+        assert!(!state.session_clients.lock().await.contains_key(&session_id));
+        assert!(!state.active_connections.lock().await.contains_key(&session_id));
+    });
 }
 
 #[test]

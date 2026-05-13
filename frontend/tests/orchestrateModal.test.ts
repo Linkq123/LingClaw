@@ -406,6 +406,65 @@ describe('orchestrate task modal hosting', () => {
     expect(promptEl?.textContent || '').toContain('Fix the hidden footer in the expanded card.');
   });
 
+  it('keeps same-task and expanding synthetic upgrades on the shared merge path', () => {
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 1,
+      layer_count: 1,
+      synthetic: true,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: '',
+          depends_on: [],
+        },
+      ],
+    });
+
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 1,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Fix the hidden footer in the expanded card.',
+          depends_on: [],
+        },
+      ],
+    });
+
+    createOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      task_count: 2,
+      tasks: [
+        {
+          id: 'task-a',
+          agent: 'frontend-coder',
+          prompt_preview: 'Fix the hidden footer in the expanded card.',
+          depends_on: [],
+        },
+        {
+          id: 'task-b',
+          agent: 'qa-reviewer',
+          prompt_preview: 'Verify the visual regression fix.',
+          depends_on: ['task-a'],
+        },
+      ],
+    });
+
+    const rows = Array.from(dom.chat?.querySelectorAll('.orchestrate-task') || []);
+    const taskARow = dom.chat?.querySelector('[data-task-id="task-a"]') as HTMLElement | null;
+    const taskAPanel = taskARow?.querySelector('.subagent-panel') as HTMLElement | null;
+    const label = dom.chat?.querySelector('.orchestrate-label') as HTMLElement | null;
+
+    expect(rows).toHaveLength(2);
+    expect(taskARow?.dataset.promptPreview).toBe('Fix the hidden footer in the expanded card.');
+    expect(taskAPanel?.dataset.taskId).toBe('orch-1:task-a');
+    expect(label?.textContent).toContain('2 layers');
+  });
+
   it('does not reuse another task panel when the same agent appears twice', () => {
     createOrchestratePanel({
       orchestrate_id: 'orch-1',

@@ -329,18 +329,20 @@ pub(crate) async fn execute_subagent_tool_with_live_output(
     config: &Config,
     http: &Client,
     workspace: &Path,
-    isolated_mcp_session: bool,
+    _isolated_mcp_session: bool,
     replay_ctx: Option<crate::LiveOutputReplayCtx>,
 ) -> tools::ToolOutcome {
     let start = tokio::time::Instant::now();
-    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) =
+        tokio::sync::mpsc::channel(tools::TOOL_LIVE_EVENT_CHANNEL_CAPACITY);
     let outcome = execute_subagent_tool(
         tool_name,
         args_str,
         config,
         http,
         workspace,
-        isolated_mcp_session,
+        _isolated_mcp_session,
+        None,
         Some(event_tx),
     );
     let timeout = runtime_timeout_for_subagent_tool(tool_name, config);
@@ -349,26 +351,29 @@ pub(crate) async fn execute_subagent_tool_with_live_output(
     let sleep = tokio::time::sleep(timeout.unwrap_or(Duration::ZERO));
     tokio::pin!(sleep);
     tokio::pin!(outcome);
+    let mut forward_event = |stream, chunk: String| {
+        let replay_ctx = replay_ctx.clone();
+        async move {
+            emit_subagent_tool_output_event(
+                live_tx,
+                task_id,
+                agent_name,
+                tool_name,
+                tool_id,
+                stream,
+                &chunk,
+                replay_ctx.as_ref(),
+            )
+            .await;
+        }
+    };
     let mut pending_result: Option<tools::ToolOutcome> = None;
     let mut event_rx_open = true;
 
     loop {
         if let Some(result) = pending_result.take() {
             if event_rx_open {
-                while let Ok(event) = event_rx.try_recv() {
-                    let tools::ToolLiveEvent::ExecOutput { stream, chunk } = event;
-                    emit_subagent_tool_output_event(
-                        live_tx,
-                        task_id,
-                        agent_name,
-                        tool_name,
-                        tool_id,
-                        stream,
-                        &chunk,
-                        replay_ctx.as_ref(),
-                    )
-                    .await;
-                }
+                tools::drain_bounded_exec_live_events(&mut event_rx, &mut forward_event).await;
             }
             return result;
         }
@@ -390,18 +395,7 @@ pub(crate) async fn execute_subagent_tool_with_live_output(
             maybe_event = event_rx.recv() => {
                 match maybe_event {
                     Some(event) => {
-                        let tools::ToolLiveEvent::ExecOutput { stream, chunk } = event;
-                        emit_subagent_tool_output_event(
-                            live_tx,
-                            task_id,
-                            agent_name,
-                            tool_name,
-                            tool_id,
-                            stream,
-                            &chunk,
-                            replay_ctx.as_ref(),
-                        )
-                        .await;
+                        tools::forward_exec_live_event(event, &mut forward_event).await;
                     }
                     None => {
                         event_rx_open = false;
@@ -1518,9 +1512,6 @@ fn build_filtered_tool_defs(
     defs
 }
 
-/// Execute a tool within the sub-agent context.
-/// Tries MCP tools first (matching the main loop pattern), then falls back
-/// to the built-in tool registry.
 async fn execute_subagent_tool(
     name: &str,
     args_str: &str,
@@ -1529,6 +1520,7 @@ async fn execute_subagent_tool(
     workspace: &Path,
     isolated_mcp_session: bool,
     event_tx: Option<tools::ToolEventSender>,
+    bounded_event_tx: Option<tools::BoundedToolEventSender>,
 ) -> tools::ToolOutcome {
     let mcp_result = if isolated_mcp_session {
         tools::mcp::execute_tool_isolated(name, args_str, config, workspace).await
@@ -1539,7 +1531,16 @@ async fn execute_subagent_tool(
     if let Some(result) = mcp_result {
         result
     } else {
-        tools::execute_tool(name, args_str, config, http, workspace, event_tx).await
+        tools::execute_tool_with_bounded_live_events(
+            name,
+            args_str,
+            config,
+            http,
+            workspace,
+            event_tx,
+            bounded_event_tx,
+        )
+        .await
     }
 }
 

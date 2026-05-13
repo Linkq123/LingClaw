@@ -11,6 +11,7 @@ use std::{
     time::Duration,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::sync::mpsc::error::TrySendError;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -110,6 +111,7 @@ pub(crate) async fn tool_exec(
     config: &Config,
     workspace: &Path,
     event_tx: Option<super::ToolEventSender>,
+    bounded_event_tx: Option<super::BoundedToolEventSender>,
 ) -> super::ToolHandlerOutput {
     let request = match parse_exec_request(args, workspace) {
         Ok(request) => request,
@@ -130,6 +132,7 @@ pub(crate) async fn tool_exec(
         config.exec_timeout,
         config.max_output_bytes,
         event_tx,
+        bounded_event_tx,
     )
     .await
     {
@@ -356,6 +359,7 @@ async fn run_exec_request(
     timeout: Duration,
     max_output_bytes: usize,
     event_tx: Option<super::ToolEventSender>,
+    bounded_event_tx: Option<super::BoundedToolEventSender>,
 ) -> std::io::Result<ExecRunOutcome> {
     let capture_limit = capture_budget_limit(max_output_bytes);
     let live_budget = SharedByteBudget::new(max_output_bytes);
@@ -382,6 +386,7 @@ async fn run_exec_request(
         capture_limit,
         live_budget.clone(),
         event_tx.clone(),
+        bounded_event_tx.clone(),
     ));
     let stderr_task = tokio::spawn(capture_stream(
         "stderr",
@@ -389,6 +394,7 @@ async fn run_exec_request(
         capture_limit,
         live_budget,
         event_tx,
+        bounded_event_tx,
     ));
 
     let status = match tokio::time::timeout(timeout, child.wait()).await {
@@ -629,6 +635,7 @@ fn flush_pending_live_utf8(
     stream: &'static str,
     pending_utf8: &mut Vec<u8>,
     event_tx: Option<super::ToolEventSender>,
+    bounded_event_tx: Option<super::BoundedToolEventSender>,
 ) {
     if pending_utf8.is_empty() {
         return;
@@ -636,7 +643,7 @@ fn flush_pending_live_utf8(
 
     let bytes = std::mem::take(pending_utf8);
     let text = String::from_utf8_lossy(&bytes);
-    emit_live_text_chunks(stream, &text, event_tx);
+    emit_live_text_chunks(stream, &text, event_tx, bounded_event_tx);
 }
 
 async fn capture_stream<R>(
@@ -645,6 +652,7 @@ async fn capture_stream<R>(
     capture_limit: usize,
     live_budget: SharedByteBudget,
     event_tx: Option<super::ToolEventSender>,
+    bounded_event_tx: Option<super::BoundedToolEventSender>,
 ) -> std::io::Result<StreamCapture>
 where
     R: AsyncRead + Unpin,
@@ -674,6 +682,7 @@ where
                 &buffer[..forwarded],
                 &mut pending_live_utf8,
                 event_tx.clone(),
+                bounded_event_tx.clone(),
             );
         }
 
@@ -681,7 +690,12 @@ where
         truncate_capture_tail(&mut captured, capture_limit);
     }
 
-    flush_pending_live_utf8(label, &mut pending_live_utf8, event_tx);
+    flush_pending_live_utf8(
+        label,
+        &mut pending_live_utf8,
+        event_tx,
+        bounded_event_tx,
+    );
 
     Ok(StreamCapture {
         label,
@@ -705,10 +719,8 @@ fn emit_live_text_chunks(
     stream: &'static str,
     chunk: &str,
     event_tx: Option<super::ToolEventSender>,
+    bounded_event_tx: Option<super::BoundedToolEventSender>,
 ) {
-    let Some(event_tx) = event_tx else {
-        return;
-    };
     if chunk.is_empty() {
         return;
     }
@@ -722,13 +734,22 @@ fn emit_live_text_chunks(
         if end == start {
             break;
         }
-        if event_tx
-            .send(super::ToolLiveEvent::ExecOutput {
-                stream,
-                chunk: chunk[start..end].to_string(),
-            })
-            .is_err()
-        {
+        let event = super::ToolLiveEvent::ExecOutput {
+            stream,
+            chunk: chunk[start..end].to_string(),
+        };
+        let sent = if let Some(event_tx) = event_tx.as_ref() {
+            event_tx.send(event).is_ok()
+        } else if let Some(event_tx) = bounded_event_tx.as_ref() {
+            match event_tx.try_send(event) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => false,
+                Err(TrySendError::Closed(_)) => false,
+            }
+        } else {
+            false
+        };
+        if !sent {
             break;
         }
         start = end;
@@ -740,6 +761,7 @@ pub(crate) fn forward_live_chunk(
     bytes: &[u8],
     pending_utf8: &mut Vec<u8>,
     event_tx: Option<super::ToolEventSender>,
+    bounded_event_tx: Option<super::BoundedToolEventSender>,
 ) {
     if bytes.is_empty() {
         return;
@@ -756,7 +778,7 @@ pub(crate) fn forward_live_chunk(
     }
 
     let text = String::from_utf8_lossy(complete);
-    emit_live_text_chunks(stream, &text, event_tx);
+    emit_live_text_chunks(stream, &text, event_tx, bounded_event_tx);
 }
 
 fn apply_exec_process_flags(command: &mut tokio::process::Command) {

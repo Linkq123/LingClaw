@@ -402,11 +402,23 @@ fn forward_live_chunk_preserves_utf8_split_across_reads() {
     let mut pending = Vec::new();
     let bytes = "你好".as_bytes();
 
-    forward_live_chunk("stdout", &bytes[..2], &mut pending, Some(tx.clone()));
+    forward_live_chunk(
+        "stdout",
+        &bytes[..2],
+        &mut pending,
+        Some(tx.clone()),
+        None,
+    );
     assert!(rx.try_recv().is_err(), "incomplete utf-8 prefix should not emit yet");
     assert_eq!(pending, bytes[..2]);
 
-    forward_live_chunk("stdout", &bytes[2..], &mut pending, Some(tx));
+    forward_live_chunk(
+        "stdout",
+        &bytes[2..],
+        &mut pending,
+        Some(tx),
+        None,
+    );
     let mut combined = String::new();
     while let Ok(event) = rx.try_recv() {
         match event {
