@@ -5,21 +5,21 @@ fn phase_transitions_happy_path() {
     let mut ctx = AgentLoopCtx::new(false);
     assert_eq!(ctx.phase(), AgentPhase::Analyze);
 
-    // Analyze → Act
+    // Analyze -> Act
     ctx.transition_to_act();
     assert_eq!(ctx.phase(), AgentPhase::Act);
 
-    // Act → Observe (2 tool calls)
+    // Act -> Observe (2 tool calls)
     ctx.transition_to_observe(2);
     assert_eq!(ctx.phase(), AgentPhase::Observe);
     assert_eq!(ctx.tool_calls, 2);
 
-    // Observe → Analyze (new cycle)
+    // Observe -> Analyze (new cycle)
     ctx.transition_to_analyze();
     assert_eq!(ctx.phase(), AgentPhase::Analyze);
     assert_eq!(ctx.cycles, 1);
 
-    // Analyze → Finish
+    // Analyze -> Finish
     ctx.transition_to_finish(FinishReason::Complete);
     assert_eq!(ctx.phase(), AgentPhase::Finish);
     assert_eq!(ctx.finish_reason, Some(FinishReason::Complete));
@@ -94,13 +94,37 @@ fn finish_heuristic() {
 
 #[test]
 fn evaluate_finish_returns_correct_reasons() {
-    // Tool calls → continue (None)
+    // Tool calls -> continue (None)
     assert_eq!(evaluate_finish(true, true), None);
     assert_eq!(evaluate_finish(false, true), None);
-    // Content, no tools → Complete
+    // Content, no tools -> Complete
     assert_eq!(evaluate_finish(true, false), Some(FinishReason::Complete));
-    // No content, no tools → Empty
+    // No content, no tools -> Empty
     assert_eq!(evaluate_finish(false, false), Some(FinishReason::Empty));
+}
+
+#[test]
+fn evaluate_finish_ignores_task_state_readiness_and_blockers() {
+    let mut state = seeded_state("fix the timeout handling");
+    state.uncertainties.push(UncertaintyItem {
+        topic: "timeout verification".into(),
+        reason: "the write path was not inspected yet".into(),
+        blocking: true,
+    });
+    state.recompute_ready_to_finish();
+    assert!(!state.ready_to_finish);
+    assert!(state.has_blocking_uncertainty());
+
+    assert_eq!(evaluate_finish(true, false), Some(FinishReason::Complete));
+}
+
+#[test]
+fn evaluate_finish_returns_complete_for_action_oriented_reply_without_tools() {
+    let mut state = seeded_state("implement retry handling in the CLI");
+    state.recompute_ready_to_finish();
+    assert!(!state.ready_to_finish);
+
+    assert_eq!(evaluate_finish(true, false), Some(FinishReason::Complete));
 }
 
 fn seeded_state(query: &str) -> WorkingState {
@@ -109,220 +133,6 @@ fn seeded_state(query: &str) -> WorkingState {
     state
 }
 
-#[test]
-fn finish_gate_defers_action_oriented_plan_only_reply_once() {
-    let state = seeded_state("optimize the repo performance and apply the changes");
-    let decision = evaluate_finish_with_gate(
-        true,
-        false,
-        &FinishGateContext {
-            finish_deferred_once: false,
-            assistant_content: Some(
-                "I would start by reviewing the code and then optimize the hot path.",
-            ),
-            memory_next_actions: &[],
-            working_state: &state,
-        },
-    );
-
-    match decision {
-        FinishDecision::Defer(hint) => {
-            assert!(hint.contains("Finish Check"));
-            assert!(hint.contains("confirmed finding"));
-        }
-        _ => panic!("expected finish deferral for action-oriented plan-only reply"),
-    }
-}
-
-#[test]
-fn finish_gate_allows_finish_after_single_deferral() {
-    let state = seeded_state("optimize the repo performance and apply the changes");
-    let decision = evaluate_finish_with_gate(
-        true,
-        false,
-        &FinishGateContext {
-            finish_deferred_once: true,
-            assistant_content: Some("Here is the best answer I can provide."),
-            memory_next_actions: &[],
-            working_state: &state,
-        },
-    );
-
-    assert!(matches!(
-        decision,
-        FinishDecision::Finish(FinishReason::Complete)
-    ));
-}
-
-#[test]
-fn finish_gate_does_not_defer_for_informational_file_question() {
-    let state = seeded_state("what does main.rs do?");
-    let decision = evaluate_finish_with_gate(
-        true,
-        false,
-        &FinishGateContext {
-            finish_deferred_once: false,
-            assistant_content: Some("main.rs wires together the CLI entrypoints and runtime."),
-            memory_next_actions: &[],
-            working_state: &state,
-        },
-    );
-
-    assert!(matches!(
-        decision,
-        FinishDecision::Finish(FinishReason::Complete)
-    ));
-}
-
-#[test]
-fn finish_gate_allows_grounded_brief_answer_after_observation() {
-    let mut state = seeded_state("which file sets the timeout?");
-    state
-        .completed_steps
-        .push("search_files succeeded in 4ms (call c1).".into());
-    state.evidence.push(EvidenceItem {
-        claim: "Found code/reference match: src/config.rs: timeout_ms = 30".into(),
-        source_tool: "search_files".into(),
-        source_ref: "c1".into(),
-        confidence: EvidenceConfidence::High,
-    });
-    state.recompute_ready_to_finish();
-    let decision = evaluate_finish_with_gate(
-        true,
-        false,
-        &FinishGateContext {
-            finish_deferred_once: false,
-            assistant_content: Some("src/config.rs"),
-            memory_next_actions: &[],
-            working_state: &state,
-        },
-    );
-
-    assert!(matches!(
-        decision,
-        FinishDecision::Finish(FinishReason::Complete)
-    ));
-}
-
-#[test]
-fn finish_gate_defers_generic_wrap_up_when_evidence_is_not_used() {
-    let mut state = seeded_state("optimize the repo performance and apply the changes");
-    state
-        .completed_steps
-        .push("search_files succeeded in 5ms (call c1).".into());
-    state.evidence.push(EvidenceItem {
-        claim: "Found code/reference match: src/runtime_loop.rs hot path allocates every cycle"
-            .into(),
-        source_tool: "search_files".into(),
-        source_ref: "c1".into(),
-        confidence: EvidenceConfidence::High,
-    });
-    state.recompute_ready_to_finish();
-    let decision = evaluate_finish_with_gate(
-        true,
-        false,
-        &FinishGateContext {
-            finish_deferred_once: false,
-            assistant_content: Some("Done."),
-            memory_next_actions: &[],
-            working_state: &state,
-        },
-    );
-
-    match decision {
-        FinishDecision::Defer(hint) => {
-            assert!(hint.contains("concrete findings"));
-            assert!(hint.contains("Strongest evidence:"));
-            assert!(hint.contains("runtime_loop.rs"));
-        }
-        _ => panic!("expected finish deferral for unsupported wrap-up"),
-    }
-}
-
-#[test]
-fn finish_gate_does_not_treat_chinese_recommendation_as_uncertain() {
-    let state = seeded_state("next step");
-    let decision = evaluate_finish_with_gate(
-        true,
-        false,
-        &FinishGateContext {
-            finish_deferred_once: false,
-            memory_next_actions: &[],
-            working_state: &state,
-            assistant_content: Some("建议先清理缓存，再重新运行命令并检查第一条报错。"),
-        },
-    );
-
-    assert!(matches!(
-        decision,
-        FinishDecision::Finish(FinishReason::Complete)
-    ));
-}
-
-#[test]
-fn finish_gate_defers_when_blocking_uncertainty_remains() {
-    let mut state = seeded_state("diagnose why the build is failing");
-    state.uncertainties.push(UncertaintyItem {
-        topic: "exec failure".into(),
-        reason: "cargo test failed before the target file was inspected".into(),
-        blocking: true,
-    });
-    state
-        .next_actions
-        .push("Try a smaller command or inspect the relevant files first.".into());
-    state.recompute_ready_to_finish();
-    let decision = evaluate_finish_with_gate(
-        true,
-        false,
-        &FinishGateContext {
-            finish_deferred_once: false,
-            assistant_content: Some("I need another pass."),
-            memory_next_actions: &[],
-            working_state: &state,
-        },
-    );
-
-    match decision {
-        FinishDecision::Defer(hint) => {
-            assert!(hint.contains("blocking uncertainty"));
-            assert!(hint.contains("Top blocker:"));
-            assert!(hint.contains("exec failure"));
-            assert!(hint.contains("cargo test failed before the target file was inspected"));
-            assert!(hint.contains("Suggested next actions"));
-            assert!(hint.contains("Try a smaller command or inspect the relevant files first."));
-        }
-        _ => panic!("expected finish deferral for blocking uncertainty"),
-    }
-}
-
-#[test]
-fn finish_gate_hint_includes_retrieved_memory_follow_ups() {
-    let state = seeded_state("implement a safer test flow");
-    let memory_actions = vec![
-        "Run cargo check before cargo test.".to_string(),
-        "Revisit 'windows install flow': remove the stale helper.".to_string(),
-    ];
-    let decision = evaluate_finish_with_gate(
-        true,
-        false,
-        &FinishGateContext {
-            finish_deferred_once: false,
-            assistant_content: Some("I would start by looking around."),
-            memory_next_actions: &memory_actions,
-            working_state: &state,
-        },
-    );
-
-    match decision {
-        FinishDecision::Defer(hint) => {
-            assert!(hint.contains("Suggested next actions"));
-            assert!(hint.contains("Run cargo check before cargo test."));
-            assert!(hint.contains("Relevant memory follow-ups"));
-            assert!(hint.contains("cargo check before cargo test"));
-        }
-        _ => panic!("expected finish deferral with memory-guided follow-up"),
-    }
-}
 
 #[test]
 fn task_intent_classifies_common_queries() {
@@ -410,7 +220,11 @@ fn seed_from_query_preserves_state_for_follow_up_continuation_query() {
 
 #[test]
 fn seed_from_query_preserves_state_for_polite_or_particle_continuation_query() {
-    for query in ["continue please", "please continue", "继续一下"] {
+    for query in [
+        "continue please",
+        "please continue",
+        "继续一下",
+    ] {
         let mut state = seeded_state("fix the timeout handling");
         state.completed_steps.push(
             "execution progress: patch `src/config.rs` via patch_file in 3ms (call c1).".into(),
@@ -528,13 +342,16 @@ fn text_mentions_command_anchor_requires_exact_command_match() {
 
 #[test]
 fn chinese_task_result_counts_as_action_and_change_progress() {
-    let mut change_state = seeded_state("修复安装脚本");
+    let mut change_state = seeded_state(
+        "修复安装脚本",
+    );
     apply_rule_based_working_state_update(
         &mut change_state,
         &[ToolResultEntry {
             id: "c1".into(),
             name: "task".into(),
-            result: "已修复并更新安装配置".into(),
+            result: "已修复并更新安装配置"
+                .into(),
             duration_ms: 20,
             is_error: false,
             call_summary: Some("delegate to `reviewer`".into()),
@@ -548,7 +365,9 @@ fn chinese_task_result_counts_as_action_and_change_progress() {
     assert!(change_state.has_successful_change_trace());
     assert!(change_state.ready_to_finish);
 
-    let mut execute_state = seeded_state("运行工作区测试");
+    let mut execute_state = seeded_state(
+        "运行工作区测试",
+    );
     apply_rule_based_working_state_update(
         &mut execute_state,
         &[ToolResultEntry {
@@ -571,13 +390,17 @@ fn chinese_task_result_counts_as_action_and_change_progress() {
 
 #[test]
 fn chinese_exec_success_text_counts_as_execution_progress_without_trace() {
-    let mut state = seeded_state("运行工作区测试");
+    let mut state = seeded_state(
+        "运行工作区测试",
+    );
     apply_rule_based_working_state_update(
         &mut state,
         &[ToolResultEntry {
             id: "c-exec".into(),
             name: "exec".into(),
-            result: "已通过测试并构建成功".into(),
+            result:
+                "已通过测试并构建成功"
+                    .into(),
             duration_ms: 20,
             is_error: false,
             call_summary: None,
@@ -588,15 +411,6 @@ fn chinese_exec_success_text_counts_as_execution_progress_without_trace() {
     assert!(state.has_successful_execution_trace());
     assert!(!state.has_successful_change_trace());
     assert!(state.ready_to_finish);
-}
-
-#[test]
-fn token_looks_like_exact_value_rejects_alphanumeric_words() {
-    assert!(token_looks_like_exact_value("45"));
-    assert!(token_looks_like_exact_value("3ms"));
-    assert!(token_looks_like_exact_value("v2"));
-    assert!(!token_looks_like_exact_value("page2"));
-    assert!(!token_looks_like_exact_value("hello1"));
 }
 
 #[test]
@@ -651,68 +465,6 @@ fn push_unique_evidence_keeps_distinct_stable_refs() {
     );
 
     assert_eq!(evidence.len(), 2);
-}
-
-#[test]
-fn short_source_ref_does_not_false_positive_ground_finish_grounding() {
-    let mut state = seeded_state("which file sets the timeout?");
-    state.evidence.push(EvidenceItem {
-        claim: "Observed file content: timeout_ms = 45".into(),
-        source_tool: "read_file".into(),
-        source_ref: "c1".into(),
-        confidence: EvidenceConfidence::High,
-    });
-
-    assert!(!answer_is_grounded_in_state(
-        &state,
-        "I think c1 is probably enough to answer this."
-    ));
-}
-
-#[test]
-fn evidence_tokens_do_not_ground_answers_via_substring_overlap() {
-    let mut state = seeded_state("which file sets the timeout?");
-    state.evidence.push(EvidenceItem {
-        claim: "Found code/reference match: src/main.rs reports timeout_ms = 45".into(),
-        source_tool: "search_files".into(),
-        source_ref: "src/main.rs".into(),
-        confidence: EvidenceConfidence::High,
-    });
-
-    assert!(!answer_is_grounded_in_state(
-        &state,
-        "first try the cache and then retry the command"
-    ));
-}
-
-#[test]
-fn short_exact_value_answer_is_grounded_by_confirmed_evidence() {
-    let mut state = seeded_state("what timeout value was observed?");
-    state.evidence.push(EvidenceItem {
-        claim: "Observed file content: timeout_ms = 45".into(),
-        source_tool: "read_file".into(),
-        source_ref: "src/runtime.rs".into(),
-        confidence: EvidenceConfidence::High,
-    });
-
-    assert!(answer_is_grounded_in_state(&state, "45"));
-}
-
-#[test]
-fn long_generic_answer_is_not_grounded_without_evidence_overlap() {
-    let mut state = seeded_state("optimize the repo performance and apply the changes");
-    state.evidence.push(EvidenceItem {
-        claim: "Found code/reference match: src/runtime_loop.rs hot path allocates every cycle"
-            .into(),
-        source_tool: "search_files".into(),
-        source_ref: "src/runtime_loop.rs".into(),
-        confidence: EvidenceConfidence::High,
-    });
-
-    assert!(!answer_is_grounded_in_state(
-        &state,
-        "I reviewed the workspace carefully, compared several broad options, documented a few general ideas, and I think the safest path is to keep iterating methodically before making any final claim."
-    ));
 }
 
 #[test]
@@ -837,43 +589,6 @@ fn auto_think_level_runtime_escalates_on_stagnation_and_error_streak() {
     );
 }
 
-#[test]
-fn auto_think_level_runtime_escalates_on_repeated_finish_deferrals() {
-    let one_deferral = auto_think_decision_runtime(AutoThinkRuntimeSignals {
-        intent: TaskIntent::Change,
-        cycles: 7,
-        task_pressure: 1,
-        action_oriented: true,
-        finish_deferral_count: 1,
-        ..AutoThinkRuntimeSignals::default()
-    });
-    assert_eq!(one_deferral.selected_level.label(), "high");
-    assert!(
-        one_deferral
-            .escalators
-            .contains(&"finish_deferral".to_string())
-    );
-    assert!(
-        !one_deferral
-            .dampeners
-            .contains(&"late_loop_decay".to_string())
-    );
-
-    let repeated_deferrals = auto_think_decision_runtime(AutoThinkRuntimeSignals {
-        intent: TaskIntent::Change,
-        cycles: 7,
-        task_pressure: 1,
-        action_oriented: true,
-        finish_deferral_count: 3,
-        ..AutoThinkRuntimeSignals::default()
-    });
-    assert_eq!(repeated_deferrals.selected_level.label(), "xhigh");
-    assert!(
-        repeated_deferrals
-            .escalators
-            .contains(&"repeated_finish_deferrals".to_string())
-    );
-}
 
 #[test]
 fn auto_think_level_runtime_escalates_on_low_value_retries() {
@@ -1767,7 +1482,7 @@ fn observation_context_hint_builds_markdown() {
         tool_name: "read_file".into(),
         byte_size: 5000,
         line_count: 100,
-        hint: "read_file returned 100 lines / 5000 bytes — focus on key findings".into(),
+        hint: "read_file returned 100 lines / 5000 bytes - focus on key findings".into(),
     }];
     let hint = build_observation_context_hint(&summaries, 0).unwrap();
     assert!(hint.starts_with("## Recent Observation Notes"));
@@ -1835,7 +1550,13 @@ fn simple_query_rejects_complex() {
     assert!(!is_simple_query("analyze this:\nfn main() {}"));
     assert!(!is_simple_query(&"a".repeat(200)));
     // Chinese complex keywords
-    assert!(!is_simple_query("帮我实现一个排序算法"));
-    assert!(!is_simple_query("分析这段代码"));
-    assert!(!is_simple_query("编写一个函数"));
+    assert!(!is_simple_query(
+        "帮我实现一个排序算法"
+    ));
+    assert!(!is_simple_query(
+        "分析这段代码"
+    ));
+    assert!(!is_simple_query(
+        "编写一个函数"
+    ));
 }

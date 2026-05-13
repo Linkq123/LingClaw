@@ -38,7 +38,6 @@ function sampleTrace(overrides: Partial<AutoTraceEvent> = {}): AutoTraceEvent {
       ready_to_finish: false,
       action_oriented: true,
       has_blocking_uncertainty: true,
-      finish_deferral_count: 1,
       progress_made: false,
       retry_pattern: 'same_tool',
       error_kind: 'timeout',
@@ -91,6 +90,8 @@ describe('auto trace debug panel', () => {
     expect(dom.toggleAutoDebugBtn?.textContent).toBe('Auto Debug: On');
     expect(panel?.textContent).toContain('selected=high');
     expect(panel?.textContent).toContain('baseline=medium');
+    expect(panel?.textContent).toContain('ready_signal=no');
+    expect(panel?.textContent).toContain('blocked_signal=yes');
     expect(panel?.textContent).toContain('retry=same_tool');
   });
 
@@ -100,14 +101,14 @@ describe('auto trace debug panel', () => {
     applyAutoTrace(
       sampleTrace({
         selected_think: 'xhigh',
-        escalators: ['retry_same_args', 'repeated_finish_deferrals'],
+        escalators: ['retry_same_args'],
       }),
     );
 
     const panels = document.querySelectorAll('[data-auto-trace-panel="true"]');
     expect(panels).toHaveLength(1);
     expect(panels[0].textContent).toContain('selected=xhigh');
-    expect(panels[0].textContent).toContain('retry_same_args, repeated_finish_deferrals');
+    expect(panels[0].textContent).toContain('retry_same_args');
   });
 
   it('ignores sub-agent traces for the top-level debug panel', () => {

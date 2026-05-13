@@ -158,7 +158,7 @@ fn format_status_auto_decision(
     signals: &agent::AutoThinkTraceSignals,
 ) -> String {
     format!(
-        "auto_decision: selected={} baseline={} reason={} escalators={} dampeners={} clamps={}\nauto_signals: intent={} chars={} obs={} results={} tool_errors={} summaries={} bytes={} stagnation={} error_streak={} pressure={} ready={} action={} blocked={} finish_deferrals={} progress={} retry={} error_kind={} evidence_delta={}",
+        "auto_decision: selected={} baseline={} reason={} escalators={} dampeners={} clamps={}\nauto_signals: intent={} chars={} obs={} results={} tool_errors={} summaries={} bytes={} stagnation={} error_streak={} pressure={} ready_signal={} action={} blocked_signal={} progress={} retry={} error_kind={} evidence_delta={}",
         selected,
         baseline,
         reason,
@@ -178,7 +178,6 @@ fn format_status_auto_decision(
         status_auto_signal_flag(signals.ready_to_finish),
         status_auto_signal_flag(signals.action_oriented),
         status_auto_signal_flag(signals.has_blocking_uncertainty),
-        signals.finish_deferral_count,
         status_auto_signal_flag(signals.progress_made),
         signals.retry_pattern,
         signals.error_kind,
@@ -226,7 +225,6 @@ fn status_estimated_auto_decision(
             agent::TaskIntent::Change | agent::TaskIntent::Investigate | agent::TaskIntent::Execute
         ),
         has_blocking_uncertainty: working_state.has_blocking_uncertainty(),
-        finish_deferral_count: 0,
         progress_made: false,
         retry_pattern: agent::AutoRetryPattern::None,
         error_kind: agent::AutoErrorKind::None,
@@ -263,7 +261,6 @@ fn status_auto_signals_line(
             Some(action_oriented),
             Some(ready_to_finish),
             Some(has_blocking_uncertainty),
-            Some(finish_deferred_once),
         ) = (
             round.auto_observation_strength.as_deref(),
             round.auto_stagnation_streak,
@@ -272,11 +269,10 @@ fn status_auto_signals_line(
             round.auto_action_oriented,
             round.auto_ready_to_finish,
             round.auto_has_blocking_uncertainty,
-            round.auto_finish_deferred_once,
         )
     {
         return Some(format!(
-            "auto_signals: live cycles={} obs={} stagnation={} errors={} pressure={} action={} ready={} blocked={} finish_deferred={}",
+            "auto_signals: live cycles={} obs={} stagnation={} errors={} pressure={} action={} ready_signal={} blocked_signal={}",
             round.cycle.unwrap_or(0),
             observation_strength,
             stagnation_streak,
@@ -285,7 +281,6 @@ fn status_auto_signals_line(
             status_auto_signal_flag(action_oriented),
             status_auto_signal_flag(ready_to_finish),
             status_auto_signal_flag(has_blocking_uncertainty),
-            status_auto_signal_flag(finish_deferred_once),
         ));
     }
     if !providers::auto_think_supported(resolved) {

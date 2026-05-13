@@ -5533,7 +5533,6 @@ fn replay_live_round_rehydrates_inflight_round_state() {
                 "ready_to_finish": false,
                 "action_oriented": true,
                 "has_blocking_uncertainty": false,
-                "finish_deferral_count": 0,
                 "progress_made": false,
                 "retry_pattern": "none",
                 "error_kind": "none",
@@ -5636,6 +5635,7 @@ fn replay_live_round_rehydrates_inflight_round_state() {
     assert_eq!(replayed[1]["selected_think"], "high");
     assert_eq!(replayed[1]["baseline_reason"], "mid_loop_investigate");
     assert_eq!(replayed[1]["signals"]["intent"], "investigate");
+    assert!(replayed[1]["signals"].get("finish_deferral_count").is_none());
     assert_eq!(replayed[2]["type"], "thinking_start");
     assert_eq!(replayed[3]["type"], "thinking_delta");
     assert_eq!(replayed[3]["content"], "step-1");
@@ -5884,7 +5884,6 @@ fn dispatch_live_event_ignores_subagent_start_for_parent_round() {
                 "ready_to_finish": false,
                 "action_oriented": true,
                 "has_blocking_uncertainty": false,
-                "finish_deferral_count": 0,
                 "progress_made": false,
                 "retry_pattern": "none",
                 "error_kind": "none",
@@ -5995,7 +5994,6 @@ fn dispatch_live_event_ignores_subagent_auto_trace_for_parent_round() {
                 "ready_to_finish": false,
                 "action_oriented": true,
                 "has_blocking_uncertainty": false,
-                "finish_deferral_count": 0,
                 "progress_made": false,
                 "retry_pattern": "none",
                 "error_kind": "none",
@@ -6036,7 +6034,6 @@ fn dispatch_live_event_ignores_subagent_auto_trace_for_parent_round() {
                 "ready_to_finish": false,
                 "action_oriented": false,
                 "has_blocking_uncertainty": false,
-                "finish_deferral_count": 0,
                 "progress_made": false,
                 "retry_pattern": "none",
                 "error_kind": "none",
@@ -8852,7 +8849,6 @@ fn dispatch_live_event_allows_live_round_source_after_run_teardown() {
                 auto_action_oriented: None,
                 auto_ready_to_finish: None,
                 auto_has_blocking_uncertainty: None,
-                auto_finish_deferred_once: None,
                 latest_auto_trace: None,
                 has_observation: false,
                 assistant_text: String::new(),

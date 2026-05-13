@@ -806,9 +806,6 @@ async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
         last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
         stagnation_streak: 0,
         error_streak: 0,
-        finish_gate_hint: None,
-        finish_gate_deferred_once: false,
-        finish_gate_deferral_count: 0,
         recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
@@ -919,9 +916,6 @@ fn phase_state_for_analyze_test() -> AgentPhaseState {
         last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
         stagnation_streak: 0,
         error_streak: 0,
-        finish_gate_hint: None,
-        finish_gate_deferred_once: false,
-        finish_gate_deferral_count: 0,
         recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(true),
@@ -1317,9 +1311,6 @@ async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections(
         last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
         stagnation_streak: 0,
         error_streak: 0,
-        finish_gate_hint: Some(format!("## Finish Check\n{}", "B".repeat(1_400))),
-        finish_gate_deferred_once: false,
-        finish_gate_deferral_count: 0,
         recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
@@ -1374,102 +1365,9 @@ async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections(
     };
 
     assert!(prompt.contains("## Observation Hint"));
-    assert!(prompt.contains("## Finish Check"));
     assert!(prompt.contains("## Task State"));
     assert_eq!(prompt.matches(DYNAMIC_PROMPT_TRUNCATION_MARKER).count(), 1);
     assert!(!prompt.contains("## Working Method"));
-
-    let _ = std::fs::remove_dir_all(&workspace);
-}
-
-#[tokio::test]
-async fn prepare_analyze_snapshot_preserves_finish_hint_when_budget_skips_it() {
-    let state = Arc::new(test_app_state());
-    let session_id = "finish-hint-budget-session".to_string();
-    let workspace = temp_workspace("finish-hint-budget");
-    std::fs::create_dir_all(&workspace).expect("workspace should be created");
-    prompts::init_session_prompt_files(&workspace);
-
-    let mut session = test_session(&session_id, "Main", None);
-    session.workspace = workspace.clone();
-    session.messages.push(ChatMessage {
-        role: "user".into(),
-        content: Some("investigate the timeout path and summarize the result".into()),
-        images: None,
-        thinking: None,
-        anthropic_thinking_blocks: None,
-        tool_calls: None,
-        tool_call_id: None,
-        timestamp: None,
-    });
-    {
-        let mut sessions = state.sessions.lock().await;
-        sessions.insert(session_id.clone(), session);
-    }
-
-    let cancel = CancellationToken::new();
-    let run_cancel = CancellationToken::new();
-    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
-        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
-    let ctx = AgentRunCtx {
-        state: &state,
-        current_session_id: &session_id,
-        cancel: &cancel,
-        live_tx: &live_tx,
-        run_cancel: &run_cancel,
-    };
-    let mut phase_state = AgentPhaseState {
-        round: 0,
-        pending_tool_calls: Vec::new(),
-        collected_results: Vec::new(),
-        results_origin_query: None,
-        working_state: agent::WorkingState::default(),
-        retrieved_task_memory: None,
-        retrieved_task_memory_key: None,
-        retrieved_task_memory_cycle: None,
-        cycle_workspace: PathBuf::new(),
-        last_observation_hint: Some(format!("## Observation Hint\n{}", "A".repeat(5_000))),
-        last_observation_strength: agent::AutoObservationStrength::None,
-        last_tool_results_count: 0,
-        last_tool_error_count: 0,
-        last_summary_count: 0,
-        last_summary_bytes: 0,
-        last_progress_made: false,
-        last_error_kind: agent::AutoErrorKind::None,
-        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
-        stagnation_streak: 0,
-        error_streak: 0,
-        finish_gate_hint: Some("## Finish Check\nUse the concrete findings in your answer.".into()),
-        finish_gate_deferred_once: false,
-        finish_gate_deferral_count: 0,
-        recent_tool_history: Vec::new(),
-        pending_interventions: Vec::new(),
-        react_ctx: agent::AgentLoopCtx::new(false),
-        shutting_down: false,
-        run_stopped: false,
-        run_detached: false,
-        last_save_instant: None,
-        usage_snap_input: 0,
-        usage_snap_output: 0,
-    };
-
-    prepare_analyze_snapshot(&ctx, &mut phase_state)
-        .await
-        .expect("snapshot should be prepared");
-
-    let prompt = {
-        let sessions = state.sessions.lock().await;
-        sessions
-            .get(&session_id)
-            .and_then(|session| session.messages.first())
-            .and_then(|message| message.content.clone())
-            .expect("system prompt should be present")
-    };
-
-    assert!(prompt.contains("## Observation Hint"));
-    assert!(!prompt.contains("## Finish Check"));
-    assert!(phase_state.last_observation_hint.is_none());
-    assert!(phase_state.finish_gate_hint.is_some());
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -1541,9 +1439,6 @@ async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
         last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::NoMeaningfulProgress,
         stagnation_streak: 4,
         error_streak: 3,
-        finish_gate_hint: Some("## Finish Check\nlegacy finish gate hint".into()),
-        finish_gate_deferred_once: true,
-        finish_gate_deferral_count: 2,
         recent_tool_history: vec![agent::ToolResultEntry {
             id: "tool-1".into(),
             name: "read_file".into(),
@@ -1593,8 +1488,6 @@ async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
     assert_eq!(phase_state.stagnation_streak, 0);
     assert_eq!(phase_state.error_streak, 0);
     assert_eq!(phase_state.react_ctx.cycles, 0);
-    assert!(!phase_state.finish_gate_deferred_once);
-    assert_eq!(phase_state.finish_gate_deferral_count, 0);
     assert!(phase_state.recent_tool_history.is_empty());
 
     let prompt = {
@@ -1606,7 +1499,6 @@ async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
             .expect("system prompt should be present")
     };
     assert!(!prompt.contains("legacy observation context"));
-    assert!(!prompt.contains("legacy finish gate hint"));
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -1681,9 +1573,6 @@ async fn update_working_state_keeps_results_attached_to_their_original_query() {
         last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
         stagnation_streak: 0,
         error_streak: 0,
-        finish_gate_hint: None,
-        finish_gate_deferred_once: false,
-        finish_gate_deferral_count: 0,
         recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
@@ -1788,9 +1677,6 @@ async fn update_working_state_reuses_same_cycle_task_memory_selection() {
         last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
         stagnation_streak: 0,
         error_streak: 0,
-        finish_gate_hint: None,
-        finish_gate_deferred_once: false,
-        finish_gate_deferral_count: 0,
         recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
@@ -1952,9 +1838,6 @@ async fn update_working_state_refreshes_task_memory_after_state_changes() {
         last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
         stagnation_streak: 0,
         error_streak: 0,
-        finish_gate_hint: None,
-        finish_gate_deferred_once: false,
-        finish_gate_deferral_count: 0,
         recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
@@ -2040,9 +1923,6 @@ async fn prepare_analyze_snapshot_injects_fresh_task_state_each_time() {
         last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
         stagnation_streak: 0,
         error_streak: 0,
-        finish_gate_hint: None,
-        finish_gate_deferred_once: false,
-        finish_gate_deferral_count: 0,
         recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
@@ -2199,9 +2079,6 @@ async fn prepare_analyze_snapshot_injects_retrieved_task_memory() {
         last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
         stagnation_streak: 0,
         error_streak: 0,
-        finish_gate_hint: None,
-        finish_gate_deferred_once: false,
-        finish_gate_deferral_count: 0,
         recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
@@ -2309,9 +2186,6 @@ async fn prepare_analyze_snapshot_injects_agent_recommendations_and_delegation_g
         last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
         stagnation_streak: 0,
         error_streak: 0,
-        finish_gate_hint: None,
-        finish_gate_deferred_once: false,
-        finish_gate_deferral_count: 0,
         recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),
@@ -2457,9 +2331,6 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
         last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
         stagnation_streak: 0,
         error_streak: 0,
-        finish_gate_hint: None,
-        finish_gate_deferred_once: false,
-        finish_gate_deferral_count: 0,
         recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(false),

@@ -624,7 +624,6 @@ async fn status_command_prefers_live_round_effective_think() {
             auto_action_oriented: Some("true".parse().expect("bool should parse")),
             auto_ready_to_finish: Some(false),
             auto_has_blocking_uncertainty: Some(true),
-            auto_finish_deferred_once: Some(false),
             has_observation: true,
             ..Default::default()
         },
@@ -640,7 +639,7 @@ async fn status_command_prefers_live_round_effective_think() {
     assert!(result.response.contains("runtime_think: xhigh"));
     assert!(result.response.contains("think xhigh"));
     assert!(result.response.contains(
-        "auto_signals: live cycles=2 obs=strong stagnation=1 errors=2 pressure=3 action=yes ready=no blocked=yes finish_deferred=no"
+        "auto_signals: live cycles=2 obs=strong stagnation=1 errors=2 pressure=3 action=yes ready_signal=no blocked_signal=yes"
     ));
 
     let _ = tokio::fs::remove_dir_all(&workspace).await;
@@ -927,7 +926,6 @@ async fn status_command_prefers_live_round_effective_think_over_base_model_suppo
             auto_action_oriented: Some(true),
             auto_ready_to_finish: Some(false),
             auto_has_blocking_uncertainty: Some(false),
-            auto_finish_deferred_once: Some(false),
             has_observation: false,
             ..Default::default()
         },
@@ -953,7 +951,7 @@ async fn status_command_prefers_live_round_effective_think_over_base_model_suppo
     assert!(result.response.contains("runtime_think: high"));
     assert!(result.response.contains("think high"));
     assert!(result.response.contains(
-        "auto_signals: live cycles=0 obs=none stagnation=0 errors=0 pressure=2 action=yes ready=no blocked=no finish_deferred=no"
+        "auto_signals: live cycles=0 obs=none stagnation=0 errors=0 pressure=2 action=yes ready_signal=no blocked_signal=no"
     ));
     assert!(!result.response.contains("auto_signals: unavailable"));
     assert_ne!(base_budget, live_budget);
@@ -1101,10 +1099,7 @@ async fn status_command_reports_latest_auto_trace_summary() {
                 selected_think: "high".to_string(),
                 baseline_level: "medium".to_string(),
                 baseline_reason: "mid_loop_investigate".to_string(),
-                escalators: vec![
-                    "stagnation_streak".to_string(),
-                    "finish_deferral".to_string(),
-                ],
+                escalators: vec!["stagnation_streak".to_string()],
                 dampeners: Vec::new(),
                 clamps: Vec::new(),
                 signals: agent::AutoThinkTraceSignals {
@@ -1121,7 +1116,6 @@ async fn status_command_reports_latest_auto_trace_summary() {
                     ready_to_finish: false,
                     action_oriented: true,
                     has_blocking_uncertainty: true,
-                    finish_deferral_count: 1,
                     progress_made: false,
                     retry_pattern: "same_tool".to_string(),
                     error_kind: "timeout".to_string(),
@@ -1138,11 +1132,13 @@ async fn status_command_reports_latest_auto_trace_summary() {
     assert_eq!(result.response_type, "system");
     assert!(result.response.contains("runtime_think: high"));
     assert!(result.response.contains(
-        "auto_decision: selected=high baseline=medium reason=mid_loop_investigate escalators=stagnation_streak,finish_deferral dampeners=none clamps=none"
+        "auto_decision: selected=high baseline=medium reason=mid_loop_investigate escalators=stagnation_streak dampeners=none clamps=none"
     ));
     assert!(result.response.contains(
-        "auto_signals: intent=investigate chars=96 obs=medium results=2 tool_errors=1 summaries=1 bytes=4096 stagnation=3 error_streak=1 pressure=2 ready=no action=yes blocked=yes finish_deferrals=1 progress=no retry=same_tool error_kind=timeout evidence_delta=no_meaningful_progress"
+        "auto_signals: intent=investigate chars=96 obs=medium results=2 tool_errors=1 summaries=1 bytes=4096 stagnation=3 error_streak=1 pressure=2 ready_signal=no action=yes blocked_signal=yes progress=no retry=same_tool error_kind=timeout evidence_delta=no_meaningful_progress"
     ));
+    assert!(!result.response.contains("finish_deferrals"));
+    assert!(!result.response.contains("finish_deferred"));
 
     let _ = tokio::fs::remove_dir_all(&workspace).await;
 }
@@ -1295,7 +1291,6 @@ async fn status_command_reports_live_runtime_provider_for_cross_provider_fast_mo
             auto_action_oriented: Some(true),
             auto_ready_to_finish: Some(false),
             auto_has_blocking_uncertainty: Some(false),
-            auto_finish_deferred_once: Some(false),
             has_observation: false,
             ..Default::default()
         },

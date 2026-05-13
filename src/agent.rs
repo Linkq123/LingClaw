@@ -16,10 +16,6 @@
 // ══════════════════════════════════════════════════════════════════════════════
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static FINISH_GATE_DEFERRALS: AtomicU64 = AtomicU64::new(0);
 const TASK_STATE_PROMPT_CHAR_BUDGET: usize = 1_200;
 const TASK_STATE_MAX_COMPLETED_STEPS: usize = 5;
 const TASK_STATE_MAX_EVIDENCE_ITEMS: usize = 5;
@@ -1942,252 +1938,6 @@ pub(crate) fn evaluate_finish(has_content: bool, has_tool_calls: bool) -> Option
     }
 }
 
-pub(crate) enum FinishDecision {
-    ContinueToAct,
-    Finish(FinishReason),
-    Defer(String),
-}
-
-pub(crate) struct FinishGateContext<'a> {
-    pub finish_deferred_once: bool,
-    pub assistant_content: Option<&'a str>,
-    pub memory_next_actions: &'a [String],
-    pub working_state: &'a WorkingState,
-}
-
-pub(crate) fn evaluate_finish_with_gate(
-    has_content: bool,
-    has_tool_calls: bool,
-    context: &FinishGateContext<'_>,
-) -> FinishDecision {
-    let Some(reason) = evaluate_finish(has_content, has_tool_calls) else {
-        return FinishDecision::ContinueToAct;
-    };
-    if reason == FinishReason::Empty || context.finish_deferred_once {
-        return FinishDecision::Finish(reason);
-    }
-
-    if should_defer_finish(context) {
-        FINISH_GATE_DEFERRALS.fetch_add(1, Ordering::Relaxed);
-        return FinishDecision::Defer(build_finish_gate_hint(context));
-    }
-
-    FinishDecision::Finish(reason)
-}
-
-pub(crate) fn finish_gate_metrics() -> u64 {
-    FINISH_GATE_DEFERRALS.load(Ordering::Relaxed)
-}
-
-fn should_defer_finish(context: &FinishGateContext<'_>) -> bool {
-    let state = context.working_state;
-
-    if state.has_blocking_uncertainty() {
-        return true;
-    }
-
-    if state.intent.is_action_oriented() && !state.ready_to_finish {
-        return true;
-    }
-
-    state.has_confirmed_evidence()
-        && !answer_is_grounded_in_state(state, context.assistant_content.unwrap_or(""))
-}
-
-fn build_finish_gate_hint(context: &FinishGateContext<'_>) -> String {
-    let state = context.working_state;
-    let mut lines = vec![
-        "## Finish Check".to_string(),
-        "Before finishing, verify that the user's task is genuinely complete.".to_string(),
-    ];
-
-    if state.has_blocking_uncertainty() {
-        lines.push(
-            "There is still at least one blocking uncertainty. Resolve it or explain the remaining gap explicitly.".to_string(),
-        );
-    }
-
-    if state.intent.is_action_oriented() && !state.ready_to_finish {
-        lines.push(
-            "Action-oriented work still needs at least one confirmed finding or successful execution trace before you wrap up.".to_string(),
-        );
-    }
-
-    if state.has_confirmed_evidence()
-        && !answer_is_grounded_in_state(state, context.assistant_content.unwrap_or(""))
-    {
-        lines.push(
-            "You already gathered evidence. Use the concrete findings in your answer instead of giving a generic wrap-up.".to_string(),
-        );
-    }
-
-    if let Some(blocker) = prioritized_blocking_uncertainty(state) {
-        lines.push(format!("Top blocker: {}", format_uncertainty_hint(blocker)));
-    }
-    if state.has_confirmed_evidence()
-        && let Some(evidence) = prioritized_confirmed_evidence(state)
-    {
-        lines.push(format!(
-            "Strongest evidence: [{}] {} ({})",
-            evidence.confidence.label(),
-            evidence.claim,
-            compact_evidence_ref(evidence)
-        ));
-    }
-
-    let next_steps = prioritized_finish_hint_actions(state, context.memory_next_actions);
-    if !next_steps.is_empty() {
-        lines.push("Suggested next actions:".to_string());
-        for action in next_steps {
-            lines.push(format!("- {action}"));
-        }
-    }
-    if !context.memory_next_actions.is_empty() {
-        lines.push("Relevant memory follow-ups:".to_string());
-        for action in context
-            .memory_next_actions
-            .iter()
-            .take(TASK_STATE_MAX_NEXT_ACTIONS)
-        {
-            lines.push(format!("- {action}"));
-        }
-    }
-
-    lines.join("\n")
-}
-
-fn prioritized_blocking_uncertainty(state: &WorkingState) -> Option<&UncertaintyItem> {
-    state.uncertainties.iter().rev().find(|item| item.blocking)
-}
-
-fn prioritized_confirmed_evidence(state: &WorkingState) -> Option<&EvidenceItem> {
-    state
-        .evidence
-        .iter()
-        .rev()
-        .find(|item| matches!(item.confidence, EvidenceConfidence::High))
-        .or_else(|| {
-            state
-                .evidence
-                .iter()
-                .rev()
-                .find(|item| item.confidence.is_confirmed())
-        })
-}
-
-fn prioritized_finish_hint_actions<'a>(
-    state: &'a WorkingState,
-    memory_next_actions: &'a [String],
-) -> Vec<&'a str> {
-    let mut actions = Vec::new();
-    let mut seen = HashSet::new();
-
-    for action in state
-        .next_actions
-        .iter()
-        .chain(memory_next_actions.iter())
-        .filter_map(|action| {
-            let trimmed = action.trim();
-            (!trimmed.is_empty()).then_some(trimmed)
-        })
-    {
-        let key = normalized_key(action);
-        if seen.insert(key) {
-            actions.push(action);
-            if actions.len() >= TASK_STATE_MAX_NEXT_ACTIONS {
-                break;
-            }
-        }
-    }
-
-    actions
-}
-
-fn format_uncertainty_hint(item: &UncertaintyItem) -> String {
-    let topic = item.topic.trim();
-    let reason = item.reason.trim();
-    match (topic.is_empty(), reason.is_empty()) {
-        (false, false) => format!("{topic} - {reason}"),
-        (false, true) => topic.to_string(),
-        (true, false) => reason.to_string(),
-        (true, true) => "blocking uncertainty remains unresolved".to_string(),
-    }
-}
-
-fn answer_is_grounded_in_state(state: &WorkingState, content: &str) -> bool {
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return false;
-    }
-    if !state.has_confirmed_evidence() {
-        return true;
-    }
-
-    let answer_tokens = crate::tokenize_for_matching(trimmed)
-        .into_iter()
-        .filter(|token| token.len() >= 2)
-        .collect::<HashSet<_>>();
-    if answer_tokens.is_empty() {
-        return false;
-    }
-
-    state
-        .evidence
-        .iter()
-        .filter(|item| item.confidence.is_confirmed())
-        .any(|item| {
-            if source_ref_supports_grounding_match(&item.source_ref)
-                && text_mentions_anchor(trimmed, &item.source_ref)
-            {
-                return true;
-            }
-            let matched_tokens = crate::tokenize_for_matching(&item.claim)
-                .into_iter()
-                .filter(|token| token.len() >= 2)
-                .filter(|token| answer_tokens.contains(token))
-                .collect::<HashSet<_>>();
-            matched_tokens.len() >= 2
-                || matched_tokens.iter().any(|token| token.len() >= 6)
-                || (answer_tokens.len() == 1
-                    && matched_tokens.len() == 1
-                    && matched_tokens
-                        .iter()
-                        .all(|token| token_looks_like_exact_value(token)))
-        })
-}
-
-fn source_ref_supports_grounding_match(source_ref: &str) -> bool {
-    source_ref.chars().count() > 3
-}
-
-fn token_looks_like_exact_value(token: &str) -> bool {
-    if token.is_empty() || !token.chars().any(|ch| ch.is_ascii_digit()) {
-        return false;
-    }
-    if token.chars().all(|ch| ch.is_ascii_digit()) {
-        return true;
-    }
-    if let Some(version) = token.strip_prefix('v') {
-        return !version.is_empty() && version.chars().all(|ch| ch.is_ascii_digit() || ch == '.');
-    }
-
-    let digit_prefix_len = token
-        .char_indices()
-        .find(|(_, ch)| !ch.is_ascii_digit())
-        .map(|(idx, _)| idx)
-        .unwrap_or(token.len());
-    if digit_prefix_len == 0 || digit_prefix_len == token.len() {
-        return false;
-    }
-
-    let suffix = &token[digit_prefix_len..];
-    !suffix.is_empty()
-        && suffix.chars().count() <= 4
-        && suffix
-            .chars()
-            .all(|ch| ch.is_ascii_alphabetic() || matches!(ch, '%' | 'x'))
-}
-
 // ──────────────────────────────────────────────────────────────────────────────
 //  Hook System — lifecycle extension points
 // ──────────────────────────────────────────────────────────────────────────────
@@ -2410,8 +2160,6 @@ pub(crate) struct AutoThinkTraceSignals {
     #[serde(default)]
     pub(crate) has_blocking_uncertainty: bool,
     #[serde(default)]
-    pub(crate) finish_deferral_count: usize,
-    #[serde(default)]
     pub(crate) progress_made: bool,
     #[serde(default)]
     pub(crate) retry_pattern: String,
@@ -2545,7 +2293,6 @@ pub(crate) struct AutoThinkRuntimeSignals {
     pub(crate) ready_to_finish: bool,
     pub(crate) action_oriented: bool,
     pub(crate) has_blocking_uncertainty: bool,
-    pub(crate) finish_deferral_count: usize,
     pub(crate) progress_made: bool,
     pub(crate) retry_pattern: AutoRetryPattern,
     pub(crate) error_kind: AutoErrorKind,
@@ -2568,7 +2315,6 @@ impl AutoThinkRuntimeSignals {
             ready_to_finish: self.ready_to_finish,
             action_oriented: self.action_oriented,
             has_blocking_uncertainty: self.has_blocking_uncertainty,
-            finish_deferral_count: self.finish_deferral_count,
             progress_made: self.progress_made,
             retry_pattern: self.retry_pattern.label().to_string(),
             error_kind: self.error_kind.label().to_string(),
@@ -2853,14 +2599,6 @@ pub(crate) fn auto_think_decision_runtime(signals: AutoThinkRuntimeSignals) -> A
         _ => {}
     }
 
-    if signals.finish_deferral_count >= 3 {
-        score += 2;
-        push_auto_reason(&mut escalators, "repeated_finish_deferrals");
-    } else if signals.finish_deferral_count >= 1 {
-        score += 1;
-        push_auto_reason(&mut escalators, "finish_deferral");
-    }
-
     if !signals.progress_made {
         match signals.retry_pattern {
             AutoRetryPattern::SameArgs => {
@@ -2945,7 +2683,6 @@ pub(crate) fn auto_think_decision_runtime(signals: AutoThinkRuntimeSignals) -> A
         && !signals.has_blocking_uncertainty
         && signals.stagnation_streak == 0
         && signals.error_streak == 0
-        && signals.finish_deferral_count == 0
         && signals.task_pressure <= 1
         && signals.observation_strength.pressure() <= 1
         && matches!(signals.retry_pattern, AutoRetryPattern::None)
@@ -2959,7 +2696,6 @@ pub(crate) fn auto_think_decision_runtime(signals: AutoThinkRuntimeSignals) -> A
         && signals.ready_to_finish
         && signals.progress_made
         && !signals.has_blocking_uncertainty
-        && signals.finish_deferral_count == 0
         && signals.task_pressure <= 1
     {
         let converging_cap = if signals.action_oriented {

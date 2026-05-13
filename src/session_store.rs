@@ -845,7 +845,6 @@ pub(crate) fn build_session_status(session: &Session, config: &Config) -> String
         .map(format_token_count)
         .unwrap_or_else(|| "-".into());
     let (prompt_cache_hits, prompt_cache_misses) = super::system_prompt_cache_metrics();
-    let finish_deferrals = crate::agent::finish_gate_metrics();
     let (session_save_writes, session_save_skips) = session_persist_metrics();
 
     format!(
@@ -861,7 +860,7 @@ pub(crate) fn build_session_status(session: &Session, config: &Config) -> String
          react: {}\n\
          tools: {}\n\
          reasoning: {}\n\
-         runtime_metrics: prompt_cache={}/{} finish_deferrals={} session_saves(write/skip)={}/{}",
+         runtime_metrics: prompt_cache={}/{} session_saves(write/skip)={}/{}",
         resolved.provider.label(),
         resolved.api_base,
         resolved.model_id,
@@ -876,7 +875,6 @@ pub(crate) fn build_session_status(session: &Session, config: &Config) -> String
         if session.show_reasoning { "on" } else { "off" },
         prompt_cache_hits,
         prompt_cache_misses,
-        finish_deferrals,
         session_save_writes,
         session_save_skips,
     )

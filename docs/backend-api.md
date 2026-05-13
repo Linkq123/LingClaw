@@ -974,7 +974,6 @@ ws://127.0.0.1:18989/ws
   "auto_action_oriented": true,
   "auto_ready_to_finish": false,
   "auto_has_blocking_uncertainty": true,
-  "auto_finish_deferred_once": false
 }
 ```
 
@@ -1016,7 +1015,6 @@ ws://127.0.0.1:18989/ws
     "ready_to_finish": false,
     "action_oriented": true,
     "has_blocking_uncertainty": true,
-    "finish_deferral_count": 0,
     "progress_made": true,
     "retry_pattern": "same_tool",
     "error_kind": "none",
@@ -1029,7 +1027,7 @@ ws://127.0.0.1:18989/ws
 
 - `selected_think` 为最终发送给模型的思维级别；若 `BeforeLlmCall` Hook 覆盖了 think，trace 会直接反映覆盖后的值，并在 `clamps` 中加入 `hook_think_override`
 - `baseline_*` 描述本轮 runtime auto policy 在未叠加 escalator / dampener / clamp 之前的基线判断
-- `signals` 是用于决策的实时输入快照，也是 `/status` 中 `auto_signals` / `auto_decision` 摘要的来源
+- `signals` 是用于 auto-think 决策的实时输入快照，也是 `/status` 中 `auto_signals` / `auto_decision` 摘要的来源；其中 `ready_to_finish` / `has_blocking_uncertainty` 现在是 advisory signals，不直接决定主循环是否 finish
 
 ### `delta`
 

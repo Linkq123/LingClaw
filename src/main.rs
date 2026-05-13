@@ -602,7 +602,6 @@ struct LiveRoundState {
     auto_action_oriented: Option<bool>,
     auto_ready_to_finish: Option<bool>,
     auto_has_blocking_uncertainty: Option<bool>,
-    auto_finish_deferred_once: Option<bool>,
     latest_auto_trace: Option<agent::AutoThinkTrace>,
     has_observation: bool,
     assistant_text: String,
@@ -2097,7 +2096,6 @@ async fn dispatch_live_event(
                             auto_ready_to_finish: event["auto_ready_to_finish"].as_bool(),
                             auto_has_blocking_uncertainty: event["auto_has_blocking_uncertainty"]
                                 .as_bool(),
-                            auto_finish_deferred_once: event["auto_finish_deferred_once"].as_bool(),
                             latest_auto_trace: None,
                             has_observation: false,
                             assistant_text: String::new(),
@@ -2539,9 +2537,6 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
         }
         if let Some(value) = live_round.auto_has_blocking_uncertainty {
             start_obj.insert("auto_has_blocking_uncertainty".to_string(), json!(value));
-        }
-        if let Some(value) = live_round.auto_finish_deferred_once {
-            start_obj.insert("auto_finish_deferred_once".to_string(), json!(value));
         }
     }
 

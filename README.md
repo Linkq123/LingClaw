@@ -31,7 +31,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **Daily Reflection（可选）**：启用 `dailyReflection` 后，多步任务完成时会在 Finish 后台异步生成简短 reflection，追加到 workspace 下的 `memory/YYYY-MM-DD.md`；`/reflection`、`/reflection today`、`/reflection yesterday`、`/reflection list` 可查看状态和已过滤的 reflection 条目
 - **更细粒度的 Token 统计**：Primary、Fast、Sub-Agent、Memory、Reflection、Context 六类模型角色都会分别累计 token；`/new` 压缩、自动上下文压缩、Structured Memory 和 Daily Reflection 的非流式调用也会计入 Usage
 - **可关闭的 Slash Command 卡片**：聊天页中由斜杠命令返回的 `success`、`system`、`error` 卡片支持点击关闭；运行进度和自动压缩通知仍保持常驻提示
-- **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环；运行时维护每轮临时 `WorkingState`，基于 `TaskIntent`、证据、blocker 和下一步动作做状态驱动的 finish gate，而不是只看回复文本启发式
+- **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环；运行时维护每轮临时 `WorkingState`，用于汇总 `TaskIntent`、证据、blocker 和下一步动作，辅助 observation 摘要、动态 prompt 注入与 auto-think 信号
 - **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留；错误工具标记 `[FAILED]` 并附带耗时；在多工具、错误或超长结果场景下，还会触发轻量状态摘要来更新当前 `WorkingState`
 - **推理可见性控制**：默认开启 ReAct 阶段转换 WS 事件（`react_phase`），可通过 `/react on|off` 手动切换；浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
 - **Auto 思维可观测性**：当 `/think auto` 且当前模型支持 reasoning effort 时，后端会额外发送 `auto_trace` WebSocket 事件；`/status` 会显示 live runtime think、auto signals 与 request budget 摘要，前端 `Auto Debug` 开关只在本地展示最新一条顶层轨迹，不会写回 session 配置
@@ -556,14 +556,14 @@ Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的
 | **Analyze** | 分析用户意图 | 模型分析请求，决定是直接回答还是使用工具。可借助 `think` 工具作为推理便签。 |
 | **Act** | 执行工具 | 模型发出结构化 tool_calls，runtime 调用 `execute_tool()` 执行。所有路径经过安全检查。 |
 | **Observe** | 消化工具结果 | 工具结果以原始内容写入对话历史。大结果 (>4KB) 生成非破坏性摘要：WS `observation` 事件 + 系统提示注入。 |
-| **Finish** | 完成回答 | 显式判定任务已完成：请求已回答、修改已执行、验证已通过、无剩余 blocker。退出循环。 |
+| **Finish** | 完成回答 | 显式结束当前循环：Analyze 阶段若模型未发出 tool_calls，则带内容回复记为 `complete`，空回复记为 `empty`，随后退出循环。 |
 
 #### 运行时认知层
 
 - **每轮携带临时 WorkingState**：挂在 `AgentPhaseState` 上，只在当前 run 内存在；核心字段包括 `intent`、`primary_goal`、`completed_steps`、`evidence`、`open_questions`、`uncertainties`、`next_actions`、`ready_to_finish`
 - **Observe 先规则更新，再按需轻量摘要**：成功工具写入完成步骤/证据，失败工具写入 blocker；只有在工具报错、结果超长或本轮工具数大于 2 时，才会调用 fast model 生成 JSON `StateDigestDelta`
 - **Analyze 动态注入任务上下文**：除基础 system prompt 外，还会按预算注入 `## Task State`、Relevant Past Experience、Tool Hints、Suggested Tool Order、Suggested Sub-Agents、Delegation Guidance；这些内容不进入静态 system prompt cache
-- **Finish gate 改为状态驱动**：`Inform / Change / Investigate / Execute` 四类任务分别检查 blocker、confirmed evidence、执行痕迹和 change 痕迹；若仍存在 blocker，最多 defer 一次，然后允许 honest finish，避免空转
+- **Finish 判定保持轻量**：Analyze 阶段通过 `evaluate_finish()` 仅根据“是否有内容 / 是否有 tool_calls”决定进入 Finish 或继续 Act；`WorkingState` 继续服务于上下文构建、auto-think 和 observation 汇总，而不是拦截 finish 出口
 
 **关键设计决策：**
 
@@ -626,7 +626,7 @@ src/
 ├── main.rs            (~2970 行) — 共享类型, WebSocket/HTTP 处理, 系统提示构建, 安全检查, JSON fence/分词等通用辅助
 ├── runtime_loop.rs    (~3060 行) — 阶段执行循环, WorkingState/session 协调, 动态 prompt 注入, 轻量 state digest, 干预持久化, orchestrate 执行
 │   └── runtime_loop/socket_input.rs (~550 行) — socket 空闲/忙碌输入辅助
-├── agent.rs           (~2340 行) — AgentPhase 状态机, TaskIntent/WorkingState, finish gate, 证据/不确定性归并, 观察结果摘要
+├── agent.rs           (~2340 行) — AgentPhase 状态机, TaskIntent/WorkingState, finish heuristic, 证据/不确定性归并, 观察结果摘要
 ├── commands.rs        (~1630 行) — 斜杠命令处理器 (handle_command, /skills-system install/uninstall 等)
 ├── cli.rs             (~3030 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
 ├── config.rs          (~1490 行) — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载

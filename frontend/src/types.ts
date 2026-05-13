@@ -180,7 +180,6 @@ export interface AutoTraceSignals {
   ready_to_finish: boolean;
   action_oriented: boolean;
   has_blocking_uncertainty: boolean;
-  finish_deferral_count: number;
   progress_made: boolean;
   retry_pattern: string;
   error_kind: string;

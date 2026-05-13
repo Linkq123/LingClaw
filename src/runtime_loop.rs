@@ -212,9 +212,6 @@ struct AgentPhaseState {
     last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality,
     stagnation_streak: usize,
     error_streak: usize,
-    finish_gate_hint: Option<String>,
-    finish_gate_deferred_once: bool,
-    finish_gate_deferral_count: usize,
     recent_tool_history: Vec<agent::ToolResultEntry>,
     pending_interventions: Vec<String>,
     react_ctx: agent::AgentLoopCtx,
@@ -688,18 +685,12 @@ async fn prepare_analyze_snapshot(
     // Dynamic context injections into the system prompt:
     // - Observation hint from previous cycle
     // - Planning nudge on first cycle for multi-step tasks
-    // - Finish nudge for deep loops
     if let Some(ref mut content) = fresh_system.content {
         let mut remaining_budget = DYNAMIC_PROMPT_INJECTION_CHAR_BUDGET;
         append_owned_dynamic_prompt_section(
             content,
             &mut remaining_budget,
             &mut phase_state.last_observation_hint,
-        );
-        append_owned_dynamic_prompt_section(
-            content,
-            &mut remaining_budget,
-            &mut phase_state.finish_gate_hint,
         );
         if let Some(task_state) = agent::render_task_state_for_prompt(&phase_state.working_state) {
             let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &task_state);
@@ -899,7 +890,6 @@ fn runtime_auto_think_signals(
             agent::TaskIntent::Change | agent::TaskIntent::Investigate | agent::TaskIntent::Execute
         ),
         has_blocking_uncertainty: phase_state.working_state.has_blocking_uncertainty(),
-        finish_deferral_count: phase_state.finish_gate_deferral_count,
         progress_made: phase_state.last_progress_made,
         retry_pattern: agent::auto_retry_pattern(&phase_state.recent_tool_history),
         error_kind: phase_state.last_error_kind,
@@ -920,9 +910,6 @@ fn reset_runtime_auto_state_for_new_goal(phase_state: &mut AgentPhaseState) {
     phase_state.last_evidence_delta_quality = agent::AutoEvidenceDeltaQuality::None;
     phase_state.stagnation_streak = 0;
     phase_state.error_streak = 0;
-    phase_state.finish_gate_hint = None;
-    phase_state.finish_gate_deferred_once = false;
-    phase_state.finish_gate_deferral_count = 0;
     phase_state.recent_tool_history.clear();
 }
 
@@ -1053,43 +1040,17 @@ async fn advance_after_llm_response(
 ) {
     let has_content = message.has_nonempty_content();
     let has_tools = message.has_tool_calls();
-    let memory_next_actions = phase_state
-        .retrieved_task_memory
-        .as_ref()
-        .map(|selection| {
-            memory::task_memory_next_actions(selection, phase_state.working_state.intent)
-        })
-        .unwrap_or_default();
-
-    match agent::evaluate_finish_with_gate(
-        has_content,
-        has_tools,
-        &agent::FinishGateContext {
-            finish_deferred_once: phase_state.finish_gate_deferred_once,
-            assistant_content: message.content.as_deref(),
-            memory_next_actions: &memory_next_actions,
-            working_state: &phase_state.working_state,
-        },
-    ) {
-        agent::FinishDecision::ContinueToAct => {
+    match agent::evaluate_finish(has_content, has_tools) {
+        None => {
             phase_state.results_origin_query = latest_query.map(str::to_string);
             phase_state.pending_tool_calls = message.tool_calls.clone().unwrap_or_default();
             phase_state.react_ctx.transition_to_act();
             send_react_phase_event(live_tx, &phase_state.react_ctx, "act").await;
         }
-        agent::FinishDecision::Finish(reason) => {
+        Some(reason) => {
             phase_state.results_origin_query = None;
-            phase_state.finish_gate_deferred_once = false;
             phase_state.react_ctx.transition_to_finish(reason);
             send_react_phase_event(live_tx, &phase_state.react_ctx, "finish").await;
-        }
-        agent::FinishDecision::Defer(hint) => {
-            phase_state.results_origin_query = None;
-            phase_state.finish_gate_deferred_once = true;
-            phase_state.finish_gate_deferral_count =
-                phase_state.finish_gate_deferral_count.saturating_add(1);
-            phase_state.finish_gate_hint = Some(hint);
-            send_react_phase_event(live_tx, &phase_state.react_ctx, "analyze").await;
         }
     }
     phase_state.round += 1;
@@ -2501,10 +2462,6 @@ async fn run_analyze_phase(
             "auto_has_blocking_uncertainty".to_string(),
             json!(auto_signals.has_blocking_uncertainty),
         );
-        start_obj.insert(
-            "auto_finish_deferred_once".to_string(),
-            json!(auto_signals.finish_deferral_count > 0),
-        );
     }
 
     if !live_send(ctx.live_tx, start_event).await {
@@ -2873,7 +2830,6 @@ async fn run_observe_phase(
         .iter()
         .map(|summary| summary.byte_size)
         .sum::<usize>();
-    let finish_deferred_once = phase_state.finish_gate_deferred_once;
     update_working_state(ctx, phase_state, &summaries).await;
     let progress_made =
         agent::auto_think_progress_made(&state_before_observe, &phase_state.working_state);
@@ -2899,18 +2855,15 @@ async fn run_observe_phase(
         phase_state.error_streak.saturating_add(consecutive_errors)
     };
     let should_count_stagnation = !phase_state.collected_results.is_empty()
-        || phase_state.working_state.has_blocking_uncertainty()
-        || finish_deferred_once;
+        || phase_state.working_state.has_blocking_uncertainty();
     if progress_made {
         phase_state.stagnation_streak = 0;
     } else if should_count_stagnation {
         phase_state.stagnation_streak = phase_state.stagnation_streak.saturating_add(1);
     }
     if progress_made {
-        phase_state.finish_gate_deferral_count = 0;
         phase_state.recent_tool_history.clear();
     }
-    phase_state.finish_gate_deferred_once = false;
     phase_state.last_observation_hint =
         agent::build_observation_context_hint(&summaries, consecutive_errors);
     phase_state.collected_results.clear();
@@ -3208,9 +3161,6 @@ pub(crate) async fn run_agent_session(
         last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
         stagnation_streak: 0,
         error_streak: 0,
-        finish_gate_hint: None,
-        finish_gate_deferred_once: false,
-        finish_gate_deferral_count: 0,
         recent_tool_history: Vec::new(),
         pending_interventions: Vec::new(),
         react_ctx: agent::AgentLoopCtx::new(show_react),
