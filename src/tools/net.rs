@@ -1,9 +1,37 @@
 use std::net::{IpAddr, ToSocketAddrs};
+use std::sync::OnceLock;
 use std::time::Duration;
 
+use futures::StreamExt;
 use reqwest::Client;
+use scraper::{Html, Selector};
 
 use crate::{Config, truncate};
+
+const SAFE_FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+const HTTP_FETCH_DEFAULT_MAX_BYTES: usize = 102_400;
+const HTTP_FETCH_HTML_READ_BUDGET_MULTIPLIER: usize = 4;
+const HTTP_FETCH_HTML_READ_BUDGET_CAP: usize = 256 * 1024;
+const HTML_BLOCK_SEPARATOR: char = '\u{001e}';
+const HTML_PREFORMATTED_START: char = '\u{001f}';
+const HTML_PREFORMATTED_END: char = '\u{001d}';
+
+static HTTP_FETCH_CLIENT: OnceLock<Result<Client, String>> = OnceLock::new();
+
+pub(crate) fn build_safe_fetch_client() -> Result<Client, String> {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(SAFE_FETCH_TIMEOUT)
+        .build()
+        .map_err(|e| format!("http_fetch error: failed to create safe HTTP client: {e}"))
+}
+
+fn shared_http_fetch_client() -> Result<&'static Client, String> {
+    HTTP_FETCH_CLIENT
+        .get_or_init(build_safe_fetch_client)
+        .as_ref()
+        .map_err(Clone::clone)
+}
 
 /// Return true if an IP address is private/loopback/link-local/unspecified.
 fn is_private_ip(ip: &IpAddr) -> bool {
@@ -120,6 +148,358 @@ fn explicit_path_extension(path: &str) -> Option<&str> {
     Some(&segment[dot_index..])
 }
 
+fn truncate_bytes(bytes: &[u8], max: usize) -> String {
+    truncate_decoded_text(String::from_utf8_lossy(bytes).into_owned(), bytes.len() > max, max)
+}
+
+fn truncate_decoded_text(text: String, was_truncated: bool, max: usize) -> String {
+    if !was_truncated {
+        return text;
+    }
+    let cut = text.len().min(max);
+    let end = (0..=cut)
+        .rev()
+        .find(|&i| text.is_char_boundary(i))
+        .unwrap_or(0);
+    format!(
+        "{}...\n[truncated at {} bytes, reached fetch limit of {} bytes]",
+        &text[..end],
+        end,
+        max
+    )
+}
+
+fn response_content_type(resp: &reqwest::Response) -> Option<String> {
+    resp.headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn is_html_response_content_type(content_type: &str) -> bool {
+    content_type.starts_with("text/html") || content_type.starts_with("application/xhtml+xml")
+}
+
+fn http_fetch_final_limit(max_bytes: usize, config: &Config) -> usize {
+    max_bytes.min(config.max_output_bytes)
+}
+
+fn html_fetch_read_limit(final_limit: usize) -> usize {
+    final_limit
+        .saturating_mul(HTTP_FETCH_HTML_READ_BUDGET_MULTIPLIER)
+        .min(HTTP_FETCH_HTML_READ_BUDGET_CAP)
+        .max(final_limit)
+}
+
+struct LimitedBodyRead {
+    text: String,
+    was_truncated: bool,
+}
+
+async fn read_response_body_limited(
+    resp: reqwest::Response,
+    max_bytes: usize,
+) -> Result<LimitedBodyRead, String> {
+    let mut stream = resp.bytes_stream();
+    let mut body = Vec::new();
+    let read_limit = max_bytes.saturating_add(1);
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("http_fetch error reading body: {e}"))?;
+        let remaining = read_limit.saturating_sub(body.len());
+        if remaining == 0 {
+            break;
+        }
+        let to_take = chunk.len().min(remaining);
+        body.extend_from_slice(&chunk[..to_take]);
+        if body.len() >= read_limit {
+            break;
+        }
+    }
+
+    let was_truncated = body.len() > max_bytes;
+    if was_truncated {
+        body.truncate(max_bytes);
+    }
+
+    Ok(LimitedBodyRead {
+        text: String::from_utf8_lossy(&body).into_owned(),
+        was_truncated,
+    })
+}
+
+fn normalize_html_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn finalize_visible_html_text(text: &str) -> String {
+    let mut out = String::new();
+    let mut whitespace = String::new();
+    let mut in_preformatted = false;
+
+    for ch in text.chars() {
+        match ch {
+            HTML_PREFORMATTED_START => {
+                whitespace.clear();
+                in_preformatted = true;
+            }
+            HTML_PREFORMATTED_END => {
+                while out.ends_with([' ', '\n']) {
+                    out.pop();
+                }
+                in_preformatted = false;
+            }
+            HTML_BLOCK_SEPARATOR if in_preformatted => {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            HTML_BLOCK_SEPARATOR => {
+                whitespace.clear();
+                if !out.is_empty() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+            }
+            '\r' if in_preformatted => {}
+            '\n' if in_preformatted => {
+                while out.ends_with(' ') {
+                    out.pop();
+                }
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            ch if ch.is_whitespace() && in_preformatted => {
+                out.push(ch);
+            }
+            ch if ch.is_whitespace() => {
+                whitespace.push(ch);
+            }
+            ch => {
+                if !whitespace.is_empty() && !out.is_empty() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                whitespace.clear();
+                out.push(ch);
+            }
+        }
+    }
+
+    if out.starts_with(HTML_BLOCK_SEPARATOR) {
+        out.remove(0);
+    }
+    while out.ends_with([' ', '\n', HTML_BLOCK_SEPARATOR]) {
+        out.pop();
+    }
+    out
+}
+
+fn normalize_html_text_preserving_preformatted(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn collect_preformatted_text(node: scraper::ElementRef<'_>, out: &mut String) {
+    for child in node.children() {
+        if let Some(text) = child.value().as_text() {
+            out.push_str(text);
+            continue;
+        }
+        if let Some(element) = scraper::ElementRef::wrap(child) {
+            let name = element.value().name();
+            if name == "br" {
+                out.push('\n');
+                continue;
+            }
+            if matches!(name, "script" | "style") {
+                continue;
+            }
+            collect_preformatted_text(element, out);
+        }
+    }
+}
+
+fn strip_html_block_case_insensitive(html: &str, tag_name: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let open = format!("<{tag_name}");
+    let close = format!("</{tag_name}>");
+    let mut out = String::with_capacity(html.len());
+    let mut cursor = 0;
+
+    while let Some(start_rel) = lower[cursor..].find(&open) {
+        let start = cursor + start_rel;
+        out.push_str(&html[cursor..start]);
+        let search_from = start + open.len();
+        if let Some(close_rel) = lower[search_from..].find(&close) {
+            let after_close = search_from + close_rel + close.len();
+            cursor = after_close;
+        } else {
+            cursor = html.len();
+            break;
+        }
+    }
+
+    out.push_str(&html[cursor..]);
+    out
+}
+
+fn strip_html_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+
+    for ch in html.chars() {
+        match ch {
+            '<' => {
+                in_tag = true;
+                if !out.ends_with([' ', '\n']) {
+                    out.push(' ');
+                }
+            }
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+
+    normalize_html_whitespace(&out)
+}
+
+fn is_block_boundary_element(name: &str) -> bool {
+    matches!(
+        name,
+        "address"
+            | "article"
+            | "aside"
+            | "blockquote"
+            | "body"
+            | "br"
+            | "caption"
+            | "dd"
+            | "details"
+            | "div"
+            | "dl"
+            | "dt"
+            | "figcaption"
+            | "figure"
+            | "footer"
+            | "form"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "hr"
+            | "li"
+            | "main"
+            | "nav"
+            | "ol"
+            | "p"
+            | "pre"
+            | "section"
+            | "table"
+            | "tbody"
+            | "td"
+            | "tfoot"
+            | "th"
+            | "thead"
+            | "tr"
+            | "ul"
+    )
+}
+
+fn ensure_text_separator(out: &mut String) {
+    if !out.is_empty() && !out.ends_with(HTML_BLOCK_SEPARATOR) {
+        out.push(HTML_BLOCK_SEPARATOR);
+    }
+}
+
+fn collect_inline_text(node: scraper::ElementRef<'_>, out: &mut String) {
+    for child in node.children() {
+        if let Some(text) = child.value().as_text() {
+            out.push_str(text);
+            continue;
+        }
+        if let Some(element) = scraper::ElementRef::wrap(child) {
+            let name = element.value().name();
+            if name == "br" {
+                out.push(' ');
+                continue;
+            }
+            if matches!(name, "script" | "style") {
+                continue;
+            }
+            collect_inline_text(element, out);
+        }
+    }
+}
+
+fn collect_visible_text(node: scraper::ElementRef<'_>, out: &mut String) {
+    let name = node.value().name();
+    if name == "pre" {
+        ensure_text_separator(out);
+        out.push(HTML_PREFORMATTED_START);
+        let mut preformatted = String::new();
+        collect_preformatted_text(node, &mut preformatted);
+        out.push_str(&normalize_html_text_preserving_preformatted(&preformatted));
+        out.push(HTML_PREFORMATTED_END);
+        ensure_text_separator(out);
+        return;
+    }
+    if name == "code" {
+        let mut inline = String::new();
+        collect_inline_text(node, &mut inline);
+        out.push_str(&inline);
+        return;
+    }
+
+    let is_block = is_block_boundary_element(name);
+    if is_block {
+        ensure_text_separator(out);
+    }
+
+    for child in node.children() {
+        if let Some(text) = child.value().as_text() {
+            out.push_str(text);
+            continue;
+        }
+        if let Some(element) = scraper::ElementRef::wrap(child) {
+            let child_name = element.value().name();
+            if matches!(child_name, "script" | "style") {
+                continue;
+            }
+            collect_visible_text(element, out);
+        }
+    }
+
+    if is_block {
+        ensure_text_separator(out);
+    }
+}
+
+fn visible_text_from_document(document: &Html) -> String {
+    let body_selector = Selector::parse("body").expect("body selector should be valid");
+    let mut out = String::new();
+    if let Some(body) = document.select(&body_selector).next() {
+        collect_visible_text(body, &mut out);
+    } else {
+        collect_visible_text(document.root_element(), &mut out);
+    }
+    finalize_visible_html_text(&out)
+}
+
+fn simplify_html_for_fetch(html: &str) -> String {
+    let without_scripts = strip_html_block_case_insensitive(html, "script");
+    let without_styles = strip_html_block_case_insensitive(&without_scripts, "style");
+    let document = Html::parse_document(&without_styles);
+    let visible = visible_text_from_document(&document);
+    if visible.is_empty() {
+        strip_html_tags(&without_styles)
+    } else {
+        visible
+    }
+}
+
 /// Validate that a URL is a safe, reachable image URL.
 /// Performs SSRF check, allows extensionless dynamic image URLs, and rejects
 /// explicit non-PNG/JPEG suffixes early so obvious bad inputs fail before model calls.
@@ -157,45 +537,49 @@ pub(crate) async fn tool_http_fetch(
     if let Some(msg) = check_ssrf(url).await {
         return msg;
     }
-    let max_bytes = args["max_bytes"].as_u64().unwrap_or(102_400) as usize;
+    let max_bytes = args["max_bytes"]
+        .as_u64()
+        .unwrap_or(HTTP_FETCH_DEFAULT_MAX_BYTES as u64) as usize;
     if max_bytes == 0 {
         return "http_fetch error: max_bytes must be >= 1".into();
     }
 
-    // Build a one-off client with redirects disabled to prevent redirect-based SSRF.
-    let no_redirect = match Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(15))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => return format!("http_fetch error: failed to create safe HTTP client: {e}"),
+    let fetch_client = match shared_http_fetch_client() {
+        Ok(client) => client,
+        Err(err) => return err,
     };
+    let final_limit = http_fetch_final_limit(max_bytes, config);
 
-    let result = tokio::time::timeout(Duration::from_secs(15), no_redirect.get(url).send()).await;
+    let result = tokio::time::timeout(SAFE_FETCH_TIMEOUT, fetch_client.get(url).send()).await;
 
     match result {
         Ok(Ok(resp)) => {
             let status = resp.status();
-            let content_type = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("unknown")
-                .to_string();
-            match resp.text().await {
-                Ok(text) => {
+            let content_type = response_content_type(&resp).unwrap_or_else(|| "unknown".into());
+            let body_limit = if is_html_response_content_type(&content_type) {
+                html_fetch_read_limit(final_limit)
+            } else {
+                final_limit
+            };
+            match read_response_body_limited(resp, body_limit).await {
+                Ok(read) => {
+                    let body = if is_html_response_content_type(&content_type) {
+                        simplify_html_for_fetch(&read.text)
+                    } else {
+                        read.text
+                    };
+                    let body = truncate_decoded_text(body, read.was_truncated, body_limit);
                     let header = format!("HTTP {status} | {content_type}\n---\n");
-                    truncate(
-                        &format!("{header}{text}"),
-                        max_bytes.min(config.max_output_bytes),
-                    )
+                    truncate(&format!("{header}{body}"), final_limit)
                 }
-                Err(e) => format!("http_fetch error reading body: {e}"),
+                Err(e) => e,
             }
         }
         Ok(Err(e)) => format!("http_fetch error: {e}"),
-        Err(_) => "http_fetch error: request timed out (15s)".into(),
+        Err(_) => format!(
+            "http_fetch error: request timed out ({}s)",
+            SAFE_FETCH_TIMEOUT.as_secs()
+        ),
     }
 }
 

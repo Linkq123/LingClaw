@@ -77,7 +77,207 @@ async fn check_ssrf_allows_https_public_domain() {
     assert!(check_ssrf("https://example.com").await.is_none());
 }
 
-// ── validate_image_url ──────────────────────────────────────────────────────
+#[test]
+fn shared_http_fetch_client_reuses_single_client_instance() {
+    let first = shared_http_fetch_client().expect("shared fetch client should initialize");
+    let second = shared_http_fetch_client().expect("shared fetch client should be reused");
+    assert!(std::ptr::eq(first, second));
+}
+
+#[test]
+fn html_fetch_read_limit_expands_and_caps_html_budget() {
+    assert_eq!(html_fetch_read_limit(1_000), 4_000);
+    assert_eq!(html_fetch_read_limit(100_000), 256 * 1024);
+    assert_eq!(html_fetch_read_limit(300_000), 300_000);
+}
+
+#[test]
+fn is_html_response_content_type_matches_html_and_xhtml() {
+    assert!(is_html_response_content_type("text/html; charset=utf-8"));
+    assert!(is_html_response_content_type("application/xhtml+xml"));
+    assert!(!is_html_response_content_type("text/plain"));
+}
+
+#[test]
+fn simplify_html_for_fetch_uses_visible_text_order() {
+    let html = r#"
+        <html>
+          <body>
+            <header><a href="/">Home</a></header>
+            <main>
+              <article>
+                <h1>Title</h1>
+                <p>First <strong>paragraph</strong>.</p>
+              </article>
+            </main>
+          </body>
+        </html>
+    "#;
+
+    let simplified = simplify_html_for_fetch(html);
+
+    assert!(simplified.contains("Home Title First paragraph."));
+}
+
+#[test]
+fn simplify_html_for_fetch_preserves_code_like_span_boundaries() {
+    let html = r#"
+        <html>
+          <body>
+            <code><span>foo</span><span>(</span><span>bar</span><span>)</span></code>
+            <pre><span>{</span><span>"a"</span><span>:</span><span>1</span><span>}</span></pre>
+          </body>
+        </html>
+    "#;
+
+    let simplified = simplify_html_for_fetch(html);
+
+    assert!(simplified.contains("foo(bar)"));
+    assert!(simplified.contains("{\"a\":1}"));
+    assert!(!simplified.contains("foo ( bar )"));
+}
+
+#[test]
+fn simplify_html_for_fetch_keeps_inline_code_adjacent_to_punctuation() {
+    let html = r#"
+        <html>
+          <body>
+            <p>Use <code>foo(bar)</code>.</p>
+          </body>
+        </html>
+    "#;
+
+    let simplified = simplify_html_for_fetch(html);
+
+    assert!(simplified.contains("Use foo(bar)."));
+    assert!(!simplified.contains("Use foo(bar) ."));
+}
+
+#[test]
+fn simplify_html_for_fetch_preserves_leading_indent_in_first_pre_line() {
+    let html = r#"
+        <html>
+          <body><pre>  first
+    second</pre></body>
+        </html>
+    "#;
+
+    let simplified = simplify_html_for_fetch(html);
+
+    assert!(simplified.starts_with("  first\n    second"));
+}
+
+#[test]
+fn simplify_html_for_fetch_separates_adjacent_block_elements_in_compressed_html() {
+    let html = "<html><body><h1>Title</h1><p>Intro</p><ul><li>Step1</li><li>Step2</li></ul></body></html>";
+
+    let simplified = simplify_html_for_fetch(html);
+
+    assert!(simplified.contains("Title Intro Step1 Step2"));
+    assert!(!simplified.contains("TitleIntro"));
+    assert!(!simplified.contains("Step1Step2"));
+}
+
+#[test]
+fn simplify_html_for_fetch_keeps_noscript_fallback_text() {
+    let html = r#"
+        <html>
+          <body>
+            <div id="app"></div>
+            <noscript>Enable JavaScript or read the fallback docs here.</noscript>
+          </body>
+        </html>
+    "#;
+
+    let simplified = simplify_html_for_fetch(html);
+
+    assert!(simplified.contains("Enable JavaScript or read the fallback docs here."));
+}
+
+#[test]
+fn simplify_html_for_fetch_preserves_preformatted_indentation_and_br() {
+    let html = r#"
+        <html>
+          <body>
+            <pre>if x:
+  print("a")<br>  print("b")</pre>
+          </body>
+        </html>
+    "#;
+
+    let simplified = simplify_html_for_fetch(html);
+
+    assert!(simplified.contains("if x:\n  print(\"a\")\n  print(\"b\")"));
+}
+
+#[test]
+fn simplify_html_for_fetch_preserves_preformatted_newlines() {
+    let html = r#"
+        <html>
+          <body>
+            <pre>cargo test
+  -- --nocapture
+{"a": 1}</pre>
+          </body>
+        </html>
+    "#;
+
+    let simplified = simplify_html_for_fetch(html);
+
+    assert!(simplified.contains("cargo test\n  -- --nocapture\n{\"a\": 1}"));
+}
+
+#[test]
+fn truncate_decoded_text_adds_marker_after_html_simplification() {
+    let body = truncate_decoded_text("Hello world".to_string(), true, 5);
+    assert!(body.contains("[truncated at 5 bytes, reached fetch limit of 5 bytes]"));
+}
+
+#[test]
+fn simplify_html_for_fetch_removes_tags_and_script_like_blocks() {
+    let html = r#"
+        <html>
+          <head>
+            <title>Example</title>
+            <style>.hidden { display:none; }</style>
+            <script>console.log('x')</script>
+          </head>
+          <body>
+            <h1>Hello</h1>
+            <p>World <strong>again</strong></p>
+            <noscript>fallback only</noscript>
+          </body>
+        </html>
+    "#;
+
+    let simplified = simplify_html_for_fetch(html);
+
+    assert!(!simplified.contains("<html"));
+    assert!(simplified.contains("Hello"));
+    assert!(simplified.contains("World"));
+    assert!(simplified.contains("again"));
+    assert!(simplified.contains("fallback only"));
+    assert!(!simplified.contains("console.log"));
+    assert!(!simplified.contains("display:none"));
+}
+
+#[test]
+fn simplify_html_for_fetch_collapses_whitespace() {
+    let simplified = simplify_html_for_fetch("<div>Hello</div>\n\n   <div>world</div>");
+    assert_eq!(simplified, "Hello world");
+}
+
+#[test]
+fn read_response_body_limited_truncates_at_max_bytes() {
+    let text = truncate_bytes(b"hello world", 5);
+    assert_eq!(text, "hello...\n[truncated at 5 bytes, reached fetch limit of 5 bytes]");
+}
+
+#[test]
+fn read_response_body_limited_preserves_utf8_boundaries() {
+    let text = truncate_bytes("你好世界".as_bytes(), 5);
+    assert_eq!(text, "你...\n[truncated at 3 bytes, reached fetch limit of 5 bytes]");
+}
 
 #[tokio::test]
 async fn validate_image_url_accepts_common_image_extensions() {
