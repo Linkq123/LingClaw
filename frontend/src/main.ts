@@ -115,8 +115,12 @@ import {
   finalizeOrDiscardLiveReasoningPanel,
 } from './renderers/reasoning.js';
 import {
+  applyCompressionOutcome,
   applyTopLevelAutoTrace,
   clearActiveAutoTrace,
+  clearCompressionOutcome,
+  clearCompressionOutcomeForNewAnalyzeCycle,
+  clearCompressionOutcomeForNewRound,
   toggleAutoDebug,
   updateAutoDebugToggleButton,
 } from './renderers/auto-trace.js';
@@ -431,6 +435,7 @@ function loadEarlierMessages() {
 function handleMessage(data) {
   switch (data.type) {
     case 'session':
+      clearCompressionOutcome();
       state.currentSessionId = data.id;
       dom.sessionNameEl.textContent = data.name || 'Main';
       dom.sessionIdEl.textContent = data.id.slice(0, 12);
@@ -460,6 +465,7 @@ function handleMessage(data) {
       break;
 
     case 'history': {
+      clearCompressionOutcome();
       closeToolDrawer();
       closeSubagentModal();
       closeOrchestrateTaskModal();
@@ -520,6 +526,7 @@ function handleMessage(data) {
 
     case 'start': {
       if (data.subagent) break;
+      clearCompressionOutcomeForNewRound(data.cycle);
       clearActiveAutoTrace();
       const isNewTurn = !state.busy || state.currentRoundStartedAt === 0;
       setBusy(true);
@@ -539,6 +546,36 @@ function handleMessage(data) {
       applyTopLevelAutoTrace(data);
       break;
 
+    case 'context_compressed':
+      applyCompressionOutcome({
+        outcome: 'compressed',
+        saved_tokens: data.saved_tokens,
+        saved_percent: data.saved_percent,
+      });
+      addSystem(
+        `Context auto-compressed: removed ${data.messages_removed || 0} messages, token estimate ${data.before_estimate || 0} -> ${data.after_estimate || 0}`,
+      );
+      break;
+
+    case 'context_compress_skipped':
+      applyCompressionOutcome({
+        outcome: 'skipped',
+        reason: data.reason,
+      });
+      break;
+
+    case 'context_pruned':
+      addSystem(`Context pruned to fit budget: removed ${data.messages_removed || 0} additional messages`);
+      break;
+
+    case 'context_compress_failed':
+      applyCompressionOutcome({
+        outcome: 'failed',
+        reason: data.error,
+      });
+      addError(`Context auto-compress failed: ${data.error || 'unknown error'}`);
+      break;
+
     case 'delta':
       if (data.subagent) break;
       if (data.content) markCurrentRoundFirstTokenAt();
@@ -549,6 +586,7 @@ function handleMessage(data) {
       break;
 
     case 'done': {
+      clearCompressionOutcome();
       const finishedAssistantMsg = finishAssistantStream({ discardIfEmpty: true });
       const activeReasoningPanel = state.reasoningPanel;
       finishReasoningStream();
@@ -589,6 +627,9 @@ function handleMessage(data) {
     }
 
     case 'react_phase':
+      if (data.phase === 'analyze') {
+        clearCompressionOutcomeForNewAnalyzeCycle(data.cycle ?? 0);
+      }
       showReactStatus(data.phase, data.cycle);
       break;
 
@@ -779,16 +820,6 @@ function handleMessage(data) {
       finishOrchestratePanel(data);
       break;
 
-    case 'context_compressed':
-      addSystem(
-        `Context auto-compressed: removed ${data.messages_removed || 0} messages, token estimate ${data.before_estimate || 0} -> ${data.after_estimate || 0}`,
-      );
-      break;
-
-    case 'context_compress_failed':
-      addError(`Context auto-compress failed: ${data.error || 'unknown error'}`);
-      break;
-
     case 'progress':
       addSystem(data.content);
       break;
@@ -806,6 +837,7 @@ function handleMessage(data) {
       break;
 
     case 'error':
+      clearCompressionOutcome();
       finishAssistantStream({ discardIfEmpty: true });
       finishReasoningStream();
       clearReactStatus();

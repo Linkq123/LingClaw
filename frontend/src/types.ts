@@ -164,6 +164,30 @@ export interface ThinkingDoneEvent {
 }
 export interface ContextCompressedEvent {
   type: 'context_compressed';
+  saved_tokens?: number;
+  saved_percent?: number;
+}
+
+export interface ContextPrunedEvent {
+  type: 'context_pruned';
+  messages_removed?: number;
+}
+
+export interface ContextCompressSkippedEvent {
+  type: 'context_compress_skipped';
+  reason?: string;
+}
+
+export interface ContextCompressFailedEvent {
+  type: 'context_compress_failed';
+  error?: string;
+}
+
+export interface CompressionOutcome {
+  outcome: 'compressed' | 'skipped' | 'failed';
+  saved_tokens?: number;
+  saved_percent?: number;
+  reason?: string;
 }
 
 export interface AutoTraceSignals {
@@ -200,6 +224,7 @@ export interface AutoTraceEvent {
   dampeners: string[];
   clamps: string[];
   signals: AutoTraceSignals;
+  compression?: CompressionOutcome;
 }
 
 export interface UsageEvent {
@@ -284,6 +309,9 @@ export type WebSocketMessage =
   | ThinkingDoneEvent
   | AutoTraceEvent
   | ContextCompressedEvent
+  | ContextPrunedEvent
+  | ContextCompressSkippedEvent
+  | ContextCompressFailedEvent
   | UsageEvent
   | OrchestrateStartedEvent
   | OrchestrateLayerEvent

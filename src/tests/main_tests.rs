@@ -390,6 +390,626 @@ fn repeated_compression_excludes_previous_summary() {
 }
 
 #[test]
+fn replay_live_round_replays_compression_before_assistant_delta() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-compression-order-{}", now_epoch());
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(8);
+
+    rt.block_on(async {
+        state.live_rounds.lock().await.insert(
+            session_id.clone(),
+            LiveRoundState {
+                connection_id: 1,
+                round: 1,
+                react_visible: true,
+                phase: Some("analyze".into()),
+                cycle: Some(2),
+                effective_model: Some("openai/gpt-4o-reasoner".into()),
+                effective_think: Some("high".into()),
+                latest_compression: LiveCompressionState {
+                    outcome: Some("compressed".to_string()),
+                    reason: None,
+                    messages_removed: Some(4),
+                    before_estimate: Some(5_000),
+                    after_estimate: Some(4_000),
+                    saved_tokens: Some(1024),
+                    saved_percent: Some(18),
+                    pruned_messages_removed: Some(3),
+                },
+                latest_auto_trace: Some(agent::AutoThinkTrace {
+                    round: 1,
+                    cycle: 2,
+                    phase: "analyze".to_string(),
+                    model: "openai/gpt-4o-reasoner".to_string(),
+                    provider: "openai".to_string(),
+                    selected_think: "high".to_string(),
+                    baseline_level: "medium".to_string(),
+                    baseline_reason: "mid_loop_investigate".to_string(),
+                    escalators: vec![],
+                    dampeners: vec![],
+                    clamps: vec![],
+                    signals: agent::AutoThinkTraceSignals {
+                        intent: "investigate".to_string(),
+                        user_msg_chars: 96,
+                        observation_strength: "medium".to_string(),
+                        tool_results_count: 2,
+                        tool_error_count: 1,
+                        summary_count: 1,
+                        summary_bytes: 4096,
+                        stagnation_streak: 3,
+                        error_streak: 1,
+                        task_pressure: 2,
+                        ready_to_finish: false,
+                        action_oriented: true,
+                        has_blocking_uncertainty: true,
+                        progress_made: false,
+                        retry_pattern: "same_tool".to_string(),
+                        error_kind: "timeout".to_string(),
+                        evidence_delta_quality: "no_meaningful_progress".to_string(),
+                    },
+                }),
+                assistant_text: "hello replay".to_string(),
+                ..Default::default()
+            },
+        );
+    });
+
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let compression = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("compression should arrive before timeout")
+            .expect("compression should be queued")
+    });
+    let pruned = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("pruned event should arrive before timeout")
+            .expect("pruned event should be queued")
+    });
+    let start = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("start should arrive before timeout")
+            .expect("start should be queued")
+    });
+    let auto_trace = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("auto_trace should arrive before timeout")
+            .expect("auto_trace should be queued")
+    });
+    let delta = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("delta should arrive before timeout")
+            .expect("delta should be queued")
+    });
+
+    let compression: serde_json::Value =
+        serde_json::from_str(&compression).expect("compression should be json");
+    let pruned: serde_json::Value = serde_json::from_str(&pruned).expect("pruned should be json");
+    let start: serde_json::Value = serde_json::from_str(&start).expect("start should be json");
+    let auto_trace: serde_json::Value =
+        serde_json::from_str(&auto_trace).expect("auto_trace should be json");
+    let delta: serde_json::Value = serde_json::from_str(&delta).expect("delta should be json");
+
+    assert_eq!(compression["type"], "context_compressed");
+    assert_eq!(compression["messages_removed"], 4);
+    assert_eq!(compression["before_estimate"], 5_000);
+    assert_eq!(compression["after_estimate"], 4_000);
+    assert_eq!(pruned["type"], "context_pruned");
+    assert_eq!(pruned["messages_removed"], 3);
+    assert_eq!(start["type"], "start");
+    assert_eq!(auto_trace["type"], "auto_trace");
+    assert_eq!(delta["type"], "delta");
+    assert_eq!(delta["content"], "hello replay");
+}
+
+#[test]
+fn replay_live_round_replays_prune_only_state() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-prune-only-order-{}", now_epoch());
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(8);
+
+    rt.block_on(async {
+        state.live_rounds.lock().await.insert(
+            session_id.clone(),
+            LiveRoundState {
+                connection_id: 1,
+                round: 1,
+                react_visible: true,
+                phase: Some("analyze".into()),
+                cycle: Some(2),
+                effective_model: Some("openai/gpt-4o-reasoner".into()),
+                effective_think: Some("high".into()),
+                latest_compression: LiveCompressionState {
+                    pruned_messages_removed: Some(3),
+                    ..Default::default()
+                },
+                assistant_text: "hello replay".to_string(),
+                ..Default::default()
+            },
+        );
+    });
+
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let pruned = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("pruned event should arrive before timeout")
+            .expect("pruned event should be queued")
+    });
+    let start = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("start should arrive before timeout")
+            .expect("start should be queued")
+    });
+    let delta = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("delta should arrive before timeout")
+            .expect("delta should be queued")
+    });
+
+    let pruned: serde_json::Value = serde_json::from_str(&pruned).expect("pruned should be json");
+    let start: serde_json::Value = serde_json::from_str(&start).expect("start should be json");
+    let delta: serde_json::Value = serde_json::from_str(&delta).expect("delta should be json");
+
+    assert_eq!(pruned["type"], "context_pruned");
+    assert_eq!(pruned["messages_removed"], 3);
+    assert_eq!(start["type"], "start");
+    assert_eq!(delta["type"], "delta");
+    assert_eq!(delta["content"], "hello replay");
+}
+
+#[test]
+fn react_phase_analyze_clears_stale_compression_state_on_cycle_advance() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-react-phase-clear-{}", now_epoch());
+
+    rt.block_on(async {
+        state.live_rounds.lock().await.insert(
+            session_id.clone(),
+            LiveRoundState {
+                connection_id: 1,
+                round: 1,
+                phase: Some("observe".into()),
+                cycle: Some(0),
+                latest_compression: LiveCompressionState {
+                    outcome: Some("compressed".to_string()),
+                    reason: None,
+                    messages_removed: Some(4),
+                    before_estimate: Some(5_000),
+                    after_estimate: Some(4_000),
+                    saved_tokens: Some(1_000),
+                    saved_percent: Some(20),
+                    pruned_messages_removed: Some(3),
+                },
+                ..Default::default()
+            },
+        );
+
+        dispatch_live_event(
+            &state,
+            &session_id,
+            1,
+            json!({
+                "type": "react_phase",
+                "phase": "analyze",
+                "cycle": 1
+            }),
+        )
+        .await;
+    });
+
+    let round = rt.block_on(async {
+        state
+            .live_rounds
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("live round should exist after react_phase")
+    });
+
+    assert_eq!(round.phase.as_deref(), Some("analyze"));
+    assert_eq!(round.cycle, Some(1));
+    assert_eq!(round.latest_compression.outcome, None);
+    assert_eq!(round.latest_compression.reason, None);
+    assert_eq!(round.latest_compression.messages_removed, None);
+    assert_eq!(round.latest_compression.before_estimate, None);
+    assert_eq!(round.latest_compression.after_estimate, None);
+    assert_eq!(round.latest_compression.saved_tokens, None);
+    assert_eq!(round.latest_compression.saved_percent, None);
+    assert_eq!(round.latest_compression.pruned_messages_removed, None);
+    assert!(!round.has_pending_pre_start_context_updates);
+}
+
+#[test]
+fn replay_live_round_replays_only_new_cycle_prune_after_analyze_transition() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-new-cycle-prune-replay-{}", now_epoch());
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(8);
+
+    rt.block_on(async {
+        state.live_rounds.lock().await.insert(
+            session_id.clone(),
+            LiveRoundState {
+                connection_id: 1,
+                round: 2,
+                react_visible: true,
+                phase: Some("analyze".into()),
+                cycle: Some(1),
+                effective_model: Some("openai/gpt-4o-reasoner".into()),
+                effective_think: Some("high".into()),
+                latest_compression: LiveCompressionState {
+                    pruned_messages_removed: Some(2),
+                    ..Default::default()
+                },
+                assistant_text: "hello replay".to_string(),
+                ..Default::default()
+            },
+        );
+    });
+
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let first = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("first event should arrive before timeout")
+            .expect("first event should be queued")
+    });
+    let second = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("second event should arrive before timeout")
+            .expect("second event should be queued")
+    });
+    let third = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("third event should arrive before timeout")
+            .expect("third event should be queued")
+    });
+
+    let first: serde_json::Value = serde_json::from_str(&first).expect("first should be json");
+    let second: serde_json::Value = serde_json::from_str(&second).expect("second should be json");
+    let third: serde_json::Value = serde_json::from_str(&third).expect("third should be json");
+
+    assert_eq!(first["type"], "context_pruned");
+    assert_eq!(first["messages_removed"], 2);
+    assert_eq!(second["type"], "start");
+    assert_eq!(third["type"], "delta");
+}
+
+#[test]
+fn start_event_preserves_current_cycle_pre_start_compression_state() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-start-prestart-compression-{}", now_epoch());
+
+    rt.block_on(async {
+        state.live_rounds.lock().await.insert(
+            session_id.clone(),
+            LiveRoundState {
+                connection_id: 1,
+                latest_compression: LiveCompressionState {
+                    outcome: Some("compressed".to_string()),
+                    reason: None,
+                    messages_removed: Some(4),
+                    before_estimate: Some(5_000),
+                    after_estimate: Some(4_000),
+                    saved_tokens: Some(1_000),
+                    saved_percent: Some(20),
+                    pruned_messages_removed: Some(3),
+                },
+                has_pending_pre_start_context_updates: true,
+                ..Default::default()
+            },
+        );
+
+        dispatch_live_event(
+            &state,
+            &session_id,
+            1,
+            json!({
+                "type": "start",
+                "round": 2,
+                "phase": "analyze",
+                "cycle": 5,
+                "react_visible": true,
+                "model": "openai/gpt-4o-reasoner",
+                "think_level": "high"
+            }),
+        )
+        .await;
+    });
+
+    let round = rt.block_on(async {
+        state
+            .live_rounds
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("live round should exist after start")
+    });
+
+    assert_eq!(round.round, 2);
+    assert_eq!(round.cycle, Some(5));
+    assert_eq!(round.latest_compression.outcome.as_deref(), Some("compressed"));
+    assert_eq!(round.latest_compression.reason, None);
+    assert_eq!(round.latest_compression.messages_removed, Some(4));
+    assert_eq!(round.latest_compression.before_estimate, Some(5_000));
+    assert_eq!(round.latest_compression.after_estimate, Some(4_000));
+    assert_eq!(round.latest_compression.saved_tokens, Some(1_000));
+    assert_eq!(round.latest_compression.saved_percent, Some(20));
+    assert_eq!(round.latest_compression.pruned_messages_removed, Some(3));
+    assert!(!round.has_pending_pre_start_context_updates);
+}
+
+#[test]
+fn start_event_carries_forward_only_prune_state_into_next_cycle() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-start-prune-carry-{}", now_epoch());
+
+    rt.block_on(async {
+        state.live_rounds.lock().await.insert(
+            session_id.clone(),
+            LiveRoundState {
+                connection_id: 1,
+                round: 1,
+                latest_compression: LiveCompressionState {
+                    outcome: Some("compressed".to_string()),
+                    reason: None,
+                    messages_removed: Some(4),
+                    before_estimate: Some(5_000),
+                    after_estimate: Some(4_000),
+                    saved_tokens: Some(1_000),
+                    saved_percent: Some(20),
+                    pruned_messages_removed: Some(3),
+                },
+                has_pending_pre_start_context_updates: false,
+                ..Default::default()
+            },
+        );
+
+        dispatch_live_event(
+            &state,
+            &session_id,
+            1,
+            json!({
+                "type": "start",
+                "round": 2,
+                "phase": "analyze",
+                "cycle": 5,
+                "react_visible": true,
+                "model": "openai/gpt-4o-reasoner",
+                "think_level": "high"
+            }),
+        )
+        .await;
+    });
+
+    let round = rt.block_on(async {
+        state
+            .live_rounds
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("live round should exist after start")
+    });
+
+    assert_eq!(round.round, 2);
+    assert_eq!(round.cycle, Some(5));
+    assert_eq!(round.latest_compression.outcome, None);
+    assert_eq!(round.latest_compression.reason, None);
+    assert_eq!(round.latest_compression.messages_removed, None);
+    assert_eq!(round.latest_compression.before_estimate, None);
+    assert_eq!(round.latest_compression.after_estimate, None);
+    assert_eq!(round.latest_compression.saved_tokens, None);
+    assert_eq!(round.latest_compression.saved_percent, None);
+    assert_eq!(round.latest_compression.pruned_messages_removed, None);
+    assert!(!round.has_pending_pre_start_context_updates);
+}
+
+#[test]
+fn start_event_preserves_current_cycle_pre_start_prune_only_state() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-start-prestart-prune-only-{}", now_epoch());
+
+    rt.block_on(async {
+        state.live_rounds.lock().await.insert(
+            session_id.clone(),
+            LiveRoundState {
+                connection_id: 1,
+                latest_compression: LiveCompressionState {
+                    pruned_messages_removed: Some(3),
+                    ..Default::default()
+                },
+                has_pending_pre_start_context_updates: true,
+                ..Default::default()
+            },
+        );
+
+        dispatch_live_event(
+            &state,
+            &session_id,
+            1,
+            json!({
+                "type": "start",
+                "round": 2,
+                "phase": "analyze",
+                "cycle": 5,
+                "react_visible": true,
+                "model": "openai/gpt-4o-reasoner",
+                "think_level": "high"
+            }),
+        )
+        .await;
+    });
+
+    let round = rt.block_on(async {
+        state
+            .live_rounds
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("live round should exist after start")
+    });
+
+    assert_eq!(round.latest_compression.outcome, None);
+    assert_eq!(round.latest_compression.pruned_messages_removed, Some(3));
+    assert!(!round.has_pending_pre_start_context_updates);
+}
+
+#[test]
+fn replay_live_round_replays_current_cycle_pre_start_compression_after_start() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-prestart-compression-replay-{}", now_epoch());
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(8);
+
+    rt.block_on(async {
+        state.live_rounds.lock().await.insert(
+            session_id.clone(),
+            LiveRoundState {
+                connection_id: 1,
+                round: 2,
+                react_visible: true,
+                phase: Some("analyze".into()),
+                cycle: Some(5),
+                effective_model: Some("openai/gpt-4o-reasoner".into()),
+                effective_think: Some("high".into()),
+                latest_compression: LiveCompressionState {
+                    outcome: Some("compressed".to_string()),
+                    reason: None,
+                    messages_removed: Some(4),
+                    before_estimate: Some(5_000),
+                    after_estimate: Some(4_000),
+                    saved_tokens: Some(1_000),
+                    saved_percent: Some(20),
+                    pruned_messages_removed: Some(3),
+                },
+                assistant_text: "hello replay".to_string(),
+                ..Default::default()
+            },
+        );
+    });
+
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let first = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("first event should arrive before timeout")
+            .expect("first event should be queued")
+    });
+    let second = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("second event should arrive before timeout")
+            .expect("second event should be queued")
+    });
+    let third = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("third event should arrive before timeout")
+            .expect("third event should be queued")
+    });
+    let fourth = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("fourth event should arrive before timeout")
+            .expect("fourth event should be queued")
+    });
+
+    let first: serde_json::Value = serde_json::from_str(&first).expect("first should be json");
+    let second: serde_json::Value = serde_json::from_str(&second).expect("second should be json");
+    let third: serde_json::Value = serde_json::from_str(&third).expect("third should be json");
+    let fourth: serde_json::Value = serde_json::from_str(&fourth).expect("fourth should be json");
+
+    assert_eq!(first["type"], "context_compressed");
+    assert_eq!(first["messages_removed"], 4);
+    assert_eq!(second["type"], "context_pruned");
+    assert_eq!(second["messages_removed"], 3);
+    assert_eq!(third["type"], "start");
+    assert_eq!(fourth["type"], "delta");
+}
+
+#[test]
+fn replay_live_round_does_not_replay_stale_compression_after_cycle_boundary() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("live-cycle-boundary-replay-{}", now_epoch());
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(8);
+
+    rt.block_on(async {
+        state.live_rounds.lock().await.insert(
+            session_id.clone(),
+            LiveRoundState {
+                connection_id: 1,
+                round: 2,
+                react_visible: true,
+                phase: Some("analyze".into()),
+                cycle: Some(5),
+                effective_model: Some("openai/gpt-4o-reasoner".into()),
+                effective_think: Some("high".into()),
+                latest_compression: LiveCompressionState {
+                    pruned_messages_removed: Some(3),
+                    ..Default::default()
+                },
+                assistant_text: "hello replay".to_string(),
+                ..Default::default()
+            },
+        );
+    });
+
+    rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
+
+    let first = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("first event should arrive before timeout")
+            .expect("first event should be queued")
+    });
+    let second = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("second event should arrive before timeout")
+            .expect("second event should be queued")
+    });
+    let third = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), replay_rx.recv())
+            .await
+            .expect("third event should arrive before timeout")
+            .expect("third event should be queued")
+    });
+
+    let first: serde_json::Value = serde_json::from_str(&first).expect("first should be json");
+    let second: serde_json::Value = serde_json::from_str(&second).expect("second should be json");
+    let third: serde_json::Value = serde_json::from_str(&third).expect("third should be json");
+
+    assert_eq!(first["type"], "context_pruned");
+    assert_eq!(first["messages_removed"], 3);
+    assert_eq!(second["type"], "start");
+    assert_eq!(third["type"], "delta");
+}
+
+#[test]
 fn compression_source_text_redacts_exec_tool_call_arguments() {
     let messages = vec![
         make_message("system", "system"),
@@ -419,6 +1039,349 @@ fn compression_source_text_redacts_exec_tool_call_arguments() {
     assert!(!source.contains("super-secret"));
     assert!(!source.contains("key-123"));
     assert!(!source.contains("TOKEN=\"value\""));
+}
+
+#[test]
+fn apply_live_compression_event_clears_stale_pruned_state_on_new_compression() {
+    let mut round = LiveRoundState {
+        latest_compression: LiveCompressionState {
+            pruned_messages_removed: Some(3),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let event = json!({
+        "type": "context_compressed",
+        "messages_removed": 4,
+        "before_estimate": 5_000,
+        "after_estimate": 4_000,
+        "saved_tokens": 1_000,
+        "saved_percent": 20,
+    });
+
+    apply_live_compression_event(&mut round, "context_compressed", &event);
+
+    assert_eq!(round.latest_compression.outcome.as_deref(), Some("compressed"));
+    assert_eq!(round.latest_compression.messages_removed, Some(4));
+    assert_eq!(round.latest_compression.before_estimate, Some(5_000));
+    assert_eq!(round.latest_compression.after_estimate, Some(4_000));
+    assert_eq!(round.latest_compression.saved_tokens, Some(1_000));
+    assert_eq!(round.latest_compression.saved_percent, Some(20));
+    assert_eq!(round.latest_compression.pruned_messages_removed, None);
+}
+
+#[test]
+fn apply_live_compression_event_clears_stale_pruned_state_on_skipped_compression() {
+    let mut round = LiveRoundState {
+        latest_compression: LiveCompressionState {
+            pruned_messages_removed: Some(3),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let event = json!({
+        "type": "context_compress_skipped",
+        "reason": "insufficient_savings",
+    });
+
+    apply_live_compression_event(&mut round, "context_compress_skipped", &event);
+
+    assert_eq!(round.latest_compression.outcome.as_deref(), Some("skipped"));
+    assert_eq!(
+        round.latest_compression.reason.as_deref(),
+        Some("insufficient_savings")
+    );
+    assert_eq!(round.latest_compression.messages_removed, None);
+    assert_eq!(round.latest_compression.before_estimate, None);
+    assert_eq!(round.latest_compression.after_estimate, None);
+    assert_eq!(round.latest_compression.saved_tokens, None);
+    assert_eq!(round.latest_compression.saved_percent, None);
+    assert_eq!(round.latest_compression.pruned_messages_removed, None);
+}
+
+#[test]
+fn apply_live_compression_event_clears_stale_pruned_state_on_failed_compression() {
+    let mut round = LiveRoundState {
+        latest_compression: LiveCompressionState {
+            pruned_messages_removed: Some(3),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let event = json!({
+        "type": "context_compress_failed",
+        "error": "network timeout",
+    });
+
+    apply_live_compression_event(&mut round, "context_compress_failed", &event);
+
+    assert_eq!(round.latest_compression.outcome.as_deref(), Some("failed"));
+    assert_eq!(round.latest_compression.reason.as_deref(), Some("network timeout"));
+    assert_eq!(round.latest_compression.messages_removed, None);
+    assert_eq!(round.latest_compression.before_estimate, None);
+    assert_eq!(round.latest_compression.after_estimate, None);
+    assert_eq!(round.latest_compression.saved_tokens, None);
+    assert_eq!(round.latest_compression.saved_percent, None);
+    assert_eq!(round.latest_compression.pruned_messages_removed, None);
+}
+
+#[test]
+fn compression_replay_event_restores_compressed_state() {
+    let round = LiveRoundState {
+        latest_compression: LiveCompressionState {
+            outcome: Some("compressed".to_string()),
+            reason: None,
+            messages_removed: Some(4),
+            before_estimate: Some(5_000),
+            after_estimate: Some(4_000),
+            saved_tokens: Some(1024),
+            saved_percent: Some(18),
+            pruned_messages_removed: None,
+        },
+        ..Default::default()
+    };
+
+    let event = compression_replay_event(&round).expect("compression replay event should exist");
+    assert_eq!(event["type"].as_str(), Some("context_compressed"));
+    assert_eq!(event["messages_removed"].as_u64(), Some(4));
+    assert_eq!(event["before_estimate"].as_u64(), Some(5_000));
+    assert_eq!(event["after_estimate"].as_u64(), Some(4_000));
+    assert_eq!(event["saved_tokens"].as_u64(), Some(1024));
+    assert_eq!(event["saved_percent"].as_u64(), Some(18));
+}
+
+#[test]
+fn compression_replay_event_restores_skipped_state() {
+    let round = LiveRoundState {
+        latest_compression: LiveCompressionState {
+            outcome: Some("skipped".to_string()),
+            reason: Some("insufficient_savings".to_string()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let event = compression_replay_event(&round).expect("compression replay event should exist");
+    assert_eq!(event["type"].as_str(), Some("context_compress_skipped"));
+    assert_eq!(event["reason"].as_str(), Some("insufficient_savings"));
+}
+
+#[test]
+fn apply_context_compressed_metrics_recomputes_saved_fields() {
+    let mut event = json!({
+        "type": "context_compressed",
+        "before_estimate": 5_000,
+        "after_estimate": 4_500,
+        "saved_tokens": 500,
+        "saved_percent": 10,
+        "compression_ratio": 90,
+    });
+
+    crate::hooks::apply_context_compressed_metrics(&mut event, 5_000, 4_000);
+
+    assert_eq!(event["before_estimate"].as_u64(), Some(5_000));
+    assert_eq!(event["after_estimate"].as_u64(), Some(4_000));
+    assert_eq!(event["saved_tokens"].as_u64(), Some(1_000));
+    assert_eq!(event["saved_percent"].as_u64(), Some(20));
+    assert_eq!(event["compression_ratio"].as_u64(), Some(80));
+}
+
+#[test]
+fn compression_pruned_replay_event_restores_prune_state() {
+    let round = LiveRoundState {
+        latest_compression: LiveCompressionState {
+            pruned_messages_removed: Some(3),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let event = compression_pruned_replay_event(&round).expect("prune replay event should exist");
+    assert_eq!(event["type"].as_str(), Some("context_pruned"));
+    assert_eq!(event["messages_removed"].as_u64(), Some(3));
+}
+
+#[test]
+fn context_compress_skipped_event_includes_reason() {
+    let event = crate::hooks::build_context_compress_skipped_event("insufficient_savings");
+
+    assert_eq!(event["type"].as_str(), Some("context_compress_skipped"));
+    assert_eq!(event["reason"].as_str(), Some("insufficient_savings"));
+}
+
+#[test]
+fn context_compressed_event_includes_savings_metrics() {
+    let event = crate::hooks::build_context_compressed_event(4, 5_000, 4_000, 320, true);
+
+    assert_eq!(event["type"].as_str(), Some("context_compressed"));
+    assert_eq!(event["messages_removed"].as_u64(), Some(4));
+    assert_eq!(event["before_estimate"].as_u64(), Some(5_000));
+    assert_eq!(event["after_estimate"].as_u64(), Some(4_000));
+    assert_eq!(event["saved_tokens"].as_u64(), Some(1_000));
+    assert_eq!(event["saved_percent"].as_u64(), Some(20));
+    assert_eq!(event["compression_ratio"].as_u64(), Some(80));
+    assert_eq!(event["incremental"].as_bool(), Some(true));
+}
+
+#[test]
+fn compression_saves_enough_requires_absolute_and_relative_savings() {
+    assert!(crate::hooks::compression_saves_enough(5_000, 4_000));
+    assert!(!crate::hooks::compression_saves_enough(5_000, 4_800));
+    assert!(!crate::hooks::compression_saves_enough(2_000, 1_780));
+}
+
+#[test]
+fn should_auto_compress_uses_request_budget_when_available() {
+    let messages = vec![
+        make_message("system", "system"),
+        make_message("user", &"Q".repeat(5000)),
+        make_message("assistant", &"A".repeat(5000)),
+        make_message("user", &"Q2".repeat(5000)),
+        make_message("assistant", &"A2".repeat(5000)),
+        make_message("user", &"Q3".repeat(5000)),
+        make_message("assistant", &"A3".repeat(5000)),
+        make_message("user", &"Q4".repeat(5000)),
+        make_message("assistant", &"A4".repeat(5000)),
+        make_message("user", &"Q5".repeat(5000)),
+        make_message("assistant", &"A5".repeat(5000)),
+        make_message("user", &"Q6".repeat(5000)),
+        make_message("assistant", &"A6".repeat(5000)),
+        make_message("user", &"Q7".repeat(5000)),
+        make_message("assistant", &"A7".repeat(5000)),
+        make_message("user", &"Q8".repeat(5000)),
+        make_message("assistant", &"A8".repeat(5000)),
+        make_message("user", &"Q9".repeat(5000)),
+        make_message("assistant", &"A9".repeat(5000)),
+    ];
+    let input = crate::hooks::HookInput {
+        messages: messages.clone(),
+        model: "openai/gpt-4o-mini".into(),
+        provider: Provider::OpenAI,
+        workspace: PathBuf::new(),
+        input_budget: usize::MAX,
+        request_budget: Some(
+            crate::context::estimate_request_tokens_for_provider(Provider::OpenAI, &messages, &[]),
+        ),
+        compression_extra_tools: Some(Vec::new()),
+        cycle: 0,
+        compression_context: None,
+    };
+
+    assert!(crate::hooks::should_auto_compress(&input, 8, 90));
+}
+
+#[test]
+fn should_auto_compress_falls_back_to_message_budget_without_request_budget() {
+    let messages = vec![
+        make_message("system", "system"),
+        make_message("user", "u1"),
+        make_message("assistant", "a1"),
+        make_message("user", "u2"),
+        make_message("assistant", "a2"),
+        make_message("user", "u3"),
+        make_message("assistant", "a3"),
+        make_message("user", "u4"),
+        make_message("assistant", "a4"),
+        make_message("user", "u5"),
+        make_message("assistant", "a5"),
+        make_message("user", "u6"),
+        make_message("assistant", "a6"),
+        make_message("user", "u7"),
+        make_message("assistant", "a7"),
+        make_message("user", "u8"),
+        make_message("assistant", "a8"),
+        make_message("user", "u9"),
+        make_message("assistant", "a9"),
+    ];
+    let message_estimate = crate::estimate_tokens_for_provider(Provider::OpenAI, &messages);
+    let input = crate::hooks::HookInput {
+        messages,
+        model: "openai/gpt-4o-mini".into(),
+        provider: Provider::OpenAI,
+        workspace: PathBuf::new(),
+        input_budget: message_estimate,
+        request_budget: None,
+        compression_extra_tools: None,
+        cycle: 0,
+        compression_context: None,
+    };
+
+    assert!(crate::hooks::should_auto_compress(&input, 8, 90));
+}
+
+#[test]
+fn compression_source_text_with_context_prepends_structured_sections() {
+    let messages = vec![
+        make_message("system", "system"),
+        make_message("user", "question"),
+        make_message("assistant", "answer"),
+    ];
+    let context = crate::hooks::CompressionContextSections {
+        task_state: Some("## Task State\n- Goal: inspect runtime loop".into()),
+        observation_hint: Some("## Recent Observation Notes\n- read_file returned 900 lines".into()),
+        task_memory: Some("## Relevant Past Experience\n- Focus: prior blockers".into()),
+    };
+
+    let source = crate::hooks::build_compression_source_text_with_context(&messages, Some(&context));
+
+    assert!(source.starts_with("## Task State"));
+    assert!(source.contains("## Recent Observation Notes"));
+    assert!(source.contains("## Relevant Past Experience"));
+    assert!(source.contains("User: question"));
+    assert!(source.contains("Assistant: answer"));
+}
+
+#[test]
+fn compression_call_prompt_wraps_previous_summary_for_incremental_merge() {
+    let messages = vec![
+        make_message("system", "system"),
+        build_auto_summary_message("summary of early conversation"),
+        make_message("user", "new question"),
+        make_message("assistant", "new answer"),
+    ];
+
+    let prompt = crate::hooks::build_compression_call_prompt(&messages)
+        .expect("prompt should be created for non-empty source");
+
+    assert_eq!(prompt.len(), 2);
+    let system = prompt[0].content.as_deref().unwrap();
+    let user = prompt[1].content.as_deref().unwrap();
+    assert!(system.contains("Merge them into a single updated summary"));
+    assert!(user.contains("## Previous Summary"));
+    assert!(user.contains("summary of early conversation"));
+    assert!(user.contains("## New Conversation To Merge"));
+    assert!(user.contains("new question"));
+    assert!(user.contains("new answer"));
+}
+
+#[test]
+fn compression_call_prompt_uses_fresh_summary_prompt_without_previous_summary() {
+    let messages = vec![
+        make_message("system", "system"),
+        make_message("user", "question"),
+        make_message("assistant", "answer"),
+    ];
+
+    let prompt = crate::hooks::build_compression_call_prompt(&messages)
+        .expect("prompt should be created for non-empty source");
+
+    assert_eq!(prompt.len(), 2);
+    let system = prompt[0].content.as_deref().unwrap();
+    let user = prompt[1].content.as_deref().unwrap();
+    assert!(!system.contains("Merge them into a single updated summary"));
+    assert!(!user.contains("## Previous Summary"));
+    assert!(user.contains("question"));
+    assert!(user.contains("answer"));
+}
+
+#[test]
+fn compression_call_prompt_returns_none_for_empty_source() {
+    let messages = vec![make_message("system", "system")];
+
+    assert!(crate::hooks::build_compression_call_prompt(&messages).is_none());
 }
 
 #[test]
@@ -4822,6 +5785,59 @@ fn handle_command_persists_new_on_empty_context() {
 }
 
 #[test]
+fn handle_command_new_persists_existing_auto_summary_to_memory() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("persist-new-auto-summary-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let mut session = test_session(&session_id, "Persist New Auto Summary", None);
+    session.workspace = workspace.clone();
+    session.version = SESSION_VERSION;
+    session.messages.push(crate::hooks::build_auto_summary_message(
+        "Recovered summary from auto compression.",
+    ));
+
+    let state = test_app_state();
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(session_id.clone(), session.clone());
+    }
+    rt.block_on(save_session_to_disk(&session))
+        .expect("session should be saved before new");
+
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+
+    let new_result = rt
+        .block_on(handle_command("/new", &session_id, 1, &state, &tx, &cancel))
+        .expect("command should return a result");
+    assert_eq!(new_result.response_type, "system");
+    assert!(new_result.sessions_changed);
+    assert!(new_result.refresh_history);
+
+    let persisted = load_session_from_disk(&session_id).expect("session should load from disk");
+    assert_eq!(persisted.messages.len(), 1);
+    assert_eq!(persisted.messages[0].role, "system");
+    assert!(new_result.response.contains("Conversation compressed and saved to memory/"));
+
+    let local_snapshot = prompts::current_local_snapshot();
+    let today = local_snapshot.today();
+    let memory_path = workspace.join("memory").join(format!("{today}.md"));
+    let memory = std::fs::read_to_string(&memory_path).expect("memory file should exist");
+    assert!(memory.contains("Recovered summary from auto compression."));
+    assert!(!memory.contains("## Context Summary (auto-generated)"));
+
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let _ = std::fs::remove_file(path);
+    let session_dir = workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
 fn handle_command_switch_is_blocked_in_single_session_mode() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let source_id = format!("abandon-empty-switch-source-{}", now_epoch());
@@ -8850,6 +9866,8 @@ fn dispatch_live_event_allows_live_round_source_after_run_teardown() {
                 auto_ready_to_finish: None,
                 auto_has_blocking_uncertainty: None,
                 latest_auto_trace: None,
+                latest_compression: LiveCompressionState::default(),
+                has_pending_pre_start_context_updates: false,
                 has_observation: false,
                 assistant_text: String::new(),
                 reasoning_text: String::new(),

@@ -770,21 +770,13 @@ async fn prepare_analyze_snapshot(
         *first = fresh_system;
     }
 
-    let msg_count_before = session.messages.len();
-    crate::context::prune_messages_for_provider(
-        &mut session.messages,
-        config.resolve_model(&model_str).provider,
-        context_input_budget_for_model(&config, &model_str),
-    );
-    let pruned_count = msg_count_before - session.messages.len();
-
     phase_state.cycle_workspace = session.workspace.clone();
 
     Some(AnalyzeSnapshot {
         model: model_str,
         usage_role,
         think_level: session.think_level.clone(),
-        pruned_count,
+        pruned_count: 0,
         user_msg_chars,
         latest_query,
     })
@@ -828,11 +820,9 @@ async fn fit_messages_to_request_budget(
 
 async fn send_before_analyze_events(
     ctx: &AgentRunCtx<'_>,
-    model: &str,
-    mut hook_events: Vec<serde_json::Value>,
+    hook_events: Vec<serde_json::Value>,
     pruned_count: usize,
 ) -> Option<Vec<ChatMessage>> {
-    let config = ctx.state.config();
     let final_messages = {
         let sessions = ctx.state.sessions.lock().await;
         sessions
@@ -840,13 +830,6 @@ async fn send_before_analyze_events(
             .map(|session| session.messages.clone())
             .unwrap_or_default()
     };
-    let final_context_estimate =
-        estimate_tokens_for_provider(config.resolve_model(model).provider, &final_messages);
-    for event in &mut hook_events {
-        if event["type"] == "context_compressed" {
-            event["after_estimate"] = json!(final_context_estimate);
-        }
-    }
 
     for event in hook_events {
         if !live_send(ctx.live_tx, event).await {
@@ -2317,8 +2300,24 @@ async fn run_analyze_phase(
     };
     let extra_tools = build_cycle_tools(ctx, phase_state, &resolved).await;
 
-    // Run BeforeAnalyze hooks (including auto-compress) BEFORE the fine prune
-    // so compression can preserve context that would otherwise be hard-deleted.
+    let request_budget = crate::context::context_input_budget_for_runtime(
+        &config,
+        &snapshot.model,
+        &effective_think,
+    );
+    let compression_context = Some(hooks::CompressionContextSections {
+        task_state: agent::render_task_state_for_prompt(&phase_state.working_state),
+        observation_hint: phase_state.last_observation_hint.clone(),
+        task_memory: phase_state
+            .retrieved_task_memory
+            .as_ref()
+            .and_then(|selection| {
+                memory::format_task_memory_for_prompt(selection, phase_state.working_state.intent)
+            }),
+    });
+
+    // Run BeforeAnalyze hooks (including auto-compress) before any destructive
+    // request-budget pruning so compression can preserve older history first.
     let before_analyze_events = run_hooks(
         &ctx.state.hooks,
         agent::HookPoint::BeforeAnalyze,
@@ -2327,6 +2326,9 @@ async fn run_analyze_phase(
         &config,
         &ctx.state.http,
         phase_state.react_ctx.cycles,
+        compression_context,
+        Some(request_budget),
+        Some(extra_tools.clone()),
     )
     .await;
 
@@ -2341,7 +2343,6 @@ async fn run_analyze_phase(
 
     let final_msgs_snapshot = match send_before_analyze_events(
         ctx,
-        &snapshot.model,
         before_analyze_events,
         total_pruned_count,
     )
@@ -2892,6 +2893,9 @@ async fn run_observe_phase(
         &config,
         &ctx.state.http,
         phase_state.react_ctx.cycles,
+        None,
+        None,
+        None,
     )
     .await;
 
@@ -2928,6 +2932,9 @@ async fn run_finish_phase(
         &config,
         &ctx.state.http,
         phase_state.react_ctx.cycles,
+        None,
+        None,
+        None,
     )
     .await;
 

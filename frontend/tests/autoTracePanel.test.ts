@@ -2,8 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   applyAutoTrace,
+  applyCompressionOutcome,
   applyTopLevelAutoTrace,
   clearActiveAutoTrace,
+  clearCompressionOutcome,
+  clearCompressionOutcomeForNewAnalyzeCycle,
+  clearCompressionOutcomeForNewRound,
   setAutoDebugEnabled,
   updateAutoDebugToggleButton,
 } from '../src/renderers/auto-trace.js';
@@ -67,6 +71,7 @@ describe('auto trace debug panel', () => {
     clearActiveAutoTrace();
     state.autoDebugEnabled = false;
     state.latestAutoTrace = null;
+    state.latestCompression = null;
     state.autoDebugRow = null;
     document.body.innerHTML = '';
     dom.chat = null;
@@ -80,6 +85,84 @@ describe('auto trace debug panel', () => {
     expect(state.autoDebugRow).toBeNull();
     expect(document.querySelector('[data-auto-trace-panel="true"]')).toBeNull();
     expect(dom.toggleAutoDebugBtn?.textContent).toBe('Auto Debug: Off');
+  });
+
+  it('clears the compression outcome when explicitly reset', () => {
+    applyCompressionOutcome({
+      outcome: 'compressed',
+      saved_tokens: 1024,
+      saved_percent: 18,
+    });
+    clearCompressionOutcome();
+    applyAutoTrace(sampleTrace());
+    setAutoDebugEnabled(true);
+
+    const panel = document.querySelector('[data-auto-trace-panel="true"]');
+    expect(panel?.textContent).not.toContain('compression=');
+  });
+
+  it('keeps failed compression state available to the next trace until cleared', () => {
+    applyCompressionOutcome({
+      outcome: 'failed',
+      reason: 'network timeout',
+    });
+    applyAutoTrace(sampleTrace());
+    setAutoDebugEnabled(true);
+
+    const panel = document.querySelector('[data-auto-trace-panel="true"]');
+    expect(panel?.textContent).toContain('compression=failed reason=network timeout');
+  });
+
+  it('ignores context_pruned for auto debug compression state', () => {
+    applyCompressionOutcome({
+      outcome: 'compressed',
+      saved_tokens: 1024,
+      saved_percent: 18,
+    });
+    applyAutoTrace(sampleTrace());
+    setAutoDebugEnabled(true);
+
+    const panel = document.querySelector('[data-auto-trace-panel="true"]');
+    expect(panel?.textContent).toContain('compression=compressed saved_tokens=1024 saved_percent=18');
+  });
+
+  it('keeps the latest compression outcome through start-of-round trace clearing', () => {
+    applyCompressionOutcome({
+      outcome: 'compressed',
+      saved_tokens: 1024,
+      saved_percent: 18,
+    });
+    clearActiveAutoTrace();
+    applyAutoTrace(sampleTrace());
+    setAutoDebugEnabled(true);
+
+    const panel = document.querySelector('[data-auto-trace-panel="true"]');
+    expect(panel?.textContent).toContain('compression=compressed saved_tokens=1024 saved_percent=18');
+  });
+
+  it('renders the latest compression outcome alongside the trace', () => {
+    applyCompressionOutcome({
+      outcome: 'compressed',
+      saved_tokens: 1024,
+      saved_percent: 18,
+    });
+    applyAutoTrace(sampleTrace());
+    setAutoDebugEnabled(true);
+
+    const panel = document.querySelector('[data-auto-trace-panel="true"]');
+    expect(panel?.textContent).toContain('compression=compressed saved_tokens=1024 saved_percent=18');
+  });
+
+  it('keeps the latest compression outcome when a trace arrives later', () => {
+    applyCompressionOutcome({
+      outcome: 'skipped',
+      reason: 'insufficient_savings',
+    });
+    applyAutoTrace(sampleTrace());
+    setAutoDebugEnabled(true);
+
+    const panel = document.querySelector('[data-auto-trace-panel="true"]');
+    expect(panel?.textContent).toContain('compression=skipped reason=insufficient_savings');
   });
 
   it('renders the cached trace when the local debug toggle is enabled', () => {
@@ -109,6 +192,70 @@ describe('auto trace debug panel', () => {
     expect(panels).toHaveLength(1);
     expect(panels[0].textContent).toContain('selected=xhigh');
     expect(panels[0].textContent).toContain('retry_same_args');
+  });
+
+  it('clears stale compression at start when react updates are disabled', () => {
+    applyCompressionOutcome({
+      outcome: 'compressed',
+      saved_tokens: 1024,
+      saved_percent: 18,
+    });
+    applyAutoTrace(sampleTrace({ cycle: 4 }));
+    clearCompressionOutcomeForNewRound(5);
+    clearActiveAutoTrace();
+    applyAutoTrace(sampleTrace({ cycle: 5 }));
+    setAutoDebugEnabled(true);
+
+    const panel = document.querySelector('[data-auto-trace-panel="true"]');
+    expect(state.latestCompression).toBeNull();
+    expect(panel?.textContent).not.toContain('compression=');
+  });
+
+  it('does not carry stale compression into a newer trace cycle without react phase updates', () => {
+    applyCompressionOutcome({
+      outcome: 'compressed',
+      saved_tokens: 1024,
+      saved_percent: 18,
+    });
+    applyAutoTrace(sampleTrace({ cycle: 4 }));
+    applyAutoTrace(sampleTrace({ cycle: 5 }));
+    setAutoDebugEnabled(true);
+
+    const panel = document.querySelector('[data-auto-trace-panel="true"]');
+    expect(state.latestCompression).toBeNull();
+    expect(panel?.textContent).not.toContain('compression=');
+  });
+
+  it('clears stale compression when a newer analyze cycle begins', () => {
+    applyCompressionOutcome({
+      outcome: 'compressed',
+      saved_tokens: 1024,
+      saved_percent: 18,
+    });
+    applyAutoTrace(sampleTrace({ cycle: 4 }));
+    clearCompressionOutcomeForNewAnalyzeCycle(5);
+    applyAutoTrace(sampleTrace({ cycle: 5 }));
+    setAutoDebugEnabled(true);
+
+    const panel = document.querySelector('[data-auto-trace-panel="true"]');
+    expect(state.latestCompression).toBeNull();
+    expect(panel?.textContent).not.toContain('compression=');
+  });
+
+  it('keeps compression within the same analyze cycle', () => {
+    applyCompressionOutcome({
+      outcome: 'compressed',
+      saved_tokens: 1024,
+      saved_percent: 18,
+    });
+    applyAutoTrace(sampleTrace({ cycle: 4 }));
+    clearCompressionOutcomeForNewAnalyzeCycle(4);
+    applyAutoTrace(sampleTrace({ cycle: 4, selected_think: 'xhigh' }));
+    setAutoDebugEnabled(true);
+
+    const panel = document.querySelector('[data-auto-trace-panel="true"]');
+    expect(state.latestCompression?.outcome).toBe('compressed');
+    expect(panel?.textContent).toContain('compression=compressed saved_tokens=1024 saved_percent=18');
   });
 
   it('ignores sub-agent traces for the top-level debug panel', () => {

@@ -496,6 +496,574 @@ async fn status_command_uses_runtime_auto_policy_for_idle_auto_sessions() {
 }
 
 #[tokio::test]
+async fn status_command_reports_compression_recorded_before_start_event() {
+    let workspace = unique_temp_workspace("lingclaw-command-status-compression-prestart");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai".to_string(),
+        crate::config::JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "openai-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![crate::config::JsonModelEntry {
+                id: "gpt-4o-reasoner".to_string(),
+                name: None,
+                reasoning: Some(true),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+
+    let state = AppState {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
+            api_key: "env-key".to_string(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            model: "openai/gpt-4o-reasoner".to_string(),
+            fast_model: None,
+            sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
+            memory_model: None,
+            reflection_model: None,
+            context_model: None,
+            provider: crate::Provider::OpenAI,
+            anthropic_prompt_caching: false,
+            providers,
+            mcp_servers: HashMap::new(),
+            port: crate::DEFAULT_PORT,
+            max_context_tokens: 32000,
+            exec_timeout: Duration::from_secs(30),
+            tool_timeout: Duration::from_secs(30),
+            sub_agent_timeout: Duration::from_secs(300),
+            max_llm_retries: 2,
+            max_output_bytes: 50 * 1024,
+            max_file_bytes: 200 * 1024,
+            openai_stream_include_usage: false,
+            structured_memory: false,
+            daily_reflection: false,
+            s3: None,
+            enable_state_digest: true,
+        })),
+        http: reqwest::Client::new(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+        memory_queue: std::sync::Mutex::new(None),
+    };
+
+    let mut session = Session {
+        id: "status-compression-prestart".to_string(),
+        name: "Status Compression Prestart".to_string(),
+        messages: Vec::new(),
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: "estimated".to_string(),
+        output_token_source: "estimated".to_string(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: Some("openai/gpt-4o-reasoner".to_string()),
+        think_level: "auto".to_string(),
+        show_react: true,
+        show_tools: true,
+        show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
+        version: 4,
+        workspace: workspace.clone(),
+    };
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
+    session.messages.push(build_system_prompt(
+        &config,
+        &workspace,
+        &model,
+        &session.disabled_system_skills,
+    ));
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.id.clone(), session);
+
+    state.live_rounds.lock().await.insert(
+        "status-compression-prestart".to_string(),
+        crate::LiveRoundState {
+            cycle: Some(0),
+            effective_model: Some("openai/gpt-4o-reasoner".to_string()),
+            effective_think: Some("medium".to_string()),
+            latest_compression: crate::LiveCompressionState {
+                outcome: Some("skipped".to_string()),
+                reason: Some("insufficient_savings".to_string()),
+                messages_removed: None,
+                before_estimate: None,
+                after_estimate: None,
+                saved_tokens: None,
+                saved_percent: None,
+                pruned_messages_removed: None,
+            },
+            ..Default::default()
+        },
+    );
+
+    let result = handle_status_command("status-compression-prestart", &state).await;
+
+    assert_eq!(result.response_type, "system");
+    assert!(result.response.contains("compression: skipped reason=insufficient_savings"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn status_command_reports_prune_only_state() {
+    let workspace = unique_temp_workspace("lingclaw-command-status-prune-only");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai".to_string(),
+        crate::config::JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "openai-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![crate::config::JsonModelEntry {
+                id: "gpt-4o-reasoner".to_string(),
+                name: None,
+                reasoning: Some(true),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+
+    let state = AppState {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
+            api_key: "env-key".to_string(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            model: "openai/gpt-4o-reasoner".to_string(),
+            fast_model: None,
+            sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
+            memory_model: None,
+            reflection_model: None,
+            context_model: None,
+            provider: crate::Provider::OpenAI,
+            anthropic_prompt_caching: false,
+            providers,
+            mcp_servers: HashMap::new(),
+            port: crate::DEFAULT_PORT,
+            max_context_tokens: 32000,
+            exec_timeout: Duration::from_secs(30),
+            tool_timeout: Duration::from_secs(30),
+            sub_agent_timeout: Duration::from_secs(300),
+            max_llm_retries: 2,
+            max_output_bytes: 50 * 1024,
+            max_file_bytes: 200 * 1024,
+            openai_stream_include_usage: false,
+            structured_memory: false,
+            daily_reflection: false,
+            s3: None,
+            enable_state_digest: true,
+        })),
+        http: reqwest::Client::new(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+        memory_queue: std::sync::Mutex::new(None),
+    };
+
+    let mut session = Session {
+        id: "status-prune-only".to_string(),
+        name: "Status Prune Only".to_string(),
+        messages: Vec::new(),
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: "estimated".to_string(),
+        output_token_source: "estimated".to_string(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: Some("openai/gpt-4o-reasoner".to_string()),
+        think_level: "auto".to_string(),
+        show_react: true,
+        show_tools: true,
+        show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
+        version: 4,
+        workspace: workspace.clone(),
+    };
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
+    session.messages.push(build_system_prompt(
+        &config,
+        &workspace,
+        &model,
+        &session.disabled_system_skills,
+    ));
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.id.clone(), session);
+
+    state.live_rounds.lock().await.insert(
+        "status-prune-only".to_string(),
+        crate::LiveRoundState {
+            cycle: Some(5),
+            effective_model: Some("openai/gpt-4o-reasoner".to_string()),
+            effective_think: Some("high".to_string()),
+            latest_compression: crate::LiveCompressionState {
+                pruned_messages_removed: Some(3),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+
+    let result = handle_status_command("status-prune-only", &state).await;
+
+    assert_eq!(result.response_type, "system");
+    assert!(result.response.contains("pruned: removed 3 additional message(s) to fit request budget"));
+    assert!(!result.response.contains("compression:"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn status_command_reports_replayed_compression_outcome_after_reconnect() {
+    let workspace = unique_temp_workspace("lingclaw-command-status-compression-replay");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai".to_string(),
+        crate::config::JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "openai-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![crate::config::JsonModelEntry {
+                id: "gpt-4o-reasoner".to_string(),
+                name: None,
+                reasoning: Some(true),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+
+    let state = AppState {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
+            api_key: "env-key".to_string(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            model: "openai/gpt-4o-reasoner".to_string(),
+            fast_model: None,
+            sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
+            memory_model: None,
+            reflection_model: None,
+            context_model: None,
+            provider: crate::Provider::OpenAI,
+            anthropic_prompt_caching: false,
+            providers,
+            mcp_servers: HashMap::new(),
+            port: crate::DEFAULT_PORT,
+            max_context_tokens: 32000,
+            exec_timeout: Duration::from_secs(30),
+            tool_timeout: Duration::from_secs(30),
+            sub_agent_timeout: Duration::from_secs(300),
+            max_llm_retries: 2,
+            max_output_bytes: 50 * 1024,
+            max_file_bytes: 200 * 1024,
+            openai_stream_include_usage: false,
+            structured_memory: false,
+            daily_reflection: false,
+            s3: None,
+            enable_state_digest: true,
+        })),
+        http: reqwest::Client::new(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+        memory_queue: std::sync::Mutex::new(None),
+    };
+
+    let mut session = Session {
+        id: "status-compression-replay".to_string(),
+        name: "Status Compression Replay".to_string(),
+        messages: Vec::new(),
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: "estimated".to_string(),
+        output_token_source: "estimated".to_string(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: Some("openai/gpt-4o-reasoner".to_string()),
+        think_level: "auto".to_string(),
+        show_react: true,
+        show_tools: true,
+        show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
+        version: 4,
+        workspace: workspace.clone(),
+    };
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
+    session.messages.push(build_system_prompt(
+        &config,
+        &workspace,
+        &model,
+        &session.disabled_system_skills,
+    ));
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.id.clone(), session);
+
+    state.live_rounds.lock().await.insert(
+        "status-compression-replay".to_string(),
+        crate::LiveRoundState {
+            cycle: Some(0),
+            effective_model: Some("openai/gpt-4o-reasoner".to_string()),
+            effective_think: Some("medium".to_string()),
+            latest_compression: crate::LiveCompressionState {
+                outcome: Some("compressed".to_string()),
+                reason: None,
+                messages_removed: Some(2),
+                before_estimate: Some(4096),
+                after_estimate: Some(3072),
+                saved_tokens: Some(512),
+                saved_percent: Some(12),
+                pruned_messages_removed: None,
+            },
+            has_observation: false,
+            ..Default::default()
+        },
+    );
+
+    let result = handle_status_command("status-compression-replay", &state).await;
+
+    assert_eq!(result.response_type, "system");
+    assert!(result.response.contains("compression: compressed saved_tokens=512 saved_percent=12"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn status_command_reports_latest_compression_outcome() {
+    let workspace = unique_temp_workspace("lingclaw-command-status-compression");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai".to_string(),
+        crate::config::JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "openai-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![crate::config::JsonModelEntry {
+                id: "gpt-4o-reasoner".to_string(),
+                name: None,
+                reasoning: Some(true),
+                input: None,
+                cost: None,
+                context_window: Some(128000),
+                max_tokens: Some(8192),
+                compat: None,
+            }],
+        },
+    );
+
+    let state = AppState {
+        config: std::sync::Mutex::new(Arc::new(crate::Config {
+            api_key: "env-key".to_string(),
+            api_base: "https://api.openai.com/v1".to_string(),
+            model: "openai/gpt-4o-reasoner".to_string(),
+            fast_model: None,
+            sub_agent_model: None,
+            sub_agent_model_overrides: Default::default(),
+            memory_model: None,
+            reflection_model: None,
+            context_model: None,
+            provider: crate::Provider::OpenAI,
+            anthropic_prompt_caching: false,
+            providers,
+            mcp_servers: HashMap::new(),
+            port: crate::DEFAULT_PORT,
+            max_context_tokens: 32000,
+            exec_timeout: Duration::from_secs(30),
+            tool_timeout: Duration::from_secs(30),
+            sub_agent_timeout: Duration::from_secs(300),
+            max_llm_retries: 2,
+            max_output_bytes: 50 * 1024,
+            max_file_bytes: 200 * 1024,
+            openai_stream_include_usage: false,
+            structured_memory: false,
+            daily_reflection: false,
+            s3: None,
+            enable_state_digest: true,
+        })),
+        http: reqwest::Client::new(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+        memory_queue: std::sync::Mutex::new(None),
+    };
+
+    let mut session = Session {
+        id: "status-compression".to_string(),
+        name: "Status Compression".to_string(),
+        messages: Vec::new(),
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: "estimated".to_string(),
+        output_token_source: "estimated".to_string(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: Some("openai/gpt-4o-reasoner".to_string()),
+        think_level: "auto".to_string(),
+        show_react: true,
+        show_tools: true,
+        show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
+        version: 4,
+        workspace: workspace.clone(),
+    };
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
+    session.messages.push(build_system_prompt(
+        &config,
+        &workspace,
+        &model,
+        &session.disabled_system_skills,
+    ));
+
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session.id.clone(), session);
+    state.live_rounds.lock().await.insert(
+        "status-compression".to_string(),
+        crate::LiveRoundState {
+            cycle: Some(2),
+            effective_model: Some("openai/gpt-4o-reasoner".to_string()),
+            effective_think: Some("high".to_string()),
+            latest_compression: crate::LiveCompressionState {
+                outcome: Some("compressed".to_string()),
+                reason: None,
+                messages_removed: Some(4),
+                before_estimate: Some(5000),
+                after_estimate: Some(4000),
+                saved_tokens: Some(1024),
+                saved_percent: Some(18),
+                pruned_messages_removed: None,
+            },
+            ..Default::default()
+        },
+    );
+
+    let result = handle_status_command("status-compression", &state).await;
+
+    assert_eq!(result.response_type, "system");
+    assert!(result.response.contains("compression: compressed saved_tokens=1024 saved_percent=18"));
+
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
 async fn status_command_prefers_live_round_effective_think() {
     let workspace = unique_temp_workspace("lingclaw-command-status-auto");
     let _ = tokio::fs::remove_dir_all(&workspace).await;

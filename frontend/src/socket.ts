@@ -1,7 +1,7 @@
 import { state, dom } from './state.js';
 import { MAX_RECONNECT_ATTEMPTS } from './constants.js';
 import { addSystem, setBusy } from './renderers/chat.js';
-import { clearActiveAutoTrace } from './renderers/auto-trace.js';
+import { clearActiveAutoTrace, clearCompressionOutcome } from './renderers/auto-trace.js';
 import { clearReactStatus } from './renderers/react-status.js';
 import { closeToolDrawer } from './renderers/tools.js';
 import { finishAssistantStream, finishReasoningStream } from './handlers/stream.js';
@@ -41,6 +41,7 @@ export function connect(onMessage) {
     finishReasoningStream();
     closeToolDrawer();
     clearReactStatus();
+    clearCompressionOutcome();
     clearActiveAutoTrace();
     state.reasoningPanel = null;
     setBusy(false);

@@ -79,6 +79,89 @@ struct ThinkOverrideHook {
     new_level: String,
 }
 
+struct ForceCompressionHook;
+
+impl crate::hooks::AgentHook for ForceCompressionHook {
+    fn name(&self) -> &'static str {
+        "force_compression"
+    }
+
+    fn point(&self) -> agent::HookPoint {
+        agent::HookPoint::BeforeAnalyze
+    }
+
+    fn should_run(&self, _: &[ChatMessage], _: Provider, _: usize, _: usize) -> bool {
+        true
+    }
+
+    fn run<'a>(
+        &'a self,
+        input: crate::hooks::HookInput,
+        _: &'a Config,
+        _: &'a reqwest::Client,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::hooks::HookOutput> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let messages = crate::build_compressed_messages(&input.messages, 3, "forced summary");
+            crate::hooks::HookOutput::ReplaceMessages {
+                messages,
+                events: vec![crate::hooks::build_context_compressed_event(
+                    2,
+                    10_000,
+                    4_000,
+                    320,
+                    false,
+                )],
+                usage: None,
+            }
+        })
+    }
+}
+
+struct ForceCompressionSkippedHook;
+
+impl crate::hooks::AgentHook for ForceCompressionSkippedHook {
+    fn name(&self) -> &'static str {
+        "force_compression_skipped"
+    }
+
+    fn point(&self) -> agent::HookPoint {
+        agent::HookPoint::BeforeAnalyze
+    }
+
+    fn should_run(&self, _: &[ChatMessage], _: Provider, _: usize, _: usize) -> bool {
+        true
+    }
+
+    fn run<'a>(
+        &'a self,
+        _: crate::hooks::HookInput,
+        _: &'a Config,
+        _: &'a reqwest::Client,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::hooks::HookOutput> + Send + 'a>>
+    {
+        Box::pin(async move {
+            crate::hooks::HookOutput::EmitEvents {
+                events: vec![crate::hooks::build_context_compress_skipped_event(
+                    "insufficient_savings",
+                )],
+                usage: Some(crate::context::UsageUpdate {
+                    input_tokens: 123,
+                    output_tokens: 45,
+                    input_source: "provider".to_string(),
+                    output_source: "provider".to_string(),
+                    labels: crate::context::build_usage_labels(
+                        123,
+                        45,
+                        Some("openai"),
+                        Some(crate::context::USAGE_ROLE_CONTEXT),
+                    ),
+                }),
+            }
+        })
+    }
+}
+
 impl crate::hooks::AgentHook for ThinkOverrideHook {
     fn name(&self) -> &'static str {
         "test_think_override"
@@ -1250,6 +1333,342 @@ async fn run_analyze_phase_skips_auto_trace_for_unsupported_models() {
     assert_eq!(first["type"].as_str(), Some("start"));
     assert_ne!(second["type"].as_str(), Some("auto_trace"));
     assert_eq!(first["think_level"].as_str(), Some("off"));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn prepare_analyze_snapshot_preserves_messages_for_before_analyze_compression() {
+    let state = Arc::new(test_app_state());
+    let session_id = "snapshot-preserves-history".to_string();
+    let workspace = temp_workspace("snapshot-preserves-history");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.workspace = workspace.clone();
+    for idx in 0..18 {
+        session.messages.push(ChatMessage {
+            role: "user".into(),
+            content: Some(format!("old question {idx} {}", "A".repeat(400))),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        });
+        session.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: Some(format!("old answer {idx} {}", "B".repeat(400))),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        });
+    }
+    let original_len = session.messages.len();
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state
+        .working_state
+        .seed_from_query(Some("compress the old conversation"));
+
+    let snapshot = prepare_analyze_snapshot(&ctx, &mut phase_state)
+        .await
+        .expect("snapshot should be prepared");
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions.get(&session_id).expect("session should exist");
+    assert_eq!(session.messages.len(), original_len);
+    assert_eq!(snapshot.pruned_count, 0);
+    assert!(crate::hooks::find_auto_compress_cutoff(&session.messages, 8).is_some());
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_analyze_phase_emits_context_compress_skipped_for_low_savings() {
+    let mut hooks = HookRegistry::new();
+    hooks.register(Box::new(ForceCompressionSkippedHook));
+
+    let state = Arc::new(test_app_state_with_hooks(hooks));
+    install_openai_model(&state, "gpt-4o-reasoner", true);
+
+    let session_id = "context-compress-skipped".to_string();
+    let workspace = temp_workspace("context-compress-skipped");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut session = test_session(&session_id, "Main", Some("openai/gpt-4o-reasoner"));
+    session.workspace = workspace.clone();
+    for idx in 0..14 {
+        session.messages.push(ChatMessage {
+            role: "user".into(),
+            content: Some(format!("investigation turn {idx} {}", "C".repeat(900))),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        });
+        session.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: Some(format!("analysis turn {idx} {}", "D".repeat(900))),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        });
+    }
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.working_state.seed_from_query(Some(
+        "investigate the timeout loop and explain the blockers",
+    ));
+
+    let control = run_analyze_phase(&ctx, &mut phase_state).await;
+    assert!(matches!(control, AgentPhaseControl::Break));
+
+    let first = live_rx.recv().await.expect("first event should be emitted");
+    assert_eq!(first["type"].as_str(), Some("context_compress_skipped"));
+    assert_eq!(first["reason"].as_str(), Some("insufficient_savings"));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_hooks_skips_replace_messages_when_compression_saves_nothing() {
+    let state = Arc::new(test_app_state());
+    let session_id = "context-compress-no-savings".to_string();
+    let workspace = temp_workspace("context-compress-no-savings");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut session = test_session(&session_id, "Main", Some("openai/gpt-4o-reasoner"));
+    session.workspace = workspace.clone();
+    for idx in 0..14 {
+        session.messages.push(ChatMessage {
+            role: "user".into(),
+            content: Some(format!("investigation turn {idx} {}", "C".repeat(900))),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        });
+        session.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: Some(format!("analysis turn {idx} {}", "D".repeat(900))),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        });
+    }
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session.clone());
+    }
+
+    let before_messages = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .expect("session should exist")
+            .messages
+            .clone()
+    };
+    let input_budget = 1;
+    let input = crate::hooks::HookInput {
+        messages: before_messages.clone(),
+        model: "openai/gpt-4o-mini".into(),
+        provider: Provider::OpenAI,
+        workspace: workspace.clone(),
+        input_budget,
+        request_budget: None,
+        compression_extra_tools: None,
+        cycle: 0,
+        compression_context: None,
+    };
+
+    let should_compress = crate::hooks::should_auto_compress(&input, 8, 90);
+    assert!(should_compress);
+    assert!(!crate::hooks::compression_saves_enough(10_000, 9_900));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn emit_events_usage_updates_session_tokens_for_skipped_compression() {
+    let session_id = "context-compress-skipped-usage".to_string();
+    let workspace = temp_workspace("context-compress-skipped-usage");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let state = Arc::new(test_app_state());
+    let mut session = test_session(&session_id, "Main", Some("openai/gpt-4o-reasoner"));
+    session.workspace = workspace.clone();
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let mut hooks = HookRegistry::new();
+    hooks.register(Box::new(ForceCompressionSkippedHook));
+    let events = run_hooks(
+        &hooks,
+        agent::HookPoint::BeforeAnalyze,
+        &state.sessions,
+        &session_id,
+        &state.config(),
+        &state.http,
+        0,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["type"].as_str(), Some("context_compress_skipped"));
+
+    let sessions = state.sessions.lock().await;
+    let persisted = sessions.get(&session_id).expect("session should exist");
+    assert_eq!(persisted.input_tokens, 123);
+    assert_eq!(persisted.output_tokens, 45);
+    assert_eq!(
+        persisted.daily_provider_usage[&crate::context::usage_provider_label("openai")],
+        [123, 45]
+    );
+    assert_eq!(
+        persisted.daily_provider_usage
+            [&crate::context::usage_role_label(crate::context::USAGE_ROLE_CONTEXT)],
+        [123, 45]
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_analyze_phase_emits_context_pruned_after_before_analyze_compression() {
+    let mut hooks = HookRegistry::new();
+    hooks.register(Box::new(ForceCompressionHook));
+
+    let state = Arc::new(test_app_state_with_hooks(hooks));
+    install_openai_model(&state, "gpt-4o-reasoner", true);
+
+    let session_id = "context-compress-before-prune".to_string();
+    let workspace = temp_workspace("context-compress-before-prune");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut session = test_session(&session_id, "Main", Some("openai/gpt-4o-reasoner"));
+    session.workspace = workspace.clone();
+    for idx in 0..14 {
+        session.messages.push(ChatMessage {
+            role: "user".into(),
+            content: Some(format!("investigation turn {idx} {}", "C".repeat(900))),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        });
+        session.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: Some(format!("analysis turn {idx} {}", "D".repeat(900))),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        });
+    }
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.working_state.seed_from_query(Some(
+        "investigate the timeout loop and explain the blockers",
+    ));
+
+    let control = run_analyze_phase(&ctx, &mut phase_state).await;
+    assert!(matches!(control, AgentPhaseControl::Break));
+
+    let compressed = live_rx
+        .recv()
+        .await
+        .expect("compression event should be emitted");
+    let pruned = live_rx.recv().await.expect("prune event should be emitted");
+    let start = live_rx.recv().await.expect("start event should be emitted");
+    let auto_trace = live_rx.recv().await.expect("auto trace should be emitted");
+    let error = live_rx.recv().await.expect("budget error should stop the round");
+
+    assert_eq!(compressed["type"].as_str(), Some("context_compressed"));
+    assert_eq!(compressed["before_estimate"].as_u64(), Some(10_000));
+    assert_eq!(compressed["after_estimate"].as_u64(), Some(4_000));
+    assert_eq!(compressed["saved_tokens"].as_u64(), Some(6_000));
+    assert_eq!(compressed["saved_percent"].as_u64(), Some(60));
+    assert!(compressed["compression_ratio"].as_u64().is_some());
+    assert_eq!(pruned["type"].as_str(), Some("context_pruned"));
+    assert_eq!(start["type"].as_str(), Some("start"));
+    assert_eq!(auto_trace["type"].as_str(), Some("auto_trace"));
+    assert!(pruned["messages_removed"].as_u64().unwrap_or(0) > 0);
+    assert_eq!(error["type"].as_str(), Some("error"));
 
     let _ = std::fs::remove_dir_all(&workspace);
 }

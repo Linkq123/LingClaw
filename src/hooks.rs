@@ -9,7 +9,8 @@ use crate::{
     config::{Config, Provider},
     context::{
         USAGE_ROLE_CONTEXT, UsageUpdate, apply_usage_update, build_usage_labels,
-        context_input_budget_for_model, estimate_tokens_for_provider, turn_len,
+        context_input_budget_for_model, estimate_request_tokens_for_provider,
+        estimate_tokens_for_provider, turn_len,
     },
     providers,
     session_store::replace_session_messages,
@@ -18,15 +19,27 @@ use crate::{
 
 // ── Hook Infrastructure ──────────────────────────────────────────────────────
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CompressionContextSections {
+    pub(crate) task_state: Option<String>,
+    pub(crate) observation_hint: Option<String>,
+    pub(crate) task_memory: Option<String>,
+}
+
 /// Owned snapshot of session state for hook execution (lock-free).
 #[allow(dead_code)]
+#[derive(Clone, Debug)]
 pub(crate) struct HookInput {
     pub(crate) messages: Vec<ChatMessage>,
     pub(crate) model: String,
     pub(crate) provider: Provider,
     pub(crate) workspace: PathBuf,
     pub(crate) input_budget: usize,
+    pub(crate) request_budget: Option<usize>,
+    pub(crate) compression_extra_tools: Option<Vec<serde_json::Value>>,
     pub(crate) cycle: usize,
+    pub(crate) compression_context: Option<CompressionContextSections>,
 }
 
 /// Mutations a hook can request.
@@ -37,6 +50,11 @@ pub(crate) enum HookOutput {
     /// Replace session messages and optionally emit frontend events.
     ReplaceMessages {
         messages: Vec<ChatMessage>,
+        events: Vec<serde_json::Value>,
+        usage: Option<UsageUpdate>,
+    },
+    /// Skip applying a hook result but still emit frontend events.
+    EmitEvents {
         events: Vec<serde_json::Value>,
         usage: Option<UsageUpdate>,
     },
@@ -111,6 +129,18 @@ pub(crate) trait AgentHook: Send + Sync {
         input_budget: usize,
         cycle: usize,
     ) -> bool;
+
+    /// Full-input eligibility check for hooks that need more than the legacy
+    /// `should_run` parameters. Defaults to the legacy method so existing hooks
+    /// do not need to change.
+    fn should_run_with_input(&self, input: &HookInput) -> bool {
+        self.should_run(
+            &input.messages,
+            input.provider,
+            input.input_budget,
+            input.cycle,
+        )
+    }
 
     /// Execute the hook asynchronously. Called WITHOUT session lock.
     fn run<'a>(
@@ -197,6 +227,16 @@ const AUTO_COMPRESS_THRESHOLD_PERCENT: usize = 90;
 const AUTO_COMPRESS_KEEP_RECENT_TURNS: usize = 8;
 const AUTO_COMPRESS_INPUT_CHAR_LIMIT: usize = 60_000;
 const AUTO_COMPRESS_SUMMARY_CHAR_LIMIT: usize = 12_000;
+const AUTO_COMPRESS_MIN_SAVED_TOKENS: usize = 256;
+const AUTO_COMPRESS_MIN_SAVED_PERCENT: usize = 10;
+
+fn compression_system_content(has_previous_summary: bool) -> &'static str {
+    if has_previous_summary {
+        "You compress older conversation context for an AI coding assistant so the agent can keep working without losing actionable state.\n\nYou are given a previous summary and new conversation turns. Merge them into a single updated summary, preserving all still-relevant information from the previous summary and incorporating new details.\n\nProduce a single concise markdown summary with the following sections, in this order, omitting any section that has no content:\n- User goal & constraints: the user's current objective and any hard requirements, scope limits, language, or style rules they set.\n- Files & components touched: repository paths, functions, modules, or external systems involved. Preserve exact paths when mentioned.\n- Key findings: important facts surfaced by tools (search/read/run output) that the agent will need later. Prefer precise quotes or exact identifiers over paraphrase.\n- Decisions & rationale: design choices already made and why, including any approaches the user explicitly approved or rejected.\n- Failed attempts & blockers: what has been tried, why it failed, and any errors/warnings that remain unresolved.\n- Open issues / next steps: work still pending or the immediate next action the agent was about to take.\n\nHard rules:\n- Keep it factual and compact. No filler, no meta commentary (\"In summary...\"), no apologies.\n- Do not fabricate information that is not in the source text.\n- When merging, drop obsolete information from the previous summary that has been superseded by new conversation.\n- Preserve tool call IDs, error codes, and exact identifiers verbatim when they appear.\n- Do not wrap the output in code blocks.\n- Match the language of the source conversation."
+    } else {
+        "You compress older conversation context for an AI coding assistant so the agent can keep working without losing actionable state.\n\nProduce a single concise markdown summary with the following sections, in this order, omitting any section that has no content:\n- User goal & constraints: the user's current objective and any hard requirements, scope limits, language, or style rules they set.\n- Files & components touched: repository paths, functions, modules, or external systems involved. Preserve exact paths when mentioned.\n- Key findings: important facts surfaced by tools (search/read/run output) that the agent will need later. Prefer precise quotes or exact identifiers over paraphrase.\n- Decisions & rationale: design choices already made and why, including any approaches the user explicitly approved or rejected.\n- Failed attempts & blockers: what has been tried, why it failed, and any errors/warnings that remain unresolved.\n- Open issues / next steps: work still pending or the immediate next action the agent was about to take.\n\nHard rules:\n- Keep it factual and compact. No filler, no meta commentary (\"In summary...\"), no apologies.\n- Do not fabricate information that is not in the source text.\n- Preserve tool call IDs, error codes, and exact identifiers verbatim when they appear.\n- Do not wrap the output in code blocks.\n- Match the language of the source conversation."
+    }
+}
 
 pub(crate) fn find_auto_compress_cutoff(
     messages: &[ChatMessage],
@@ -222,7 +262,7 @@ pub(crate) fn find_auto_compress_cutoff(
 }
 
 /// Extract the existing auto-generated summary from messages, if any.
-fn extract_existing_summary(messages: &[ChatMessage]) -> Option<&str> {
+pub(crate) fn extract_existing_summary(messages: &[ChatMessage]) -> Option<&str> {
     messages.iter().find_map(|msg| {
         msg.content
             .as_deref()
@@ -230,8 +270,30 @@ fn extract_existing_summary(messages: &[ChatMessage]) -> Option<&str> {
     })
 }
 
-pub(crate) fn build_compression_source_text(messages: &[ChatMessage]) -> String {
+pub(crate) fn build_compression_source_text_with_context(
+    messages: &[ChatMessage],
+    context: Option<&CompressionContextSections>,
+) -> String {
     let mut lines = Vec::new();
+    if let Some(context) = context {
+        if let Some(task_state) = context.task_state.as_deref().filter(|value| !value.is_empty()) {
+            lines.push(task_state.to_string());
+        }
+        if let Some(observation_hint) = context
+            .observation_hint
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            lines.push(observation_hint.to_string());
+        }
+        if let Some(task_memory) = context
+            .task_memory
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            lines.push(task_memory.to_string());
+        }
+    }
     for msg in messages {
         match msg.role.as_str() {
             "user" => {
@@ -289,6 +351,73 @@ pub(crate) fn build_compression_source_text(messages: &[ChatMessage]) -> String 
     truncate(&lines.join("\n"), AUTO_COMPRESS_INPUT_CHAR_LIMIT)
 }
 
+pub(crate) fn build_compression_source_text(messages: &[ChatMessage]) -> String {
+    build_compression_source_text_with_context(messages, None)
+}
+
+pub(crate) fn build_compression_call_prompt_with_context(
+    messages: &[ChatMessage],
+    context: Option<&CompressionContextSections>,
+) -> Option<Vec<ChatMessage>> {
+    let source_text = build_compression_source_text_with_context(messages, context);
+    if source_text.trim().is_empty() {
+        return None;
+    }
+
+    let existing_summary = extract_existing_summary(messages);
+    let user_content = if let Some(prev) = existing_summary {
+        format!("## Previous Summary\n{prev}\n\n## New Conversation To Merge\n{source_text}")
+    } else {
+        source_text
+    };
+
+    Some(vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some(compression_system_content(existing_summary.is_some()).into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some(user_content),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(crate::now_epoch()),
+        },
+    ])
+}
+
+pub(crate) fn build_compression_call_prompt(messages: &[ChatMessage]) -> Option<Vec<ChatMessage>> {
+    build_compression_call_prompt_with_context(messages, None)
+}
+
+pub(crate) fn estimate_summary_output_tokens(
+    provider: Provider,
+    summary_content: &str,
+) -> u64 {
+    estimate_tokens_for_provider(
+        provider,
+        &[ChatMessage {
+            role: "assistant".into(),
+            content: Some(summary_content.to_string()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        }],
+    ) as u64
+}
+
 pub(crate) fn build_auto_summary_message(summary: &str) -> ChatMessage {
     ChatMessage {
         role: "assistant".into(),
@@ -317,6 +446,25 @@ pub(crate) fn build_compressed_messages(
     out
 }
 
+pub(crate) fn apply_context_compressed_metrics(event: &mut serde_json::Value, before_estimate: usize, after_estimate: usize) {
+    let saved_tokens = before_estimate.saturating_sub(after_estimate);
+    let saved_percent = if before_estimate > 0 {
+        ((saved_tokens as f64) / (before_estimate as f64) * 100.0).round() as usize
+    } else {
+        0
+    };
+    let compression_ratio = if before_estimate > 0 {
+        ((after_estimate as f64) / (before_estimate as f64) * 100.0).round() as usize
+    } else {
+        100
+    };
+    event["before_estimate"] = json!(before_estimate);
+    event["after_estimate"] = json!(after_estimate);
+    event["saved_tokens"] = json!(saved_tokens);
+    event["saved_percent"] = json!(saved_percent);
+    event["compression_ratio"] = json!(compression_ratio);
+}
+
 pub(crate) fn build_context_compressed_event(
     removed_messages: usize,
     before_estimate: usize,
@@ -324,19 +472,20 @@ pub(crate) fn build_context_compressed_event(
     summary_tokens: usize,
     was_incremental: bool,
 ) -> serde_json::Value {
-    let compression_ratio = if before_estimate > 0 {
-        ((after_estimate as f64) / (before_estimate as f64) * 100.0).round() as usize
-    } else {
-        100
-    };
-    json!({
+    let mut event = json!({
         "type": "context_compressed",
         "messages_removed": removed_messages,
-        "before_estimate": before_estimate,
-        "after_estimate": after_estimate,
         "summary_tokens": summary_tokens,
-        "compression_ratio": compression_ratio,
         "incremental": was_incremental,
+    });
+    apply_context_compressed_metrics(&mut event, before_estimate, after_estimate);
+    event
+}
+
+pub(crate) fn build_context_compress_skipped_event(reason: &str) -> serde_json::Value {
+    json!({
+        "type": "context_compress_skipped",
+        "reason": reason,
     })
 }
 
@@ -352,6 +501,38 @@ impl AutoCompressContextHook {
             keep_recent_turns: AUTO_COMPRESS_KEEP_RECENT_TURNS,
         }
     }
+}
+
+pub(crate) fn compression_saves_enough(before_estimate: usize, after_estimate: usize) -> bool {
+    let saved = before_estimate.saturating_sub(after_estimate);
+    if saved < AUTO_COMPRESS_MIN_SAVED_TOKENS {
+        return false;
+    }
+    if before_estimate == 0 {
+        return false;
+    }
+    saved.saturating_mul(100) >= before_estimate.saturating_mul(AUTO_COMPRESS_MIN_SAVED_PERCENT)
+}
+
+pub(crate) fn should_auto_compress(
+    input: &HookInput,
+    keep_recent_turns: usize,
+    threshold_percent: usize,
+) -> bool {
+    if input.input_budget == 0 {
+        return false;
+    }
+    if find_auto_compress_cutoff(&input.messages, keep_recent_turns).is_none() {
+        return false;
+    }
+    if let Some(request_budget) = input.request_budget {
+        let extra_tools = input.compression_extra_tools.as_deref().unwrap_or(&[]);
+        return estimate_request_tokens_for_provider(input.provider, &input.messages, extra_tools)
+            .saturating_mul(100)
+            >= request_budget.saturating_mul(threshold_percent);
+    }
+    estimate_tokens_for_provider(input.provider, &input.messages).saturating_mul(100)
+        >= input.input_budget.saturating_mul(threshold_percent)
 }
 
 impl AgentHook for AutoCompressContextHook {
@@ -370,14 +551,22 @@ impl AgentHook for AutoCompressContextHook {
         input_budget: usize,
         _cycle: usize,
     ) -> bool {
-        if input_budget == 0 {
-            return false;
-        }
-        if find_auto_compress_cutoff(messages, self.keep_recent_turns).is_none() {
-            return false;
-        }
-        estimate_tokens_for_provider(provider, messages).saturating_mul(100)
-            >= input_budget.saturating_mul(self.threshold_percent)
+        let input = HookInput {
+            messages: messages.to_vec(),
+            model: String::new(),
+            provider,
+            workspace: PathBuf::new(),
+            input_budget,
+            request_budget: None,
+            compression_extra_tools: None,
+            cycle: 0,
+            compression_context: None,
+        };
+        should_auto_compress(&input, self.keep_recent_turns, self.threshold_percent)
+    }
+
+    fn should_run_with_input(&self, input: &HookInput) -> bool {
+        should_auto_compress(input, self.keep_recent_turns, self.threshold_percent)
     }
 
     fn run<'a>(
@@ -395,51 +584,15 @@ impl AgentHook for AutoCompressContextHook {
 
             let before_estimate = estimate_tokens_for_provider(input.provider, &input.messages);
             let to_compress = &input.messages[1..compress_end];
-            let source_text = build_compression_source_text(to_compress);
-            if source_text.trim().is_empty() {
-                return HookOutput::NoOp;
-            }
-
-            // Incremental compression: if there's an existing summary in the
-            // messages being compressed, provide it as prior context so the LLM
-            // merges rather than starting from scratch.
-            let existing_summary = extract_existing_summary(to_compress);
-            let user_content = if let Some(prev) = existing_summary {
-                format!(
-                    "## Previous Summary\n{prev}\n\n## New Conversation To Merge\n{source_text}"
+            let Some(prompt) =
+                build_compression_call_prompt_with_context(
+                    to_compress,
+                    input.compression_context.as_ref(),
                 )
-            } else {
-                source_text.clone()
+            else {
+                return HookOutput::NoOp;
             };
-
-            let system_content = if existing_summary.is_some() {
-                "You compress older conversation context for an AI coding assistant so the agent can keep working without losing actionable state.\n\nYou are given a previous summary and new conversation turns. Merge them into a single updated summary, preserving all still-relevant information from the previous summary and incorporating new details.\n\nProduce a single concise markdown summary with the following sections, in this order, omitting any section that has no content:\n- User goal & constraints: the user's current objective and any hard requirements, scope limits, language, or style rules they set.\n- Files & components touched: repository paths, functions, modules, or external systems involved. Preserve exact paths when mentioned.\n- Key findings: important facts surfaced by tools (search/read/run output) that the agent will need later. Prefer precise quotes or exact identifiers over paraphrase.\n- Decisions & rationale: design choices already made and why, including any approaches the user explicitly approved or rejected.\n- Failed attempts & blockers: what has been tried, why it failed, and any errors/warnings that remain unresolved.\n- Open issues / next steps: work still pending or the immediate next action the agent was about to take.\n\nHard rules:\n- Keep it factual and compact. No filler, no meta commentary (\"In summary...\"), no apologies.\n- Do not fabricate information that is not in the source text.\n- When merging, drop obsolete information from the previous summary that has been superseded by new conversation.\n- Preserve tool call IDs, error codes, and exact identifiers verbatim when they appear.\n- Do not wrap the output in code blocks.\n- Match the language of the source conversation."
-            } else {
-                "You compress older conversation context for an AI coding assistant so the agent can keep working without losing actionable state.\n\nProduce a single concise markdown summary with the following sections, in this order, omitting any section that has no content:\n- User goal & constraints: the user's current objective and any hard requirements, scope limits, language, or style rules they set.\n- Files & components touched: repository paths, functions, modules, or external systems involved. Preserve exact paths when mentioned.\n- Key findings: important facts surfaced by tools (search/read/run output) that the agent will need later. Prefer precise quotes or exact identifiers over paraphrase.\n- Decisions & rationale: design choices already made and why, including any approaches the user explicitly approved or rejected.\n- Failed attempts & blockers: what has been tried, why it failed, and any errors/warnings that remain unresolved.\n- Open issues / next steps: work still pending or the immediate next action the agent was about to take.\n\nHard rules:\n- Keep it factual and compact. No filler, no meta commentary (\"In summary...\"), no apologies.\n- Do not fabricate information that is not in the source text.\n- Preserve tool call IDs, error codes, and exact identifiers verbatim when they appear.\n- Do not wrap the output in code blocks.\n- Match the language of the source conversation."
-            };
-
-            let prompt = vec![
-                ChatMessage {
-                    role: "system".into(),
-                    content: Some(system_content.into()),
-                    images: None,
-                    thinking: None,
-                    anthropic_thinking_blocks: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    timestamp: None,
-                },
-                ChatMessage {
-                    role: "user".into(),
-                    content: Some(user_content),
-                    images: None,
-                    thinking: None,
-                    anthropic_thinking_blocks: None,
-                    tool_calls: None,
-                    tool_call_id: None,
-                    timestamp: Some(crate::now_epoch()),
-                },
-            ];
+            let existing_summary = extract_existing_summary(to_compress);
 
             // Use context_model → primary fallback chain for compression.
             let compress_model = config.context_model_or(&input.model);
@@ -459,8 +612,7 @@ impl AgentHook for AutoCompressContextHook {
                 Ok(_) => return HookOutput::NoOp,
                 Err(e) => {
                     // Emit failure event so the frontend can inform the user.
-                    return HookOutput::ReplaceMessages {
-                        messages: input.messages,
+                    return HookOutput::EmitEvents {
                         events: vec![json!({
                             "type": "context_compress_failed",
                             "error": e.to_string(),
@@ -473,15 +625,41 @@ impl AgentHook for AutoCompressContextHook {
             let summary_text = summary.content;
             let messages = build_compressed_messages(&input.messages, compress_end, &summary_text);
             let after_estimate = estimate_tokens_for_provider(input.provider, &messages);
-            let removed_messages = compress_end.saturating_sub(1);
-            let summary_tokens = estimate_tokens_for_provider(input.provider, &messages[1..2]);
             let provider_name = config.resolve_provider_name(compress_model);
             let input_tokens = summary
                 .input_tokens
                 .unwrap_or_else(|| estimate_tokens_for_provider(resolved.provider, &prompt) as u64);
-            let output_tokens = summary.output_tokens.unwrap_or_else(|| {
-                estimate_tokens_for_provider(resolved.provider, &messages[1..2]) as u64
-            });
+            let output_tokens = summary
+                .output_tokens
+                .unwrap_or_else(|| estimate_summary_output_tokens(resolved.provider, &summary_text));
+            let usage = UsageUpdate {
+                input_tokens,
+                output_tokens,
+                input_source: if summary.input_tokens.is_some() {
+                    "provider".to_string()
+                } else {
+                    "estimated".to_string()
+                },
+                output_source: if summary.output_tokens.is_some() {
+                    "provider".to_string()
+                } else {
+                    "estimated".to_string()
+                },
+                labels: build_usage_labels(
+                    input_tokens,
+                    output_tokens,
+                    Some(&provider_name),
+                    Some(USAGE_ROLE_CONTEXT),
+                ),
+            };
+            if !compression_saves_enough(before_estimate, after_estimate) {
+                return HookOutput::EmitEvents {
+                    events: vec![build_context_compress_skipped_event("insufficient_savings")],
+                    usage: Some(usage),
+                };
+            }
+            let removed_messages = compress_end.saturating_sub(1);
+            let summary_tokens = estimate_tokens_for_provider(input.provider, &messages[1..2]);
 
             HookOutput::ReplaceMessages {
                 messages,
@@ -492,26 +670,7 @@ impl AgentHook for AutoCompressContextHook {
                     summary_tokens,
                     existing_summary.is_some(),
                 )],
-                usage: Some(UsageUpdate {
-                    input_tokens,
-                    output_tokens,
-                    input_source: if summary.input_tokens.is_some() {
-                        "provider".to_string()
-                    } else {
-                        "estimated".to_string()
-                    },
-                    output_source: if summary.output_tokens.is_some() {
-                        "provider".to_string()
-                    } else {
-                        "estimated".to_string()
-                    },
-                    labels: build_usage_labels(
-                        input_tokens,
-                        output_tokens,
-                        Some(&provider_name),
-                        Some(USAGE_ROLE_CONTEXT),
-                    ),
-                }),
+                usage: Some(usage),
             }
         })
     }
@@ -533,6 +692,9 @@ pub(crate) async fn run_hooks(
     config: &Config,
     http: &Client,
     cycle: usize,
+    compression_context: Option<CompressionContextSections>,
+    request_budget: Option<usize>,
+    compression_extra_tools: Option<Vec<serde_json::Value>>,
 ) -> Vec<serde_json::Value> {
     let mut events = Vec::new();
     for index in 0..registry.len() {
@@ -553,7 +715,18 @@ pub(crate) async fn run_hooks(
             let model = session.effective_model(&config.model);
             let provider = config.resolve_model(model).provider;
             let input_budget = context_input_budget_for_model(config, model);
-            hook.should_run(&session.messages, provider, input_budget, cycle)
+            let input = HookInput {
+                messages: session.messages.clone(),
+                model: model.to_string(),
+                provider,
+                workspace: session.workspace.clone(),
+                input_budget,
+                request_budget,
+                compression_extra_tools: compression_extra_tools.clone(),
+                cycle,
+                compression_context: compression_context.clone(),
+            };
+            hook.should_run_with_input(&input)
         };
         if !should_run {
             continue;
@@ -575,7 +748,10 @@ pub(crate) async fn run_hooks(
                 provider,
                 workspace: session.workspace.clone(),
                 input_budget,
+                request_budget,
+                compression_extra_tools: compression_extra_tools.clone(),
                 cycle,
+                compression_context: compression_context.clone(),
             }
         }; // lock dropped
 
@@ -592,6 +768,18 @@ pub(crate) async fn run_hooks(
                     replace_session_messages(session, new_msgs);
                     session.updated_at = crate::now_epoch();
                     if let Some(usage) = usage.as_ref() {
+                        apply_usage_update(session, usage);
+                    }
+                }
+                events.extend(hook_events);
+            }
+            HookOutput::EmitEvents {
+                events: hook_events,
+                usage,
+            } => {
+                if let Some(usage) = usage.as_ref() {
+                    let mut sessions_guard = sessions.lock().await;
+                    if let Some(session) = sessions_guard.get_mut(session_id) {
                         apply_usage_update(session, usage);
                     }
                 }

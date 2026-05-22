@@ -1,4 +1,4 @@
-import type { AutoTraceEvent, ImageAttachment, HistoryMessage, ReactPhase } from './types.js';
+import type { AutoTraceEvent, CompressionOutcome, ImageAttachment, HistoryMessage, ReactPhase } from './types.js';
 
 // ── DOM refs ──
 
@@ -71,6 +71,7 @@ export interface AppState {
   showReasoning: boolean;
   autoDebugEnabled: boolean;
   latestAutoTrace: AutoTraceEvent | null;
+  latestCompression: CompressionOutcome | null;
   autoDebugRow: HTMLElement | null;
   autoFollowChat: boolean;
   hasBufferedChatUpdates: boolean;
@@ -137,6 +138,7 @@ export const state: AppState = {
   showReasoning: true,
   autoDebugEnabled: false,
   latestAutoTrace: null,
+  latestCompression: null,
   autoDebugRow: null,
   autoFollowChat: true,
   hasBufferedChatUpdates: false,

@@ -587,6 +587,18 @@ struct LiveToolState {
 }
 
 #[derive(Clone, Default)]
+struct LiveCompressionState {
+    outcome: Option<String>,
+    reason: Option<String>,
+    messages_removed: Option<usize>,
+    before_estimate: Option<usize>,
+    after_estimate: Option<usize>,
+    saved_tokens: Option<usize>,
+    saved_percent: Option<usize>,
+    pruned_messages_removed: Option<usize>,
+}
+
+#[derive(Clone, Default)]
 struct LiveRoundState {
     connection_id: u64,
     round: usize,
@@ -603,6 +615,8 @@ struct LiveRoundState {
     auto_ready_to_finish: Option<bool>,
     auto_has_blocking_uncertainty: Option<bool>,
     latest_auto_trace: Option<agent::AutoThinkTrace>,
+    latest_compression: LiveCompressionState,
+    has_pending_pre_start_context_updates: bool,
     has_observation: bool,
     assistant_text: String,
     reasoning_text: String,
@@ -2030,6 +2044,57 @@ async fn take_live_client_send_batch(
     }
 }
 
+fn apply_live_compression_event(round: &mut LiveRoundState, event_type: &str, event: &serde_json::Value) {
+    match event_type {
+        "context_compressed" => {
+            round.latest_compression.outcome = Some("compressed".to_string());
+            round.latest_compression.reason = None;
+            round.latest_compression.messages_removed =
+                event["messages_removed"].as_u64().map(|value| value as usize);
+            round.latest_compression.before_estimate =
+                event["before_estimate"].as_u64().map(|value| value as usize);
+            round.latest_compression.after_estimate =
+                event["after_estimate"].as_u64().map(|value| value as usize);
+            round.latest_compression.saved_tokens =
+                event["saved_tokens"].as_u64().map(|value| value as usize);
+            round.latest_compression.saved_percent =
+                event["saved_percent"].as_u64().map(|value| value as usize);
+            round.latest_compression.pruned_messages_removed = None;
+        }
+        "context_compress_skipped" => {
+            round.latest_compression.outcome = Some("skipped".to_string());
+            round.latest_compression.reason = event["reason"].as_str().map(str::to_string);
+            round.latest_compression.messages_removed = None;
+            round.latest_compression.before_estimate = None;
+            round.latest_compression.after_estimate = None;
+            round.latest_compression.saved_tokens = None;
+            round.latest_compression.saved_percent = None;
+            round.latest_compression.pruned_messages_removed = None;
+        }
+        "context_compress_failed" => {
+            round.latest_compression.outcome = Some("failed".to_string());
+            round.latest_compression.reason = event["error"].as_str().map(str::to_string);
+            round.latest_compression.messages_removed = None;
+            round.latest_compression.before_estimate = None;
+            round.latest_compression.after_estimate = None;
+            round.latest_compression.saved_tokens = None;
+            round.latest_compression.saved_percent = None;
+            round.latest_compression.pruned_messages_removed = None;
+        }
+        _ => {}
+    }
+}
+
+fn apply_live_pruned_event(round: &mut LiveRoundState, event: &serde_json::Value) {
+    round.latest_compression.pruned_messages_removed =
+        event["messages_removed"].as_u64().map(|value| value as usize);
+}
+
+fn clear_live_compression_state(round: &mut LiveRoundState) {
+    round.latest_compression = LiveCompressionState::default();
+    round.has_pending_pre_start_context_updates = false;
+}
+
 async fn dispatch_live_event(
     state: &AppState,
     session_id: &str,
@@ -2070,6 +2135,11 @@ async fn dispatch_live_event(
         match event_type {
             "start" => {
                 if !is_subagent_live_event(&event) {
+                    let latest_compression = live_rounds
+                        .get(session_id)
+                        .filter(|round| round.has_pending_pre_start_context_updates)
+                        .map(|round| round.latest_compression.clone())
+                        .unwrap_or_default();
                     live_rounds.insert(
                         session_id.to_string(),
                         LiveRoundState {
@@ -2097,6 +2167,8 @@ async fn dispatch_live_event(
                             auto_has_blocking_uncertainty: event["auto_has_blocking_uncertainty"]
                                 .as_bool(),
                             latest_auto_trace: None,
+                            latest_compression,
+                            has_pending_pre_start_context_updates: false,
                             has_observation: false,
                             assistant_text: String::new(),
                             reasoning_text: String::new(),
@@ -2129,6 +2201,36 @@ async fn dispatch_live_event(
                 {
                     round.effective_think = Some(trace.selected_think.clone());
                     round.latest_auto_trace = Some(trace);
+                }
+            }
+            "context_compressed" | "context_compress_skipped" | "context_compress_failed" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
+                {
+                    apply_live_compression_event(round, event_type, &event);
+                    round.has_pending_pre_start_context_updates = true;
+                } else if !is_subagent_live_event(&event) {
+                    let mut round = live_rounds.remove(session_id).unwrap_or_default();
+                    round.connection_id = connection_id;
+                    apply_live_compression_event(&mut round, event_type, &event);
+                    round.has_pending_pre_start_context_updates = true;
+                    live_rounds.insert(session_id.to_string(), round);
+                }
+            }
+            "context_pruned" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
+                {
+                    apply_live_pruned_event(round, &event);
+                    round.has_pending_pre_start_context_updates = true;
+                } else if !is_subagent_live_event(&event) {
+                    let mut round = live_rounds.remove(session_id).unwrap_or_default();
+                    round.connection_id = connection_id;
+                    apply_live_pruned_event(&mut round, &event);
+                    round.has_pending_pre_start_context_updates = true;
+                    live_rounds.insert(session_id.to_string(), round);
                 }
             }
             "thinking_start" => {
@@ -2290,8 +2392,15 @@ async fn dispatch_live_event(
                     && round.connection_id == connection_id
                     && !is_subagent_live_event(&event)
                 {
-                    round.phase = event["phase"].as_str().map(str::to_string);
-                    round.cycle = event["cycle"].as_u64().map(|value| value as usize);
+                    let next_phase = event["phase"].as_str().map(str::to_string);
+                    let next_cycle = event["cycle"].as_u64().map(|value| value as usize);
+                    let is_new_analyze_cycle = matches!(next_phase.as_deref(), Some("analyze"))
+                        && next_cycle.zip(round.cycle).is_some_and(|(next, current)| next > current);
+                    if is_new_analyze_cycle {
+                        clear_live_compression_state(round);
+                    }
+                    round.phase = next_phase;
+                    round.cycle = next_cycle;
                 }
             }
             "observation" => {
@@ -2499,6 +2608,35 @@ async fn dispatch_live_event(
     }
 }
 
+fn compression_replay_event(live_round: &LiveRoundState) -> Option<serde_json::Value> {
+    match live_round.latest_compression.outcome.as_deref()? {
+        "compressed" => Some(json!({
+            "type": "context_compressed",
+            "messages_removed": live_round.latest_compression.messages_removed,
+            "before_estimate": live_round.latest_compression.before_estimate,
+            "after_estimate": live_round.latest_compression.after_estimate,
+            "saved_tokens": live_round.latest_compression.saved_tokens,
+            "saved_percent": live_round.latest_compression.saved_percent,
+        })),
+        "skipped" => Some(json!({
+            "type": "context_compress_skipped",
+            "reason": live_round.latest_compression.reason,
+        })),
+        "failed" => Some(json!({
+            "type": "context_compress_failed",
+            "error": live_round.latest_compression.reason,
+        })),
+        _ => None,
+    }
+}
+
+fn compression_pruned_replay_event(live_round: &LiveRoundState) -> Option<serde_json::Value> {
+    Some(json!({
+        "type": "context_pruned",
+        "messages_removed": live_round.latest_compression.pruned_messages_removed?,
+    }))
+}
+
 async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
     let live_round = { state.live_rounds.lock().await.get(session_id).cloned() };
     let Some(live_round) = live_round else {
@@ -2540,6 +2678,14 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
         }
     }
 
+    let compression_event = compression_replay_event(&live_round);
+    let pruned_event = compression_pruned_replay_event(&live_round);
+    if let Some(event) = compression_event {
+        ws_send(tx, &event).await;
+    }
+    if let Some(event) = pruned_event {
+        ws_send(tx, &event).await;
+    }
     ws_send(tx, &start_event).await;
     if let Some(trace) = live_round.latest_auto_trace.as_ref() {
         ws_send(tx, &trace.to_live_event()).await;

@@ -8,7 +8,11 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     AppState, ChatMessage, MAIN_SESSION_ID, Session, WsTx, agent, build_system_prompt,
     build_system_prompt_with_query_cached, default_show_react, default_show_reasoning,
-    default_show_tools, memory, now_epoch, prompts, providers,
+    default_show_tools,
+    hooks::{
+        build_compression_call_prompt, estimate_summary_output_tokens, extract_existing_summary,
+    },
+    memory, now_epoch, prompts, providers,
     session_admin::gather_global_today_usage,
     session_store::{
         build_session_status, build_usage_report, replace_session_messages,
@@ -302,6 +306,46 @@ fn status_auto_signals_line(
     })
 }
 
+fn status_compression_line(live_round: Option<&crate::LiveRoundState>) -> Option<String> {
+    let details = live_round?;
+    let compression = details.latest_compression.outcome.as_deref()?;
+    match compression {
+        "compressed" => Some(format!(
+            "compression: compressed saved_tokens={} saved_percent={}"
+            ,
+            details.latest_compression.saved_tokens.unwrap_or(0),
+            details.latest_compression.saved_percent.unwrap_or(0)
+        )),
+        "skipped" => Some(format!(
+            "compression: skipped reason={}"
+            ,
+            details
+                .latest_compression
+                .reason
+                .as_deref()
+                .unwrap_or("unknown")
+        )),
+        "failed" => Some(format!(
+            "compression: failed reason={}"
+            ,
+            details
+                .latest_compression
+                .reason
+                .as_deref()
+                .unwrap_or("unknown")
+        )),
+        _ => None,
+    }
+}
+
+fn status_pruned_line(live_round: Option<&crate::LiveRoundState>) -> Option<String> {
+    let pruned_messages_removed = live_round?.latest_compression.pruned_messages_removed?;
+    Some(format!(
+        "pruned: removed {} additional message(s) to fit request budget",
+        pruned_messages_removed
+    ))
+}
+
 fn status_runtime_target_block(
     config: &crate::Config,
     active_model: &str,
@@ -408,6 +452,12 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
     if let Some(auto_line) = status_auto_signals_line(session, &resolved, live_round.as_ref()) {
         status_lines.push(auto_line);
     }
+    if let Some(compression_line) = status_compression_line(live_round.as_ref()) {
+        status_lines.push(compression_line);
+    }
+    if let Some(pruned_line) = status_pruned_line(live_round.as_ref()) {
+        status_lines.push(pruned_line);
+    }
     if enabled_mcp_servers > 0 {
         status_lines.push(format!(
             "mcp_schema_cache: {}/{} enabled server(s) cached",
@@ -507,58 +557,67 @@ async fn handle_new_command(
     cancel: &CancellationToken,
 ) -> Option<CommandResult> {
     let config = state.config();
-    let (conversation_text, workspace, model_str) = {
+    let (compress_messages, workspace, model_str) = {
         let sessions = state.sessions.lock().await;
         let session = match sessions.get(current_session_id) {
             Some(s) => s,
             None => return Some(command_result("Session not found", "system", false)),
         };
-        let mut lines = Vec::new();
-        for msg in &session.messages {
-            match msg.role.as_str() {
-                "user" => {
-                    if let Some(c) = &msg.content {
-                        lines.push(format!("User: {c}"));
-                    }
-                }
-                "assistant" => {
-                    if let Some(c) = &msg.content
-                        && !c.is_empty()
-                    {
-                        lines.push(format!("Assistant: {c}"));
-                    }
-                }
-                _ => {}
-            }
-        }
         (
-            lines.join("\n"),
+            session.messages.clone(),
             session.workspace.clone(),
             session.effective_model(&config.model).to_string(),
         )
     };
 
-    if conversation_text.is_empty() {
+    let memory_dir = workspace.join("memory");
+    tokio::fs::create_dir_all(&memory_dir).await.ok();
+
+    let Some(compress_prompt) = build_compression_call_prompt(&compress_messages) else {
+        let existing_summary = extract_existing_summary(&compress_messages);
+        let mut saved_memory_date: Option<String> = None;
+        if let Some(existing_summary) = existing_summary {
+            let summary_body = existing_summary
+                .strip_prefix("## Context Summary (auto-generated)")
+                .unwrap_or(existing_summary)
+                .trim();
+            let local_snapshot = prompts::current_local_snapshot();
+            let today = local_snapshot.today();
+            let memory_path = memory_dir.join(format!("{today}.md"));
+            if let Err(e) =
+                append_daily_memory_entry(&memory_path, &today, &local_snapshot.hhmm(), summary_body)
+                    .await
+            {
+                return Some(command_result(
+                    format!("Failed to write memory: {e}"),
+                    "system",
+                    false,
+                ));
+            }
+            saved_memory_date = Some(today);
+        }
         match reset_session_context_and_persist(state, current_session_id).await {
             Ok(()) => {
-                return Some(command_result_with_history(
-                    "Context cleared.",
-                    "system",
-                    true,
-                ));
+                let response = if let Some(today) = saved_memory_date.as_deref() {
+                    format!("Conversation compressed and saved to memory/{today}.md. Context cleared.")
+                } else {
+                    "Context cleared.".to_string()
+                };
+                return Some(command_result_with_history(response, "system", true));
             }
             Err(err) if err == "Session not found" => {
                 return Some(command_result(err, "system", false));
             }
             Err(err) => {
-                return Some(command_result(
-                    format!("Failed to persist cleared context: {err}"),
-                    "error",
-                    false,
-                ));
+                let response = if let Some(today) = saved_memory_date.as_deref() {
+                    format!("Memory saved to memory/{today}.md but failed to clear context: {err}")
+                } else {
+                    format!("Failed to persist cleared context: {err}")
+                };
+                return Some(command_result(response, "error", false));
             }
-        }
-    }
+        };
+    };
 
     if !ws_send(
         tx,
@@ -572,28 +631,6 @@ async fn handle_new_command(
         return None;
     }
 
-    let compress_prompt = vec![
-        ChatMessage {
-            role: "system".into(),
-            content: Some("You are a conversation summarizer. Compress the following conversation into a concise markdown summary. Keep key decisions, code changes, problems solved, and important context. Use bullet points. Write in the same language as the conversation. Do NOT wrap in code blocks.".into()),
-            images: None,
-            thinking: None,
-            anthropic_thinking_blocks: None,
-            tool_calls: None,
-            tool_call_id: None,
-            timestamp: None,
-        },
-        ChatMessage {
-            role: "user".into(),
-            content: Some(truncate(&conversation_text, 60_000)),
-            images: None,
-            thinking: None,
-            anthropic_thinking_blocks: None,
-            tool_calls: None,
-            tool_call_id: None,
-            timestamp: Some(now_epoch()),
-        },
-    ];
     let resolved = config.resolve_model(&model_str);
     let summary = tokio::select! {
         biased;
@@ -622,21 +659,9 @@ async fn handle_new_command(
     let input_tokens = summary.input_tokens.unwrap_or_else(|| {
         crate::estimate_tokens_for_provider(resolved.provider, &compress_prompt) as u64
     });
-    let output_tokens = summary.output_tokens.unwrap_or_else(|| {
-        crate::message_token_len_for_provider(
-            resolved.provider,
-            &crate::ChatMessage {
-                role: "assistant".into(),
-                content: Some(summary.content.clone()),
-                images: None,
-                thinking: None,
-                anthropic_thinking_blocks: None,
-                tool_calls: None,
-                tool_call_id: None,
-                timestamp: None,
-            },
-        ) as u64
-    });
+    let output_tokens = summary
+        .output_tokens
+        .unwrap_or_else(|| estimate_summary_output_tokens(resolved.provider, &summary.content));
     {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(current_session_id) {
@@ -675,10 +700,7 @@ async fn handle_new_command(
 
     let local_snapshot = prompts::current_local_snapshot();
     let today = local_snapshot.today();
-    let memory_dir = workspace.join("memory");
-    tokio::fs::create_dir_all(&memory_dir).await.ok();
     let memory_path = memory_dir.join(format!("{today}.md"));
-
     let write_result =
         append_daily_memory_entry(&memory_path, &today, &local_snapshot.hhmm(), &summary).await;
 

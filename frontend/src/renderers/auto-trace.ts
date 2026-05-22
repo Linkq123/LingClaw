@@ -34,6 +34,18 @@ function signalSummary(trace: AutoTraceEvent): string {
   ].join(' ');
 }
 
+function compressionSummary(trace: AutoTraceEvent): string | null {
+  const compression = trace.compression;
+  if (!compression) return null;
+  if (compression.outcome === 'compressed') {
+    return `compression=compressed saved_tokens=${compression.saved_tokens ?? 0} saved_percent=${compression.saved_percent ?? 0}`;
+  }
+  if (compression.outcome === 'skipped') {
+    return `compression=skipped reason=${compression.reason ?? 'unknown'}`;
+  }
+  return `compression=failed reason=${compression.reason ?? 'unknown'}`;
+}
+
 function ensureAutoDebugRow(): HTMLElement | null {
   if (!dom.chat) return null;
   if (!state.autoDebugRow) {
@@ -75,6 +87,7 @@ function renderAutoDebugPanel(): void {
         dampeners=${escHtml(reasonList(trace.dampeners))}
         clamps=${escHtml(reasonList(trace.clamps))}
       </div>
+      ${compressionSummary(trace) ? `<div class="auto-debug-line auto-debug-list">${escHtml(compressionSummary(trace)!)}</div>` : ''}
       <pre class="auto-debug-signals">${escHtml(signalSummary(trace))}</pre>
     </div>
   `;
@@ -99,8 +112,50 @@ export function clearActiveAutoTrace(): void {
   clearAutoTracePanel();
 }
 
+export function clearCompressionOutcome(): void {
+  state.latestCompression = null;
+}
+
+export function clearCompressionOutcomeForNewAnalyzeCycle(nextCycle: number): void {
+  const currentCycle = state.latestAutoTrace?.cycle ?? state.reactStatusCycle;
+  if (currentCycle != null && nextCycle > currentCycle) {
+    clearCompressionOutcome();
+  }
+}
+
+export function clearCompressionOutcomeForNewRound(nextCycle: number | null | undefined): void {
+  const currentCycle = state.latestAutoTrace?.cycle ?? state.reactStatusCycle;
+  if (currentCycle != null && nextCycle != null && nextCycle > currentCycle) {
+    clearCompressionOutcome();
+  }
+}
+
+export function applyCompressionOutcome(compression: NonNullable<AutoTraceEvent['compression']>): void {
+  state.latestCompression = compression;
+  if (state.latestAutoTrace) {
+    state.latestAutoTrace = {
+      ...state.latestAutoTrace,
+      compression,
+    };
+  }
+  if (state.autoDebugEnabled && state.latestAutoTrace) {
+    renderAutoDebugPanel();
+  }
+}
+
 export function applyAutoTrace(trace: AutoTraceEvent): void {
-  state.latestAutoTrace = trace;
+  const previousCycle = state.latestAutoTrace?.cycle;
+  const compression =
+    previousCycle != null && trace.cycle > previousCycle
+      ? trace.compression
+      : trace.compression ?? state.latestCompression ?? undefined;
+  if (previousCycle != null && trace.cycle > previousCycle && !trace.compression) {
+    clearCompressionOutcome();
+  }
+  state.latestAutoTrace = {
+    ...trace,
+    compression,
+  };
   if (state.autoDebugEnabled) {
     renderAutoDebugPanel();
   }
