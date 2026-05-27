@@ -7,7 +7,9 @@ use tokio::time::MissedTickBehavior;
 mod socket_input;
 
 pub(crate) use socket_input::{
-    IdleSocketInputAction, handle_idle_socket_input, resolve_or_create_socket_session,
+    IdleSocketInputAction, ensure_session_ready, handle_idle_socket_input,
+    resolve_or_create_socket_session, resolve_session_target_for_command,
+    resolve_session_target_for_delete,
 };
 use socket_input::{drain_busy_socket_messages, persist_pending_interventions};
 
@@ -2341,16 +2343,11 @@ async fn run_analyze_phase(
         };
     let total_pruned_count = snapshot.pruned_count.saturating_add(extra_pruned_count);
 
-    let final_msgs_snapshot = match send_before_analyze_events(
-        ctx,
-        before_analyze_events,
-        total_pruned_count,
-    )
-    .await
-    {
-        Some(msgs) => msgs,
-        None => return AgentPhaseControl::Break,
-    };
+    let final_msgs_snapshot =
+        match send_before_analyze_events(ctx, before_analyze_events, total_pruned_count).await {
+            Some(msgs) => msgs,
+            None => return AgentPhaseControl::Break,
+        };
     // ── BeforeLlmCall hook (before budget check so estimate includes hook changes) ──
     let llm_hook_input = LlmHookInput {
         messages: final_msgs_snapshot.clone(),

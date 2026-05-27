@@ -17,7 +17,7 @@
 - HTTP 基础地址：`http://127.0.0.1:18989`
 - WebSocket 地址：`ws://127.0.0.1:18989/ws`
 - 服务框架：`axum`
-- 会话模型：当前仅暴露单主会话 `main`
+- 会话模型：默认会话为 `main`，同时支持多个持久化 session
 
 后端暴露两类接口：
 
@@ -89,7 +89,7 @@
 
 ### 3.3 会话范围
 
-当前服务端只对外暴露主会话 `main`。`/api/sessions` 也只会返回主会话信息。
+服务端默认会话为 `main`，同时支持多个持久化 session。`/api/sessions` 会返回当前已加载或已持久化的 session 摘要；WebSocket 连接可通过查询参数 `?session=<id>` 绑定到指定 session，省略时回退到 `main`。
 
 ## 4. HTTP API
 
@@ -117,7 +117,7 @@
 
 ## 4.2 GET /api/sessions
 
-返回当前主会话摘要。
+返回当前已知 session 摘要列表。
 
 ### 响应
 
@@ -132,6 +132,15 @@
       "model": "openai/gpt-4o-mini",
       "created_at": 1710000000,
       "updated_at": 1710001234
+    },
+    {
+      "id": "research-notes",
+      "name": "research-notes",
+      "messages": 7,
+      "tool_calls": 2,
+      "model": "openai/gpt-4o-mini",
+      "created_at": 1710002222,
+      "updated_at": 1710003333
     }
   ]
 }
@@ -139,9 +148,10 @@
 
 ### 说明
 
-- 当前实现只返回 `main`
+- 返回值按 `updated_at` 倒序排列
 - `messages` 为会话消息条数
 - `tool_calls` 为累计工具调用次数
+- 列表同时覆盖默认 `main` 和其他已创建 session
 
 ## 4.3 GET /api/client-config
 
@@ -419,7 +429,7 @@
 
 - `command` 不能为空
 - `timeoutSecs` 不能为 `0`
-- `cwd` 必须位于主会话 workspace 内
+- `cwd` 必须位于当前配置测试所使用 session 的 workspace 内
 - `cwd` 不允许逃逸 workspace
 - `cwd` 不允许穿过受保护 symlink
 - `cwd` 不允许指向 `.lingclaw-bootstrap`
@@ -593,7 +603,7 @@
 
 ## 4.8 GET /api/usage
 
-返回当前主会话的 token 统计。
+返回当前默认 session（`main`）的 token 统计。
 
 ### 响应
 
@@ -778,6 +788,16 @@ Authorization: Bearer <shutdown-token>
 ws://127.0.0.1:18989/ws
 ```
 
+也可以通过查询参数绑定到指定 session：
+
+```text
+ws://127.0.0.1:18989/ws?session=research-notes
+```
+
+- `session` 省略时默认绑定 `main`
+- 指定的 session 不存在时，服务端会按该 id 创建新 session（前提是 id 合法）
+- 非法 session id 会回退到 `main`，并额外推送一条 `error` 事件说明原因
+
 建立连接后，服务端通常会按以下顺序推送初始化事件：
 
 1. `session`
@@ -796,7 +816,7 @@ ws://127.0.0.1:18989/ws
 帮我检查这个仓库的配置问题
 ```
 
-服务端会将其作为用户消息写入主会话，然后启动一轮 agent 执行。
+服务端会将其作为当前 WebSocket 绑定 session 的用户消息，然后启动一轮 agent 执行。
 
 ### 5.2.2 Slash 命令
 
@@ -1520,7 +1540,7 @@ WebSocket 下若图片不合法，通常以 `system` 事件返回错误，例如
 
 - `/api/config/test-model` 与 `/api/config/test-mcp` 的“联通性失败”通常返回 `200 + {ok:false}`
 - `/api/config` 在配置文件语法错误时不会返回 4xx，而是返回可恢复信息
-- `/api/sessions` 当前只返回主会话 `main`
+- `/api/sessions` 返回当前已知 session 摘要列表
 - WebSocket 客户端消息没有显式 `type` 字段，按“纯文本 / slash 命令 / JSON 图片消息”三种形态自动分流
 - 忙碌时普通文本会进入 deferred intervention 队列，不会立即中断主执行
 

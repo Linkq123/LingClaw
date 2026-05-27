@@ -690,12 +690,7 @@ where
         truncate_capture_tail(&mut captured, capture_limit);
     }
 
-    flush_pending_live_utf8(
-        label,
-        &mut pending_live_utf8,
-        event_tx,
-        bounded_event_tx,
-    );
+    flush_pending_live_utf8(label, &mut pending_live_utf8, event_tx, bounded_event_tx);
 
     Ok(StreamCapture {
         label,

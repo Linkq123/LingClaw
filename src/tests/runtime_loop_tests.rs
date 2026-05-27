@@ -1,6 +1,6 @@
 use super::*;
 
-use std::{collections::HashMap, sync::atomic::AtomicU64};
+use std::{collections::{HashMap, VecDeque}, sync::atomic::AtomicU64};
 
 use crate::config::{JsonModelEntry, JsonProviderConfig, S3Config};
 
@@ -106,11 +106,7 @@ impl crate::hooks::AgentHook for ForceCompressionHook {
             crate::hooks::HookOutput::ReplaceMessages {
                 messages,
                 events: vec![crate::hooks::build_context_compressed_event(
-                    2,
-                    10_000,
-                    4_000,
-                    320,
-                    false,
+                    2, 10_000, 4_000, 320, false,
                 )],
                 usage: None,
             }
@@ -221,6 +217,493 @@ fn auto_think_support_treats_gemini3_as_reasoning_capable() {
     };
 
     assert!(providers::auto_think_supported(&resolved));
+}
+
+async fn recv_json_with_timeout(rx: &mut tokio::sync::mpsc::Receiver<String>) -> serde_json::Value {
+    let payload = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+        .await
+        .expect("timed out waiting for message")
+        .expect("channel closed before message arrived");
+    serde_json::from_str(&payload).expect("payload json")
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_broadcasts_session_list_when_session_set_changes() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (other_tx, mut other_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let delete_session_id = "broadcast-delete-target".to_string();
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+        sessions.insert(
+            delete_session_id.clone(),
+            test_session(&delete_session_id, "Delete Target", None),
+        );
+    }
+    {
+        let mut clients = state.session_clients.lock().await;
+        clients.insert(
+            session_id.clone(),
+            SessionClientBinding {
+                connection_id: 1,
+                tx: tx.clone(),
+                replay_ready: true,
+                pending_events: VecDeque::new(),
+                live_send_in_progress: false,
+            },
+        );
+        clients.insert(
+            "other-session".to_string(),
+            SessionClientBinding {
+                connection_id: 2,
+                tx: other_tx.clone(),
+                replay_ready: true,
+                pending_events: VecDeque::new(),
+                live_send_in_progress: false,
+            },
+        );
+    }
+
+    let action = handle_idle_socket_input(
+        format!("/delete {delete_session_id}"),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+
+    let current_events = vec![
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+    ];
+    let current_types = current_events
+        .iter()
+        .map(|payload| payload["type"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert!(current_types.contains(&"system".to_string()));
+    assert!(current_types.contains(&"session".to_string()));
+    assert!(current_types.contains(&"session_list".to_string()));
+
+    let other_parsed = recv_json_with_timeout(&mut other_rx).await;
+    assert_eq!(other_parsed["type"].as_str(), Some("session_list"));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn ensure_session_ready_reuses_loaded_session_case_insensitively() {
+    let state = Arc::new(test_app_state());
+    let session_id = "CaseSensitiveSession".to_string();
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Case Session", None));
+    }
+
+    let (resolved, created_fresh) = ensure_session_ready(&state, Some("casesensitivesession"))
+        .await
+        .expect("case variant should resolve to loaded session");
+
+    assert_eq!(resolved, session_id);
+    assert!(!created_fresh);
+    let sessions = state.sessions.lock().await;
+    assert_eq!(sessions.len(), 1);
+    assert!(sessions.contains_key("CaseSensitiveSession"));
+    assert!(!sessions.contains_key("casesensitivesession"));
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn ensure_session_ready_allows_case_distinct_loaded_sessions_on_case_sensitive_platforms() {
+    let state = Arc::new(test_app_state());
+    let upper_session_id = "CaseDistinctSession".to_string();
+    let lower_session_id = "casedistinctsession".to_string();
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(
+            upper_session_id.clone(),
+            test_session(&upper_session_id, "Upper Case Session", None),
+        );
+        sessions.insert(
+            lower_session_id.clone(),
+            test_session(&lower_session_id, "Lower Case Session", None),
+        );
+    }
+
+    let (resolved, created_fresh) = ensure_session_ready(&state, Some(&lower_session_id))
+        .await
+        .expect("exact case session should resolve independently");
+
+    assert_eq!(resolved, lower_session_id);
+    assert!(!created_fresh);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn ensure_session_ready_uses_persisted_canonical_id_for_case_alias() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("CasePersistedSession{}", now_epoch());
+    let workspace = crate::session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let mut session = test_session(&session_id, "Case Persisted", None);
+    session.workspace = workspace.clone();
+    save_session_to_disk(&session)
+        .await
+        .expect("session should persist");
+
+    let requested = session_id.to_ascii_lowercase();
+    let (resolved, created_fresh) = ensure_session_ready(&state, Some(&requested))
+        .await
+        .expect("case alias should load persisted canonical session");
+
+    assert_eq!(resolved, session_id);
+    assert!(!created_fresh);
+    let sessions = state.sessions.lock().await;
+    assert_eq!(sessions.len(), 1);
+    assert!(sessions.contains_key(&session_id));
+    assert!(!sessions.contains_key(&requested));
+
+    let _ = tokio::fs::remove_file(
+        crate::session_store::sessions_dir().join(format!("{session_id}.json")),
+    )
+    .await;
+    let _ = tokio::fs::remove_dir_all(workspace.parent().unwrap()).await;
+}
+
+#[tokio::test]
+async fn resolve_or_create_socket_session_broadcasts_session_list_for_fresh_session() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("fresh-ws-session-{}", now_epoch());
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (other_tx, mut other_rx) = tokio::sync::mpsc::channel::<String>(8);
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(MAIN_SESSION_ID.to_string(), test_session(MAIN_SESSION_ID, "Main", None));
+    }
+    {
+        let mut clients = state.session_clients.lock().await;
+        clients.insert(
+            MAIN_SESSION_ID.to_string(),
+            SessionClientBinding {
+                connection_id: 2,
+                tx: other_tx.clone(),
+                replay_ready: true,
+                pending_events: VecDeque::new(),
+                live_send_in_progress: false,
+            },
+        );
+    }
+
+    let connection_cancel = CancellationToken::new();
+    let resolved = resolve_or_create_socket_session(
+        &state,
+        &tx,
+        Some(&session_id),
+        1,
+        &connection_cancel,
+    )
+    .await;
+
+    assert_eq!(resolved, session_id);
+
+    let current_events = vec![
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+    ];
+    let current_types = current_events
+        .iter()
+        .map(|payload| payload["type"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert!(current_types.contains(&"session".to_string()));
+    assert!(current_types.contains(&"view_state".to_string()));
+    assert!(current_types.contains(&"history".to_string()));
+
+    let other_parsed = recv_json_with_timeout(&mut other_rx).await;
+    assert_eq!(other_parsed["type"].as_str(), Some("session_list"));
+
+    let _ = tokio::fs::remove_file(
+        crate::session_store::sessions_dir().join(format!("{session_id}.json")),
+    )
+    .await;
+    let _ = tokio::fs::remove_dir_all(crate::session_workspace_path(&session_id).parent().unwrap()).await;
+}
+
+#[tokio::test]
+async fn resolve_or_create_socket_session_cancels_old_connection_before_replay() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("reconnect-cancel-session-{}", now_epoch());
+    let old_cancel = CancellationToken::new();
+    let new_cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Reconnect Target", None));
+    }
+    {
+        let mut cancels = state.connection_cancels.lock().await;
+        cancels.insert(
+            session_id.clone(),
+            ConnectionCancelBinding {
+                connection_id: 99,
+                cancel: old_cancel.clone(),
+            },
+        );
+    }
+
+    let resolved = resolve_or_create_socket_session(&state, &tx, Some(&session_id), 1, &new_cancel).await;
+
+    assert_eq!(resolved, session_id);
+    assert!(old_cancel.is_cancelled());
+    assert!(!new_cancel.is_cancelled());
+    {
+        let cancels = state.connection_cancels.lock().await;
+        let binding = cancels
+            .get(&session_id)
+            .expect("new cancel binding should be installed before replay");
+        assert_eq!(binding.connection_id, 1);
+        assert!(!binding.cancel.is_cancelled());
+    }
+
+    let current_events = vec![
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+    ];
+    let current_types = current_events
+        .iter()
+        .map(|payload| payload["type"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert!(current_types.contains(&"session".to_string()));
+    assert!(current_types.contains(&"view_state".to_string()));
+    assert!(current_types.contains(&"history".to_string()));
+}
+
+#[tokio::test]
+async fn resolve_or_create_socket_session_replays_live_tail_for_running_session() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("reconnect-live-session-{}", now_epoch());
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Reconnect Target", None));
+    }
+    {
+        let mut runs = state.active_runs.lock().await;
+        runs.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 99,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+    }
+    let old_cancel = CancellationToken::new();
+    {
+        let mut cancels = state.connection_cancels.lock().await;
+        cancels.insert(
+            session_id.clone(),
+            ConnectionCancelBinding {
+                connection_id: 99,
+                cancel: old_cancel.clone(),
+            },
+        );
+    }
+
+    dispatch_live_event(
+        state.as_ref(),
+        &session_id,
+        99,
+        serde_json::json!({
+            "type":"start",
+            "round":1,
+            "phase":"act",
+            "cycle":0,
+            "react_visible":false,
+        }),
+    )
+    .await;
+
+    let connection_cancel = CancellationToken::new();
+    let resolved = resolve_or_create_socket_session(
+        &state,
+        &tx,
+        Some(&session_id),
+        1,
+        &connection_cancel,
+    )
+    .await;
+
+    assert_eq!(resolved, session_id);
+    assert!(old_cancel.is_cancelled());
+    assert!(!connection_cancel.is_cancelled());
+
+    dispatch_live_event(
+        state.as_ref(),
+        &session_id,
+        99,
+        serde_json::json!({"type":"delta","content":"tail after reconnect"}),
+    )
+    .await;
+
+    let current_events = vec![
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+    ];
+    let current_types = current_events
+        .iter()
+        .map(|payload| payload["type"].as_str().unwrap_or_default().to_string())
+        .collect::<Vec<_>>();
+    assert!(current_types.contains(&"session".to_string()));
+    assert!(current_types.contains(&"view_state".to_string()));
+    assert!(current_types.contains(&"history".to_string()));
+    assert!(current_types.contains(&"start".to_string()));
+    assert!(current_events.iter().any(|payload| {
+        payload["type"].as_str() == Some("delta")
+            && payload["content"].as_str() == Some("tail after reconnect")
+    }));
+}
+
+#[tokio::test]
+async fn switch_session_broadcasts_session_list_when_session_set_changes() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (other_tx, mut other_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let new_session_id = format!("broadcast-created-session-{}", now_epoch());
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+    }
+    {
+        let mut clients = state.session_clients.lock().await;
+        clients.insert(
+            session_id.clone(),
+            SessionClientBinding {
+                connection_id: 1,
+                tx: tx.clone(),
+                replay_ready: true,
+                pending_events: VecDeque::new(),
+                live_send_in_progress: false,
+            },
+        );
+        clients.insert(
+            "other-session".to_string(),
+            SessionClientBinding {
+                connection_id: 2,
+                tx: other_tx.clone(),
+                replay_ready: true,
+                pending_events: VecDeque::new(),
+                live_send_in_progress: false,
+            },
+        );
+    }
+
+    let action = handle_idle_socket_input(
+        format!("/switch {new_session_id}"),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+    )
+    .await;
+
+    let IdleSocketInputAction::SwitchSession { session_id, result } = action else {
+        panic!("switch command should request session switch");
+    };
+
+    assert_eq!(session_id, new_session_id);
+
+    switch_socket_session(
+        &state,
+        &tx,
+        &current_session_ref,
+        &mut current_session_id,
+        &CancellationToken::new(),
+        1,
+        session_id,
+    )
+    .await
+    .expect("session switch should succeed");
+
+    if result.session_list_changed {
+        broadcast_session_list_payload(&state).await;
+    }
+    ws_send(
+        &tx,
+        &serde_json::json!({
+            "type": result.response_type,
+            "content": result.response,
+            "dismissible": result.dismissible,
+        }),
+    )
+    .await;
+
+    {
+        let mut current_payloads = Vec::new();
+        while let Ok(Some(payload)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            rx.recv(),
+        )
+        .await
+        {
+            current_payloads.push(payload);
+        }
+        let current_types = current_payloads
+            .iter()
+            .map(|payload| {
+                serde_json::from_str::<serde_json::Value>(payload)
+                    .expect("payload json")["type"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+        assert!(current_types.contains(&"session".to_string()));
+    }
+
+    let other_parsed = recv_json_with_timeout(&mut other_rx).await;
+    assert_eq!(other_parsed["type"].as_str(), Some("session_list"));
+
+    let _ = tokio::fs::remove_file(
+        crate::session_store::sessions_dir().join(format!("{new_session_id}.json")),
+    )
+    .await;
+    let _ = tokio::fs::remove_dir_all(crate::session_workspace_path(&new_session_id).parent().unwrap()).await;
 }
 
 #[tokio::test]
@@ -815,7 +1298,10 @@ async fn run_agent_session_stop_preserves_interventions_after_trimming_incomplet
     assert!(!outcome.rerun_agent);
     assert!(!outcome.shutting_down);
 
-    let progress_event = live_rx.recv().await.expect("progress event should be emitted");
+    let progress_event = live_rx
+        .recv()
+        .await
+        .expect("progress event should be emitted");
     assert_eq!(progress_event["type"].as_str(), Some("progress"));
     let done_event = live_rx.recv().await.expect("done event should be emitted");
     assert_eq!(done_event["type"].as_str(), Some("done"));
@@ -1656,7 +2142,10 @@ async fn run_analyze_phase_emits_context_pruned_after_before_analyze_compression
     let pruned = live_rx.recv().await.expect("prune event should be emitted");
     let start = live_rx.recv().await.expect("start event should be emitted");
     let auto_trace = live_rx.recv().await.expect("auto trace should be emitted");
-    let error = live_rx.recv().await.expect("budget error should stop the round");
+    let error = live_rx
+        .recv()
+        .await
+        .expect("budget error should stop the round");
 
     assert_eq!(compressed["type"].as_str(), Some("context_compressed"));
     assert_eq!(compressed["before_estimate"].as_u64(), Some(10_000));

@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::{
-        DefaultBodyLimit, Multipart, Request, State,
+        DefaultBodyLimit, Multipart, Query, Request, State,
         ws::{Message as WsMsg, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode},
@@ -60,12 +60,16 @@ pub(crate) use memory::MemoryUpdateQueue;
 
 use commands::handle_command;
 use runtime_loop::{
-    IdleSocketInputAction, handle_idle_socket_input, resolve_or_create_socket_session,
-    run_agent_session,
+    IdleSocketInputAction, ensure_session_ready, handle_idle_socket_input,
+    resolve_or_create_socket_session, run_agent_session,
 };
-use session_store::{load_session_from_disk, refresh_session_system_prompt, save_session_to_disk};
+use session_store::{
+    SessionSummary, load_session_from_disk, refresh_session_system_prompt, save_session_to_disk,
+    sessions_dir,
+};
 use socket_sync::{
-    build_session_info_payload, send_command_refresh, send_existing_session_payloads,
+    broadcast_session_list_payload, build_session_info_payload, send_command_refresh,
+    send_existing_session_payloads,
 };
 use socket_tasks::{ConnectionCleanup, finalize_connection, spawn_connection_tasks};
 
@@ -86,10 +90,10 @@ use session_admin::gather_global_today_usage;
 #[cfg(test)]
 use session_store::{
     build_active_session_lines, build_global_today_usage, build_history_payload,
-    build_session_status, build_session_usage, build_usage_report, list_saved_session_ids_in_dir,
-    list_saved_session_summaries_in_dir, recoverable_session_ids_from_summaries,
-    replace_session_messages, resolve_session_target, sanitize_session_messages, sessions_dir,
-    subagent_snapshot_storage_key, trim_incomplete_tool_calls,
+    build_session_status, build_session_usage, build_usage_report,
+    list_saved_session_ids_in_dir, list_saved_session_summaries_in_dir,
+    recoverable_session_ids_from_summaries, replace_session_messages, resolve_session_target,
+    sanitize_session_messages, subagent_snapshot_storage_key, trim_incomplete_tool_calls,
     trim_incomplete_tool_calls_in_session,
 };
 use std::collections::{HashSet, VecDeque};
@@ -1641,11 +1645,14 @@ fn queue_live_client_events_for_binding(
     events: Vec<serde_json::Value>,
 ) -> Option<QueueLiveClientEventsResult> {
     if !events.is_empty()
-        && binding.pending_events.len().saturating_add(events.len()) > MAX_PENDING_LIVE_CLIENT_EVENTS
+        && binding.pending_events.len().saturating_add(events.len())
+            > MAX_PENDING_LIVE_CLIENT_EVENTS
     {
-        return Some(QueueLiveClientEventsResult::Disconnect(SlowClientDisconnect {
-            connection_id: binding.connection_id,
-        }));
+        return Some(QueueLiveClientEventsResult::Disconnect(
+            SlowClientDisconnect {
+                connection_id: binding.connection_id,
+            },
+        ));
     }
 
     if !binding.replay_ready {
@@ -1680,11 +1687,7 @@ fn queue_live_client_events_for_binding(
     }))
 }
 
-async fn flush_queued_live_client_events(
-    state: &AppState,
-    session_id: &str,
-    connection_id: u64,
-) {
+async fn flush_queued_live_client_events(state: &AppState, session_id: &str, connection_id: u64) {
     loop {
         let next_batch = {
             let mut clients = state.session_clients.lock().await;
@@ -1694,7 +1697,9 @@ async fn flush_queued_live_client_events(
             if binding.connection_id != connection_id {
                 return;
             }
-            if binding.live_send_in_progress || binding.pending_events.is_empty() || !binding.replay_ready
+            if binding.live_send_in_progress
+                || binding.pending_events.is_empty()
+                || !binding.replay_ready
             {
                 return;
             }
@@ -1718,7 +1723,8 @@ async fn flush_queued_live_client_events(
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     if tx.send(payload).await.is_err() {
-                        unbind_session_connection_if_matches(state, session_id, connection_id).await;
+                        unbind_session_connection_if_matches(state, session_id, connection_id)
+                            .await;
                         return;
                     }
                     unsent_start += 1;
@@ -1830,7 +1836,8 @@ async fn record_tool_output_event_for_replay_and_client(
                 if let Some(task_key) = live_task_key_from_event(&event) {
                     if !round.active_tasks.contains(&task_key) {
                         let start_event = synthetic_task_started_event_for_output(&event);
-                        let can_store_task_start = round.delegated_events.len() < DELEGATED_EVENTS_CAP;
+                        let can_store_task_start =
+                            round.delegated_events.len() < DELEGATED_EVENTS_CAP;
                         let mut recorded_orchestrate_start = false;
                         if let Some(orchestrate_started_event) =
                             synthetic_orchestrate_started_event_for_output(
@@ -1847,16 +1854,21 @@ async fn record_tool_output_event_for_replay_and_client(
                                 && round.delegated_events.len() + usize::from(can_store_task_start)
                                     <= DELEGATED_EVENTS_CAP
                             {
-                                if let Some(existing) = round.delegated_events.iter_mut().rev().find(|existing| {
-                                    existing["type"] == "orchestrate_started"
-                                        && existing["synthetic"].as_bool().unwrap_or(false)
-                                        && existing["orchestrate_id"].as_str() == Some(orchestrate_id.as_str())
-                                }) {
+                                if let Some(existing) =
+                                    round.delegated_events.iter_mut().rev().find(|existing| {
+                                        existing["type"] == "orchestrate_started"
+                                            && existing["synthetic"].as_bool().unwrap_or(false)
+                                            && existing["orchestrate_id"].as_str()
+                                                == Some(orchestrate_id.as_str())
+                                    })
+                                {
                                     *existing = orchestrate_started_event.clone();
                                     client_events.push(orchestrate_started_event);
                                 } else {
                                     round.active_orchestrations.insert(orchestrate_id);
-                                    round.delegated_events.push(orchestrate_started_event.clone());
+                                    round
+                                        .delegated_events
+                                        .push(orchestrate_started_event.clone());
                                     client_events.push(orchestrate_started_event);
                                     recorded_orchestrate_start = true;
                                 }
@@ -1884,7 +1896,8 @@ async fn record_tool_output_event_for_replay_and_client(
                 if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
                     merge_live_tool_output(&mut tool.live_output, stream, chunk);
                     if tool.arguments.is_empty() {
-                        if let Some(tool_call_event) = synthetic_tool_call_event_for_output(&event) {
+                        if let Some(tool_call_event) = synthetic_tool_call_event_for_output(&event)
+                        {
                             client_events.push(tool_call_event);
                         }
                     }
@@ -1948,6 +1961,32 @@ async fn record_tool_output_event_for_replay_and_client(
     }
     if unsent_start == events.len() {
         finish_live_client_send(state, session_id, connection_id, Vec::new()).await;
+    }
+}
+
+pub(crate) async fn replace_connection_cancel_binding(
+    state: &AppState,
+    session_id: &str,
+    connection_id: u64,
+    connection_cancel: &CancellationToken,
+) {
+    let old_binding = {
+        let mut cancels = state.connection_cancels.lock().await;
+        let old_binding = cancels.remove(session_id);
+        cancels.insert(
+            session_id.to_string(),
+            ConnectionCancelBinding {
+                connection_id,
+                cancel: connection_cancel.clone(),
+            },
+        );
+        old_binding
+    };
+
+    if let Some(old_binding) = old_binding
+        && old_binding.connection_id != connection_id
+    {
+        old_binding.cancel.cancel();
     }
 }
 
@@ -2044,15 +2083,21 @@ async fn take_live_client_send_batch(
     }
 }
 
-fn apply_live_compression_event(round: &mut LiveRoundState, event_type: &str, event: &serde_json::Value) {
+fn apply_live_compression_event(
+    round: &mut LiveRoundState,
+    event_type: &str,
+    event: &serde_json::Value,
+) {
     match event_type {
         "context_compressed" => {
             round.latest_compression.outcome = Some("compressed".to_string());
             round.latest_compression.reason = None;
-            round.latest_compression.messages_removed =
-                event["messages_removed"].as_u64().map(|value| value as usize);
-            round.latest_compression.before_estimate =
-                event["before_estimate"].as_u64().map(|value| value as usize);
+            round.latest_compression.messages_removed = event["messages_removed"]
+                .as_u64()
+                .map(|value| value as usize);
+            round.latest_compression.before_estimate = event["before_estimate"]
+                .as_u64()
+                .map(|value| value as usize);
             round.latest_compression.after_estimate =
                 event["after_estimate"].as_u64().map(|value| value as usize);
             round.latest_compression.saved_tokens =
@@ -2086,8 +2131,9 @@ fn apply_live_compression_event(round: &mut LiveRoundState, event_type: &str, ev
 }
 
 fn apply_live_pruned_event(round: &mut LiveRoundState, event: &serde_json::Value) {
-    round.latest_compression.pruned_messages_removed =
-        event["messages_removed"].as_u64().map(|value| value as usize);
+    round.latest_compression.pruned_messages_removed = event["messages_removed"]
+        .as_u64()
+        .map(|value| value as usize);
 }
 
 fn clear_live_compression_state(round: &mut LiveRoundState) {
@@ -2290,7 +2336,10 @@ async fn dispatch_live_event(
                     let is_synthetic = event["synthetic"].as_bool().unwrap_or(false);
                     if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
                         tool.name = event["name"].as_str().unwrap_or_default().to_string();
-                        if !incoming_arguments.is_empty() || tool.arguments.is_empty() || !is_synthetic {
+                        if !incoming_arguments.is_empty()
+                            || tool.arguments.is_empty()
+                            || !is_synthetic
+                        {
                             tool.arguments = incoming_arguments.to_string();
                         }
                     } else {
@@ -2395,7 +2444,9 @@ async fn dispatch_live_event(
                     let next_phase = event["phase"].as_str().map(str::to_string);
                     let next_cycle = event["cycle"].as_u64().map(|value| value as usize);
                     let is_new_analyze_cycle = matches!(next_phase.as_deref(), Some("analyze"))
-                        && next_cycle.zip(round.cycle).is_some_and(|(next, current)| next > current);
+                        && next_cycle
+                            .zip(round.cycle)
+                            .is_some_and(|(next, current)| next > current);
                     if is_new_analyze_cycle {
                         clear_live_compression_state(round);
                     }
@@ -2416,11 +2467,14 @@ async fn dispatch_live_event(
                     && let Some(task_key) = live_task_key_from_event(&event)
                 {
                     if round.active_tasks.contains(&task_key) {
-                        if let Some(existing) = round.delegated_events.iter_mut().rev().find(|existing| {
-                            existing["type"] == "task_started"
-                                && live_task_key_from_event(existing).as_deref() == Some(task_key.as_str())
-                                && existing["prompt"].as_str().unwrap_or_default().is_empty()
-                        }) {
+                        if let Some(existing) =
+                            round.delegated_events.iter_mut().rev().find(|existing| {
+                                existing["type"] == "task_started"
+                                    && live_task_key_from_event(existing).as_deref()
+                                        == Some(task_key.as_str())
+                                    && existing["prompt"].as_str().unwrap_or_default().is_empty()
+                            })
+                        {
                             *existing = event.clone();
                         }
                     } else {
@@ -2768,8 +2822,24 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
 
 // ── WebSocket Handler ────────────────────────────────────────────────────────
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state, None))
+#[derive(Deserialize)]
+struct SessionQuery {
+    #[serde(default)]
+    session: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WsSessionQuery {
+    #[serde(default)]
+    session: Option<String>,
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Query(query): Query<WsSessionQuery>,
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_socket(socket, state, query.session))
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Option<String>) {
@@ -2822,27 +2892,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         reader_cancel.cancel();
     });
 
-    let mut current_session_id =
-        resolve_or_create_socket_session(&state, &tx, requested_id.as_deref(), connection_id).await;
-
-    // Kick out any previous connection bound to this session.
-    {
-        let mut cancels = state.connection_cancels.lock().await;
-        if let Some(old_binding) = cancels.remove(&current_session_id) {
-            old_binding.cancel.cancel();
-        }
-        cancels.insert(
-            current_session_id.clone(),
-            ConnectionCancelBinding {
-                connection_id,
-                cancel: connection_cancel.clone(),
-            },
-        );
-    }
-
-    bind_session_connection(&state, &current_session_id, connection_id, &tx, false).await;
-    replay_live_round(&tx, &state, &current_session_id).await;
-    finish_session_replay(&state, &current_session_id, connection_id).await;
+    let mut current_session_id = resolve_or_create_socket_session(
+        &state,
+        &tx,
+        requested_id.as_deref(),
+        connection_id,
+        &connection_cancel,
+    )
+    .await;
 
     let cancel = state.shutdown.clone();
     let current_session_ref = Arc::new(Mutex::new(current_session_id.clone()));
@@ -2879,6 +2936,47 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             {
                 IdleSocketInputAction::Continue => continue,
                 IdleSocketInputAction::StartAgent => {}
+                IdleSocketInputAction::SwitchSession { session_id, result } => {
+                    match switch_socket_session(
+                        &state,
+                        &tx,
+                        &current_session_ref,
+                        &mut current_session_id,
+                        &connection_cancel,
+                        connection_id,
+                        session_id,
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            if result.session_list_changed {
+                                broadcast_session_list_payload(&state).await;
+                            }
+                            ws_send(
+                                &tx,
+                                &json!({
+                                    "type": result.response_type,
+                                    "content": result.response,
+                                    "dismissible": result.dismissible,
+                                }),
+                            )
+                            .await;
+                            continue;
+                        }
+                        Err(error) => {
+                            ws_send(
+                                &tx,
+                                &json!({
+                                    "type": "error",
+                                    "content": error,
+                                    "dismissible": true,
+                                }),
+                            )
+                            .await;
+                            continue;
+                        }
+                    }
+                }
                 IdleSocketInputAction::Break => break,
             }
         } // end if !rerun_agent
@@ -2920,6 +3018,46 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
     .await;
 }
 
+async fn switch_socket_session(
+    state: &AppState,
+    tx: &WsTx,
+    current_session_ref: &Arc<Mutex<String>>,
+    current_session_id: &mut String,
+    connection_cancel: &CancellationToken,
+    connection_id: u64,
+    next_session_id: String,
+) -> Result<(), String> {
+    if next_session_id == *current_session_id {
+        return Ok(());
+    }
+
+    let previous_session_id = current_session_id.clone();
+    session_store::save_current_session_to_disk(state, &previous_session_id)
+        .await
+        .map_err(|err| {
+            format!("Failed to save session '{previous_session_id}' before switch: {err}")
+        })?;
+
+    unbind_session_connection_if_matches(state, &previous_session_id, connection_id).await;
+    {
+        let mut cancels = state.connection_cancels.lock().await;
+        cancels.remove(&previous_session_id);
+    }
+    replace_connection_cancel_binding(state, &next_session_id, connection_id, connection_cancel).await;
+
+    *current_session_id = next_session_id.clone();
+    {
+        let mut guard = current_session_ref.lock().await;
+        *guard = next_session_id.clone();
+    }
+
+    bind_session_connection(state, &next_session_id, connection_id, tx, false).await;
+    send_existing_session_payloads(tx, state, &next_session_id).await;
+    replay_live_round(tx, state, &next_session_id).await;
+    finish_session_replay(state, &next_session_id, connection_id).await;
+    Ok(())
+}
+
 // ── HTTP API ──────────────────────────────────────────────────────────────────
 
 async fn api_shutdown(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -2954,23 +3092,36 @@ async fn api_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn api_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let sessions = state.sessions.lock().await;
+    let persisted_summaries = list_saved_session_summaries_in_dir(&sessions_dir());
     let config = state.config();
-    let list: Vec<serde_json::Value> = sessions
-        .get(MAIN_SESSION_ID)
-        .map(|s| {
-            json!({
-                "id": MAIN_SESSION_ID,
-                "name": s.name,
-                "messages": s.messages.len(),
-                "tool_calls": s.tool_calls_count,
-                "model": s.effective_model(&config.model),
-                "created_at": s.created_at,
-                "updated_at": s.updated_at,
-            })
-        })
-        .into_iter()
-        .collect();
+    let mut list: Vec<serde_json::Value> = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    {
+        let sessions = state.sessions.lock().await;
+        for session in sessions.values() {
+            seen_ids.insert(session.id.clone());
+            list.push(SessionSummary::from_session(session).to_json(&config, Some(session)));
+        }
+    }
+
+    for summary in persisted_summaries {
+        if seen_ids.contains(&summary.id) {
+            continue;
+        }
+        let session = if summary.corrupt {
+            None
+        } else {
+            load_session_from_disk(&summary.id)
+        };
+        list.push(summary.to_json(&config, session.as_ref()));
+    }
+
+    list.sort_by(|a, b| {
+        let b_ts = b["updated_at"].as_u64().unwrap_or(0);
+        let a_ts = a["updated_at"].as_u64().unwrap_or(0);
+        b_ts.cmp(&a_ts)
+    });
     Json(json!({"sessions": list}))
 }
 
@@ -3460,13 +3611,26 @@ async fn api_test_mcp(
 
 /// GET /api/usage — token usage statistics.
 async fn api_usage(
+    Query(query): Query<SessionQuery>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_local_request_headers(&headers)?;
 
+    let session_id = match query.session.as_deref() {
+        Some(requested) => crate::session_store::validate_session_id(requested)
+            .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?
+            .to_string(),
+        None => MAIN_SESSION_ID.to_string(),
+    };
+
     let mut sessions = state.sessions.lock().await;
-    let session = sessions.get_mut(MAIN_SESSION_ID);
+    if !sessions.contains_key(session_id.as_str()) {
+        if let Some(session) = load_session_from_disk(&session_id) {
+            sessions.insert(session_id.clone(), session);
+        }
+    }
+    let session = sessions.get_mut(session_id.as_str());
     let (
         daily_input,
         daily_output,
@@ -3784,22 +3948,12 @@ async fn main() {
         memory_queue: std::sync::Mutex::new(memory_queue),
     });
 
-    // Ensure main session exists (load from disk or create fresh)
-    {
-        let main_session = load_session_from_disk(MAIN_SESSION_ID).unwrap_or_else(|| {
-            let mut s = Session::new_with_id(MAIN_SESSION_ID, "Main");
-            let config = state.config();
-            let model = s.effective_model(&config.model).to_string();
-            let sys = build_system_prompt(&config, &s.workspace, &model, &s.disabled_system_skills);
-            s.messages.push(sys);
-            s
-        });
-        state
-            .sessions
-            .lock()
-            .await
-            .insert(MAIN_SESSION_ID.to_string(), main_session);
-        eprintln!("  Main session: ready");
+    match ensure_session_ready(&state, None).await {
+        Ok((session_id, _)) => eprintln!("  Default session: {session_id} ready"),
+        Err(error) => {
+            eprintln!("Failed to initialize default session: {error}");
+            return;
+        }
     }
 
     let static_dir = resolve_static_dir();

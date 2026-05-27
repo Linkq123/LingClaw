@@ -16,8 +16,12 @@ import {
   formatTokenCount,
   formatToolDuration,
   hideWelcome,
+  normalizePendingDeleteSessionId,
+  pendingDeleteSessionIdForSelection,
   scheduleBackgroundTask,
+  shouldSwitchToSelectedSession,
 } from './utils.js';
+import type { SessionSummary } from './types.js';
 import {
   syncToolDrawerBounds,
   cancelToolDrawerBoundsSync,
@@ -68,12 +72,13 @@ import {
   finishReasoningStream,
   scheduleFlush,
 } from './handlers/stream.js';
-import { connect, cancelReconnect } from './socket.js';
+import { connect, cancelReconnect, reconnectToActiveSession } from './socket.js';
 import {
   ensureUploadTokenInternal,
   updateAttachButton,
   dropUnavailablePendingUploads,
   initImageListeners,
+  renderImagePreviews,
 } from './images.js';
 import { sendCmd, initInputListeners } from './input.js';
 import { toggleMobileMenu, closeMobileMenu, initMobileListeners } from './mobile.js';
@@ -197,6 +202,98 @@ function updateUsageBadge() {
   }
   dom.usageBadge.textContent = `📊 ${formatTokenCount(inp)} in / ${formatTokenCount(out)} out`;
   dom.usageBadge.title = `今日: ${formatTokenCount(inp)} input, ${formatTokenCount(out)} output\n累计: ${formatTokenCount(state.totalInputTokens)} input, ${formatTokenCount(state.totalOutputTokens)} output`;
+}
+
+function normalizeSessionListPayload(payload): SessionSummary[] {
+  return Array.isArray(payload?.sessions)
+    ? payload.sessions.map((session) => ({
+        id: String(session.id ?? ''),
+        name: String(session.name ?? session.id ?? ''),
+        updated_at:
+          typeof session.updated_at === 'number' ? session.updated_at : Number(session.updated_at ?? 0),
+        corrupt: session.corrupt === true,
+      }))
+    : [];
+}
+
+function renderSessionPicker() {
+  if (!dom.sessionPicker) return;
+  const activeSessionId = state.activeSessionId;
+  const preferredSelectedSessionId = dom.sessionPicker.value || activeSessionId || state.sessions[0]?.id || '';
+  state.pendingDeleteSessionId = normalizePendingDeleteSessionId(
+    state.sessions,
+    activeSessionId,
+    state.pendingDeleteSessionId,
+  );
+  dom.sessionPicker.replaceChildren(
+    ...state.sessions.map((session) => {
+      const option = document.createElement('option');
+      option.value = session.id;
+      option.textContent = session.name || session.id;
+      return option;
+    }),
+  );
+  const selectedSessionId = state.sessions.some((session) => session.id === preferredSelectedSessionId)
+    ? preferredSelectedSessionId
+    : activeSessionId || state.sessions[0]?.id || '';
+  dom.sessionPicker.value = selectedSessionId;
+  const deleteTargetSessionId = pendingDeleteSessionIdForSelection(
+    state.sessions,
+    activeSessionId,
+    selectedSessionId,
+    state.pendingDeleteSessionId,
+  );
+  if (dom.deleteSessionBtn) {
+    dom.deleteSessionBtn.disabled = !deleteTargetSessionId;
+  }
+}
+
+async function refreshSessionsList() {
+  try {
+    const response = await fetch('/api/sessions', { cache: 'no-store' });
+    if (!response.ok) return;
+    const payload = await response.json();
+    state.sessions = normalizeSessionListPayload(payload);
+    renderSessionPicker();
+  } catch {
+    // ignore session list refresh failures; live socket state still works
+  }
+}
+
+function switchToSession(sessionId: string) {
+  const nextSessionId = String(sessionId || '').trim();
+  if (!nextSessionId || nextSessionId === state.activeSessionId || state.sessionSwitchInFlight) {
+    renderSessionPicker();
+    return;
+  }
+  state.pendingDeleteSessionId = state.activeSessionId && state.activeSessionId !== 'main'
+    ? state.activeSessionId
+    : '';
+  state.activeSessionId = nextSessionId;
+  state.sessionSwitchInFlight = true;
+  renderSessionPicker();
+  reconnectToActiveSession(handleMessage);
+}
+
+function promptAndCreateSession() {
+  const raw = window.prompt('New session id');
+  const nextSessionId = raw?.trim();
+  if (!nextSessionId) return;
+  switchToSession(nextSessionId);
+}
+
+function deleteCurrentSession() {
+  if (!dom.sessionPicker || state.sessionSwitchInFlight) return;
+  const targetSessionId = pendingDeleteSessionIdForSelection(
+    state.sessions,
+    state.activeSessionId,
+    dom.sessionPicker.value,
+    state.pendingDeleteSessionId,
+  );
+  if (!targetSessionId) return;
+  const confirmed = window.confirm(`Delete session ${targetSessionId}?`);
+  if (!confirmed) return;
+  sendCmd(`/delete ${targetSessionId}`);
 }
 
 function appendRoundUsage(messageEl, inputTokens, outputTokens, firstTokenMs = null) {
@@ -434,9 +531,14 @@ function loadEarlierMessages() {
 
 function handleMessage(data) {
   switch (data.type) {
+    case 'session_list':
+      state.sessions = normalizeSessionListPayload(data);
+      renderSessionPicker();
+      break;
     case 'session':
       clearCompressionOutcome();
-      state.currentSessionId = data.id;
+      state.activeSessionId = data.id;
+      state.sessionSwitchInFlight = false;
       dom.sessionNameEl.textContent = data.name || 'Main';
       dom.sessionIdEl.textContent = data.id.slice(0, 12);
       if (data.capabilities && typeof data.capabilities.image === 'boolean') {
@@ -462,6 +564,7 @@ function handleMessage(data) {
         updateUsageBadge();
       }
       applyViewState(data);
+      void refreshSessionsList();
       break;
 
     case 'history': {
@@ -473,6 +576,9 @@ function handleMessage(data) {
       clearActiveAutoTrace();
       clearBufferedChatUpdates();
       setAutoFollowChat(true);
+      state.pendingImages = [];
+      renderImagePreviews();
+      state.inputHistoryIndex = -1;
       // replaceChildren() avoids the extra HTML parser invocation of
       // `innerHTML = ''` and is slightly friendlier to GC on large chats.
       dom.chat.replaceChildren();
@@ -861,7 +967,7 @@ const actionHandlers = {
   },
   'nav-usage': () => {
     closeMobileMenu();
-    openUsagePage();
+    openUsagePage(state.activeSessionId);
   },
   'close-page': (el) => {
     const overlay = el.closest('.page-overlay');
@@ -1126,6 +1232,23 @@ function handleJumpToLatestClick() {
   jumpToLatest();
 }
 
+function handleSessionPickerChange() {
+  if (!dom.sessionPicker) return;
+  if (!shouldSwitchToSelectedSession(state.sessions, state.activeSessionId, dom.sessionPicker.value)) {
+    renderSessionPicker();
+    return;
+  }
+  switchToSession(dom.sessionPicker.value);
+}
+
+function handleNewSessionClick() {
+  promptAndCreateSession();
+}
+
+function handleDeleteSessionClick() {
+  deleteCurrentSession();
+}
+
 // Throttle the chat scroll handler to one invocation per animation frame.
 // `scroll` fires at device refresh rate on fast wheels/touchpads; running
 // `syncChatScrollState` every single event produced redundant state writes
@@ -1185,6 +1308,16 @@ installChatResizeObserver();
 if (dom.jumpToLatestBtn) {
   dom.jumpToLatestBtn.addEventListener('click', handleJumpToLatestClick);
 }
+if (dom.sessionPicker) {
+  dom.sessionPicker.addEventListener('change', handleSessionPickerChange);
+}
+if (dom.newSessionBtn) {
+  dom.newSessionBtn.addEventListener('click', handleNewSessionClick);
+}
+if (dom.deleteSessionBtn) {
+  dom.deleteSessionBtn.addEventListener('click', handleDeleteSessionClick);
+}
+void refreshSessionsList();
 
 // Vite HMR: remove global listeners on module dispose so hot reloads don't
 // accumulate duplicate handlers in the dev build. No-op in production.
@@ -1212,6 +1345,15 @@ if (import.meta.hot) {
     }
     if (dom.jumpToLatestBtn) {
       dom.jumpToLatestBtn.removeEventListener('click', handleJumpToLatestClick);
+    }
+    if (dom.sessionPicker) {
+      dom.sessionPicker.removeEventListener('change', handleSessionPickerChange);
+    }
+    if (dom.newSessionBtn) {
+      dom.newSessionBtn.removeEventListener('click', handleNewSessionClick);
+    }
+    if (dom.deleteSessionBtn) {
+      dom.deleteSessionBtn.removeEventListener('click', handleDeleteSessionClick);
     }
   });
 }

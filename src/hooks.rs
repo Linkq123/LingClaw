@@ -276,7 +276,11 @@ pub(crate) fn build_compression_source_text_with_context(
 ) -> String {
     let mut lines = Vec::new();
     if let Some(context) = context {
-        if let Some(task_state) = context.task_state.as_deref().filter(|value| !value.is_empty()) {
+        if let Some(task_state) = context
+            .task_state
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
             lines.push(task_state.to_string());
         }
         if let Some(observation_hint) = context
@@ -399,10 +403,7 @@ pub(crate) fn build_compression_call_prompt(messages: &[ChatMessage]) -> Option<
     build_compression_call_prompt_with_context(messages, None)
 }
 
-pub(crate) fn estimate_summary_output_tokens(
-    provider: Provider,
-    summary_content: &str,
-) -> u64 {
+pub(crate) fn estimate_summary_output_tokens(provider: Provider, summary_content: &str) -> u64 {
     estimate_tokens_for_provider(
         provider,
         &[ChatMessage {
@@ -446,7 +447,11 @@ pub(crate) fn build_compressed_messages(
     out
 }
 
-pub(crate) fn apply_context_compressed_metrics(event: &mut serde_json::Value, before_estimate: usize, after_estimate: usize) {
+pub(crate) fn apply_context_compressed_metrics(
+    event: &mut serde_json::Value,
+    before_estimate: usize,
+    after_estimate: usize,
+) {
     let saved_tokens = before_estimate.saturating_sub(after_estimate);
     let saved_percent = if before_estimate > 0 {
         ((saved_tokens as f64) / (before_estimate as f64) * 100.0).round() as usize
@@ -584,12 +589,10 @@ impl AgentHook for AutoCompressContextHook {
 
             let before_estimate = estimate_tokens_for_provider(input.provider, &input.messages);
             let to_compress = &input.messages[1..compress_end];
-            let Some(prompt) =
-                build_compression_call_prompt_with_context(
-                    to_compress,
-                    input.compression_context.as_ref(),
-                )
-            else {
+            let Some(prompt) = build_compression_call_prompt_with_context(
+                to_compress,
+                input.compression_context.as_ref(),
+            ) else {
                 return HookOutput::NoOp;
             };
             let existing_summary = extract_existing_summary(to_compress);
@@ -629,9 +632,9 @@ impl AgentHook for AutoCompressContextHook {
             let input_tokens = summary
                 .input_tokens
                 .unwrap_or_else(|| estimate_tokens_for_provider(resolved.provider, &prompt) as u64);
-            let output_tokens = summary
-                .output_tokens
-                .unwrap_or_else(|| estimate_summary_output_tokens(resolved.provider, &summary_text));
+            let output_tokens = summary.output_tokens.unwrap_or_else(|| {
+                estimate_summary_output_tokens(resolved.provider, &summary_text)
+            });
             let usage = UsageUpdate {
                 input_tokens,
                 output_tokens,

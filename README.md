@@ -8,7 +8,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 
 - **Skill** — LLM 推理层：系统提示、模型路由、上下文裁剪、思维模式、结构化记忆注入
 - **CLI** — 工具执行层：安全的命令/文件/网络工具、沙盒路径、SSRF 防护、安装与更新
-- **Loop** — 连接层：WebSocket 主会话、流式输出、斜杠命令、持久化、异步记忆更新
+- **Loop** — 连接层：WebSocket 多会话运行时、流式输出、斜杠命令、持久化、异步记忆更新
 
 整个后端约 19900 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
 
@@ -16,12 +16,12 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 
 - **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`；另有 2 个动态工具：`task`（子代理委托，发现代理时注册）、`orchestrate`（多代理 DAG 编排，发现代理时注册）
 - **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；主 Agent 与子代理都会按需发现并使用这些 MCP tools；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断；server 启动连续失败会进入短暂冷却，避免请求风暴
-- **单主会话**：运行时固定使用 `main`，不再创建、切换或删除其他会话
+- **多会话**：默认会话仍为 `main`，但现在支持创建、切换、列出和删除其他持久化 session；前端通过 header 中的 session picker 切换，WebSocket 连接按 session 绑定并在切换时重连
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、frontend-coder、backend-coder、general-coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
-- **文档化斜杠命令**：`/new`、`/model`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/reflection`、`/help`
+- **文档化斜杠命令**：`/new`、`/model`、`/switch`、`/sessions`、`/delete`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/reflection`、`/help`
 - **四 Provider 模型路由**：OpenAI + Anthropic + Ollama + Gemini，支持 `provider/model` 和纯 model ID
-- **主会话模型覆盖**：运行时通过 `/model` 切换 `main` 使用的模型
-- **持久化主会话**：固定保存 `main` 工作区和磁盘存档
+- **会话模型覆盖**：运行时通过 `/model` 切换当前活动 session 使用的模型
+- **会话持久化**：默认 `main` 与其他 session 都会各自保存工作区和磁盘存档
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
 - **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、毛玻璃渐变背景、稳定的 Markdown 分段渲染（表格、代码块、任务列表、引用、数学公式等常见格式）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、主回复右下角显示本轮输入/输出 token 和首 token 耗时、输入框上下键历史导航（最多 10 条）；Settings 页面（React 岛屿）支持在线编辑配置、Provider 连接测试、MCP Server 连接测试，并可在 Models 标签页直接编辑 `compat.thinkingFormat`；顶部提供默认关闭的 `Auto Debug` 本地开关，用于查看最近一条顶层 `think=auto` 决策轨迹；Usage 页面（React 岛屿）显示 Token 用量统计、按 Model Role 拆分的明细卡片与 Canvas 图表
 - **图片附件**：支持通过 URL 或本地 JPEG/PNG 上传附加图片到用户消息；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；Gemini/Ollama 会由 LingClaw 本地预取为 base64/inlineData 并持久化缓存到会话工作区，因此可配合私网、localhost 或仅局域网可达的网关使用；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
@@ -252,8 +252,8 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 `structuredMemory` 是一个默认关闭的可选功能，用于维护一份**机器可读**的长期记忆，与人工编辑的 `MEMORY.md` 和 `memory/YYYY-MM-DD.md` 并存。
 
 - 启用方式：在 `settings.structuredMemory` 中设为 `true`，或设置环境变量 `LINGCLAW_STRUCTURED_MEMORY=true`
-- 存储位置：`~/.lingclaw/main/workspace/structured_memory.json`
-- 审计文件：`~/.lingclaw/main/workspace/structured_memory.audit.jsonl`
+- 存储位置：`~/.lingclaw/<session-id>/workspace/structured_memory.json`
+- 审计文件：`~/.lingclaw/<session-id>/workspace/structured_memory.audit.jsonl`
 - 更新时机：每轮回答完成后的 Finish 阶段，异步入队并做 3 秒 debounce，不阻塞主 agent loop
 - 模型选择：优先使用 `agents.defaults.model.memory` 或环境变量 `LINGCLAW_MEMORY_MODEL`；未设置时回退到当前会话有效模型
 - 提取来源：使用 user/assistant 对话内容，并附带 tool 调用名与 tool 结果首行摘要；会过滤自动生成的 `## Context Summary (auto-generated)` 压缩摘要
@@ -266,7 +266,7 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 `dailyReflection` 是一个默认关闭的可选功能，用于把多步任务结束后的简短复盘写入每日记忆文件。它与 `structuredMemory` 不同：前者写的是面向人阅读的 daily log 条目，后者维护的是机器可读的 `structured_memory.json`。
 
 - 启用方式：在 `settings.dailyReflection` 中设为 `true`，或设置环境变量 `LINGCLAW_DAILY_REFLECTION=true`
-- 存储位置：`~/.lingclaw/main/workspace/memory/YYYY-MM-DD.md`
+- 存储位置：`~/.lingclaw/<session-id>/workspace/memory/YYYY-MM-DD.md`
 - 写入格式：reflection 会以 `## HH:MM Local — Reflection (...)` 形式追加到 daily memory 文件中，与 `/new` 写入的普通压缩摘要共存
 - 触发条件：仅在完成阶段触发，默认至少需要 3 个 agent cycle，并受 10 分钟冷却限制；不阻塞主 agent loop
 - 模型选择：优先使用 `agents.defaults.model.reflection` 或环境变量 `LINGCLAW_REFLECTION_MODEL`；未设置时回退到 `memory` 模型，再回退到当前会话有效模型
@@ -319,7 +319,7 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 | `/status` | 显示当前有效模型/provider、runtime phase/cycle、上下文估算、最大输出 token、思维级别；当 `/think auto` 时额外显示 live `auto_signals` / `auto_decision` 摘要，token 数值按 K/M 显示 |
 | `/system-prompt` | 输出当前会话的新鲜系统提示词，以及该系统提示词按当前 provider 估算的 token 开销 |
 | `/mcp [refresh]` | 查看当前已加载的 MCP server 状态；加上 `refresh` 时强制刷新工具缓存并重建运行时 MCP 会话 |
-| `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；单会话模式下同时显示主会话今日总 token 估算，按 K/M 显示 |
+| `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；同时附带所有已加载 session 的今日总 token 汇总，按 K/M 显示 |
 | `/clear` | 清空消息但保留系统提示 |
 | `/memory [stats\|debug]` | 查看当前 structured memory 摘要与 updater 状态；`stats` 仅显示运行状态，`debug` 额外显示最近审计记录 |
 | `/reflection [today\|yesterday\|list]` | 查看当前 daily reflection 状态与 reflection 条目；默认显示 feature 状态、冷却信息和今天的 reflection 预览，`list` 只列出实际包含 reflection 的日期文件 |
@@ -359,7 +359,7 @@ Skills 从三个目录分层加载，后加载的同名 Skill 覆盖先前的：
 |------|------|------|
 | **System** | `docs/reference/skills/` 或 `~/.lingclaw/system-skills/` | 随程序分发的内置 Skills；安装时自动部署到 `~/.lingclaw/system-skills/` |
 | **Global** | `~/.lingclaw/skills/` | 跨 session 共享的全局 Skills |
-| **Session** | `~/.lingclaw/main/workspace/skills/` | 主会话专属 Skills |
+| **Session** | `~/.lingclaw/<session-id>/workspace/skills/` | 当前 session 专属 Skills |
 
 ### 结构
 
@@ -418,7 +418,7 @@ SKILL.md 的 YAML frontmatter 格式兼容 [Agent Skills 规范](https://agentsk
 |------|------|------|
 | **System** | `docs/reference/agents/` | 随程序分发的内置子代理 |
 | **Global** | `~/.lingclaw/agents/` | 跨 session 共享的全局子代理 |
-| **Session** | `~/.lingclaw/main/workspace/agents/` | 主会话专属子代理 |
+| **Session** | `~/.lingclaw/<session-id>/workspace/agents/` | 当前 session 专属子代理 |
 
 ### 内置子代理
 
@@ -501,8 +501,8 @@ tools:
         │                  │                   │
 ┌───────▼───────┐  ┌───────▼────────┐  ┌──────▼────────┐
 │  Agent Loop   │  │  Session Store │  │  Config       │
-│  ReAct FSM    │  │  主会话持久化    │  │  模型路由      │
-│  ≤200 rounds  │  │  主会话工作区    │  │  环境变量回退   │
+│  ReAct FSM    │  │  会话持久化      │  │  模型路由      │
+│  ≤200 rounds  │  │  会话工作区      │  │  环境变量回退   │
 └───┬───────┬───┘  └────────────────┘  └───────────────┘
     │       │
 ┌───▼───┐ ┌─▼──────────────────┐
@@ -636,7 +636,7 @@ src/
 ├── hooks.rs           (~830 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
 ├── memory.rs          (~3020 行) — structured_memory.json 读写, task memory 检索/排序, prompt 注入, MemoryUpdateQueue, /memory 状态
 ├── image_uploads.rs   (~760 行)  — S3 签名/上传, PNG/JPEG 校验, 生命周期管理, 附件令牌签发
-├── session_admin.rs   (~10 行)   — 全局用量统计 (仅主会话)
+├── session_admin.rs   (~10 行)   — 全局用量统计
 ├── session_store.rs   (~630 行)  — 会话持久化, 迁移, 磁盘 I/O
 ├── socket_sync.rs     (~100 行)  — WebSocket 会话声明, 断线监听, 重绑定
 ├── socket_tasks.rs    (~150 行)  — WebSocket 读写任务
@@ -857,8 +857,9 @@ think_level 映射：
 ├── system-agents/          — 安装时部署的系统子代理 (从 docs/reference/agents/ 复制)
 ├── skills/                 — 全局 Skills (跨 session 共享)
 ├── sessions/
-│   └── main.json           — 主会话存档
-├── main/workspace/         — 主会话工作区
+│   ├── main.json           — 默认会话存档
+│   └── <session-id>.json   — 其他 session 存档
+├── <session-id>/workspace/ — 对应 session 工作区
 │   ├── AGENTS.md           — 核心代理行为
 │   ├── IDENTITY.md         — 身份信息
 │   ├── SOUL.md             — 高层推理规则
@@ -901,7 +902,7 @@ think_level 映射：
 
 | type | 用途 |
 |---|---|
-| `session` | 首次连接或主会话刷新时的当前会话信息 |
+| `session` | 首次连接或当前绑定 session 刷新时的当前会话信息 |
 | `history` | 当前会话历史消息 |
 | `view_state` | `show_tools` / `show_reasoning` / `show_react` 状态同步 |
 | `start` | 新一轮回复开始 |
@@ -941,7 +942,7 @@ think_level 映射：
 | 端点 | 方法 | 说明 |
 |---|---|---|
 | `/api/health` | GET | 健康检查（返回 `version`、`model`、`sessions`） |
-| `/api/sessions` | GET | 返回主会话信息 |
+| `/api/sessions` | GET | 返回已知 session 列表 |
 | `/api/client-config` | GET | 返回前端配置（上传 token、S3 能力标记等） |
 | `/api/config` | GET | 读取原始 JSON 配置文件（含解析错误回退） |
 | `/api/config` | PUT | 校验并保存 JSON 配置文件（原子写入 + 备份恢复） |
@@ -954,7 +955,7 @@ think_level 映射：
 
 ## Session Workspace
 
-主会话拥有独立工作区 `~/.lingclaw/main/workspace/`，包含以下提示文件：
+当前 session 拥有独立工作区 `~/.lingclaw/<session-id>/workspace/`，包含以下提示文件：
 
 | 文件 | 用途 |
 |---|---|

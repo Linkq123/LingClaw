@@ -1,4 +1,4 @@
-import type { AutoTraceEvent, CompressionOutcome, ImageAttachment, HistoryMessage, ReactPhase } from './types.js';
+import type { AutoTraceEvent, CompressionOutcome, ImageAttachment, HistoryMessage, ReactPhase, SessionSummary } from './types.js';
 
 // ── DOM refs ──
 
@@ -15,6 +15,9 @@ export interface DomRefs {
   connLabel: HTMLElement | null;
   sessionNameEl: HTMLElement | null;
   sessionIdEl: HTMLElement | null;
+  sessionPicker: HTMLSelectElement | null;
+  newSessionBtn: HTMLButtonElement | null;
+  deleteSessionBtn: HTMLButtonElement | null;
   headerVersionEl: HTMLElement | null;
   toggleToolsBtn: HTMLButtonElement | null;
   toggleReasoningBtn: HTMLButtonElement | null;
@@ -49,7 +52,10 @@ export interface AppState {
   ws: WebSocket | null;
   currentMsg: HTMLElement | null;
   busy: boolean;
-  currentSessionId: string;
+  activeSessionId: string;
+  pendingDeleteSessionId: string;
+  sessions: SessionSummary[];
+  sessionSwitchInFlight: boolean;
   reasoningPanel: HTMLElement | null;
   reactStatusRow: HTMLElement | null;
   reactStatusPhase: ReactPhase;
@@ -116,7 +122,10 @@ export const state: AppState = {
   ws: null,
   currentMsg: null,
   busy: false,
-  currentSessionId: '',
+  activeSessionId: '',
+  pendingDeleteSessionId: '',
+  sessions: [],
+  sessionSwitchInFlight: false,
   reasoningPanel: null,
   reactStatusRow: null,
   reactStatusPhase: '',
@@ -183,6 +192,9 @@ export function initDomRefs() {
   dom.connLabel = document.getElementById('conn-label');
   dom.sessionNameEl = document.getElementById('session-name');
   dom.sessionIdEl = document.getElementById('session-id');
+  dom.sessionPicker = document.getElementById('session-picker') as HTMLSelectElement | null;
+  dom.newSessionBtn = document.getElementById('new-session-btn') as HTMLButtonElement | null;
+  dom.deleteSessionBtn = document.getElementById('delete-session-btn') as HTMLButtonElement | null;
   dom.headerVersionEl = document.getElementById('app-version-header');
   dom.toggleToolsBtn = document.getElementById('toggle-tools-btn') as HTMLButtonElement | null;
   dom.toggleReasoningBtn = document.getElementById(

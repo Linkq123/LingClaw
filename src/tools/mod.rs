@@ -403,7 +403,9 @@ fn tool_handler_exec<'a>(
     event_tx: Option<ToolEventSender>,
     bounded_event_tx: Option<BoundedToolEventSender>,
 ) -> ToolFuture<'a> {
-    Box::pin(async move { exec::tool_exec(args, config, workspace, event_tx, bounded_event_tx).await })
+    Box::pin(
+        async move { exec::tool_exec(args, config, workspace, event_tx, bounded_event_tx).await },
+    )
 }
 
 fn tool_handler_read_file<'a>(

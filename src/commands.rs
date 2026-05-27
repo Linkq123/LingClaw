@@ -6,17 +6,21 @@ use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AppState, ChatMessage, MAIN_SESSION_ID, Session, WsTx, agent, build_system_prompt,
+    AppState, MAIN_SESSION_ID, Session, WsTx, agent, build_system_prompt,
     build_system_prompt_with_query_cached, default_show_react, default_show_reasoning,
     default_show_tools,
     hooks::{
         build_compression_call_prompt, estimate_summary_output_tokens, extract_existing_summary,
     },
     memory, now_epoch, prompts, providers,
+    runtime_loop::{
+        ensure_session_ready, resolve_session_target_for_command, resolve_session_target_for_delete,
+    },
     session_admin::gather_global_today_usage,
     session_store::{
-        build_session_status, build_usage_report, replace_session_messages,
-        save_session_to_disk_locked, session_persist_gate,
+        SessionSummary, build_session_status, build_usage_report,
+        list_saved_session_summaries_in_dir, replace_session_messages, save_session_to_disk_locked,
+        session_persist_gate, sessions_dir,
     },
     tools, truncate, ws_send,
 };
@@ -27,8 +31,10 @@ pub(crate) struct CommandResult {
     pub(crate) response: String,
     pub(crate) response_type: &'static str,
     pub(crate) sessions_changed: bool,
+    pub(crate) session_list_changed: bool,
     pub(crate) refresh_history: bool,
     pub(crate) dismissible: bool,
+    pub(crate) switch_to_session: Option<String>,
 }
 
 pub(crate) fn command_result(
@@ -40,8 +46,10 @@ pub(crate) fn command_result(
         response: response.into(),
         response_type,
         sessions_changed,
+        session_list_changed: false,
         refresh_history: false,
         dismissible: true,
+        switch_to_session: None,
     }
 }
 
@@ -52,6 +60,29 @@ pub(crate) fn command_result_with_history(
 ) -> CommandResult {
     CommandResult {
         refresh_history: true,
+        ..command_result(response, response_type, sessions_changed)
+    }
+}
+
+pub(crate) fn command_result_with_session_switch(
+    response: impl Into<String>,
+    response_type: &'static str,
+    sessions_changed: bool,
+    session_id: impl Into<String>,
+) -> CommandResult {
+    CommandResult {
+        switch_to_session: Some(session_id.into()),
+        ..command_result(response, response_type, sessions_changed)
+    }
+}
+
+pub(crate) fn command_result_with_session_list_change(
+    response: impl Into<String>,
+    response_type: &'static str,
+    sessions_changed: bool,
+) -> CommandResult {
+    CommandResult {
+        session_list_changed: true,
         ..command_result(response, response_type, sessions_changed)
     }
 }
@@ -311,14 +342,12 @@ fn status_compression_line(live_round: Option<&crate::LiveRoundState>) -> Option
     let compression = details.latest_compression.outcome.as_deref()?;
     match compression {
         "compressed" => Some(format!(
-            "compression: compressed saved_tokens={} saved_percent={}"
-            ,
+            "compression: compressed saved_tokens={} saved_percent={}",
             details.latest_compression.saved_tokens.unwrap_or(0),
             details.latest_compression.saved_percent.unwrap_or(0)
         )),
         "skipped" => Some(format!(
-            "compression: skipped reason={}"
-            ,
+            "compression: skipped reason={}",
             details
                 .latest_compression
                 .reason
@@ -326,8 +355,7 @@ fn status_compression_line(live_round: Option<&crate::LiveRoundState>) -> Option
                 .unwrap_or("unknown")
         )),
         "failed" => Some(format!(
-            "compression: failed reason={}"
-            ,
+            "compression: failed reason={}",
             details
                 .latest_compression
                 .reason
@@ -584,9 +612,13 @@ async fn handle_new_command(
             let local_snapshot = prompts::current_local_snapshot();
             let today = local_snapshot.today();
             let memory_path = memory_dir.join(format!("{today}.md"));
-            if let Err(e) =
-                append_daily_memory_entry(&memory_path, &today, &local_snapshot.hhmm(), summary_body)
-                    .await
+            if let Err(e) = append_daily_memory_entry(
+                &memory_path,
+                &today,
+                &local_snapshot.hhmm(),
+                summary_body,
+            )
+            .await
             {
                 return Some(command_result(
                     format!("Failed to write memory: {e}"),
@@ -599,7 +631,9 @@ async fn handle_new_command(
         match reset_session_context_and_persist(state, current_session_id).await {
             Ok(()) => {
                 let response = if let Some(today) = saved_memory_date.as_deref() {
-                    format!("Conversation compressed and saved to memory/{today}.md. Context cleared.")
+                    format!(
+                        "Conversation compressed and saved to memory/{today}.md. Context cleared."
+                    )
                 } else {
                     "Context cleared.".to_string()
                 };
@@ -734,16 +768,47 @@ async fn handle_new_command(
 }
 
 async fn handle_switch_command(
-    _arg: &str,
-    _current_session_id: &str,
+    arg: &str,
+    current_session_id: &str,
     _connection_id: u64,
-    _state: &AppState,
+    state: &AppState,
 ) -> CommandResult {
-    command_result(
-        "Single-session mode is enabled. LingClaw only keeps the main session.",
-        "system",
-        false,
-    )
+    if arg.is_empty() {
+        return command_result("Usage: /switch <session-id>", "system", false);
+    }
+
+    let target_session_id = match resolve_session_target_for_command(state, arg).await {
+        Ok(session_id) => session_id,
+        Err(err) if err.contains("not found") => {
+            match crate::session_store::validate_session_id(arg) {
+                Ok(session_id) => session_id.to_string(),
+                Err(validation_err) => return command_result(validation_err, "error", false),
+            }
+        }
+        Err(err) => return command_result(err, "error", false),
+    };
+
+    if target_session_id == current_session_id {
+        return command_result(
+            format!("Already using session: {target_session_id}"),
+            "system",
+            false,
+        );
+    }
+
+    match ensure_session_ready(state, Some(&target_session_id)).await {
+        Ok((session_id, created_fresh)) => {
+            let mut result = command_result_with_session_switch(
+                format!("Switching to session: {session_id}"),
+                "system",
+                true,
+                session_id,
+            );
+            result.session_list_changed = created_fresh;
+            result
+        }
+        Err(err) => command_result(err, "error", false),
+    }
 }
 
 async fn handle_model_command(
@@ -1487,8 +1552,8 @@ async fn handle_reasoning_command(
     }
 }
 
-fn handle_help_command(current_session_id: &str) -> CommandResult {
-    let mut help = "\
+fn handle_help_command(_current_session_id: &str) -> CommandResult {
+    let help = "\
 Commands:
     /new             Compress conversation to memory & clear context
     /status          Show session status
@@ -1496,6 +1561,9 @@ Commands:
     /mcp [refresh]   Show MCP load status or refresh cache
     /usage           Show session token usage
     /model [name]    Show or switch model
+    /switch <id>     Switch to or create a session
+    /sessions        List sessions
+    /delete <id>     Delete a non-current session
     /think [level]   Set thinking mode (auto|off|minimal|low|medium|high|xhigh|max)
     /react [on|off]  Toggle ReAct phase visibility
     /tool [on|off]   Toggle tool card visibility
@@ -1511,29 +1579,160 @@ Commands:
     /reflection [today|yesterday|list] Show daily reflection status and reflection entries
     /help            Show this help"
         .to_string();
-    if current_session_id == MAIN_SESSION_ID {
-        help.push_str("\n\nSingle-session mode: LingClaw keeps only the main session.");
-    }
     command_result(help, "system", false)
 }
 
-async fn handle_sessions_command(_current_session_id: &str, _state: &AppState) -> CommandResult {
-    command_result(
-        "Single-session mode is enabled. Only the main session is available.",
-        "system",
-        false,
-    )
+async fn handle_sessions_command(current_session_id: &str, state: &AppState) -> CommandResult {
+    let config = state.config();
+    let active_ids: HashSet<String> = state
+        .active_connections
+        .lock()
+        .await
+        .keys()
+        .cloned()
+        .collect();
+    let mut summaries = list_saved_session_summaries_in_dir(&sessions_dir());
+    let sessions = state.sessions.lock().await;
+    for session in sessions.values() {
+        let already_listed = summaries.iter().any(|summary| summary.id == session.id);
+        if already_listed {
+            continue;
+        }
+        summaries.push(SessionSummary::from_session(session));
+    }
+    summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    let active_lines =
+        crate::session_store::build_active_session_lines(&sessions, &active_ids, &config);
+    let mut lines = vec![format!("Sessions (current: {current_session_id}):")];
+    for summary in summaries {
+        let id = summary.id.as_str();
+        let name = summary.name.as_str();
+        let messages = summary.messages;
+        let mut suffixes = Vec::new();
+        if id == current_session_id {
+            suffixes.push("current");
+        }
+        if id == MAIN_SESSION_ID {
+            suffixes.push("default");
+        }
+        if active_ids.contains(id) {
+            suffixes.push("active");
+        }
+        let suffix = if suffixes.is_empty() {
+            String::new()
+        } else {
+            format!(" [{}]", suffixes.join(", "))
+        };
+        lines.push(format!("  {id} — {name} ({messages} messages){suffix}"));
+    }
+    if !active_lines.is_empty() {
+        lines.push(String::new());
+        lines.push("Active sessions: ".to_string());
+        lines.extend(active_lines);
+    }
+    command_result(lines.join("\n"), "system", false)
 }
 
 async fn handle_delete_command(
-    _arg: &str,
-    _current_session_id: &str,
-    _state: &AppState,
+    arg: &str,
+    current_session_id: &str,
+    state: &AppState,
 ) -> CommandResult {
-    command_result(
-        "Single-session mode is enabled. The main session cannot be deleted.",
+    if arg.is_empty() {
+        return command_result("Usage: /delete <session-id>", "system", false);
+    }
+    let target_session_id = match resolve_session_target_for_delete(state, arg).await {
+        Ok(session_id) => session_id,
+        Err(err) => return command_result(err, "error", false),
+    };
+    if target_session_id == current_session_id {
+        return command_result("Cannot delete the current session.", "error", false);
+    }
+    if target_session_id == MAIN_SESSION_ID {
+        return command_result("Cannot delete the default main session.", "error", false);
+    }
+    if state
+        .active_connections
+        .lock()
+        .await
+        .contains_key(&target_session_id)
+    {
+        return command_result(
+            format!("Cannot delete active session: {target_session_id}"),
+            "error",
+            false,
+        );
+    }
+    if state
+        .active_runs
+        .lock()
+        .await
+        .contains_key(&target_session_id)
+    {
+        return command_result(
+            format!("Cannot delete running session: {target_session_id}"),
+            "error",
+            false,
+        );
+    }
+
+    let session_file = sessions_dir().join(format!("{target_session_id}.json"));
+    let workspace_root = crate::session_workspace_path(&target_session_id)
+        .parent()
+        .map(|path| path.to_path_buf());
+
+    if let Some(workspace_root) = workspace_root {
+        let workspace_exists = match tokio::fs::try_exists(&workspace_root).await {
+            Ok(exists) => exists,
+            Err(err) => {
+                return command_result(
+                    format!("Failed to inspect session workspace: {err}"),
+                    "error",
+                    false,
+                );
+            }
+        };
+        if workspace_exists && let Err(err) = tokio::fs::remove_dir_all(&workspace_root).await {
+            return command_result(
+                format!("Failed to delete session workspace for {target_session_id}: {err}"),
+                "error",
+                false,
+            );
+        }
+    }
+
+    let session_file_exists = match tokio::fs::try_exists(&session_file).await {
+        Ok(exists) => exists,
+        Err(err) => {
+            return command_result(
+                format!("Failed to inspect session file: {err}"),
+                "error",
+                false,
+            );
+        }
+    };
+    if session_file_exists && let Err(err) = tokio::fs::remove_file(&session_file).await {
+        return command_result(
+            format!("Failed to delete session file for {target_session_id}: {err}"),
+            "error",
+            false,
+        );
+    }
+
+    let removed = {
+        let mut sessions = state.sessions.lock().await;
+        sessions.remove(&target_session_id).is_some()
+    };
+
+    command_result_with_session_list_change(
+        if removed {
+            format!("Deleted session: {target_session_id}")
+        } else {
+            format!("Deleted saved session: {target_session_id}")
+        },
         "system",
-        false,
+        true,
     )
 }
 

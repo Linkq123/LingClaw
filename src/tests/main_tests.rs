@@ -1,5 +1,6 @@
 use super::*;
 use crate::config::JsonMcpServerConfig;
+use crate::session_store::load_session_from_disk;
 use crate::session_store::replace_session_file_from_temp;
 use axum::http::{HeaderMap, HeaderValue};
 use serde_json::json;
@@ -746,7 +747,10 @@ fn start_event_preserves_current_cycle_pre_start_compression_state() {
 
     assert_eq!(round.round, 2);
     assert_eq!(round.cycle, Some(5));
-    assert_eq!(round.latest_compression.outcome.as_deref(), Some("compressed"));
+    assert_eq!(
+        round.latest_compression.outcome.as_deref(),
+        Some("compressed")
+    );
     assert_eq!(round.latest_compression.reason, None);
     assert_eq!(round.latest_compression.messages_removed, Some(4));
     assert_eq!(round.latest_compression.before_estimate, Some(5_000));
@@ -1062,7 +1066,10 @@ fn apply_live_compression_event_clears_stale_pruned_state_on_new_compression() {
 
     apply_live_compression_event(&mut round, "context_compressed", &event);
 
-    assert_eq!(round.latest_compression.outcome.as_deref(), Some("compressed"));
+    assert_eq!(
+        round.latest_compression.outcome.as_deref(),
+        Some("compressed")
+    );
     assert_eq!(round.latest_compression.messages_removed, Some(4));
     assert_eq!(round.latest_compression.before_estimate, Some(5_000));
     assert_eq!(round.latest_compression.after_estimate, Some(4_000));
@@ -1119,7 +1126,10 @@ fn apply_live_compression_event_clears_stale_pruned_state_on_failed_compression(
     apply_live_compression_event(&mut round, "context_compress_failed", &event);
 
     assert_eq!(round.latest_compression.outcome.as_deref(), Some("failed"));
-    assert_eq!(round.latest_compression.reason.as_deref(), Some("network timeout"));
+    assert_eq!(
+        round.latest_compression.reason.as_deref(),
+        Some("network timeout")
+    );
     assert_eq!(round.latest_compression.messages_removed, None);
     assert_eq!(round.latest_compression.before_estimate, None);
     assert_eq!(round.latest_compression.after_estimate, None);
@@ -1262,9 +1272,11 @@ fn should_auto_compress_uses_request_budget_when_available() {
         provider: Provider::OpenAI,
         workspace: PathBuf::new(),
         input_budget: usize::MAX,
-        request_budget: Some(
-            crate::context::estimate_request_tokens_for_provider(Provider::OpenAI, &messages, &[]),
-        ),
+        request_budget: Some(crate::context::estimate_request_tokens_for_provider(
+            Provider::OpenAI,
+            &messages,
+            &[],
+        )),
         compression_extra_tools: Some(Vec::new()),
         cycle: 0,
         compression_context: None,
@@ -1321,11 +1333,14 @@ fn compression_source_text_with_context_prepends_structured_sections() {
     ];
     let context = crate::hooks::CompressionContextSections {
         task_state: Some("## Task State\n- Goal: inspect runtime loop".into()),
-        observation_hint: Some("## Recent Observation Notes\n- read_file returned 900 lines".into()),
+        observation_hint: Some(
+            "## Recent Observation Notes\n- read_file returned 900 lines".into(),
+        ),
         task_memory: Some("## Relevant Past Experience\n- Focus: prior blockers".into()),
     };
 
-    let source = crate::hooks::build_compression_source_text_with_context(&messages, Some(&context));
+    let source =
+        crate::hooks::build_compression_source_text_with_context(&messages, Some(&context));
 
     assert!(source.starts_with("## Task State"));
     assert!(source.contains("## Recent Observation Notes"));
@@ -3738,7 +3753,7 @@ fn build_global_today_usage_sums_all_sessions() {
         (third.id.clone(), third),
     ]);
 
-    let usage = build_global_today_usage(&sessions);
+    let usage = build_global_today_usage(sessions.values());
 
     assert!(usage.contains("global_today_usage_est: # 所有会话今日 token 使用估算"));
     assert!(usage.contains("input_tokens: 3K"));
@@ -3747,7 +3762,7 @@ fn build_global_today_usage_sums_all_sessions() {
 }
 
 #[test]
-fn gather_global_today_usage_uses_main_session_only_in_single_session_mode() {
+fn gather_global_today_usage_includes_unloaded_persisted_sessions() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = test_app_state();
     let mut current = test_session(MAIN_SESSION_ID, "Main", None);
@@ -3777,9 +3792,9 @@ fn gather_global_today_usage_uses_main_session_only_in_single_session_mode() {
     let usage = rt.block_on(gather_global_today_usage(&state));
 
     assert!(usage.contains("global_today_usage_est: # 所有会话今日 token 使用估算"));
-    assert!(usage.contains("input_tokens: 2.3K"));
-    assert!(usage.contains("output_tokens: 560"));
-    assert!(usage.contains("total_tokens: 2.9K"));
+    assert!(usage.contains("input_tokens: 3K"));
+    assert!(usage.contains("output_tokens: 1K"));
+    assert!(usage.contains("total_tokens: 4K"));
 }
 
 #[test]
@@ -3802,6 +3817,50 @@ fn build_usage_report_includes_session_and_global_sections() {
     assert!(report.contains("\tinput_tokens: 3K"));
     assert!(report.contains("\toutput_tokens: 1K"));
     assert!(report.contains("\ttotal_tokens: 4K"));
+}
+
+#[test]
+fn validate_session_id_rejects_trailing_dot_ids() {
+    for id in ["foo.", "bar.."] {
+        let err = crate::session_store::validate_session_id(id)
+            .expect_err("trailing dot session id should be rejected");
+        assert!(err.contains("Invalid session id"), "{id}: {err}");
+    }
+}
+
+#[test]
+fn validate_session_id_rejects_windows_reserved_device_names() {
+    for id in ["con", "NUL", "prn.txt", "Com1", "LPT9.md"] {
+        let err = crate::session_store::validate_session_id(id)
+            .expect_err("windows reserved device name should be rejected");
+        assert!(err.contains("Windows"), "{id}: {err}");
+    }
+}
+
+#[test]
+fn validate_session_id_rejects_reserved_top_level_config_dirs_case_insensitively() {
+    for id in ["Skills", "SESSIONS", "System-Agents", "SYSTEM-SKILLS"] {
+        let err = crate::session_store::validate_session_id(id)
+            .expect_err("reserved config dir variant should be rejected");
+        assert!(err.contains("reserved"), "{id}: {err}");
+    }
+}
+
+#[test]
+fn validate_session_id_rejects_reserved_top_level_config_dirs() {
+    for id in [
+        "agents",
+        "memory",
+        "sessions",
+        "skills",
+        "static",
+        "system-agents",
+        "system-skills",
+    ] {
+        let err = crate::session_store::validate_session_id(id)
+            .expect_err("reserved config dir should be rejected");
+        assert!(err.contains("reserved"), "{id}: {err}");
+    }
 }
 
 #[test]
@@ -3852,8 +3911,8 @@ fn list_saved_session_summaries_in_dir_includes_corrupt_files() {
     let summaries = list_saved_session_summaries_in_dir(&base);
 
     assert_eq!(summaries.len(), 1);
-    assert_eq!(summaries[0]["id"].as_str(), Some("broken-session"));
-    assert_eq!(summaries[0]["corrupt"].as_bool(), Some(true));
+    assert_eq!(summaries[0].id, "broken-session");
+    assert!(summaries[0].corrupt);
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -3890,39 +3949,62 @@ fn list_saved_session_summaries_in_dir_counts_messages_after_sanitization() {
     let summaries = list_saved_session_summaries_in_dir(&base);
 
     assert_eq!(summaries.len(), 1);
-    assert_eq!(summaries[0]["id"].as_str(), Some(session_id.as_str()));
-    assert_eq!(summaries[0]["messages"].as_u64(), Some(0));
-    assert_eq!(summaries[0]["corrupt"].as_bool(), Some(false));
+    assert_eq!(summaries[0].id, session_id);
+    assert_eq!(summaries[0].messages, 0);
+    assert!(!summaries[0].corrupt);
 
     let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]
-fn resolve_or_create_socket_session_ignores_requested_session_and_uses_main() {
+fn resolve_or_create_socket_session_honors_requested_session() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = Arc::new(test_app_state());
+    let session_id = format!("legacy-session-{}", now_epoch());
+    let session_workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&session_workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: session_workspace,
+    };
     let (tx, mut rx) = mpsc::channel::<String>(4);
 
+    let connection_cancel = CancellationToken::new();
     let resolved = rt.block_on(resolve_or_create_socket_session(
         &state,
         &tx,
-        Some("legacy-session"),
+        Some(&session_id),
         1,
+        &connection_cancel,
     ));
 
-    assert_eq!(resolved, MAIN_SESSION_ID);
+    assert_eq!(resolved, session_id);
     assert!(
         rt.block_on(state.sessions.lock())
-            .contains_key(MAIN_SESSION_ID)
+            .contains_key(session_id.as_str())
     );
 
-    let payload = rt
-        .block_on(rx.recv())
-        .expect("session payload should be sent");
-    let parsed: serde_json::Value =
-        serde_json::from_str(&payload).expect("payload should be valid json");
-    assert_eq!(parsed["type"].as_str(), Some("session"));
-    assert_eq!(parsed["id"].as_str(), Some(MAIN_SESSION_ID));
+    let payloads = vec![
+        rt.block_on(rx.recv())
+            .expect("first payload should be sent"),
+        rt.block_on(rx.recv())
+            .expect("second payload should be sent"),
+        rt.block_on(rx.recv())
+            .expect("third payload should be sent"),
+    ];
+    let payload_types = payloads
+        .iter()
+        .map(|payload| {
+            serde_json::from_str::<serde_json::Value>(payload)
+                .expect("payload should be valid json")["type"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert!(payload_types.contains(&"session".to_string()));
+    assert!(payload_types.contains(&"view_state".to_string()));
+    assert!(payload_types.contains(&"history".to_string()));
 }
 
 #[test]
@@ -4723,6 +4805,159 @@ async fn api_client_config_returns_upload_token() {
 }
 
 #[tokio::test]
+async fn api_sessions_lists_loaded_non_main_sessions() {
+    let state = Arc::new(test_app_state());
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(
+            MAIN_SESSION_ID.to_string(),
+            test_session(MAIN_SESSION_ID, "Main", None),
+        );
+        sessions.insert(
+            "verify-open".to_string(),
+            test_session("verify-open", "verify-open", None),
+        );
+    }
+
+    let response = api_sessions(State(state)).await.into_response();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should be readable");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body).expect("payload should be valid json");
+    let sessions = payload["sessions"]
+        .as_array()
+        .expect("sessions array should be present");
+
+    assert!(
+        sessions
+            .iter()
+            .any(|session| session["id"] == MAIN_SESSION_ID)
+    );
+    assert!(
+        sessions
+            .iter()
+            .any(|session| session["id"] == "verify-open")
+    );
+}
+
+#[tokio::test]
+async fn api_sessions_includes_corrupt_persisted_sessions() {
+    let session_id = format!(
+        "api-sessions-corrupt-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos()
+    );
+    let session_file = sessions_dir().join(format!("{session_id}.json"));
+    tokio::fs::write(&session_file, b"not valid json")
+        .await
+        .expect("corrupt session file should be written");
+
+    let state = Arc::new(test_app_state());
+
+    let response = api_sessions(State(state)).await.into_response();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should be readable");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body).expect("payload should be valid json");
+    let sessions = payload["sessions"]
+        .as_array()
+        .expect("sessions array should be present");
+
+    let corrupt_session = sessions
+        .iter()
+        .find(|session| session["id"] == session_id)
+        .expect("corrupt persisted session should be listed");
+    assert_eq!(corrupt_session["corrupt"], true);
+    assert_eq!(corrupt_session["name"], "[Corrupt Session]");
+
+    let _ = tokio::fs::remove_file(&session_file).await;
+}
+
+#[tokio::test]
+async fn api_usage_loads_persisted_session_not_yet_in_memory() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("usage-persisted-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace,
+    };
+
+    let mut persisted_session = test_session(&session_id, "Persisted Usage", None);
+    persisted_session.workspace = session_workspace_path(&session_id);
+    persisted_session.version = SESSION_VERSION;
+    persisted_session.input_tokens = 77;
+    persisted_session.output_tokens = 11;
+    persisted_session.input_token_source = "provider".to_string();
+    persisted_session.output_token_source = "estimated".to_string();
+    save_session_to_disk(&persisted_session)
+        .await
+        .expect("session should persist to disk");
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_usage(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers,
+        State(state.clone()),
+    )
+    .await
+    .expect("local request should be accepted");
+
+    assert_eq!(payload["total_input"], 77);
+    assert_eq!(payload["total_output"], 11);
+    assert_eq!(payload["input_source"], "provider");
+    assert_eq!(payload["output_source"], "estimated");
+    assert!(state.sessions.lock().await.contains_key(session_id.as_str()));
+}
+
+#[tokio::test]
+async fn api_usage_uses_requested_session_query() {
+    let state = Arc::new(test_app_state());
+    let mut main_session = test_session(MAIN_SESSION_ID, "Main", None);
+    main_session.input_tokens = 100;
+    main_session.output_tokens = 20;
+
+    let mut alt_session = test_session("usage-alt", "Usage Alt", None);
+    alt_session.input_tokens = 55;
+    alt_session.output_tokens = 5;
+    alt_session.input_token_source = "provider".to_string();
+    alt_session.output_token_source = "estimated".to_string();
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(main_session.id.clone(), main_session);
+        sessions.insert(alt_session.id.clone(), alt_session);
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_usage(
+        Query(SessionQuery {
+            session: Some("usage-alt".to_string()),
+        }),
+        headers,
+        State(state),
+    )
+    .await
+    .expect("local request should be accepted");
+
+    assert_eq!(payload["total_input"], 55);
+    assert_eq!(payload["total_output"], 5);
+    assert_eq!(payload["input_source"], "provider");
+    assert_eq!(payload["output_source"], "estimated");
+}
+
+#[tokio::test]
 async fn api_usage_returns_token_sources() {
     let state = Arc::new(test_app_state());
     let mut session = test_session(MAIN_SESSION_ID, "Main", None);
@@ -4741,7 +4976,7 @@ async fn api_usage_returns_token_sources() {
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
 
-    let Json(payload) = api_usage(headers, State(state))
+    let Json(payload) = api_usage(Query(SessionQuery { session: None }), headers, State(state))
         .await
         .expect("local request should be accepted");
 
@@ -4773,9 +5008,13 @@ async fn api_usage_rolls_over_stale_daily_usage_before_serializing() {
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
 
-    let Json(payload) = api_usage(headers, State(state.clone()))
-        .await
-        .expect("local request should be accepted");
+    let Json(payload) = api_usage(
+        Query(SessionQuery { session: None }),
+        headers,
+        State(state.clone()),
+    )
+    .await
+    .expect("local request should be accepted");
 
     assert_eq!(payload["daily_input"], 0);
     assert_eq!(payload["daily_output"], 0);
@@ -5794,9 +6033,11 @@ fn handle_command_new_persists_existing_auto_summary_to_memory() {
     let mut session = test_session(&session_id, "Persist New Auto Summary", None);
     session.workspace = workspace.clone();
     session.version = SESSION_VERSION;
-    session.messages.push(crate::hooks::build_auto_summary_message(
-        "Recovered summary from auto compression.",
-    ));
+    session
+        .messages
+        .push(crate::hooks::build_auto_summary_message(
+            "Recovered summary from auto compression.",
+        ));
 
     let state = test_app_state();
     {
@@ -5819,7 +6060,11 @@ fn handle_command_new_persists_existing_auto_summary_to_memory() {
     let persisted = load_session_from_disk(&session_id).expect("session should load from disk");
     assert_eq!(persisted.messages.len(), 1);
     assert_eq!(persisted.messages[0].role, "system");
-    assert!(new_result.response.contains("Conversation compressed and saved to memory/"));
+    assert!(
+        new_result
+            .response
+            .contains("Conversation compressed and saved to memory/")
+    );
 
     let local_snapshot = prompts::current_local_snapshot();
     let today = local_snapshot.today();
@@ -5881,10 +6126,13 @@ fn handle_command_switch_is_blocked_in_single_session_mode() {
         ))
         .expect("command should return a result");
 
-    assert!(
-        result
-            .response
-            .contains("LingClaw only keeps the main session")
+    assert_eq!(
+        result.response,
+        format!("Switching to session: {target_id}")
+    );
+    assert_eq!(
+        result.switch_to_session.as_deref(),
+        Some(target_id.as_str())
     );
     assert!(sessions_dir().join(format!("{source_id}.json")).exists());
     assert!(
@@ -5906,26 +6154,89 @@ fn handle_command_switch_is_blocked_in_single_session_mode() {
 #[test]
 fn recoverable_session_ids_skip_empty_and_corrupt_sessions() {
     let summaries = vec![
-        json!({
-            "id": "empty-session",
-            "messages": 0,
-            "corrupt": false,
-        }),
-        json!({
-            "id": "corrupt-session",
-            "messages": 99,
-            "corrupt": true,
-        }),
-        json!({
-            "id": "real-session",
-            "messages": 3,
-            "corrupt": false,
-        }),
+        crate::session_store::SessionSummary {
+            id: "empty-session".to_string(),
+            name: "Empty".to_string(),
+            messages: 0,
+            tool_calls: 0,
+            created_at: 0,
+            updated_at: 0,
+            corrupt: false,
+        },
+        crate::session_store::SessionSummary {
+            id: "corrupt-session".to_string(),
+            name: "[Corrupt Session]".to_string(),
+            messages: 99,
+            tool_calls: 0,
+            created_at: 0,
+            updated_at: 0,
+            corrupt: true,
+        },
+        crate::session_store::SessionSummary {
+            id: "real-session".to_string(),
+            name: "Real".to_string(),
+            messages: 3,
+            tool_calls: 0,
+            created_at: 0,
+            updated_at: 0,
+            corrupt: false,
+        },
     ];
 
     let recoverable = recoverable_session_ids_from_summaries(&summaries);
 
     assert_eq!(recoverable, vec!["real-session".to_string()]);
+}
+
+#[test]
+fn resolve_session_target_for_command_accepts_persisted_empty_session_prefix() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let session_id = format!("empty-prefix-session-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace,
+    };
+
+    let persisted_session = Session {
+        id: session_id.clone(),
+        name: "Empty Persisted".to_string(),
+        messages: Vec::new(),
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: false,
+        show_tools: true,
+        show_reasoning: true,
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
+        version: SESSION_VERSION,
+        workspace: session_workspace_path(&session_id),
+    };
+    rt.block_on(save_session_to_disk(&persisted_session)).expect("session should persist");
+
+    let prefix = &session_id[..session_id.len().min(12)];
+    let resolved = rt.block_on(crate::runtime_loop::resolve_session_target_for_command(
+        &state, prefix,
+    ))
+        .expect("empty persisted session prefix should resolve");
+
+    assert_eq!(resolved, session_id);
 }
 
 #[test]
@@ -6058,6 +6369,104 @@ fn finalize_connection_keeps_main_session_loaded_in_memory() {
         .map(PathBuf::from)
         .expect("session dir should exist");
     let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn switch_socket_session_binds_new_session_before_replay_so_live_events_are_not_lost() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let previous_session_id = MAIN_SESSION_ID.to_string();
+    let next_session_id = format!("switch-live-session-{}", now_epoch());
+    let next_workspace = session_workspace_path(&next_session_id);
+    std::fs::create_dir_all(&next_workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: next_session_id.clone(),
+        workspace: next_workspace,
+    };
+
+    let mut previous_session = test_session(&previous_session_id, "Main", None);
+    previous_session.workspace = session_workspace_path(&previous_session_id);
+    let mut next_session = test_session(&next_session_id, "Switch Target", None);
+    next_session.workspace = session_workspace_path(&next_session_id);
+    rt.block_on(async {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(previous_session_id.clone(), previous_session);
+        sessions.insert(next_session_id.clone(), next_session);
+    });
+
+    let (tx, mut rx) = mpsc::channel::<String>(16);
+    let current_session_ref = Arc::new(Mutex::new(previous_session_id.clone()));
+    let mut current_session_id = previous_session_id.clone();
+    let connection_cancel = CancellationToken::new();
+
+    rt.block_on(bind_session_connection(
+        state.as_ref(),
+        &previous_session_id,
+        1,
+        &tx,
+        true,
+    ));
+    rt.block_on(async {
+        state.connection_cancels.lock().await.insert(
+            previous_session_id.clone(),
+            ConnectionCancelBinding {
+                connection_id: 1,
+                cancel: connection_cancel.clone(),
+            },
+        );
+        state.active_runs.lock().await.insert(
+            next_session_id.clone(),
+            SessionRunBinding {
+                connection_id: 99,
+                cancel: CancellationToken::new(),
+                stop_requested: Arc::new(AtomicBool::new(false)),
+                deferred_interventions: Arc::new(Mutex::new(DeferredInterventionState::open())),
+            },
+        );
+    });
+    rt.block_on(dispatch_live_event(
+        state.as_ref(),
+        &next_session_id,
+        99,
+        json!({"type":"start","round":1,"phase":"act","cycle":0,"react_visible":false}),
+    ));
+
+    rt.block_on(switch_socket_session(
+        state.as_ref(),
+        &tx,
+        &current_session_ref,
+        &mut current_session_id,
+        &connection_cancel,
+        1,
+        next_session_id.clone(),
+    ))
+    .expect("session switch should succeed");
+
+    rt.block_on(dispatch_live_event(
+        state.as_ref(),
+        &next_session_id,
+        99,
+        json!({"type":"delta","content":"tail after switch"}),
+    ));
+
+    let payloads = rt.block_on(async {
+        let mut events = Vec::new();
+        for _ in 0..5 {
+            let payload = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
+                .await
+                .expect("payload should arrive before timeout")
+                .expect("channel should stay open during switch replay");
+            events.push(serde_json::from_str::<serde_json::Value>(&payload).expect("payload json"));
+        }
+        events
+    });
+
+    assert!(payloads.iter().any(|event| event["type"] == "session"));
+    assert!(payloads.iter().any(|event| event["type"] == "history"));
+    assert!(payloads.iter().any(|event| event["type"] == "start"));
+    assert!(payloads.iter().any(|event| {
+        event["type"] == "delta" && event["content"] == "tail after switch"
+    }));
 }
 
 #[test]
@@ -6367,7 +6776,13 @@ fn disconnect_session_connection_if_matches_cancels_matching_socket() {
 
     assert!(cancel.is_cancelled());
     rt.block_on(async {
-        assert!(!state.active_connections.lock().await.contains_key(&session_id));
+        assert!(
+            !state
+                .active_connections
+                .lock()
+                .await
+                .contains_key(&session_id)
+        );
         assert!(!state.session_clients.lock().await.contains_key(&session_id));
     });
 }
@@ -6415,7 +6830,15 @@ fn disconnect_session_connection_if_matches_keeps_newer_socket_alive() {
     assert!(!current_cancel.is_cancelled());
     assert!(!newer_cancel.is_cancelled());
     rt.block_on(async {
-        assert_eq!(state.active_connections.lock().await.get(&session_id).copied(), Some(2));
+        assert_eq!(
+            state
+                .active_connections
+                .lock()
+                .await
+                .get(&session_id)
+                .copied(),
+            Some(2)
+        );
         assert_eq!(
             state
                 .session_clients
@@ -6651,7 +7074,11 @@ fn replay_live_round_rehydrates_inflight_round_state() {
     assert_eq!(replayed[1]["selected_think"], "high");
     assert_eq!(replayed[1]["baseline_reason"], "mid_loop_investigate");
     assert_eq!(replayed[1]["signals"]["intent"], "investigate");
-    assert!(replayed[1]["signals"].get("finish_deferral_count").is_none());
+    assert!(
+        replayed[1]["signals"]
+            .get("finish_deferral_count")
+            .is_none()
+    );
     assert_eq!(replayed[2]["type"], "thinking_start");
     assert_eq!(replayed[3]["type"], "thinking_delta");
     assert_eq!(replayed[3]["content"], "step-1");
@@ -6721,7 +7148,13 @@ fn record_tool_output_event_disconnects_slow_client_socket_on_overflow() {
     assert!(cancel.is_cancelled());
     rt.block_on(async {
         assert!(!state.session_clients.lock().await.contains_key(&session_id));
-        assert!(!state.active_connections.lock().await.contains_key(&session_id));
+        assert!(
+            !state
+                .active_connections
+                .lock()
+                .await
+                .contains_key(&session_id)
+        );
     });
 }
 
@@ -6732,7 +7165,13 @@ fn record_tool_output_event_only_synthesizes_missing_tool_call_once() {
     let session_id = format!("live-tool-output-synth-{}", now_epoch());
     let (bound_tx, mut bound_rx) = mpsc::channel::<String>(16);
 
-    rt.block_on(bind_session_connection(&state, &session_id, 1, &bound_tx, true));
+    rt.block_on(bind_session_connection(
+        &state,
+        &session_id,
+        1,
+        &bound_tx,
+        true,
+    ));
     rt.block_on(dispatch_live_event(
         &state,
         &session_id,
@@ -6813,7 +7252,10 @@ fn record_tool_output_event_only_synthesizes_missing_tool_call_once() {
     }))
     .expect("follow-up tool_output should parse");
     assert_eq!(next_event["type"], "tool_output");
-    assert!(matches!(bound_rx.try_recv(), Err(tokio::sync::mpsc::error::TryRecvError::Empty)));
+    assert!(matches!(
+        bound_rx.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
 
     let live_round = rt.block_on(async {
         state
@@ -7301,7 +7743,10 @@ fn replay_live_round_replaces_synthetic_task_start_with_real_prompt() {
     });
     assert_eq!(live_round.delegated_events.len(), 2);
     assert_eq!(live_round.delegated_events[0]["type"], "task_started");
-    assert_eq!(live_round.delegated_events[0]["prompt"], "Implement feature");
+    assert_eq!(
+        live_round.delegated_events[0]["prompt"],
+        "Implement feature"
+    );
 
     let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
     rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
@@ -8845,7 +9290,9 @@ fn live_dispatch_serializes_normal_events_behind_pending_tool_output_flush() {
     ));
 
     for _ in 0..writer_capacity {
-        let _ = bound_rx.try_recv().expect("sentinel should still be queued");
+        let _ = bound_rx
+            .try_recv()
+            .expect("sentinel should still be queued");
     }
     assert!(matches!(
         bound_rx.try_recv(),
@@ -8970,7 +9417,10 @@ fn best_effort_subagent_tool_output_preserves_orchestration_context_for_replay()
         assert_eq!(round.delegated_events[0]["type"], "orchestrate_started");
         assert_eq!(round.delegated_events[0]["orchestrate_id"], "orch-1");
         assert_eq!(round.delegated_events[0]["synthetic"], true);
-        assert_eq!(round.delegated_events[1]["type"], "orchestrate_task_started");
+        assert_eq!(
+            round.delegated_events[1]["type"],
+            "orchestrate_task_started"
+        );
         assert_eq!(round.delegated_events[1]["orchestrate_id"], "orch-1");
         assert_eq!(round.delegated_events[1]["id"], "task-1");
         assert_eq!(round.delegated_events[2]["type"], "tool_output");
@@ -9325,26 +9775,22 @@ fn best_effort_tool_output_flushes_after_writer_queue_recovers_without_followup_
     });
     assert_eq!(sentinel, json!({"type":"sentinel"}).to_string());
 
-    let flushed_tool_call = serde_json::from_str::<serde_json::Value>(
-        &rt.block_on(async {
-            tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
-                .await
-                .expect("queued tool call should arrive before timeout")
-                .expect("queued tool call should be delivered")
-        }),
-    )
+    let flushed_tool_call = serde_json::from_str::<serde_json::Value>(&rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+            .await
+            .expect("queued tool call should arrive before timeout")
+            .expect("queued tool call should be delivered")
+    }))
     .expect("flushed tool call should be valid json");
     assert_eq!(flushed_tool_call["type"], "tool_call");
     assert_eq!(flushed_tool_call["id"], "tool-1");
 
-    let flushed_output = serde_json::from_str::<serde_json::Value>(
-        &rt.block_on(async {
-            tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
-                .await
-                .expect("queued tool output should arrive before timeout")
-                .expect("queued tool output should be delivered")
-        }),
-    )
+    let flushed_output = serde_json::from_str::<serde_json::Value>(&rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+            .await
+            .expect("queued tool output should arrive before timeout")
+            .expect("queued tool output should be delivered")
+    }))
     .expect("flushed payload should be valid json");
     assert_eq!(flushed_output["type"], "tool_output");
     assert_eq!(flushed_output["chunk"], "queued output");
@@ -9472,10 +9918,7 @@ fn synthetic_orchestration_growth_preserves_existing_task_agents() {
         }),
         first,
     ];
-    let active_tasks = HashSet::from([
-        "orch-1:task-a".to_string(),
-        "orch-1:task-b".to_string(),
-    ]);
+    let active_tasks = HashSet::from(["orch-1:task-a".to_string(), "orch-1:task-b".to_string()]);
 
     let synthetic = synthetic_orchestrate_started_event_for_output(
         &second,
@@ -9610,13 +10053,15 @@ fn best_effort_subagent_tool_output_replays_updated_synthetic_orchestration_to_c
 
     let start: serde_json::Value = serde_json::from_str(&start).expect("start should be json");
     let first_orchestrate_started: serde_json::Value =
-        serde_json::from_str(&first_orchestrate_started).expect("first orchestrate_started should be json");
+        serde_json::from_str(&first_orchestrate_started)
+            .expect("first orchestrate_started should be json");
     let task_a_started: serde_json::Value =
         serde_json::from_str(&task_a_started).expect("task-a start should be json");
     let task_a_output: serde_json::Value =
         serde_json::from_str(&task_a_output).expect("task-a output should be json");
     let second_orchestrate_started: serde_json::Value =
-        serde_json::from_str(&second_orchestrate_started).expect("second orchestrate_started should be json");
+        serde_json::from_str(&second_orchestrate_started)
+            .expect("second orchestrate_started should be json");
     let task_b_started: serde_json::Value =
         serde_json::from_str(&task_b_started).expect("task-b start should be json");
     let task_b_output: serde_json::Value =
@@ -11256,7 +11701,10 @@ fn save_session_replace_from_temp_restores_backup_on_failed_swap() {
 
 #[test]
 fn save_session_replace_from_temp_replaces_existing_file_with_stale_backup() {
-    let base = std::env::temp_dir().join(format!("lingclaw-session-replace-stale-backup-{}", now_epoch()));
+    let base = std::env::temp_dir().join(format!(
+        "lingclaw-session-replace-stale-backup-{}",
+        now_epoch()
+    ));
     let path = base.join("session.json");
     let tmp_path = base.join("session.json.tmp");
     let backup_path = base.join("session.json.lingclaw-save-backup");

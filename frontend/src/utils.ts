@@ -1,3 +1,5 @@
+import type { SessionSummary } from './types.js';
+
 export function escHtml(s) {
   s = String(s ?? '');
   return s
@@ -178,6 +180,45 @@ export function formatTokenCount(n) {
   if (n < 10000) return (n / 1000).toFixed(1) + 'K';
   if (n < 1000000) return Math.round(n / 1000) + 'K';
   return (n / 1000000).toFixed(1) + 'M';
+}
+
+export function normalizePendingDeleteSessionId(
+  sessions: SessionSummary[],
+  activeSessionId: string,
+  pendingDeleteSessionId: string,
+) {
+  const candidate = String(pendingDeleteSessionId || '').trim();
+  if (!candidate || candidate === 'main' || candidate === activeSessionId) return '';
+  return sessions.some((session) => session.id === candidate) ? candidate : '';
+}
+
+export function pendingDeleteSessionIdForSelection(
+  sessions: SessionSummary[],
+  activeSessionId: string,
+  selectedSessionId: string,
+  pendingDeleteSessionId: string,
+) {
+  const selected = String(selectedSessionId || '').trim();
+  if (selected && selected !== 'main' && selected !== activeSessionId) {
+    const selectedSession = sessions.find((session) => session.id === selected);
+    if (selectedSession?.corrupt) {
+      return selected;
+    }
+  }
+  return normalizePendingDeleteSessionId(sessions, activeSessionId, pendingDeleteSessionId);
+}
+
+export function shouldSwitchToSelectedSession(
+  sessions: SessionSummary[],
+  activeSessionId: string,
+  selectedSessionId: string,
+) {
+  const selected = String(selectedSessionId || '').trim();
+  if (!selected || selected === activeSessionId) {
+    return false;
+  }
+  const selectedSession = sessions.find((session) => session.id === selected);
+  return selectedSession?.corrupt !== true;
 }
 
 export function hideWelcome() {

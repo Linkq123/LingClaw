@@ -91,8 +91,8 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 
 ## Runtime and data flow details that matter
 
-- The app exposes a single persistent public session: `main`.
 - The browser talks to the backend primarily over `/ws`; live reconnect/replay behavior is an important part of correctness.
+- The app keeps `main` as the default session, but now supports multiple persisted sessions and frontend session switching.
 - Automatic context compression runs as a `BeforeAnalyze` hook in `src/hooks.rs`.
 - `/new` compresses the conversation into `memory/YYYY-MM-DD.md` and clears context; it does not create a new session.
 - Skills are discovered from three layers: system (`docs/reference/skills/`), global (`~/.lingclaw/skills/`), and session-local (`skills/`).

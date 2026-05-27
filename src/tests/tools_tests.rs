@@ -402,23 +402,14 @@ fn forward_live_chunk_preserves_utf8_split_across_reads() {
     let mut pending = Vec::new();
     let bytes = "你好".as_bytes();
 
-    forward_live_chunk(
-        "stdout",
-        &bytes[..2],
-        &mut pending,
-        Some(tx.clone()),
-        None,
+    forward_live_chunk("stdout", &bytes[..2], &mut pending, Some(tx.clone()), None);
+    assert!(
+        rx.try_recv().is_err(),
+        "incomplete utf-8 prefix should not emit yet"
     );
-    assert!(rx.try_recv().is_err(), "incomplete utf-8 prefix should not emit yet");
     assert_eq!(pending, bytes[..2]);
 
-    forward_live_chunk(
-        "stdout",
-        &bytes[2..],
-        &mut pending,
-        Some(tx),
-        None,
-    );
+    forward_live_chunk("stdout", &bytes[2..], &mut pending, Some(tx), None);
     let mut combined = String::new();
     while let Ok(event) = rx.try_recv() {
         match event {
@@ -758,7 +749,8 @@ async fn execute_tool_caps_combined_stdout_and_stderr_output_to_budget() {
     let payload = "B".repeat(220);
     let outcome = execute_tool(
         "exec",
-        &serde_json::to_string(&stdout_and_stderr_payload_args(&payload)).expect("args should serialize"),
+        &serde_json::to_string(&stdout_and_stderr_payload_args(&payload))
+            .expect("args should serialize"),
         &config,
         &reqwest::Client::new(),
         &workspace,

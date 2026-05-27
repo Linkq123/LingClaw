@@ -1,4 +1,6 @@
 use super::*;
+use crate::ChatMessage;
+use std::path::PathBuf;
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, atomic::AtomicU64},
@@ -21,6 +23,37 @@ fn unique_session_id(prefix: &str) -> String {
         .expect("system time should be after unix epoch")
         .as_nanos();
     format!("{prefix}-{unique}")
+}
+
+fn test_config() -> crate::Config {
+    crate::Config {
+        api_key: "env-key".to_string(),
+        api_base: "https://api.openai.com/v1".to_string(),
+        model: "gpt-4o-mini".to_string(),
+        fast_model: None,
+        sub_agent_model: None,
+        sub_agent_model_overrides: Default::default(),
+        memory_model: None,
+        reflection_model: None,
+        context_model: None,
+        provider: crate::Provider::OpenAI,
+        anthropic_prompt_caching: false,
+        providers: HashMap::new(),
+        mcp_servers: HashMap::new(),
+        port: crate::DEFAULT_PORT,
+        max_context_tokens: 32000,
+        exec_timeout: Duration::from_secs(30),
+        tool_timeout: Duration::from_secs(30),
+        sub_agent_timeout: Duration::from_secs(300),
+        max_llm_retries: 2,
+        max_output_bytes: 50 * 1024,
+        max_file_bytes: 200 * 1024,
+        openai_stream_include_usage: false,
+        structured_memory: false,
+        daily_reflection: false,
+        s3: None,
+        enable_state_digest: true,
+    }
 }
 
 #[tokio::test]
@@ -633,7 +666,11 @@ async fn status_command_reports_compression_recorded_before_start_event() {
     let result = handle_status_command("status-compression-prestart", &state).await;
 
     assert_eq!(result.response_type, "system");
-    assert!(result.response.contains("compression: skipped reason=insufficient_savings"));
+    assert!(
+        result
+            .response
+            .contains("compression: skipped reason=insufficient_savings")
+    );
 
     let _ = tokio::fs::remove_dir_all(&workspace).await;
 }
@@ -770,7 +807,11 @@ async fn status_command_reports_prune_only_state() {
     let result = handle_status_command("status-prune-only", &state).await;
 
     assert_eq!(result.response_type, "system");
-    assert!(result.response.contains("pruned: removed 3 additional message(s) to fit request budget"));
+    assert!(
+        result
+            .response
+            .contains("pruned: removed 3 additional message(s) to fit request budget")
+    );
     assert!(!result.response.contains("compression:"));
 
     let _ = tokio::fs::remove_dir_all(&workspace).await;
@@ -915,7 +956,11 @@ async fn status_command_reports_replayed_compression_outcome_after_reconnect() {
     let result = handle_status_command("status-compression-replay", &state).await;
 
     assert_eq!(result.response_type, "system");
-    assert!(result.response.contains("compression: compressed saved_tokens=512 saved_percent=12"));
+    assert!(
+        result
+            .response
+            .contains("compression: compressed saved_tokens=512 saved_percent=12")
+    );
 
     let _ = tokio::fs::remove_dir_all(&workspace).await;
 }
@@ -1058,7 +1103,11 @@ async fn status_command_reports_latest_compression_outcome() {
     let result = handle_status_command("status-compression", &state).await;
 
     assert_eq!(result.response_type, "system");
-    assert!(result.response.contains("compression: compressed saved_tokens=1024 saved_percent=18"));
+    assert!(
+        result
+            .response
+            .contains("compression: compressed saved_tokens=1024 saved_percent=18")
+    );
 
     let _ = tokio::fs::remove_dir_all(&workspace).await;
 }
@@ -2030,7 +2079,348 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
 }
 
 #[tokio::test]
-async fn switch_command_is_blocked_in_single_session_mode() {
+async fn delete_command_rejects_active_session() {
+    let workspace = unique_temp_workspace("lingclaw-command-delete-active");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let active_session_id = unique_session_id("delete-active");
+    let state = AppState {
+        config: std::sync::Mutex::new(Arc::new(test_config())),
+        http: reqwest::Client::new(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+        memory_queue: std::sync::Mutex::new(None),
+    };
+
+    let mut session = Session::new_with_id(&active_session_id, "Active Delete Target");
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
+    session.messages.push(build_system_prompt(
+        &config,
+        &session.workspace,
+        &model,
+        &session.disabled_system_skills,
+    ));
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(active_session_id.clone(), session);
+    state
+        .active_connections
+        .lock()
+        .await
+        .insert(active_session_id.clone(), 99);
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+    let result = handle_command(
+        &format!("/delete {active_session_id}"),
+        MAIN_SESSION_ID,
+        1,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("command should resolve");
+
+    assert_eq!(result.response_type, "error");
+    assert_eq!(
+        result.response,
+        format!("Cannot delete active session: {active_session_id}")
+    );
+    assert!(state.sessions.lock().await.contains_key(&active_session_id));
+
+    let _ = tokio::fs::remove_dir_all(workspace.parent().unwrap_or(&workspace)).await;
+}
+
+#[tokio::test]
+async fn delete_command_rejects_running_session_without_active_connection() {
+    let workspace = unique_temp_workspace("lingclaw-command-delete-running");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let running_session_id = unique_session_id("delete-running");
+    let state = AppState {
+        config: std::sync::Mutex::new(Arc::new(test_config())),
+        http: reqwest::Client::new(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+        memory_queue: std::sync::Mutex::new(None),
+    };
+
+    let mut session = Session::new_with_id(&running_session_id, "Running Delete Target");
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
+    session.messages.push(build_system_prompt(
+        &config,
+        &session.workspace,
+        &model,
+        &session.disabled_system_skills,
+    ));
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(running_session_id.clone(), session);
+    state.active_runs.lock().await.insert(
+        running_session_id.clone(),
+        crate::SessionRunBinding {
+            connection_id: 42,
+            cancel: CancellationToken::new(),
+            stop_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deferred_interventions: Arc::new(Mutex::new(crate::DeferredInterventionState::open())),
+        },
+    );
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+    let result = handle_command(
+        &format!("/delete {running_session_id}"),
+        MAIN_SESSION_ID,
+        1,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("command should resolve");
+
+    assert_eq!(result.response_type, "error");
+    assert_eq!(
+        result.response,
+        format!("Cannot delete running session: {running_session_id}")
+    );
+    assert!(
+        state
+            .sessions
+            .lock()
+            .await
+            .contains_key(&running_session_id)
+    );
+
+    let _ = tokio::fs::remove_dir_all(workspace.parent().unwrap_or(&workspace)).await;
+}
+
+#[tokio::test]
+async fn delete_command_reports_filesystem_failure_without_removing_memory_session() {
+    let session_id = unique_session_id("delete-fs-failure");
+    let state = AppState {
+        config: std::sync::Mutex::new(Arc::new(test_config())),
+        http: reqwest::Client::new(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+        memory_queue: std::sync::Mutex::new(None),
+    };
+
+    let mut session = Session::new_with_id(&session_id, "FS Failure Target");
+    let config = state.config();
+    let model = session.effective_model(&config.model).to_string();
+    session.messages.push(build_system_prompt(
+        &config,
+        &session.workspace,
+        &model,
+        &session.disabled_system_skills,
+    ));
+    let session_dir = session
+        .workspace
+        .parent()
+        .map(PathBuf::from)
+        .expect("session dir should exist");
+    let sentinel_path = session_dir.join("sentinel.txt");
+    tokio::fs::write(&sentinel_path, b"keep")
+        .await
+        .expect("sentinel should be written");
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let session_file = sessions_dir().join(format!("{session_id}.json"));
+    tokio::fs::write(&session_file, b"persisted")
+        .await
+        .expect("session file should be written");
+
+    tokio::fs::remove_dir_all(&session_dir)
+        .await
+        .expect("session directory should be removable before test setup");
+    tokio::fs::write(&session_dir, b"blocking-file")
+        .await
+        .expect("blocking file should be written");
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+    let result = handle_command(
+        &format!("/delete {session_id}"),
+        MAIN_SESSION_ID,
+        1,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("command should resolve");
+
+    assert_eq!(result.response_type, "error");
+    assert!(
+        result
+            .response
+            .contains("Failed to delete session workspace")
+    );
+    assert!(state.sessions.lock().await.contains_key(&session_id));
+    assert!(
+        tokio::fs::try_exists(&session_dir)
+            .await
+            .expect("workspace check should succeed")
+    );
+    assert!(
+        tokio::fs::try_exists(&session_file)
+            .await
+            .expect("file check should succeed")
+    );
+
+    let _ = tokio::fs::remove_file(&session_dir).await;
+    let _ = tokio::fs::remove_dir_all(session_dir).await;
+    let _ = tokio::fs::remove_file(&session_file).await;
+}
+
+#[tokio::test]
+async fn switch_command_rejects_corrupt_persisted_session_target() {
+    let session_id = unique_session_id("switch-corrupt");
+    let session_file = crate::session_store::sessions_dir().join(format!("{session_id}.json"));
+    tokio::fs::write(&session_file, b"not valid json")
+        .await
+        .expect("corrupt session file should be written");
+
+    let state = AppState {
+        config: std::sync::Mutex::new(Arc::new(test_config())),
+        http: reqwest::Client::new(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+        memory_queue: std::sync::Mutex::new(None),
+    };
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+    let result = handle_command(
+        &format!("/switch {session_id}"),
+        MAIN_SESSION_ID,
+        1,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("command should resolve");
+
+    assert_eq!(result.response_type, "error");
+    assert_eq!(
+        result.response,
+        format!("Session '{session_id}' is corrupt and could not be loaded.")
+    );
+    assert_eq!(result.switch_to_session, None);
+    assert!(state.sessions.lock().await.get(&session_id).is_none());
+
+    let persisted_contents = tokio::fs::read_to_string(&session_file)
+        .await
+        .expect("corrupt session file should remain on disk");
+    assert_eq!(persisted_contents, "not valid json");
+
+    let _ = tokio::fs::remove_file(&session_file).await;
+}
+
+#[tokio::test]
+async fn delete_command_allows_targeting_corrupt_persisted_session() {
+    let session_id = unique_session_id("delete-corrupt");
+    let session_file = crate::session_store::sessions_dir().join(format!("{session_id}.json"));
+    tokio::fs::write(&session_file, b"not valid json")
+        .await
+        .expect("corrupt session file should be written");
+
+    let state = AppState {
+        config: std::sync::Mutex::new(Arc::new(test_config())),
+        http: reqwest::Client::new(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
+        active_connections: Mutex::new(HashMap::new()),
+        session_clients: Mutex::new(HashMap::new()),
+        live_rounds: Mutex::new(HashMap::new()),
+        active_runs: Mutex::new(HashMap::new()),
+        connection_cancels: Mutex::new(HashMap::new()),
+        next_connection_id: AtomicU64::new(1),
+        shutdown: CancellationToken::new(),
+        shutdown_token: "test-shutdown-token".to_string(),
+        upload_token: "test-upload-token".to_string(),
+        hooks: crate::HookRegistry::new(),
+        memory_queue: std::sync::Mutex::new(None),
+    };
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+    let result = handle_command(
+        &format!("/delete {session_id}"),
+        MAIN_SESSION_ID,
+        1,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("command should resolve");
+
+    assert_eq!(result.response_type, "system");
+    assert_eq!(
+        result.response,
+        format!("Deleted saved session: {session_id}")
+    );
+    assert!(
+        !tokio::fs::try_exists(&session_file)
+            .await
+            .expect("session file check should succeed")
+    );
+}
+
+#[tokio::test]
+async fn switch_command_creates_or_switches_session() {
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
             api_key: "env-key".to_string(),
@@ -2089,11 +2479,8 @@ async fn switch_command_is_blocked_in_single_session_mode() {
     .await
     .expect("command should resolve");
 
-    assert!(
-        result
-            .response
-            .contains("LingClaw only keeps the main session")
-    );
+    assert_eq!(result.response, "Switching to session: another-session");
+    assert_eq!(result.switch_to_session.as_deref(), Some("another-session"));
 }
 
 #[tokio::test]

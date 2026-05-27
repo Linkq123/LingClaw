@@ -7,8 +7,12 @@ let _open: (() => void) | null = null;
 let _close: (() => void) | null = null;
 // See note on the same flag in SettingsPage.tsx.
 let pendingOpen = false;
+let _usageSessionId = '';
 
-export function openUsagePage(): void {
+export function openUsagePage(sessionId?: string): void {
+  if (sessionId) {
+    _usageSessionId = sessionId;
+  }
   if (_open) _open();
   else pendingOpen = true;
 }
@@ -517,14 +521,19 @@ export function UsagePage() {
   const [usageData, setUsageData] = useState<UsageData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [usageSessionId, setUsageSessionId] = useState('');
   const [dailyRange, setDailyRange] = useState(7);
   const [providerRange, setProviderRange] = useState(7);
 
   useEffect(() => {
-    _open = () => setVisible(true);
+    _open = () => {
+      setUsageSessionId(_usageSessionId);
+      setVisible(true);
+    };
     _close = () => setVisible(false);
     if (pendingOpen) {
       pendingOpen = false;
+      setUsageSessionId(_usageSessionId);
       setVisible(true);
     }
     return () => {
@@ -546,7 +555,10 @@ export function UsagePage() {
     setLoading(true);
     setError('');
     try {
-      const resp = await fetch('/api/usage', signal ? { signal } : undefined);
+      const usageUrl = usageSessionId
+        ? `/api/usage?session=${encodeURIComponent(usageSessionId)}`
+        : '/api/usage';
+      const resp = await fetch(usageUrl, signal ? { signal } : undefined);
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
       const data: UsageData = await resp.json();
       setUsageData(data);
@@ -556,7 +568,7 @@ export function UsagePage() {
     } finally {
       if (!signal || !signal.aborted) setLoading(false);
     }
-  }, []);
+  }, [usageSessionId]);
 
   useEffect(() => {
     if (!visible) return;

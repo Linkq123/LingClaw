@@ -2405,7 +2405,8 @@ async fn execute_subagent_tool_with_live_output_returns_on_cancellation() {
             "args": ["-c", "sleep 5"],
         })
     };
-    let (live_tx, _live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let cancel = CancellationToken::new();
     let cancel_clone = cancel.clone();
     tokio::spawn(async move {
@@ -2450,7 +2451,8 @@ async fn execute_subagent_tool_with_live_output_prefers_completed_result_over_ca
     let args = serde_json::json!({
         "thought": "finished before cancellation"
     });
-    let (live_tx, _live_rx) = tokio::sync::mpsc::channel::<serde_json::Value>(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let cancel = CancellationToken::new();
     cancel.cancel();
 
@@ -3241,7 +3243,10 @@ Run the requested command.
         }
     });
 
-    let sentinel = live_rx.recv().await.expect("sentinel should remain queued first");
+    let sentinel = live_rx
+        .recv()
+        .await
+        .expect("sentinel should remain queued first");
     assert_eq!(sentinel["type"], "sentinel");
 
     let mut failed_error = None;

@@ -15,7 +15,27 @@ function setConnStatus(status: 'connecting' | 'connected' | 'disconnected', labe
   if (dom.connLabel) dom.connLabel.textContent = label;
 }
 
+function sessionWebSocketUrl(): string {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  const url = new URL(`${proto}://${location.host}/ws`);
+  if (state.activeSessionId) {
+    url.searchParams.set('session', state.activeSessionId);
+  }
+  return url.toString();
+}
+
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+function resetSessionScopedUiState(): void {
+  finishAssistantStream({ discardIfEmpty: true });
+  finishReasoningStream();
+  closeToolDrawer();
+  clearReactStatus();
+  clearCompressionOutcome();
+  clearActiveAutoTrace();
+  state.reasoningPanel = null;
+  setBusy(false);
+}
 
 export function cancelReconnect(): void {
   if (reconnectTimer !== null) {
@@ -25,9 +45,8 @@ export function cancelReconnect(): void {
 }
 
 export function connect(onMessage) {
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   setConnStatus('connecting', 'Connecting…');
-  state.ws = new WebSocket(`${proto}://${location.host}/ws`);
+  state.ws = new WebSocket(sessionWebSocketUrl());
 
   state.ws.onopen = () => {
     state.reconnectDelay = 1000;
@@ -37,14 +56,7 @@ export function connect(onMessage) {
   };
 
   state.ws.onclose = () => {
-    finishAssistantStream({ discardIfEmpty: true });
-    finishReasoningStream();
-    closeToolDrawer();
-    clearReactStatus();
-    clearCompressionOutcome();
-    clearActiveAutoTrace();
-    state.reasoningPanel = null;
-    setBusy(false);
+    resetSessionScopedUiState();
     if (state.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
       const delaySecs = Math.ceil(state.reconnectDelay / 1000);
       setConnStatus(
@@ -61,6 +73,7 @@ export function connect(onMessage) {
       state.reconnectDelay = Math.min(state.reconnectDelay * 2, 30000);
       state.reconnectAttempts++;
     } else {
+      state.sessionSwitchInFlight = false;
       setConnStatus('disconnected', 'Offline');
       addSystem('Connection lost. Please refresh the page.', 'error');
     }
@@ -78,4 +91,19 @@ export function connect(onMessage) {
     }
     onMessage(data);
   };
+}
+
+export function reconnectToActiveSession(onMessage): void {
+  cancelReconnect();
+  state.reconnectAttempts = 0;
+  state.reconnectDelay = 1000;
+  if (state.ws) {
+    const ws = state.ws;
+    state.ws = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.close();
+  }
+  resetSessionScopedUiState();
+  connect(onMessage);
 }

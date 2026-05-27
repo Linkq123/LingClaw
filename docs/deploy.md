@@ -313,7 +313,7 @@ docker run -d \
 
 | 挂载卷 | 用途 |
 |--------|------|
-| `lingclaw-data` | 持久化主会话数据和工作区（`~/.lingclaw/sessions/main.json`、`~/.lingclaw/main/workspace/`） |
+| `lingclaw-data` | 持久化默认会话和其他 session 数据（`~/.lingclaw/sessions/*.json`、`~/.lingclaw/<session-id>/workspace/`） |
 | `.lingclaw.json` | 配置文件（必须，容器不支持 Setup Wizard；bind mount 覆盖卷内同路径） |
 
 ### 3.4 Docker Compose

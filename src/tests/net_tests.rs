@@ -169,7 +169,8 @@ fn simplify_html_for_fetch_preserves_leading_indent_in_first_pre_line() {
 
 #[test]
 fn simplify_html_for_fetch_separates_adjacent_block_elements_in_compressed_html() {
-    let html = "<html><body><h1>Title</h1><p>Intro</p><ul><li>Step1</li><li>Step2</li></ul></body></html>";
+    let html =
+        "<html><body><h1>Title</h1><p>Intro</p><ul><li>Step1</li><li>Step2</li></ul></body></html>";
 
     let simplified = simplify_html_for_fetch(html);
 
@@ -270,13 +271,19 @@ fn simplify_html_for_fetch_collapses_whitespace() {
 #[test]
 fn read_response_body_limited_truncates_at_max_bytes() {
     let text = truncate_bytes(b"hello world", 5);
-    assert_eq!(text, "hello...\n[truncated at 5 bytes, reached fetch limit of 5 bytes]");
+    assert_eq!(
+        text,
+        "hello...\n[truncated at 5 bytes, reached fetch limit of 5 bytes]"
+    );
 }
 
 #[test]
 fn read_response_body_limited_preserves_utf8_boundaries() {
     let text = truncate_bytes("你好世界".as_bytes(), 5);
-    assert_eq!(text, "你...\n[truncated at 3 bytes, reached fetch limit of 5 bytes]");
+    assert_eq!(
+        text,
+        "你...\n[truncated at 3 bytes, reached fetch limit of 5 bytes]"
+    );
 }
 
 #[tokio::test]

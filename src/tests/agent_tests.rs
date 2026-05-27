@@ -133,7 +133,6 @@ fn seeded_state(query: &str) -> WorkingState {
     state
 }
 
-
 #[test]
 fn task_intent_classifies_common_queries() {
     assert_eq!(
@@ -220,11 +219,7 @@ fn seed_from_query_preserves_state_for_follow_up_continuation_query() {
 
 #[test]
 fn seed_from_query_preserves_state_for_polite_or_particle_continuation_query() {
-    for query in [
-        "continue please",
-        "please continue",
-        "继续一下",
-    ] {
+    for query in ["continue please", "please continue", "继续一下"] {
         let mut state = seeded_state("fix the timeout handling");
         state.completed_steps.push(
             "execution progress: patch `src/config.rs` via patch_file in 3ms (call c1).".into(),
@@ -342,16 +337,13 @@ fn text_mentions_command_anchor_requires_exact_command_match() {
 
 #[test]
 fn chinese_task_result_counts_as_action_and_change_progress() {
-    let mut change_state = seeded_state(
-        "修复安装脚本",
-    );
+    let mut change_state = seeded_state("修复安装脚本");
     apply_rule_based_working_state_update(
         &mut change_state,
         &[ToolResultEntry {
             id: "c1".into(),
             name: "task".into(),
-            result: "已修复并更新安装配置"
-                .into(),
+            result: "已修复并更新安装配置".into(),
             duration_ms: 20,
             is_error: false,
             call_summary: Some("delegate to `reviewer`".into()),
@@ -365,9 +357,7 @@ fn chinese_task_result_counts_as_action_and_change_progress() {
     assert!(change_state.has_successful_change_trace());
     assert!(change_state.ready_to_finish);
 
-    let mut execute_state = seeded_state(
-        "运行工作区测试",
-    );
+    let mut execute_state = seeded_state("运行工作区测试");
     apply_rule_based_working_state_update(
         &mut execute_state,
         &[ToolResultEntry {
@@ -390,17 +380,13 @@ fn chinese_task_result_counts_as_action_and_change_progress() {
 
 #[test]
 fn chinese_exec_success_text_counts_as_execution_progress_without_trace() {
-    let mut state = seeded_state(
-        "运行工作区测试",
-    );
+    let mut state = seeded_state("运行工作区测试");
     apply_rule_based_working_state_update(
         &mut state,
         &[ToolResultEntry {
             id: "c-exec".into(),
             name: "exec".into(),
-            result:
-                "已通过测试并构建成功"
-                    .into(),
+            result: "已通过测试并构建成功".into(),
             duration_ms: 20,
             is_error: false,
             call_summary: None,
@@ -588,7 +574,6 @@ fn auto_think_level_runtime_escalates_on_stagnation_and_error_streak() {
         "max"
     );
 }
-
 
 #[test]
 fn auto_think_level_runtime_escalates_on_low_value_retries() {
@@ -1550,13 +1535,7 @@ fn simple_query_rejects_complex() {
     assert!(!is_simple_query("analyze this:\nfn main() {}"));
     assert!(!is_simple_query(&"a".repeat(200)));
     // Chinese complex keywords
-    assert!(!is_simple_query(
-        "帮我实现一个排序算法"
-    ));
-    assert!(!is_simple_query(
-        "分析这段代码"
-    ));
-    assert!(!is_simple_query(
-        "编写一个函数"
-    ));
+    assert!(!is_simple_query("帮我实现一个排序算法"));
+    assert!(!is_simple_query("分析这段代码"));
+    assert!(!is_simple_query("编写一个函数"));
 }

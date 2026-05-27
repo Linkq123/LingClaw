@@ -26,6 +26,47 @@ struct PersistedSessionCacheEntry {
     file_len: u64,
 }
 
+#[derive(Clone)]
+pub(crate) struct SessionSummary {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) messages: usize,
+    pub(crate) tool_calls: usize,
+    pub(crate) created_at: u64,
+    pub(crate) updated_at: u64,
+    pub(crate) corrupt: bool,
+}
+
+impl SessionSummary {
+    pub(crate) fn from_session(session: &Session) -> Self {
+        Self {
+            id: session.id.clone(),
+            name: session.name.clone(),
+            messages: sanitized_non_system_message_count(session),
+            tool_calls: session.tool_calls_count,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            corrupt: false,
+        }
+    }
+
+    pub(crate) fn to_json(&self, config: &Config, session: Option<&Session>) -> serde_json::Value {
+        let model = session
+            .map(|session| session.effective_model(&config.model).to_string())
+            .unwrap_or_else(|| config.model.clone());
+        json!({
+            "id": self.id,
+            "name": self.name,
+            "messages": self.messages,
+            "tool_calls": self.tool_calls,
+            "model": model,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "corrupt": self.corrupt,
+        })
+    }
+}
+
 type PersistedSessionCacheLock = OnceLock<Mutex<HashMap<String, PersistedSessionCacheEntry>>>;
 static PERSISTED_SESSION_CACHE: PersistedSessionCacheLock = OnceLock::new();
 static SESSION_SAVE_WRITES: AtomicU64 = AtomicU64::new(0);
@@ -146,6 +187,69 @@ pub(crate) fn session_persist_metrics() -> (u64, u64) {
         SESSION_SAVE_WRITES.load(Ordering::Relaxed),
         SESSION_SAVE_SKIPS.load(Ordering::Relaxed),
     )
+}
+
+const RESERVED_SESSION_IDS: &[&str] = &[
+    "agents",
+    "memory",
+    "sessions",
+    "skills",
+    "static",
+    "system-agents",
+    "system-skills",
+];
+
+const WINDOWS_RESERVED_DEVICE_NAMES: &[&str] = &[
+    "aux",
+    "con",
+    "com1",
+    "com2",
+    "com3",
+    "com4",
+    "com5",
+    "com6",
+    "com7",
+    "com8",
+    "com9",
+    "lpt1",
+    "lpt2",
+    "lpt3",
+    "lpt4",
+    "lpt5",
+    "lpt6",
+    "lpt7",
+    "lpt8",
+    "lpt9",
+    "nul",
+    "prn",
+];
+
+pub(crate) fn validate_session_id(id: &str) -> Result<&str, String> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return Err("Session id cannot be empty.".to_string());
+    }
+    if trimmed == "." || trimmed == ".." || trimmed.ends_with('.') {
+        return Err("Invalid session id.".to_string());
+    }
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(
+            "Invalid session id. Use only letters, numbers, dots, dashes, or underscores."
+                .to_string(),
+        );
+    }
+    let lowered = trimmed.to_ascii_lowercase();
+    if RESERVED_SESSION_IDS.contains(&lowered.as_str()) {
+        return Err("Invalid session id. This name is reserved.".to_string());
+    }
+    let windows_reserved_name = lowered.split('.').next().unwrap_or("");
+    if WINDOWS_RESERVED_DEVICE_NAMES.contains(&windows_reserved_name) {
+        return Err("Invalid session id. This name is reserved on Windows.".to_string());
+    }
+    Ok(trimmed)
 }
 
 pub(crate) fn subagent_snapshot_storage_key(tool_call_id: &str, occurrence: usize) -> String {
@@ -509,10 +613,32 @@ pub(crate) fn load_session_snapshot_from_path(path: &Path) -> Option<Session> {
     Some(session)
 }
 
-pub(crate) fn load_session_from_disk(id: &str) -> Option<Session> {
-    if id.contains('/') || id.contains('\\') || id.contains("..") {
-        return None;
+pub(crate) fn canonical_saved_session_id(id: &str) -> Option<String> {
+    let id = validate_session_id(id).ok()?;
+    let dir = sessions_dir();
+    let mut fallback = None;
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if stem == id {
+                return Some(stem.to_string());
+            }
+            if cfg!(windows) && stem.eq_ignore_ascii_case(id) {
+                fallback = Some(stem.to_string());
+            }
+        }
     }
+    fallback
+}
+
+pub(crate) fn load_session_from_disk(id: &str) -> Option<Session> {
+    let id = canonical_saved_session_id(id).or_else(|| validate_session_id(id).ok().map(str::to_string))?;
     let path = sessions_dir().join(format!("{id}.json"));
     let tmp_path = sessions_dir().join(format!("{id}.json.tmp"));
     // Load from primary, fall back to .tmp, or pick the newer of the two.
@@ -568,7 +694,6 @@ pub(crate) fn refresh_session_system_prompt(state: &AppState, session: &mut Sess
     }
 }
 
-#[cfg(test)]
 pub(crate) fn sanitized_non_system_message_count(session: &Session) -> usize {
     let mut normalized = session.clone();
     normalize_session(&mut normalized);
@@ -579,59 +704,40 @@ pub(crate) fn sanitized_non_system_message_count(session: &Session) -> usize {
         .count()
 }
 
-#[cfg(test)]
-pub(crate) fn list_saved_session_summaries_in_dir(dir: &Path) -> Vec<serde_json::Value> {
+pub(crate) fn list_saved_session_summaries_in_dir(dir: &Path) -> Vec<SessionSummary> {
     let mut out = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) == Some("json") {
                 if let Some(session) = load_session_snapshot_from_path(&path) {
-                    let msg_count = sanitized_non_system_message_count(&session);
-                    out.push(json!({
-                        "id": session.id,
-                        "name": session.name,
-                        "messages": msg_count,
-                        "created_at": session.created_at,
-                        "updated_at": session.updated_at,
-                        "corrupt": false,
-                    }));
+                    out.push(SessionSummary::from_session(&session));
                 } else if let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) {
-                    out.push(json!({
-                        "id": id,
-                        "name": "[Corrupt Session]",
-                        "messages": 0,
-                        "created_at": 0,
-                        "updated_at": 0,
-                        "corrupt": true,
-                    }));
+                    out.push(SessionSummary {
+                        id: id.to_string(),
+                        name: "[Corrupt Session]".to_string(),
+                        messages: 0,
+                        tool_calls: 0,
+                        created_at: 0,
+                        updated_at: 0,
+                        corrupt: true,
+                    });
                 }
             }
         }
     }
-    out.sort_by(|a, b| {
-        let b_ts = b["updated_at"].as_u64().unwrap_or(0);
-        let a_ts = a["updated_at"].as_u64().unwrap_or(0);
-        b_ts.cmp(&a_ts)
-    });
+    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     out
 }
 
-#[cfg(test)]
-pub(crate) fn recoverable_session_ids_from_summaries(
-    summaries: &[serde_json::Value],
-) -> Vec<String> {
+pub(crate) fn recoverable_session_ids_from_summaries(summaries: &[SessionSummary]) -> Vec<String> {
     summaries
         .iter()
-        .filter(|summary| {
-            summary["corrupt"].as_bool() != Some(true)
-                && summary["messages"].as_u64().unwrap_or(0) > 0
-        })
-        .filter_map(|summary| summary["id"].as_str().map(str::to_string))
+        .filter(|summary| !summary.corrupt && summary.messages > 0)
+        .map(|summary| summary.id.clone())
         .collect()
 }
 
-#[cfg(test)]
 pub(crate) fn list_saved_session_ids_in_dir(dir: &Path) -> HashSet<String> {
     let mut ids = HashSet::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
@@ -776,11 +882,11 @@ pub(crate) fn build_view_state_payload(session: &Session) -> serde_json::Value {
     })
 }
 
-#[cfg(test)]
 pub(crate) fn resolve_session_target(
     target: &str,
     known_ids: &HashSet<String>,
 ) -> Result<String, String> {
+    let target = validate_session_id(target)?;
     if known_ids.contains(target) {
         return Ok(target.to_string());
     }
@@ -800,7 +906,6 @@ pub(crate) fn resolve_session_target(
     }
 }
 
-#[cfg(test)]
 pub(crate) fn build_active_session_lines(
     sessions: &HashMap<String, Session>,
     active_ids: &HashSet<String>,
@@ -897,15 +1002,37 @@ total_usage_est: # 当前会话累计 token 使用估算\n\ttotal_tokens: {}\n\t
     )
 }
 
-pub(crate) fn build_global_today_usage(sessions: &HashMap<String, Session>) -> String {
+pub(crate) fn build_global_today_usage<'a>(sessions: impl IntoIterator<Item = &'a Session>) -> String {
     let (global_today_input_tokens, global_today_output_tokens) =
-        super::accumulate_daily_token_usage(sessions.values());
+        super::accumulate_daily_token_usage(sessions);
     format_usage_block(
         "global_today_usage_est",
         "所有会话今日 token 使用估算",
         global_today_input_tokens,
         global_today_output_tokens,
     )
+}
+
+pub(crate) fn load_saved_sessions_not_in(loaded_ids: &HashSet<String>) -> Vec<Session> {
+    let mut sessions = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(sessions_dir()) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                continue;
+            };
+            if loaded_ids.contains(id) {
+                continue;
+            }
+            if let Some(session) = load_session_from_disk(id) {
+                sessions.push(session);
+            }
+        }
+    }
+    sessions
 }
 
 pub(crate) fn build_usage_report(session: &Session, global_today_usage: &str) -> String {

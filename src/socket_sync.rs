@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use crate::{AppState, WsTx, session_store::*, ws_send};
+use crate::{AppState, SessionSummary, WsTx, session_store::*, ws_send};
 
 fn default_history_payload() -> serde_json::Value {
     json!({"type":"history","messages":[]})
@@ -69,6 +69,50 @@ pub(crate) fn build_session_usage_payload(session: &crate::Session) -> serde_jso
         "total_input": session.input_tokens,
         "total_output": session.output_tokens,
     })
+}
+
+pub(crate) fn build_session_list_payload(state: &AppState) -> serde_json::Value {
+    let config = state.config();
+    let mut summaries = list_saved_session_summaries_in_dir(&sessions_dir());
+
+    if let Ok(sessions) = state.sessions.try_lock() {
+        for session in sessions.values() {
+            let already_listed = summaries.iter().any(|summary| summary.id == session.id);
+            if already_listed {
+                continue;
+            }
+            summaries.push(SessionSummary::from_session(session));
+        }
+    }
+
+    summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut list = Vec::new();
+    for summary in summaries {
+        if !seen_ids.insert(summary.id.clone()) {
+            continue;
+        }
+        let session = if summary.corrupt {
+            None
+        } else {
+            load_session_from_disk(&summary.id)
+        };
+        list.push(summary.to_json(&config, session.as_ref()));
+    }
+
+    json!({"type":"session_list","sessions": list})
+}
+
+pub(crate) async fn broadcast_session_list_payload(state: &AppState) {
+    let payload = build_session_list_payload(state);
+    let clients = {
+        let clients = state.session_clients.lock().await;
+        clients.values().map(|binding| binding.tx.clone()).collect::<Vec<_>>()
+    };
+    for tx in clients {
+        ws_send(&tx, &payload).await;
+    }
 }
 
 pub(crate) async fn send_command_refresh(

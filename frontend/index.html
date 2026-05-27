@@ -21,6 +21,18 @@
         <div class="brand-block">
           <img class="brand-logo" src="/branding/logo-mark.png" alt="" width="28" height="28" />
           <span class="session-name" id="session-name">LingClaw</span>
+          <span class="session-id" id="session-id"></span>
+          <select id="session-picker" class="session-picker" aria-label="Select session"></select>
+          <button id="new-session-btn" class="session-manage-btn mobile-hide" aria-label="New session">
+            New Session
+          </button>
+          <button
+            id="delete-session-btn"
+            class="session-manage-btn mobile-hide"
+            aria-label="Delete current session"
+          >
+            Delete
+          </button>
           <button
             id="theme-toggle-btn"
             class="theme-toggle-btn header-theme-toggle"
@@ -32,7 +44,6 @@
           </button>
           <span class="app-version-badge header-version" id="app-version-header" hidden></span>
         </div>
-        <span class="session-id" id="session-id"></span>
         <div class="actions">
           <span class="usage-badge" id="usage-badge" title="今日 Token 用量"></span>
           <button

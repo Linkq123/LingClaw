@@ -171,7 +171,9 @@ impl Drop for OrchestrateTaskEventGuard<'_> {
                 let live_tx = self.live_tx.clone();
                 handle.spawn(async move {
                     if let Err(err) = live_tx.send(event).await {
-                        eprintln!("[orchestrate-guard] failed to emit fallback task_failed event: {err}");
+                        eprintln!(
+                            "[orchestrate-guard] failed to emit fallback task_failed event: {err}"
+                        );
                     }
                 });
             } else if let Err(err) = self.live_tx.try_send(event) {

@@ -54,8 +54,16 @@
   }
   .brand-block {
     min-width: 0;
+    flex-wrap: wrap;
   }
   header .session-id {
+    display: none;
+  }
+  .session-picker {
+    min-width: 96px;
+    max-width: 140px;
+  }
+  .session-manage-btn {
     display: none;
   }
   header .actions {

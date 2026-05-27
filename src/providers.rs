@@ -805,8 +805,12 @@ async fn fetch_images_base64(
 /// Build an HTTP client suitable for safe outbound fetches:
 /// redirects disabled (SSRF defense), 15 s timeout.
 pub(crate) fn build_image_fetch_client() -> Result<Client, String> {
-    tools::net::build_safe_fetch_client()
-        .map_err(|e| e.replace("http_fetch error: ", "Failed to create safe HTTP client for image fetch: "))
+    tools::net::build_safe_fetch_client().map_err(|e| {
+        e.replace(
+            "http_fetch error: ",
+            "Failed to create safe HTTP client for image fetch: ",
+        )
+    })
 }
 
 fn image_cache_dir(workspace: &Path) -> PathBuf {

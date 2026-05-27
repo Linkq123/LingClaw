@@ -149,7 +149,11 @@ fn explicit_path_extension(path: &str) -> Option<&str> {
 }
 
 fn truncate_bytes(bytes: &[u8], max: usize) -> String {
-    truncate_decoded_text(String::from_utf8_lossy(bytes).into_owned(), bytes.len() > max, max)
+    truncate_decoded_text(
+        String::from_utf8_lossy(bytes).into_owned(),
+        bytes.len() > max,
+        max,
+    )
 }
 
 fn truncate_decoded_text(text: String, was_truncated: bool, max: usize) -> String {

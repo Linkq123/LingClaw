@@ -1,5 +1,9 @@
 use super::*;
 
+use std::collections::HashSet;
+
+use crate::session_store::load_session_from_disk;
+use crate::socket_sync::broadcast_session_list_payload;
 use serde::Deserialize;
 use serde_json::json;
 
@@ -50,34 +54,80 @@ pub(super) fn resolve_input_image_url(
 pub(crate) enum IdleSocketInputAction {
     Continue,
     StartAgent,
+    SwitchSession {
+        session_id: String,
+        result: crate::commands::CommandResult,
+    },
     Break,
 }
 
-pub(crate) async fn resolve_or_create_socket_session(
-    state: &Arc<AppState>,
-    tx: &WsTx,
-    _requested_id: Option<&str>,
-    _connection_id: u64,
-) -> String {
-    ensure_main_session_ready(state).await;
-    send_existing_session_payloads(tx, state, MAIN_SESSION_ID).await;
-    MAIN_SESSION_ID.to_string()
-}
+pub(crate) async fn ensure_session_ready(
+    state: &AppState,
+    requested_id: Option<&str>,
+) -> Result<(String, bool), String> {
+    let session_id = match requested_id {
+        Some(id) => crate::session_store::validate_session_id(id)?.to_string(),
+        None => MAIN_SESSION_ID.to_string(),
+    };
+    let saved_session_id = crate::session_store::canonical_saved_session_id(&session_id);
+    let effective_session_id = saved_session_id.as_deref().unwrap_or(&session_id).to_string();
 
-async fn ensure_main_session_ready(state: &Arc<AppState>) {
     {
         let mut sessions = state.sessions.lock().await;
-        if let Some(session) = sessions.get_mut(MAIN_SESSION_ID) {
+        if let Some(existing_session_id) = sessions
+            .keys()
+            .find(|existing_id| {
+                *existing_id == &effective_session_id
+                    || (cfg!(windows) && existing_id.eq_ignore_ascii_case(&effective_session_id))
+            })
+            .cloned()
+        {
+            let session = sessions
+                .get_mut(&existing_session_id)
+                .expect("existing session id should still be present");
             refresh_session_system_prompt(state, session);
-            return;
+            return Ok((existing_session_id, false));
         }
     }
 
     let config = state.config();
-    let (mut session, created_fresh) = match load_session_from_disk(MAIN_SESSION_ID) {
+    let display_name = if effective_session_id == MAIN_SESSION_ID {
+        "Main".to_string()
+    } else {
+        effective_session_id.clone()
+    };
+    let persisted_session_path =
+        crate::session_store::sessions_dir().join(format!("{effective_session_id}.json"));
+    let persisted_session_tmp_path =
+        crate::session_store::sessions_dir().join(format!("{effective_session_id}.json.tmp"));
+    let persisted_session_exists = saved_session_id.is_some()
+        || match tokio::fs::try_exists(&persisted_session_path).await {
+            Ok(exists) => exists,
+            Err(err) => {
+                return Err(format!(
+                    "Failed to inspect persisted session '{}': {err}",
+                    session_id
+                ));
+            }
+        } || match tokio::fs::try_exists(&persisted_session_tmp_path).await {
+            Ok(exists) => exists,
+            Err(err) => {
+                return Err(format!(
+                    "Failed to inspect persisted session '{}': {err}",
+                    session_id
+                ));
+            }
+        };
+    let (mut session, created_fresh) = match load_session_from_disk(&effective_session_id) {
         Some(session) => (session, false),
+        None if persisted_session_exists => {
+            return Err(format!(
+                "Session '{}' is corrupt and could not be loaded.",
+                effective_session_id
+            ));
+        }
         None => {
-            let mut session = Session::new_with_id(MAIN_SESSION_ID, "Main");
+            let mut session = Session::new_with_id(&effective_session_id, &display_name);
             let model = session.effective_model(&config.model).to_string();
             let sys = build_system_prompt(
                 &config,
@@ -93,14 +143,90 @@ async fn ensure_main_session_ready(state: &Arc<AppState>) {
 
     if created_fresh && let Err(error) = save_session_to_disk(&session).await {
         eprintln!(
-            "Warning: failed to persist main session on creation: {error}; keeping in memory"
+            "Warning: failed to persist session {} on creation: {error}; keeping in memory",
+            effective_session_id
         );
     }
 
+    let final_session_id = session.id.clone();
     let mut sessions = state.sessions.lock().await;
-    sessions
-        .entry(MAIN_SESSION_ID.to_string())
-        .or_insert(session);
+    sessions.entry(final_session_id.clone()).or_insert(session);
+    Ok((final_session_id, created_fresh))
+}
+
+pub(crate) async fn resolve_or_create_socket_session(
+    state: &AppState,
+    tx: &WsTx,
+    requested_id: Option<&str>,
+    connection_id: u64,
+    connection_cancel: &CancellationToken,
+) -> String {
+    match ensure_session_ready(state, requested_id).await {
+        Ok((session_id, created_fresh)) => {
+            replace_connection_cancel_binding(state, &session_id, connection_id, connection_cancel)
+                .await;
+            bind_session_connection(state, &session_id, connection_id, tx, false).await;
+            send_existing_session_payloads(tx, state, &session_id).await;
+            replay_live_round(tx, state, &session_id).await;
+            finish_session_replay(state, &session_id, connection_id).await;
+            if created_fresh {
+                broadcast_session_list_payload(state).await;
+            }
+            session_id
+        }
+        Err(error) => {
+            let fallback_session_id = ensure_session_ready(state, None)
+                .await
+                .map(|(session_id, _)| session_id)
+                .unwrap_or_else(|_| MAIN_SESSION_ID.to_string());
+            replace_connection_cancel_binding(
+                state,
+                &fallback_session_id,
+                connection_id,
+                connection_cancel,
+            )
+            .await;
+            bind_session_connection(state, &fallback_session_id, connection_id, tx, false).await;
+            send_existing_session_payloads(tx, state, &fallback_session_id).await;
+            replay_live_round(tx, state, &fallback_session_id).await;
+            finish_session_replay(state, &fallback_session_id, connection_id).await;
+            ws_send(
+                tx,
+                &json!({
+                    "type":"error",
+                    "content": error,
+                    "dismissible": true,
+                }),
+            )
+            .await;
+            fallback_session_id
+        }
+    }
+}
+
+pub(crate) async fn known_session_ids(state: &AppState) -> HashSet<String> {
+    let mut known_ids = crate::session_store::list_saved_session_ids_in_dir(
+        &crate::session_store::sessions_dir(),
+    );
+    let sessions = state.sessions.lock().await;
+    known_ids.extend(sessions.keys().cloned());
+    known_ids.insert(MAIN_SESSION_ID.to_string());
+    known_ids
+}
+
+pub(crate) async fn resolve_session_target_for_command(
+    state: &AppState,
+    target: &str,
+) -> Result<String, String> {
+    let known_ids = known_session_ids(state).await;
+    crate::session_store::resolve_session_target(target, &known_ids)
+}
+
+pub(crate) async fn resolve_session_target_for_delete(
+    state: &AppState,
+    target: &str,
+) -> Result<String, String> {
+    resolve_session_target_for_command(state, target).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -230,6 +356,9 @@ pub(crate) async fn handle_idle_socket_input(
         }
 
         if let Some(result) = cmd_result {
+            if let Some(session_id) = result.switch_to_session.clone() {
+                return IdleSocketInputAction::SwitchSession { session_id, result };
+            }
             send_command_refresh(tx, state, current_session_id, result.refresh_history).await;
 
             ws_send(
@@ -257,6 +386,9 @@ pub(crate) async fn handle_idle_socket_input(
                     build_session_info_payload(current_session_id, &name, state, &model, usage)
                 };
                 ws_send(tx, &payload).await;
+            }
+            if result.session_list_changed {
+                broadcast_session_list_payload(state).await;
             }
         } else {
             ws_send(
@@ -569,6 +701,9 @@ async fn build_busy_command_events(
             )
         };
         events.push(payload);
+    }
+    if result.session_list_changed {
+        events.push(crate::socket_sync::build_session_list_payload(state));
     }
 
     Some(events)

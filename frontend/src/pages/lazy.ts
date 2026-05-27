@@ -118,12 +118,12 @@ export function closeSettingsPage(): void {
   if (settingsChunk) void settingsChunk.then((mod) => mod.closeSettingsPage()).catch(() => {});
 }
 
-export function openUsagePage(): void {
+export function openUsagePage(sessionId?: string): void {
   const gen = ++usageOpenGeneration;
   void loadUsage()
     .then((mod) => {
       if (usageOpenGeneration !== gen) return;
-      mod.openUsagePage();
+      mod.openUsagePage(sessionId);
     })
     .catch(() => {
       // Chunk load failed; usageChunk cleared for retry on next attempt.

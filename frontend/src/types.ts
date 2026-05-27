@@ -45,6 +45,13 @@ export type ReactPhase = 'analyze' | 'act' | 'observe' | 'finish' | '';
 
 // ── WebSocket event types ──
 
+export interface SessionSummary {
+  id: string;
+  name: string;
+  updated_at?: number;
+  corrupt?: boolean;
+}
+
 export interface SessionEvent {
   type: 'session';
   id: string;
