@@ -713,6 +713,7 @@ pub(crate) fn list_saved_session_summaries_in_dir(dir: &Path) -> Vec<SessionSumm
     out
 }
 
+#[cfg(test)]
 pub(crate) fn recoverable_session_ids_from_summaries(summaries: &[SessionSummary]) -> Vec<String> {
     summaries
         .iter()

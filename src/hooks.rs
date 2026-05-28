@@ -355,6 +355,7 @@ pub(crate) fn build_compression_source_text_with_context(
     truncate(&lines.join("\n"), AUTO_COMPRESS_INPUT_CHAR_LIMIT)
 }
 
+#[cfg(test)]
 pub(crate) fn build_compression_source_text(messages: &[ChatMessage]) -> String {
     build_compression_source_text_with_context(messages, None)
 }

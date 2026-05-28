@@ -148,6 +148,7 @@ fn explicit_path_extension(path: &str) -> Option<&str> {
     Some(&segment[dot_index..])
 }
 
+#[cfg(test)]
 fn truncate_bytes(bytes: &[u8], max: usize) -> String {
     truncate_decoded_text(
         String::from_utf8_lossy(bytes).into_owned(),
