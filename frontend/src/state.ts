@@ -27,6 +27,7 @@ export interface DomRefs {
   sessionDrawerList: HTMLElement | null;
   sessionDrawerToggleBtn: HTMLButtonElement | null;
   sessionDrawerNewBtn: HTMLButtonElement | null;
+  slashCommandMenu: HTMLElement | null;
   todosHost: HTMLElement | null;
   todosPanel: HTMLElement | null;
   headerVersionEl: HTMLElement | null;
@@ -236,6 +237,7 @@ export function initDomRefs() {
   dom.sessionDrawerNewBtn = document.getElementById(
     'session-drawer-new-btn',
   ) as HTMLButtonElement | null;
+  dom.slashCommandMenu = document.getElementById('slash-command-menu');
   dom.todosHost = document.getElementById('todos-host');
   dom.todosPanel = document.getElementById('todos-panel');
   dom.headerVersionEl = document.getElementById('app-version-header');

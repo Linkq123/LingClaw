@@ -508,6 +508,78 @@ header .actions button.is-active {
   backdrop-filter: blur(18px) saturate(1.16);
   -webkit-backdrop-filter: blur(18px) saturate(1.16);
 }
+.slash-command-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 240px;
+  padding: 6px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border: 1px solid var(--glass-border);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--glass-surface) 94%, var(--surface));
+  box-shadow: 0 10px 30px rgba(44,46,62,.10);
+  backdrop-filter: blur(16px) saturate(1.08);
+  -webkit-backdrop-filter: blur(16px) saturate(1.08);
+}
+.slash-command-item {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: background .16s ease, border-color .16s ease, transform .16s ease;
+}
+.slash-command-item:hover,
+.slash-command-item.is-active {
+  border-color: color-mix(in srgb, var(--accent2) 26%, var(--border));
+  background: color-mix(in srgb, var(--accent2) 10%, transparent);
+}
+.slash-command-item:focus-visible {
+  outline: none;
+  border-color: var(--accent2);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent2) 16%, transparent);
+}
+.slash-command-item-command {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.slash-command-item-description {
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--dim);
+}
+.slash-command-item-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  margin-left: 8px;
+  padding: 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--accent-success) 24%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent-success) 10%, transparent);
+  color: color-mix(in srgb, var(--accent-success) 84%, var(--text));
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.slash-command-empty {
+  padding: 10px 12px;
+  color: var(--dim);
+  font-size: 12px;
+}
 /* Image preview bar */
 .image-preview-bar {
   display: flex;
@@ -677,6 +749,7 @@ header .actions button.is-active {
 }
 .input-composer {
   flex: 1;
+  min-width: 0;
   display: flex;
   gap: 8px;
   align-items: center;
@@ -695,6 +768,7 @@ header .actions button.is-active {
 }
 #input {
   flex: 1;
+  min-width: 0;
   background: transparent;
   border: none;
   border-radius: 0;

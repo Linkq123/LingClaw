@@ -4,9 +4,196 @@ import { canSendWhileBusy } from './utils.js';
 import { syncToolDrawerBounds, scrollDown } from './scroll.js';
 import { addMsg, addSystem, setBusy, renderUserImageThumbnails } from './renderers/chat.js';
 import { renderImagePreviews, uploadLocalImages } from './images.js';
+import {
+  buildSlashCommandInput,
+  getSlashCommandMenuState,
+  isBusyAllowedSlashCommand,
+  normalizeSlashCommandText,
+  type SlashCommandSpec,
+} from './slashCommands.js';
 
 // Guard: prevent double-registration on Vite HMR re-execution of main.ts.
 let _listenerInit = false;
+let slashMenuSuggestions: SlashCommandSpec[] = [];
+let slashMenuActiveIndex = 0;
+
+function closeSlashCommandMenu() {
+  const menu = dom.slashCommandMenu;
+  if (!menu || menu.hidden) {
+    slashMenuSuggestions = [];
+    slashMenuActiveIndex = 0;
+    return;
+  }
+  menu.hidden = true;
+  menu.replaceChildren();
+  slashMenuSuggestions = [];
+  slashMenuActiveIndex = 0;
+  syncToolDrawerBounds();
+}
+
+function applySlashCommandSuggestion(spec: SlashCommandSpec) {
+  if (!dom.input) return;
+  dom.input.value = buildSlashCommandInput(dom.input.value, spec);
+  dom.input.focus();
+  dom.input.setSelectionRange(dom.input.value.length, dom.input.value.length);
+  dom.input.style.height = 'auto';
+  dom.input.style.height = Math.min(dom.input.scrollHeight, 120) + 'px';
+  closeSlashCommandMenu();
+  syncToolDrawerBounds();
+}
+
+function renderSlashCommandMenu() {
+  const menu = dom.slashCommandMenu;
+  if (!menu || !dom.input) return;
+
+  const nextState = getSlashCommandMenuState(dom.input.value);
+  if (!nextState) {
+    closeSlashCommandMenu();
+    return;
+  }
+
+  const previousActiveCommand = slashMenuSuggestions[slashMenuActiveIndex]?.command;
+  slashMenuSuggestions = nextState.suggestions;
+
+  if (slashMenuSuggestions.length === 0) {
+    slashMenuActiveIndex = 0;
+  } else {
+    const previousIndex = previousActiveCommand
+      ? slashMenuSuggestions.findIndex((spec) => spec.command === previousActiveCommand)
+      : -1;
+    slashMenuActiveIndex =
+      previousIndex >= 0 ? previousIndex : Math.min(slashMenuActiveIndex, slashMenuSuggestions.length - 1);
+  }
+
+  const fragment = document.createDocumentFragment();
+  if (slashMenuSuggestions.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'slash-command-empty';
+    empty.textContent = 'No matching commands';
+    fragment.appendChild(empty);
+  } else {
+    for (const [index, spec] of slashMenuSuggestions.entries()) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'slash-command-item';
+      button.dataset.slashCommand = spec.command;
+      if (index === slashMenuActiveIndex) {
+        button.classList.add('is-active');
+        button.setAttribute('aria-selected', 'true');
+      } else {
+        button.setAttribute('aria-selected', 'false');
+      }
+      button.addEventListener('mouseenter', () => {
+        slashMenuActiveIndex = index;
+        renderSlashCommandMenu();
+      });
+      button.addEventListener('mousedown', (event) => {
+        event.preventDefault();
+      });
+      button.addEventListener('click', () => {
+        applySlashCommandSuggestion(spec);
+      });
+
+      const commandRow = document.createElement('div');
+      commandRow.className = 'slash-command-item-command';
+      commandRow.textContent = spec.args ? `${spec.command} ${spec.args}` : spec.command;
+      if (isBusyAllowedSlashCommand(spec)) {
+        const badge = document.createElement('span');
+        badge.className = 'slash-command-item-badge';
+        badge.textContent = 'Live';
+        commandRow.appendChild(badge);
+      }
+
+      const description = document.createElement('div');
+      description.className = 'slash-command-item-description';
+      description.textContent = spec.description;
+
+      button.append(commandRow, description);
+      fragment.appendChild(button);
+    }
+  }
+
+  menu.hidden = false;
+  menu.replaceChildren(fragment);
+  syncToolDrawerBounds();
+}
+
+function moveSlashCommandSelection(direction: 1 | -1) {
+  if (slashMenuSuggestions.length === 0) return;
+  slashMenuActiveIndex =
+    (slashMenuActiveIndex + direction + slashMenuSuggestions.length) % slashMenuSuggestions.length;
+  renderSlashCommandMenu();
+}
+
+function applyPendingSlashCommandSuggestion(text: string): boolean {
+  const menuState = getSlashCommandMenuState(text);
+  if (!menuState || menuState.exactMatch || menuState.suggestions.length === 0) {
+    return false;
+  }
+
+  const activeCommand = slashMenuSuggestions[slashMenuActiveIndex]?.command;
+  const suggestion =
+    (activeCommand
+      ? menuState.suggestions.find((spec) => spec.command === activeCommand)
+      : undefined) ??
+    menuState.suggestions[Math.min(slashMenuActiveIndex, menuState.suggestions.length - 1)];
+
+  if (!suggestion) {
+    return false;
+  }
+
+  applySlashCommandSuggestion(suggestion);
+  return true;
+}
+
+function handleSlashCommandKeydown(e: KeyboardEvent): boolean {
+  if (!dom.input || dom.slashCommandMenu?.hidden !== false) return false;
+  const menuState = getSlashCommandMenuState(dom.input.value);
+  if (!menuState) {
+    closeSlashCommandMenu();
+    return false;
+  }
+
+  if (e.key === 'ArrowDown') {
+    if (slashMenuSuggestions.length === 0) {
+      closeSlashCommandMenu();
+      return false;
+    }
+    e.preventDefault();
+    moveSlashCommandSelection(1);
+    return true;
+  }
+
+  if (e.key === 'ArrowUp') {
+    if (slashMenuSuggestions.length === 0) {
+      closeSlashCommandMenu();
+      return false;
+    }
+    e.preventDefault();
+    moveSlashCommandSelection(-1);
+    return true;
+  }
+
+  if (e.key === 'Tab') {
+    if (slashMenuSuggestions.length === 0) return false;
+    e.preventDefault();
+    applySlashCommandSuggestion(slashMenuSuggestions[slashMenuActiveIndex]);
+    return true;
+  }
+
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeSlashCommandMenu();
+    return true;
+  }
+
+  if (e.key === 'Enter' && !e.shiftKey && applyPendingSlashCommandSuggestion(dom.input.value)) {
+    e.preventDefault();
+    return true;
+  }
+
+  return false;
+}
 
 export function send() {
   if (!state.ws || state.ws.readyState !== 1) return;
@@ -15,16 +202,22 @@ export function send() {
   if (!text && state.pendingImages.length === 0) return;
 
   if (text.startsWith('/') && state.pendingImages.length === 0) {
-    if (state.busy && !canSendWhileBusy(text)) {
+    if (applyPendingSlashCommandSuggestion(text)) {
+      return;
+    }
+
+    const commandText = normalizeSlashCommandText(text);
+    if (state.busy && !canSendWhileBusy(commandText)) {
       addSystem(
         'Agent \u8fd0\u884c\u4e2d\u65f6\uff0c\u53ea\u5141\u8bb8 /stop\u3001/tool \u548c /reasoning\u3002',
       );
       return;
     }
-    sendCmd(text);
-    pushInputHistory(text);
+    sendCmd(commandText);
+    pushInputHistory(commandText);
     dom.input.value = '';
     dom.input.style.height = 'auto';
+    closeSlashCommandMenu();
     syncToolDrawerBounds();
     return;
   }
@@ -52,6 +245,7 @@ export function send() {
   pushInputHistory(text);
   dom.input.value = '';
   dom.input.style.height = 'auto';
+  closeSlashCommandMenu();
   syncToolDrawerBounds();
 }
 
@@ -72,15 +266,19 @@ export function stopAgent() {
 }
 
 export function sendCmd(cmd) {
-  if ((!canSendWhileBusy(cmd) && state.busy) || !state.ws || state.ws.readyState !== 1) return;
+  const normalizedCmd = normalizeSlashCommandText(cmd.trim());
+  if ((!canSendWhileBusy(normalizedCmd) && state.busy) || !state.ws || state.ws.readyState !== 1) {
+    return;
+  }
   setBusy(true);
-  state.ws.send(cmd);
+  state.ws.send(normalizedCmd);
 }
 
 export function initInputListeners() {
   if (_listenerInit) return;
   _listenerInit = true;
   dom.input.addEventListener('keydown', (e) => {
+    if (handleSlashCommandKeydown(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       send();
@@ -126,7 +324,17 @@ export function initInputListeners() {
   dom.input.addEventListener('input', () => {
     dom.input.style.height = 'auto';
     dom.input.style.height = Math.min(dom.input.scrollHeight, 120) + 'px';
+    renderSlashCommandMenu();
     syncToolDrawerBounds();
+  });
+  dom.input.addEventListener('focus', () => {
+    renderSlashCommandMenu();
+  });
+  dom.input.addEventListener('blur', () => {
+    window.setTimeout(() => {
+      if (dom.inputArea?.contains(document.activeElement)) return;
+      closeSlashCommandMenu();
+    }, 0);
   });
   dom.sendBtn.addEventListener('click', () => {
     send();
