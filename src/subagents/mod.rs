@@ -87,10 +87,11 @@ pub(crate) struct ToolPermissions {
 
 impl ToolPermissions {
     /// Check if a tool name is permitted under this permission set.
-    /// `task` and `orchestrate` are always denied to prevent recursive sub-agent spawning.
+    /// `task`, `orchestrate`, and session-scoped `todos` are always denied to
+    /// prevent recursive spawning and shared-state contention.
     pub fn is_allowed(&self, tool_name: &str) -> bool {
         // Never allow recursive task delegation or orchestration from sub-agents
-        if tool_name == "task" || tool_name == "orchestrate" {
+        if matches!(tool_name, "task" | "orchestrate" | "todos") {
             return false;
         }
         let in_allow = self.allow.is_empty() || self.allow.iter().any(|t| t == tool_name);

@@ -21,7 +21,7 @@
 
 后端暴露两类接口：
 
-- HTTP：健康检查、配置读写、模型与 MCP 联通性测试、Usage、图片上传、优雅关停
+- HTTP：健康检查、session 摘要、配置读写、todos、模型与 MCP 联通性测试、Usage、图片上传、优雅关停
 - WebSocket：聊天主通道，承载流式回复、工具事件、推理事件、子代理事件、编排事件
 
 ## 2. 访问与鉴权约束
@@ -89,7 +89,7 @@
 
 ### 3.3 会话范围
 
-服务端默认会话为 `main`，同时支持多个持久化 session。`/api/sessions` 会返回当前已加载或已持久化的 session 摘要；WebSocket 连接可通过查询参数 `?session=<id>` 绑定到指定 session，省略时回退到 `main`。
+服务端默认会话为 `main`，同时支持多个持久化 session。`/api/sessions` 会返回当前已加载或已持久化的 session 摘要；WebSocket 连接可通过查询参数 `?session=<id>` 绑定到指定 session，省略时回退到 `main`。每个 session 还持有一份当前 `todos` 快照（`revision`、`items[]`、`last_updated_by`、`updated_at`），随会话一起持久化；执行 `/clear` 时会清空 `items[]` 并推进 `revision`，从而拒绝旧的 in-flight 写入。
 
 ## 4. HTTP API
 
@@ -657,7 +657,124 @@
 - `source_scope`: 当前固定为 `latest_update`
 - `providers` / `roles`: 值格式均为 `[input_tokens, output_tokens]`
 
-## 4.9 POST /api/upload-images
+## 4.9 PUT /api/todos
+
+原子替换指定 session 的当前 todos 清单。
+
+- 查询参数：`session=<id>`（可选，省略时默认 `main`）
+- 请求体采用“整表替换 + revision 乐观并发”协议
+- 成功时返回最新快照
+- 若 `base_revision` 已过期，则返回 `409 Conflict` 和当前服务端快照，不落盘、不覆盖新数据
+
+### 请求体
+
+```json
+{
+  "base_revision": 3,
+  "items": [
+    {
+      "id": "todo-1",
+      "content": "Review runtime loop changes",
+      "status": "in_progress"
+    },
+    {
+      "id": "todo-2",
+      "content": "Update backend API docs",
+      "status": "pending"
+    }
+  ]
+}
+```
+
+### 请求规则
+
+- `items` 表示完整有序列表，服务端不会做局部 merge
+- 允许空数组，表示清空 todos
+- 最多 `12` 项
+- `id` 必须唯一、非空，最长 `64` 字符
+- `content` 必须非空，最长 `200` 字符
+- `status` 仅允许：`pending`、`in_progress`、`completed`
+- 整个列表最多只允许 `1` 个 `in_progress`
+
+### 成功响应
+
+状态码：`200 OK`
+
+```json
+{
+  "ok": true,
+  "conflict": false,
+  "revision": 4,
+  "items": [
+    {
+      "id": "todo-1",
+      "content": "Review runtime loop changes",
+      "status": "in_progress"
+    },
+    {
+      "id": "todo-2",
+      "content": "Update backend API docs",
+      "status": "pending"
+    }
+  ],
+  "last_updated_by": "user",
+  "updated_at": 1710002345
+}
+```
+
+字段说明：
+
+- `ok`：本次写入是否生效
+- `conflict`：是否发生 revision 冲突
+- `revision`：服务端最新 revision
+- `items`：服务端权威有序列表
+- `last_updated_by`：最近一次成功写入来源，`user` 或 `assistant`
+- `updated_at`：最新快照时间戳（Unix 秒）
+
+### 冲突响应
+
+状态码：`409 Conflict`
+
+```json
+{
+  "ok": false,
+  "conflict": true,
+  "revision": 5,
+  "items": [
+    {
+      "id": "todo-1",
+      "content": "Review runtime loop changes",
+      "status": "completed"
+    }
+  ],
+  "last_updated_by": "assistant",
+  "updated_at": 1710002400
+}
+```
+
+说明：
+
+- 该响应里的 `items` / `revision` 就是当前服务端权威快照
+- 客户端应以它覆盖本地临时状态，再基于新 `revision` 重试
+
+### 参数或校验错误
+
+状态码：`400 Bad Request`
+
+```json
+{
+  "error": "todos error: only one item may use status 'in_progress'"
+}
+```
+
+### 典型错误状态码
+
+- `400 Bad Request`：session id 非法、JSON 不合法或 todos 校验失败
+- `404 Not Found`：指定 session 不存在且无法加载
+- `409 Conflict`：`base_revision` 落后
+- `500 Internal Server Error`：持久化失败
+
+## 4.10 POST /api/upload-images
 
 上传本地图片到 S3-compatible 存储，并返回可用 URL 与受信 object key。
 
@@ -752,7 +869,7 @@
 }
 ```
 
-## 4.10 POST /api/shutdown
+## 4.11 POST /api/shutdown
 
 供本地 CLI 调用的优雅关停接口。
 
@@ -802,7 +919,8 @@ ws://127.0.0.1:18989/ws?session=research-notes
 
 1. `session`
 2. `view_state`
-3. `history`
+3. `todos_state`
+4. `history`
 
 ## 5.2 客户端 -> 服务端
 
@@ -918,6 +1036,36 @@ ws://127.0.0.1:18989/ws?session=research-notes
 }
 ```
 
+### `todos_state`
+
+```json
+{
+  "type": "todos_state",
+  "revision": 4,
+  "items": [
+    {
+      "id": "todo-1",
+      "content": "Review runtime loop changes",
+      "status": "in_progress"
+    },
+    {
+      "id": "todo-2",
+      "content": "Update backend API docs",
+      "status": "pending"
+    }
+  ],
+  "last_updated_by": "assistant",
+  "updated_at": 1710002400
+}
+```
+
+说明：
+
+- 这是会话级 todo 面板的唯一权威数据源
+- 首次连接、切换 session、重连回放、用户编辑、主代理调用 `todos` 工具后，都会重新发送
+- `items` 顺序即 UI 展示顺序
+- `last_updated_by = user` 时，表示最近一次成功写入来自前端 `/api/todos`
+
 ### `history`
 
 ```json
@@ -971,6 +1119,11 @@ ws://127.0.0.1:18989/ws?session=research-notes
 - `assistant`
 - `tool_call`
 - `tool_result`
+
+补充说明：
+
+- `todos` 工具的 `tool_call` / `tool_result` 不会进入这里的可见历史列表
+- 前端应使用 `todos_state` 渲染 todo 面板，而不是从 `history.messages` 反推
 
 ## 5.3.2 一轮主执行中的基础事件
 
@@ -1140,6 +1293,11 @@ reasoning 流结束。
   "subagent": "reviewer"
 }
 ```
+
+补充说明：
+
+- 内置 `todos` 工具不会发送普通 `tool_call` / `tool_result` 可视化事件
+- 对 todos 的可视化更新统一通过 `todos_state` 推送，避免污染时间线
 
 ### `observation`
 
@@ -1528,7 +1686,7 @@ WebSocket 下若图片不合法，通常以 `system` 事件返回错误，例如
 
 1. 轮询或请求 `GET /api/health`，确认服务可用
 2. 建立 `/ws` 连接
-3. 收到 `session`、`view_state`、`history` 后初始化 UI
+3. 收到 `session`、`view_state`、`todos_state`、`history` 后初始化 UI
 4. 发送纯文本或图片 JSON 消息
 5. 处理 `start -> delta/thinking/tool/* -> done`
 6. 如需本地上传图片：
@@ -1541,6 +1699,7 @@ WebSocket 下若图片不合法，通常以 `system` 事件返回错误，例如
 - `/api/config/test-model` 与 `/api/config/test-mcp` 的“联通性失败”通常返回 `200 + {ok:false}`
 - `/api/config` 在配置文件语法错误时不会返回 4xx，而是返回可恢复信息
 - `/api/sessions` 返回当前已知 session 摘要列表
+- `/api/todos` 使用整表替换 + revision 冲突语义；冲突时返回 `409 + 当前快照`
 - WebSocket 客户端消息没有显式 `type` 字段，按“纯文本 / slash 命令 / JSON 图片消息”三种形态自动分流
 - 忙碌时普通文本会进入 deferred intervention 队列，不会立即中断主执行
 

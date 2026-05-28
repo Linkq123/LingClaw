@@ -1,6 +1,9 @@
 use super::*;
 
-use std::{collections::{HashMap, VecDeque}, sync::atomic::AtomicU64};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::atomic::AtomicU64,
+};
 
 use crate::config::{JsonModelEntry, JsonProviderConfig, S3Config};
 
@@ -312,7 +315,10 @@ async fn ensure_session_ready_reuses_loaded_session_case_insensitively() {
 
     {
         let mut sessions = state.sessions.lock().await;
-        sessions.insert(session_id.clone(), test_session(&session_id, "Case Session", None));
+        sessions.insert(
+            session_id.clone(),
+            test_session(&session_id, "Case Session", None),
+        );
     }
 
     let (resolved, created_fresh) = ensure_session_ready(&state, Some("casesensitivesession"))
@@ -396,7 +402,10 @@ async fn resolve_or_create_socket_session_broadcasts_session_list_for_fresh_sess
 
     {
         let mut sessions = state.sessions.lock().await;
-        sessions.insert(MAIN_SESSION_ID.to_string(), test_session(MAIN_SESSION_ID, "Main", None));
+        sessions.insert(
+            MAIN_SESSION_ID.to_string(),
+            test_session(MAIN_SESSION_ID, "Main", None),
+        );
     }
     {
         let mut clients = state.session_clients.lock().await;
@@ -413,14 +422,9 @@ async fn resolve_or_create_socket_session_broadcasts_session_list_for_fresh_sess
     }
 
     let connection_cancel = CancellationToken::new();
-    let resolved = resolve_or_create_socket_session(
-        &state,
-        &tx,
-        Some(&session_id),
-        1,
-        &connection_cancel,
-    )
-    .await;
+    let resolved =
+        resolve_or_create_socket_session(&state, &tx, Some(&session_id), 1, &connection_cancel)
+            .await;
 
     assert_eq!(resolved, session_id);
 
@@ -444,7 +448,8 @@ async fn resolve_or_create_socket_session_broadcasts_session_list_for_fresh_sess
         crate::session_store::sessions_dir().join(format!("{session_id}.json")),
     )
     .await;
-    let _ = tokio::fs::remove_dir_all(crate::session_workspace_path(&session_id).parent().unwrap()).await;
+    let _ = tokio::fs::remove_dir_all(crate::session_workspace_path(&session_id).parent().unwrap())
+        .await;
 }
 
 #[tokio::test]
@@ -457,7 +462,10 @@ async fn resolve_or_create_socket_session_cancels_old_connection_before_replay()
 
     {
         let mut sessions = state.sessions.lock().await;
-        sessions.insert(session_id.clone(), test_session(&session_id, "Reconnect Target", None));
+        sessions.insert(
+            session_id.clone(),
+            test_session(&session_id, "Reconnect Target", None),
+        );
     }
     {
         let mut cancels = state.connection_cancels.lock().await;
@@ -470,7 +478,8 @@ async fn resolve_or_create_socket_session_cancels_old_connection_before_replay()
         );
     }
 
-    let resolved = resolve_or_create_socket_session(&state, &tx, Some(&session_id), 1, &new_cancel).await;
+    let resolved =
+        resolve_or_create_socket_session(&state, &tx, Some(&session_id), 1, &new_cancel).await;
 
     assert_eq!(resolved, session_id);
     assert!(old_cancel.is_cancelled());
@@ -506,7 +515,10 @@ async fn resolve_or_create_socket_session_replays_live_tail_for_running_session(
 
     {
         let mut sessions = state.sessions.lock().await;
-        sessions.insert(session_id.clone(), test_session(&session_id, "Reconnect Target", None));
+        sessions.insert(
+            session_id.clone(),
+            test_session(&session_id, "Reconnect Target", None),
+        );
     }
     {
         let mut runs = state.active_runs.lock().await;
@@ -547,14 +559,9 @@ async fn resolve_or_create_socket_session_replays_live_tail_for_running_session(
     .await;
 
     let connection_cancel = CancellationToken::new();
-    let resolved = resolve_or_create_socket_session(
-        &state,
-        &tx,
-        Some(&session_id),
-        1,
-        &connection_cancel,
-    )
-    .await;
+    let resolved =
+        resolve_or_create_socket_session(&state, &tx, Some(&session_id), 1, &connection_cancel)
+            .await;
 
     assert_eq!(resolved, session_id);
     assert!(old_cancel.is_cancelled());
@@ -675,19 +682,15 @@ async fn switch_session_broadcasts_session_list_when_session_set_changes() {
 
     {
         let mut current_payloads = Vec::new();
-        while let Ok(Some(payload)) = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx.recv(),
-        )
-        .await
+        while let Ok(Some(payload)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await
         {
             current_payloads.push(payload);
         }
         let current_types = current_payloads
             .iter()
             .map(|payload| {
-                serde_json::from_str::<serde_json::Value>(payload)
-                    .expect("payload json")["type"]
+                serde_json::from_str::<serde_json::Value>(payload).expect("payload json")["type"]
                     .as_str()
                     .unwrap_or_default()
                     .to_string()
@@ -703,7 +706,12 @@ async fn switch_session_broadcasts_session_list_when_session_set_changes() {
         crate::session_store::sessions_dir().join(format!("{new_session_id}.json")),
     )
     .await;
-    let _ = tokio::fs::remove_dir_all(crate::session_workspace_path(&new_session_id).parent().unwrap()).await;
+    let _ = tokio::fs::remove_dir_all(
+        crate::session_workspace_path(&new_session_id)
+            .parent()
+            .unwrap(),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1447,6 +1455,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 0,
         workspace: PathBuf::new(),
     }

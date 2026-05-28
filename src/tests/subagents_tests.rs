@@ -23,6 +23,7 @@ fn test_tool_permissions_basic() {
     assert!(perms.is_allowed("read_file"));
     assert!(perms.is_allowed("exec"));
     assert!(!perms.is_allowed("task")); // task always denied
+    assert!(!perms.is_allowed("todos"));
 }
 
 #[test]

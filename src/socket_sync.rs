@@ -10,9 +10,13 @@ fn default_view_state_payload() -> serde_json::Value {
     json!({"type":"view_state","show_tools":true,"show_reasoning":true,"show_react":true})
 }
 
+fn default_todos_state_payload() -> serde_json::Value {
+    crate::todos::build_todos_state_event(&crate::todos::TodoSnapshot::default())
+}
+
 pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, session_id: &str) {
     let config = state.config();
-    let (name, history, view_state, supports_image, usage) = {
+    let (name, history, view_state, todos_state, supports_image, usage) = {
         let sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get(session_id) {
             let model = session.effective_model(&config.model);
@@ -22,6 +26,7 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
                 session.name.clone(),
                 build_history_payload_with_s3(session, config.s3.as_ref()),
                 build_view_state_payload(session),
+                crate::todos::build_todos_state_event(&session.todos),
                 supports_image,
                 usage,
             )
@@ -30,6 +35,7 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
                 "New Chat".to_string(),
                 default_history_payload(),
                 default_view_state_payload(),
+                default_todos_state_payload(),
                 false,
                 json!({}),
             )
@@ -43,6 +49,7 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
     )
     .await;
     ws_send(tx, &view_state).await;
+    ws_send(tx, &todos_state).await;
     ws_send(tx, &history).await;
 }
 
@@ -108,7 +115,10 @@ pub(crate) async fn broadcast_session_list_payload(state: &AppState) {
     let payload = build_session_list_payload(state);
     let clients = {
         let clients = state.session_clients.lock().await;
-        clients.values().map(|binding| binding.tx.clone()).collect::<Vec<_>>()
+        clients
+            .values()
+            .map(|binding| binding.tx.clone())
+            .collect::<Vec<_>>()
     };
     for tx in clients {
         ws_send(&tx, &payload).await;
@@ -126,17 +136,19 @@ pub(crate) async fn send_command_refresh(
         let sessions = state.sessions.lock().await;
         sessions.get(session_id).map(|session| {
             let view_state = build_view_state_payload(session);
+            let todos_state = crate::todos::build_todos_state_event(&session.todos);
             let history = if include_history {
                 Some(build_history_payload_with_s3(session, config.s3.as_ref()))
             } else {
                 None
             };
-            (view_state, history)
+            (view_state, todos_state, history)
         })
     };
 
-    if let Some((view_state, history)) = refresh_view_state {
+    if let Some((view_state, todos_state, history)) = refresh_view_state {
         ws_send(tx, &view_state).await;
+        ws_send(tx, &todos_state).await;
         if let Some(history_payload) = history {
             ws_send(tx, &history_payload).await;
         }

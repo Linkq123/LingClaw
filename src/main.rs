@@ -7,7 +7,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use futures::{SinkExt, StreamExt};
 use reqwest::Client;
@@ -43,6 +43,7 @@ mod session_store;
 mod socket_sync;
 mod socket_tasks;
 mod subagents;
+mod todos;
 mod tools;
 
 pub(crate) use config::{Config, DEFAULT_PORT, Provider, config_dir_path, config_file_path};
@@ -64,8 +65,8 @@ use runtime_loop::{
     resolve_or_create_socket_session, run_agent_session,
 };
 use session_store::{
-    SessionSummary, load_session_from_disk, refresh_session_system_prompt, save_session_to_disk,
-    sessions_dir,
+    SessionSummary, list_saved_session_summaries_in_dir, load_session_from_disk,
+    refresh_session_system_prompt, save_session_to_disk, sessions_dir,
 };
 use socket_sync::{
     broadcast_session_list_payload, build_session_info_payload, send_command_refresh,
@@ -90,8 +91,7 @@ use session_admin::gather_global_today_usage;
 #[cfg(test)]
 use session_store::{
     build_active_session_lines, build_global_today_usage, build_history_payload,
-    build_session_status, build_session_usage, build_usage_report,
-    list_saved_session_ids_in_dir, list_saved_session_summaries_in_dir,
+    build_session_status, build_session_usage, build_usage_report, list_saved_session_ids_in_dir,
     recoverable_session_ids_from_summaries, replace_session_messages, resolve_session_target,
     sanitize_session_messages, subagent_snapshot_storage_key, trim_incomplete_tool_calls,
     trim_incomplete_tool_calls_in_session,
@@ -289,7 +289,7 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
-const SESSION_VERSION: u32 = 4;
+const SESSION_VERSION: u32 = 5;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {
@@ -341,6 +341,8 @@ struct Session {
     /// Compact delegated-task snapshots keyed by parent `task` tool_call_id.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     subagent_snapshots: HashMap<String, SubagentHistorySnapshot>,
+    #[serde(default)]
+    todos: todos::TodoSnapshot,
     #[serde(default)]
     version: u32,
     #[serde(skip)]
@@ -396,6 +398,10 @@ fn migrate_session(session: &mut Session) {
         session.input_token_source = default_token_usage_source();
         session.output_token_source = default_token_usage_source();
     }
+    if session.version < 5 {
+        session.todos = todos::TodoSnapshot::empty(session.updated_at);
+    }
+    todos::normalize_snapshot(&mut session.todos, session.updated_at);
     session.version = SESSION_VERSION;
 }
 
@@ -437,6 +443,7 @@ impl Session {
             disabled_system_skills: HashSet::new(),
             failed_tool_results: HashSet::new(),
             subagent_snapshots: HashMap::new(),
+            todos: todos::TodoSnapshot::empty(now_epoch()),
             version: SESSION_VERSION,
             workspace,
         }
@@ -1593,6 +1600,53 @@ pub(crate) async fn ws_send(tx: &WsTx, data: &serde_json::Value) -> bool {
 
 pub(crate) async fn live_send(tx: &LiveTx, data: serde_json::Value) -> bool {
     tx.send(data).await.is_ok()
+}
+
+pub(crate) async fn send_session_client_event(
+    state: &AppState,
+    session_id: &str,
+    event: serde_json::Value,
+) {
+    let Some(SessionClientSendBatch {
+        connection_id,
+        tx,
+        events,
+    }) = take_live_client_send_batch(
+        state,
+        session_id,
+        queue_live_client_events(state, session_id, vec![event]).await,
+    )
+    .await
+    else {
+        return;
+    };
+
+    let mut unsent_start = 0usize;
+    while unsent_start < events.len() {
+        let payload = events[unsent_start].to_string();
+        match tx.try_send(payload) {
+            Ok(()) => {
+                unsent_start += 1;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                requeue_live_client_events(
+                    state,
+                    session_id,
+                    connection_id,
+                    events[unsent_start..].to_vec(),
+                )
+                .await;
+                break;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                unbind_session_connection_if_matches(state, session_id, connection_id).await;
+                break;
+            }
+        }
+    }
+    if unsent_start == events.len() {
+        finish_live_client_send(state, session_id, connection_id, Vec::new()).await;
+    }
 }
 
 pub(crate) async fn forward_tool_output_event_best_effort(
@@ -3043,7 +3097,8 @@ async fn switch_socket_session(
         let mut cancels = state.connection_cancels.lock().await;
         cancels.remove(&previous_session_id);
     }
-    replace_connection_cancel_binding(state, &next_session_id, connection_id, connection_cancel).await;
+    replace_connection_cancel_binding(state, &next_session_id, connection_id, connection_cancel)
+        .await;
 
     *current_session_id = next_session_id.clone();
     {
@@ -3123,6 +3178,63 @@ async fn api_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         b_ts.cmp(&a_ts)
     });
     Json(json!({"sessions": list}))
+}
+
+async fn api_todos(
+    Query(query): Query<SessionQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<crate::todos::TodoReplaceRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let session_id = match query.session.as_deref() {
+        Some(requested) => crate::session_store::validate_session_id(requested)
+            .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?
+            .to_string(),
+        None => MAIN_SESSION_ID.to_string(),
+    };
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        if !sessions.contains_key(session_id.as_str())
+            && let Some(session) = load_session_from_disk(&session_id)
+        {
+            sessions.insert(session_id.clone(), session);
+        }
+    }
+
+    match crate::todos::replace_session_todos(
+        state.as_ref(),
+        &session_id,
+        request,
+        crate::todos::TodoUpdateOrigin::User,
+    )
+    .await
+    {
+        Ok(response) => {
+            let status = if response.conflict {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::OK
+            };
+            Ok((
+                status,
+                Json(serde_json::to_value(response).unwrap_or_else(|_| json!({}))),
+            ))
+        }
+        Err(crate::todos::TodoUpdateError::SessionNotFound) => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Session not found" })),
+        )),
+        Err(crate::todos::TodoUpdateError::Validation(error)) => {
+            Err((StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))
+        }
+        Err(crate::todos::TodoUpdateError::Persist(error)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        )),
+    }
 }
 
 async fn api_client_config(
@@ -3964,6 +4076,7 @@ async fn main() {
         .route("/api/health", get(api_health))
         .route("/api/client-config", get(api_client_config))
         .route("/api/sessions", get(api_sessions))
+        .route("/api/todos", put(api_todos))
         .route("/api/config", get(api_get_config).put(api_put_config))
         .route("/api/config/test-model", post(api_test_model))
         .route("/api/config/test-mcp", post(api_test_mcp))
@@ -3982,7 +4095,7 @@ async fn main() {
     let addr = format!("127.0.0.1:{port}");
     println!("🦀 LingClaw v2 listening on http://{addr}");
     println!(
-        "   Tools: think, exec, read_file, write_file, patch_file, list_dir, search_files, http_fetch"
+        "   Tools: think, todos, exec, read_file, write_file, patch_file, list_dir, search_files, http_fetch"
     );
 
     let listener = match tokio::net::TcpListener::bind(&addr).await {

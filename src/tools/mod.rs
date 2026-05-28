@@ -88,6 +88,7 @@ type ToolHandler = for<'a> fn(
 type ToolTraceBuilder = fn(&serde_json::Value) -> Option<crate::agent::ToolExecutionTrace>;
 
 pub(crate) const TOOL_NAME_THINK: &str = "think";
+pub(crate) const TOOL_NAME_TODOS: &str = "todos";
 pub(crate) const TOOL_NAME_EXEC: &str = "exec";
 pub(crate) const TOOL_NAME_READ_FILE: &str = "read_file";
 pub(crate) const TOOL_NAME_WRITE_FILE: &str = "write_file";
@@ -100,7 +101,7 @@ pub(crate) const TOOL_NAME_TASK: &str = "task";
 pub(crate) const TOOL_NAME_ORCHESTRATE: &str = "orchestrate";
 
 pub(crate) fn tool_runtime_timeout(tool_name: &str, config: &Config) -> Option<Duration> {
-    if tool_name == TOOL_NAME_EXEC {
+    if matches!(tool_name, TOOL_NAME_EXEC | TOOL_NAME_TODOS) {
         None
     } else {
         Some(config.tool_timeout)
@@ -138,6 +139,47 @@ fn tool_parameters_think() -> serde_json::Value {
             }
         },
         "required": ["thought"]
+    })
+}
+
+fn tool_parameters_todos() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "base_revision": {
+                "type": "integer",
+                "minimum": 0,
+                "description": "Current todo revision expected by the caller"
+            },
+            "items": {
+                "type": "array",
+                "maxItems": crate::todos::MAX_TODO_ITEMS,
+                "description": "Full ordered todo list replacement",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": crate::todos::MAX_TODO_ID_CHARS
+                        },
+                        "content": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": crate::todos::MAX_TODO_CONTENT_CHARS
+                        },
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "completed"]
+                        }
+                    },
+                    "required": ["id", "content", "status"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["base_revision", "items"],
+        "additionalProperties": false
     })
 }
 
@@ -349,6 +391,11 @@ fn tool_prompt_line_think(_: &Config) -> String {
         .to_string()
 }
 
+fn tool_prompt_line_todos(_: &Config) -> String {
+    "**todos** — Replace the session todo list with an ordered checklist for multi-step work. Use this to track progress and react to user edits."
+        .to_string()
+}
+
 fn tool_prompt_line_exec(config: &Config) -> String {
     format!(
         "**exec** — Execute commands (timeout: {}s). Prefer `program` + `args`; use `command` for shell-only workflows. Supports working_dir, env, stdin.",
@@ -393,6 +440,22 @@ fn tool_handler_think<'a>(
     _: Option<BoundedToolEventSender>,
 ) -> ToolFuture<'a> {
     Box::pin(async move { ToolHandlerOutput::explicit(exec::tool_think(args), false) })
+}
+
+fn tool_handler_todos<'a>(
+    _: &'a serde_json::Value,
+    _: &'a Config,
+    _: &'a Client,
+    _: &'a Path,
+    _: Option<ToolEventSender>,
+    _: Option<BoundedToolEventSender>,
+) -> ToolFuture<'a> {
+    Box::pin(async move {
+        ToolHandlerOutput::explicit(
+            "todos error: runtime session context unavailable".to_string(),
+            true,
+        )
+    })
 }
 
 fn tool_handler_exec<'a>(
@@ -501,6 +564,20 @@ fn tool_handler_delete_file<'a>(
 
 fn trace_builder_none(_: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
     None
+}
+
+fn trace_builder_todos(args: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
+    let item_count = args
+        .get("items")
+        .and_then(serde_json::Value::as_array)
+        .map(std::vec::Vec::len)?;
+    let base_revision = tool_arg_u64(args, "base_revision")?;
+    Some(crate::agent::ToolExecutionTrace {
+        summary: compact_tool_call_summary(&format!(
+            "replace todos with {item_count} items at revision {base_revision}"
+        )),
+        ..crate::agent::ToolExecutionTrace::default()
+    })
 }
 
 fn trace_builder_exec(args: &serde_json::Value) -> Option<crate::agent::ToolExecutionTrace> {
@@ -661,6 +738,15 @@ pub(crate) fn tool_specs() -> &'static [ToolSpec] {
             parameters: tool_parameters_think,
             handler: tool_handler_think,
             trace_builder: trace_builder_none,
+        },
+        ToolSpec {
+            name: TOOL_NAME_TODOS,
+            description: "Replace the session todo list with an ordered checklist snapshot. Use this for multi-step plans, progress tracking, and adapting to user edits.",
+            relevance_hint: "todo checklist tasks plan progress tracking ordered steps",
+            prompt_line: tool_prompt_line_todos,
+            parameters: tool_parameters_todos,
+            handler: tool_handler_todos,
+            trace_builder: trace_builder_todos,
         },
         ToolSpec {
             name: TOOL_NAME_EXEC,
@@ -1243,6 +1329,10 @@ pub(crate) fn is_read_only_tool(name: &str) -> bool {
 /// This tool is handled specially by the runtime loop, not the standard execute path.
 pub(crate) fn is_task_tool(name: &str) -> bool {
     name == TOOL_NAME_TASK
+}
+
+pub(crate) fn is_todos_tool(name: &str) -> bool {
+    name == TOOL_NAME_TODOS
 }
 
 /// Returns true if the named tool can safely run in parallel with other parallelizable tools.

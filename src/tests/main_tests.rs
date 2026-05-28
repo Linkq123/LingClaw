@@ -261,6 +261,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 0,
         workspace: PathBuf::new(),
     }
@@ -1724,6 +1725,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 0,
         workspace: PathBuf::new(),
     };
@@ -1780,6 +1782,7 @@ fn build_history_payload_marks_failed_tool_result_with_is_error() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: HashSet::from(["task_1".to_string()]),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -1838,6 +1841,7 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -1893,6 +1897,7 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -1977,6 +1982,7 @@ fn build_history_payload_includes_thinking_only_assistant_messages() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2048,6 +2054,7 @@ fn build_history_payload_redacts_exec_tool_call_arguments() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2146,6 +2153,7 @@ fn build_history_payload_includes_subagent_snapshot_on_task_results() {
                 error: None,
             },
         )]),
+        todos: crate::todos::TodoSnapshot::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2253,6 +2261,7 @@ fn build_history_payload_redacts_exec_args_in_subagent_snapshot() {
                 error: None,
             },
         )]),
+        todos: crate::todos::TodoSnapshot::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2337,6 +2346,7 @@ fn build_history_payload_normalizes_legacy_subagent_snapshot_keys() {
                 ..Default::default()
             },
         )]),
+        todos: crate::todos::TodoSnapshot::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2459,6 +2469,7 @@ fn build_history_payload_distinguishes_repeated_task_tool_call_ids() {
                 second_snapshot.clone(),
             ),
         ]),
+        todos: crate::todos::TodoSnapshot::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2597,6 +2608,7 @@ fn replace_session_messages_rekeys_subagent_snapshots_for_remaining_history() {
                 },
             ),
         ]),
+        todos: crate::todos::TodoSnapshot::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2630,6 +2642,176 @@ fn replace_session_messages_rekeys_subagent_snapshots_for_remaining_history() {
     assert_eq!(
         results[0]["subagent_snapshot"]["result_excerpt"].as_str(),
         Some("Second delegated result")
+    );
+}
+
+#[tokio::test]
+async fn replace_session_todos_rejects_stale_revision_without_overwriting_snapshot() {
+    let state = test_app_state();
+    let session_id = format!("todos-conflict-{}", now_epoch());
+    let mut session = test_session(&session_id, "Todos Conflict", None);
+    session.version = SESSION_VERSION;
+    session.todos = crate::todos::TodoSnapshot {
+        revision: 2,
+        items: vec![crate::todos::TodoItem {
+            id: "todo-1".into(),
+            content: "keep current".into(),
+            status: crate::todos::TodoStatus::InProgress,
+        }],
+        last_updated_by: crate::todos::TodoUpdatedBy::User,
+        updated_at: 123,
+    };
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let response = crate::todos::replace_session_todos(
+        &state,
+        &session_id,
+        crate::todos::TodoReplaceRequest {
+            base_revision: 1,
+            items: vec![crate::todos::TodoItem {
+                id: "todo-2".into(),
+                content: "stale overwrite".into(),
+                status: crate::todos::TodoStatus::Pending,
+            }],
+        },
+        crate::todos::TodoUpdateOrigin::Assistant,
+    )
+    .await
+    .expect("stale revision should return a conflict snapshot");
+
+    assert!(!response.ok);
+    assert!(response.conflict);
+    assert_eq!(response.revision, 2);
+    assert_eq!(response.items.len(), 1);
+    assert_eq!(response.items[0].content, "keep current");
+
+    let stored = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .expect("session should still exist")
+            .todos
+            .clone()
+    };
+    assert_eq!(stored.revision, 2);
+    assert_eq!(stored.items[0].content, "keep current");
+
+    let _ = std::fs::remove_file(sessions_dir().join(format!("{session_id}.json")));
+}
+
+#[test]
+fn build_history_payload_omits_todos_tool_messages() {
+    let session = Session {
+        id: "test".into(),
+        name: "Test".into(),
+        messages: vec![
+            make_message("system", "system"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "todo_call_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: crate::tools::TOOL_NAME_TODOS.into(),
+                        arguments: r#"{"base_revision":0,"items":[]}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(1000),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some(r#"{"ok":true,"conflict":false,"revision":1,"items":[]}"#.into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: Some("todo_call_1".into()),
+                timestamp: Some(1001),
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: None,
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "exec_call_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "exec".into(),
+                        arguments: r#"{"command":"echo ok"}"#.into(),
+                    },
+                }]),
+                tool_call_id: None,
+                timestamp: Some(1002),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: Some("ok".into()),
+                images: None,
+                thinking: None,
+                anthropic_thinking_blocks: None,
+                tool_calls: None,
+                tool_call_id: Some("exec_call_1".into()),
+                timestamp: Some(1003),
+            },
+        ],
+        created_at: 0,
+        updated_at: 0,
+        tool_calls_count: 2,
+        input_tokens: 0,
+        output_tokens: 0,
+        daily_input_tokens: 0,
+        daily_output_tokens: 0,
+        input_token_source: default_token_usage_source(),
+        output_token_source: default_token_usage_source(),
+        token_usage_day: prompts::current_local_snapshot().today(),
+        daily_provider_usage: HashMap::new(),
+        total_label_usage: HashMap::new(),
+        usage_history: Vec::new(),
+        model_override: None,
+        think_level: default_think_level(),
+        show_react: default_show_react(),
+        show_tools: default_show_tools(),
+        show_reasoning: default_show_reasoning(),
+        disabled_system_skills: HashSet::new(),
+        failed_tool_results: Default::default(),
+        subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
+        version: SESSION_VERSION,
+        workspace: PathBuf::new(),
+    };
+
+    let payload = build_history_payload(&session);
+    let messages = payload["messages"]
+        .as_array()
+        .expect("history messages should be an array");
+
+    assert!(
+        messages
+            .iter()
+            .all(|message| message["id"] != "todo_call_1")
+    );
+    assert!(messages.iter().any(|message| {
+        message["role"] == "tool_call"
+            && message["id"] == "exec_call_1"
+            && message["name"] == "exec"
+    }));
+    assert!(
+        messages
+            .iter()
+            .any(|message| { message["role"] == "tool_result" && message["id"] == "exec_call_1" })
     );
 }
 
@@ -4292,6 +4474,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 0,
         workspace: workspace.clone(),
     };
@@ -4440,6 +4623,7 @@ fn save_session_to_disk_redacts_exec_arguments_in_messages_and_snapshots() {
                 ..Default::default()
             },
         )]),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 0,
         workspace,
     };
@@ -4503,6 +4687,7 @@ fn save_session_to_disk_overwrites_existing_file() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 1,
         workspace: workspace.clone(),
     };
@@ -4590,6 +4775,7 @@ fn save_session_to_disk_skips_identical_payload_rewrite() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: SESSION_VERSION,
         workspace,
     };
@@ -4916,7 +5102,13 @@ async fn api_usage_loads_persisted_session_not_yet_in_memory() {
     assert_eq!(payload["total_output"], 11);
     assert_eq!(payload["input_source"], "provider");
     assert_eq!(payload["output_source"], "estimated");
-    assert!(state.sessions.lock().await.contains_key(session_id.as_str()));
+    assert!(
+        state
+            .sessions
+            .lock()
+            .await
+            .contains_key(session_id.as_str())
+    );
 }
 
 #[tokio::test]
@@ -5606,6 +5798,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 0,
         workspace: PathBuf::new(),
     };
@@ -5938,6 +6131,16 @@ fn handle_command_persists_clear_changes() {
     session.version = SESSION_VERSION;
     session.messages.push(make_message("user", "keep me?"));
     session.messages.push(make_message("assistant", "no"));
+    session.todos = crate::todos::TodoSnapshot {
+        revision: 4,
+        items: vec![crate::todos::TodoItem {
+            id: "todo-1".into(),
+            content: "stale item".into(),
+            status: crate::todos::TodoStatus::InProgress,
+        }],
+        last_updated_by: crate::todos::TodoUpdatedBy::User,
+        updated_at: 44,
+    };
 
     let state = test_app_state();
     {
@@ -5968,7 +6171,32 @@ fn handle_command_persists_clear_changes() {
     assert_eq!(persisted.messages.len(), 1);
     assert_eq!(persisted.messages[0].role, "system");
     assert_eq!(persisted.tool_calls_count, 0);
+    assert_eq!(persisted.todos.revision, 5);
+    assert!(persisted.todos.items.is_empty());
+    assert_eq!(
+        persisted.todos.last_updated_by,
+        crate::todos::TodoUpdatedBy::User
+    );
     assert!(persisted.updated_at > 0);
+
+    let stale_todo_write = rt
+        .block_on(crate::todos::replace_session_todos(
+            &state,
+            &session_id,
+            crate::todos::TodoReplaceRequest {
+                base_revision: 4,
+                items: vec![crate::todos::TodoItem {
+                    id: "todo-stale".into(),
+                    content: "should not return".into(),
+                    status: crate::todos::TodoStatus::Pending,
+                }],
+            },
+            crate::todos::TodoUpdateOrigin::Assistant,
+        ))
+        .expect("stale write should return conflict snapshot");
+    assert!(stale_todo_write.conflict);
+    assert_eq!(stale_todo_write.revision, 5);
+    assert!(stale_todo_write.items.is_empty());
 
     let path = sessions_dir().join(format!("{session_id}.json"));
     let _ = std::fs::remove_file(path);
@@ -6225,15 +6453,18 @@ fn resolve_session_target_for_command_accepts_persisted_empty_session_prefix() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: SESSION_VERSION,
         workspace: session_workspace_path(&session_id),
     };
-    rt.block_on(save_session_to_disk(&persisted_session)).expect("session should persist");
+    rt.block_on(save_session_to_disk(&persisted_session))
+        .expect("session should persist");
 
     let prefix = &session_id[..session_id.len().min(12)];
-    let resolved = rt.block_on(crate::runtime_loop::resolve_session_target_for_command(
-        &state, prefix,
-    ))
+    let resolved = rt
+        .block_on(crate::runtime_loop::resolve_session_target_for_command(
+            &state, prefix,
+        ))
         .expect("empty persisted session prefix should resolve");
 
     assert_eq!(resolved, session_id);
@@ -6464,9 +6695,11 @@ fn switch_socket_session_binds_new_session_before_replay_so_live_events_are_not_
     assert!(payloads.iter().any(|event| event["type"] == "session"));
     assert!(payloads.iter().any(|event| event["type"] == "history"));
     assert!(payloads.iter().any(|event| event["type"] == "start"));
-    assert!(payloads.iter().any(|event| {
-        event["type"] == "delta" && event["content"] == "tail after switch"
-    }));
+    assert!(
+        payloads
+            .iter()
+            .any(|event| { event["type"] == "delta" && event["content"] == "tail after switch" })
+    );
 }
 
 #[test]
@@ -11638,6 +11871,7 @@ fn trim_incomplete_tool_calls_in_session_drops_orphaned_subagent_snapshots() {
                 ..Default::default()
             },
         )]),
+        todos: crate::todos::TodoSnapshot::default(),
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };

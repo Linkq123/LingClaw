@@ -129,9 +129,11 @@ import {
   toggleAutoDebug,
   updateAutoDebugToggleButton,
 } from './renderers/auto-trace.js';
+import { applyTodosState, applyTodosVisibility, initTodosPanel } from './renderers/todos.js';
 
 // ── Initialize DOM ──
 initDomRefs();
+initTodosPanel();
 
 // React islands (Settings & Usage) are now code-split and mounted lazily on
 // first `openSettingsPage()` / `openUsagePage()` call. We also prefetch them
@@ -140,6 +142,10 @@ initDomRefs();
 // ── View toggles ──
 
 function updateViewToggleButtons() {
+  if (dom.toggleTodosBtn) {
+    dom.toggleTodosBtn.textContent = `Todos: ${state.showTodos ? 'On' : 'Off'}`;
+    dom.toggleTodosBtn.classList.toggle('is-active', state.showTodos);
+  }
   if (dom.toggleToolsBtn) {
     dom.toggleToolsBtn.textContent = `Tools: ${state.showTools ? 'On' : 'Off'}`;
     dom.toggleToolsBtn.classList.toggle('is-active', state.showTools);
@@ -173,6 +179,12 @@ function applyViewState(viewState) {
     }
   }
 
+  updateViewToggleButtons();
+}
+
+function toggleTodosVisibility() {
+  state.showTodos = !state.showTodos;
+  applyTodosVisibility();
   updateViewToggleButtons();
 }
 
@@ -567,6 +579,10 @@ function handleMessage(data) {
       void refreshSessionsList();
       break;
 
+    case 'todos_state':
+      applyTodosState(data);
+      break;
+
     case 'history': {
       clearCompressionOutcome();
       closeToolDrawer();
@@ -959,6 +975,7 @@ function handleMessage(data) {
 
 const actionHandlers = {
   'toggle-tools': () => toggleToolsVisibility(),
+  'toggle-todos': () => toggleTodosVisibility(),
   'toggle-reasoning': () => toggleReasoningVisibility(),
   'toggle-auto-debug': () => toggleAutoDebug(),
   'nav-settings': () => {
@@ -1289,6 +1306,7 @@ scheduleBackgroundTask(() => {
   void preloadMarkdownEngine();
 });
 updateViewToggleButtons();
+applyTodosVisibility();
 syncToolDrawerBounds();
 updateJumpToLatestVisibility();
 

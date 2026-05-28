@@ -58,6 +58,7 @@ The runtime uses an explicit ReAct-style state machine:
 - `src/runtime_loop/socket_input.rs` — socket input handling while idle/busy
 - `src/agent.rs` — phase/state-machine logic, task intent, working state, finish heuristics, observation summarization
 - `src/commands.rs` — slash command handlers like `/new`, `/status`, `/mcp`, `/memory`, `/reflection`
+- `src/todos.rs` — session-scoped todos validation, optimistic revision handling, and broadcast payloads
 - `src/providers.rs` — provider abstraction for OpenAI, Anthropic, Ollama, and Gemini streaming/tool calling
 - `src/context.rs` — token estimation, request budgets, pruning
 - `src/hooks.rs` — lifecycle hooks, tool/LLM/command hooks, automatic context compression
@@ -81,7 +82,8 @@ Frontend source lives in `frontend/` and builds into `static/`, which the Rust s
 - `frontend/src/main.ts` — browser entrypoint and WebSocket event switchboard
 - `frontend/src/socket.ts` — connection lifecycle and reconnect behavior
 - `frontend/src/state.ts` — central UI state and DOM refs
-- `frontend/src/renderers/` — chat, tools, reasoning, subagent, orchestration, and auto-trace panels
+- `frontend/src/renderers/` — chat, todos, tools, reasoning, subagent, orchestration, and auto-trace panels
+- `frontend/src/renderers/todos.ts` — session-level todos panel and `/api/todos` persistence flow
 - `frontend/src/handlers/stream.ts` — streamed assistant/reasoning text handling
 - `frontend/src/pages/SettingsPage.tsx` and `frontend/src/pages/UsagePage.tsx` — React islands
 - `frontend/src/markdown.ts` — markdown/KaTeX/highlighting pipeline
@@ -92,11 +94,13 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 ## Runtime and data flow details that matter
 
 - The browser talks to the backend primarily over `/ws`; live reconnect/replay behavior is an important part of correctness.
+- Session-scoped todos are synchronized over the dedicated `todos_state` WebSocket event and persisted with the session; `/api/todos` uses full-list replacement plus revision conflict detection.
 - The app keeps `main` as the default session, but now supports multiple persisted sessions and frontend session switching.
 - Automatic context compression runs as a `BeforeAnalyze` hook in `src/hooks.rs`.
 - `/new` compresses the conversation into `memory/YYYY-MM-DD.md` and clears context; it does not create a new session.
+- `/clear` clears the current message context and todo items, while advancing the todos revision so stale in-flight writes cannot repopulate the list.
 - Skills are discovered from three layers: system (`docs/reference/skills/`), global (`~/.lingclaw/skills/`), and session-local (`skills/`).
-- Sub-agents are discovered from the parallel three-layer `agents/` hierarchy and enable the dynamic `task` and `orchestrate` tools.
+- Sub-agents are discovered from the parallel three-layer `agents/` hierarchy and enable the dynamic `task` and `orchestrate` tools; they do not receive the session-scoped `todos` tool.
 - Structured memory and daily reflection are optional background features driven from Finish-phase/runtime services, not part of the main foreground response path.
 
 ## Security and safety-sensitive areas

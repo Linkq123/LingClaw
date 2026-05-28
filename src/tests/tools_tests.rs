@@ -928,6 +928,18 @@ fn render_ranked_tool_recommendations_respects_memory_preferences() {
 }
 
 #[test]
+fn tool_runtime_timeout_exempts_exec_and_todos() {
+    let config = test_config();
+
+    assert_eq!(tool_runtime_timeout(TOOL_NAME_EXEC, &config), None);
+    assert_eq!(tool_runtime_timeout(TOOL_NAME_TODOS, &config), None);
+    assert_eq!(
+        tool_runtime_timeout(TOOL_NAME_READ_FILE, &config),
+        Some(config.tool_timeout)
+    );
+}
+
+#[test]
 fn ensure_think_tool_preserves_rank_order_when_inserted() {
     let specs = tool_specs();
     let find_idx = |name: &str| {

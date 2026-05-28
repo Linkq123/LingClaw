@@ -100,11 +100,21 @@
   .msg-row.assistant { width: 95%; min-width: 0; }
   .reasoning-panel,
   .tool-panel,
+  .todos-panel,
   .subagent-panel,
   .orchestrate-panel {
     width: 95%;
     max-width: 95%;
     min-width: 0;
+  }
+  .todos-host {
+    padding: 10px 16px 0;
+  }
+  .todo-row {
+    grid-template-columns: 1fr;
+  }
+  .todo-row-actions {
+    justify-content: flex-end;
   }
   .timeline-node {
     width: 95%;

@@ -145,6 +145,10 @@ header .actions button.is-active {
 .conn-label { letter-spacing: .3px; }
 
 /* ── Chat ── */
+.todos-host {
+  padding: 12px clamp(20px, 3vw, 36px) 0;
+}
+
 #chat {
   flex: 1;
   overflow-y: auto;

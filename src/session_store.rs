@@ -179,6 +179,7 @@ struct PersistedSessionView<'a> {
     failed_tool_results: HashSet<String>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     subagent_snapshots: HashMap<String, crate::SubagentHistorySnapshot>,
+    todos: &'a crate::todos::TodoSnapshot,
     version: u32,
 }
 
@@ -200,28 +201,8 @@ const RESERVED_SESSION_IDS: &[&str] = &[
 ];
 
 const WINDOWS_RESERVED_DEVICE_NAMES: &[&str] = &[
-    "aux",
-    "con",
-    "com1",
-    "com2",
-    "com3",
-    "com4",
-    "com5",
-    "com6",
-    "com7",
-    "com8",
-    "com9",
-    "lpt1",
-    "lpt2",
-    "lpt3",
-    "lpt4",
-    "lpt5",
-    "lpt6",
-    "lpt7",
-    "lpt8",
-    "lpt9",
-    "nul",
-    "prn",
+    "aux", "con", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1",
+    "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9", "nul", "prn",
 ];
 
 pub(crate) fn validate_session_id(id: &str) -> Result<&str, String> {
@@ -601,6 +582,7 @@ fn build_session_persist_payload(session: &Session) -> Result<String, String> {
         disabled_system_skills: &session.disabled_system_skills,
         failed_tool_results,
         subagent_snapshots,
+        todos: &session.todos,
         version: session.version,
     })
     .map_err(|e| e.to_string())
@@ -638,7 +620,8 @@ pub(crate) fn canonical_saved_session_id(id: &str) -> Option<String> {
 }
 
 pub(crate) fn load_session_from_disk(id: &str) -> Option<Session> {
-    let id = canonical_saved_session_id(id).or_else(|| validate_session_id(id).ok().map(str::to_string))?;
+    let id = canonical_saved_session_id(id)
+        .or_else(|| validate_session_id(id).ok().map(str::to_string))?;
     let path = sessions_dir().join(format!("{id}.json"));
     let tmp_path = sessions_dir().join(format!("{id}.json.tmp"));
     // Load from primary, fall back to .tmp, or pick the newer of the two.
@@ -767,6 +750,7 @@ pub(crate) fn build_history_payload_with_s3(
     let snapshot_lookup =
         normalize_subagent_snapshots_for_messages(&session.messages, &session.subagent_snapshots);
     let mut tool_occurrences: HashMap<String, usize> = HashMap::new();
+    let mut tool_names_by_id: HashMap<String, String> = HashMap::new();
     for msg in &session.messages {
         match msg.role.as_str() {
             "system" => {}
@@ -810,6 +794,10 @@ pub(crate) fn build_history_payload_with_s3(
                     && session.show_tools
                 {
                     for tc in tcs {
+                        tool_names_by_id.insert(tc.id.clone(), tc.function.name.clone());
+                        if tc.function.name == crate::tools::TOOL_NAME_TODOS {
+                            continue;
+                        }
                         msgs.push(json!({
                             "role":"tool_call",
                             "name":tc.function.name,
@@ -827,6 +815,11 @@ pub(crate) fn build_history_payload_with_s3(
                     && let Some(c) = &msg.content
                 {
                     let tool_call_id = msg.tool_call_id.as_deref().unwrap_or("");
+                    if tool_names_by_id.get(tool_call_id).map(String::as_str)
+                        == Some(crate::tools::TOOL_NAME_TODOS)
+                    {
+                        continue;
+                    }
                     let snapshot_key = if tool_call_id.is_empty() {
                         None
                     } else {
@@ -1002,7 +995,9 @@ total_usage_est: # 当前会话累计 token 使用估算\n\ttotal_tokens: {}\n\t
     )
 }
 
-pub(crate) fn build_global_today_usage<'a>(sessions: impl IntoIterator<Item = &'a Session>) -> String {
+pub(crate) fn build_global_today_usage<'a>(
+    sessions: impl IntoIterator<Item = &'a Session>,
+) -> String {
     let (global_today_input_tokens, global_today_output_tokens) =
         super::accumulate_daily_token_usage(sessions);
     format_usage_block(

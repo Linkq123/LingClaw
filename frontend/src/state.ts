@@ -1,4 +1,12 @@
-import type { AutoTraceEvent, CompressionOutcome, ImageAttachment, HistoryMessage, ReactPhase, SessionSummary } from './types.js';
+import type {
+  AutoTraceEvent,
+  CompressionOutcome,
+  ImageAttachment,
+  HistoryMessage,
+  ReactPhase,
+  SessionSummary,
+  TodosStateEvent,
+} from './types.js';
 
 // ── DOM refs ──
 
@@ -18,7 +26,10 @@ export interface DomRefs {
   sessionPicker: HTMLSelectElement | null;
   newSessionBtn: HTMLButtonElement | null;
   deleteSessionBtn: HTMLButtonElement | null;
+  todosHost: HTMLElement | null;
+  todosPanel: HTMLElement | null;
   headerVersionEl: HTMLElement | null;
+  toggleTodosBtn: HTMLButtonElement | null;
   toggleToolsBtn: HTMLButtonElement | null;
   toggleReasoningBtn: HTMLButtonElement | null;
   toggleAutoDebugBtn: HTMLButtonElement | null;
@@ -56,6 +67,13 @@ export interface AppState {
   pendingDeleteSessionId: string;
   sessions: SessionSummary[];
   sessionSwitchInFlight: boolean;
+  todos: TodosStateEvent;
+  todoDrafts: Map<string, string>;
+  todoSaving: boolean;
+  todoSavingItemId: string | null;
+  todoFeedbackMessage: string;
+  todoFeedbackKind: 'conflict' | 'error' | '';
+  todoPendingFocusId: string | null;
   reasoningPanel: HTMLElement | null;
   reactStatusRow: HTMLElement | null;
   reactStatusPhase: ReactPhase;
@@ -73,6 +91,7 @@ export interface AppState {
   flushHandle: number;
   deferredHistory: HistoryMessage[];
   activeToolPanel: HTMLElement | null;
+  showTodos: boolean;
   showTools: boolean;
   showReasoning: boolean;
   autoDebugEnabled: boolean;
@@ -126,6 +145,19 @@ export const state: AppState = {
   pendingDeleteSessionId: '',
   sessions: [],
   sessionSwitchInFlight: false,
+  todos: {
+    type: 'todos_state',
+    revision: 0,
+    items: [],
+    last_updated_by: 'assistant',
+    updated_at: 0,
+  },
+  todoDrafts: new Map(),
+  todoSaving: false,
+  todoSavingItemId: null,
+  todoFeedbackMessage: '',
+  todoFeedbackKind: '',
+  todoPendingFocusId: null,
   reasoningPanel: null,
   reactStatusRow: null,
   reactStatusPhase: '',
@@ -143,6 +175,7 @@ export const state: AppState = {
   flushHandle: 0,
   deferredHistory: [],
   activeToolPanel: null,
+  showTodos: true,
   showTools: true,
   showReasoning: true,
   autoDebugEnabled: false,
@@ -195,7 +228,10 @@ export function initDomRefs() {
   dom.sessionPicker = document.getElementById('session-picker') as HTMLSelectElement | null;
   dom.newSessionBtn = document.getElementById('new-session-btn') as HTMLButtonElement | null;
   dom.deleteSessionBtn = document.getElementById('delete-session-btn') as HTMLButtonElement | null;
+  dom.todosHost = document.getElementById('todos-host');
+  dom.todosPanel = document.getElementById('todos-panel');
   dom.headerVersionEl = document.getElementById('app-version-header');
+  dom.toggleTodosBtn = document.getElementById('toggle-todos-btn') as HTMLButtonElement | null;
   dom.toggleToolsBtn = document.getElementById('toggle-tools-btn') as HTMLButtonElement | null;
   dom.toggleReasoningBtn = document.getElementById(
     'toggle-reasoning-btn',

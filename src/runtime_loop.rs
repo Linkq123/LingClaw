@@ -694,6 +694,8 @@ async fn prepare_analyze_snapshot(
             &mut remaining_budget,
             &mut phase_state.last_observation_hint,
         );
+        let todos_section = crate::todos::render_prompt_section(&session.todos);
+        let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &todos_section);
         if let Some(task_state) = agent::render_task_state_for_prompt(&phase_state.working_state) {
             let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &task_state);
         }
@@ -757,8 +759,9 @@ async fn prepare_analyze_snapshot(
                 content,
                 &mut remaining_budget,
                 "## Working Method\n\
-                 For complex multi-step tasks, use the `think` tool first to outline your plan \
-                 before executing other tools. For simple questions or single-step tasks, respond directly.",
+                 For complex multi-step tasks, use the `todos` tool to keep an ordered checklist \
+                 and `think` for scratchpad reasoning before executing other tools. For simple \
+                 questions or single-step tasks, respond directly.",
             );
         }
         if let Some(nudge) = agent::build_finish_nudge(phase_state.react_ctx.cycles) {
@@ -1083,6 +1086,66 @@ async fn execute_tool(
         result
     } else {
         tools::execute_tool(name, args_str, config, http, workspace, event_tx).await
+    }
+}
+
+async fn execute_todos_tool(
+    state: &Arc<AppState>,
+    session_id: &str,
+    args_str: &str,
+) -> tools::ToolOutcome {
+    let state = Arc::clone(state);
+    let session_id = session_id.to_string();
+    let args_str = args_str.to_string();
+
+    // Keep the durable write path alive even if the outer tool loop is cancelled
+    // after we've started mutating session-scoped todo state.
+    match tokio::spawn(async move {
+        let start = std::time::Instant::now();
+        let request: crate::todos::TodoReplaceRequest = match serde_json::from_str(&args_str) {
+            Ok(request) => request,
+            Err(error) => {
+                return tools::ToolOutcome {
+                    output: format!("todos error: invalid arguments JSON: {error}"),
+                    is_error: true,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    subagent_snapshot: None,
+                };
+            }
+        };
+
+        match crate::todos::replace_session_todos(
+            state.as_ref(),
+            &session_id,
+            request,
+            crate::todos::TodoUpdateOrigin::Assistant,
+        )
+        .await
+        {
+            Ok(response) => tools::ToolOutcome {
+                output: serde_json::to_string(&response)
+                    .unwrap_or_else(|_| "{\"ok\":false,\"conflict\":false}".to_string()),
+                is_error: false,
+                duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
+            },
+            Err(error) => tools::ToolOutcome {
+                output: error.message(),
+                is_error: true,
+                duration_ms: start.elapsed().as_millis() as u64,
+                subagent_snapshot: None,
+            },
+        }
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => tools::ToolOutcome {
+            output: format!("todos error: internal task failed: {error}"),
+            is_error: true,
+            duration_ms: 0,
+            subagent_snapshot: None,
+        },
     }
 }
 
@@ -1652,18 +1715,20 @@ async fn execute_tool_call(
     let effective_args = match hook_output {
         hooks::HookOutput::Reject { reason, events } => {
             // Still send the tool_call event so the frontend sees the attempted call.
-            let display_args =
-                tools::display_tool_arguments(&tc.function.name, &tc.function.arguments);
-            let _ = live_send(
-                ctx.live_tx,
-                json!({
-                    "type":"tool_call",
-                    "id": tc.id,
-                    "name": tc.function.name,
-                    "arguments": display_args,
-                }),
-            )
-            .await;
+            if !tools::is_todos_tool(&tc.function.name) {
+                let display_args =
+                    tools::display_tool_arguments(&tc.function.name, &tc.function.arguments);
+                let _ = live_send(
+                    ctx.live_tx,
+                    json!({
+                        "type":"tool_call",
+                        "id": tc.id,
+                        "name": tc.function.name,
+                        "arguments": display_args,
+                    }),
+                )
+                .await;
+            }
             for ev in events {
                 let _ = live_send(ctx.live_tx, ev).await;
             }
@@ -1685,16 +1750,17 @@ async fn execute_tool_call(
     let display_args = tools::display_tool_arguments(&tc.function.name, &effective_args);
 
     // Send tool_call event with the effective (possibly hook-modified) arguments.
-    if !live_send(
-        ctx.live_tx,
-        json!({
-            "type":"tool_call",
-            "id": tc.id,
-            "name": tc.function.name,
-            "arguments": display_args,
-        }),
-    )
-    .await
+    if !tools::is_todos_tool(&tc.function.name)
+        && !live_send(
+            ctx.live_tx,
+            json!({
+                "type":"tool_call",
+                "id": tc.id,
+                "name": tc.function.name,
+                "arguments": display_args,
+            }),
+        )
+        .await
     {
         return Err(AgentPhaseControl::Break);
     }
@@ -1743,6 +1809,16 @@ async fn execute_tool_call(
                 ctx.state,
                 ctx.current_session_id,
             ),
+        )
+        .await
+    } else if tools::is_todos_tool(&tc.function.name) {
+        run_tool_with_feedback(
+            ctx.live_tx,
+            ctx.run_cancel,
+            &tc.id,
+            &tc.function.name,
+            runtime_timeout_for_tool(&tc.function.name, &config),
+            execute_todos_tool(ctx.state, ctx.current_session_id, &effective_args),
         )
         .await
     } else {
@@ -1815,18 +1891,19 @@ async fn record_tool_result(
         }
     }
 
-    if !live_send(
-        ctx.live_tx,
-        json!({
-            "type":"tool_result",
-            "id": tc.id,
-            "name": tc.function.name,
-            "result": result.output,
-            "duration_ms": result.duration_ms,
-            "is_error": result.is_error,
-        }),
-    )
-    .await
+    if !tools::is_todos_tool(&tc.function.name)
+        && !live_send(
+            ctx.live_tx,
+            json!({
+                "type":"tool_result",
+                "id": tc.id,
+                "name": tc.function.name,
+                "result": result.output,
+                "duration_ms": result.duration_ms,
+                "is_error": result.is_error,
+            }),
+        )
+        .await
     {
         return AgentPhaseControl::Break;
     }

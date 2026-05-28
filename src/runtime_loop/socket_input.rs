@@ -70,7 +70,10 @@ pub(crate) async fn ensure_session_ready(
         None => MAIN_SESSION_ID.to_string(),
     };
     let saved_session_id = crate::session_store::canonical_saved_session_id(&session_id);
-    let effective_session_id = saved_session_id.as_deref().unwrap_or(&session_id).to_string();
+    let effective_session_id = saved_session_id
+        .as_deref()
+        .unwrap_or(&session_id)
+        .to_string();
 
     {
         let mut sessions = state.sessions.lock().await;
@@ -109,7 +112,8 @@ pub(crate) async fn ensure_session_ready(
                     session_id
                 ));
             }
-        } || match tokio::fs::try_exists(&persisted_session_tmp_path).await {
+        }
+        || match tokio::fs::try_exists(&persisted_session_tmp_path).await {
             Ok(exists) => exists,
             Err(err) => {
                 return Err(format!(
@@ -205,9 +209,8 @@ pub(crate) async fn resolve_or_create_socket_session(
 }
 
 pub(crate) async fn known_session_ids(state: &AppState) -> HashSet<String> {
-    let mut known_ids = crate::session_store::list_saved_session_ids_in_dir(
-        &crate::session_store::sessions_dir(),
-    );
+    let mut known_ids =
+        crate::session_store::list_saved_session_ids_in_dir(&crate::session_store::sessions_dir());
     let sessions = state.sessions.lock().await;
     known_ids.extend(sessions.keys().cloned());
     known_ids.insert(MAIN_SESSION_ID.to_string());

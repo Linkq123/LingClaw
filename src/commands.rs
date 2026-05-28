@@ -553,6 +553,7 @@ async fn reset_session_context_and_persist(
                 session.subagent_snapshots.clone(),
                 session.failed_tool_results.clone(),
                 session.tool_calls_count,
+                session.todos.clone(),
                 session.updated_at,
             )
         },
@@ -566,12 +567,23 @@ async fn reset_session_context_and_persist(
             );
             replace_session_messages(session, vec![sys]);
             session.tool_calls_count = 0;
+            session.todos =
+                crate::todos::TodoSnapshot::cleared_by_user_from(&session.todos, now_epoch());
         },
-        |session, (messages, subagent_snapshots, failed_tool_results, tool_calls_count, updated_at)| {
+        |session,
+         (
+            messages,
+            subagent_snapshots,
+            failed_tool_results,
+            tool_calls_count,
+            todos,
+            updated_at,
+        )| {
             session.messages = messages;
             session.subagent_snapshots = subagent_snapshots;
             session.failed_tool_results = failed_tool_results;
             session.tool_calls_count = tool_calls_count;
+            session.todos = todos;
             session.updated_at = updated_at;
         },
     )

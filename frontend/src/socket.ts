@@ -4,6 +4,7 @@ import { addSystem, setBusy } from './renderers/chat.js';
 import { clearActiveAutoTrace, clearCompressionOutcome } from './renderers/auto-trace.js';
 import { clearReactStatus } from './renderers/react-status.js';
 import { closeToolDrawer } from './renderers/tools.js';
+import { resetTodosUiState } from './renderers/todos.js';
 import { finishAssistantStream, finishReasoningStream } from './handlers/stream.js';
 
 // Connection indicator has three visual states: connecting (amber, pulsing),
@@ -33,6 +34,7 @@ function resetSessionScopedUiState(): void {
   clearReactStatus();
   clearCompressionOutcome();
   clearActiveAutoTrace();
+  resetTodosUiState();
   state.reasoningPanel = null;
   setBusy(false);
 }

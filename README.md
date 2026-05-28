@@ -14,16 +14,17 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 
 ## Features
 
-- **9 标准工具**：`think`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`；另有 2 个动态工具：`task`（子代理委托，发现代理时注册）、`orchestrate`（多代理 DAG 编排，发现代理时注册）
+- **10 标准工具**：`think`、`todos`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`；另有 2 个动态工具：`task`（子代理委托，发现代理时注册）、`orchestrate`（多代理 DAG 编排，发现代理时注册）
 - **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；主 Agent 与子代理都会按需发现并使用这些 MCP tools；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断；server 启动连续失败会进入短暂冷却，避免请求风暴
 - **多会话**：默认会话仍为 `main`，但现在支持创建、切换、列出和删除其他持久化 session；前端通过 header 中的 session picker 切换，WebSocket 连接按 session 绑定并在切换时重连
+- **会话级 Todos**：新增结构化 `todos` 工具，维护每个 session 唯一的一份当前任务清单；采用“整表替换 + revision 乐观并发”协议，支持用户与主代理协同编辑、重连恢复、冲突检测，以及顶部常驻 todo 面板展示
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、frontend-coder、backend-coder、general-coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
 - **文档化斜杠命令**：`/new`、`/model`、`/switch`、`/sessions`、`/delete`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/reflection`、`/help`
 - **四 Provider 模型路由**：OpenAI + Anthropic + Ollama + Gemini，支持 `provider/model` 和纯 model ID
 - **会话模型覆盖**：运行时通过 `/model` 切换当前活动 session 使用的模型
-- **会话持久化**：默认 `main` 与其他 session 都会各自保存工作区和磁盘存档
+- **会话持久化**：默认 `main` 与其他 session 都会各自保存工作区、消息历史、视图状态和当前 todos 快照
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
-- **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、毛玻璃渐变背景、稳定的 Markdown 分段渲染（表格、代码块、任务列表、引用、数学公式等常见格式）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、主回复右下角显示本轮输入/输出 token 和首 token 耗时、输入框上下键历史导航（最多 10 条）；Settings 页面（React 岛屿）支持在线编辑配置、Provider 连接测试、MCP Server 连接测试，并可在 Models 标签页直接编辑 `compat.thinkingFormat`；顶部提供默认关闭的 `Auto Debug` 本地开关，用于查看最近一条顶层 `think=auto` 决策轨迹；Usage 页面（React 岛屿）显示 Token 用量统计、按 Model Role 拆分的明细卡片与 Canvas 图表
+- **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、毛玻璃渐变背景、稳定的 Markdown 分段渲染（表格、代码块、任务列表、引用、数学公式等常见格式）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、主回复右下角显示本轮输入/输出 token 和首 token 耗时、输入框上下键历史导航（最多 10 条）；header 与聊天区之间常驻会话级 todo 面板，支持增删改、状态切换和上下移动，`Todos: On/Off` 仅控制本地显示、不修改 session 数据；Settings 页面（React 岛屿）支持在线编辑配置、Provider 连接测试、MCP Server 连接测试，并可在 Models 标签页直接编辑 `compat.thinkingFormat`；顶部提供默认关闭的 `Auto Debug` 本地开关，用于查看最近一条顶层 `think=auto` 决策轨迹；Usage 页面（React 岛屿）显示 Token 用量统计、按 Model Role 拆分的明细卡片与 Canvas 图表
 - **图片附件**：支持通过 URL 或本地 JPEG/PNG 上传附加图片到用户消息；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；Gemini/Ollama 会由 LingClaw 本地预取为 base64/inlineData 并持久化缓存到会话工作区，因此可配合私网、localhost 或仅局域网可达的网关使用；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
@@ -37,7 +38,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **Auto 思维可观测性**：当 `/think auto` 且当前模型支持 reasoning effort 时，后端会额外发送 `auto_trace` WebSocket 事件；`/status` 会显示 live runtime think、auto signals 与 request budget 摘要，前端 `Auto Debug` 开关只在本地展示最新一条顶层轨迹，不会写回 session 配置
 - **结构化工具结果**：`ToolOutcome`（output + is_error + duration_ms），前缀式错误检测，schema 约束校验（required/type/range/length），`tool_result` WS 事件携带耗时和错误标记
 - **原子持久化**：会话存档先写 `.tmp` 再 rename（Windows 兼容），加载时自动修剪不完整工具调用
-- **会话版本控制**：`SESSION_VERSION = 4`，旧存档自动迁移并补齐 `show_tools` / `show_reasoning` / `show_react` 等字段默认值
+- **会话版本控制**：`SESSION_VERSION = 5`，旧存档自动迁移并补齐 `show_tools` / `show_reasoning` / `show_react` / `todos` 等字段默认值
 - **上下文裁剪追踪**：Analyze 阶段裁剪后发送 `context_pruned` WS 事件，包含移除消息数
 - **安全控制**：危险命令检测、沙盒路径解析、SSRF 阻断、重定向阻断、输出/文件大小上限
 
@@ -320,7 +321,7 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 | `/system-prompt` | 输出当前会话的新鲜系统提示词，以及该系统提示词按当前 provider 估算的 token 开销 |
 | `/mcp [refresh]` | 查看当前已加载的 MCP server 状态；加上 `refresh` 时强制刷新工具缓存并重建运行时 MCP 会话 |
 | `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；同时附带所有已加载 session 的今日总 token 汇总，按 K/M 显示 |
-| `/clear` | 清空消息但保留系统提示 |
+| `/clear` | 清空消息和当前 session 的 todos 列表，保留系统提示；todos revision 会前进以拒绝旧写入 |
 | `/memory [stats\|debug]` | 查看当前 structured memory 摘要与 updater 状态；`stats` 仅显示运行状态，`debug` 额外显示最近审计记录 |
 | `/reflection [today\|yesterday\|list]` | 查看当前 daily reflection 状态与 reflection 条目；默认显示 feature 状态、冷却信息和今天的 reflection 预览，`list` 只列出实际包含 reflection 的日期文件 |
 | `/help` | 命令帮助 |
@@ -329,6 +330,8 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 
 导航栏中的 `Auto Debug` 为本地调试开关，默认关闭且不持久化到 session；开启后会把最近一条顶层 `auto_trace` 渲染为调试卡片，不影响正常聊天流与 slash command 输出。
 
+导航栏中的 `Todos: On/Off` 也是纯本地显示开关，只控制 todo 面板显隐；当前 session 的 todos 内容、revision 和保存状态仍以后端 `todos_state` / `/api/todos` 为准。
+
 Settings → Usage 页面除了现有今日/累计图表外，还会显示按 `Primary`、`Fast`、`Sub-Agent`、`Memory`、`Reflection`、`Context` 划分的 Token Breakdown。对于升级前已经存在的旧会话，角色级累计值会从 0.6.1 开始逐步建立；旧快照中仍保留的 provider 数据会继续在历史图表里展示。
 
 ## Tools
@@ -336,6 +339,7 @@ Settings → Usage 页面除了现有今日/累计图表外，还会显示按 `P
 | 工具 | 说明 |
 |---|---|
 | `think` | 内部推理便签 |
+| `todos` | 会话级结构化任务清单（整表替换 + revision 冲突检测） |
 | `exec` | 运行 shell 命令，带超时和危险命令过滤 |
 | `read_file` | 读文件，支持可选行范围 |
 | `write_file` | 创建或覆写文件 |
@@ -467,7 +471,7 @@ tools:
 - **隔离执行**：子代理拥有独立的消息历史、过滤后的工具集、独立的 ReAct 循环；工具集同时可包含内置工具和 MCP 工具
 - **超时与安全**：子代理总执行时间受 `subAgentTimeout`（默认 300s）限制，内部各工具保留各自超时；`max_turns` 有 50 轮硬上限；`/stop` 和断开连接可随时取消
 - **Hook 集成**：子代理的工具执行经过 BeforeToolExec / AfterToolExec Hook 链，Reject 事件会转发给父 Agent
-- **递归阻断**：`task` 工具始终被排除在子代理的工具集之外，防止无限委托
+- **递归阻断**：`task`、`orchestrate` 和 session 级 `todos` 始终被排除在子代理的工具集之外，防止无限委托或竞争同一份清单
 - **事件流**：`task_started`、`task_progress`、`task_tool`、`task_completed`、`task_failed` 事件实时流向前端
 - **查看代理**：`/agents` 列出所有已发现的子代理、来源以及当前过滤后的有效工具列表
 
@@ -524,7 +528,7 @@ tools:
 |---|---|---|
 | **Skill** | LLM 推理、系统提示构建、上下文裁剪、token 估算、思维模式、结构化记忆注入 | `src/main.rs`（`build_system_prompt`, `prune_messages`, `estimate_tokens`）、`src/providers.rs`（流式调用）、`src/prompts.rs`（模板加载）、`src/memory.rs`（结构化记忆） |
 | **CLI** | 工具注册/分发/执行、路径沙盒、危险命令检测、SSRF 防护 | `src/tools/mod.rs`（注册表）、`src/tools/fs.rs`（文件工具）、`src/tools/net.rs`（网络工具）、`src/tools/exec.rs`（执行工具） |
-| **Loop** | WebSocket 处理、会话生命周期、斜杠命令、持久化、HTTP API | `src/main.rs`（`handle_socket`, `handle_command`, session 管理） |
+| **Loop** | WebSocket 处理、会话生命周期、斜杠命令、持久化、HTTP API | `src/main.rs`（`handle_socket`, `handle_command`, session 管理）、`src/todos.rs`（session 级 todos 校验/持久化/广播） |
 
 ### ReAct 状态机
 
@@ -553,7 +557,7 @@ Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的
 
 | 阶段 | 含义 | 行为 |
 |---|---|---|
-| **Analyze** | 分析用户意图 | 模型分析请求，决定是直接回答还是使用工具。可借助 `think` 工具作为推理便签。 |
+| **Analyze** | 分析用户意图 | 模型分析请求，决定是直接回答还是使用工具。可借助 `think` 作为推理便签，并用 `todos` 维护多步任务清单。 |
 | **Act** | 执行工具 | 模型发出结构化 tool_calls，runtime 调用 `execute_tool()` 执行。所有路径经过安全检查。 |
 | **Observe** | 消化工具结果 | 工具结果以原始内容写入对话历史。大结果 (>4KB) 生成非破坏性摘要：WS `observation` 事件 + 系统提示注入。 |
 | **Finish** | 完成回答 | 显式结束当前循环：Analyze 阶段若模型未发出 tool_calls，则带内容回复记为 `complete`，空回复记为 `empty`，随后退出循环。 |
@@ -628,6 +632,7 @@ src/
 │   └── runtime_loop/socket_input.rs (~550 行) — socket 空闲/忙碌输入辅助
 ├── agent.rs           (~2340 行) — AgentPhase 状态机, TaskIntent/WorkingState, finish heuristic, 证据/不确定性归并, 观察结果摘要
 ├── commands.rs        (~1630 行) — 斜杠命令处理器 (handle_command, /skills-system install/uninstall 等)
+├── todos.rs           (~360 行)  — session 级 todos 快照, 校验, revision 冲突处理, 事件构建
 ├── cli.rs             (~3030 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
 ├── config.rs          (~1490 行) — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
 ├── context.rs         (~570 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
@@ -674,6 +679,7 @@ frontend/                         — 前端源码 (TypeScript + React, Vite 构
 │   ├── handlers/stream.ts        — 流式响应处理
 │   ├── renderers/                — UI 渲染模块
 │   │   ├── chat.ts               — 聊天消息渲染
+│   │   ├── todos.ts              — session 级 todo 面板
 │   │   ├── tools.ts              — 工具面板
 │   │   ├── subagent.ts           — 子代理面板
 │   │   ├── orchestrate.ts        — DAG 编排面板
@@ -719,8 +725,22 @@ struct Session {
     show_tools: bool,
     show_reasoning: bool,
     show_react: bool,
+    todos: TodoSnapshot,
     disabled_system_skills: HashSet<String>,  // 运行时禁用的系统 Skill 模式
-    version: u32,              // 会话版本 (当前 SESSION_VERSION = 4)
+    version: u32,              // 会话版本 (当前 SESSION_VERSION = 5)
+}
+
+struct TodoSnapshot {
+    revision: u64,
+    items: Vec<TodoItem>,
+    last_updated_by: TodoUpdatedBy,  // "user"|"assistant"
+    updated_at: u64,
+}
+
+struct TodoItem {
+    id: String,
+    content: String,
+    status: TodoStatus,             // "pending"|"in_progress"|"completed"
 }
 
 struct ChatMessage {
@@ -903,8 +923,9 @@ think_level 映射：
 | type | 用途 |
 |---|---|
 | `session` | 首次连接或当前绑定 session 刷新时的当前会话信息 |
-| `history` | 当前会话历史消息 |
 | `view_state` | `show_tools` / `show_reasoning` / `show_react` 状态同步 |
+| `todos_state` | 当前 session 的 todos 快照（revision / items / last_updated_by / updated_at） |
+| `history` | 当前会话历史消息 |
 | `start` | 新一轮回复开始 |
 | `auto_trace` | `think=auto` 的最新顶层决策轨迹（selected think、baseline、signals、escalators/dampeners/clamps） |
 | `delta` | 流式文本片段 |
@@ -937,12 +958,15 @@ think_level 映射：
 | `system` | 中性系统消息 |
 | `error` | 错误消息 |
 
+初始化回放顺序通常为 `session -> view_state -> todos_state -> history`。`todos` 工具的调用与结果不会渲染到普通工具时间线，也不会出现在 `history` 载荷里；前端应始终以 `todos_state` 驱动专用 todo 面板。
+
 ## HTTP API
 
 | 端点 | 方法 | 说明 |
 |---|---|---|
 | `/api/health` | GET | 健康检查（返回 `version`、`model`、`sessions`） |
 | `/api/sessions` | GET | 返回已知 session 列表 |
+| `/api/todos?session=<id>` | PUT | 原子替换当前 session 的 todos 清单；成功返回最新快照，revision 冲突返回 `409` + 当前快照 |
 | `/api/client-config` | GET | 返回前端配置（上传 token、S3 能力标记等） |
 | `/api/config` | GET | 读取原始 JSON 配置文件（含解析错误回退） |
 | `/api/config` | PUT | 校验并保存 JSON 配置文件（原子写入 + 备份恢复） |

@@ -52,6 +52,31 @@ export interface SessionSummary {
   corrupt?: boolean;
 }
 
+export type TodoStatus = 'pending' | 'in_progress' | 'completed';
+
+export interface TodoItem {
+  id: string;
+  content: string;
+  status: TodoStatus;
+}
+
+export interface TodosStateEvent {
+  type: 'todos_state';
+  revision: number;
+  items: TodoItem[];
+  last_updated_by: 'user' | 'assistant';
+  updated_at: number;
+}
+
+export interface TodosUpdateResponse {
+  ok: boolean;
+  conflict: boolean;
+  revision: number;
+  items: TodoItem[];
+  last_updated_by: 'user' | 'assistant';
+  updated_at: number;
+}
+
 export interface SessionEvent {
   type: 'session';
   id: string;
@@ -299,6 +324,7 @@ export interface OrchestrateCompletedEvent {
 
 export type WebSocketMessage =
   | SessionEvent
+  | TodosStateEvent
   | HistoryEvent
   | DeltaEvent
   | ToolCallEvent

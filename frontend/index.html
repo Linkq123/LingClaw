@@ -58,6 +58,13 @@
             Usage
           </button>
           <button
+            id="toggle-todos-btn"
+            data-action="toggle-todos"
+            aria-label="Toggle todos visibility"
+          >
+            Todos: On
+          </button>
+          <button
             id="toggle-tools-btn"
             data-action="toggle-tools"
             aria-label="Toggle tools visibility"
@@ -110,6 +117,7 @@
           </div>
         </div>
       </header>
+      <section id="todos-host" class="todos-host" aria-live="polite"></section>
       <div id="chat" role="log" aria-live="polite">
         <div class="welcome" id="welcome">
           <div class="welcome-logo"><img src="/branding/logo-wordmark.png" alt="LingClaw" /></div>

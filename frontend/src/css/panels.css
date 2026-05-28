@@ -1,3 +1,200 @@
+/* ── Todos panel ── */
+
+.todos-panel {
+  width: min(var(--chat-output-width), calc(100% - 8px));
+  max-width: 100%;
+  min-width: 320px;
+  border: 1px solid var(--panel-border-soft);
+  border-radius: 10px;
+  background: var(--panel-surface);
+  box-shadow: var(--panel-shadow-soft);
+  padding: 12px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.todos-panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.todos-panel-heading {
+  min-width: 0;
+}
+
+.todos-panel-title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.todos-panel-meta {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--dim);
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.todos-panel-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.todos-panel-saving {
+  font-size: 11px;
+  color: var(--accent2);
+  font-weight: 700;
+}
+
+.todos-add-btn,
+.todos-empty-btn,
+.todo-row-btn {
+  border: 1px solid var(--panel-border-soft);
+  background: var(--panel-surface-alt);
+  color: var(--text);
+  border-radius: 8px;
+  cursor: pointer;
+  transition:
+    border-color 0.18s ease,
+    background 0.18s ease,
+    color 0.18s ease;
+}
+
+.todos-add-btn:hover:not(:disabled),
+.todos-empty-btn:hover:not(:disabled),
+.todo-row-btn:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent2) 22%, var(--panel-border-soft));
+  background: var(--panel-hover);
+}
+
+.todos-add-btn {
+  width: 30px;
+  height: 30px;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.todos-feedback {
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  background: color-mix(in srgb, var(--panel-surface-alt) 82%, transparent);
+  color: var(--dim);
+}
+
+.todos-feedback.is-conflict {
+  background: color-mix(in srgb, var(--accent-warn) 12%, var(--panel-surface));
+  color: color-mix(in srgb, var(--accent-warn) 72%, var(--text));
+}
+
+.todos-feedback.is-error {
+  background: color-mix(in srgb, var(--accent-error) 12%, var(--panel-surface));
+  color: color-mix(in srgb, var(--accent-error) 82%, var(--text));
+}
+
+.todos-panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.todos-empty {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border: 1px dashed var(--panel-border-soft);
+  border-radius: 10px;
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.todos-empty-btn {
+  min-height: 30px;
+  padding: 0 12px;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.todos-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.todo-row {
+  display: grid;
+  grid-template-columns: 120px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.todo-row.is-saving {
+  opacity: 0.72;
+}
+
+.todo-row-status,
+.todo-row-input {
+  min-width: 0;
+  min-height: 34px;
+  border: 1px solid var(--panel-border-soft);
+  border-radius: 8px;
+  background: var(--panel-surface-alt);
+  color: var(--text);
+  font: inherit;
+}
+
+.todo-row-status {
+  padding: 0 10px;
+  text-transform: capitalize;
+}
+
+.todo-row-input {
+  padding: 0 12px;
+}
+
+.todo-row-status:focus,
+.todo-row-input:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent2) 34%, var(--panel-border-soft));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent2) 12%, transparent);
+}
+
+.todo-row-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.todo-row-btn {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.todos-add-btn:disabled,
+.todos-empty-btn:disabled,
+.todo-row-btn:disabled,
+.todo-row-status:disabled,
+.todo-row-input:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
 /* ── Timeline connector ── */
 
 /* Hide tool/subagent/orchestrate panels when tools are toggled off. Panels

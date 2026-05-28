@@ -139,6 +139,7 @@ async fn think_command_waits_for_session_persist_gate_before_mutating_session() 
             disabled_system_skills: HashSet::new(),
             failed_tool_results: Default::default(),
             subagent_snapshots: HashMap::new(),
+            todos: crate::todos::TodoSnapshot::default(),
             version: 4,
             workspace: workspace.clone(),
         },
@@ -349,6 +350,7 @@ async fn status_command_reports_runtime_request_estimate() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -489,6 +491,7 @@ async fn status_command_uses_runtime_auto_policy_for_idle_auto_sessions() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -626,6 +629,7 @@ async fn status_command_reports_compression_recorded_before_start_event() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -773,6 +777,7 @@ async fn status_command_reports_prune_only_state() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -915,6 +920,7 @@ async fn status_command_reports_replayed_compression_outcome_after_reconnect() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1063,6 +1069,7 @@ async fn status_command_reports_latest_compression_outcome() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1212,6 +1219,7 @@ async fn status_command_prefers_live_round_effective_think() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1362,6 +1370,7 @@ async fn status_command_prefers_live_round_effective_think_for_manual_sessions()
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1513,6 +1522,7 @@ async fn status_command_prefers_live_round_effective_think_over_base_model_suppo
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1684,6 +1694,7 @@ async fn status_command_reports_latest_auto_trace_summary() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -1878,6 +1889,7 @@ async fn status_command_reports_live_runtime_provider_for_cross_provider_fast_mo
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -2028,6 +2040,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -2563,6 +2576,7 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -2679,6 +2693,7 @@ async fn memory_command_rejects_unknown_subcommand() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -2814,6 +2829,7 @@ async fn reflection_command_disabled_shows_hint() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -2949,6 +2965,7 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -3123,6 +3140,7 @@ async fn reflection_command_disabled_allows_read_today() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -3256,6 +3274,7 @@ async fn reflection_command_enabled_shows_status() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -3401,6 +3420,7 @@ async fn reflection_command_today_shows_content() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -3552,6 +3572,7 @@ async fn reflection_command_today_filters_out_new_summaries() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -3706,6 +3727,7 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -3863,6 +3885,7 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
@@ -3997,6 +4020,7 @@ async fn reflection_command_invalid_arg_shows_usage() {
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
+        todos: crate::todos::TodoSnapshot::default(),
         version: 4,
         workspace: workspace.clone(),
     };
