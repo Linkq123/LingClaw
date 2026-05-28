@@ -80,6 +80,8 @@ The runtime uses an explicit ReAct-style state machine:
 Frontend source lives in `frontend/` and builds into `static/`, which the Rust server serves directly.
 
 - `frontend/src/main.ts` — browser entrypoint and WebSocket event switchboard
+- `frontend/src/input.ts` — message composer, slash-command menu behavior, image paste/drop, and send/stop flows
+- `frontend/src/slashCommands.ts` — slash command catalog, normalization helpers, and autocomplete matching
 - `frontend/src/socket.ts` — connection lifecycle and reconnect behavior
 - `frontend/src/state.ts` — central UI state and DOM refs
 - `frontend/src/renderers/` — chat, todos, tools, reasoning, subagent, orchestration, and auto-trace panels
@@ -96,6 +98,8 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 - The browser talks to the backend primarily over `/ws`; live reconnect/replay behavior is an important part of correctness.
 - Session-scoped todos are synchronized over the dedicated `todos_state` WebSocket event and persisted with the session; `/api/todos` uses full-list replacement plus revision conflict detection.
 - The app keeps `main` as the default session, but now supports multiple persisted sessions and frontend session switching.
+- The frontend session switcher lives in a collapsible left drawer; the Todos panel is a local visibility toggle and defaults to hidden on first load.
+- Slash command autocomplete is frontend-local UI on top of the existing `/...` command transport: incomplete prefixes can be completed via keyboard or mouse before dispatch.
 - Automatic context compression runs as a `BeforeAnalyze` hook in `src/hooks.rs`.
 - `/new` compresses the conversation into `memory/YYYY-MM-DD.md` and clears context; it does not create a new session.
 - `/clear` clears the current message context and todo items, while advancing the todos revision so stale in-flight writes cannot repopulate the list.

@@ -388,7 +388,7 @@ header .actions button.is-active {
 
 /* ── Chat ── */
 .todos-host {
-  padding: 12px clamp(20px, 3vw, 36px) 0;
+  padding: 8px clamp(20px, 3vw, 36px) 0;
 }
 
 #chat {
@@ -522,6 +522,9 @@ header .actions button.is-active {
   box-shadow: 0 10px 30px rgba(44,46,62,.10);
   backdrop-filter: blur(16px) saturate(1.08);
   -webkit-backdrop-filter: blur(16px) saturate(1.08);
+}
+.slash-command-menu[hidden] {
+  display: none;
 }
 .slash-command-item {
   width: 100%;

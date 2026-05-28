@@ -229,7 +229,7 @@ struct AgentPhaseState {
 /// Minimum interval between observe-phase incremental saves.
 const OBSERVE_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 const AUTO_TOOL_HISTORY_CAP: usize = 12;
-const DYNAMIC_PROMPT_INJECTION_CHAR_BUDGET: usize = 4_000;
+const DYNAMIC_PROMPT_OPTIONAL_SECTIONS_CHAR_BUDGET: usize = 4_000;
 const DYNAMIC_PROMPT_TRUNCATION_MARKER: &str = "\n*(additional dynamic context truncated)*";
 
 enum AgentPhaseControl {
@@ -633,6 +633,17 @@ fn append_owned_dynamic_prompt_section(
     }
 }
 
+fn append_required_dynamic_prompt_section(content: &mut String, section: &str) -> bool {
+    let section = section.trim();
+    if section.is_empty() {
+        return false;
+    }
+
+    content.push_str("\n\n");
+    content.push_str(section);
+    true
+}
+
 async fn prepare_analyze_snapshot(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
@@ -685,17 +696,19 @@ async fn prepare_analyze_snapshot(
     let discovered_agents = crate::subagents::discovery::discover_all_agents(&session.workspace);
 
     // Dynamic context injections into the system prompt:
+    // - Required session state that must survive optional-context truncation
     // - Observation hint from previous cycle
     // - Planning nudge on first cycle for multi-step tasks
     if let Some(ref mut content) = fresh_system.content {
-        let mut remaining_budget = DYNAMIC_PROMPT_INJECTION_CHAR_BUDGET;
+        let todos_section = crate::todos::render_prompt_section(&session.todos);
+        let _ = append_required_dynamic_prompt_section(content, &todos_section);
+
+        let mut remaining_budget = DYNAMIC_PROMPT_OPTIONAL_SECTIONS_CHAR_BUDGET;
         append_owned_dynamic_prompt_section(
             content,
             &mut remaining_budget,
             &mut phase_state.last_observation_hint,
         );
-        let todos_section = crate::todos::render_prompt_section(&session.todos);
-        let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &todos_section);
         if let Some(task_state) = agent::render_task_state_for_prompt(&phase_state.working_state) {
             let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &task_state);
         }

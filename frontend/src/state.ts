@@ -179,7 +179,7 @@ export const state: AppState = {
   deferredHistory: [],
   activeToolPanel: null,
   sessionDrawerExpanded: true,
-  showTodos: true,
+  showTodos: false,
   showTools: true,
   showReasoning: true,
   autoDebugEnabled: false,

@@ -42,6 +42,23 @@ function applySlashCommandSuggestion(spec: SlashCommandSpec) {
   syncToolDrawerBounds();
 }
 
+function scrollActiveSlashCommandIntoView(menu: HTMLElement) {
+  const activeItem = menu.querySelector<HTMLElement>('.slash-command-item.is-active');
+  if (activeItem && typeof activeItem.scrollIntoView === 'function') {
+    activeItem.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+function syncSlashCommandMenuSelection(menu: HTMLElement) {
+  const items = menu.querySelectorAll<HTMLElement>('.slash-command-item');
+  items.forEach((item, index) => {
+    const isActive = index === slashMenuActiveIndex;
+    item.classList.toggle('is-active', isActive);
+    item.setAttribute('aria-selected', isActive ? 'true' : 'false');
+  });
+  scrollActiveSlashCommandIntoView(menu);
+}
+
 function renderSlashCommandMenu() {
   const menu = dom.slashCommandMenu;
   if (!menu || !dom.input) return;
@@ -77,15 +94,10 @@ function renderSlashCommandMenu() {
       button.type = 'button';
       button.className = 'slash-command-item';
       button.dataset.slashCommand = spec.command;
-      if (index === slashMenuActiveIndex) {
-        button.classList.add('is-active');
-        button.setAttribute('aria-selected', 'true');
-      } else {
-        button.setAttribute('aria-selected', 'false');
-      }
+      button.dataset.slashIndex = String(index);
       button.addEventListener('mouseenter', () => {
         slashMenuActiveIndex = index;
-        renderSlashCommandMenu();
+        syncSlashCommandMenuSelection(menu);
       });
       button.addEventListener('mousedown', (event) => {
         event.preventDefault();
@@ -115,6 +127,7 @@ function renderSlashCommandMenu() {
 
   menu.hidden = false;
   menu.replaceChildren(fragment);
+  syncSlashCommandMenuSelection(menu);
   syncToolDrawerBounds();
 }
 
@@ -122,7 +135,9 @@ function moveSlashCommandSelection(direction: 1 | -1) {
   if (slashMenuSuggestions.length === 0) return;
   slashMenuActiveIndex =
     (slashMenuActiveIndex + direction + slashMenuSuggestions.length) % slashMenuSuggestions.length;
-  renderSlashCommandMenu();
+  if (dom.slashCommandMenu) {
+    syncSlashCommandMenuSelection(dom.slashCommandMenu);
+  }
 }
 
 function applyPendingSlashCommandSuggestion(text: string): boolean {

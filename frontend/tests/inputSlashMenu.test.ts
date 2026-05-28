@@ -56,6 +56,57 @@ describe('input slash command menu', () => {
     expect(menu.hidden).toBe(true);
   });
 
+  it('applies a slash command suggestion when clicked with the mouse', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    stateModule.state.ws = { readyState: 0 } as WebSocket;
+
+    const { initInputListeners } = await import('../src/input.js');
+    initInputListeners();
+
+    const input = stateModule.dom.input!;
+    const menu = stateModule.dom.slashCommandMenu!;
+
+    input.value = '/sk';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+
+    const target = Array.from(menu.querySelectorAll<HTMLButtonElement>('.slash-command-item')).find((item) =>
+      item.textContent?.includes('/skills-system'),
+    );
+
+    expect(target).toBeDefined();
+
+    target!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+    target!.click();
+
+    expect(input.value).toBe('/skills-system ');
+    expect(menu.hidden).toBe(true);
+  });
+
+  it('scrolls the active slash command into view when arrow keys change the selection', async () => {
+    const scrollIntoViewMock = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: scrollIntoViewMock,
+    });
+
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    stateModule.state.ws = { readyState: 0 } as WebSocket;
+
+    const { initInputListeners } = await import('../src/input.js');
+    initInputListeners();
+
+    const input = stateModule.dom.input!;
+    input.value = '/sk';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    scrollIntoViewMock.mockClear();
+
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+
+    expect(scrollIntoViewMock).toHaveBeenCalledWith({ block: 'nearest' });
+  });
+
   it('sends exact slash commands with Enter instead of treating them as autocomplete picks', async () => {
     const stateModule = await import('../src/state.js');
     stateModule.initDomRefs();

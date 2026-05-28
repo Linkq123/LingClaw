@@ -16,15 +16,15 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 
 - **10 标准工具**：`think`、`todos`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`；另有 2 个动态工具：`task`（子代理委托，发现代理时注册）、`orchestrate`（多代理 DAG 编排，发现代理时注册）
 - **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；主 Agent 与子代理都会按需发现并使用这些 MCP tools；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断；server 启动连续失败会进入短暂冷却，避免请求风暴
-- **多会话**：默认会话仍为 `main`，但现在支持创建、切换、列出和删除其他持久化 session；前端通过 header 中的 session picker 切换，WebSocket 连接按 session 绑定并在切换时重连
-- **会话级 Todos**：新增结构化 `todos` 工具，维护每个 session 唯一的一份当前任务清单；采用“整表替换 + revision 乐观并发”协议，支持用户与主代理协同编辑、重连恢复、冲突检测，以及顶部常驻 todo 面板展示
+- **多会话**：默认会话仍为 `main`，但现在支持创建、切换、列出和删除其他持久化 session；前端使用左侧可折叠的 session drawer 切换，WebSocket 连接按 session 绑定并在切换时重连
+- **会话级 Todos**：新增结构化 `todos` 工具，维护每个 session 唯一的一份当前任务清单；采用“整表替换 + revision 乐观并发”协议，支持用户与主代理协同编辑、重连恢复、冲突检测，以及专用 todo 面板展示
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、frontend-coder、backend-coder、general-coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
 - **文档化斜杠命令**：`/new`、`/model`、`/switch`、`/sessions`、`/delete`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/reflection`、`/help`
 - **四 Provider 模型路由**：OpenAI + Anthropic + Ollama + Gemini，支持 `provider/model` 和纯 model ID
 - **会话模型覆盖**：运行时通过 `/model` 切换当前活动 session 使用的模型
 - **会话持久化**：默认 `main` 与其他 session 都会各自保存工作区、消息历史、视图状态和当前 todos 快照
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
-- **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、毛玻璃渐变背景、稳定的 Markdown 分段渲染（表格、代码块、任务列表、引用、数学公式等常见格式）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、主回复右下角显示本轮输入/输出 token 和首 token 耗时、输入框上下键历史导航（最多 10 条）；header 与聊天区之间常驻会话级 todo 面板，支持增删改、状态切换和上下移动，`Todos: On/Off` 仅控制本地显示、不修改 session 数据；Settings 页面（React 岛屿）支持在线编辑配置、Provider 连接测试、MCP Server 连接测试，并可在 Models 标签页直接编辑 `compat.thinkingFormat`；顶部提供默认关闭的 `Auto Debug` 本地开关，用于查看最近一条顶层 `think=auto` 决策轨迹；Usage 页面（React 岛屿）显示 Token 用量统计、按 Model Role 拆分的明细卡片与 Canvas 图表
+- **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、毛玻璃渐变背景、稳定的 Markdown 分段渲染（表格、代码块、任务列表、引用、数学公式等常见格式）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、主回复右下角显示本轮输入/输出 token 和首 token 耗时、输入框上下键历史导航（最多 10 条）、输入 `/` 时的斜杠命令自动补全菜单（支持键盘上下选择、Tab/Enter 补全和鼠标点击）；左侧 session drawer 支持折叠/展开，todo 面板默认隐藏，可通过 `Todos: On/Off` 本地开关显示，支持增删改、状态切换和上下移动，但不修改 session 数据以外的视图状态；Settings 页面（React 岛屿）支持在线编辑配置、Provider 连接测试、MCP Server 连接测试，并可在 Models 标签页直接编辑 `compat.thinkingFormat`；顶部提供默认关闭的 `Auto Debug` 本地开关，用于查看最近一条顶层 `think=auto` 决策轨迹；Usage 页面（React 岛屿）显示 Token 用量统计、按 Model Role 拆分的明细卡片与 Canvas 图表
 - **图片附件**：支持通过 URL 或本地 JPEG/PNG 上传附加图片到用户消息；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；Gemini/Ollama 会由 LingClaw 本地预取为 base64/inlineData 并持久化缓存到会话工作区，因此可配合私网、localhost 或仅局域网可达的网关使用；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
@@ -328,9 +328,11 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 
 聊天页里由斜杠命令生成的 `success`、`system`、`error` 卡片支持点击右上角关闭；`progress`、`context_pruned`、`context_compressed`、`context_compress_failed` 这类运行态通知不提供关闭按钮。
 
+聊天输入框在首字符输入 `/` 时会弹出 slash command 菜单：支持按前缀过滤、`↑/↓` 切换高亮项、`Tab` 补全、对非精确匹配用 `Enter` 或发送按钮先补全再发送，也支持直接用鼠标点击菜单项。
+
 导航栏中的 `Auto Debug` 为本地调试开关，默认关闭且不持久化到 session；开启后会把最近一条顶层 `auto_trace` 渲染为调试卡片，不影响正常聊天流与 slash command 输出。
 
-导航栏中的 `Todos: On/Off` 也是纯本地显示开关，只控制 todo 面板显隐；当前 session 的 todos 内容、revision 和保存状态仍以后端 `todos_state` / `/api/todos` 为准。
+导航栏中的 `Todos: On/Off` 也是纯本地显示开关，默认关闭，只控制 todo 面板显隐；当前 session 的 todos 内容、revision 和保存状态仍以后端 `todos_state` / `/api/todos` 为准。
 
 Settings → Usage 页面除了现有今日/累计图表外，还会显示按 `Primary`、`Fast`、`Sub-Agent`、`Memory`、`Reflection`、`Context` 划分的 Token Breakdown。对于升级前已经存在的旧会话，角色级累计值会从 0.6.1 开始逐步建立；旧快照中仍保留的 provider 数据会继续在历史图表里展示。
 

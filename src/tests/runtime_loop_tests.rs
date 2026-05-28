@@ -2290,6 +2290,123 @@ async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections(
 }
 
 #[tokio::test]
+async fn prepare_analyze_snapshot_preserves_todos_when_optional_sections_overflow_budget() {
+    let state = Arc::new(test_app_state());
+    let session_id = "todos-required-dynamic-section".to_string();
+    let workspace = temp_workspace("todos-required-dynamic-section");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let todo_id = "todo-timeout-path-anchor".to_string();
+    let todo_content = format!("preserve this todo in prompt {}", "T".repeat(160));
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.workspace = workspace.clone();
+    session.todos = crate::todos::TodoSnapshot {
+        revision: 7,
+        items: vec![crate::todos::TodoItem {
+            id: todo_id.clone(),
+            content: todo_content.clone(),
+            status: crate::todos::TodoStatus::InProgress,
+        }],
+        last_updated_by: crate::todos::TodoUpdatedBy::User,
+        updated_at: now_epoch(),
+    };
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("investigate the timeout path and preserve current work".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = AgentPhaseState {
+        round: 0,
+        pending_tool_calls: Vec::new(),
+        collected_results: Vec::new(),
+        results_origin_query: None,
+        working_state: agent::WorkingState::default(),
+        retrieved_task_memory: None,
+        retrieved_task_memory_key: None,
+        retrieved_task_memory_cycle: None,
+        cycle_workspace: PathBuf::new(),
+        last_observation_hint: Some(format!("## Observation Hint\n{}", "A".repeat(6_000))),
+        last_observation_strength: agent::AutoObservationStrength::None,
+        last_tool_results_count: 0,
+        last_tool_error_count: 0,
+        last_summary_count: 0,
+        last_summary_bytes: 0,
+        last_progress_made: false,
+        last_error_kind: agent::AutoErrorKind::None,
+        last_evidence_delta_quality: agent::AutoEvidenceDeltaQuality::None,
+        stagnation_streak: 0,
+        error_streak: 0,
+        recent_tool_history: Vec::new(),
+        pending_interventions: Vec::new(),
+        react_ctx: agent::AgentLoopCtx::new(false),
+        shutting_down: false,
+        run_stopped: false,
+        run_detached: false,
+        last_save_instant: None,
+        usage_snap_input: 0,
+        usage_snap_output: 0,
+    };
+
+    prepare_analyze_snapshot(&ctx, &mut phase_state)
+        .await
+        .expect("snapshot should be prepared");
+
+    let prompt = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .and_then(|session| session.messages.first())
+            .and_then(|message| message.content.clone())
+            .expect("system prompt should be present")
+    };
+
+    assert!(prompt.contains("## Current Todos"));
+    assert!(prompt.contains("- revision: 7"));
+    assert!(prompt.contains("- last_updated_by: user"));
+    assert!(prompt.contains(
+        "- note: the latest user edit is authoritative. Do not overwrite it from a stale plan."
+    ));
+    assert!(prompt.contains(&format!("id={}", serde_json::to_string(&todo_id).unwrap())));
+    assert!(prompt.contains(&format!(
+        "content={}",
+        serde_json::to_string(&todo_content).unwrap()
+    )));
+    assert!(prompt.contains("## Observation Hint"));
+    assert_eq!(prompt.matches(DYNAMIC_PROMPT_TRUNCATION_MARKER).count(), 1);
+    assert!(
+        prompt
+            .find("## Current Todos")
+            .zip(prompt.find("## Observation Hint"))
+            .is_some_and(|(todos_idx, obs_idx)| todos_idx < obs_idx)
+    );
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
 async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
     let state = Arc::new(test_app_state());
     let session_id = "snapshot-new-goal-reset".to_string();

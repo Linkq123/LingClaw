@@ -1,24 +1,24 @@
 /* ── Todos panel ── */
 
 .todos-panel {
-  width: min(var(--chat-output-width), calc(100% - 8px));
+  width: min(760px, calc(100% - 8px));
   max-width: 100%;
-  min-width: 320px;
+  min-width: 280px;
   border: 1px solid var(--panel-border-soft);
-  border-radius: 10px;
+  border-radius: 8px;
   background: var(--panel-surface);
   box-shadow: var(--panel-shadow-soft);
-  padding: 12px 14px 14px;
+  padding: 10px 12px 12px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 
 .todos-panel-header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
 }
 
 .todos-panel-heading {
@@ -33,7 +33,7 @@
 }
 
 .todos-panel-meta {
-  margin-top: 4px;
+  margin-top: 2px;
   font-size: 11px;
   color: var(--dim);
   line-height: 1.5;
@@ -43,7 +43,7 @@
 .todos-panel-actions {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   flex-shrink: 0;
 }
 
@@ -75,14 +75,14 @@
 }
 
 .todos-add-btn {
-  width: 30px;
-  height: 30px;
-  font-size: 18px;
+  width: 28px;
+  height: 28px;
+  font-size: 17px;
   line-height: 1;
 }
 
 .todos-feedback {
-  padding: 8px 10px;
+  padding: 7px 10px;
   border-radius: 8px;
   font-size: 12px;
   line-height: 1.5;
@@ -103,7 +103,7 @@
 .todos-panel-body {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 
 .todos-empty {
@@ -111,7 +111,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 10px 12px;
+  padding: 8px 10px;
   border: 1px dashed var(--panel-border-soft);
   border-radius: 10px;
   color: var(--dim);
@@ -131,13 +131,13 @@
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
 .todo-row {
   display: grid;
   grid-template-columns: 120px minmax(0, 1fr) auto;
-  gap: 8px;
+  gap: 6px;
   align-items: center;
 }
 
@@ -148,7 +148,7 @@
 .todo-row-status,
 .todo-row-input {
   min-width: 0;
-  min-height: 34px;
+  min-height: 32px;
   border: 1px solid var(--panel-border-soft);
   border-radius: 8px;
   background: var(--panel-surface-alt);
@@ -162,7 +162,7 @@
 }
 
 .todo-row-input {
-  padding: 0 12px;
+  padding: 0 10px;
 }
 
 .todo-row-status:focus,
@@ -175,12 +175,12 @@
 .todo-row-actions {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
 }
 
 .todo-row-btn {
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
   padding: 0;
   font-size: 14px;
   line-height: 1;
