@@ -16,10 +16,7 @@ import {
   formatTokenCount,
   formatToolDuration,
   hideWelcome,
-  normalizePendingDeleteSessionId,
-  pendingDeleteSessionIdForSelection,
   scheduleBackgroundTask,
-  shouldSwitchToSelectedSession,
 } from './utils.js';
 import type { SessionSummary } from './types.js';
 import {
@@ -129,10 +126,20 @@ import {
   toggleAutoDebug,
   updateAutoDebugToggleButton,
 } from './renderers/auto-trace.js';
+import {
+  initSessionDrawer,
+  renderSessionDrawer,
+  toggleSessionDrawerExpanded,
+} from './renderers/sessions.js';
 import { applyTodosState, applyTodosVisibility, initTodosPanel } from './renderers/todos.js';
 
 // ── Initialize DOM ──
 initDomRefs();
+initSessionDrawer({
+  onCreate: promptAndCreateSession,
+  onDelete: deleteSession,
+  onSwitch: switchToSession,
+});
 initTodosPanel();
 
 // React islands (Settings & Usage) are now code-split and mounted lazily on
@@ -228,45 +235,13 @@ function normalizeSessionListPayload(payload): SessionSummary[] {
     : [];
 }
 
-function renderSessionPicker() {
-  if (!dom.sessionPicker) return;
-  const activeSessionId = state.activeSessionId;
-  const preferredSelectedSessionId = dom.sessionPicker.value || activeSessionId || state.sessions[0]?.id || '';
-  state.pendingDeleteSessionId = normalizePendingDeleteSessionId(
-    state.sessions,
-    activeSessionId,
-    state.pendingDeleteSessionId,
-  );
-  dom.sessionPicker.replaceChildren(
-    ...state.sessions.map((session) => {
-      const option = document.createElement('option');
-      option.value = session.id;
-      option.textContent = session.name || session.id;
-      return option;
-    }),
-  );
-  const selectedSessionId = state.sessions.some((session) => session.id === preferredSelectedSessionId)
-    ? preferredSelectedSessionId
-    : activeSessionId || state.sessions[0]?.id || '';
-  dom.sessionPicker.value = selectedSessionId;
-  const deleteTargetSessionId = pendingDeleteSessionIdForSelection(
-    state.sessions,
-    activeSessionId,
-    selectedSessionId,
-    state.pendingDeleteSessionId,
-  );
-  if (dom.deleteSessionBtn) {
-    dom.deleteSessionBtn.disabled = !deleteTargetSessionId;
-  }
-}
-
 async function refreshSessionsList() {
   try {
     const response = await fetch('/api/sessions', { cache: 'no-store' });
     if (!response.ok) return;
     const payload = await response.json();
     state.sessions = normalizeSessionListPayload(payload);
-    renderSessionPicker();
+    renderSessionDrawer();
   } catch {
     // ignore session list refresh failures; live socket state still works
   }
@@ -275,7 +250,7 @@ async function refreshSessionsList() {
 function switchToSession(sessionId: string) {
   const nextSessionId = String(sessionId || '').trim();
   if (!nextSessionId || nextSessionId === state.activeSessionId || state.sessionSwitchInFlight) {
-    renderSessionPicker();
+    renderSessionDrawer();
     return;
   }
   state.pendingDeleteSessionId = state.activeSessionId && state.activeSessionId !== 'main'
@@ -283,7 +258,7 @@ function switchToSession(sessionId: string) {
     : '';
   state.activeSessionId = nextSessionId;
   state.sessionSwitchInFlight = true;
-  renderSessionPicker();
+  renderSessionDrawer();
   reconnectToActiveSession(handleMessage);
 }
 
@@ -294,17 +269,15 @@ function promptAndCreateSession() {
   switchToSession(nextSessionId);
 }
 
-function deleteCurrentSession() {
-  if (!dom.sessionPicker || state.sessionSwitchInFlight) return;
-  const targetSessionId = pendingDeleteSessionIdForSelection(
-    state.sessions,
-    state.activeSessionId,
-    dom.sessionPicker.value,
-    state.pendingDeleteSessionId,
-  );
+function deleteSession(sessionId: string) {
+  const targetSessionId = String(sessionId || '').trim();
+  if (!targetSessionId || state.sessionSwitchInFlight) return;
+  if (targetSessionId === 'main' || targetSessionId === state.activeSessionId) return;
   if (!targetSessionId) return;
   const confirmed = window.confirm(`Delete session ${targetSessionId}?`);
   if (!confirmed) return;
+  state.pendingDeleteSessionId = targetSessionId;
+  renderSessionDrawer();
   sendCmd(`/delete ${targetSessionId}`);
 }
 
@@ -545,7 +518,7 @@ function handleMessage(data) {
   switch (data.type) {
     case 'session_list':
       state.sessions = normalizeSessionListPayload(data);
-      renderSessionPicker();
+      renderSessionDrawer();
       break;
     case 'session':
       clearCompressionOutcome();
@@ -553,6 +526,7 @@ function handleMessage(data) {
       state.sessionSwitchInFlight = false;
       dom.sessionNameEl.textContent = data.name || 'Main';
       dom.sessionIdEl.textContent = data.id.slice(0, 12);
+      renderSessionDrawer();
       if (data.capabilities && typeof data.capabilities.image === 'boolean') {
         state.imageCapable = data.capabilities.image;
         updateAttachButton();
@@ -1249,21 +1223,12 @@ function handleJumpToLatestClick() {
   jumpToLatest();
 }
 
-function handleSessionPickerChange() {
-  if (!dom.sessionPicker) return;
-  if (!shouldSwitchToSelectedSession(state.sessions, state.activeSessionId, dom.sessionPicker.value)) {
-    renderSessionPicker();
-    return;
-  }
-  switchToSession(dom.sessionPicker.value);
+function handleSessionDrawerToggleClick() {
+  toggleSessionDrawerExpanded();
 }
 
-function handleNewSessionClick() {
+function handleSessionDrawerNewClick() {
   promptAndCreateSession();
-}
-
-function handleDeleteSessionClick() {
-  deleteCurrentSession();
 }
 
 // Throttle the chat scroll handler to one invocation per animation frame.
@@ -1326,14 +1291,11 @@ installChatResizeObserver();
 if (dom.jumpToLatestBtn) {
   dom.jumpToLatestBtn.addEventListener('click', handleJumpToLatestClick);
 }
-if (dom.sessionPicker) {
-  dom.sessionPicker.addEventListener('change', handleSessionPickerChange);
+if (dom.sessionDrawerToggleBtn) {
+  dom.sessionDrawerToggleBtn.addEventListener('click', handleSessionDrawerToggleClick);
 }
-if (dom.newSessionBtn) {
-  dom.newSessionBtn.addEventListener('click', handleNewSessionClick);
-}
-if (dom.deleteSessionBtn) {
-  dom.deleteSessionBtn.addEventListener('click', handleDeleteSessionClick);
+if (dom.sessionDrawerNewBtn) {
+  dom.sessionDrawerNewBtn.addEventListener('click', handleSessionDrawerNewClick);
 }
 void refreshSessionsList();
 
@@ -1364,14 +1326,11 @@ if (import.meta.hot) {
     if (dom.jumpToLatestBtn) {
       dom.jumpToLatestBtn.removeEventListener('click', handleJumpToLatestClick);
     }
-    if (dom.sessionPicker) {
-      dom.sessionPicker.removeEventListener('change', handleSessionPickerChange);
+    if (dom.sessionDrawerToggleBtn) {
+      dom.sessionDrawerToggleBtn.removeEventListener('click', handleSessionDrawerToggleClick);
     }
-    if (dom.newSessionBtn) {
-      dom.newSessionBtn.removeEventListener('click', handleNewSessionClick);
-    }
-    if (dom.deleteSessionBtn) {
-      dom.deleteSessionBtn.removeEventListener('click', handleDeleteSessionClick);
+    if (dom.sessionDrawerNewBtn) {
+      dom.sessionDrawerNewBtn.removeEventListener('click', handleSessionDrawerNewClick);
     }
   });
 }

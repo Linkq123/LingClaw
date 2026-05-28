@@ -334,7 +334,7 @@ export function renderTodosPanel(): void {
 
   const meta = document.createElement('div');
   meta.className = 'todos-panel-meta';
-  meta.textContent = `Revision ${snapshot.revision} · Updated by ${snapshot.last_updated_by} · ${formatUpdatedAt(snapshot.updated_at)}`;
+  meta.textContent = `Updated by ${snapshot.last_updated_by} · ${formatUpdatedAt(snapshot.updated_at)}`;
 
   heading.appendChild(title);
   heading.appendChild(meta);

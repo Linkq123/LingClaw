@@ -23,9 +23,10 @@ export interface DomRefs {
   connLabel: HTMLElement | null;
   sessionNameEl: HTMLElement | null;
   sessionIdEl: HTMLElement | null;
-  sessionPicker: HTMLSelectElement | null;
-  newSessionBtn: HTMLButtonElement | null;
-  deleteSessionBtn: HTMLButtonElement | null;
+  sessionDrawer: HTMLElement | null;
+  sessionDrawerList: HTMLElement | null;
+  sessionDrawerToggleBtn: HTMLButtonElement | null;
+  sessionDrawerNewBtn: HTMLButtonElement | null;
   todosHost: HTMLElement | null;
   todosPanel: HTMLElement | null;
   headerVersionEl: HTMLElement | null;
@@ -115,6 +116,7 @@ export interface AppState {
   inputHistoryDraft: string;
   markdownRenderQueue: HTMLElement[];
   markdownQueueHandle: number;
+  sessionDrawerExpanded: boolean;
   activeSubagentPanels: Map<string, HTMLElement>;
   activeOrchestrations: Map<
     string,
@@ -175,6 +177,7 @@ export const state: AppState = {
   flushHandle: 0,
   deferredHistory: [],
   activeToolPanel: null,
+  sessionDrawerExpanded: true,
   showTodos: true,
   showTools: true,
   showReasoning: true,
@@ -225,9 +228,14 @@ export function initDomRefs() {
   dom.connLabel = document.getElementById('conn-label');
   dom.sessionNameEl = document.getElementById('session-name');
   dom.sessionIdEl = document.getElementById('session-id');
-  dom.sessionPicker = document.getElementById('session-picker') as HTMLSelectElement | null;
-  dom.newSessionBtn = document.getElementById('new-session-btn') as HTMLButtonElement | null;
-  dom.deleteSessionBtn = document.getElementById('delete-session-btn') as HTMLButtonElement | null;
+  dom.sessionDrawer = document.getElementById('session-drawer');
+  dom.sessionDrawerList = document.getElementById('session-drawer-list');
+  dom.sessionDrawerToggleBtn = document.getElementById(
+    'session-drawer-toggle-btn',
+  ) as HTMLButtonElement | null;
+  dom.sessionDrawerNewBtn = document.getElementById(
+    'session-drawer-new-btn',
+  ) as HTMLButtonElement | null;
   dom.todosHost = document.getElementById('todos-host');
   dom.todosPanel = document.getElementById('todos-panel');
   dom.headerVersionEl = document.getElementById('app-version-header');

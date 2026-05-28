@@ -4,6 +4,7 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
   position: relative;
   z-index: 1;
   background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 34%, transparent), transparent 38%);
@@ -43,19 +44,6 @@ header .session-name {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.session-picker {
-  min-width: 140px;
-  max-width: 220px;
-  padding: 4px 8px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: var(--surface);
-  color: var(--text);
-  font-size: 12px;
-}
-.session-manage-btn {
   white-space: nowrap;
 }
 header .session-id { font-size: 11px; color: var(--dim); font-family: var(--font-mono); }
@@ -143,6 +131,260 @@ header .actions button.is-active {
 .conn-dot.connecting { background: #f0b43a; animation: pulse 1.2s infinite; box-shadow: 0 0 6px rgba(240,180,58,.35); }
 .conn-dot.disconnected { background: var(--accent-error); animation: pulse 1.5s infinite; }
 .conn-label { letter-spacing: .3px; }
+
+/* ── App shell ── */
+.app-shell {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  min-width: 0;
+}
+
+.session-drawer {
+  width: var(--session-drawer-expanded-width);
+  flex-shrink: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px 10px;
+  border-right: 1px solid var(--glass-border);
+  background:
+    linear-gradient(180deg, color-mix(in srgb, var(--glass-surface) 88%, transparent), transparent 24%),
+    color-mix(in srgb, var(--surface) 78%, transparent);
+  box-shadow: inset -1px 0 0 rgba(255,255,255,.28);
+  overflow: hidden;
+  transition: width .2s ease, padding .2s ease;
+}
+
+.session-drawer.is-collapsed {
+  width: var(--session-drawer-collapsed-width);
+  padding-inline: 8px;
+}
+
+.session-drawer-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.session-drawer-toggle-btn,
+.session-drawer-new-btn {
+  border: 1px solid var(--panel-border-soft);
+  background: var(--panel-surface-alt);
+  color: var(--text);
+  border-radius: 8px;
+  min-height: 32px;
+  cursor: pointer;
+  transition: border-color .18s ease, background .18s ease, color .18s ease, opacity .18s ease;
+}
+
+.session-drawer-toggle-btn:hover,
+.session-drawer-new-btn:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent2) 22%, var(--panel-border-soft));
+  background: var(--panel-hover);
+}
+
+.session-drawer-toggle-btn {
+  width: 32px;
+  flex-shrink: 0;
+}
+
+.session-drawer-heading {
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  min-width: 0;
+  white-space: nowrap;
+}
+
+.session-drawer-new-btn {
+  margin-left: auto;
+  padding: 0 12px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.session-drawer.is-collapsed .session-drawer-heading {
+  opacity: 0;
+  width: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.session-drawer.is-collapsed .session-drawer-new-btn {
+  width: 32px;
+  padding: 0;
+  font-size: 18px;
+}
+
+.session-drawer-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-gutter: stable;
+  padding-right: 4px;
+}
+
+.session-drawer-empty {
+  border: 1px dashed var(--panel-border-soft);
+  border-radius: 8px;
+  padding: 12px;
+  font-size: 12px;
+  color: var(--dim);
+  background: color-mix(in srgb, var(--panel-surface) 84%, transparent);
+}
+
+.session-drawer-row {
+  display: flex;
+  align-items: stretch;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.session-drawer-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  padding: 10px 12px;
+  border: 1px solid var(--panel-border-soft);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--panel-surface) 92%, transparent);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: border-color .18s ease, background .18s ease, box-shadow .18s ease;
+}
+
+.session-drawer-row-main:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent2) 24%, var(--panel-border-soft));
+  background: var(--panel-hover);
+}
+
+.session-drawer-row-main:disabled {
+  cursor: default;
+}
+
+.session-drawer-row.is-active .session-drawer-row-main {
+  border-color: color-mix(in srgb, var(--accent2) 28%, var(--panel-border-soft));
+  background: color-mix(in srgb, var(--accent2) 10%, var(--panel-surface));
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.52);
+}
+
+.session-drawer-row.is-corrupt .session-drawer-row-main {
+  border-color: color-mix(in srgb, var(--accent-error) 28%, var(--panel-border-soft));
+  background: color-mix(in srgb, var(--accent-error) 8%, var(--panel-surface));
+}
+
+.session-drawer-row.is-pending .session-drawer-row-main,
+.session-drawer-row.is-disabled .session-drawer-row-main {
+  opacity: .78;
+}
+
+.session-drawer-row-content {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.session-drawer-row-titlebar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.session-drawer-row-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.session-drawer-row-meta {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: var(--dim);
+  font-family: var(--font-mono);
+}
+
+.session-drawer-row-badge {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent2) 12%, transparent);
+  color: color-mix(in srgb, var(--accent2) 74%, var(--text));
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.session-drawer-row.is-corrupt .session-drawer-row-badge {
+  background: color-mix(in srgb, var(--accent-error) 12%, transparent);
+  color: color-mix(in srgb, var(--accent-error) 76%, var(--text));
+}
+
+.session-drawer-row-delete {
+  width: 32px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid color-mix(in srgb, var(--accent-error) 18%, var(--panel-border-soft));
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--accent-error) 8%, var(--panel-surface));
+  color: color-mix(in srgb, var(--accent-error) 78%, var(--text));
+  cursor: pointer;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity .18s ease, background .18s ease, border-color .18s ease;
+}
+
+.session-drawer-row:hover .session-drawer-row-delete,
+.session-drawer-row:focus-within .session-drawer-row-delete {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (hover: none), (pointer: coarse) {
+  .session-drawer-row-delete {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+.session-drawer-row-delete:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--accent-error) 32%, var(--panel-border-soft));
+  background: color-mix(in srgb, var(--accent-error) 14%, var(--panel-surface));
+}
+
+.session-drawer-row-delete:disabled,
+.session-drawer-new-btn:disabled {
+  opacity: .5;
+  cursor: default;
+}
+
+.conversation-column {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
 
 /* ── Chat ── */
 .todos-host {
@@ -315,12 +557,17 @@ header .actions button.is-active {
   flex-shrink: 0;
 }
 .attach-btn {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   background: none;
   border: none;
   color: var(--dim);
   font-size: 18px;
   cursor: pointer;
-  padding: 8px 4px;
+  padding: 0;
   line-height: 1;
   transition: color .15s;
   flex-shrink: 0;
@@ -432,7 +679,7 @@ header .actions button.is-active {
   flex: 1;
   display: flex;
   gap: 8px;
-  align-items: flex-end;
+  align-items: center;
   background: var(--glass-surface);
   border: 1px solid var(--glass-border);
   border-radius: 18px;
@@ -452,12 +699,14 @@ header .actions button.is-active {
   border: none;
   border-radius: 0;
   color: var(--text);
-  padding: 12px 4px;
+  padding: 10px 4px;
+  min-height: 36px;
   font-size: 14px;
   resize: none;
   max-height: 120px;
   font-family: inherit;
   transition: none;
+  line-height: 1.4;
 }
 #input:focus {
   outline: none;

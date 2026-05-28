@@ -68,7 +68,6 @@ describe('todos panel', () => {
       updated_at: 1710000000,
     });
 
-    expect(dom.todosPanel?.textContent).toContain('Revision 3');
     expect(dom.todosPanel?.textContent).toContain('Updated by user');
     expect(dom.todosPanel?.querySelector<HTMLInputElement>('.todo-row-input')?.value).toBe(
       'Inspect runtime loop',

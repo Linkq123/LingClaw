@@ -52,18 +52,29 @@
     flex-wrap: nowrap;
     gap: 8px;
   }
+  .app-shell {
+    min-width: 0;
+  }
+  .session-drawer {
+    width: var(--session-drawer-expanded-width-mobile);
+    padding: 10px 8px;
+  }
+  .session-drawer.is-collapsed {
+    width: var(--session-drawer-collapsed-width-mobile);
+    padding-inline: 6px;
+  }
+  .session-drawer-header {
+    gap: 6px;
+  }
+  .session-drawer-new-btn {
+    min-width: 32px;
+    padding-inline: 10px;
+  }
   .brand-block {
     min-width: 0;
     flex-wrap: wrap;
   }
   header .session-id {
-    display: none;
-  }
-  .session-picker {
-    min-width: 96px;
-    max-width: 140px;
-  }
-  .session-manage-btn {
     display: none;
   }
   header .actions {
@@ -109,6 +120,9 @@
   }
   .todos-host {
     padding: 10px 16px 0;
+  }
+  .session-drawer-row-main {
+    padding: 9px 10px;
   }
   .todo-row {
     grid-template-columns: 1fr;

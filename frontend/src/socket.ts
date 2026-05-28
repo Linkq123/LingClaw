@@ -3,6 +3,7 @@ import { MAX_RECONNECT_ATTEMPTS } from './constants.js';
 import { addSystem, setBusy } from './renderers/chat.js';
 import { clearActiveAutoTrace, clearCompressionOutcome } from './renderers/auto-trace.js';
 import { clearReactStatus } from './renderers/react-status.js';
+import { renderSessionDrawer } from './renderers/sessions.js';
 import { closeToolDrawer } from './renderers/tools.js';
 import { resetTodosUiState } from './renderers/todos.js';
 import { finishAssistantStream, finishReasoningStream } from './handlers/stream.js';
@@ -76,6 +77,7 @@ export function connect(onMessage) {
       state.reconnectAttempts++;
     } else {
       state.sessionSwitchInFlight = false;
+      renderSessionDrawer();
       setConnStatus('disconnected', 'Offline');
       addSystem('Connection lost. Please refresh the page.', 'error');
     }

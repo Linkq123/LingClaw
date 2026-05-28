@@ -22,17 +22,6 @@
           <img class="brand-logo" src="/branding/logo-mark.png" alt="" width="28" height="28" />
           <span class="session-name" id="session-name">LingClaw</span>
           <span class="session-id" id="session-id"></span>
-          <select id="session-picker" class="session-picker" aria-label="Select session"></select>
-          <button id="new-session-btn" class="session-manage-btn mobile-hide" aria-label="New session">
-            New Session
-          </button>
-          <button
-            id="delete-session-btn"
-            class="session-manage-btn mobile-hide"
-            aria-label="Delete current session"
-          >
-            Delete
-          </button>
           <button
             id="theme-toggle-btn"
             class="theme-toggle-btn header-theme-toggle"
@@ -117,73 +106,98 @@
           </div>
         </div>
       </header>
-      <section id="todos-host" class="todos-host" aria-live="polite"></section>
-      <div id="chat" role="log" aria-live="polite">
-        <div class="welcome" id="welcome">
-          <div class="welcome-logo"><img src="/branding/logo-wordmark.png" alt="LingClaw" /></div>
-          <div class="app-version-badge welcome-version" id="app-version-welcome" hidden></div>
-          <div class="welcome-hint">
-            你的私人 AI 助手已就绪<br />
-            输入消息开始对话，或使用 <strong>/</strong> 命令
-          </div>
-          <div class="welcome-shortcuts">
-            <button data-action="cmd" data-cmd="/clear">New Conversation</button>
-            <button data-action="cmd" data-cmd="/status">Status</button>
-            <button data-action="cmd" data-cmd="/help">Help</button>
-          </div>
-        </div>
-      </div>
-      <button id="jump-to-latest" type="button" hidden aria-label="Jump to latest messages">
-        <span class="jump-to-latest-label">回到底部</span>
-        <span class="jump-to-latest-badge" id="jump-to-latest-badge" hidden></span>
-      </button>
-      <div id="input-area">
-        <div id="image-preview-bar" class="image-preview-bar" style="display: none"></div>
-        <div class="input-composer">
-          <div class="attach-wrapper">
+      <div class="app-shell">
+        <aside class="session-drawer" id="session-drawer" aria-label="Sessions">
+          <div class="session-drawer-header">
             <button
-              id="attach-btn"
-              class="attach-btn"
-              aria-label="Attach image"
-              title="Attach image"
-              style="display: none"
+              id="session-drawer-toggle-btn"
+              class="session-drawer-toggle-btn"
+              aria-label="Collapse sessions drawer"
+              aria-expanded="true"
             >
-              📎
+              &lt;
             </button>
-            <div id="attach-popup" class="attach-popup" style="display: none">
-              <div id="attach-menu" class="attach-menu">
-                <button class="attach-menu-item" id="attach-local-btn">📁 上传本地图片</button>
-                <button class="attach-menu-item" id="attach-url-btn">🔗 输入图片 URL</button>
+            <h2 class="session-drawer-heading">Sessions</h2>
+            <button
+              id="session-drawer-new-btn"
+              class="session-drawer-new-btn"
+              aria-label="New session"
+            >
+              New Session
+            </button>
+          </div>
+          <div id="session-drawer-list" class="session-drawer-list" aria-live="polite"></div>
+        </aside>
+        <div class="conversation-column">
+          <section id="todos-host" class="todos-host" aria-live="polite"></section>
+          <div id="chat" role="log" aria-live="polite">
+            <div class="welcome" id="welcome">
+              <div class="welcome-logo"><img src="/branding/logo-wordmark.png" alt="LingClaw" /></div>
+              <div class="app-version-badge welcome-version" id="app-version-welcome" hidden></div>
+              <div class="welcome-hint">
+                你的私人 AI 助手已就绪<br />
+                输入消息开始对话，或使用 <strong>/</strong> 命令
               </div>
-              <div id="attach-url-input" class="attach-url-input" style="display: none">
-                <input
-                  type="text"
-                  id="image-url-field"
-                  placeholder="https://example.com/image.jpg"
-                  autocomplete="off"
-                />
-                <button id="image-url-add" class="attach-url-add-btn">添加</button>
-              </div>
-              <div id="attach-upload-status" class="attach-upload-status" style="display: none">
-                <span class="upload-spinner"></span> 上传中...
+              <div class="welcome-shortcuts">
+                <button data-action="cmd" data-cmd="/clear">New Conversation</button>
+                <button data-action="cmd" data-cmd="/status">Status</button>
+                <button data-action="cmd" data-cmd="/help">Help</button>
               </div>
             </div>
           </div>
-          <input type="file" id="image-file-input" accept="image/jpeg,image/png" multiple hidden />
-          <textarea
-            id="input"
-            placeholder="Message LingClaw... (/ for commands)"
-            rows="1"
-            aria-label="Message input"
-            enterkeyhint="send"
-            autocomplete="off"
-            autocapitalize="sentences"
-            spellcheck="true"
-          ></textarea>
-          <button id="stop" aria-label="Stop agent" title="Stop" style="display: none">
-            <span id="stop-icon">■</span>
+          <button id="jump-to-latest" type="button" hidden aria-label="Jump to latest messages">
+            <span class="jump-to-latest-label">回到底部</span>
+            <span class="jump-to-latest-badge" id="jump-to-latest-badge" hidden></span>
           </button>
-          <button id="send" aria-label="Send message"><span id="send-icon">↑</span></button>
+          <div id="input-area">
+            <div id="image-preview-bar" class="image-preview-bar" style="display: none"></div>
+            <div class="input-composer">
+              <div class="attach-wrapper">
+                <button
+                  id="attach-btn"
+                  class="attach-btn"
+                  aria-label="Attach image"
+                  title="Attach image"
+                  style="display: none"
+                >
+                  📎
+                </button>
+                <div id="attach-popup" class="attach-popup" style="display: none">
+                  <div id="attach-menu" class="attach-menu">
+                    <button class="attach-menu-item" id="attach-local-btn">📁 上传本地图片</button>
+                    <button class="attach-menu-item" id="attach-url-btn">🔗 输入图片 URL</button>
+                  </div>
+                  <div id="attach-url-input" class="attach-url-input" style="display: none">
+                    <input
+                      type="text"
+                      id="image-url-field"
+                      placeholder="https://example.com/image.jpg"
+                      autocomplete="off"
+                    />
+                    <button id="image-url-add" class="attach-url-add-btn">添加</button>
+                  </div>
+                  <div id="attach-upload-status" class="attach-upload-status" style="display: none">
+                    <span class="upload-spinner"></span> 上传中...
+                  </div>
+                </div>
+              </div>
+              <input type="file" id="image-file-input" accept="image/jpeg,image/png" multiple hidden />
+              <textarea
+                id="input"
+                placeholder="Message LingClaw... (/ for commands)"
+                rows="1"
+                aria-label="Message input"
+                enterkeyhint="send"
+                autocomplete="off"
+                autocapitalize="sentences"
+                spellcheck="true"
+              ></textarea>
+              <button id="stop" aria-label="Stop agent" title="Stop" style="display: none">
+                <span id="stop-icon">■</span>
+              </button>
+              <button id="send" aria-label="Send message"><span id="send-icon">↑</span></button>
+            </div>
+          </div>
         </div>
       </div>
     </div>
