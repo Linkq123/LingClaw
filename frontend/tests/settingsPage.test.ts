@@ -379,4 +379,48 @@ describe('SettingsPage model compat thinking format', () => {
       expect(input.value).toBe('qwen');
     });
   });
+
+  it('loads openai-responses providers in the API type selector', async () => {
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config' && (!init || !('method' in init) || !init.method)) {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              models: {
+                providers: {
+                  openaiResponses: {
+                    api: 'openai-responses',
+                    baseUrl: 'https://api.openai.com/v1',
+                    apiKey: 'sk-test',
+                    models: [{ id: 'gpt-5.5', input: ['text'] }],
+                  },
+                },
+              },
+            },
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      findButtonByText('Models').click();
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      const select = document.querySelector('.provider-form select');
+      if (!(select instanceof HTMLSelectElement)) throw new Error('API type select not found');
+      expect(select.value).toBe('openai-responses');
+      expect(Array.from(select.options).some((option) => option.value === 'openai-responses')).toBe(
+        true,
+      );
+    });
+  });
 });

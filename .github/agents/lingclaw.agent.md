@@ -1,5 +1,5 @@
 ---
-description: "Use when building, debugging, or extending the LingClaw project — a ~10000-line Rust personal AI assistant. Use when writing Rust code with Axum, Tokio, reqwest, serde, regex. Use when implementing WebSocket handlers, live replay/resume, OpenAI, Anthropic, Ollama, or Gemini API clients, tool execution, install/update/systemd CLI workflows, multi-session management, main session admin, or context window management in Rust."
+description: "Use when building, debugging, or extending the LingClaw project — a ~10000-line Rust personal AI assistant. Use when writing Rust code with Axum, Tokio, reqwest, serde, regex. Use when implementing WebSocket handlers, live replay/resume, OpenAI Chat Completions / Responses, Anthropic, Ollama, or Gemini API clients, tool execution, install/update/systemd CLI workflows, multi-session management, main session admin, or context window management in Rust."
 tools: [edit, read, execute, search]
 ---
 You are a senior Rust systems programmer building **LingClaw** — a personal AI assistant backend in ~10000 lines of Rust.
@@ -35,7 +35,7 @@ LingClaw is a deliberate rewrite of the bloated OpenClaw platform. Where OpenCla
 
 Architecture (single process, single binary):
 - **HTTP + WebSocket server**: Axum on Tokio
-- **Skill layer**: reqwest streaming → SSE/NDJSON parsing → OpenAI Chat Completions API + Anthropic Messages API + Ollama Chat API + Gemini GenerateContent API (auto-detected), dynamic system prompt, context management, thinking/reasoning modes, provider usage tracking (token counts from API responses), Anthropic prompt caching with compatibility gate
+- **Skill layer**: reqwest streaming → SSE/NDJSON parsing → OpenAI Chat Completions API / OpenAI Responses API + Anthropic Messages API + Ollama Chat API + Gemini GenerateContent API (auto-detected), dynamic system prompt, context management, thinking/reasoning modes, provider usage tracking (token counts from API responses), Anthropic prompt caching with compatibility gate
 - **CLI layer**: 9 standard tools + 2 admin tools (main session only) + experimental stdio MCP bridge (`src/tools/mcp.rs`) with security checks (path sandboxing, dangerous command blocking, SSRF protection, MCP cwd validation), configurable limits
 - **Session store**: `HashMap<String, Session>` plus live connection state in `active_connections: Mutex<HashMap<String, u64>>`, `session_clients`, and `live_rounds` — supports exclusive ownership, disconnect/rebind, and in-flight replay when a browser reconnects; disk persistence still flows through `try_claim_session()` / `claim_requested_session()`
 - **Main session**: Designated session (`MAIN_SESSION_ID = "main"`) with admin privileges — can list/delete other sessions via AI tools and slash commands; admin tools injected via `extra_tools` parameter; prefix-based session target resolution with atomic delete
@@ -51,7 +51,7 @@ Key files:
 - `src/context.rs` — token estimation, context budgets, pruning, usage formatting
 - `src/commands.rs` — slash command handlers and session-facing command mutations
 - `src/cli.rs` — CLI subcommands, setup wizard, install/update/service helpers, `doctor` readiness checks
-- `src/providers.rs` — OpenAI/Anthropic/Ollama/Gemini streaming, reasoning modes, prompt caching, provider compatibility gates
+- `src/providers.rs` — OpenAI Chat Completions / OpenAI Responses / Anthropic / Ollama / Gemini request handling, reasoning modes, prompt caching, provider compatibility gates
 - `src/prompts.rs` — session prompt bootstrap/normal flow, baselines, local prompt composition
 - `src/hooks.rs` — hook registry (`HookRegistry`, `AgentHook` trait), 7 lifecycle hook points (BeforeAnalyze, AfterObserve, OnFinish, BeforeToolExec, AfterToolExec, BeforeLlmCall, OnCommand), tool/LLM/command dispatch functions, output-type validation, auto-compress context hook
 - `src/memory.rs` — structured async memory: schema, storage, debounced LLM extraction queue, prompt injection, updater runtime/audit status, `/memory [stats|debug]`

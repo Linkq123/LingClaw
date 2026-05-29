@@ -20,7 +20,8 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **会话级 Todos**：新增结构化 `todos` 工具，维护每个 session 唯一的一份当前任务清单；采用“整表替换 + revision 乐观并发”协议，支持用户与主代理协同编辑、重连恢复、冲突检测，以及专用 todo 面板展示
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、frontend-coder、backend-coder、general-coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
 - **文档化斜杠命令**：`/new`、`/model`、`/switch`、`/sessions`、`/delete`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/reflection`、`/help`
-- **四 Provider 模型路由**：OpenAI + Anthropic + Ollama + Gemini，支持 `provider/model` 和纯 model ID
+- **多 Provider 模型路由**：OpenAI（Chat Completions / Responses）+ Anthropic + Ollama + Gemini，支持 `provider/model` 和纯 model ID
+- **OpenAI 双协议**：OpenAI family 现在支持保留原有 `openai-completions`（`/v1/chat/completions`）并新增 `openai-responses`（`/v1/responses`）；两者共享同一套模型解析与工具权限体系。当前 `openai-responses` 走非流式底层调用，完成后再把文本 / reasoning / tool call 结果回放到现有前端事件流，因此不会像 `openai-completions` 那样逐 token 原生流式显示
 - **会话模型覆盖**：运行时通过 `/model` 切换当前活动 session 使用的模型
 - **会话持久化**：默认 `main` 与其他 session 都会各自保存工作区、消息历史、视图状态和当前 todos 快照
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
@@ -141,6 +142,27 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
           }
         ]
       },
+      "openai-responses": {
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "sk-your-openai-key",
+        "api": "openai-responses",
+        "models": [
+          {
+            "id": "gpt-5.5",
+            "name": "gpt-5.5",
+            "reasoning": true,
+            "compat": {
+              "reasoning": {
+                "summary": "auto"
+              }
+            },
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 400000,
+            "maxTokens": 32768
+          }
+        ]
+      },
       "anthropic": {
         "baseUrl": "https://api.anthropic.com",
         "apiKey": "sk-ant-your-anthropic-key",
@@ -228,9 +250,12 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 - AWS S3 若使用官方 endpoint，建议使用与 `region` 对应的区域 host；设置向导留空 endpoint 时会自动默认到该区域地址
 - OpenAI/Anthropic 直接使用现签 URL，因此 `s3.endpoint` 必须能被远端 provider 访问；Gemini/Ollama 路径会在本地预取并转成 base64/inlineData，可用于私网、localhost 或 VPN-only 网关
 - 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容，但 Setup Wizard 不再生成它们；新配置应省略这些字段
-- `models.providers.*.api` 目前支持 `openai-completions`、`anthropic`、`ollama`、`gemini`
+- `models.providers.*.api` 目前支持 `openai-completions`、`openai-responses`、`anthropic`、`ollama`、`gemini`
+- `openai-completions` 会请求 `POST /v1/chat/completions`，保留现有 LingClaw 原生流式体验
+- `openai-responses` 会请求 `POST /v1/responses`；当前实现会把 Responses API 的 `message` / `reasoning` / `function_call` 输出解析回 LingClaw 现有消息结构，但底层仍是一次性请求完成后再回放前端事件，不是原生 Responses SSE 增量流
 - `models.providers.*.baseUrl` 和 `models.providers.*.apiKey` 支持精确的 `${ENV_NAME}` 占位符；运行时会按环境变量展开，例如 `"baseUrl": "${OPENAI_API_BASE}"`、`"apiKey": "${OPENAI_API_KEY}"`
 - `models.providers.*.models[].compat.thinkingFormat` 为可选字符串，用于显式指定 OpenAI-compatible 的 thinking / reasoning 方言；常见值包括 `openai`、`qwen`、`doubao`、`deepseek-v4`、`ollama`、`gpt-oss`。Settings → Models 的 `Thinking Format` 输入框会直接读写这个字段
+- `models.providers.*.models[].compat.reasoning.summary` 为可选字符串，仅在 `openai-responses` 下使用；写入后会透传到 `reasoning.summary`，未配置时默认发送 `"auto"`
 - `compat.thinkingFormat = "deepseek-v4"` 时，会额外发送 `thinking.type=enabled|disabled`；开启 thinking 时，`reasoning_effort` 仅使用 `high` / `max` 两档，其中 `minimal` / `low` / `medium` / `high` 都会收敛到 `high`，`xhigh` / `max` 会收敛到 `max`
 - `compat.thinkingFormat = "doubao"` 时，会显式发送 `thinking.type=enabled|disabled`；开启 thinking 时，`reasoning_effort` 仅支持 `low` / `medium` / `high` 三档，`minimal` 会收敛到 `low`，`xhigh` / `max` 会收敛到 `high`
 - Gemini 3 使用官方 `generationConfig.thinkingConfig`：`includeThoughts` 控制思考摘要是否流式返回，`thinkingLevel` 映射到 `MINIMAL`/`LOW`/`MEDIUM`/`HIGH`；原生 tool calling 会保留并回传 `functionCall.id`、`functionResponse.id`，并在响应提供真实 `thoughtSignature` 时随原始 `functionCall` part 回传，以兼容并行工具调用与 Gemini 的签名校验
@@ -518,9 +543,11 @@ tools:
     │         │
 ┌───▼─────────▼────────────────────────────────────────────────────┐
 │                      Provider Layer                               │
-│   call_llm_stream() → OpenAI SSE / Anthropic SSE / Ollama NDJSON / Gemini SSE │
+│   call_llm_stream() → OpenAI Chat SSE · Responses HTTP replay     │
+│   Anthropic SSE · Ollama NDJSON · Gemini SSE                      │
 │   ResolvedModel · thinking/reasoning 参数映射                      │
-│   tool_definitions_*() → OpenAI / Anthropic / Ollama / Gemini tool schemas │
+│   tool_definitions_*() → OpenAI-family / Anthropic / Ollama       │
+│   / Gemini tool schemas                                           │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -573,7 +600,7 @@ Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的
 
 **关键设计决策：**
 
-- **不回退到文本协议**：保留 OpenAI/Anthropic/Ollama/Gemini 原生结构化 tool calling，不使用文本版 `Action: tool_name\nAction Input: {...}` 解析
+- **不回退到文本协议**：保留 OpenAI（Chat Completions / Responses）/ Anthropic / Ollama / Gemini 原生结构化 tool calling，不使用文本版 `Action: tool_name\nAction Input: {...}` 解析
 - **不污染对话历史**：完整思维链仅在 `think` 工具内部或 provider reasoning stream 中存在，不写入主消息序列
 - **推理可见性已实现**：默认启用 `react_phase` WS 事件，前端会显示阶段切换；可通过 `/react off` 关闭；`done` 事件始终包含结构化 `reason` 字段
 - **provider 层感知状态**：`auto` 模式下 `auto_think_level()` 根据循环深度动态调整推理预算（首轮 medium / 有 observation 时 high / 深轮 low）
@@ -638,7 +665,7 @@ src/
 ├── cli.rs             (~3030 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
 ├── config.rs          (~1490 行) — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
 ├── context.rs         (~570 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
-├── providers.rs       (~3030 行) — OpenAI/Anthropic/Ollama/Gemini 调用, 流式解析, 推理模式, prompt caching
+├── providers.rs       (~3680 行) — OpenAI Chat/Responses、Anthropic、Ollama、Gemini 调用, 流式/回放解析, 推理模式, prompt caching
 ├── prompts.rs         (~1030 行) — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
 ├── hooks.rs           (~830 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
 ├── memory.rs          (~3020 行) — structured_memory.json 读写, task memory 检索/排序, prompt 注入, MemoryUpdateQueue, /memory 状态
@@ -709,7 +736,7 @@ src/tests/                      — 模块测试文件 (~13600 行)
 ### 核心数据结构
 
 ```rust
-enum Provider { OpenAI, Anthropic, Ollama, Gemini }
+enum Provider { OpenAI, OpenAIResponses, Anthropic, Ollama, Gemini }
 
 struct Config {
     api_key, api_base, model, provider,
@@ -790,7 +817,7 @@ enum AgentPhase {
 
 ### Provider 层
 
-四 Provider 支持，统一的调用接口：
+四类 Provider + OpenAI 双协议支持，统一的调用接口：
 
 ```text
 call_llm_stream(http, resolved, messages, tx, think_level, extra_tools)
@@ -802,28 +829,35 @@ call_llm_stream(http, resolved, messages, tx, think_level, extra_tools)
     │         ├─ think_level → reasoning_effort 映射
     │         └─ SSE 流解析 → WebSocket 转发
     │
-        ├─ resolved.provider == Anthropic
-        │    └─ call_llm_stream_anthropic()
-        │         ├─ convert_messages_to_anthropic()
-        │         ├─ tool_definitions_anthropic()
-        │         ├─ think_level → budget_tokens 映射
-        │         └─ SSE 流解析 → WebSocket 转发
-        │
-        └─ resolved.provider == Ollama
-          └─ call_llm_stream_ollama()
-            ├─ convert_messages_to_ollama()
-            ├─ tool_definitions_ollama()
-            ├─ think_level → think 映射
-            └─ NDJSON 流解析 → WebSocket 转发
-
-        └─ resolved.provider == Gemini
-          └─ call_llm_stream_gemini()
-            ├─ convert_messages_to_gemini()
-            ├─ tool_definitions_gemini()
-            ├─ Gemini 3 thinkingConfig(thinkingLevel/includeThoughts)
-            ├─ functionCall.id / functionResponse.id / thoughtSignature 回传
-            ├─ 图片 inlineData(base64)
-            └─ SSE 流解析 → WebSocket 转发
+    ├─ resolved.provider == OpenAIResponses
+    │    └─ call_llm_stream_openai_responses()
+    │         ├─ convert_messages_to_openai_responses_input()
+    │         ├─ tools 扁平化为 Responses API function schema
+    │         ├─ think_level → reasoning.effort / reasoning.summary 映射
+    │         └─ 非流式 Responses 结果 → 现有 WebSocket 事件回放
+    │
+    ├─ resolved.provider == Anthropic
+    │    └─ call_llm_stream_anthropic()
+    │         ├─ convert_messages_to_anthropic()
+    │         ├─ tool_definitions_anthropic()
+    │         ├─ think_level → budget_tokens 映射
+    │         └─ SSE 流解析 → WebSocket 转发
+    │
+    ├─ resolved.provider == Ollama
+    │    └─ call_llm_stream_ollama()
+    │         ├─ convert_messages_to_ollama()
+    │         ├─ tool_definitions_ollama()
+    │         ├─ think_level → think 映射
+    │         └─ NDJSON 流解析 → WebSocket 转发
+    │
+    └─ resolved.provider == Gemini
+         └─ call_llm_stream_gemini()
+              ├─ convert_messages_to_gemini()
+              ├─ tool_definitions_gemini()
+              ├─ Gemini 3 thinkingConfig(thinkingLevel/includeThoughts)
+              ├─ functionCall.id / functionResponse.id / thoughtSignature 回传
+              ├─ 图片 inlineData(base64)
+              └─ SSE 流解析 → WebSocket 转发
 ```
 
 think_level 映射：
@@ -840,6 +874,7 @@ think_level 映射：
 
 注：上表中的 `OpenAI reasoning_effort` 列描述的是默认 OpenAI-compatible 映射；如果显式配置了 `compat.thinkingFormat`，会按对应方言覆写：
 
+- `openai-responses`：使用 `reasoning.effort` / `reasoning.summary`；`off` 只在支持 `none` 的 gpt-5.1+ 非 pro 模型上发送 `none`，不支持时省略 `reasoning`；pro 模型非 `off` 档位会收敛到 `high`
 - `deepseek-v4`：开启 thinking 时仅发送 `high` / `max`，关闭时发送 `thinking.type=disabled`
 - `doubao`：发送 `thinking.type=enabled|disabled`，开启时仅发送 `low` / `medium` / `high`
 

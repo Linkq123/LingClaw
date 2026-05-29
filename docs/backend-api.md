@@ -347,7 +347,7 @@
 
 ```json
 {
-  "api": "openai-completions | anthropic | ollama | gemini",
+  "api": "openai-completions | openai-responses | anthropic | ollama | gemini",
   "baseUrl": "string",
   "apiKey": "string",
   "models": [
@@ -375,14 +375,19 @@
 - provider 名称只允许字母、数字、`.`、`-`、`_`
 - `api` 只允许：
   - `openai-completions`
+  - `openai-responses`
   - `anthropic`
   - `ollama`
   - `gemini`
+- `openai-completions` 对应 `POST /v1/chat/completions`
+- `openai-responses` 对应 `POST /v1/responses`
+- 当前 `openai-responses` 实现会把 Responses API 返回的 `message` / `reasoning` / `function_call` 结果映射回 LingClaw 现有消息结构，并在请求完成后回放到前端 WebSocket 事件流；它不是原生 Responses SSE 逐事件透传
 - `baseUrl` 不能为空
 - `baseUrl` / `apiKey` 可以直接写字面值，也可以写成精确的 `${ENV_NAME}` 占位符；运行时会按环境变量展开
 - `models[].id` 不能为空
 - `models[].compat` 如提供，必须是对象
 - `models[].compat.thinkingFormat` 如提供，必须是字符串；用于显式声明 OpenAI-compatible 的 thinking / reasoning 方言（例如 `openai`、`qwen`、`doubao`、`deepseek-v4`、`ollama`、`gpt-oss`）
+- `models[].compat.reasoning.summary` 如提供，必须是字符串；仅 `openai-responses` 使用，会透传到 Responses API 的 `reasoning.summary`
 - `models[].compat.thinkingFormat = "deepseek-v4"` 时，请求会显式发送 `thinking.type=enabled|disabled`；开启 thinking 时，`reasoning_effort` 仅使用 `high` / `max`
 - `models[].compat.thinkingFormat = "doubao"` 时，请求会显式发送 `thinking.type=enabled|disabled`；开启 thinking 时，`reasoning_effort` 仅使用 `low` / `medium` / `high`
 
@@ -511,7 +516,7 @@
 - `baseUrl`: 必填
 - `apiKey`: 可为空，是否必需由 provider 决定
 - `baseUrl` / `apiKey`: 在配置文件中也可以写成 `${ENV_NAME}`，例如 `${OPENAI_API_BASE}` / `${OPENAI_API_KEY}`
-- `api`: 默认 `openai-completions`
+- `api`: 默认 `openai-completions`，也可显式传 `openai-responses`
 - `modelId`: 必填
 
 ### 成功响应

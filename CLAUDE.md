@@ -59,7 +59,7 @@ The runtime uses an explicit ReAct-style state machine:
 - `src/agent.rs` — phase/state-machine logic, task intent, working state, finish heuristics, observation summarization
 - `src/commands.rs` — slash command handlers like `/new`, `/status`, `/mcp`, `/memory`, `/reflection`
 - `src/todos.rs` — session-scoped todos validation, optimistic revision handling, and broadcast payloads
-- `src/providers.rs` — provider abstraction for OpenAI, Anthropic, Ollama, and Gemini streaming/tool calling
+- `src/providers.rs` — provider abstraction for OpenAI Chat Completions, OpenAI Responses, Anthropic, Ollama, and Gemini request/stream handling
 - `src/context.rs` — token estimation, request budgets, pruning
 - `src/hooks.rs` — lifecycle hooks, tool/LLM/command hooks, automatic context compression
 - `src/memory.rs` — structured memory storage/injection and updater queue
@@ -98,6 +98,7 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 - The browser talks to the backend primarily over `/ws`; live reconnect/replay behavior is an important part of correctness.
 - Session-scoped todos are synchronized over the dedicated `todos_state` WebSocket event and persisted with the session; `/api/todos` uses full-list replacement plus revision conflict detection.
 - The app keeps `main` as the default session, but now supports multiple persisted sessions and frontend session switching.
+- OpenAI family currently has two protocol kinds: `openai-completions` (`/v1/chat/completions`) and `openai-responses` (`/v1/responses`). The existing Chat Completions path remains the native streaming implementation; the current Responses path is request/response at the HTTP layer and then replays LingClaw's existing live events after completion.
 - The frontend session switcher lives in a collapsible left drawer; the Todos panel is a local visibility toggle and defaults to hidden on first load.
 - Slash command autocomplete is frontend-local UI on top of the existing `/...` command transport: incomplete prefixes can be completed via keyboard or mouse before dispatch.
 - Automatic context compression runs as a `BeforeAnalyze` hook in `src/hooks.rs`.

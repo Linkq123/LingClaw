@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::json;
 use std::{collections::HashMap, time::Duration};
 
 fn runtime_alignment_config(
@@ -234,6 +235,106 @@ fn model_supports_image_prefers_runtime_aligned_provider_for_plain_ids() {
         "openai-b/shared-model"
     );
     assert!(config.model_supports_image("shared-model"));
+}
+
+#[test]
+fn openai_responses_is_supported_as_builtin_provider_api_kind() {
+    assert_eq!(
+        Provider::from_api_kind("openai-responses"),
+        Provider::OpenAIResponses
+    );
+    assert_eq!(
+        Provider::OpenAIResponses.default_api_base(),
+        "https://api.openai.com/v1"
+    );
+    assert_eq!(
+        Provider::OpenAIResponses.api_key_env_var(),
+        Some("OPENAI_API_KEY")
+    );
+    assert_eq!(Provider::OpenAIResponses.label(), "openai-responses");
+    assert!(validate_provider_api_kind("openai-responses").is_ok());
+}
+
+#[test]
+fn openai_responses_builtin_provider_name_and_model_refs_resolve() {
+    assert_eq!(
+        Provider::detect("gpt-5.5", "", Some("openai-responses")),
+        Provider::OpenAIResponses
+    );
+    assert_eq!(
+        Provider::detect("openai-responses/gpt-5.5", "", None),
+        Provider::OpenAIResponses
+    );
+    assert!(is_builtin_provider_name("openai-responses"));
+
+    let config = runtime_alignment_config(
+        Provider::OpenAIResponses,
+        Provider::OpenAIResponses.default_api_base(),
+        "openai-key",
+        "openai-responses/gpt-5.5",
+        HashMap::new(),
+    );
+
+    assert_eq!(
+        config.resolve_model("openai-responses/gpt-5.5").provider,
+        Provider::OpenAIResponses
+    );
+    assert_eq!(
+        config.resolve_provider_name("openai-responses/gpt-5.5"),
+        "openai-responses"
+    );
+    assert_eq!(
+        config.resolved_model_ref("openai-responses/gpt-5.5"),
+        "openai-responses/gpt-5.5"
+    );
+    assert_eq!(
+        config
+            .canonical_model_ref("openai-responses/gpt-5.5")
+            .unwrap(),
+        "openai-responses/gpt-5.5"
+    );
+}
+
+#[test]
+fn resolve_model_reads_openai_responses_reasoning_summary_from_compat() {
+    let mut providers = HashMap::new();
+    providers.insert(
+        "openai-responses".to_string(),
+        JsonProviderConfig {
+            base_url: Provider::OpenAIResponses.default_api_base().to_string(),
+            api_key: "openai-key".to_string(),
+            api: "openai-responses".to_string(),
+            models: vec![JsonModelEntry {
+                id: "gpt-5.5".to_string(),
+                name: None,
+                reasoning: Some(true),
+                input: Some(vec!["text".to_string()]),
+                cost: None,
+                context_window: Some(400000),
+                max_tokens: Some(32768),
+                compat: Some(json!({
+                    "reasoning": {
+                        "summary": "detailed"
+                    }
+                })),
+            }],
+        },
+    );
+
+    let config = runtime_alignment_config(
+        Provider::OpenAIResponses,
+        Provider::OpenAIResponses.default_api_base(),
+        "openai-key",
+        "openai-responses/gpt-5.5",
+        providers,
+    );
+
+    let resolved = config.resolve_model("openai-responses/gpt-5.5");
+    assert_eq!(resolved.provider, Provider::OpenAIResponses);
+    assert_eq!(
+        resolved.openai_responses_reasoning_summary.as_deref(),
+        Some("detailed")
+    );
 }
 
 #[test]

@@ -113,6 +113,49 @@ fn spawn_one_shot_http_server(
     (format!("http://{}", address), request_rx, handle)
 }
 
+struct MockHttpResponse {
+    status: &'static str,
+    content_type: &'static str,
+    body: String,
+}
+
+fn spawn_http_server_with_responses(
+    responses: Vec<MockHttpResponse>,
+) -> (
+    String,
+    mpsc::Receiver<CapturedHttpRequest>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should expose address");
+    let (request_tx, request_rx) = mpsc::channel();
+
+    let handle = thread::spawn(move || {
+        for response_item in responses {
+            let (mut stream, _) = listener.accept().expect("request should connect");
+            let request = read_http_request(&mut stream);
+            request_tx
+                .send(request)
+                .expect("captured request should be sent");
+            let response = format!(
+                "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_item.status,
+                response_item.content_type,
+                response_item.body.len(),
+                response_item.body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("response should be written");
+            stream.flush().expect("response should flush");
+        }
+    });
+
+    (format!("http://{}", address), request_rx, handle)
+}
+
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -131,6 +174,63 @@ fn think_level_to_reasoning_effort_all_levels() {
     assert_eq!(think_level_to_reasoning_effort("max"), "xhigh");
     assert_eq!(think_level_to_reasoning_effort("unknown"), "medium");
     assert_eq!(think_level_to_reasoning_effort("auto"), "medium");
+}
+
+#[test]
+fn think_level_to_openai_responses_reasoning_effort_all_levels() {
+    let model = "gpt-5.5";
+    assert_eq!(
+        think_level_to_openai_responses_reasoning_effort(model, "off"),
+        Some("none")
+    );
+    assert_eq!(
+        think_level_to_openai_responses_reasoning_effort(model, "minimal"),
+        Some("low")
+    );
+    assert_eq!(
+        think_level_to_openai_responses_reasoning_effort(model, "low"),
+        Some("low")
+    );
+    assert_eq!(
+        think_level_to_openai_responses_reasoning_effort(model, "medium"),
+        Some("medium")
+    );
+    assert_eq!(
+        think_level_to_openai_responses_reasoning_effort(model, "high"),
+        Some("high")
+    );
+    assert_eq!(
+        think_level_to_openai_responses_reasoning_effort(model, "xhigh"),
+        Some("high")
+    );
+    assert_eq!(
+        think_level_to_openai_responses_reasoning_effort(model, "max"),
+        Some("high")
+    );
+    assert_eq!(
+        think_level_to_openai_responses_reasoning_effort(model, "unknown"),
+        Some("medium")
+    );
+    assert_eq!(
+        think_level_to_openai_responses_reasoning_effort(model, "auto"),
+        Some("medium")
+    );
+    assert_eq!(
+        think_level_to_openai_responses_reasoning_effort("gpt-5", "off"),
+        None
+    );
+    assert_eq!(
+        think_level_to_openai_responses_reasoning_effort("gpt-5-pro", "off"),
+        None
+    );
+    assert_eq!(
+        think_level_to_openai_responses_reasoning_effort("gpt-5-pro", "low"),
+        Some("high")
+    );
+    assert_eq!(
+        think_level_to_openai_responses_reasoning_effort("gpt-5.5-pro", "medium"),
+        Some("high")
+    );
 }
 
 #[test]
@@ -1006,6 +1106,7 @@ fn anthropic_thinking_does_not_inflate_max_tokens() {
         model_id: "claude-sonnet-test".into(),
         reasoning: true,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(128_000),
         context_window: 200_000,
         stream_include_usage: false,
@@ -1052,6 +1153,7 @@ fn anthropic_thinking_uses_latest_adaptive_shape_for_low_level() {
         model_id: "claude-opus-4-7".into(),
         reasoning: true,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(4_096),
         context_window: 1_000_000,
         stream_include_usage: false,
@@ -1087,6 +1189,7 @@ fn anthropic_thinking_disabled_when_think_level_is_off() {
         model_id: "claude-opus-4-7".into(),
         reasoning: true,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(16_000),
         context_window: 1_000_000,
         stream_include_usage: false,
@@ -1321,6 +1424,7 @@ async fn build_ollama_stream_body_includes_tools_think_and_num_predict() {
         model_id: "qwen3".into(),
         reasoning: true,
         thinking_format: Some("ollama".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(256),
         context_window: 128000,
         stream_include_usage: false,
@@ -1359,6 +1463,7 @@ async fn build_ollama_stream_body_uses_levels_for_gpt_oss() {
         model_id: "gpt-oss:20b".into(),
         reasoning: true,
         thinking_format: Some("gpt-oss".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -1410,6 +1515,7 @@ fn build_openai_stream_body_uses_null_tool_call_content_for_official_api() {
         model_id: "gpt-4o-mini".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(128),
         context_window: 128000,
         stream_include_usage: false,
@@ -1449,6 +1555,7 @@ fn build_openai_stream_body_keeps_string_tool_call_content_for_compatible_api() 
         model_id: "gpt-5.4".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(128),
         context_window: 128000,
         stream_include_usage: false,
@@ -1488,6 +1595,7 @@ fn build_openai_stream_body_deepseek_v4_sends_thinking_and_reasoning_effort() {
         model_id: "deepseek-v4-pro".into(),
         reasoning: true,
         thinking_format: Some("deepseek-v4".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -1545,6 +1653,7 @@ fn build_openai_stream_body_deepseek_v4_replays_missing_reasoning_tool_turn_as_t
         model_id: "deepseek-v4-pro".into(),
         reasoning: true,
         thinking_format: Some("deepseek-v4".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -1696,6 +1805,7 @@ async fn build_openai_stream_body_deepseek_v4_keeps_reasoning_after_parallel_too
         model_id: "deepseek-v4-pro".into(),
         reasoning: true,
         thinking_format: Some("deepseek-v4".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -1762,6 +1872,7 @@ fn build_openai_stream_body_deepseek_v4_off_keeps_reasoningless_tool_turn_struct
         model_id: "deepseek-v4-pro".into(),
         reasoning: true,
         thinking_format: Some("deepseek-v4".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -1834,6 +1945,7 @@ fn build_openai_stream_body_non_deepseek_keeps_reasoningless_tool_turn_structure
         model_id: "gpt-4.1".into(),
         reasoning: true,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -1906,6 +2018,7 @@ fn build_openai_stream_body_deepseek_v4_maps_xhigh_to_max() {
         model_id: "deepseek-v4-pro".into(),
         reasoning: true,
         thinking_format: Some("deepseek-v4".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -1928,6 +2041,7 @@ fn build_openai_stream_body_deepseek_v4_maps_low_to_high() {
         model_id: "deepseek-v4-pro".into(),
         reasoning: true,
         thinking_format: Some("deepseek-v4".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -1949,6 +2063,7 @@ fn build_openai_stream_body_deepseek_v4_off_sends_thinking_disabled() {
         model_id: "deepseek-v4-pro".into(),
         reasoning: true,
         thinking_format: Some("deepseek-v4".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -1971,6 +2086,7 @@ fn build_openai_stream_body_doubao_caps_xhigh_to_high() {
         model_id: "doubao-thinking".into(),
         reasoning: true,
         thinking_format: Some("doubao".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -1993,6 +2109,7 @@ fn build_openai_stream_body_doubao_preserves_medium() {
         model_id: "doubao-thinking".into(),
         reasoning: true,
         thinking_format: Some("doubao".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -2015,6 +2132,7 @@ fn build_openai_stream_body_doubao_off_sends_thinking_disabled() {
         model_id: "doubao-thinking".into(),
         reasoning: true,
         thinking_format: Some("doubao".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -2037,6 +2155,7 @@ fn build_openai_simple_body_deepseek_v4_includes_reasoning_content_in_messages()
         model_id: "deepseek-v4-pro".into(),
         reasoning: true,
         thinking_format: Some("deepseek-v4".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -2081,6 +2200,7 @@ fn build_openai_simple_body_doubao_explicit_medium_reasoning_controls() {
         model_id: "doubao-thinking".into(),
         reasoning: true,
         thinking_format: Some("doubao".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -2102,6 +2222,7 @@ fn build_openai_simple_body_doubao_off_sends_thinking_disabled() {
         model_id: "doubao-thinking".into(),
         reasoning: true,
         thinking_format: Some("doubao".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -2123,6 +2244,7 @@ fn build_openai_simple_body_deepseek_v4_replays_missing_reasoning_tool_turn_as_t
         model_id: "deepseek-v4-pro".into(),
         reasoning: true,
         thinking_format: Some("deepseek-v4".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -2200,6 +2322,7 @@ fn build_openai_simple_body_non_deepseek_keeps_reasoningless_tool_turn_structure
         model_id: "gpt-4.1".into(),
         reasoning: true,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -2271,6 +2394,7 @@ fn build_openai_simple_body_uses_null_tool_call_content_for_official_api() {
         model_id: "gpt-4o-mini".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(128),
         context_window: 128000,
         stream_include_usage: false,
@@ -2309,6 +2433,7 @@ fn build_openai_simple_body_keeps_string_tool_call_content_for_compatible_api() 
         model_id: "gpt-5.4".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(128),
         context_window: 128000,
         stream_include_usage: false,
@@ -2361,6 +2486,7 @@ fn auto_think_supported_for_openai_requires_official_or_explicit_format() {
         model_id: "gpt-5.4".into(),
         reasoning: true,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(128),
         context_window: 128000,
         stream_include_usage: false,
@@ -2375,6 +2501,7 @@ fn auto_think_supported_for_openai_requires_official_or_explicit_format() {
         model_id: "gpt-5.4".into(),
         reasoning: true,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(128),
         context_window: 128000,
         stream_include_usage: false,
@@ -2389,6 +2516,7 @@ fn auto_think_supported_for_openai_requires_official_or_explicit_format() {
         model_id: "gpt-5.4".into(),
         reasoning: true,
         thinking_format: Some("qwen".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(128),
         context_window: 128000,
         stream_include_usage: false,
@@ -2418,6 +2546,7 @@ async fn build_gemini_body_inlines_images_and_function_declarations() {
         model_id: "gemini-2.5-flash".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(512),
         context_window: 1_000_000,
         stream_include_usage: false,
@@ -2631,6 +2760,7 @@ async fn build_gemini_body_for_gemini3_includes_thinking_config() {
         model_id: "gemini-3-flash-preview".into(),
         reasoning: true,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(512),
         context_window: 1_000_000,
         stream_include_usage: false,
@@ -2677,6 +2807,7 @@ async fn call_llm_stream_gemini_auto_enables_medium_thinking_config() {
         model_id: "gemini-3-flash-preview".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(512),
         context_window: 1_000_000,
         stream_include_usage: false,
@@ -2807,6 +2938,7 @@ async fn call_llm_stream_gemini_closes_thinking_on_thought_only_stream_end() {
         model_id: "gemini-3-flash-preview".into(),
         reasoning: true,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(512),
         context_window: 1_000_000,
         stream_include_usage: false,
@@ -2884,6 +3016,7 @@ async fn build_gemini_body_rejects_invalid_cached_image_data() {
         model_id: "gemini-2.5-flash".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(512),
         context_window: 1_000_000,
         stream_include_usage: false,
@@ -2927,6 +3060,7 @@ fn call_llm_simple_gemini_sends_key_header_and_expected_path() {
         model_id: "gemini-2.5-flash".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(64),
         context_window: 1_000_000,
         stream_include_usage: false,
@@ -2987,6 +3121,7 @@ fn call_llm_simple_anthropic_preserves_missing_usage() {
         model_id: "claude-sonnet-test".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(64),
         context_window: 200_000,
         stream_include_usage: false,
@@ -3041,6 +3176,7 @@ fn call_llm_simple_openai_reports_raw_body_for_html_gateway_response() {
         model_id: "gpt-4o-mini".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(16),
         context_window: 128000,
         stream_include_usage: false,
@@ -3086,6 +3222,7 @@ fn call_llm_simple_openai_surfaces_json_error_envelope() {
         model_id: "gpt-4o-mini".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(16),
         context_window: 128000,
         stream_include_usage: false,
@@ -3117,6 +3254,567 @@ fn call_llm_simple_openai_surfaces_json_error_envelope() {
 }
 
 #[test]
+fn build_openai_responses_body_flattens_tools_and_replays_tool_history() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAIResponses,
+        api_base: Provider::OpenAI.default_api_base().into(),
+        api_key: "openai-secret".into(),
+        model_id: "gpt-5.5".into(),
+        reasoning: true,
+        thinking_format: None,
+        openai_responses_reasoning_summary: Some("detailed".into()),
+        max_tokens: Some(256),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("System prompt".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("Read the README".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("I'll inspect it.".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: r#"{"path":"README.md"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("README contents".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            timestamp: None,
+        },
+    ];
+    let extra_tools = vec![json!({
+        "type": "function",
+        "function": {
+            "name": "custom_lookup",
+            "description": "Look up metadata",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" }
+                },
+                "required": ["query"]
+            }
+        }
+    })];
+
+    let body =
+        build_openai_responses_body(&resolved, &messages, None, "minimal", &extra_tools, true)
+            .expect("responses body should build");
+
+    assert_eq!(body["instructions"], "System prompt");
+    assert_eq!(body["model"], "gpt-5.5");
+    assert_eq!(body["max_output_tokens"], 256);
+    assert_eq!(body["reasoning"]["effort"], "low");
+    assert_eq!(body["reasoning"]["summary"], "detailed");
+    assert_eq!(body["input"][0]["type"], "message");
+    assert_eq!(body["input"][0]["role"], "user");
+    assert_eq!(body["input"][1]["type"], "message");
+    assert_eq!(body["input"][1]["role"], "assistant");
+    assert_eq!(body["input"][1]["content"][0]["type"], "output_text");
+    assert_eq!(body["input"][1]["content"][0]["text"], "I'll inspect it.");
+    assert_eq!(body["input"][2]["type"], "function_call");
+    assert_eq!(body["input"][2]["call_id"], "call_1");
+    assert_eq!(body["input"][2]["name"], "read_file");
+    assert_eq!(body["input"][3]["type"], "function_call_output");
+    assert_eq!(body["input"][3]["call_id"], "call_1");
+    assert_eq!(body["input"][3]["output"], "README contents");
+    assert_eq!(body["tools"][0]["type"], "function");
+    assert!(body["tools"][0].get("function").is_none());
+    assert_eq!(body["tools"][0]["name"], "think");
+    assert_eq!(body["tools"][1]["name"], "todos");
+    let custom_tool = body["tools"]
+        .as_array()
+        .expect("tools should be an array")
+        .iter()
+        .find(|tool| tool["name"] == "custom_lookup")
+        .expect("custom tool should be preserved");
+    assert!(custom_tool.get("function").is_none());
+}
+
+#[test]
+fn build_openai_responses_body_disables_reasoning_when_think_is_off() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAIResponses,
+        api_base: Provider::OpenAI.default_api_base().into(),
+        api_key: "openai-secret".into(),
+        model_id: "gpt-5.5".into(),
+        reasoning: true,
+        thinking_format: None,
+        openai_responses_reasoning_summary: None,
+        max_tokens: Some(256),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hello".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let body = build_openai_responses_body(&resolved, &messages, None, "off", &[], false)
+        .expect("responses body should build");
+
+    assert_eq!(body["reasoning"]["effort"], "none");
+    assert_eq!(body["reasoning"]["summary"], "auto");
+}
+
+#[test]
+fn build_openai_responses_body_omits_reasoning_when_none_effort_is_unsupported() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAIResponses,
+        api_base: Provider::OpenAI.default_api_base().into(),
+        api_key: "openai-secret".into(),
+        model_id: "gpt-5".into(),
+        reasoning: true,
+        thinking_format: None,
+        openai_responses_reasoning_summary: None,
+        max_tokens: Some(256),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hello".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let body = build_openai_responses_body(&resolved, &messages, None, "off", &[], false)
+        .expect("responses body should build");
+
+    assert!(body.get("reasoning").is_none());
+}
+
+#[test]
+fn build_openai_responses_body_uses_previous_response_id_for_followups() {
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAIResponses,
+        api_base: Provider::OpenAI.default_api_base().into(),
+        api_key: "openai-secret".into(),
+        model_id: "gpt-5.5".into(),
+        reasoning: true,
+        thinking_format: Some("openai".into()),
+        openai_responses_reasoning_summary: None,
+        max_tokens: Some(256),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let assistant = build_openai_responses_llm_response(&json!({
+        "id": "resp_123",
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            }
+        ],
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 3
+        }
+    }))
+    .expect("response should parse")
+    .message;
+
+    assert_eq!(
+        openai_responses_response_id_from_message(&assistant),
+        Some("resp_123")
+    );
+
+    let messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("System prompt".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("Read the README".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        assistant,
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("README contents".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            timestamp: None,
+        },
+    ];
+
+    let body = build_openai_responses_body(&resolved, &messages, None, "high", &[], true)
+        .expect("responses body should build");
+
+    assert_eq!(body["previous_response_id"], "resp_123");
+    assert_eq!(
+        body["input"]
+            .as_array()
+            .expect("input should be an array")
+            .len(),
+        1
+    );
+    assert_eq!(body["input"][0]["type"], "function_call_output");
+    assert_eq!(body["input"][0]["call_id"], "call_1");
+    assert_eq!(body["input"][0]["output"], "README contents");
+}
+
+#[test]
+fn build_openai_responses_llm_response_preserves_refusal_text() {
+    let response = build_openai_responses_llm_response(&json!({
+        "id": "resp_refusal",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    { "type": "refusal", "refusal": "I can't help with that." }
+                ]
+            }
+        ],
+        "usage": {
+            "input_tokens": 5,
+            "output_tokens": 4
+        }
+    }))
+    .expect("refusal response should parse");
+
+    assert_eq!(
+        response.message.content.as_deref(),
+        Some("I can't help with that.")
+    );
+    assert_eq!(
+        openai_responses_response_id_from_message(&response.message),
+        Some("resp_refusal")
+    );
+}
+
+#[test]
+fn call_llm_stream_openai_responses_retries_without_expired_checkpoint() {
+    let first_error = json!({
+        "error": {
+            "message": "No response found for previous_response_id resp_123",
+            "type": "invalid_request_error"
+        }
+    })
+    .to_string();
+    let second_response = json!({
+        "id": "resp_789",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    { "type": "output_text", "text": "recovered" }
+                ]
+            }
+        ],
+        "usage": {
+            "input_tokens": 21,
+            "output_tokens": 2
+        }
+    })
+    .to_string();
+    let (api_base, request_rx, handle) = spawn_http_server_with_responses(vec![
+        MockHttpResponse {
+            status: "400 Bad Request",
+            content_type: "application/json",
+            body: first_error,
+        },
+        MockHttpResponse {
+            status: "200 OK",
+            content_type: "application/json",
+            body: second_response,
+        },
+    ]);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAIResponses,
+        api_base,
+        api_key: "stream-secret".into(),
+        model_id: "gpt-5.5".into(),
+        reasoning: true,
+        thinking_format: Some("openai".into()),
+        openai_responses_reasoning_summary: None,
+        max_tokens: Some(128),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let assistant = build_openai_responses_llm_response(&json!({
+        "id": "resp_123",
+        "output": [
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            }
+        ],
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 3
+        }
+    }))
+    .expect("checkpoint response should parse")
+    .message;
+    let messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("System prompt".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("Read the README".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        assistant,
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("README contents".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            timestamp: None,
+        },
+    ];
+    let (tx, _rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+    let live_tx: LiveTx = tx;
+
+    let response = runtime
+        .block_on(async {
+            call_llm_stream_openai_responses(
+                &http,
+                &resolved,
+                &messages,
+                None,
+                &live_tx,
+                "high",
+                &[],
+                false,
+                0,
+            )
+            .await
+        })
+        .expect("responses call should recover from stale checkpoint");
+
+    let first_request = request_rx.recv().expect("first request should be captured");
+    let second_request = request_rx
+        .recv()
+        .expect("fallback request should be captured");
+    handle.join().expect("server thread should join");
+
+    let first_body: serde_json::Value =
+        serde_json::from_str(&first_request.body).expect("first body should be valid json");
+    let second_body: serde_json::Value =
+        serde_json::from_str(&second_request.body).expect("second body should be valid json");
+    assert_eq!(first_body["previous_response_id"], "resp_123");
+    assert!(second_body.get("previous_response_id").is_none());
+    assert_eq!(
+        second_body["input"]
+            .as_array()
+            .expect("fallback input should be an array")
+            .len(),
+        3
+    );
+    assert_eq!(response.message.content.as_deref(), Some("recovered"));
+}
+
+#[test]
+fn call_llm_stream_openai_responses_posts_to_responses_and_replays_output() {
+    let response_body = json!({
+        "id": "resp_456",
+        "output": [
+            {
+                "type": "reasoning",
+                "summary": [
+                    { "text": "plan first" }
+                ]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "read_file",
+                "arguments": "{\"path\":\"README.md\"}"
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    { "type": "output_text", "text": "done" }
+                ]
+            }
+        ],
+        "usage": {
+            "input_tokens": 17,
+            "output_tokens": 5
+        }
+    })
+    .to_string();
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server("application/json", response_body);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAIResponses,
+        api_base,
+        api_key: "stream-secret".into(),
+        model_id: "gpt-5.5".into(),
+        reasoning: true,
+        thinking_format: Some("openai".into()),
+        openai_responses_reasoning_summary: None,
+        max_tokens: Some(128),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("read the readme".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let (tx, mut rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+    let live_tx: LiveTx = tx;
+
+    let response = runtime
+        .block_on(async {
+            call_llm_stream_openai_responses(
+                &http,
+                &resolved,
+                &messages,
+                None,
+                &live_tx,
+                "high",
+                &[],
+                true,
+                2,
+            )
+            .await
+        })
+        .expect("responses call should succeed");
+
+    let request = request_rx.recv().expect("captured request should exist");
+    handle.join().expect("server thread should join");
+
+    assert_eq!(request.request_line, "POST /responses HTTP/1.1");
+    let body: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid json");
+    assert_eq!(body["model"], "gpt-5.5");
+    assert_eq!(body["reasoning"]["effort"], "high");
+    assert_eq!(body["reasoning"]["summary"], "auto");
+    assert_eq!(response.message.content.as_deref(), Some("done"));
+    assert_eq!(response.message.thinking.as_deref(), Some("plan first"));
+    assert_eq!(
+        openai_responses_response_id_from_message(&response.message),
+        Some("resp_456")
+    );
+    assert_eq!(response.input_tokens, Some(17));
+    assert_eq!(response.output_tokens, Some(5));
+    let tool_calls = response
+        .message
+        .tool_calls
+        .expect("response should retain tool calls");
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0].id, "call_1");
+    assert_eq!(tool_calls[0].function.name, "read_file");
+    assert_eq!(tool_calls[0].function.arguments, "{\"path\":\"README.md\"}");
+
+    let mut event_types = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        event_types.push(
+            event["type"]
+                .as_str()
+                .expect("event type should be present")
+                .to_string(),
+        );
+    }
+    assert!(event_types.iter().any(|event| event == "thinking_start"));
+    assert!(event_types.iter().any(|event| event == "thinking_delta"));
+    assert!(event_types.iter().any(|event| event == "thinking_done"));
+    assert!(event_types.iter().any(|event| event == "delta"));
+}
+
+#[test]
 fn call_llm_simple_ollama_sends_auth_and_expected_body() {
     let response_body = r#"{"message":{"content":"hello from ollama"}}"#.to_string();
     let (api_base, request_rx, handle) =
@@ -3130,6 +3828,7 @@ fn call_llm_simple_ollama_sends_auth_and_expected_body() {
         model_id: "qwen3".into(),
         reasoning: true,
         thinking_format: Some("ollama".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(64),
         context_window: 128000,
         stream_include_usage: false,
@@ -3191,6 +3890,7 @@ fn call_llm_stream_ollama_parses_ndjson_end_to_end() {
         model_id: "qwen3".into(),
         reasoning: true,
         thinking_format: Some("ollama".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(128),
         context_window: 128000,
         stream_include_usage: false,
@@ -3282,6 +3982,7 @@ fn call_llm_stream_openai_reports_html_gateway_response() {
         model_id: "gpt-4o-mini".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(32),
         context_window: 128000,
         stream_include_usage: false,
@@ -3350,6 +4051,7 @@ fn call_llm_stream_openai_deepseek_multi_tool_stream_keeps_two_tool_calls_and_th
         model_id: "deepseek-v4-pro".into(),
         reasoning: true,
         thinking_format: Some("deepseek-v4".into()),
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(256),
         context_window: 128000,
         stream_include_usage: false,
@@ -3445,6 +4147,7 @@ fn call_llm_stream_openai_auto_skips_reasoning_effort_for_compatible_gateway() {
         model_id: "gpt-5.4".into(),
         reasoning: true,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(32),
         context_window: 128000,
         stream_include_usage: false,
@@ -3506,6 +4209,7 @@ fn call_llm_stream_openai_surfaces_json_error_envelope() {
         model_id: "gpt-4o-mini".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(32),
         context_window: 128000,
         stream_include_usage: false,
@@ -3605,6 +4309,7 @@ fn anthropic_prompt_caching_is_enabled_for_official_api() {
         model_id: "claude".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -3623,6 +4328,7 @@ fn anthropic_prompt_caching_is_disabled_for_compatible_api_by_default() {
         model_id: "claude".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,
@@ -3641,6 +4347,7 @@ fn anthropic_prompt_caching_can_be_forced_for_compatible_api() {
         model_id: "claude".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: None,
         context_window: 128000,
         stream_include_usage: false,

@@ -56,6 +56,27 @@
           }
         ]
       },
+      "openai-responses": {
+        "baseUrl": "https://api.openai.com/v1",
+        "apiKey": "${OPENAI_API_KEY}",
+        "api": "openai-responses",
+        "models": [
+          {
+            "id": "gpt-5.5",
+            "name": "gpt-5.5",
+            "reasoning": true,
+            "compat": {
+              "reasoning": {
+                "summary": "auto"
+              }
+            },
+            "input": ["text", "image"],
+            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
+            "contextWindow": 400000,
+            "maxTokens": 32768
+          }
+        ]
+      },
       "doubao": {
         "baseUrl": "https://your-doubao-openai-compatible-endpoint/v1",
         "apiKey": "your-doubao-key",

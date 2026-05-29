@@ -14,6 +14,7 @@ pub(crate) const DEFAULT_PORT: u16 = 18989;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Provider {
     OpenAI,
+    OpenAIResponses,
     Anthropic,
     Ollama,
     Gemini,
@@ -22,6 +23,7 @@ pub(crate) enum Provider {
 impl Provider {
     pub(crate) fn from_api_kind(api: &str) -> Self {
         match api.trim().to_ascii_lowercase().as_str() {
+            "openai-responses" => Self::OpenAIResponses,
             "anthropic" => Self::Anthropic,
             "ollama" => Self::Ollama,
             "gemini" => Self::Gemini,
@@ -31,7 +33,7 @@ impl Provider {
 
     pub(crate) fn default_api_base(self) -> &'static str {
         match self {
-            Self::OpenAI => "https://api.openai.com/v1",
+            Self::OpenAI | Self::OpenAIResponses => "https://api.openai.com/v1",
             Self::Anthropic => "https://api.anthropic.com",
             Self::Ollama => "http://127.0.0.1:11434",
             Self::Gemini => "https://generativelanguage.googleapis.com/v1beta",
@@ -40,7 +42,7 @@ impl Provider {
 
     pub(crate) fn api_key_env_var(self) -> Option<&'static str> {
         match self {
-            Self::OpenAI => Some("OPENAI_API_KEY"),
+            Self::OpenAI | Self::OpenAIResponses => Some("OPENAI_API_KEY"),
             Self::Anthropic => Some("ANTHROPIC_API_KEY"),
             Self::Ollama => None,
             Self::Gemini => Some("GEMINI_API_KEY"),
@@ -73,6 +75,9 @@ impl Provider {
         if explicit == "gemini" {
             return Self::Gemini;
         }
+        if explicit == "openai-responses" {
+            return Self::OpenAIResponses;
+        }
         if explicit == "openai" {
             return Self::OpenAI;
         }
@@ -83,6 +88,9 @@ impl Provider {
             }
             if provider_name == "ollama" {
                 return Self::Ollama;
+            }
+            if provider_name == "openai-responses" {
+                return Self::OpenAIResponses;
             }
             if provider_name == "openai" {
                 return Self::OpenAI;
@@ -111,6 +119,7 @@ impl Provider {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::OpenAI => "openai",
+            Self::OpenAIResponses => "openai-responses",
             Self::Anthropic => "anthropic",
             Self::Ollama => "ollama",
             Self::Gemini => "gemini",
@@ -406,19 +415,19 @@ pub(crate) fn validate_provider_name(name: &str) -> Result<(), String> {
 fn is_builtin_provider_name(name: &str) -> bool {
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "openai" | "anthropic" | "ollama" | "gemini"
+        "openai" | "openai-responses" | "anthropic" | "ollama" | "gemini"
     )
 }
 
 fn validate_provider_api_kind(api_kind: &str) -> Result<(), String> {
     if matches!(
         api_kind.trim().to_ascii_lowercase().as_str(),
-        "openai-completions" | "anthropic" | "ollama" | "gemini"
+        "openai-completions" | "openai-responses" | "anthropic" | "ollama" | "gemini"
     ) {
         Ok(())
     } else {
         Err(format!(
-            "unsupported api '{api_kind}'. Expected one of: openai-completions, anthropic, ollama, gemini."
+            "unsupported api '{api_kind}'. Expected one of: openai-completions, openai-responses, anthropic, ollama, gemini."
         ))
     }
 }
@@ -619,7 +628,9 @@ impl Config {
             Provider::Anthropic => std::env::var("ANTHROPIC_API_KEY")
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .unwrap_or_default(),
-            Provider::OpenAI => std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+            Provider::OpenAI | Provider::OpenAIResponses => {
+                std::env::var("OPENAI_API_KEY").unwrap_or_default()
+            }
             Provider::Ollama => std::env::var("OLLAMA_API_KEY")
                 .or_else(|_| std::env::var("OPENAI_API_KEY"))
                 .unwrap_or_default(),
@@ -633,7 +644,7 @@ impl Config {
             explicit
         } else {
             match provider {
-                Provider::OpenAI => openai_api_base_env
+                Provider::OpenAI | Provider::OpenAIResponses => openai_api_base_env
                     .unwrap_or_else(|| Provider::OpenAI.default_api_base().to_string()),
                 Provider::Anthropic => match openai_api_base_env {
                     Some(base) if base != Provider::OpenAI.default_api_base() => base,
@@ -861,7 +872,9 @@ impl Config {
                         .or_else(|_| std::env::var("OPENAI_API_KEY"))
                         .unwrap_or_else(|_| self.api_key.clone())
                 }
-                Provider::OpenAI if self.provider != Provider::OpenAI => {
+                Provider::OpenAI | Provider::OpenAIResponses
+                    if !matches!(self.provider, Provider::OpenAI | Provider::OpenAIResponses) =>
+                {
                     std::env::var("OPENAI_API_KEY").unwrap_or_else(|_| self.api_key.clone())
                 }
                 Provider::Ollama if self.provider != Provider::Ollama => {
@@ -880,6 +893,7 @@ impl Config {
             model_id: model_id.to_string(),
             reasoning: false,
             thinking_format: None,
+            openai_responses_reasoning_summary: None,
             max_tokens: None,
             context_window: self.max_context_tokens as u64,
             stream_include_usage: self.openai_stream_include_usage,
@@ -889,10 +903,20 @@ impl Config {
         let build_resolved =
             |pc: &JsonProviderConfig, model_id: &str, entry: Option<&JsonModelEntry>| {
                 let reasoning = entry.and_then(|e| e.reasoning).unwrap_or(false);
-                let thinking_format = entry
-                    .and_then(|e| e.compat.as_ref())
+                let compat = entry.and_then(|e| e.compat.as_ref());
+                let thinking_format = compat
                     .and_then(|c| c.get("thinkingFormat"))
                     .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let openai_responses_reasoning_summary = compat
+                    .and_then(|c| {
+                        c.get("reasoning")
+                            .and_then(|reasoning| reasoning.get("summary"))
+                            .or_else(|| c.get("reasoningSummary"))
+                    })
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
                 let max_tokens = entry.and_then(|e| e.max_tokens);
                 let context_window = entry
@@ -905,6 +929,7 @@ impl Config {
                     model_id: model_id.to_string(),
                     reasoning,
                     thinking_format,
+                    openai_responses_reasoning_summary,
                     max_tokens,
                     context_window,
                     stream_include_usage: self.openai_stream_include_usage,
@@ -921,6 +946,7 @@ impl Config {
             if self.providers.is_empty() {
                 let provider = match prov_name.to_ascii_lowercase().as_str() {
                     "anthropic" => Some(Provider::Anthropic),
+                    "openai-responses" => Some(Provider::OpenAIResponses),
                     "openai" => Some(Provider::OpenAI),
                     "ollama" => Some(Provider::Ollama),
                     "gemini" => Some(Provider::Gemini),
@@ -1021,6 +1047,7 @@ impl Config {
             if self.providers.is_empty() {
                 let provider = prov_name.to_ascii_lowercase();
                 if provider == "openai"
+                    || provider == "openai-responses"
                     || provider == "anthropic"
                     || provider == "ollama"
                     || provider == "gemini"
@@ -1077,6 +1104,7 @@ impl Config {
             if self.providers.is_empty() {
                 let provider = prov_name.to_ascii_lowercase();
                 if provider == "openai"
+                    || provider == "openai-responses"
                     || provider == "anthropic"
                     || provider == "ollama"
                     || provider == "gemini"
@@ -1084,7 +1112,7 @@ impl Config {
                     return Ok(format!("{provider}/{model_id}"));
                 }
                 return Err(format!(
-                    "Unknown provider '{prov_name}'. Use 'openai', 'anthropic', 'ollama', or 'gemini'."
+                    "Unknown provider '{prov_name}'. Use 'openai', 'openai-responses', 'anthropic', 'ollama', or 'gemini'."
                 ));
             }
             let Some(pc) = self.providers.get(prov_name) else {

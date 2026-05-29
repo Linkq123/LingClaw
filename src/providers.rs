@@ -21,7 +21,6 @@ use crate::{
 /// Maximum size for a single image fetched for Ollama base64 encoding (10 MB).
 const MAX_IMAGE_FETCH_BYTES: usize = 10 * 1024 * 1024;
 const IMAGE_CACHE_DIR_NAME: &str = ".image-cache";
-
 // ══════════════════════════════════════════════════════════════════════════════
 //  Provider Types
 // ══════════════════════════════════════════════════════════════════════════════
@@ -34,6 +33,8 @@ pub(crate) struct ResolvedModel {
     pub(crate) reasoning: bool,
     /// From model config `compat.thinkingFormat`: "qwen", "openai", "doubao", "anthropic", "ollama", etc.
     pub(crate) thinking_format: Option<String>,
+    /// From model config `compat.reasoning.summary` for OpenAI Responses API.
+    pub(crate) openai_responses_reasoning_summary: Option<String>,
     /// From model config `maxTokens`.
     pub(crate) max_tokens: Option<u64>,
     /// Effective context window for the resolved model.
@@ -289,6 +290,10 @@ fn openai_supports_reasoning_controls(resolved: &ResolvedModel) -> bool {
     is_official_openai_api_base(&resolved.api_base) || resolved.thinking_format.is_some()
 }
 
+fn is_openai_family(provider: Provider) -> bool {
+    matches!(provider, Provider::OpenAI | Provider::OpenAIResponses)
+}
+
 /// Convert internal messages to clean OpenAI API format (strips timestamps and
 /// extra fields so the provider receives only role/content/tool_calls/tool_call_id).
 ///
@@ -376,7 +381,7 @@ fn summarize_deepseek_tool_turn_as_plain_assistant(
         content: Some(lines.join("\n")),
         images: None,
         thinking: Some(replay_reasoning),
-        anthropic_thinking_blocks: None,
+        anthropic_thinking_blocks: assistant.anthropic_thinking_blocks.clone(),
         tool_calls: None,
         tool_call_id: None,
         timestamp: assistant.timestamp,
@@ -415,7 +420,7 @@ fn prepare_openai_messages_for_request<'a>(
     repair_deepseek_history: bool,
 ) -> Cow<'a, [ChatMessage]> {
     if repair_deepseek_history
-        && resolved.provider == Provider::OpenAI
+        && is_openai_family(resolved.provider)
         && resolved.thinking_format.as_deref() == Some("deepseek-v4")
         && messages
             .iter()
@@ -526,6 +531,431 @@ fn convert_messages_to_openai_with_options(
     }
 
     out
+}
+
+fn message_content_text_part(part_type: &str, text: &str) -> serde_json::Value {
+    json!({
+        "type": part_type,
+        "text": text,
+    })
+}
+
+fn flatten_openai_responses_tool_definition(tool: &serde_json::Value) -> serde_json::Value {
+    if tool.get("type").and_then(Value::as_str) != Some("function") {
+        return tool.clone();
+    }
+
+    if let Some(function) = tool.get("function").and_then(Value::as_object) {
+        return json!({
+            "type": "function",
+            "name": function.get("name").and_then(Value::as_str).unwrap_or(""),
+            "description": function.get("description").and_then(Value::as_str).unwrap_or(""),
+            "parameters": function.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object"})),
+        });
+    }
+
+    tool.clone()
+}
+
+fn openai_responses_response_id_from_message(message: &ChatMessage) -> Option<&str> {
+    if message.role != "assistant" {
+        return None;
+    }
+
+    message
+        .anthropic_thinking_blocks
+        .as_ref()
+        .and_then(|blocks| {
+            blocks
+                .iter()
+                .rev()
+                .find(|block| block.block_type == crate::OPENAI_RESPONSES_RESPONSE_ID_BLOCK_TYPE)
+        })
+        .and_then(|block| block.data.as_deref())
+        .filter(|response_id| !response_id.is_empty())
+}
+
+fn set_openai_responses_response_id(message: &mut ChatMessage, response_id: Option<&str>) {
+    let Some(response_id) = response_id.filter(|response_id| !response_id.is_empty()) else {
+        return;
+    };
+
+    let mut blocks = message.anthropic_thinking_blocks.take().unwrap_or_default();
+    blocks.retain(|block| block.block_type != crate::OPENAI_RESPONSES_RESPONSE_ID_BLOCK_TYPE);
+    blocks.push(AnthropicThinkingBlock {
+        block_type: crate::OPENAI_RESPONSES_RESPONSE_ID_BLOCK_TYPE.to_string(),
+        thinking: None,
+        signature: None,
+        data: Some(response_id.to_string()),
+    });
+    message.anthropic_thinking_blocks = Some(blocks);
+}
+
+fn latest_openai_responses_checkpoint(messages: &[ChatMessage]) -> Option<(&str, usize)> {
+    let last_assistant_idx = messages
+        .iter()
+        .rposition(|message| message.role == "assistant")?;
+    let response_id = openai_responses_response_id_from_message(&messages[last_assistant_idx])?;
+    Some((response_id, last_assistant_idx))
+}
+
+fn openai_responses_checkpoint_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    (lower.contains("previous_response_id") || lower.contains("previous response"))
+        && (lower.contains("not found")
+            || lower.contains("invalid")
+            || lower.contains("expired")
+            || lower.contains("does not exist"))
+}
+
+fn openai_responses_message_content(
+    msg: &ChatMessage,
+    part_type: &str,
+    include_images: bool,
+) -> serde_json::Value {
+    let mut parts = Vec::new();
+    if let Some(text) = msg.content.as_deref().filter(|text| !text.is_empty()) {
+        parts.push(message_content_text_part(part_type, text));
+    }
+    if include_images && let Some(images) = msg.images.as_ref() {
+        for image in images {
+            parts.push(json!({
+                "type": "input_image",
+                "image_url": image.url,
+            }));
+        }
+    }
+    serde_json::Value::Array(parts)
+}
+
+fn convert_messages_to_openai_responses_input(messages: &[ChatMessage]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+
+    for msg in messages {
+        match msg.role.as_str() {
+            "system" => {}
+            "user" => {
+                out.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": openai_responses_message_content(msg, "input_text", true),
+                }));
+            }
+            "assistant" => {
+                if msg.content.as_deref().is_some_and(|text| !text.is_empty()) {
+                    out.push(json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": openai_responses_message_content(msg, "output_text", false),
+                    }));
+                }
+                if let Some(tool_calls) = &msg.tool_calls {
+                    for tool_call in tool_calls {
+                        out.push(json!({
+                            "type": "function_call",
+                            "call_id": tool_call.id,
+                            "name": tool_call.function.name,
+                            "arguments": tool_call.function.arguments,
+                        }));
+                    }
+                }
+            }
+            "tool" => {
+                out.push(json!({
+                    "type": "function_call_output",
+                    "call_id": msg.tool_call_id.as_deref().unwrap_or(""),
+                    "output": msg.content.as_deref().unwrap_or(""),
+                }));
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
+fn build_openai_responses_body(
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+    s3_cfg: Option<&crate::config::S3Config>,
+    think_level: &str,
+    extra_tools: &[serde_json::Value],
+    include_builtin_tools: bool,
+) -> Result<serde_json::Value, String> {
+    build_openai_responses_body_with_checkpoint(
+        resolved,
+        messages,
+        s3_cfg,
+        think_level,
+        extra_tools,
+        include_builtin_tools,
+        true,
+    )
+}
+
+fn build_openai_responses_body_with_checkpoint(
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+    s3_cfg: Option<&crate::config::S3Config>,
+    think_level: &str,
+    extra_tools: &[serde_json::Value],
+    include_builtin_tools: bool,
+    use_previous_response_id: bool,
+) -> Result<serde_json::Value, String> {
+    let messages = materialize_image_urls(messages, s3_cfg)?;
+    let prepared_messages = prepare_openai_messages_for_request(
+        resolved,
+        &messages,
+        resolved.thinking_format.as_deref() == Some("deepseek-v4"),
+    );
+    let instructions = prepared_messages
+        .iter()
+        .find(|msg| msg.role == "system")
+        .and_then(|msg| msg.content.clone())
+        .unwrap_or_default();
+    let (previous_response_id, input_messages) = if use_previous_response_id
+        && let Some((response_id, assistant_idx)) =
+            latest_openai_responses_checkpoint(prepared_messages.as_ref())
+    {
+        (
+            Some(response_id),
+            &prepared_messages.as_ref()[assistant_idx + 1..],
+        )
+    } else {
+        (None, prepared_messages.as_ref())
+    };
+    let input = convert_messages_to_openai_responses_input(input_messages);
+    let mut all_tools: Vec<serde_json::Value> = if include_builtin_tools {
+        serde_json::from_value(tools::tool_definitions()).unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    all_tools.extend_from_slice(extra_tools);
+    let normalized_tools = all_tools
+        .iter()
+        .map(flatten_openai_responses_tool_definition)
+        .collect::<Vec<_>>();
+    let mut body = json!({
+        "model": resolved.model_id,
+        "input": input,
+    });
+    if !instructions.is_empty() {
+        body["instructions"] = json!(instructions);
+    }
+    if let Some(response_id) = previous_response_id {
+        body["previous_response_id"] = json!(response_id);
+    }
+    if !normalized_tools.is_empty() {
+        body["tools"] = json!(normalized_tools);
+    }
+    if openai_supports_reasoning_controls(resolved)
+        && let Some(reasoning_effort) =
+            think_level_to_openai_responses_reasoning_effort(&resolved.model_id, think_level)
+    {
+        body["reasoning"] = json!({
+            "effort": reasoning_effort,
+            "summary": resolved
+                .openai_responses_reasoning_summary
+                .as_deref()
+                .unwrap_or("auto"),
+        });
+    }
+    if let Some(max_tokens) = resolved.max_tokens {
+        body["max_output_tokens"] = json!(max_tokens);
+    }
+    Ok(body)
+}
+
+fn collect_openai_responses_message_text(item: &serde_json::Value) -> String {
+    item.get("content")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .or_else(|| part.get("refusal"))
+                        .and_then(Value::as_str)
+                })
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+}
+
+fn collect_openai_responses_reasoning_text(item: &serde_json::Value) -> String {
+    item.get("summary")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default()
+}
+
+fn parse_openai_responses_usage(data: &serde_json::Value) -> (Option<u64>, Option<u64>) {
+    (
+        data["usage"]["input_tokens"].as_u64(),
+        data["usage"]["output_tokens"].as_u64(),
+    )
+}
+
+async fn send_openai_responses_body(
+    http: &Client,
+    url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+    max_retries: usize,
+) -> Result<serde_json::Value, String> {
+    let resp = send_with_retry(http, max_retries, || {
+        http.post(url).bearer_auth(api_key).json(body)
+    })
+    .await?;
+    let text = resp.text().await.map_err(|e| e.to_string())?;
+    let data: serde_json::Value = parse_json_response("OpenAI Responses", &text)?;
+    if let Some(error) = provider_json_error("OpenAI Responses", &data) {
+        return Err(error);
+    }
+    Ok(data)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_openai_responses_request(
+    http: &Client,
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+    s3_cfg: Option<&crate::config::S3Config>,
+    think_level: &str,
+    extra_tools: &[serde_json::Value],
+    include_builtin_tools: bool,
+    max_retries: usize,
+) -> Result<serde_json::Value, String> {
+    let url = format!("{}/responses", resolved.api_base);
+    let body = build_openai_responses_body(
+        resolved,
+        messages,
+        s3_cfg,
+        think_level,
+        extra_tools,
+        include_builtin_tools,
+    )?;
+    let used_checkpoint = body.get("previous_response_id").is_some();
+
+    match send_openai_responses_body(http, &url, &resolved.api_key, &body, max_retries).await {
+        Ok(data) => Ok(data),
+        Err(error) if used_checkpoint && openai_responses_checkpoint_error(&error) => {
+            let fallback_body = build_openai_responses_body_with_checkpoint(
+                resolved,
+                messages,
+                s3_cfg,
+                think_level,
+                extra_tools,
+                include_builtin_tools,
+                false,
+            )?;
+            send_openai_responses_body(http, &url, &resolved.api_key, &fallback_body, max_retries)
+                .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn build_openai_responses_llm_response(data: &serde_json::Value) -> Result<LlmResponse, String> {
+    let mut content_buf = String::new();
+    let mut thinking_buf = String::new();
+    let mut tool_calls = Vec::new();
+    let response_id = data.get("id").and_then(Value::as_str);
+
+    if let Some(items) = data.get("output").and_then(Value::as_array) {
+        for item in items {
+            match item.get("type").and_then(Value::as_str).unwrap_or("") {
+                "message" => {
+                    content_buf.push_str(&collect_openai_responses_message_text(item));
+                }
+                "reasoning" => {
+                    let summary = collect_openai_responses_reasoning_text(item);
+                    if !summary.is_empty() {
+                        if !thinking_buf.is_empty() {
+                            thinking_buf.push_str("\n\n");
+                        }
+                        thinking_buf.push_str(&summary);
+                    }
+                }
+                "function_call" => {
+                    tool_calls.push(ToolCall {
+                        id: item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .or_else(|| item.get("id").and_then(Value::as_str))
+                            .unwrap_or("")
+                            .to_string(),
+                        call_type: "function".into(),
+                        gemini_thought_signature: None,
+                        function: FunctionCall {
+                            name: item
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            arguments: item
+                                .get("arguments")
+                                .and_then(Value::as_str)
+                                .unwrap_or("{}")
+                                .to_string(),
+                        },
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let (input_tokens, output_tokens) = parse_openai_responses_usage(data);
+    let mut response = build_llm_response(
+        content_buf,
+        thinking_buf,
+        tool_calls,
+        input_tokens,
+        output_tokens,
+    )?;
+    set_openai_responses_response_id(&mut response.message, response_id);
+    Ok(response)
+}
+
+async fn replay_openai_responses_live_output(
+    tx: &LiveTx,
+    response: &LlmResponse,
+) -> Result<(), String> {
+    if let Some(thinking) = response
+        .message
+        .thinking
+        .as_deref()
+        .filter(|thinking| !thinking.is_empty())
+    {
+        if !live_send(tx, json!({"type":"thinking_start"})).await {
+            return Err("Client disconnected".into());
+        }
+        if !live_send(tx, json!({"type":"thinking_delta","content":thinking})).await {
+            return Err("Client disconnected".into());
+        }
+        if !live_send(tx, json!({"type":"thinking_done"})).await {
+            return Err("Client disconnected".into());
+        }
+    }
+
+    if let Some(content) = response
+        .message
+        .content
+        .as_deref()
+        .filter(|content| !content.is_empty())
+        && !live_send(tx, json!({"type":"delta","content":content})).await
+    {
+        return Err("Client disconnected".into());
+    }
+
+    Ok(())
 }
 
 /// Convert internal messages to Anthropic API format.
@@ -1509,6 +1939,26 @@ pub(crate) async fn call_llm_simple_with_usage(
                 output_tokens: data["usage"]["completion_tokens"].as_u64(),
             })
         }
+        Provider::OpenAIResponses => {
+            let _ = workspace;
+            let data = send_openai_responses_request(
+                http,
+                resolved,
+                messages,
+                s3_cfg,
+                think_level,
+                &[],
+                false,
+                max_retries,
+            )
+            .await?;
+            let parsed = build_openai_responses_llm_response(&data)?;
+            Ok(SimpleLlmResponse {
+                content: parsed.message.content.unwrap_or_default(),
+                input_tokens: parsed.input_tokens,
+                output_tokens: parsed.output_tokens,
+            })
+        }
         Provider::Anthropic => {
             let url = format!("{}/v1/messages", resolved.api_base);
             let cache_enabled = anthropic_prompt_caching_enabled(resolved);
@@ -1652,6 +2102,51 @@ fn think_level_to_reasoning_effort(level: &str) -> &str {
     }
 }
 
+fn openai_responses_gpt5_minor(model_id: &str) -> Option<u32> {
+    let lower = model_id.to_ascii_lowercase();
+    let rest = lower.strip_prefix("gpt-5.")?;
+    let digit_count = rest.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return None;
+    }
+    rest[..digit_count].parse().ok()
+}
+
+fn openai_responses_is_gpt5_pro(model_id: &str) -> bool {
+    let lower = model_id.to_ascii_lowercase();
+    lower == "gpt-5-pro"
+        || lower.starts_with("gpt-5-pro-")
+        || (lower.starts_with("gpt-5.") && lower.contains("-pro"))
+}
+
+fn openai_responses_supports_none_effort(model_id: &str) -> bool {
+    !openai_responses_is_gpt5_pro(model_id)
+        && openai_responses_gpt5_minor(model_id).is_some_and(|minor| minor >= 1)
+}
+
+/// Map think_level to a Responses API reasoning.effort supported by the model.
+fn think_level_to_openai_responses_reasoning_effort(
+    model_id: &str,
+    level: &str,
+) -> Option<&'static str> {
+    if openai_responses_is_gpt5_pro(model_id) {
+        return match level {
+            "off" => None,
+            _ => Some("high"),
+        };
+    }
+
+    match level {
+        "off" => openai_responses_supports_none_effort(model_id).then_some("none"),
+        "minimal" => Some("low"),
+        "low" => Some("low"),
+        "medium" => Some("medium"),
+        "high" => Some("high"),
+        "xhigh" | "max" => Some("high"),
+        _ => Some("medium"),
+    }
+}
+
 /// Map think_level to DeepSeek reasoning_effort string.
 /// DeepSeek-v4 only supports "high" and "max"; lower levels map to "high".
 fn think_level_to_deepseek_reasoning_effort(level: &str) -> &str {
@@ -1746,7 +2241,9 @@ pub(crate) fn gemini_uses_thinking_level(resolved: &ResolvedModel) -> bool {
 
 pub(crate) fn auto_think_supported(resolved: &ResolvedModel) -> bool {
     match resolved.provider {
-        Provider::OpenAI => resolved.reasoning && openai_supports_reasoning_controls(resolved),
+        Provider::OpenAI | Provider::OpenAIResponses => {
+            resolved.reasoning && openai_supports_reasoning_controls(resolved)
+        }
         Provider::Anthropic => resolved.reasoning,
         Provider::Ollama => resolved.reasoning || resolved.thinking_format.is_some(),
         Provider::Gemini => {
@@ -1915,6 +2412,20 @@ pub(crate) async fn call_llm_stream_with_tool_mode(
     match resolved.provider {
         Provider::OpenAI => {
             call_llm_stream_openai(
+                http,
+                resolved,
+                messages,
+                s3_cfg,
+                tx,
+                effective_level,
+                extra_tools,
+                include_builtin_tools,
+                max_retries,
+            )
+            .await
+        }
+        Provider::OpenAIResponses => {
+            call_llm_stream_openai_responses(
                 http,
                 resolved,
                 messages,
@@ -2829,6 +3340,35 @@ async fn call_llm_stream_openai(
         stream_state.input_tokens,
         stream_state.output_tokens,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn call_llm_stream_openai_responses(
+    http: &Client,
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+    s3_cfg: Option<&crate::config::S3Config>,
+    tx: &LiveTx,
+    think_level: &str,
+    extra_tools: &[serde_json::Value],
+    include_builtin_tools: bool,
+    max_retries: usize,
+) -> Result<LlmResponse, String> {
+    let data = send_openai_responses_request(
+        http,
+        resolved,
+        messages,
+        s3_cfg,
+        think_level,
+        extra_tools,
+        include_builtin_tools,
+        max_retries,
+    )
+    .await?;
+
+    let response = build_openai_responses_llm_response(&data)?;
+    replay_openai_responses_live_output(tx, &response).await?;
+    Ok(response)
 }
 
 #[allow(clippy::too_many_arguments)]

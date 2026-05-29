@@ -424,7 +424,7 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
         crate::Provider::Anthropic => {
             tools::mcp::cached_tool_definitions_anthropic(&config, &session.workspace)
         }
-        crate::Provider::OpenAI => {
+        crate::Provider::OpenAI | crate::Provider::OpenAIResponses => {
             tools::mcp::cached_tool_definitions_openai(&config, &session.workspace)
         }
         crate::Provider::Ollama => {

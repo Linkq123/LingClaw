@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { validateModelsConfigDraftShape } from '../src/settingsValidation.js';
+import { isBuiltinProviderName, validateModelsConfigDraftShape } from '../src/settingsValidation.js';
 
 describe('settings validation', () => {
   it('accepts providers with an explicit empty apiKey string', () => {
@@ -52,6 +52,25 @@ describe('settings validation', () => {
         },
       }),
     ).not.toThrow();
+  });
+
+  it('accepts OpenAI Responses provider api kind', () => {
+    expect(() =>
+      validateModelsConfigDraftShape({
+        providers: {
+          openaiResponses: {
+            api: 'openai-responses',
+            baseUrl: 'https://api.openai.com/v1',
+            apiKey: 'test-key',
+            models: [{ id: 'gpt-5.5', input: ['text', 'image'] }],
+          },
+        },
+      }),
+    ).not.toThrow();
+  });
+
+  it('accepts OpenAI Responses as a built-in provider prefix', () => {
+    expect(isBuiltinProviderName('openai-responses')).toBe(true);
   });
 
   it('rejects providers that omit apiKey', () => {

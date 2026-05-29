@@ -173,6 +173,12 @@ struct AnthropicThinkingBlock {
     data: Option<String>,
 }
 
+pub(crate) const OPENAI_RESPONSES_RESPONSE_ID_BLOCK_TYPE: &str = "openai_responses_response_id";
+
+pub(crate) fn is_visible_anthropic_thinking_block(block: &AnthropicThinkingBlock) -> bool {
+    block.block_type != OPENAI_RESPONSES_RESPONSE_ID_BLOCK_TYPE
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
 pub(crate) struct SubagentToolHistorySnapshot {
     pub id: String,
@@ -246,7 +252,7 @@ impl ChatMessage {
     fn has_anthropic_thinking_blocks(&self) -> bool {
         self.anthropic_thinking_blocks
             .as_ref()
-            .is_some_and(|blocks| !blocks.is_empty())
+            .is_some_and(|blocks| blocks.iter().any(is_visible_anthropic_thinking_block))
     }
 
     fn has_nonempty_thinking(&self) -> bool {
@@ -3632,6 +3638,7 @@ async fn api_test_model(
             model_id,
             reasoning: false,
             thinking_format: None,
+            openai_responses_reasoning_summary: None,
             max_tokens: Some(16),
             context_window: 4096,
             stream_include_usage: false,

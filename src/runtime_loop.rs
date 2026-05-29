@@ -948,7 +948,9 @@ pub(crate) async fn build_runtime_tools(
         let agent_names: Vec<String> = agents.iter().map(|a| a.name.clone()).collect();
         let task_def = match provider {
             Provider::Anthropic => tools::task_tool_definition_anthropic(&agent_names),
-            Provider::OpenAI => tools::task_tool_definition_openai(&agent_names),
+            Provider::OpenAI | Provider::OpenAIResponses => {
+                tools::task_tool_definition_openai(&agent_names)
+            }
             Provider::Ollama => tools::task_tool_definition_ollama(&agent_names),
             Provider::Gemini => tools::task_tool_definition_gemini(&agent_names),
         };
@@ -956,7 +958,9 @@ pub(crate) async fn build_runtime_tools(
 
         let orchestrate_def = match provider {
             Provider::Anthropic => tools::orchestrate_tool_definition_anthropic(&agent_names),
-            Provider::OpenAI => tools::orchestrate_tool_definition_openai(&agent_names),
+            Provider::OpenAI | Provider::OpenAIResponses => {
+                tools::orchestrate_tool_definition_openai(&agent_names)
+            }
             Provider::Ollama => tools::orchestrate_tool_definition_ollama(&agent_names),
             Provider::Gemini => tools::orchestrate_tool_definition_gemini(&agent_names),
         };
@@ -968,13 +972,17 @@ pub(crate) async fn build_runtime_tools(
         (false, _) => Vec::new(),
         (true, true) => match provider {
             Provider::Anthropic => tools::mcp::cached_tool_definitions_anthropic(config, workspace),
-            Provider::OpenAI => tools::mcp::cached_tool_definitions_openai(config, workspace),
+            Provider::OpenAI | Provider::OpenAIResponses => {
+                tools::mcp::cached_tool_definitions_openai(config, workspace)
+            }
             Provider::Ollama => tools::mcp::cached_tool_definitions_ollama(config, workspace),
             Provider::Gemini => tools::mcp::cached_tool_definitions_gemini(config, workspace),
         },
         (true, false) => match provider {
             Provider::Anthropic => tools::mcp::tool_definitions_anthropic(config, workspace).await,
-            Provider::OpenAI => tools::mcp::tool_definitions_openai(config, workspace).await,
+            Provider::OpenAI | Provider::OpenAIResponses => {
+                tools::mcp::tool_definitions_openai(config, workspace).await
+            }
             Provider::Ollama => tools::mcp::tool_definitions_ollama(config, workspace).await,
             Provider::Gemini => tools::mcp::tool_definitions_gemini(config, workspace).await,
         },

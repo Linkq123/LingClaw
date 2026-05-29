@@ -213,6 +213,7 @@ fn auto_think_support_treats_gemini3_as_reasoning_capable() {
         model_id: "gemini-3-flash-preview".into(),
         reasoning: false,
         thinking_format: None,
+        openai_responses_reasoning_summary: None,
         max_tokens: Some(512),
         context_window: 1_000_000,
         stream_include_usage: false,

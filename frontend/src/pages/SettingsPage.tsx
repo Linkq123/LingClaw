@@ -720,6 +720,7 @@ function ProviderCardInner({
         <SettingsRow label="API Type">
           <select value={prov.api} onChange={(e) => onChange({ ...prov, api: e.target.value })}>
             <option value="openai-completions">OpenAI Completions</option>
+            <option value="openai-responses">OpenAI Responses</option>
             <option value="anthropic">Anthropic</option>
             <option value="ollama">Ollama</option>
             <option value="gemini">Gemini</option>

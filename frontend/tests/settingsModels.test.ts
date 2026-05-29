@@ -242,4 +242,28 @@ describe('settings model helpers', () => {
       },
     });
   });
+
+  it('preserves openai-responses api kinds when serializing provider forms', () => {
+    const providers = buildProviderForms({
+      openaiResponses: {
+        api: 'openai-responses',
+        baseUrl: 'https://api.openai.com/v1',
+        apiKey: 'sk-test',
+        models: [{ id: 'gpt-5.5', input: ['text', 'image'] }],
+      },
+    });
+
+    const serialized = serializeProviderForms(providers);
+
+    expect(serialized).toEqual({
+      providers: {
+        openaiResponses: {
+          api: 'openai-responses',
+          baseUrl: 'https://api.openai.com/v1',
+          apiKey: 'sk-test',
+          models: [{ id: 'gpt-5.5', input: ['text', 'image'] }],
+        },
+      },
+    });
+  });
 });

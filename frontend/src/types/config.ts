@@ -16,7 +16,7 @@ export interface ModelEntry {
 }
 
 export interface ProviderConfig {
-  api?: 'openai-completions' | 'anthropic' | 'ollama' | 'gemini';
+  api?: 'openai-completions' | 'openai-responses' | 'anthropic' | 'ollama' | 'gemini';
   baseUrl?: string;
   apiKey?: string;
   models?: ModelEntry[];

@@ -4363,6 +4363,42 @@ fn sanitize_session_messages_keeps_assistant_with_anthropic_thinking_blocks() {
 }
 
 #[test]
+fn sanitize_session_messages_drops_assistant_with_only_openai_responses_checkpoint() {
+    let mut messages = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("system".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: Some(vec![AnthropicThinkingBlock {
+                block_type: OPENAI_RESPONSES_RESPONSE_ID_BLOCK_TYPE.into(),
+                thinking: None,
+                signature: None,
+                data: Some("resp_123".into()),
+            }]),
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: Some(1),
+        },
+    ];
+
+    sanitize_session_messages(&mut messages);
+
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, "system");
+}
+
+#[test]
 fn load_session_from_disk_drops_empty_assistant_reply() {
     let session_id = format!("sanitize-load-{}", now_epoch());
     let path = sessions_dir().join(format!("{session_id}.json"));
@@ -11122,6 +11158,30 @@ fn anthropic_provider_estimate_counts_structured_thinking_blocks() {
 
     assert_eq!(openai, base);
     assert!(anthropic > openai);
+}
+
+#[test]
+fn anthropic_provider_estimate_ignores_openai_responses_checkpoint_blocks() {
+    let msg = ChatMessage {
+        role: "assistant".into(),
+        content: Some("done".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: Some(vec![AnthropicThinkingBlock {
+            block_type: OPENAI_RESPONSES_RESPONSE_ID_BLOCK_TYPE.into(),
+            thinking: None,
+            signature: None,
+            data: Some("resp_123".into()),
+        }]),
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    };
+
+    let openai = message_token_len_for_provider(Provider::OpenAI, &msg);
+    let anthropic = message_token_len_for_provider(Provider::Anthropic, &msg);
+
+    assert_eq!(anthropic, openai);
 }
 
 #[test]
