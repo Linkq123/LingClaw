@@ -381,7 +381,7 @@
   - `gemini`
 - `openai-completions` 对应 `POST /v1/chat/completions`
 - `openai-responses` 对应 `POST /v1/responses`
-- 当前 `openai-responses` 实现会把 Responses API 返回的 `message` / `reasoning` / `function_call` 结果映射回 LingClaw 现有消息结构，并在请求完成后回放到前端 WebSocket 事件流；它不是原生 Responses SSE 逐事件透传
+- 对话路径下，`openai-responses` 会设置 `stream: true` 并消费 Responses SSE 事件，把 `output_text`、reasoning summary、`function_call` 参数增量和最终 `response.completed` 映射回 LingClaw 现有消息结构与前端 WebSocket 事件流
 - `baseUrl` 不能为空
 - `baseUrl` / `apiKey` 可以直接写字面值，也可以写成精确的 `${ENV_NAME}` 占位符；运行时会按环境变量展开
 - `models[].id` 不能为空

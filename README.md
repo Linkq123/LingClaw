@@ -21,7 +21,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、frontend-coder、backend-coder、general-coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
 - **文档化斜杠命令**：`/new`、`/model`、`/switch`、`/sessions`、`/delete`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/reflection`、`/help`
 - **多 Provider 模型路由**：OpenAI（Chat Completions / Responses）+ Anthropic + Ollama + Gemini，支持 `provider/model` 和纯 model ID
-- **OpenAI 双协议**：OpenAI family 现在支持保留原有 `openai-completions`（`/v1/chat/completions`）并新增 `openai-responses`（`/v1/responses`）；两者共享同一套模型解析与工具权限体系。当前 `openai-responses` 走非流式底层调用，完成后再把文本 / reasoning / tool call 结果回放到现有前端事件流，因此不会像 `openai-completions` 那样逐 token 原生流式显示
+- **OpenAI 双协议**：OpenAI family 现在支持保留原有 `openai-completions`（`/v1/chat/completions`）并新增 `openai-responses`（`/v1/responses`）；两者共享同一套模型解析与工具权限体系。对话路径下两者都使用原生上游流式调用，`openai-responses` 会设置 `stream: true` 并把 Responses SSE 事件映射为 LingClaw 现有前端事件流
 - **会话模型覆盖**：运行时通过 `/model` 切换当前活动 session 使用的模型
 - **会话持久化**：默认 `main` 与其他 session 都会各自保存工作区、消息历史、视图状态和当前 todos 快照
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
@@ -252,7 +252,7 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 - 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容，但 Setup Wizard 不再生成它们；新配置应省略这些字段
 - `models.providers.*.api` 目前支持 `openai-completions`、`openai-responses`、`anthropic`、`ollama`、`gemini`
 - `openai-completions` 会请求 `POST /v1/chat/completions`，保留现有 LingClaw 原生流式体验
-- `openai-responses` 会请求 `POST /v1/responses`；当前实现会把 Responses API 的 `message` / `reasoning` / `function_call` 输出解析回 LingClaw 现有消息结构，但底层仍是一次性请求完成后再回放前端事件，不是原生 Responses SSE 增量流
+- `openai-responses` 会请求 `POST /v1/responses`；对话路径会设置 `stream: true` 并消费 Responses SSE 事件，将 `output_text`、reasoning summary、`function_call` 参数增量和最终 `response.completed` 映射回 LingClaw 现有消息结构与前端事件流
 - `models.providers.*.baseUrl` 和 `models.providers.*.apiKey` 支持精确的 `${ENV_NAME}` 占位符；运行时会按环境变量展开，例如 `"baseUrl": "${OPENAI_API_BASE}"`、`"apiKey": "${OPENAI_API_KEY}"`
 - `models.providers.*.models[].compat.thinkingFormat` 为可选字符串，用于显式指定 OpenAI-compatible 的 thinking / reasoning 方言；常见值包括 `openai`、`qwen`、`doubao`、`deepseek-v4`、`ollama`、`gpt-oss`。Settings → Models 的 `Thinking Format` 输入框会直接读写这个字段
 - `models.providers.*.models[].compat.reasoning.summary` 为可选字符串，仅在 `openai-responses` 下使用；写入后会透传到 `reasoning.summary`，未配置时默认发送 `"auto"`
@@ -665,7 +665,7 @@ src/
 ├── cli.rs             (~3030 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
 ├── config.rs          (~1490 行) — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
 ├── context.rs         (~570 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
-├── providers.rs       (~3680 行) — OpenAI Chat/Responses、Anthropic、Ollama、Gemini 调用, 流式/回放解析, 推理模式, prompt caching
+├── providers.rs       (~4100 行) — OpenAI Chat/Responses、Anthropic、Ollama、Gemini 调用, 流式解析, 推理模式, prompt caching
 ├── prompts.rs         (~1030 行) — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
 ├── hooks.rs           (~830 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
 ├── memory.rs          (~3020 行) — structured_memory.json 读写, task memory 检索/排序, prompt 注入, MemoryUpdateQueue, /memory 状态
@@ -834,7 +834,7 @@ call_llm_stream(http, resolved, messages, tx, think_level, extra_tools)
     │         ├─ convert_messages_to_openai_responses_input()
     │         ├─ tools 扁平化为 Responses API function schema
     │         ├─ think_level → reasoning.effort / reasoning.summary 映射
-    │         └─ 非流式 Responses 结果 → 现有 WebSocket 事件回放
+    │         └─ Responses SSE 流解析 → WebSocket 转发
     │
     ├─ resolved.provider == Anthropic
     │    └─ call_llm_stream_anthropic()

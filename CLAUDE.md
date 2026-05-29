@@ -98,7 +98,7 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 - The browser talks to the backend primarily over `/ws`; live reconnect/replay behavior is an important part of correctness.
 - Session-scoped todos are synchronized over the dedicated `todos_state` WebSocket event and persisted with the session; `/api/todos` uses full-list replacement plus revision conflict detection.
 - The app keeps `main` as the default session, but now supports multiple persisted sessions and frontend session switching.
-- OpenAI family currently has two protocol kinds: `openai-completions` (`/v1/chat/completions`) and `openai-responses` (`/v1/responses`). The existing Chat Completions path remains the native streaming implementation; the current Responses path is request/response at the HTTP layer and then replays LingClaw's existing live events after completion.
+- OpenAI family currently has two protocol kinds: `openai-completions` (`/v1/chat/completions`) and `openai-responses` (`/v1/responses`). Both conversation paths use native upstream streaming; Responses requests set `stream: true` and map Responses SSE events into LingClaw's existing live events.
 - The frontend session switcher lives in a collapsible left drawer; the Todos panel is a local visibility toggle and defaults to hidden on first load.
 - Slash command autocomplete is frontend-local UI on top of the existing `/...` command transport: incomplete prefixes can be completed via keyboard or mouse before dispatch.
 - Automatic context compression runs as a `BeforeAnalyze` hook in `src/hooks.rs`.

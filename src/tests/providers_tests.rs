@@ -113,6 +113,13 @@ fn spawn_one_shot_http_server(
     (format!("http://{}", address), request_rx, handle)
 }
 
+fn sse_data_events(events: &[serde_json::Value]) -> String {
+    events
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>()
+}
+
 struct MockHttpResponse {
     status: &'static str,
     content_type: &'static str,
@@ -3255,26 +3262,34 @@ fn call_llm_simple_openai_surfaces_json_error_envelope() {
 
 #[test]
 fn call_llm_stream_openai_responses_accepts_null_error_field() {
-    let response_body = json!({
-        "id": "resp_ok",
-        "error": null,
-        "output": [
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [
-                    { "type": "output_text", "text": "ok" }
-                ]
+    let response_body = sse_data_events(&[
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "ok"
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_ok",
+                "error": null,
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            { "type": "output_text", "text": "ok" }
+                        ]
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 4,
+                    "output_tokens": 1
+                }
             }
-        ],
-        "usage": {
-            "input_tokens": 4,
-            "output_tokens": 1
-        }
-    })
-    .to_string();
+        }),
+    ]);
     let (api_base, request_rx, handle) =
-        spawn_one_shot_http_server("application/json", response_body);
+        spawn_one_shot_http_server("text/event-stream", response_body);
     let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
     let http = reqwest::Client::new();
     let resolved = ResolvedModel {
@@ -3324,6 +3339,9 @@ fn call_llm_stream_openai_responses_accepts_null_error_field() {
     handle.join().expect("server thread should join");
 
     assert_eq!(request.request_line, "POST /responses HTTP/1.1");
+    let body: serde_json::Value =
+        serde_json::from_str(&request.body).expect("request body should be valid json");
+    assert_eq!(body["stream"], true);
     assert_eq!(response.message.content.as_deref(), Some("ok"));
     assert_eq!(
         openai_responses_response_id_from_message(&response.message),
@@ -3637,23 +3655,31 @@ fn call_llm_stream_openai_responses_retries_without_expired_checkpoint() {
         }
     })
     .to_string();
-    let second_response = json!({
-        "id": "resp_789",
-        "output": [
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [
-                    { "type": "output_text", "text": "recovered" }
-                ]
+    let second_response = sse_data_events(&[
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "recovered"
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_789",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            { "type": "output_text", "text": "recovered" }
+                        ]
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 21,
+                    "output_tokens": 2
+                }
             }
-        ],
-        "usage": {
-            "input_tokens": 21,
-            "output_tokens": 2
-        }
-    })
-    .to_string();
+        }),
+    ]);
     let (api_base, request_rx, handle) = spawn_http_server_with_responses(vec![
         MockHttpResponse {
             status: "400 Bad Request",
@@ -3662,7 +3688,7 @@ fn call_llm_stream_openai_responses_retries_without_expired_checkpoint() {
         },
         MockHttpResponse {
             status: "200 OK",
-            content_type: "application/json",
+            content_type: "text/event-stream",
             body: second_response,
         },
     ]);
@@ -3762,7 +3788,9 @@ fn call_llm_stream_openai_responses_retries_without_expired_checkpoint() {
     let second_body: serde_json::Value =
         serde_json::from_str(&second_request.body).expect("second body should be valid json");
     assert_eq!(first_body["previous_response_id"], "resp_123");
+    assert_eq!(first_body["stream"], true);
     assert!(second_body.get("previous_response_id").is_none());
+    assert_eq!(second_body["stream"], true);
     assert_eq!(
         second_body["input"]
             .as_array()
@@ -3774,38 +3802,90 @@ fn call_llm_stream_openai_responses_retries_without_expired_checkpoint() {
 }
 
 #[test]
-fn call_llm_stream_openai_responses_posts_to_responses_and_replays_output() {
-    let response_body = json!({
-        "id": "resp_456",
-        "output": [
-            {
-                "type": "reasoning",
-                "summary": [
-                    { "text": "plan first" }
-                ]
-            },
-            {
+fn call_llm_stream_openai_responses_posts_streaming_responses_and_parses_output() {
+    let response_body = sse_data_events(&[
+        json!({
+            "type": "response.created",
+            "response": {
+                "id": "resp_456"
+            }
+        }),
+        json!({
+            "type": "response.reasoning_summary_text.delta",
+            "delta": "plan "
+        }),
+        json!({
+            "type": "response.reasoning_summary_text.delta",
+            "delta": "first"
+        }),
+        json!({
+            "type": "response.output_item.added",
+            "output_index": 1,
+            "item": {
+                "id": "fc_item_1",
                 "type": "function_call",
                 "call_id": "call_1",
                 "name": "read_file",
-                "arguments": "{\"path\":\"README.md\"}"
-            },
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [
-                    { "type": "output_text", "text": "done" }
-                ]
+                "arguments": ""
             }
-        ],
-        "usage": {
-            "input_tokens": 17,
-            "output_tokens": 5
-        }
-    })
-    .to_string();
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_item_1",
+            "output_index": 1,
+            "delta": "{\"path\""
+        }),
+        json!({
+            "type": "response.function_call_arguments.delta",
+            "item_id": "fc_item_1",
+            "output_index": 1,
+            "delta": ":\"README.md\"}"
+        }),
+        json!({
+            "type": "response.function_call_arguments.done",
+            "item_id": "fc_item_1",
+            "output_index": 1,
+            "arguments": "{\"path\":\"README.md\"}"
+        }),
+        json!({
+            "type": "response.output_text.delta",
+            "delta": "done"
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_456",
+                "error": null,
+                "output": [
+                    {
+                        "type": "reasoning",
+                        "summary": [
+                            { "text": "plan first" }
+                        ]
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"README.md\"}"
+                    },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            { "type": "output_text", "text": "done" }
+                        ]
+                    }
+                ],
+                "usage": {
+                    "input_tokens": 17,
+                    "output_tokens": 5
+                }
+            }
+        }),
+    ]);
     let (api_base, request_rx, handle) =
-        spawn_one_shot_http_server("application/json", response_body);
+        spawn_one_shot_http_server("text/event-stream", response_body);
     let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
     let http = reqwest::Client::new();
     let resolved = ResolvedModel {
@@ -3858,6 +3938,7 @@ fn call_llm_stream_openai_responses_posts_to_responses_and_replays_output() {
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be valid json");
     assert_eq!(body["model"], "gpt-5.5");
+    assert_eq!(body["stream"], true);
     assert_eq!(body["reasoning"]["effort"], "high");
     assert_eq!(body["reasoning"]["summary"], "auto");
     assert_eq!(response.message.content.as_deref(), Some("done"));
@@ -4267,6 +4348,7 @@ fn call_llm_stream_openai_auto_skips_reasoning_effort_for_compatible_gateway() {
 
     let body: serde_json::Value =
         serde_json::from_str(&request.body).expect("request body should be valid json");
+    assert_eq!(body["stream"], true);
     assert_eq!(response.message.content.as_deref(), Some("ok"));
     assert!(body.get("reasoning_effort").is_none());
     assert!(body.get("enable_thinking").is_none());

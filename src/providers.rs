@@ -65,6 +65,22 @@ struct OpenAiStreamState {
     reasoning_started: bool,
 }
 
+#[derive(Default)]
+struct OpenAiResponsesStreamState {
+    current_event_type: String,
+    content_buf: String,
+    thinking_buf: String,
+    tool_calls: Vec<ToolCall>,
+    tool_call_item_indices: HashMap<String, usize>,
+    tool_call_output_indices: HashMap<usize, usize>,
+    response_id: Option<String>,
+    completed_response: Option<Value>,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    client_gone: bool,
+    reasoning_started: bool,
+}
+
 struct AnthropicStreamState {
     current_event_type: String,
     content_buf: String,
@@ -862,6 +878,442 @@ async fn send_openai_responses_request(
     }
 }
 
+async fn emit_openai_responses_reasoning_delta(
+    tx: &LiveTx,
+    state: &mut OpenAiResponsesStreamState,
+    text: &str,
+) {
+    if text.is_empty() || state.client_gone {
+        return;
+    }
+    if !state.reasoning_started {
+        state.reasoning_started = true;
+        state.client_gone = !live_send(tx, json!({"type":"thinking_start"})).await;
+    }
+    if !state.client_gone {
+        state.thinking_buf.push_str(text);
+        state.client_gone = !live_send(tx, json!({"type":"thinking_delta","content":text})).await;
+    }
+}
+
+async fn finish_openai_responses_reasoning(tx: &LiveTx, state: &mut OpenAiResponsesStreamState) {
+    if state.reasoning_started && !state.client_gone {
+        state.reasoning_started = false;
+        state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+    } else {
+        state.reasoning_started = false;
+    }
+}
+
+async fn emit_openai_responses_output_delta(
+    tx: &LiveTx,
+    state: &mut OpenAiResponsesStreamState,
+    text: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    finish_openai_responses_reasoning(tx, state).await;
+    state.content_buf.push_str(text);
+    if !state.client_gone && !live_send(tx, json!({"type":"delta","content":text})).await {
+        state.client_gone = true;
+    }
+}
+
+fn ensure_openai_responses_tool_call(
+    state: &mut OpenAiResponsesStreamState,
+    item_id: Option<&str>,
+    output_index: Option<usize>,
+) -> usize {
+    if let Some(item_id) = item_id.filter(|id| !id.is_empty())
+        && let Some(&idx) = state.tool_call_item_indices.get(item_id)
+    {
+        return idx;
+    }
+    if let Some(output_index) = output_index
+        && let Some(&idx) = state.tool_call_output_indices.get(&output_index)
+    {
+        if let Some(item_id) = item_id.filter(|id| !id.is_empty()) {
+            state
+                .tool_call_item_indices
+                .insert(item_id.to_string(), idx);
+        }
+        return idx;
+    }
+
+    let idx = state.tool_calls.len();
+    state.tool_calls.push(ToolCall {
+        id: String::new(),
+        call_type: "function".into(),
+        gemini_thought_signature: None,
+        function: FunctionCall {
+            name: String::new(),
+            arguments: String::new(),
+        },
+    });
+    if let Some(item_id) = item_id.filter(|id| !id.is_empty()) {
+        state
+            .tool_call_item_indices
+            .insert(item_id.to_string(), idx);
+    }
+    if let Some(output_index) = output_index {
+        state.tool_call_output_indices.insert(output_index, idx);
+    }
+    idx
+}
+
+fn update_openai_responses_tool_call_from_item(
+    state: &mut OpenAiResponsesStreamState,
+    item: &Value,
+    output_index: Option<usize>,
+) {
+    if item.get("type").and_then(Value::as_str) != Some("function_call") {
+        return;
+    }
+
+    let item_id = item.get("id").and_then(Value::as_str);
+    let idx = ensure_openai_responses_tool_call(state, item_id, output_index);
+    if let Some(id) = item
+        .get("call_id")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("id").and_then(Value::as_str))
+        .filter(|id| !id.is_empty())
+    {
+        state.tool_calls[idx].id = id.to_string();
+    }
+    if let Some(name) = item
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    {
+        state.tool_calls[idx].function.name = name.to_string();
+    }
+    if let Some(arguments) = item.get("arguments").and_then(Value::as_str) {
+        state.tool_calls[idx].function.arguments = arguments.to_string();
+    }
+}
+
+fn openai_responses_event_detail(data: &Value) -> Option<String> {
+    if let Some(error) = provider_json_error("OpenAI Responses", data) {
+        return Some(error);
+    }
+
+    let response = data.get("response")?;
+    if let Some(error) = provider_json_error("OpenAI Responses", response) {
+        return Some(error);
+    }
+    response
+        .get("incomplete_details")
+        .and_then(|details| details.get("reason"))
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+        .map(|reason| format!("OpenAI Responses API incomplete: {reason}"))
+}
+
+async fn process_openai_responses_stream_event(
+    data: &str,
+    fallback_event_type: &str,
+    tx: &LiveTx,
+    state: &mut OpenAiResponsesStreamState,
+) -> Result<bool, String> {
+    if data == "[DONE]" {
+        return Ok(true);
+    }
+
+    let event: Value = parse_json_response("OpenAI Responses stream", data)?;
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|event_type| !event_type.is_empty())
+        .unwrap_or(fallback_event_type);
+
+    match event_type {
+        "error" | "response.failed" => {
+            let detail = openai_responses_event_detail(&event)
+                .or_else(|| {
+                    event
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| event.to_string());
+            return Err(detail);
+        }
+        "response.incomplete" => {
+            let detail = openai_responses_event_detail(&event)
+                .unwrap_or_else(|| "OpenAI Responses API incomplete".to_string());
+            return Err(detail);
+        }
+        "response.created" | "response.in_progress" => {
+            if let Some(response_id) = event
+                .get("response")
+                .and_then(|response| response.get("id"))
+                .and_then(Value::as_str)
+            {
+                state.response_id = Some(response_id.to_string());
+            }
+        }
+        "response.completed" => {
+            if let Some(response) = event.get("response") {
+                if let Some(error) = provider_json_error("OpenAI Responses", response) {
+                    return Err(error);
+                }
+                if let Some(response_id) = response.get("id").and_then(Value::as_str) {
+                    state.response_id = Some(response_id.to_string());
+                }
+                let (input_tokens, output_tokens) = parse_openai_responses_usage(response);
+                if input_tokens.is_some() {
+                    state.input_tokens = input_tokens;
+                }
+                if output_tokens.is_some() {
+                    state.output_tokens = output_tokens;
+                }
+                state.completed_response = Some(response.clone());
+            }
+            return Ok(true);
+        }
+        "response.output_text.delta" | "response.refusal.delta" => {
+            if let Some(text) = event.get("delta").and_then(Value::as_str) {
+                emit_openai_responses_output_delta(tx, state, text).await;
+            }
+        }
+        "response.output_item.added" | "response.output_item.done" => {
+            if let Some(item) = event.get("item") {
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    finish_openai_responses_reasoning(tx, state).await;
+                }
+                update_openai_responses_tool_call_from_item(
+                    state,
+                    item,
+                    event
+                        .get("output_index")
+                        .and_then(Value::as_u64)
+                        .map(|idx| idx as usize),
+                );
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            finish_openai_responses_reasoning(tx, state).await;
+            let item_id = event.get("item_id").and_then(Value::as_str);
+            let output_index = event
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .map(|idx| idx as usize);
+            let idx = ensure_openai_responses_tool_call(state, item_id, output_index);
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                state.tool_calls[idx].function.arguments.push_str(delta);
+            }
+        }
+        "response.function_call_arguments.done" => {
+            finish_openai_responses_reasoning(tx, state).await;
+            let item_id = event.get("item_id").and_then(Value::as_str);
+            let output_index = event
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .map(|idx| idx as usize);
+            let idx = ensure_openai_responses_tool_call(state, item_id, output_index);
+            if let Some(arguments) = event.get("arguments").and_then(Value::as_str) {
+                state.tool_calls[idx].function.arguments = arguments.to_string();
+            }
+            if let Some(name) = event
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+            {
+                state.tool_calls[idx].function.name = name.to_string();
+            }
+        }
+        _ if event_type.contains("reasoning")
+            && event_type.ends_with(".delta")
+            && event.get("delta").and_then(Value::as_str).is_some() =>
+        {
+            let text = event
+                .get("delta")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            emit_openai_responses_reasoning_delta(tx, state, text).await;
+        }
+        _ => {}
+    }
+
+    Ok(false)
+}
+
+async fn process_openai_responses_sse_line(
+    line: &str,
+    tx: &LiveTx,
+    state: &mut OpenAiResponsesStreamState,
+) -> Result<bool, String> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with(':') {
+        return Ok(false);
+    }
+    if let Some(event) = line.strip_prefix("event: ") {
+        state.current_event_type = event.trim().to_string();
+        return Ok(false);
+    }
+    if let Some(data) = line.strip_prefix("data: ") {
+        let event_type = state.current_event_type.clone();
+        let done =
+            process_openai_responses_stream_event(data.trim(), &event_type, tx, state).await?;
+        state.current_event_type.clear();
+        return Ok(done);
+    }
+    Ok(false)
+}
+
+async fn consume_openai_responses_stream<S, B>(
+    stream: &mut S,
+    tx: &LiveTx,
+    state: &mut OpenAiResponsesStreamState,
+) -> Result<(), String>
+where
+    S: Stream<Item = Result<B, reqwest::Error>> + Unpin,
+    B: AsRef<[u8]>,
+{
+    let mut partial_buf = String::new();
+    let mut stream_done = false;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("stream error: {error}"))?;
+        let lines = drain_sse_lines(&mut partial_buf, &String::from_utf8_lossy(chunk.as_ref()));
+
+        for line in lines {
+            if process_openai_responses_sse_line(&line, tx, state).await? {
+                stream_done = true;
+                break;
+            }
+        }
+
+        if stream_done {
+            break;
+        }
+    }
+
+    if !stream_done && !partial_buf.trim().is_empty() {
+        let _ = process_openai_responses_sse_line(partial_buf.trim(), tx, state).await?;
+    }
+
+    Ok(())
+}
+
+fn build_openai_responses_stream_llm_response(
+    state: OpenAiResponsesStreamState,
+) -> Result<LlmResponse, String> {
+    if let Some(response) = state.completed_response.as_ref() {
+        let parsed = build_openai_responses_llm_response(response)?;
+        let has_payload = parsed
+            .message
+            .content
+            .as_deref()
+            .is_some_and(|content| !content.is_empty())
+            || parsed
+                .message
+                .thinking
+                .as_deref()
+                .is_some_and(|thinking| !thinking.is_empty())
+            || parsed
+                .message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|tool_calls| !tool_calls.is_empty());
+        if has_payload {
+            return Ok(parsed);
+        }
+    }
+
+    let mut response = build_llm_response(
+        state.content_buf,
+        state.thinking_buf,
+        state.tool_calls,
+        state.input_tokens,
+        state.output_tokens,
+    )?;
+    set_openai_responses_response_id(&mut response.message, state.response_id.as_deref());
+    Ok(response)
+}
+
+async fn send_openai_responses_stream_body(
+    http: &Client,
+    url: &str,
+    api_key: &str,
+    body: &serde_json::Value,
+    tx: &LiveTx,
+    max_retries: usize,
+) -> Result<LlmResponse, String> {
+    let resp = send_with_retry(http, max_retries, || {
+        http.post(url).bearer_auth(api_key).json(body)
+    })
+    .await?;
+    let resp = validate_stream_response("OpenAI Responses", "SSE", resp).await?;
+
+    let mut stream = resp.bytes_stream();
+    let mut state = OpenAiResponsesStreamState::default();
+    consume_openai_responses_stream(&mut stream, tx, &mut state).await?;
+
+    if state.reasoning_started && !state.client_gone {
+        state.client_gone = !live_send(tx, json!({"type":"thinking_done"})).await;
+    }
+    if state.client_gone {
+        return Err("Client disconnected".into());
+    }
+
+    build_openai_responses_stream_llm_response(state)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn send_openai_responses_stream_request(
+    http: &Client,
+    resolved: &ResolvedModel,
+    messages: &[ChatMessage],
+    s3_cfg: Option<&crate::config::S3Config>,
+    tx: &LiveTx,
+    think_level: &str,
+    extra_tools: &[serde_json::Value],
+    include_builtin_tools: bool,
+    max_retries: usize,
+) -> Result<LlmResponse, String> {
+    let url = format!("{}/responses", resolved.api_base);
+    let mut body = build_openai_responses_body(
+        resolved,
+        messages,
+        s3_cfg,
+        think_level,
+        extra_tools,
+        include_builtin_tools,
+    )?;
+    body["stream"] = json!(true);
+    let used_checkpoint = body.get("previous_response_id").is_some();
+
+    match send_openai_responses_stream_body(http, &url, &resolved.api_key, &body, tx, max_retries)
+        .await
+    {
+        Ok(response) => Ok(response),
+        Err(error) if used_checkpoint && openai_responses_checkpoint_error(&error) => {
+            let mut fallback_body = build_openai_responses_body_with_checkpoint(
+                resolved,
+                messages,
+                s3_cfg,
+                think_level,
+                extra_tools,
+                include_builtin_tools,
+                false,
+            )?;
+            fallback_body["stream"] = json!(true);
+            send_openai_responses_stream_body(
+                http,
+                &url,
+                &resolved.api_key,
+                &fallback_body,
+                tx,
+                max_retries,
+            )
+            .await
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn build_openai_responses_llm_response(data: &serde_json::Value) -> Result<LlmResponse, String> {
     let mut content_buf = String::new();
     let mut thinking_buf = String::new();
@@ -922,40 +1374,6 @@ fn build_openai_responses_llm_response(data: &serde_json::Value) -> Result<LlmRe
     )?;
     set_openai_responses_response_id(&mut response.message, response_id);
     Ok(response)
-}
-
-async fn replay_openai_responses_live_output(
-    tx: &LiveTx,
-    response: &LlmResponse,
-) -> Result<(), String> {
-    if let Some(thinking) = response
-        .message
-        .thinking
-        .as_deref()
-        .filter(|thinking| !thinking.is_empty())
-    {
-        if !live_send(tx, json!({"type":"thinking_start"})).await {
-            return Err("Client disconnected".into());
-        }
-        if !live_send(tx, json!({"type":"thinking_delta","content":thinking})).await {
-            return Err("Client disconnected".into());
-        }
-        if !live_send(tx, json!({"type":"thinking_done"})).await {
-            return Err("Client disconnected".into());
-        }
-    }
-
-    if let Some(content) = response
-        .message
-        .content
-        .as_deref()
-        .filter(|content| !content.is_empty())
-        && !live_send(tx, json!({"type":"delta","content":content})).await
-    {
-        return Err("Client disconnected".into());
-    }
-
-    Ok(())
 }
 
 /// Convert internal messages to Anthropic API format.
@@ -3357,21 +3775,18 @@ async fn call_llm_stream_openai_responses(
     include_builtin_tools: bool,
     max_retries: usize,
 ) -> Result<LlmResponse, String> {
-    let data = send_openai_responses_request(
+    send_openai_responses_stream_request(
         http,
         resolved,
         messages,
         s3_cfg,
+        tx,
         think_level,
         extra_tools,
         include_builtin_tools,
         max_retries,
     )
-    .await?;
-
-    let response = build_openai_responses_llm_response(&data)?;
-    replay_openai_responses_live_output(tx, &response).await?;
-    Ok(response)
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
