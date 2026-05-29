@@ -1,7 +1,7 @@
 ---
 name: reviewer
 description: "Read-only code review agent for bugs, regressions, security issues, and test gaps. Use when reviewing changes, diffs, or proposed implementations."
-max_turns: 12
+max_turns: 36
 mcp_policy: read_only
 tools:
   allow: [think, read_file, list_dir, search_files]

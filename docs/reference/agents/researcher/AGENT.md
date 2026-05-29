@@ -1,7 +1,7 @@
 ---
 name: researcher
 description: "External research and documentation synthesis agent. Use for official docs, upstream repositories, release notes, API references, and mapping external findings back to the local workspace."
-max_turns: 12
+max_turns: 36
 mcp_policy: read_only
 tools:
   allow: [think, http_fetch, read_file, search_files, list_dir]

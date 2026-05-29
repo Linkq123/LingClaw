@@ -1,7 +1,7 @@
 ---
 name: explore
 description: "Read-only local workspace explorer for architecture mapping, code archaeology, symbol tracing, and pinpointing where logic lives. Use for fast evidence-backed answers about the codebase."
-max_turns: 10
+max_turns: 30
 mcp_policy: read_only
 tools:
   allow: [think, read_file, list_dir, search_files]

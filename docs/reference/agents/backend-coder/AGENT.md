@@ -1,7 +1,7 @@
 ---
 name: backend-coder
 description: "Backend-focused coding sub-agent for Rust services, APIs, orchestration, data flow, integrations, and server-side debugging. Prefer minimal verified changes and preserve unrelated work."
-max_turns: 15
+max_turns: 45
 mcp_policy: all
 tools:
   allow: []

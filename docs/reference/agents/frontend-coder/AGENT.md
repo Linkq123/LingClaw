@@ -1,7 +1,7 @@
 ---
 name: frontend-coder
 description: "Frontend-focused coding sub-agent for React, TypeScript, CSS, UI behavior, rendering, and interaction polish. Prefer minimal verified changes and preserve unrelated work."
-max_turns: 15
+max_turns: 45
 mcp_policy: all
 tools:
   allow: []

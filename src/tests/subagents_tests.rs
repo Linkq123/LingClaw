@@ -2388,6 +2388,70 @@ async fn parallel_batch_interrupt_fires_hooks_only_for_completed_tools() {
 }
 
 #[tokio::test]
+async fn subagent_tool_wait_preserves_timeout_after_live_event_channel_closes() {
+    let (_event_tx, mut event_rx) =
+        tokio::sync::mpsc::channel(crate::tools::TOOL_LIVE_EVENT_CHANNEL_CAPACITY);
+    drop(_event_tx);
+
+    let cancel = CancellationToken::new();
+    let mut outcome = Box::pin(async { std::future::pending::<crate::tools::ToolOutcome>().await });
+    let mut forward_event = |_stream: &'static str, _chunk: String| async {};
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::subagents::executor::await_subagent_tool_outcome_with_live_events(
+            outcome.as_mut(),
+            &mut event_rx,
+            &mut forward_event,
+            &cancel,
+            Some(Duration::from_millis(20)),
+            tokio::time::Instant::now(),
+            crate::tools::TOOL_NAME_HTTP_FETCH,
+        ),
+    )
+    .await
+    .expect("closed live event channel must not bypass tool timeout");
+
+    assert!(result.is_error);
+    assert!(result.output.contains("tool execution timed out"));
+}
+
+#[tokio::test]
+async fn subagent_tool_wait_preserves_cancellation_after_live_event_channel_closes() {
+    let (_event_tx, mut event_rx) =
+        tokio::sync::mpsc::channel(crate::tools::TOOL_LIVE_EVENT_CHANNEL_CAPACITY);
+    drop(_event_tx);
+
+    let cancel = CancellationToken::new();
+    let cancel_clone = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel_clone.cancel();
+    });
+
+    let mut outcome = Box::pin(async { std::future::pending::<crate::tools::ToolOutcome>().await });
+    let mut forward_event = |_stream: &'static str, _chunk: String| async {};
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::subagents::executor::await_subagent_tool_outcome_with_live_events(
+            outcome.as_mut(),
+            &mut event_rx,
+            &mut forward_event,
+            &cancel,
+            Some(Duration::from_secs(30)),
+            tokio::time::Instant::now(),
+            crate::tools::TOOL_NAME_HTTP_FETCH,
+        ),
+    )
+    .await
+    .expect("closed live event channel must not bypass cancellation");
+
+    assert!(result.is_error);
+    assert!(result.output.contains("sub-agent cancelled"));
+}
+
+#[tokio::test]
 async fn execute_subagent_tool_with_live_output_returns_on_cancellation() {
     let workspace = unique_temp_workspace("lingclaw-subagent-live-output-cancelled");
     let _ = tokio::fs::remove_dir_all(&workspace).await;
@@ -2483,9 +2547,14 @@ async fn execute_subagent_tool_with_live_output_prefers_completed_result_over_ca
 #[tokio::test]
 async fn run_subagent_exec_respects_exec_timeout_before_subagent_deadline() {
     let command = slow_tool_command();
-    let response_body =
+    let tool_response_body =
         build_openai_tool_call_stream("exec", serde_json::json!({ "command": command.clone() }));
-    let (api_base, handle) = spawn_one_shot_http_server("text/event-stream", response_body);
+    let final_response_body =
+        build_openai_simple_text_response("The command timed out after the exec timeout.");
+    let (api_base, handle) = spawn_http_server_with_responses(vec![
+        ("text/event-stream", tool_response_body),
+        ("application/json", final_response_body),
+    ]);
 
     let mut config = base_config();
     config.api_base = api_base;

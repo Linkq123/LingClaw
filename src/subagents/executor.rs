@@ -11,7 +11,7 @@
 //  - OpenClaw: session-level isolation
 // ══════════════════════════════════════════════════════════════════════════════
 
-use std::{collections::HashMap, path::Path, time::Duration};
+use std::{collections::HashMap, future::Future, path::Path, pin::Pin, time::Duration};
 
 use futures::FutureExt;
 use reqwest::Client;
@@ -345,11 +345,6 @@ pub(crate) async fn execute_subagent_tool_with_live_output(
         None,
         Some(event_tx),
     );
-    let timeout = runtime_timeout_for_subagent_tool(tool_name, config);
-    let has_timeout = timeout.is_some();
-    let timeout_secs = timeout.map(|value| value.as_secs()).unwrap_or(0);
-    let sleep = tokio::time::sleep(timeout.unwrap_or(Duration::ZERO));
-    tokio::pin!(sleep);
     tokio::pin!(outcome);
     let mut forward_event = |stream, chunk: String| {
         let replay_ctx = replay_ctx.clone();
@@ -367,21 +362,49 @@ pub(crate) async fn execute_subagent_tool_with_live_output(
             .await;
         }
     };
+
+    await_subagent_tool_outcome_with_live_events(
+        outcome.as_mut(),
+        &mut event_rx,
+        &mut forward_event,
+        cancel,
+        runtime_timeout_for_subagent_tool(tool_name, config),
+        start,
+        tool_name,
+    )
+    .await
+}
+
+pub(crate) async fn await_subagent_tool_outcome_with_live_events<F, Fut>(
+    mut outcome: Pin<&mut (dyn Future<Output = tools::ToolOutcome> + Send)>,
+    event_rx: &mut tools::BoundedToolEventReceiver,
+    forward_event: &mut F,
+    cancel: &CancellationToken,
+    timeout: Option<Duration>,
+    start: tokio::time::Instant,
+    tool_name: &str,
+) -> tools::ToolOutcome
+where
+    F: FnMut(&'static str, String) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    let has_timeout = timeout.is_some();
+    let timeout_secs = timeout.map(|value| value.as_secs()).unwrap_or(0);
+    let sleep = tokio::time::sleep(timeout.unwrap_or(Duration::ZERO));
+    tokio::pin!(sleep);
     let mut pending_result: Option<tools::ToolOutcome> = None;
     let mut event_rx_open = true;
 
     loop {
         if let Some(result) = pending_result.take() {
             if event_rx_open {
-                tools::drain_bounded_exec_live_events(&mut event_rx, &mut forward_event).await;
+                tools::drain_bounded_exec_live_events(event_rx, forward_event).await;
             }
             return result;
         }
 
-        if !event_rx_open {
-            return outcome.as_mut().await;
-        }
-
+        // Some tools (for example http_fetch) never emit live output and drop
+        // the sender immediately; keep timeout/cancel active after that.
         if let Some(result) = outcome.as_mut().now_or_never() {
             pending_result = Some(result);
             continue;
@@ -392,10 +415,10 @@ pub(crate) async fn execute_subagent_tool_with_live_output(
             result = &mut outcome => {
                 pending_result = Some(result);
             }
-            maybe_event = event_rx.recv() => {
+            maybe_event = event_rx.recv(), if event_rx_open => {
                 match maybe_event {
                     Some(event) => {
-                        tools::forward_exec_live_event(event, &mut forward_event).await;
+                        tools::forward_exec_live_event(event, forward_event).await;
                     }
                     None => {
                         event_rx_open = false;

@@ -1,7 +1,7 @@
 ---
 name: general-coder
 description: "General-purpose coding sub-agent for self-contained implementation work, bug fixes, refactors, tests, and cross-layer changes that do not fit a narrower specialist."
-max_turns: 15
+max_turns: 45
 mcp_policy: all
 tools:
   allow: []
