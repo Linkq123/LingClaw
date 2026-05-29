@@ -3254,6 +3254,84 @@ fn call_llm_simple_openai_surfaces_json_error_envelope() {
 }
 
 #[test]
+fn call_llm_stream_openai_responses_accepts_null_error_field() {
+    let response_body = json!({
+        "id": "resp_ok",
+        "error": null,
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    { "type": "output_text", "text": "ok" }
+                ]
+            }
+        ],
+        "usage": {
+            "input_tokens": 4,
+            "output_tokens": 1
+        }
+    })
+    .to_string();
+    let (api_base, request_rx, handle) =
+        spawn_one_shot_http_server("application/json", response_body);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAIResponses,
+        api_base,
+        api_key: "stream-secret".into(),
+        model_id: "gpt-5.5".into(),
+        reasoning: false,
+        thinking_format: Some("openai".into()),
+        openai_responses_reasoning_summary: None,
+        max_tokens: Some(128),
+        context_window: 128000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("hi".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+    let (tx, _rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+    let live_tx: LiveTx = tx;
+
+    let response = runtime
+        .block_on(async {
+            call_llm_stream_openai_responses(
+                &http,
+                &resolved,
+                &messages,
+                None,
+                &live_tx,
+                "off",
+                &[],
+                false,
+                0,
+            )
+            .await
+        })
+        .expect("responses call should accept a successful response with error null");
+
+    let request = request_rx.recv().expect("captured request should exist");
+    handle.join().expect("server thread should join");
+
+    assert_eq!(request.request_line, "POST /responses HTTP/1.1");
+    assert_eq!(response.message.content.as_deref(), Some("ok"));
+    assert_eq!(
+        openai_responses_response_id_from_message(&response.message),
+        Some("resp_ok")
+    );
+}
+
+#[test]
 fn build_openai_responses_body_flattens_tools_and_replays_tool_history() {
     let resolved = ResolvedModel {
         provider: Provider::OpenAIResponses,

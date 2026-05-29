@@ -1742,6 +1742,9 @@ fn parse_json_response<T: DeserializeOwned>(provider: &str, body: &str) -> Resul
 
 fn provider_json_error(provider: &str, data: &Value) -> Option<String> {
     let error = data.get("error")?;
+    if error.is_null() {
+        return None;
+    }
     let detail = match error {
         Value::String(message) => message.trim().to_string(),
         Value::Object(obj) => {
