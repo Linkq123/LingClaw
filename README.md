@@ -726,7 +726,7 @@ static/                           — Vite 构建输出 (由 frontend/ 生成, �
 ├── assets/                       — 构建产物 (JS chunks, CSS, 字体)
 └── branding/                     — Logo 和品牌资源
 
-docs/reference/templates/       — 7 个提示模板文件 (BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/TOOLS/MEMORY.md)
+docs/reference/templates/       — 6 个提示模板文件 (BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/MEMORY.md)
 docs/reference/skills/          — 17 个系统内置 Skills (安装时部署到 ~/.lingclaw/system-skills/)
 docs/reference/agents/          — 6 个内置子代理 (explore, researcher, frontend-coder, backend-coder, general-coder, reviewer)
 
@@ -918,8 +918,8 @@ think_level 映射：
 │   └── <session-id>.json   — 其他 session 存档
 ├── <session-id>/workspace/ — 对应 session 工作区
 │   ├── AGENTS.md           — 核心代理行为
-│   ├── IDENTITY.md         — 身份信息
-│   ├── SOUL.md             — 高层推理规则
+│   ├── IDENTITY.md         — 主代理资料
+│   ├── SOUL.md             — 交互/工作风格偏好
 │   ├── USER.md             — 用户特定行为
 │   ├── MEMORY.md           — 持久记忆指南
 │   ├── structured_memory.json  — 机器可读结构化记忆（启用时生成）
@@ -940,6 +940,8 @@ think_level 映射：
 - 当 `IDENTITY.md` 和 `USER.md` 中的关键字段已被有效填写后，后端会自动删除 `BOOTSTRAP.md` 并切换到 Normal 模式
 - `/new` 只压缩对话 + 写入记忆 + 清空上下文，不重建 session
 - 重连不重建 `BOOTSTRAP.md`
+- 内置模板更新只影响后续新建 session；已有 session workspace 中的提示文件不会被自动覆盖
+- prompt 文件开头的 YAML frontmatter 只作为模板元数据保留，注入 system prompt 前会被剥离
 - 启用 `structuredMemory` 时，system prompt 会额外注入 `structured_memory.json` 的摘要，但不会替代人工维护的 `MEMORY.md`
 - 每轮 agent loop 后增量保存 session（原子写入：write .tmp → rename）
 - 会话切换前先保存到磁盘，失败时保留内存副本供重连恢复
@@ -1022,8 +1024,8 @@ think_level 映射：
 |---|---|
 | `BOOTSTRAP.md` | 初始引导指令 |
 | `AGENTS.md` | 核心代理行为 |
-| `IDENTITY.md` | 身份/人格信息 |
-| `SOUL.md` | 高层推理规则 |
+| `IDENTITY.md` | 主代理资料 |
+| `SOUL.md` | 交互/工作风格偏好 |
 | `USER.md` | 用户特定行为指导 |
 | `MEMORY.md` | 持久记忆指导 |
 

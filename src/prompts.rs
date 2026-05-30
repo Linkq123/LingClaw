@@ -567,7 +567,7 @@ fn migrate_legacy_agent_file(workspace: &Path) {
 
 fn read_agent_prompt(workspace: &Path) -> Option<(&'static str, String)> {
     for name in [PRIMARY_AGENT_FILE, LEGACY_AGENT_FILE] {
-        if let Some(content) = read_nonempty(workspace.join(name)) {
+        if let Some(content) = read_prompt_nonempty(workspace.join(name)) {
             return Some((name, content));
         }
     }
@@ -839,7 +839,7 @@ fn collect_persona_mtimes(workspace: &Path) -> Vec<Option<SystemTime>> {
 }
 
 fn load_persona_uncached(workspace: &Path) -> String {
-    let bootstrap = read_nonempty(workspace.join(BOOTSTRAP_FILE));
+    let bootstrap = read_prompt_nonempty(workspace.join(BOOTSTRAP_FILE));
 
     if let Some(bs_content) = bootstrap {
         // Bootstrap mode: first-run identity setup
@@ -857,7 +857,7 @@ fn load_persona_uncached(workspace: &Path) -> String {
     }
     for name in &PERSONA_WATCH_FILES[3..] {
         // IDENTITY.md, USER.md, SOUL.md
-        if let Some(content) = read_nonempty(workspace.join(name)) {
+        if let Some(content) = read_prompt_nonempty(workspace.join(name)) {
             parts.push(format!("<!-- {name} -->\n{content}"));
         }
     }
@@ -920,14 +920,14 @@ fn load_memory_uncached(workspace: &Path, today: &str, yesterday: &str) -> Strin
     }
 
     let mut parts = Vec::new();
-    if let Some(content) = read_nonempty(workspace.join("MEMORY.md")) {
+    if let Some(content) = read_prompt_nonempty(workspace.join("MEMORY.md")) {
         parts.push(format!("<!-- MEMORY.md -->\n{content}"));
     }
 
     const DAILY_MEMORY_CHAR_BUDGET: usize = 4000;
     for date_str in &[today, yesterday] {
         let path = workspace.join("memory").join(format!("{date_str}.md"));
-        if let Some(content) = read_nonempty(&path) {
+        if let Some(content) = read_prompt_nonempty(&path) {
             let content = crate::truncate(&content, DAILY_MEMORY_CHAR_BUDGET);
             parts.push(format!("<!-- memory/{date_str}.md -->\n{content}"));
         }
@@ -1003,6 +1003,87 @@ fn read_nonempty(path: impl AsRef<Path>) -> Option<String> {
             None
         }
     }
+}
+
+/// Read a prompt file and strip leading YAML frontmatter before injection.
+/// The on-disk file is left unchanged; bootstrap baseline comparisons use the
+/// raw file content instead.
+fn read_prompt_nonempty(path: impl AsRef<Path>) -> Option<String> {
+    let path = path.as_ref();
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let trimmed = strip_yaml_frontmatter(&content).trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            eprintln!("WARNING: failed to read {}: {e}", path.display());
+            None
+        }
+    }
+}
+
+fn strip_yaml_frontmatter(content: &str) -> &str {
+    let normalized = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let Some(after_open) = normalized.strip_prefix("---") else {
+        return normalized;
+    };
+
+    let Some(after_open) = after_open
+        .strip_prefix("\r\n")
+        .or_else(|| after_open.strip_prefix('\n'))
+    else {
+        return normalized;
+    };
+
+    let mut offset = normalized.len() - after_open.len();
+    let mut frontmatter_lines = Vec::new();
+    for line in after_open.split_inclusive('\n') {
+        let line_without_newline = line.trim_end_matches(['\r', '\n']);
+        offset += line.len();
+        if line_without_newline == "---" {
+            return if looks_like_yaml_frontmatter(&frontmatter_lines) {
+                &normalized[offset..]
+            } else {
+                normalized
+            };
+        }
+        frontmatter_lines.push(line_without_newline);
+    }
+
+    normalized
+}
+
+fn looks_like_yaml_frontmatter(lines: &[&str]) -> bool {
+    let mut saw_key_value = false;
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if trimmed.starts_with("- ") {
+            continue;
+        }
+
+        let Some((key, _value)) = trimmed.split_once(':') else {
+            return false;
+        };
+        let key = key.trim();
+        if key.is_empty()
+            || !key
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            return false;
+        }
+        saw_key_value = true;
+    }
+
+    saw_key_value
 }
 
 pub(crate) fn current_local_snapshot() -> LocalTimeSnapshot {

@@ -4,20 +4,19 @@ read_when:
   - Bootstrapping a workspace manually
 ---
 
-# USER.md - About Your Human
+# USER.md - User Profile
 
-_Learn about the person you're helping. Update this as you go._
+Keep durable user preferences here. Do not store secrets unless explicitly asked.
 
 - **Name:**
-- **What to call them:**
+- **Preferred address:**
 - **Pronouns:** _(optional)_
 - **Timezone:**
-- **Notes:**
+
+## Preferences
+
+-
 
 ## Context
 
-_(What do they care about? What projects are they working on? What annoys them? What makes them laugh? Build this over time.)_
-
----
-
-The more you know, the better you can help. But remember — you're learning about a person, not building a dossier. Respect the difference.
+-

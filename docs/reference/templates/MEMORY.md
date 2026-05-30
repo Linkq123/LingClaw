@@ -1,27 +1,22 @@
 # MEMORY.md - Long-Term Memory
 
-This is your curated memory — the distilled essence of what matters across sessions.
+Curated durable memory for this session workspace.
 
 ## What to Remember
 
-- **Decisions and rationale** — what was chosen and why
-- **User preferences** — communication style, naming conventions, workflow habits
-- **Lessons learned** — mistakes made, workarounds found, things that didn't work
-- **Ongoing context** — active projects, pending tasks, recurring topics
+- Decisions and rationale.
+- User preferences and workflow habits.
+- Lessons learned and recurring pitfalls.
+- Ongoing project context that should survive restarts.
 
 ## What to Skip
 
-- Raw logs (use `memory/YYYY-MM-DD.md` for those)
-- Secrets (API keys, passwords) unless the user explicitly asks
-- Transient information that won't matter next session
+- Raw logs; use `memory/YYYY-MM-DD.md`.
+- Secrets unless the user explicitly asks.
+- Transient details that will not matter later.
 
 ## How to Maintain
 
-- Review daily files periodically and promote durable insights here
-- Remove entries that are no longer relevant
-- Keep entries concise — bullet points over paragraphs
-- Organize by topic as content grows
-
----
-
-_Replace this guidance with actual memories as you learn._
+- Keep entries concise.
+- Remove stale information.
+- Organize by topic as the file grows.

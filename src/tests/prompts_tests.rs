@@ -60,6 +60,120 @@ fn load_session_prompt_files_uses_same_snapshot_for_today_and_yesterday() {
 }
 
 #[test]
+fn load_session_prompt_files_strips_leading_frontmatter_from_persona_files() {
+    let workspace = std::env::temp_dir().join("lingclaw-prompt-frontmatter-strip-test");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    fs::write(
+        workspace.join("AGENTS.md"),
+        "---\nsummary: hidden\n---\n\n# Agent Rules\nVisible agent body",
+    )
+    .expect("agent file should be written");
+    fs::write(
+        workspace.join("IDENTITY.md"),
+        "---\nsummary: hidden identity\n---\n\n# Identity\nVisible identity body",
+    )
+    .expect("identity file should be written");
+    fs::write(workspace.join("USER.md"), "# User\nVisible user body")
+        .expect("user file should be written");
+    fs::write(workspace.join("SOUL.md"), "# Style\nVisible style body")
+        .expect("soul file should be written");
+
+    let snapshot = LocalTimeSnapshot::from_datetime(
+        DateTime::parse_from_rfc3339("2026-03-16T00:05:07+08:00").expect("datetime should parse"),
+    );
+    let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
+
+    assert!(loaded.persona.contains("Visible agent body"));
+    assert!(loaded.persona.contains("Visible identity body"));
+    assert!(!loaded.persona.contains("summary: hidden"));
+    assert!(!loaded.persona.contains("summary: hidden identity"));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn load_session_prompt_files_keeps_nonleading_markdown_rule() {
+    let workspace = std::env::temp_dir().join("lingclaw-prompt-nonleading-rule-test");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    fs::write(workspace.join("AGENTS.md"), "# Agent\n\nBefore\n---\nAfter")
+        .expect("agent file should be written");
+    fs::write(workspace.join("IDENTITY.md"), "identity").expect("identity file should be written");
+    fs::write(workspace.join("USER.md"), "user").expect("user file should be written");
+    fs::write(workspace.join("SOUL.md"), "soul").expect("soul file should be written");
+
+    let snapshot = LocalTimeSnapshot::from_datetime(
+        DateTime::parse_from_rfc3339("2026-03-16T00:05:07+08:00").expect("datetime should parse"),
+    );
+    let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
+
+    assert!(loaded.persona.contains("Before\n---\nAfter"));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn load_session_prompt_files_keeps_leading_markdown_rule_without_yaml_metadata() {
+    let workspace = std::env::temp_dir().join("lingclaw-prompt-leading-rule-test");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    fs::write(
+        workspace.join("AGENTS.md"),
+        "---\nImportant prompt content\n---\nAfter rule",
+    )
+    .expect("agent file should be written");
+    fs::write(workspace.join("IDENTITY.md"), "identity").expect("identity file should be written");
+    fs::write(workspace.join("USER.md"), "user").expect("user file should be written");
+    fs::write(workspace.join("SOUL.md"), "soul").expect("soul file should be written");
+
+    let snapshot = LocalTimeSnapshot::from_datetime(
+        DateTime::parse_from_rfc3339("2026-03-16T00:05:07+08:00").expect("datetime should parse"),
+    );
+    let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
+
+    assert!(loaded.persona.contains("Important prompt content"));
+    assert!(loaded.persona.contains("After rule"));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn load_session_prompt_files_strips_leading_frontmatter_from_memory_files() {
+    let workspace = std::env::temp_dir().join("lingclaw-memory-frontmatter-strip-test");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(workspace.join("memory")).expect("memory dir should be created");
+    fs::write(workspace.join("AGENTS.md"), "agent").expect("agent file should be written");
+    fs::write(workspace.join("IDENTITY.md"), "identity").expect("identity file should be written");
+    fs::write(workspace.join("USER.md"), "user").expect("user file should be written");
+    fs::write(
+        workspace.join("MEMORY.md"),
+        "---\nsummary: hidden memory\n---\n\nLong-term memory body",
+    )
+    .expect("memory file should be written");
+    fs::write(
+        workspace.join("memory/2026-03-16.md"),
+        "---\nsummary: hidden daily\n---\n\nDaily memory body",
+    )
+    .expect("daily memory should be written");
+
+    let snapshot = LocalTimeSnapshot::from_datetime(
+        DateTime::parse_from_rfc3339("2026-03-16T00:05:07+08:00").expect("datetime should parse"),
+    );
+    let loaded = load_session_prompt_files_with_snapshot(&workspace, snapshot);
+
+    assert!(loaded.memory.contains("Long-term memory body"));
+    assert!(loaded.memory.contains("Daily memory body"));
+    assert!(!loaded.memory.contains("summary: hidden memory"));
+    assert!(!loaded.memory.contains("summary: hidden daily"));
+
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
 fn load_session_prompt_files_auto_completes_bootstrap_when_identity_is_edited() {
     let workspace = std::env::temp_dir().join("lingclaw-bootstrap-identity-edit-test");
     let _ = fs::remove_dir_all(&workspace);

@@ -452,7 +452,7 @@ static/                         # 运行时前端产物（由 frontend/ 构建�
   index.html                    # WebChat 入口
   assets/                       # 打包后的 JS/CSS/字体等资源
   branding/                     # 品牌资源
-docs/reference/templates/       # 7 个 Prompt 模板（BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/TOOLS/MEMORY.md）
+docs/reference/templates/       # 6 个 Prompt 模板（BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/MEMORY.md）
 docs/reference/skills/          # 内置 system skills（运行时磁盘发现）
 docs/reference/agents/          # 内置 system sub-agents（运行时磁盘发现）
 ~/.lingclaw/
