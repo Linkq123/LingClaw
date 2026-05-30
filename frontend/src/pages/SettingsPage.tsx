@@ -88,6 +88,85 @@ function updateModelThinkingFormat(model: ModelFormEntry, value: string): ModelF
   };
 }
 
+type TabId = 'tab-general' | 'tab-skills' | 'tab-agents' | 'tab-models' | 'tab-mcp' | 'tab-s3';
+type StatusType = 'idle' | 'loading' | 'success' | 'error';
+type TabSaveMode = 'config' | 'skills';
+
+interface TabMeta {
+  id: TabId;
+  label: string;
+  description: string;
+  saveMode: TabSaveMode;
+}
+
+const SETTINGS_TABS: ReadonlyArray<TabMeta> = [
+  {
+    id: 'tab-general',
+    label: 'General',
+    description: 'Server, timeouts, context limits, and feature switches.',
+    saveMode: 'config',
+  },
+  {
+    id: 'tab-skills',
+    label: 'Skills',
+    description: 'Session-scoped system skill availability.',
+    saveMode: 'skills',
+  },
+  {
+    id: 'tab-agents',
+    label: 'Agents',
+    description: 'Default model routing for the main agent and sub-agents.',
+    saveMode: 'config',
+  },
+  {
+    id: 'tab-models',
+    label: 'Models',
+    description: 'Provider endpoints, API keys, model capabilities, and test actions.',
+    saveMode: 'config',
+  },
+  {
+    id: 'tab-mcp',
+    label: 'MCP',
+    description: 'MCP server commands, environment, and connectivity checks.',
+    saveMode: 'config',
+  },
+  {
+    id: 'tab-s3',
+    label: 'S3',
+    description: 'S3-compatible file storage settings.',
+    saveMode: 'config',
+  },
+];
+
+function normalizeConfigForSave(config: AppConfig): AppConfig {
+  const finalConfig: AppConfig = {
+    ...config,
+    models: normalizeModelsConfig(config.models),
+  };
+  if (!finalConfig.models) delete finalConfig.models;
+
+  const s3 = finalConfig.s3;
+  if (!s3?.bucket && !s3?.endpoint) delete finalConfig.s3;
+
+  return finalConfig;
+}
+
+function sortForStableSerialize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortForStableSerialize);
+  if (!value || typeof value !== 'object') return value;
+
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+    const child = (value as Record<string, unknown>)[key];
+    if (child !== undefined) sorted[key] = sortForStableSerialize(child);
+  }
+  return sorted;
+}
+
+function serializeConfigForDirty(config: AppConfig): string {
+  return JSON.stringify(sortForStableSerialize(normalizeConfigForSave(config)));
+}
+
 // Stable role list — extracted to module scope to preserve referential identity
 // across AgentsTab renders (prevents unnecessary ModelSelect re-renders).
 const AGENT_ROLES: ReadonlyArray<{ key: string; label: string }> = [
@@ -1470,7 +1549,13 @@ function sameStringList(a: string[], b: string[]): boolean {
   return a.every((value, index) => value === b[index]);
 }
 
-function SkillsTab({ sessionId }: { sessionId: string }) {
+function SkillsTab({
+  sessionId,
+  onDirtyChange,
+}: {
+  sessionId: string;
+  onDirtyChange?: (dirty: boolean) => void;
+}) {
   const targetSessionId = sessionId || 'main';
   const [skills, setSkills] = useState<SessionSkillInfo[]>([]);
   const [savedEnabledIds, setSavedEnabledIds] = useState<string[]>([]);
@@ -1536,6 +1621,14 @@ function SkillsTab({ sessionId }: { sessionId: string }) {
         : skills,
     [query, skills],
   );
+
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
+
+  useEffect(() => {
+    return () => onDirtyChange?.(false);
+  }, [onDirtyChange]);
 
   const setSkillEnabled = useCallback((skillId: string, enabled: boolean) => {
     setSkills((current) =>
@@ -1839,31 +1932,282 @@ function CorruptConfigView({
   );
 }
 
-// ── Main SettingsPage component ───────────────────────────────────────────────
+// ── Settings shell ───────────────────────────────────────────────────────────
 
-type TabId = 'tab-general' | 'tab-skills' | 'tab-agents' | 'tab-models' | 'tab-mcp' | 'tab-s3';
-type StatusType = 'idle' | 'loading' | 'success' | 'error';
+function SettingsShell({
+  activeTab,
+  tabs,
+  status,
+  configDirty,
+  skillsDirty,
+  corrupt,
+  showDiscardConfirm,
+  onTabChange,
+  onSaveConfig,
+  onRequestClose,
+  onCancelDiscard,
+  onDiscardChanges,
+  children,
+}: {
+  activeTab: TabId;
+  tabs: ReadonlyArray<TabMeta>;
+  status: { message: string; type: StatusType };
+  configDirty: boolean;
+  skillsDirty: boolean;
+  corrupt: boolean;
+  showDiscardConfirm: boolean;
+  onTabChange: (tab: TabId) => void;
+  onSaveConfig: () => void;
+  onRequestClose: () => void;
+  onCancelDiscard: () => void;
+  onDiscardChanges: () => void;
+  children: React.ReactNode;
+}) {
+  const activeMeta = tabs.find((tab) => tab.id === activeTab) || tabs[0];
+  const titleRef = useRef<HTMLHeadingElement | null>(null);
+  const tabRefs = useRef<Partial<Record<TabId, HTMLButtonElement | null>>>({});
+  const statusClass =
+    status.type === 'success'
+      ? 'settings-status success'
+      : status.type === 'error'
+        ? 'settings-status error'
+        : 'settings-status';
+
+  useEffect(() => {
+    const timeoutId = window.setTimeout(() => titleRef.current?.focus(), 0);
+    return () => window.clearTimeout(timeoutId);
+  }, []);
+
+  const focusTab = (tabId: TabId) => {
+    window.setTimeout(() => tabRefs.current[tabId]?.focus(), 0);
+  };
+
+  const changeTab = (tabId: TabId) => {
+    if (corrupt) return;
+    onTabChange(tabId);
+  };
+
+  const handleTabKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>, tabId: TabId) => {
+    const currentIndex = tabs.findIndex((tab) => tab.id === tabId);
+    if (currentIndex < 0) return;
+
+    let nextIndex = currentIndex;
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+      nextIndex = (currentIndex + 1) % tabs.length;
+    } else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+      nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+    } else if (event.key === 'Home') {
+      nextIndex = 0;
+    } else if (event.key === 'End') {
+      nextIndex = tabs.length - 1;
+    } else {
+      return;
+    }
+
+    event.preventDefault();
+    const nextTab = tabs[nextIndex].id;
+    changeTab(nextTab);
+    focusTab(nextTab);
+  };
+
+  const canSaveConfig = !corrupt && activeMeta.saveMode === 'config';
+  const hasUnsavedChanges = configDirty || skillsDirty;
+
+  return (
+    <div className="page-panel settings-panel">
+      <div className="settings-shell">
+        <aside className="settings-sidebar" aria-label="Settings sections">
+          <div className="settings-sidebar-head">
+            <div className="settings-eyebrow">LingClaw</div>
+            <h2>Settings</h2>
+            <p>Configure runtime, providers, agents, tools, and storage.</p>
+          </div>
+          <div id="settings-tabs" className="page-tabs settings-nav" role="tablist">
+            {tabs.map((tab) => (
+              <button
+                key={tab.id}
+                ref={(node) => {
+                  tabRefs.current[tab.id] = node;
+                }}
+                id={`${tab.id}-button`}
+                role="tab"
+                type="button"
+                className={`page-tab settings-nav-item${activeTab === tab.id ? ' active' : ''}`}
+                data-tab={tab.id}
+                aria-selected={activeTab === tab.id}
+                aria-controls={`${tab.id}-panel`}
+                disabled={corrupt}
+                onClick={() => changeTab(tab.id)}
+                onKeyDown={(event) => handleTabKeyDown(event, tab.id)}
+              >
+                <span className="settings-nav-label">{tab.label}</span>
+                <span className="settings-nav-description">{tab.description}</span>
+              </button>
+            ))}
+          </div>
+        </aside>
+
+        <section className="settings-main">
+          <div className="settings-topbar">
+            <div className="settings-title-block">
+              <h2 ref={titleRef} tabIndex={-1}>
+                {corrupt ? 'Config File Error' : activeMeta.label}
+              </h2>
+              <p>
+                {corrupt
+                  ? 'Repair the JSON config before editing other settings.'
+                  : activeMeta.description}
+              </p>
+            </div>
+            <div className="settings-topbar-actions">
+              <span className={statusClass} id="settings-status">
+                {status.message}
+              </span>
+              <button
+                className="page-close"
+                title="Close"
+                aria-label="Close"
+                onClick={onRequestClose}
+              >
+                ×
+              </button>
+            </div>
+          </div>
+
+          {showDiscardConfirm && (
+            <div className="settings-discard-dialog" role="alertdialog" aria-live="assertive">
+              <div>
+                <strong>Discard unsaved changes?</strong>
+                <span>
+                  {configDirty && skillsDirty
+                    ? ' Config and Skills have unsaved changes.'
+                    : configDirty
+                      ? ' Config has unsaved changes.'
+                      : ' Skills have unsaved changes.'}
+                </span>
+              </div>
+              <div className="settings-discard-actions">
+                <button className="btn-secondary" type="button" onClick={onCancelDiscard}>
+                  Keep Editing
+                </button>
+                <button className="btn-primary btn-danger" type="button" onClick={onDiscardChanges}>
+                  Discard Changes
+                </button>
+              </div>
+            </div>
+          )}
+
+          <div className="page-body settings-body" id="settings-body">
+            {children}
+          </div>
+
+          <div className="settings-footer">
+            <div className="settings-footer-note">
+              {hasUnsavedChanges
+                ? 'You have unsaved changes.'
+                : activeMeta.saveMode === 'skills'
+                  ? 'Skills save independently for the current session.'
+                  : 'No unsaved config changes.'}
+            </div>
+            {canSaveConfig && (
+              <button
+                className="btn-primary"
+                id="settings-save-btn"
+                onClick={onSaveConfig}
+                disabled={!configDirty || status.type === 'loading'}
+              >
+                Save
+              </button>
+            )}
+          </div>
+        </section>
+      </div>
+    </div>
+  );
+}
+
+// ── Main SettingsPage component ───────────────────────────────────────────────
 
 export function SettingsPage() {
   const [visible, setVisible] = useState(false);
   const [config, setConfig] = useState<AppConfig>({});
+  const [savedConfig, setSavedConfig] = useState<AppConfig>({});
+  const [configBaseline, setConfigBaseline] = useState(() => serializeConfigForDirty({}));
   const [activeTab, setActiveTab] = useState<TabId>('tab-general');
+  const [visitedTabs, setVisitedTabs] = useState<ReadonlySet<TabId>>(
+    () => new Set(['tab-general']),
+  );
   const [status, setStatus] = useState({ message: '', type: 'idle' as StatusType });
   const [corruptData, setCorruptData] = useState<ConfigApiResponse | null>(null);
   const [discoveredAgents, setDiscoveredAgents] = useState<DiscoveredAgentInfo[]>([]);
   const [settingsSessionId, setSettingsSessionId] = useState('main');
+  const [skillsDirty, setSkillsDirty] = useState(false);
+  const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
+  const requestCloseRef = useRef<() => void>(() => setVisible(false));
+  const visibleRef = useRef(false);
+  const settingsSessionIdRef = useRef('main');
+  const hasUnsavedChangesRef = useRef(false);
+
+  const configDirty = useMemo(
+    () => serializeConfigForDirty(config) !== configBaseline,
+    [config, configBaseline],
+  );
+  const hasUnsavedChanges = configDirty || skillsDirty;
+
+  const closeWithoutPrompt = useCallback(() => {
+    setShowDiscardConfirm(false);
+    setConfig(savedConfig);
+    setConfigBaseline(serializeConfigForDirty(savedConfig));
+    setVisible(false);
+    setSkillsDirty(false);
+  }, [savedConfig]);
+
+  const requestClose = useCallback(() => {
+    if (hasUnsavedChanges) {
+      setShowDiscardConfirm(true);
+      return;
+    }
+    closeWithoutPrompt();
+  }, [closeWithoutPrompt, hasUnsavedChanges]);
+
+  useEffect(() => {
+    requestCloseRef.current = requestClose;
+  }, [requestClose]);
+
+  useEffect(() => {
+    visibleRef.current = visible;
+  }, [visible]);
+
+  useEffect(() => {
+    settingsSessionIdRef.current = settingsSessionId;
+  }, [settingsSessionId]);
+
+  useEffect(() => {
+    hasUnsavedChangesRef.current = hasUnsavedChanges;
+  }, [hasUnsavedChanges]);
 
   // Register bridge functions
   useEffect(() => {
     _open = () => {
-      setSettingsSessionId(pendingSessionId || 'main');
+      const nextSessionId = pendingSessionId || 'main';
+      if (
+        visibleRef.current &&
+        hasUnsavedChangesRef.current &&
+        nextSessionId !== settingsSessionIdRef.current
+      ) {
+        setShowDiscardConfirm(true);
+        return;
+      }
+      setSettingsSessionId(nextSessionId);
+      if (!hasUnsavedChangesRef.current) setShowDiscardConfirm(false);
       setVisible(true);
     };
-    _close = () => setVisible(false);
+    _close = () => requestCloseRef.current();
     // Honour any open request that arrived before the lazy chunk finished loading.
     if (pendingOpen) {
       pendingOpen = false;
       setSettingsSessionId(pendingSessionId || 'main');
+      setShowDiscardConfirm(false);
       setVisible(true);
     }
     return () => {
@@ -1878,6 +2222,31 @@ export function SettingsPage() {
     if (el) el.hidden = !visible;
   }, [visible]);
 
+  useEffect(() => {
+    if (!visible) return;
+    setVisitedTabs((current) => {
+      if (current.has(activeTab)) return current;
+      return new Set(current).add(activeTab);
+    });
+  }, [activeTab, visible]);
+
+  useEffect(() => {
+    if (!visible) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (showDiscardConfirm) setShowDiscardConfirm(false);
+      else requestClose();
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => window.removeEventListener('keydown', onKeyDown, true);
+  }, [requestClose, showDiscardConfirm, visible]);
+
+  useEffect(() => {
+    if (!hasUnsavedChanges) setShowDiscardConfirm(false);
+  }, [hasUnsavedChanges]);
+
   // Load config when opened
   useEffect(() => {
     if (!visible) return;
@@ -1891,11 +2260,18 @@ export function SettingsPage() {
         setDiscoveredAgents(data.discoveredAgents || []);
         if (data.parse_error) {
           setCorruptData(data);
+          setConfig({});
+          setSavedConfig({});
+          setConfigBaseline(serializeConfigForDirty({}));
           setStatus({ message: 'Config file has syntax errors', type: 'error' });
           return;
         }
+        const nextConfig = data.config || {};
         setCorruptData(null);
-        setConfig(data.config || {});
+        setConfig(nextConfig);
+        setSavedConfig(nextConfig);
+        setConfigBaseline(serializeConfigForDirty(nextConfig));
+        if (!hasUnsavedChangesRef.current) setShowDiscardConfirm(false);
         setStatus({ message: `Loaded from ${data.path}`, type: 'success' });
       } catch (e: unknown) {
         if ((e as Error).name === 'AbortError') return;
@@ -1945,10 +2321,7 @@ export function SettingsPage() {
   };
 
   const saveConfig = async () => {
-    const finalConfig: AppConfig = {
-      ...config,
-      models: normalizeModelsConfig(config.models),
-    };
+    const finalConfig = normalizeConfigForSave(config);
 
     try {
       validateAgentModels(finalConfig);
@@ -1956,10 +2329,6 @@ export function SettingsPage() {
       setStatus({ message: (e as Error).message, type: 'error' });
       return;
     }
-
-    // Clean up s3 if empty
-    const s3 = finalConfig.s3;
-    if (!s3?.bucket && !s3?.endpoint) delete finalConfig.s3;
 
     setStatus({ message: 'Saving...', type: 'loading' });
     try {
@@ -1978,100 +2347,124 @@ export function SettingsPage() {
           'Saved successfully! Most changes apply immediately. Restart LingClaw only for port changes.',
         type: 'success',
       });
+      setConfig(finalConfig);
+      setSavedConfig(finalConfig);
+      setConfigBaseline(serializeConfigForDirty(finalConfig));
     } catch (e: unknown) {
       setStatus({ message: `Save failed: ${(e as Error).message}`, type: 'error' });
     }
   };
 
+  const selectTab = useCallback((tab: TabId) => {
+    setShowDiscardConfirm(false);
+    setActiveTab(tab);
+    setVisitedTabs((current) => {
+      if (current.has(tab)) return current;
+      return new Set(current).add(tab);
+    });
+  }, []);
+
   if (!visible) return null;
-
-  const tabs: Array<{ id: TabId; label: string }> = [
-    { id: 'tab-general', label: 'General' },
-    { id: 'tab-skills', label: 'Skills' },
-    { id: 'tab-agents', label: 'Agents' },
-    { id: 'tab-models', label: 'Models' },
-    { id: 'tab-mcp', label: 'MCP' },
-    { id: 'tab-s3', label: 'S3' },
-  ];
-
-  const statusClass =
-    status.type === 'success'
-      ? 'settings-status success'
-      : status.type === 'error'
-        ? 'settings-status error'
-        : 'settings-status';
 
   // Render the inner page-panel; the outer #settings-page overlay is managed via useEffect above
   return (
-    <div className="page-panel">
-      <div className="page-header">
-        <h2>Settings</h2>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <span className={statusClass} id="settings-status">
-            {status.message}
-          </span>
-          {!corruptData && activeTab !== 'tab-skills' && (
-            <button className="btn-primary" id="settings-save-btn" onClick={saveConfig}>
-              Save
-            </button>
-          )}
-          <button
-            className="page-close"
-            title="Close"
-            aria-label="Close"
-            onClick={() => setVisible(false)}
-          >
-            ×
-          </button>
-        </div>
-      </div>
-
+    <SettingsShell
+      activeTab={activeTab}
+      tabs={SETTINGS_TABS}
+      status={status}
+      configDirty={configDirty}
+      skillsDirty={skillsDirty}
+      corrupt={!!corruptData}
+      showDiscardConfirm={showDiscardConfirm}
+      onTabChange={selectTab}
+      onSaveConfig={saveConfig}
+      onRequestClose={requestClose}
+      onCancelDiscard={() => setShowDiscardConfirm(false)}
+      onDiscardChanges={closeWithoutPrompt}
+    >
       {corruptData ? (
-        <div className="page-body" id="settings-body">
+        <>
           <CorruptConfigView
             data={corruptData}
             onStatus={handleStatus}
             onReloaded={(d) => {
               if (!d.parse_error) {
+                const nextConfig = d.config || {};
                 setCorruptData(null);
-                setConfig(d.config || {});
+                setConfig(nextConfig);
+                setSavedConfig(nextConfig);
+                setConfigBaseline(serializeConfigForDirty(nextConfig));
                 setStatus({ message: 'Loaded', type: 'success' });
               } else {
                 setCorruptData(d);
               }
             }}
           />
-        </div>
+        </>
       ) : (
         <>
-          <div id="settings-tabs" className="page-tabs">
-            {tabs.map((t) => (
-              <button
-                key={t.id}
-                className={`page-tab${activeTab === t.id ? ' active' : ''}`}
-                data-tab={t.id}
-                onClick={() => setActiveTab(t.id)}
-              >
-                {t.label}
-              </button>
-            ))}
-          </div>
-          <div className="page-body" id="settings-body">
-            {activeTab === 'tab-general' && <GeneralTab config={config} onChange={setConfig} />}
-            {activeTab === 'tab-skills' && <SkillsTab sessionId={settingsSessionId} />}
-            {activeTab === 'tab-agents' && (
+          {visitedTabs.has('tab-general') && (
+            <section
+              id="tab-general-panel"
+              role="tabpanel"
+              aria-labelledby="tab-general-button"
+              hidden={activeTab !== 'tab-general'}
+            >
+              <GeneralTab config={config} onChange={setConfig} />
+            </section>
+          )}
+          {visitedTabs.has('tab-skills') && (
+            <section
+              id="tab-skills-panel"
+              role="tabpanel"
+              aria-labelledby="tab-skills-button"
+              hidden={activeTab !== 'tab-skills'}
+            >
+              <SkillsTab sessionId={settingsSessionId} onDirtyChange={setSkillsDirty} />
+            </section>
+          )}
+          {visitedTabs.has('tab-agents') && (
+            <section
+              id="tab-agents-panel"
+              role="tabpanel"
+              aria-labelledby="tab-agents-button"
+              hidden={activeTab !== 'tab-agents'}
+            >
               <AgentsTab config={config} onChange={setConfig} discoveredAgents={discoveredAgents} />
-            )}
-            {activeTab === 'tab-models' && (
+            </section>
+          )}
+          {visitedTabs.has('tab-models') && (
+            <section
+              id="tab-models-panel"
+              role="tabpanel"
+              aria-labelledby="tab-models-button"
+              hidden={activeTab !== 'tab-models'}
+            >
               <ModelsTab config={config} onChange={setConfig} onStatus={handleStatus} />
-            )}
-            {activeTab === 'tab-mcp' && (
+            </section>
+          )}
+          {visitedTabs.has('tab-mcp') && (
+            <section
+              id="tab-mcp-panel"
+              role="tabpanel"
+              aria-labelledby="tab-mcp-button"
+              hidden={activeTab !== 'tab-mcp'}
+            >
               <McpTab config={config} onChange={setConfig} onStatus={handleStatus} />
-            )}
-            {activeTab === 'tab-s3' && <S3Tab config={config} onChange={setConfig} />}
-          </div>
+            </section>
+          )}
+          {visitedTabs.has('tab-s3') && (
+            <section
+              id="tab-s3-panel"
+              role="tabpanel"
+              aria-labelledby="tab-s3-button"
+              hidden={activeTab !== 'tab-s3'}
+            >
+              <S3Tab config={config} onChange={setConfig} />
+            </section>
+          )}
         </>
       )}
-    </div>
+    </SettingsShell>
   );
 }
