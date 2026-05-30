@@ -557,28 +557,47 @@ fn discover_all_skills_deduplicates_by_name_later_wins() {
     )
     .expect("unique skill file should be written");
 
-    // Simulate the exact merge+dedup from discover_all_skills
-    let mut all = Vec::new();
-    all.extend(discover_skills_in_dir(
-        &system_dir,
-        SkillSource::System,
-        "system://skills/",
-    ));
-    all.extend(discover_skills_in_dir(
-        &session_dir,
-        SkillSource::Session,
-        "skills/",
-    ));
+    // Same-layer duplicates with different paths should both survive. This is
+    // how namespaced system skills such as anthropics/pdf and openai/pdf stay
+    // independently addressable.
+    let sys_pdf_a = system_dir.join("vendor-a").join("pdf");
+    fs::create_dir_all(&sys_pdf_a).expect("sys pdf a dir should be created");
+    fs::write(
+        sys_pdf_a.join("SKILL.md"),
+        "---\nname: pdf\ndescription: Vendor A\n---\n",
+    )
+    .expect("sys pdf a file should be written");
+    let sys_pdf_b = system_dir.join("vendor-b").join("pdf");
+    fs::create_dir_all(&sys_pdf_b).expect("sys pdf b dir should be created");
+    fs::write(
+        sys_pdf_b.join("SKILL.md"),
+        "---\nname: pdf\ndescription: Vendor B\n---\n",
+    )
+    .expect("sys pdf b file should be written");
 
-    let mut seen = std::collections::HashMap::new();
-    for (idx, skill) in all.iter().enumerate() {
-        seen.insert(skill.name.clone(), idx);
-    }
-    let mut deduped: Vec<SkillMeta> = seen.into_values().map(|idx| all[idx].clone()).collect();
-    deduped.sort_by(|a, b| a.name.cmp(&b.name));
+    // Simulate the exact merge+dedup from discover_all_skills.
+    let mut deduped = Vec::new();
+    let append_layer = |merged: &mut Vec<SkillMeta>, layer: Vec<SkillMeta>| {
+        let layer_names = layer
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        merged.retain(|skill| !layer_names.contains(&skill.name));
+        merged.extend(layer);
+    };
+    append_layer(
+        &mut deduped,
+        discover_skills_in_dir(&system_dir, SkillSource::System, "system://skills/"),
+    );
+    append_layer(
+        &mut deduped,
+        discover_skills_in_dir(&session_dir, SkillSource::Session, "skills/"),
+    );
 
-    // Two unique names after dedup
-    assert_eq!(deduped.len(), 2);
+    deduped.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+
+    // Four entries: same-layer pdf duplicates survive, cross-layer xray is overridden.
+    assert_eq!(deduped.len(), 4);
 
     // "only-sys" retained from system layer
     let unique = deduped.iter().find(|s| s.name == "only-sys").unwrap();
@@ -588,6 +607,15 @@ fn discover_all_skills_deduplicates_by_name_later_wins() {
     let xray = deduped.iter().find(|s| s.name == "xray").unwrap();
     assert_eq!(xray.source, SkillSource::Session);
     assert_eq!(xray.description, "Session version");
+
+    let pdf_paths = deduped
+        .iter()
+        .filter(|s| s.name == "pdf")
+        .map(|s| s.path.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(pdf_paths.len(), 2);
+    assert!(pdf_paths.contains(&"system://skills/vendor-a/pdf/SKILL.md"));
+    assert!(pdf_paths.contains(&"system://skills/vendor-b/pdf/SKILL.md"));
 
     let _ = fs::remove_dir_all(&base);
 }

@@ -71,6 +71,7 @@ export interface SessionSkillsApiResponse {
     name?: string;
   };
   skills?: SessionSkillInfo[];
+  enabledSystemSkills?: string[];
   disabledSystemSkills?: string[];
   error?: string;
 }

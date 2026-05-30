@@ -136,6 +136,7 @@ async fn think_command_waits_for_session_persist_gate_before_mutating_session() 
             show_react: true,
             show_tools: true,
             show_reasoning: true,
+            enabled_system_skills: HashSet::new(),
             disabled_system_skills: HashSet::new(),
             failed_tool_results: Default::default(),
             subagent_snapshots: HashMap::new(),
@@ -347,6 +348,7 @@ async fn status_command_reports_runtime_request_estimate() {
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -360,7 +362,7 @@ async fn status_command_reports_runtime_request_estimate() {
         &config,
         &workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     session.messages.push(ChatMessage {
         role: "user".into(),
@@ -488,6 +490,7 @@ async fn status_command_uses_runtime_auto_policy_for_idle_auto_sessions() {
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -501,7 +504,7 @@ async fn status_command_uses_runtime_auto_policy_for_idle_auto_sessions() {
         &config,
         &workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     session.messages.push(ChatMessage {
         role: "user".into(),
@@ -626,6 +629,7 @@ async fn status_command_reports_compression_recorded_before_start_event() {
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -639,7 +643,7 @@ async fn status_command_reports_compression_recorded_before_start_event() {
         &config,
         &workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -774,6 +778,7 @@ async fn status_command_reports_prune_only_state() {
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -787,7 +792,7 @@ async fn status_command_reports_prune_only_state() {
         &config,
         &workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -917,6 +922,7 @@ async fn status_command_reports_replayed_compression_outcome_after_reconnect() {
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -930,7 +936,7 @@ async fn status_command_reports_replayed_compression_outcome_after_reconnect() {
         &config,
         &workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -1066,6 +1072,7 @@ async fn status_command_reports_latest_compression_outcome() {
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -1079,7 +1086,7 @@ async fn status_command_reports_latest_compression_outcome() {
         &config,
         &workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
 
     state
@@ -1216,6 +1223,7 @@ async fn status_command_prefers_live_round_effective_think() {
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -1229,7 +1237,7 @@ async fn status_command_prefers_live_round_effective_think() {
         &config,
         &workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
 
     state
@@ -1367,6 +1375,7 @@ async fn status_command_prefers_live_round_effective_think_for_manual_sessions()
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -1380,7 +1389,7 @@ async fn status_command_prefers_live_round_effective_think_for_manual_sessions()
         &config,
         &workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
 
     state
@@ -1519,6 +1528,7 @@ async fn status_command_prefers_live_round_effective_think_over_base_model_suppo
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -1532,7 +1542,7 @@ async fn status_command_prefers_live_round_effective_think_over_base_model_suppo
         &config,
         &workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
 
     state
@@ -1691,6 +1701,7 @@ async fn status_command_reports_latest_auto_trace_summary() {
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -1704,7 +1715,7 @@ async fn status_command_reports_latest_auto_trace_summary() {
         &config,
         &workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
 
     state
@@ -1886,6 +1897,7 @@ async fn status_command_reports_live_runtime_provider_for_cross_provider_fast_mo
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -1899,7 +1911,7 @@ async fn status_command_reports_live_runtime_provider_for_cross_provider_fast_mo
         &config,
         &workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
 
     state
@@ -2037,6 +2049,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -2050,7 +2063,7 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
         &config,
         &workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     session.messages.push(ChatMessage {
         role: "user".into(),
@@ -2125,7 +2138,7 @@ async fn delete_command_rejects_active_session() {
         &config,
         &session.workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -2194,7 +2207,7 @@ async fn delete_command_rejects_running_session_without_active_connection() {
         &config,
         &session.workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -2266,7 +2279,7 @@ async fn delete_command_reports_filesystem_failure_without_removing_memory_sessi
         &config,
         &session.workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     let session_dir = session
         .workspace
@@ -2573,6 +2586,7 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -2586,7 +2600,7 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
         &config,
         &workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -2690,6 +2704,7 @@ async fn memory_command_rejects_unknown_subcommand() {
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -2703,7 +2718,7 @@ async fn memory_command_rejects_unknown_subcommand() {
         &config,
         &workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -2826,6 +2841,7 @@ async fn reflection_command_disabled_shows_hint() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -2838,7 +2854,7 @@ async fn reflection_command_disabled_shows_hint() {
         &config,
         &workspace,
         &config.model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -2962,6 +2978,7 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -2974,7 +2991,7 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
         &config,
         &workspace,
         &config.model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -3137,6 +3154,7 @@ async fn reflection_command_disabled_allows_read_today() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -3149,7 +3167,7 @@ async fn reflection_command_disabled_allows_read_today() {
         &config,
         &workspace,
         &config.model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -3271,6 +3289,7 @@ async fn reflection_command_enabled_shows_status() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -3283,7 +3302,7 @@ async fn reflection_command_enabled_shows_status() {
         &config,
         &workspace,
         &config.model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -3417,6 +3436,7 @@ async fn reflection_command_today_shows_content() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -3429,7 +3449,7 @@ async fn reflection_command_today_shows_content() {
         &config,
         &workspace,
         &config.model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -3569,6 +3589,7 @@ async fn reflection_command_today_filters_out_new_summaries() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -3581,7 +3602,7 @@ async fn reflection_command_today_filters_out_new_summaries() {
         &config,
         &workspace,
         &config.model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -3724,6 +3745,7 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -3736,7 +3758,7 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
         &config,
         &workspace,
         &config.model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -3882,6 +3904,7 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -3894,7 +3917,7 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
         &config,
         &workspace,
         &config.model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions
@@ -4017,6 +4040,7 @@ async fn reflection_command_invalid_arg_shows_usage() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -4029,7 +4053,7 @@ async fn reflection_command_invalid_arg_shows_usage() {
         &config,
         &workspace,
         &config.model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     ));
     state
         .sessions

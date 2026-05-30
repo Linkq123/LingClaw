@@ -1462,6 +1462,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),

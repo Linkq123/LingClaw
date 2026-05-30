@@ -652,7 +652,7 @@ async fn prepare_analyze_snapshot(
     let mut sessions = ctx.state.sessions.lock().await;
     let session = sessions.get_mut(ctx.current_session_id)?;
     let base_model = session.effective_model(&config.model).to_string();
-    let disabled = session.disabled_system_skills.clone();
+    let enabled_system_skills = session.enabled_system_skills.clone();
 
     // Extract latest user message for query-aware memory retrieval and complexity sensing.
     let latest_query = latest_user_query_from_messages(&session.messages);
@@ -682,7 +682,7 @@ async fn prepare_analyze_snapshot(
         &config,
         &session.workspace,
         &model_str,
-        &disabled,
+        &enabled_system_skills,
         latest_query.as_deref(),
     );
 

@@ -117,7 +117,7 @@ static SYSTEM_PROMPT_STATIC_CACHE: SystemPromptCacheLock = OnceLock::new();
 struct SystemPromptStaticCacheKey {
     workspace: PathBuf,
     query: Option<String>,
-    disabled_skills_hash: u64,
+    enabled_skills_hash: u64,
     persona_hash: u64,
     tool_lines_hash: u64,
     mcp_note_hash: u64,
@@ -296,7 +296,7 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
-const SESSION_VERSION: u32 = 5;
+const SESSION_VERSION: u32 = 6;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {
@@ -339,8 +339,12 @@ struct Session {
     show_tools: bool,
     #[serde(default = "default_show_reasoning")]
     show_reasoning: bool,
-    /// System skill paths disabled for this session (e.g. "anthropics", "anthropics/pdf").
+    /// System skill paths enabled for this session (e.g. "anthropics", "anthropics/pdf").
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    enabled_system_skills: HashSet<String>,
+    /// Legacy field read from older session files. System skill injection is now
+    /// allow-list based through `enabled_system_skills`.
+    #[serde(default, skip_serializing)]
     disabled_system_skills: HashSet<String>,
     /// Tool call ids whose persisted tool result ended in an error state.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
@@ -408,6 +412,9 @@ fn migrate_session(session: &mut Session) {
     if session.version < 5 {
         session.todos = todos::TodoSnapshot::empty(session.updated_at);
     }
+    if session.version < 6 {
+        session.enabled_system_skills = HashSet::new();
+    }
     todos::normalize_snapshot(&mut session.todos, session.updated_at);
     session.version = SESSION_VERSION;
 }
@@ -447,6 +454,7 @@ impl Session {
             show_react: default_show_react(),
             show_tools: default_show_tools(),
             show_reasoning: default_show_reasoning(),
+            enabled_system_skills: HashSet::new(),
             disabled_system_skills: HashSet::new(),
             failed_tool_results: HashSet::new(),
             subagent_snapshots: HashMap::new(),
@@ -857,9 +865,9 @@ fn build_system_prompt(
     config: &Config,
     workspace: &Path,
     model: &str,
-    disabled_system_skills: &HashSet<String>,
+    enabled_system_skills: &HashSet<String>,
 ) -> ChatMessage {
-    build_system_prompt_with_query_cached(config, workspace, model, disabled_system_skills, None)
+    build_system_prompt_with_query_cached(config, workspace, model, enabled_system_skills, None)
 }
 
 fn hash_prompt_part<T: Hash>(value: &T) -> u64 {
@@ -868,8 +876,8 @@ fn hash_prompt_part<T: Hash>(value: &T) -> u64 {
     hasher.finish()
 }
 
-fn hash_disabled_system_skills(disabled_system_skills: &HashSet<String>) -> u64 {
-    let mut items: Vec<&str> = disabled_system_skills.iter().map(String::as_str).collect();
+fn hash_enabled_system_skills(enabled_system_skills: &HashSet<String>) -> u64 {
+    let mut items: Vec<&str> = enabled_system_skills.iter().map(String::as_str).collect();
     items.sort_unstable();
     hash_prompt_part(&items)
 }
@@ -877,7 +885,7 @@ fn hash_disabled_system_skills(disabled_system_skills: &HashSet<String>) -> u64 
 fn build_system_prompt_static_prefix_cached(
     workspace: &Path,
     current_query: Option<&str>,
-    disabled_system_skills: &HashSet<String>,
+    enabled_system_skills: &HashSet<String>,
     persona: &str,
     tool_lines: &str,
     mcp_note: &str,
@@ -888,7 +896,7 @@ fn build_system_prompt_static_prefix_cached(
         .map(str::trim)
         .filter(|query| !query.is_empty())
         .map(ToOwned::to_owned);
-    let disabled_skills_hash = hash_disabled_system_skills(disabled_system_skills);
+    let enabled_skills_hash = hash_enabled_system_skills(enabled_system_skills);
     let persona_hash = hash_prompt_part(&persona);
     let tool_lines_hash = hash_prompt_part(&tool_lines);
     let mcp_note_hash = hash_prompt_part(&mcp_note);
@@ -897,7 +905,7 @@ fn build_system_prompt_static_prefix_cached(
     let key = SystemPromptStaticCacheKey {
         workspace: workspace.to_path_buf(),
         query,
-        disabled_skills_hash,
+        enabled_skills_hash,
         persona_hash,
         tool_lines_hash,
         mcp_note_hash,
@@ -954,7 +962,7 @@ fn build_system_prompt_with_query(
     config: &Config,
     workspace: &Path,
     model: &str,
-    disabled_system_skills: &HashSet<String>,
+    enabled_system_skills: &HashSet<String>,
     current_query: Option<&str>,
 ) -> ChatMessage {
     let os_name = if cfg!(windows) {
@@ -975,18 +983,13 @@ fn build_system_prompt_with_query(
         .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
         .unwrap_or_default();
 
-    let skills_section = prompts::discover_all_skills(workspace);
-    let skills_section: Vec<_> = if disabled_system_skills.is_empty() {
-        skills_section
-    } else {
-        skills_section
-            .into_iter()
-            .filter(|s| {
-                s.source != prompts::SkillSource::System
-                    || !prompts::is_system_skill_disabled(&s.path, disabled_system_skills)
-            })
-            .collect()
-    };
+    let skills_section = prompts::discover_all_skills(workspace)
+        .into_iter()
+        .filter(|s| {
+            s.source != prompts::SkillSource::System
+                || prompts::is_system_skill_enabled(&s.path, enabled_system_skills)
+        })
+        .collect::<Vec<_>>();
     let skills_section = prompts::render_skills_catalog(&skills_section, current_query)
         .map(|s| format!("\n\n{s}"))
         .unwrap_or_default();
@@ -1069,7 +1072,7 @@ fn build_system_prompt_with_query_cached(
     config: &Config,
     workspace: &Path,
     model: &str,
-    disabled_system_skills: &HashSet<String>,
+    enabled_system_skills: &HashSet<String>,
     current_query: Option<&str>,
 ) -> ChatMessage {
     let os_name = if cfg!(windows) {
@@ -1090,18 +1093,13 @@ fn build_system_prompt_with_query_cached(
         .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
         .unwrap_or_default();
 
-    let skills_section = prompts::discover_all_skills(workspace);
-    let skills_section: Vec<_> = if disabled_system_skills.is_empty() {
-        skills_section
-    } else {
-        skills_section
-            .into_iter()
-            .filter(|s| {
-                s.source != prompts::SkillSource::System
-                    || !prompts::is_system_skill_disabled(&s.path, disabled_system_skills)
-            })
-            .collect()
-    };
+    let skills_section = prompts::discover_all_skills(workspace)
+        .into_iter()
+        .filter(|s| {
+            s.source != prompts::SkillSource::System
+                || prompts::is_system_skill_enabled(&s.path, enabled_system_skills)
+        })
+        .collect::<Vec<_>>();
     let skills_section = prompts::render_skills_catalog(&skills_section, current_query)
         .map(|s| format!("\n\n{s}"))
         .unwrap_or_default();
@@ -1127,7 +1125,7 @@ fn build_system_prompt_with_query_cached(
     let stable_prefix = build_system_prompt_static_prefix_cached(
         workspace,
         current_query,
-        disabled_system_skills,
+        enabled_system_skills,
         &persona,
         &tool_lines,
         &mcp_note,
@@ -3206,14 +3204,14 @@ async fn ensure_session_loaded_for_api(
 
 fn build_session_skill_payloads(
     workspace: &Path,
-    disabled_system_skills: &HashSet<String>,
+    enabled_system_skills: &HashSet<String>,
 ) -> Vec<serde_json::Value> {
     prompts::discover_skills_by_source(workspace, prompts::SkillSource::System)
         .into_iter()
         .filter_map(|skill| {
             let id = prompts::system_skill_relative_dir(&skill.path)?;
             let group = id.split('/').next().unwrap_or(id.as_str()).to_string();
-            let enabled = !prompts::is_system_skill_disabled(&skill.path, disabled_system_skills);
+            let enabled = prompts::is_system_skill_enabled(&skill.path, enabled_system_skills);
             Some(json!({
                 "id": id,
                 "name": skill.name,
@@ -3226,6 +3224,25 @@ fn build_session_skill_payloads(
         .collect()
 }
 
+fn session_system_skill_status_lists(
+    all_skill_ids: &HashSet<String>,
+    enabled_system_skills: &HashSet<String>,
+) -> (Vec<String>, Vec<String>) {
+    let mut enabled = Vec::new();
+    let mut disabled = Vec::new();
+    for id in all_skill_ids {
+        let path = format!("system://skills/{id}/SKILL.md");
+        if prompts::is_system_skill_enabled(&path, enabled_system_skills) {
+            enabled.push(id.clone());
+        } else {
+            disabled.push(id.clone());
+        }
+    }
+    enabled.sort();
+    disabled.sort();
+    (enabled, disabled)
+}
+
 async fn api_session_skills(
     Query(query): Query<SessionQuery>,
     headers: HeaderMap,
@@ -3235,7 +3252,7 @@ async fn api_session_skills(
 
     let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
     let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
-    let (session_name, workspace, disabled_system_skills) = {
+    let (session_name, workspace, enabled_system_skills) = {
         let sessions = state.sessions.lock().await;
         let Some(session) = sessions.get(&session_id) else {
             return Err((
@@ -3246,19 +3263,25 @@ async fn api_session_skills(
         (
             session.name.clone(),
             session.workspace.clone(),
-            session.disabled_system_skills.clone(),
+            session.enabled_system_skills.clone(),
         )
     };
 
-    let mut disabled: Vec<_> = disabled_system_skills.iter().cloned().collect();
-    disabled.sort();
+    let all_skill_ids =
+        prompts::discover_skills_by_source(&workspace, prompts::SkillSource::System)
+            .iter()
+            .filter_map(|skill| prompts::system_skill_relative_dir(&skill.path))
+            .collect::<HashSet<_>>();
+    let (enabled, disabled) =
+        session_system_skill_status_lists(&all_skill_ids, &enabled_system_skills);
 
     Ok(Json(json!({
         "session": {
             "id": session_id,
             "name": session_name,
         },
-        "skills": build_session_skill_payloads(&workspace, &disabled_system_skills),
+        "skills": build_session_skill_payloads(&workspace, &enabled_system_skills),
+        "enabledSystemSkills": enabled,
         "disabledSystemSkills": disabled,
     })))
 }
@@ -3290,7 +3313,7 @@ async fn api_put_session_skills(
     let persist_gate = session_persist_gate(&session_id);
     let _persist_guard = persist_gate.lock().await;
 
-    let (workspace, all_skill_ids, current_disabled_system_skills) = {
+    let (workspace, all_skill_ids, current_enabled_system_skills) = {
         let sessions = state.sessions.lock().await;
         let Some(session) = sessions.get(&session_id) else {
             return Err((
@@ -3307,7 +3330,7 @@ async fn api_put_session_skills(
         (
             workspace,
             all_skill_ids,
-            session.disabled_system_skills.clone(),
+            session.enabled_system_skills.clone(),
         )
     };
 
@@ -3351,14 +3374,14 @@ async fn api_put_session_skills(
         enabled.insert(id);
     }
 
-    let disabled_system_skills = all_skill_ids
+    let enabled_system_skills = all_skill_ids
         .iter()
         .filter(|id| {
             if managed_skill_ids.contains(*id) {
-                !enabled.contains(*id)
+                enabled.contains(*id)
             } else {
                 let path = format!("system://skills/{id}/SKILL.md");
-                prompts::is_system_skill_disabled(&path, &current_disabled_system_skills)
+                prompts::is_system_skill_enabled(&path, &current_enabled_system_skills)
             }
         })
         .cloned()
@@ -3373,13 +3396,13 @@ async fn api_put_session_skills(
             ));
         };
         let old_session = session.clone();
-        session.disabled_system_skills = disabled_system_skills.clone();
+        session.enabled_system_skills = enabled_system_skills.clone();
         session.updated_at = now_epoch();
         refresh_session_system_prompt(&state, session);
 
-        let skills = build_session_skill_payloads(&workspace, &session.disabled_system_skills);
-        let mut disabled: Vec<_> = session.disabled_system_skills.iter().cloned().collect();
-        disabled.sort();
+        let skills = build_session_skill_payloads(&workspace, &session.enabled_system_skills);
+        let (enabled, disabled) =
+            session_system_skill_status_lists(&all_skill_ids, &session.enabled_system_skills);
         let payload = json!({
             "ok": true,
             "session": {
@@ -3387,6 +3410,7 @@ async fn api_put_session_skills(
                 "name": session.name,
             },
             "skills": skills,
+            "enabledSystemSkills": enabled,
             "disabledSystemSkills": disabled,
         });
 

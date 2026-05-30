@@ -223,42 +223,46 @@ fn collect_skills_dir_mtimes(workspace: &Path) -> Vec<Option<SystemTime>> {
 }
 
 fn discover_all_skills_uncached(workspace: &Path) -> Vec<SkillMeta> {
-    let mut all = Vec::new();
+    let mut merged = Vec::new();
+
+    let append_layer = |merged: &mut Vec<SkillMeta>, layer: Vec<SkillMeta>| {
+        let layer_names = layer
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect::<std::collections::HashSet<_>>();
+        merged.retain(|skill| !layer_names.contains(&skill.name));
+        merged.extend(layer);
+    };
 
     // Layer 1: system (bundled with binary)
     if let Some(dir) = system_skills_dir() {
-        all.extend(discover_skills_in_dir(
-            &dir,
-            SkillSource::System,
-            "system://skills/",
-        ));
+        append_layer(
+            &mut merged,
+            discover_skills_in_dir(&dir, SkillSource::System, "system://skills/"),
+        );
     }
 
     // Layer 2: global (~/.lingclaw/skills/)
     if let Some(dir) = global_skills_dir() {
-        all.extend(discover_skills_in_dir(
-            &dir,
-            SkillSource::Global,
-            "~/.lingclaw/skills/",
-        ));
+        append_layer(
+            &mut merged,
+            discover_skills_in_dir(&dir, SkillSource::Global, "~/.lingclaw/skills/"),
+        );
     }
 
     // Layer 3: session workspace (skills/)
     let session_dir = workspace.join(SKILLS_DIR);
-    all.extend(discover_skills_in_dir(
-        &session_dir,
-        SkillSource::Session,
-        "skills/",
-    ));
+    append_layer(
+        &mut merged,
+        discover_skills_in_dir(&session_dir, SkillSource::Session, "skills/"),
+    );
 
-    // Deduplicate: later source wins (session > global > system)
-    let mut seen = std::collections::HashMap::new();
-    for (idx, skill) in all.iter().enumerate() {
-        seen.insert(skill.name.clone(), idx);
-    }
-    let mut deduped: Vec<SkillMeta> = seen.into_values().map(|idx| all[idx].clone()).collect();
-    deduped.sort_by(|a, b| a.name.cmp(&b.name));
-    deduped
+    // Cross-layer deduplication: later layers still override earlier layers by
+    // skill name, but duplicates within the same layer are preserved. This keeps
+    // namespaced system skills such as `anthropics/pdf` and `openai/pdf`
+    // independently addressable.
+    merged.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.path.cmp(&b.path)));
+    merged
 }
 
 /// Discover skills from a single source layer.
@@ -420,15 +424,9 @@ fn skill_relevance(skill: &SkillMeta, query_tokens: &[String]) -> usize {
         .count()
 }
 
-/// Check whether a system skill path is disabled by any entry in the disabled set.
-///
-/// `path` looks like `system://skills/anthropics/pdf/SKILL.md`.
-/// `disabled` entries are relative segments like `anthropics` or `anthropics/pdf`.
-///
-/// A disabled entry matches if it equals the relative dir or is a prefix of it.
-pub(crate) fn is_system_skill_disabled(path: &str, disabled: &HashSet<String>) -> bool {
+fn system_skill_matches_patterns(path: &str, patterns: &HashSet<String>) -> bool {
     let rel_dir = system_skill_relative_dir(path).unwrap_or_else(|| path.to_string());
-    for pattern in disabled {
+    for pattern in patterns {
         if rel_dir == pattern.as_str() {
             return true;
         }
@@ -440,6 +438,25 @@ pub(crate) fn is_system_skill_disabled(path: &str, disabled: &HashSet<String>) -
         }
     }
     false
+}
+
+/// Check whether a system skill path is disabled by any entry in the disabled set.
+///
+/// `path` looks like `system://skills/anthropics/pdf/SKILL.md`.
+/// `disabled` entries are relative segments like `anthropics` or `anthropics/pdf`.
+///
+/// A disabled entry matches if it equals the relative dir or is a prefix of it.
+pub(crate) fn is_system_skill_disabled(path: &str, disabled: &HashSet<String>) -> bool {
+    system_skill_matches_patterns(path, disabled)
+}
+
+/// Check whether a system skill path is enabled by any entry in the enabled set.
+///
+/// This uses the same relative-dir and parent-pattern matching as disabled
+/// system skills, so an entry like `anthropics` enables all current
+/// `anthropics/...` system skills.
+pub(crate) fn is_system_skill_enabled(path: &str, enabled: &HashSet<String>) -> bool {
+    system_skill_matches_patterns(path, enabled)
 }
 
 /// Extract the relative system skill directory id from a virtual or relative path.

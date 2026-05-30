@@ -39,7 +39,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **Auto 思维可观测性**：当 `/think auto` 且当前模型支持 reasoning effort 时，后端会额外发送 `auto_trace` WebSocket 事件；`/status` 会显示 live runtime think、auto signals 与 request budget 摘要，前端 `Auto Debug` 开关只在本地展示最新一条顶层轨迹，不会写回 session 配置
 - **结构化工具结果**：`ToolOutcome`（output + is_error + duration_ms），前缀式错误检测，schema 约束校验（required/type/range/length），`tool_result` WS 事件携带耗时和错误标记
 - **原子持久化**：会话存档先写 `.tmp` 再 rename（Windows 兼容），加载时自动修剪不完整工具调用
-- **会话版本控制**：`SESSION_VERSION = 5`，旧存档自动迁移并补齐 `show_tools` / `show_reasoning` / `show_react` / `todos` 等字段默认值
+- **会话版本控制**：`SESSION_VERSION = 6`，旧存档自动迁移并补齐 `show_tools` / `show_reasoning` / `show_react` / `todos` / `enabled_system_skills` 等字段默认值
 - **上下文裁剪追踪**：Analyze 阶段裁剪后发送 `context_pruned` WS 事件，包含移除消息数
 - **安全控制**：危险命令检测、沙盒路径解析、SSRF 阻断、重定向阻断、输出/文件大小上限
 
@@ -420,16 +420,16 @@ description: 描述这个 Skill 做什么以及何时触发
 ### 工作原理
 
 - **发现**：系统自动扫描三层目录下的 `skills/*/SKILL.md`
-- **元数据注入**：Skill 名称、来源标签和描述在每轮对话的系统提示中呈现（Level 1：始终可见）
+- **元数据注入**：已启用的 Skill 名称、来源标签和描述在每轮对话的系统提示中呈现（Level 1）
 - **按需加载**：AI 在任务匹配时通过 `read_file` 读取完整 SKILL.md 内容（Level 2）。System 和 Global Skills 使用虚拟路径（如 `system://skills/anthropics/pdf/SKILL.md`、`~/.lingclaw/skills/xxx/SKILL.md`），`read_file`、`list_dir`、`search_files` 均可透明访问
 - **资源引用**：Skill 目录中的参考文件按需读取（Level 3）
 - **去重**：同名 Skill 按 System → Global → Session 顺序加载，后加载的覆盖先前的
-- **Session 级开关**：Settings → Skills 可为当前 session 开启/关闭系统内置 Skills；默认全部开启，关闭后该 system Skill 不再进入当前 session 的系统提示。Global 和 Session-local Skills 暂不在 Settings 中管理，仍按目录自动发现并注入
+- **Session 级开关**：Settings → Skills 可为当前 session 开启/关闭系统内置 Skills；系统 Skills 默认不注入，只有开启并保存后才进入当前 session 的系统提示。Global 和 Session-local Skills 暂不在 Settings 中管理，仍按目录自动发现并注入
 - **运行时管理**：
   - `/skills` — 列出所有 Skills（含来源标签）和工具
-  - `/skills-system` — 列出系统内置 Skills 状态（loaded/disabled）
-  - `/skills-system install <pattern>` — 重新启用之前禁用的 Skill
-  - `/skills-system uninstall <pattern>` — 禁用 Skill（支持组级如 `anthropics` 或单个如 `anthropics/pdf`）
+  - `/skills-system` — 列出系统内置 Skills 状态（enabled/disabled）
+  - `/skills-system install <pattern>` — 启用 Skill（支持组级如 `anthropics` 或单个如 `anthropics/pdf`）
+  - `/skills-system uninstall <pattern>` — 关闭 Skill
   - `/skills-global` — 仅列出全局 Skills
   - `/skills-session` — 仅列出当前 session Skills
 - **部署**：`lingclaw install` 和 `lingclaw update` 会自动将 `docs/reference/skills/` 复制到 `~/.lingclaw/system-skills/`，并将 `docs/reference/agents/` 复制到 `~/.lingclaw/system-agents/`，确保系统 Skills / Sub-Agents 在安装后可用
@@ -728,7 +728,7 @@ static/                           — Vite 构建输出 (由 frontend/ 生成, �
 └── branding/                     — Logo 和品牌资源
 
 docs/reference/templates/       — 6 个提示模板文件 (BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/MEMORY.md)
-docs/reference/skills/          — 17 个系统内置 Skills (安装时部署到 ~/.lingclaw/system-skills/)
+docs/reference/skills/          — 系统内置 Skills (安装时部署到 ~/.lingclaw/system-skills/)
 docs/reference/agents/          — 6 个内置子代理 (explore, researcher, frontend-coder, backend-coder, general-coder, reviewer)
 
 src/tests/                      — 模块测试文件 (~13600 行)
@@ -756,8 +756,8 @@ struct Session {
     show_reasoning: bool,
     show_react: bool,
     todos: TodoSnapshot,
-    disabled_system_skills: HashSet<String>,  // 运行时禁用的系统 Skill 模式
-    version: u32,              // 会话版本 (当前 SESSION_VERSION = 5)
+    enabled_system_skills: HashSet<String>,   // 当前 session 启用注入的系统 Skill 模式
+    version: u32,              // 会话版本 (当前 SESSION_VERSION = 6)
 }
 
 struct TodoSnapshot {

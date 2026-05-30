@@ -447,7 +447,7 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
         &config,
         &session.workspace,
         &active_model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     );
     if let Some(first) = request_messages.first_mut()
         && first.role == "system"
@@ -563,7 +563,7 @@ async fn reset_session_context_and_persist(
                 &config,
                 &session.workspace,
                 &model,
-                &session.disabled_system_skills,
+                &session.enabled_system_skills,
             );
             replace_session_messages(session, vec![sys]);
             session.tool_calls_count = 0;
@@ -918,7 +918,7 @@ async fn handle_system_prompt_command(current_session_id: &str, state: &AppState
                 &config,
                 &session.workspace,
                 &model,
-                &session.disabled_system_skills,
+                &session.enabled_system_skills,
                 latest_query,
             );
             let prompt_tokens =
@@ -1044,9 +1044,9 @@ async fn handle_skills_command(
 
 /// Handle `/skills-system [install|uninstall <pattern>]`.
 ///
-/// Without arguments: list all system skills with loaded/disabled status.
+/// Without arguments: list all system skills with enabled/disabled status.
 /// `uninstall <pattern>`: disable system skills matching the pattern (e.g. `anthropics`, `anthropics/pdf`).
-/// `install <pattern>`:   re-enable previously disabled system skills.
+/// `install <pattern>`:   enable system skills matching the pattern.
 async fn handle_skills_system_command(
     arg: &str,
     current_session_id: &str,
@@ -1077,8 +1077,8 @@ async fn handle_skills_system_command(
                 return command_result(
                     "Usage: /skills-system install <pattern>\n\
                      Examples:\n\
-                     \x20 /skills-system install anthropics        — re-install all anthropics skills\n\
-                     \x20 /skills-system install anthropics/pdf    — re-install only the pdf skill",
+                     \x20 /skills-system install anthropics        — enable all anthropics skills\n\
+                     \x20 /skills-system install anthropics/pdf    — enable only the pdf skill",
                     "system",
                     false,
                 );
@@ -1089,7 +1089,7 @@ async fn handle_skills_system_command(
             "Unknown subcommand. Usage:\n\
              \x20 /skills-system                         — show system skills status\n\
              \x20 /skills-system uninstall <pattern>     — disable a skill or group\n\
-             \x20 /skills-system install <pattern>       — re-enable a skill or group",
+             \x20 /skills-system install <pattern>       — enable a skill or group",
             "system",
             false,
         ),
@@ -1097,14 +1097,14 @@ async fn handle_skills_system_command(
 }
 
 async fn show_system_skills_status(current_session_id: &str, state: &AppState) -> CommandResult {
-    let (workspace, disabled) = {
+    let (workspace, enabled) = {
         let sessions = state.sessions.lock().await;
         let Some(session) = sessions.get(current_session_id) else {
             return command_result("Session not found.", "error", false);
         };
         (
             session.workspace.clone(),
-            session.disabled_system_skills.clone(),
+            session.enabled_system_skills.clone(),
         )
     };
 
@@ -1128,9 +1128,9 @@ async fn show_system_skills_status(current_session_id: &str, state: &AppState) -
         }
     } else {
         for skill in &skills {
-            let is_disabled = prompts::is_system_skill_disabled(&skill.path, &disabled);
-            let status = if is_disabled { "disabled" } else { "loaded" };
-            let status_icon = if is_disabled { "✗" } else { "✓" };
+            let is_enabled = prompts::is_system_skill_enabled(&skill.path, &enabled);
+            let status = if is_enabled { "enabled" } else { "disabled" };
+            let status_icon = if is_enabled { "✓" } else { "✗" };
             if skill.description.is_empty() {
                 output.push_str(&format!(
                     "\n  {status_icon} [{status}] {} ({})",
@@ -1145,10 +1145,10 @@ async fn show_system_skills_status(current_session_id: &str, state: &AppState) -
         }
     }
 
-    if !disabled.is_empty() {
-        let mut sorted: Vec<_> = disabled.iter().cloned().collect();
+    if !enabled.is_empty() {
+        let mut sorted: Vec<_> = enabled.iter().cloned().collect();
         sorted.sort();
-        output.push_str(&format!("\n\nDisabled patterns: {}", sorted.join(", ")));
+        output.push_str(&format!("\n\nEnabled patterns: {}", sorted.join(", ")));
     }
 
     command_result(output, "system", false)
@@ -1202,20 +1202,14 @@ async fn toggle_system_skill(
         );
     }
 
-    // Pre-compute the new disabled set outside the closure so we have access to
-    // `system_skills` for the parent-pattern expansion logic (install sub-skill
-    // when a parent group is disabled → replace parent with sibling disables).
-    let compute_new_disabled = |current: &HashSet<String>| -> HashSet<String> {
+    // Pre-compute the new enabled set outside the closure so we have access to
+    // `system_skills` for parent-pattern expansion logic. If a parent group is
+    // enabled and one child is disabled, replace the parent with the remaining
+    // enabled children.
+    let compute_new_enabled = |current: &HashSet<String>| -> HashSet<String> {
         let mut new_set = current.clone();
         if disable {
-            new_set.insert(pattern.clone());
-        } else {
-            // Remove exact match and any sub-patterns covered by this install
             new_set.retain(|p| p != &pattern && !p.starts_with(&format!("{}/", pattern)));
-
-            // If a parent pattern still covers the installed pattern, expand it:
-            // e.g. disabled={"anthropics"}, install "anthropics/pdf" →
-            //   remove "anthropics", add individual disables for all siblings.
             let parents: Vec<String> = new_set
                 .iter()
                 .filter(|p| pattern.starts_with(&format!("{}/", p)))
@@ -1223,13 +1217,12 @@ async fn toggle_system_skill(
                 .collect();
             for parent in parents {
                 new_set.remove(&parent);
-                // Add individual disable entries for sibling skills not being installed
                 for skill in &system_skills {
                     let rel = skill_relative_dir(&skill.path);
-                    if prompts::is_system_skill_disabled(
+                    if prompts::is_system_skill_enabled(
                         &skill.path,
                         &HashSet::from([parent.clone()]),
-                    ) && !prompts::is_system_skill_disabled(
+                    ) && !prompts::is_system_skill_enabled(
                         &skill.path,
                         &HashSet::from([pattern.clone()]),
                     ) {
@@ -1237,20 +1230,50 @@ async fn toggle_system_skill(
                     }
                 }
             }
+        } else {
+            if new_set
+                .iter()
+                .any(|p| p == &pattern || pattern.starts_with(&format!("{}/", p)))
+            {
+                return new_set;
+            }
+            new_set.retain(|p| p != &pattern && !p.starts_with(&format!("{}/", pattern)));
+            new_set.insert(pattern.clone());
         }
         new_set
     };
 
     let pattern_for_msg = pattern.clone();
+    let config = state.config();
     match persist_session_update(
         state,
         current_session_id,
-        |session| session.disabled_system_skills.clone(),
         |session| {
-            session.disabled_system_skills = compute_new_disabled(&session.disabled_system_skills);
+            (
+                session.enabled_system_skills.clone(),
+                session.messages.clone(),
+                session.updated_at,
+            )
         },
-        |session, old| {
-            session.disabled_system_skills = old;
+        |session| {
+            session.enabled_system_skills = compute_new_enabled(&session.enabled_system_skills);
+            let model = session.effective_model(&config.model).to_string();
+            let sys = build_system_prompt(
+                &config,
+                &session.workspace,
+                &model,
+                &session.enabled_system_skills,
+            );
+            if let Some(first) = session.messages.first_mut()
+                && first.role == "system"
+            {
+                *first = sys;
+            }
+        },
+        |session, (enabled_system_skills, messages, updated_at)| {
+            session.enabled_system_skills = enabled_system_skills;
+            session.messages = messages;
+            session.updated_at = updated_at;
         },
     )
     .await

@@ -174,7 +174,7 @@ struct PersistedSessionView<'a> {
     show_tools: bool,
     show_reasoning: bool,
     #[serde(skip_serializing_if = "HashSet::is_empty")]
-    disabled_system_skills: &'a HashSet<String>,
+    enabled_system_skills: &'a HashSet<String>,
     #[serde(skip_serializing_if = "HashSet::is_empty")]
     failed_tool_results: HashSet<String>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
@@ -579,7 +579,7 @@ fn build_session_persist_payload(session: &Session) -> Result<String, String> {
         show_react: session.show_react,
         show_tools: session.show_tools,
         show_reasoning: session.show_reasoning,
-        disabled_system_skills: &session.disabled_system_skills,
+        enabled_system_skills: &session.enabled_system_skills,
         failed_tool_results,
         subagent_snapshots,
         todos: &session.todos,
@@ -668,7 +668,7 @@ pub(crate) fn refresh_session_system_prompt(state: &AppState, session: &mut Sess
         &config,
         &session.workspace,
         &model,
-        &session.disabled_system_skills,
+        &session.enabled_system_skills,
     );
     if let Some(first) = session.messages.first_mut()
         && first.role == "system"

@@ -137,7 +137,7 @@ pub(crate) async fn ensure_session_ready(
                 &config,
                 &session.workspace,
                 &model,
-                &session.disabled_system_skills,
+                &session.enabled_system_skills,
             );
             session.messages.push(sys);
             (session, true)

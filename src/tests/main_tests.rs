@@ -258,6 +258,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -1722,6 +1723,7 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -1779,6 +1781,7 @@ fn build_history_payload_marks_failed_tool_result_with_is_error() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: HashSet::from(["task_1".to_string()]),
         subagent_snapshots: HashMap::new(),
@@ -1838,6 +1841,7 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
         show_react: default_show_react(),
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -1894,6 +1898,7 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
         show_react: default_show_react(),
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -1979,6 +1984,7 @@ fn build_history_payload_includes_thinking_only_assistant_messages() {
         show_react: default_show_react(),
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -2051,6 +2057,7 @@ fn build_history_payload_redacts_exec_tool_call_arguments() {
         show_react: default_show_react(),
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -2129,6 +2136,7 @@ fn build_history_payload_includes_subagent_snapshot_on_task_results() {
         show_react: default_show_react(),
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::from([(
@@ -2234,6 +2242,7 @@ fn build_history_payload_redacts_exec_args_in_subagent_snapshot() {
         show_react: default_show_react(),
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::from([(
@@ -2336,6 +2345,7 @@ fn build_history_payload_normalizes_legacy_subagent_snapshot_keys() {
         show_react: default_show_react(),
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::from([(
@@ -2457,6 +2467,7 @@ fn build_history_payload_distinguishes_repeated_task_tool_call_ids() {
         show_react: default_show_react(),
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::from([
@@ -2588,6 +2599,7 @@ fn replace_session_messages_rekeys_subagent_snapshots_for_remaining_history() {
         show_react: default_show_react(),
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::from([
@@ -2785,6 +2797,7 @@ fn build_history_payload_omits_todos_tool_messages() {
         show_react: default_show_react(),
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -4510,6 +4523,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -4641,6 +4655,7 @@ fn save_session_to_disk_redacts_exec_arguments_in_messages_and_snapshots() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::from([(
@@ -4723,6 +4738,7 @@ fn save_session_to_disk_overwrites_existing_file() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -4811,6 +4827,7 @@ fn save_session_to_disk_skips_identical_payload_rewrite() {
         show_react: true,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -5103,7 +5120,7 @@ async fn api_sessions_includes_corrupt_persisted_sessions() {
 }
 
 #[tokio::test]
-async fn api_session_skills_defaults_system_skills_to_enabled() {
+async fn api_session_skills_defaults_system_skills_to_disabled() {
     let state = Arc::new(test_app_state());
     let session_id = format!("skills-default-{}", now_epoch());
     let workspace = session_workspace_path(&session_id);
@@ -5139,12 +5156,16 @@ async fn api_session_skills_defaults_system_skills_to_enabled() {
         .as_array()
         .expect("skills should be an array");
     assert!(!skills.is_empty(), "system skills should be discovered");
-    assert!(skills.iter().all(|skill| skill["enabled"] == true));
-    assert_eq!(payload["disabledSystemSkills"], json!([]));
+    assert!(skills.iter().all(|skill| skill["enabled"] == false));
+    assert_eq!(payload["enabledSystemSkills"], json!([]));
+    let disabled = payload["disabledSystemSkills"]
+        .as_array()
+        .expect("disabled list should be present");
+    assert_eq!(disabled.len(), skills.len());
 }
 
 #[tokio::test]
-async fn api_put_session_skills_persists_disabled_set_and_refreshes_prompt() {
+async fn api_put_session_skills_persists_enabled_set_and_refreshes_prompt() {
     let state = Arc::new(test_app_state());
     let session_id = format!("skills-put-{}", now_epoch());
     let workspace = session_workspace_path(&session_id);
@@ -5182,18 +5203,14 @@ async fn api_put_session_skills_persists_disabled_set_and_refreshes_prompt() {
     .expect("session skills should save");
 
     assert_eq!(payload["ok"], true);
-    let disabled = payload["disabledSystemSkills"]
-        .as_array()
-        .expect("disabled list should be present");
-    assert!(disabled.iter().any(|id| id == "anthropics/xlsx"));
-    assert!(!disabled.iter().any(|id| id == "anthropics/pdf"));
+    assert_eq!(payload["enabledSystemSkills"], json!(["anthropics/pdf"]));
 
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&session_id)
         .expect("session should remain loaded");
-    assert!(session.disabled_system_skills.contains("anthropics/xlsx"));
-    assert!(!session.disabled_system_skills.contains("anthropics/pdf"));
+    assert!(session.enabled_system_skills.contains("anthropics/pdf"));
+    assert!(!session.enabled_system_skills.contains("anthropics/xlsx"));
     let system_prompt = session.messages[0]
         .content
         .as_deref()
@@ -5203,7 +5220,8 @@ async fn api_put_session_skills_persists_disabled_set_and_refreshes_prompt() {
     drop(sessions);
 
     let persisted = load_session_from_disk(&session_id).expect("session should persist");
-    assert!(persisted.disabled_system_skills.contains("anthropics/xlsx"));
+    assert!(persisted.enabled_system_skills.contains("anthropics/pdf"));
+    assert!(persisted.disabled_system_skills.is_empty());
 }
 
 #[tokio::test]
@@ -5245,22 +5263,22 @@ async fn api_put_session_skills_only_updates_client_known_skill_ids() {
     .expect("session skills should save");
 
     assert_eq!(payload["ok"], true);
-    assert_eq!(payload["disabledSystemSkills"], json!([]));
+    assert_eq!(payload["enabledSystemSkills"], json!(["anthropics/pdf"]));
 
     let sessions = state.sessions.lock().await;
     let session = sessions
         .get(&session_id)
         .expect("session should remain loaded");
     assert!(
-        session.disabled_system_skills.is_empty(),
-        "skills outside knownSystemSkills should keep their existing enabled state"
+        !session.enabled_system_skills.contains("anthropics/xlsx"),
+        "skills outside knownSystemSkills should keep their existing disabled state"
     );
     let system_prompt = session.messages[0]
         .content
         .as_deref()
         .expect("system prompt should be refreshed");
     assert!(system_prompt.contains("system://skills/anthropics/pdf/SKILL.md"));
-    assert!(system_prompt.contains("system://skills/anthropics/xlsx/SKILL.md"));
+    assert!(!system_prompt.contains("system://skills/anthropics/xlsx/SKILL.md"));
 }
 
 #[tokio::test]
@@ -5349,7 +5367,7 @@ async fn api_session_skills_reflects_skills_system_command_state() {
 
     let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
     let result = handle_command(
-        "/skills-system uninstall anthropics/pdf",
+        "/skills-system install anthropics/pdf",
         &session_id,
         1,
         &state,
@@ -5379,7 +5397,80 @@ async fn api_session_skills_reflects_skills_system_command_state() {
         .iter()
         .find(|skill| skill["id"] == "anthropics/pdf")
         .expect("pdf skill should be listed");
-    assert_eq!(pdf["enabled"], false);
+    assert_eq!(pdf["enabled"], true);
+}
+
+#[tokio::test]
+async fn api_session_skills_expands_enabled_group_patterns_for_round_trip() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("skills-group-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+
+    let mut session = test_session(&session_id, "Skills Group", None);
+    session.workspace = workspace;
+    session.version = SESSION_VERSION;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+    let result = handle_command(
+        "/skills-system install anthropics",
+        &session_id,
+        1,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("skills-system command should resolve");
+    assert_eq!(result.response_type, "system");
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    let Json(payload) = api_session_skills(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers.clone(),
+        State(state.clone()),
+    )
+    .await
+    .expect("session skills should load");
+
+    let enabled = payload["enabledSystemSkills"]
+        .as_array()
+        .expect("enabled list should be present");
+    assert!(
+        enabled.iter().all(|id| id != "anthropics"),
+        "GET should expose concrete skill ids, not persisted group patterns"
+    );
+    assert!(enabled.iter().any(|id| id == "anthropics/pdf"));
+
+    let Json(round_trip_payload) = api_put_session_skills(
+        Query(SessionQuery {
+            session: Some(session_id),
+        }),
+        headers,
+        State(state),
+        Json(SessionSkillsUpdateRequest {
+            enabled_system_skills: enabled
+                .iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect(),
+            known_system_skills: None,
+        }),
+    )
+    .await
+    .expect("expanded enabled ids should be accepted by PUT");
+    assert_eq!(round_trip_payload["ok"], true);
 }
 
 #[tokio::test]
@@ -6114,6 +6205,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -6769,6 +6861,7 @@ fn resolve_session_target_for_command_accepts_persisted_empty_session_prefix() {
         show_react: false,
         show_tools: true,
         show_reasoning: true,
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
@@ -12177,6 +12270,7 @@ fn trim_incomplete_tool_calls_in_session_drops_orphaned_subagent_snapshots() {
         show_react: default_show_react(),
         show_tools: default_show_tools(),
         show_reasoning: default_show_reasoning(),
+        enabled_system_skills: HashSet::new(),
         disabled_system_skills: HashSet::new(),
         failed_tool_results: HashSet::from(["tc1".to_string()]),
         subagent_snapshots: HashMap::from([(

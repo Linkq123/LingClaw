@@ -1729,8 +1729,9 @@ function SkillsTab({
         </button>
       </div>
       <div className="skills-summary">
-        {enabledCount} of {skills.length} system skills enabled. Global and session-local skills are
-        still discovered automatically.
+        {enabledCount} of {skills.length} system skills enabled. System skills are off by default
+        and are injected only after you enable and save them here. Global and session-local skills
+        are still discovered automatically.
       </div>
       <div className="skills-list">
         {visibleSkills.length === 0 ? (
