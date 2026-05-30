@@ -295,6 +295,7 @@ async fn handle_idle_socket_input_broadcasts_session_list_when_session_set_chang
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
     ];
     let current_types = current_events
         .iter()
@@ -433,6 +434,8 @@ async fn resolve_or_create_socket_session_broadcasts_session_list_for_fresh_sess
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
     ];
     let current_types = current_events
         .iter()
@@ -440,7 +443,9 @@ async fn resolve_or_create_socket_session_broadcasts_session_list_for_fresh_sess
         .collect::<Vec<_>>();
     assert!(current_types.contains(&"session".to_string()));
     assert!(current_types.contains(&"view_state".to_string()));
+    assert!(current_types.contains(&"todos_state".to_string()));
     assert!(current_types.contains(&"history".to_string()));
+    assert!(current_types.contains(&"session_list".to_string()));
 
     let other_parsed = recv_json_with_timeout(&mut other_rx).await;
     assert_eq!(other_parsed["type"].as_str(), Some("session_list"));
@@ -498,6 +503,7 @@ async fn resolve_or_create_socket_session_cancels_old_connection_before_replay()
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
     ];
     let current_types = current_events
         .iter()
@@ -505,6 +511,7 @@ async fn resolve_or_create_socket_session_cancels_old_connection_before_replay()
         .collect::<Vec<_>>();
     assert!(current_types.contains(&"session".to_string()));
     assert!(current_types.contains(&"view_state".to_string()));
+    assert!(current_types.contains(&"todos_state".to_string()));
     assert!(current_types.contains(&"history".to_string()));
 }
 
@@ -582,6 +589,7 @@ async fn resolve_or_create_socket_session_replays_live_tail_for_running_session(
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
     ];
     let current_types = current_events
         .iter()
@@ -589,6 +597,7 @@ async fn resolve_or_create_socket_session_replays_live_tail_for_running_session(
         .collect::<Vec<_>>();
     assert!(current_types.contains(&"session".to_string()));
     assert!(current_types.contains(&"view_state".to_string()));
+    assert!(current_types.contains(&"todos_state".to_string()));
     assert!(current_types.contains(&"history".to_string()));
     assert!(current_types.contains(&"start".to_string()));
     assert!(current_events.iter().any(|payload| {

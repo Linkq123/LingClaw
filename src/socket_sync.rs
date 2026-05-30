@@ -113,15 +113,12 @@ pub(crate) fn build_session_list_payload(state: &AppState) -> serde_json::Value 
 
 pub(crate) async fn broadcast_session_list_payload(state: &AppState) {
     let payload = build_session_list_payload(state);
-    let clients = {
+    let session_ids = {
         let clients = state.session_clients.lock().await;
-        clients
-            .values()
-            .map(|binding| binding.tx.clone())
-            .collect::<Vec<_>>()
+        clients.keys().cloned().collect::<Vec<_>>()
     };
-    for tx in clients {
-        ws_send(&tx, &payload).await;
+    for session_id in session_ids {
+        crate::send_session_client_event(state, &session_id, payload.clone()).await;
     }
 }
 

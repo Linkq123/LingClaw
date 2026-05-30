@@ -847,6 +847,8 @@ const LIVE_REPLAY_CAP: usize = 128 * 1024;
 /// long-running rounds with many sub-agent / orchestration events.
 const DELEGATED_EVENTS_CAP: usize = 10_000;
 const TOOL_PROGRESS_HEARTBEAT_SECS: u64 = 1;
+const LIVE_CLIENT_SEND_BACKPRESSURE_TIMEOUT_MS: u64 = 25;
+const LIVE_CLIENT_SEND_BACKPRESSURE_MAX_TIMEOUTS: usize = 4;
 
 // ── System Prompt ────────────────────────────────────────────────────────────
 
@@ -1627,30 +1629,7 @@ pub(crate) async fn send_session_client_event(
         return;
     };
 
-    let mut unsent_start = 0usize;
-    while unsent_start < events.len() {
-        let payload = events[unsent_start].to_string();
-        match tx.try_send(payload) {
-            Ok(()) => {
-                unsent_start += 1;
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                requeue_live_client_events(
-                    state,
-                    session_id,
-                    connection_id,
-                    events[unsent_start..].to_vec(),
-                )
-                .await;
-                break;
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                unbind_session_connection_if_matches(state, session_id, connection_id).await;
-                break;
-            }
-        }
-    }
-    if unsent_start == events.len() {
+    if send_live_client_events_to_writer(state, session_id, connection_id, &tx, events).await {
         finish_live_client_send(state, session_id, connection_id, Vec::new()).await;
     }
 }
@@ -1774,26 +1753,8 @@ async fn flush_queued_live_client_events(state: &AppState, session_id: &str, con
             return;
         };
 
-        let mut unsent_start = 0usize;
-        while unsent_start < events.len() {
-            let payload = events[unsent_start].to_string();
-            match tx.try_send(payload.clone()) {
-                Ok(()) => {
-                    unsent_start += 1;
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    if tx.send(payload).await.is_err() {
-                        unbind_session_connection_if_matches(state, session_id, connection_id)
-                            .await;
-                        return;
-                    }
-                    unsent_start += 1;
-                }
-                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    unbind_session_connection_if_matches(state, session_id, connection_id).await;
-                    return;
-                }
-            }
+        if !send_live_client_events_to_writer(state, session_id, connection_id, &tx, events).await {
+            return;
         }
 
         let mut clients = state.session_clients.lock().await;
@@ -1837,18 +1798,60 @@ async fn finish_live_client_send(
     }
 }
 
-async fn requeue_live_client_events(
+async fn send_live_client_events_to_writer(
     state: &AppState,
     session_id: &str,
     connection_id: u64,
+    tx: &WsTx,
     events: Vec<serde_json::Value>,
-) {
-    if events.is_empty() {
-        return;
+) -> bool {
+    let mut unsent_start = 0usize;
+    let mut consecutive_timeouts = 0usize;
+    while unsent_start < events.len() {
+        let payload = events[unsent_start].to_string();
+        match tx.try_send(payload.clone()) {
+            Ok(()) => {
+                consecutive_timeouts = 0;
+                unsent_start += 1;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                match tx
+                    .send_timeout(
+                        payload,
+                        Duration::from_millis(LIVE_CLIENT_SEND_BACKPRESSURE_TIMEOUT_MS),
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        consecutive_timeouts = 0;
+                        unsent_start += 1;
+                    }
+                    Err(tokio::sync::mpsc::error::SendTimeoutError::Timeout(_)) => {
+                        consecutive_timeouts += 1;
+                        if consecutive_timeouts >= LIVE_CLIENT_SEND_BACKPRESSURE_MAX_TIMEOUTS {
+                            disconnect_session_connection_if_matches(
+                                state,
+                                session_id,
+                                connection_id,
+                            )
+                            .await;
+                            return false;
+                        }
+                    }
+                    Err(tokio::sync::mpsc::error::SendTimeoutError::Closed(_)) => {
+                        unbind_session_connection_if_matches(state, session_id, connection_id)
+                            .await;
+                        return false;
+                    }
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                unbind_session_connection_if_matches(state, session_id, connection_id).await;
+                return false;
+            }
+        }
     }
-
-    finish_live_client_send(state, session_id, connection_id, events).await;
-    flush_queued_live_client_events(state, session_id, connection_id).await;
+    true
 }
 
 async fn take_live_client_events_for_send(
@@ -1911,8 +1914,7 @@ async fn record_tool_output_event_for_replay_and_client(
                                 .unwrap_or_default()
                                 .to_string();
                             if !orchestrate_id.is_empty()
-                                && round.delegated_events.len() + usize::from(can_store_task_start)
-                                    <= DELEGATED_EVENTS_CAP
+                                && round.delegated_events.len() < DELEGATED_EVENTS_CAP
                             {
                                 if let Some(existing) =
                                     round.delegated_events.iter_mut().rev().find(|existing| {
@@ -1996,30 +1998,7 @@ async fn record_tool_output_event_for_replay_and_client(
         return;
     };
 
-    let mut unsent_start = 0usize;
-    while unsent_start < events.len() {
-        let payload = events[unsent_start].to_string();
-        match tx.try_send(payload) {
-            Ok(()) => {
-                unsent_start += 1;
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                requeue_live_client_events(
-                    state,
-                    session_id,
-                    connection_id,
-                    events[unsent_start..].to_vec(),
-                )
-                .await;
-                break;
-            }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                unbind_session_connection_if_matches(state, session_id, connection_id).await;
-                break;
-            }
-        }
-    }
-    if unsent_start == events.len() {
+    if send_live_client_events_to_writer(state, session_id, connection_id, &tx, events).await {
         finish_live_client_send(state, session_id, connection_id, Vec::new()).await;
     }
 }
@@ -2709,15 +2688,7 @@ async fn dispatch_live_event(
         return;
     };
 
-    let mut all_sent = true;
-    for pending_event in events {
-        if !ws_send(&tx, &pending_event).await {
-            unbind_session_connection_if_matches(state, session_id, connection_id).await;
-            all_sent = false;
-            break;
-        }
-    }
-    if all_sent {
+    if send_live_client_events_to_writer(state, session_id, connection_id, &tx, events).await {
         finish_live_client_send(state, session_id, connection_id, Vec::new()).await;
     }
 }

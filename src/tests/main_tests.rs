@@ -4173,6 +4173,8 @@ fn resolve_or_create_socket_session_honors_requested_session() {
             .expect("second payload should be sent"),
         rt.block_on(rx.recv())
             .expect("third payload should be sent"),
+        rt.block_on(rx.recv())
+            .expect("fourth payload should be sent"),
     ];
     let payload_types = payloads
         .iter()
@@ -4186,6 +4188,7 @@ fn resolve_or_create_socket_session_honors_requested_session() {
         .collect::<Vec<_>>();
     assert!(payload_types.contains(&"session".to_string()));
     assert!(payload_types.contains(&"view_state".to_string()));
+    assert!(payload_types.contains(&"todos_state".to_string()));
     assert!(payload_types.contains(&"history".to_string()));
 }
 
@@ -6718,7 +6721,7 @@ fn switch_socket_session_binds_new_session_before_replay_so_live_events_are_not_
 
     let payloads = rt.block_on(async {
         let mut events = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..6 {
             let payload = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
                 .await
                 .expect("payload should arrive before timeout")
@@ -6892,7 +6895,7 @@ fn handle_command_reports_mcp_load_failures() {
 }
 
 #[test]
-fn finish_session_replay_flushes_pending_events_through_serialized_sender() {
+fn finish_session_replay_disconnects_slow_client_when_writer_queue_stays_full() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = Arc::new(test_app_state());
     let session_id = format!("live-replay-flush-{}", now_epoch());
@@ -6930,13 +6933,6 @@ fn finish_session_replay_flushes_pending_events_through_serialized_sender() {
 
     rt.block_on(finish_session_replay(state.as_ref(), &session_id, 1));
 
-    rt.block_on(dispatch_live_event(
-        state.as_ref(),
-        &session_id,
-        1,
-        json!({"type":"delta","content":"live second"}),
-    ));
-
     for _ in 0..writer_capacity {
         assert_eq!(
             bound_rx
@@ -6952,15 +6948,10 @@ fn finish_session_replay_flushes_pending_events_through_serialized_sender() {
 
     rt.block_on(async {
         let clients = state.session_clients.lock().await;
-        let binding = clients
-            .get(&session_id)
-            .expect("session client binding should exist");
-        assert!(binding.replay_ready);
-        assert!(binding.live_send_in_progress);
-        assert_eq!(binding.pending_events.len(), 3);
-        assert_eq!(binding.pending_events[0]["type"], "start");
-        assert_eq!(binding.pending_events[1]["content"], "replayed first");
-        assert_eq!(binding.pending_events[2]["content"], "live second");
+        assert!(
+            !clients.contains_key(&session_id),
+            "persistently full writer queue should disconnect the slow client"
+        );
     });
 }
 
@@ -9364,7 +9355,7 @@ fn best_effort_tool_output_preserves_replay_when_writer_queue_is_full() {
 }
 
 #[test]
-fn best_effort_tool_output_retries_live_send_after_queue_recovers() {
+fn best_effort_tool_output_disconnects_slow_client_when_writer_queue_stays_full() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = Arc::new(test_app_state());
     let session_id = format!("live-tool-output-retry-{}", now_epoch());
@@ -9447,48 +9438,17 @@ fn best_effort_tool_output_retries_live_send_after_queue_recovers() {
         Err(tokio::sync::mpsc::error::TryRecvError::Empty)
     ));
 
-    rt.block_on(forward_tool_output_event_best_effort(
-        &dummy_live_tx,
-        json!({
-            "type":"tool_output",
-            "id":"tool-1",
-            "name":"exec",
-            "stream":"stdout",
-            "chunk":"live output",
-        }),
-        Some(&replay_ctx),
-    ));
-
-    let queued_output = serde_json::from_str::<serde_json::Value>(
-        &bound_rx
-            .try_recv()
-            .expect("pending tool output should flush once the writer recovers"),
-    )
-    .expect("queued payload should be valid json");
-    assert_eq!(queued_output["type"], "tool_output");
-    assert_eq!(queued_output["chunk"], "queued output");
-
-    let live_output = serde_json::from_str::<serde_json::Value>(
-        &bound_rx
-            .try_recv()
-            .expect("current tool output should follow the flushed backlog"),
-    )
-    .expect("live payload should be valid json");
-    assert_eq!(live_output["type"], "tool_output");
-    assert_eq!(live_output["chunk"], "live output");
-
     rt.block_on(async {
         let clients = state.session_clients.lock().await;
-        let binding = clients
-            .get(&session_id)
-            .expect("session client binding should exist");
-        assert!(binding.pending_events.is_empty());
-        assert!(!binding.live_send_in_progress);
+        assert!(
+            !clients.contains_key(&session_id),
+            "persistently full writer queue should disconnect the slow client"
+        );
     });
 }
 
 #[test]
-fn live_dispatch_serializes_normal_events_behind_pending_tool_output_flush() {
+fn live_dispatch_serializes_normal_events_after_recovered_tool_output_flush() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = Arc::new(test_app_state());
     let session_id = format!("live-tool-output-serialize-{}", now_epoch());
@@ -9546,27 +9506,34 @@ fn live_dispatch_serializes_normal_events_behind_pending_tool_output_flush() {
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
-    rt.block_on(forward_tool_output_event_best_effort(
-        &dummy_live_tx,
-        json!({
-            "type":"tool_output",
-            "id":"tool-1",
-            "name":"exec",
-            "stream":"stdout",
-            "chunk":"queued output",
-        }),
-        Some(&replay_ctx),
-    ));
+    let forward = rt.block_on(async {
+        tokio::spawn(async move {
+            forward_tool_output_event_best_effort(
+                &dummy_live_tx,
+                json!({
+                    "type":"tool_output",
+                    "id":"tool-1",
+                    "name":"exec",
+                    "stream":"stdout",
+                    "chunk":"queued output",
+                }),
+                Some(&replay_ctx),
+            )
+            .await;
+        })
+    });
 
     for _ in 0..writer_capacity {
-        let _ = bound_rx
-            .try_recv()
-            .expect("sentinel should still be queued");
+        let _ = rt.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+                .await
+                .expect("sentinel should arrive before timeout")
+                .expect("sentinel should be delivered")
+        });
     }
-    assert!(matches!(
-        bound_rx.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
+    rt.block_on(async {
+        forward.await.expect("forward task should complete");
+    });
 
     rt.block_on(dispatch_live_event(
         &state,
@@ -9848,7 +9815,7 @@ fn synthetic_orchestration_keeps_replayable_open_state_when_only_panel_fits() {
 }
 
 #[test]
-fn best_effort_tool_output_flushes_pending_live_events_on_next_dispatch() {
+fn best_effort_tool_output_preserves_order_after_writer_queue_recovers() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = Arc::new(test_app_state());
     let session_id = format!("live-tool-output-flush-{}", now_epoch());
@@ -9906,34 +9873,43 @@ fn best_effort_tool_output_flushes_pending_live_events_on_next_dispatch() {
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
-    rt.block_on(forward_tool_output_event_best_effort(
-        &dummy_live_tx,
-        json!({
-            "type":"tool_output",
-            "id":"tool-1",
-            "name":"exec",
-            "stream":"stdout",
-            "chunk":"queued output",
-        }),
-        Some(&replay_ctx),
-    ));
-
-    rt.block_on(async {
-        let clients = state.session_clients.lock().await;
-        let binding = clients
-            .get(&session_id)
-            .expect("session client binding should exist");
-        assert_eq!(binding.pending_events.len(), 1);
+    let forward = rt.block_on(async {
+        tokio::spawn(async move {
+            forward_tool_output_event_best_effort(
+                &dummy_live_tx,
+                json!({
+                    "type":"tool_output",
+                    "id":"tool-1",
+                    "name":"exec",
+                    "stream":"stdout",
+                    "chunk":"queued output",
+                }),
+                Some(&replay_ctx),
+            )
+            .await;
+        })
     });
 
     for _ in 0..writer_capacity {
         assert_eq!(
-            bound_rx
-                .try_recv()
-                .expect("sentinel should still be queued"),
+            rt.block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())
+                    .await
+                    .expect("sentinel should arrive before timeout")
+                    .expect("sentinel should be delivered")
+            }),
             json!({"type":"sentinel"}).to_string()
         );
     }
+    rt.block_on(async {
+        forward.await.expect("forward task should complete");
+        let clients = state.session_clients.lock().await;
+        let binding = clients
+            .get(&session_id)
+            .expect("session client binding should exist");
+        assert!(binding.pending_events.is_empty());
+        assert!(!binding.live_send_in_progress);
+    });
 
     rt.block_on(dispatch_live_event(
         &state,
