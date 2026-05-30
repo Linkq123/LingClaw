@@ -38,6 +38,10 @@ const env = await client.beta.environments.create({
 });
 ```
 
+### Self-hosted sandboxes
+
+To run tool execution in **your own infrastructure** instead of Anthropic's, set `config: {type: "self_hosted"}` — the agent loop stays on Anthropic's side, but `bash` / file ops / code execute in a container you control via an outbound-polling worker. The `networking` block does not apply (you control egress). Resource mounting (`file`, `github_repository`) and memory stores behave differently — see `shared/managed-agents-self-hosted-sandboxes.md` for the worker, credentials, and cloud-vs-self-hosted comparison.
+
 ### Environment CRUD
 
 | Operation        | Method   | Path                                       | Notes |
@@ -63,7 +67,6 @@ Upload a file first via the Files API, then reference by `file_id` + `mount_path
 // 1. Upload
 const file = await client.beta.files.upload({
   file: fs.createReadStream("data.csv"),
-  purpose: "agent",
 });
 
 // 2. Attach as a session resource
@@ -136,7 +139,7 @@ Repositories are attached for the lifetime of the session — to change which re
 const agent = await client.beta.agents.create(
   {
     name: 'GitHub Agent',
-    model: 'claude-opus-4-7',
+    model: 'claude-opus-4-8',
     mcp_servers: [
       { type: 'url', name: 'github', url: 'https://api.githubcopilot.com/mcp/' },
     ],
@@ -170,7 +173,7 @@ import os
 
 agent = client.beta.agents.create(
     name="GitHub Agent",
-    model="claude-opus-4-7",
+    model="claude-opus-4-8",
     mcp_servers=[{
         "type": "url",
         "name": "github",

@@ -8,11 +8,11 @@ Use this when a user wants to set up a Managed Agent from scratch. Three steps: 
 
 ---
 
-Claude Managed Agents is a hosted agent: Anthropic runs the agent loop on its orchestration layer and provisions a sandboxed container per session where the agent's tools execute. You supply the agent config and the environment config; the harness — event stream, sandbox orchestration, prompt caching, context compaction, and extended thinking — is handled for you.
+Claude Managed Agents is a hosted agent: Anthropic runs the agent loop on its orchestration layer and provisions a sandboxed container per session where the agent's tools execute (or, with a `self_hosted` environment, your own worker runs the tools — see `shared/managed-agents-self-hosted-sandboxes.md`). You supply the agent config and the environment config; the harness — event stream, sandbox orchestration, prompt caching, context compaction, and extended thinking — is handled for you.
 
 **What you supply:**
 - **An agent config** — tools, skills, model, system prompt. Reusable and versioned.
-- **An environment config** — the sandbox your agent's tools execute in (networking, packages). Reusable across agents.
+- **An environment config** — the sandbox your agent's tools execute in (`cloud`: networking, packages; or `self_hosted`: your own infra). Reusable across agents.
 
 Each run of the agent is a **session**.
 
@@ -51,7 +51,7 @@ Three rounds. Batch the questions in each round; don't ask them one at a time.
 
 **Round B — Skills, files, and repos.** What the agent has on hand when it starts.
 
-*Skills* — two types; both work the same way — Claude auto-uses them when relevant. Max 64 per agent.
+*Skills* — two types; both work the same way — Claude auto-uses them when relevant. Max 20 per agent.
 - [ ] **Pre-built Agent Skills**: `xlsx`, `docx`, `pptx`, `pdf`. Reference by name.
 - [ ] **Custom Skills**: skills uploaded to the user's org via the Skills API. Reference by `skill_id` + optional `version`. If the skill doesn't exist yet, walk the user through `POST /v1/skills` + `POST /v1/skills/{id}/versions` (beta header `skills-2025-10-02`). Full detail: `shared/managed-agents-tools.md` → Skills + Skills API.
 
@@ -74,7 +74,7 @@ Emit as `resources: [{type: "file", file_id, mount_path}]`. Max 999 file resourc
 - [ ] Networking: unrestricted internet from the container, or lock egress to specific hosts? (If locked, MCP server domains must be in `allowed_hosts` or tools silently fail.)
 - [ ] Name?
 - [ ] Job (one or two sentences — becomes the system prompt)?
-- [ ] Model? (default `claude-opus-4-7`)
+- [ ] Model? (default `claude-opus-4-8`)
 
 ---
 

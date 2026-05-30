@@ -155,7 +155,7 @@
 
 ## 4.3 GET/PUT /api/session-skills
 
-管理指定 session 可注入的系统内置 Skills。该接口只覆盖 `system` 来源的 Skills；`global` 和 `session` 来源仍按目录自动发现并注入，不在 Settings 页面中启停。
+管理指定 session 可注入的系统内置 Skills。系统 Skills 默认不注入，只有在该 session 中启用后才进入系统提示。该接口只覆盖 `system` 来源的 Skills；`global` 和 `session` 来源仍按目录自动发现并注入，不在 Settings 页面中启停。
 
 ### 查询参数
 
@@ -176,10 +176,11 @@
       "description": "PDF processing workflow",
       "path": "system://skills/anthropics/pdf/SKILL.md",
       "group": "anthropics",
-      "enabled": true
+      "enabled": false
     }
   ],
-  "disabledSystemSkills": []
+  "enabledSystemSkills": [],
+  "disabledSystemSkills": ["anthropics/pdf"]
 }
 ```
 
@@ -202,6 +203,7 @@
     "name": "Main"
   },
   "skills": [],
+  "enabledSystemSkills": ["anthropics/pdf", "anthropics/xlsx"],
   "disabledSystemSkills": ["anthropics/pptx"]
 }
 ```
@@ -209,10 +211,10 @@
 ### 说明
 
 - `skill.id` 是系统 Skill 相对目录，如 `anthropics/pdf`
-- 新建和旧 session 默认所有系统 Skills 开启
-- PUT 默认会把未包含在 `enabledSystemSkills` 中的当前已发现系统 Skills 记录到 session 的 `disabled_system_skills`
-- `knownSystemSkills` 可选；提供后，后端只更新这批客户端已加载的 Skills，未包含其中但服务端后来新发现的 Skills 会保留原状态，避免 Settings 页面保存时误关闭新增 Skills
-- 保存后会刷新该 session 的 system prompt；关闭的系统 Skill 不再出现在 `## Skills`
+- 新建和迁移后的旧 session 默认所有系统 Skills 关闭
+- PUT 会把 `enabledSystemSkills` 保存为 session 的 `enabled_system_skills`
+- `knownSystemSkills` 可选；提供后，后端只更新这批客户端已加载的 Skills，未包含其中但服务端后来新发现的 Skills 会保留原状态，避免 Settings 页面保存时误开启或误关闭新增 Skills
+- 保存后会刷新该 session 的 system prompt；只有启用的系统 Skill 会出现在 `## Skills`
 - 未知 session 返回 `404`，未知 Skill id 返回 `400`
 
 ## 4.4 GET /api/client-config

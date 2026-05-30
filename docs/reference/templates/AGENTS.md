@@ -39,9 +39,9 @@ Use memory only for durable context:
 
 ## Tools
 
-Skills are loaded from system, global, and session layers. When a task matches a
-skill description, read the skill before using it. Keep personal notes in
-`USER.md` or `MEMORY.md`, not in skill files.
+Skills are loaded from enabled system skills plus global and session layers.
+When a task matches a skill description, read the skill before using it. Keep
+personal notes in `USER.md` or `MEMORY.md`, not in skill files.
 
 ## Delegation
 
