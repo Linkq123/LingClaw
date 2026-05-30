@@ -5,6 +5,8 @@ import type {
   DiscoveredAgentInfo,
   McpServerConfig,
   S3Config,
+  SessionSkillInfo,
+  SessionSkillsApiResponse,
 } from '../types/config.js';
 import {
   validateProviderName,
@@ -31,8 +33,10 @@ let _close: (() => void) | null = null;
 // the first time `openSettingsPage` is called. Remember the intent so the
 // component can honour it as soon as its mount effect runs.
 let pendingOpen = false;
+let pendingSessionId = 'main';
 
-export function openSettingsPage(): void {
+export function openSettingsPage(sessionId?: string): void {
+  pendingSessionId = sessionId?.trim() || 'main';
   if (_open) _open();
   else pendingOpen = true;
 }
@@ -315,7 +319,10 @@ function AgentsTab({
 
   const setModelValue = useCallback(
     (key: string, val: string) => {
-      const currentModel = (config.agents?.defaults?.model || {}) as Record<string, string | undefined>;
+      const currentModel = (config.agents?.defaults?.model || {}) as Record<
+        string,
+        string | undefined
+      >;
       const newModel = { ...currentModel };
       if (val) newModel[key] = val;
       else delete newModel[key];
@@ -339,9 +346,8 @@ function AgentsTab({
           return { key, agentName, value };
         })
         .filter(
-          (
-            entry,
-          ): entry is { key: string; agentName: string; value: string | undefined } => entry !== null,
+          (entry): entry is { key: string; agentName: string; value: string | undefined } =>
+            entry !== null,
         )
         .sort((a, b) => a.agentName.localeCompare(b.agentName)),
     [model],
@@ -457,7 +463,12 @@ function AgentsTab({
             return (
               <div
                 key={key}
-                style={{ display: 'grid', gap: 6, padding: '8px 0', borderTop: '1px solid var(--border)' }}
+                style={{
+                  display: 'grid',
+                  gap: 6,
+                  padding: '8px 0',
+                  borderTop: '1px solid var(--border)',
+                }}
               >
                 <div
                   style={{
@@ -477,7 +488,11 @@ function AgentsTab({
                     Remove
                   </button>
                 </div>
-                <ModelSelect value={value} options={allModels} onChange={(val) => setModel(key, val)} />
+                <ModelSelect
+                  value={value}
+                  options={allModels}
+                  onChange={(val) => setModel(key, val)}
+                />
               </div>
             );
           })
@@ -830,17 +845,20 @@ function ModelsTab({
     [clearProviderReset],
   );
 
-  const updateProvider = useCallback((p: ProviderFormData) => {
-    setProviders((prev) => {
-      const nextProviders = prev.map((old) => (old._key === p._key ? p : old));
-      const newModels = serializeProviderForms(nextProviders);
-      if (JSON.stringify(newModels) !== JSON.stringify(config.models)) {
-        onChange({ ...config, models: newModels });
-      }
-      return nextProviders;
-    });
-    setFormDirty(true);
-  }, [config, onChange]);
+  const updateProvider = useCallback(
+    (p: ProviderFormData) => {
+      setProviders((prev) => {
+        const nextProviders = prev.map((old) => (old._key === p._key ? p : old));
+        const newModels = serializeProviderForms(nextProviders);
+        if (JSON.stringify(newModels) !== JSON.stringify(config.models)) {
+          onChange({ ...config, models: newModels });
+        }
+        return nextProviders;
+      });
+      setFormDirty(true);
+    },
+    [config, onChange],
+  );
 
   const deleteProvider = useCallback(
     (rowKey: string) => {
@@ -1423,6 +1441,236 @@ function McpTab({
   );
 }
 
+// ── Skills Tab ───────────────────────────────────────────────────────────────
+
+function normalizeSessionSkill(skill: SessionSkillInfo): SessionSkillInfo {
+  return {
+    id: String(skill.id || ''),
+    name: String(skill.name || skill.id || ''),
+    description: skill.description ? String(skill.description) : '',
+    path: String(skill.path || ''),
+    group: skill.group ? String(skill.group) : '',
+    enabled: skill.enabled !== false,
+  };
+}
+
+function sortedEnabledIds(skills: SessionSkillInfo[]): string[] {
+  return skills
+    .filter((skill) => skill.enabled)
+    .map((skill) => skill.id)
+    .sort();
+}
+
+function sortedSkillIds(skills: SessionSkillInfo[]): string[] {
+  return skills.map((skill) => skill.id).sort();
+}
+
+function sameStringList(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((value, index) => value === b[index]);
+}
+
+function SkillsTab({ sessionId }: { sessionId: string }) {
+  const targetSessionId = sessionId || 'main';
+  const [skills, setSkills] = useState<SessionSkillInfo[]>([]);
+  const [savedEnabledIds, setSavedEnabledIds] = useState<string[]>([]);
+  const [knownSkillIds, setKnownSkillIds] = useState<string[]>([]);
+  const [sessionLabel, setSessionLabel] = useState(targetSessionId);
+  const [filterText, setFilterText] = useState('');
+  const [status, setStatus] = useState<{ message: string; type: StatusType }>({
+    message: '',
+    type: 'idle',
+  });
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  const loadSkills = useCallback(
+    async (signal?: AbortSignal) => {
+      setLoading(true);
+      setStatus({ message: 'Loading skills...', type: 'loading' });
+      try {
+        const response = await fetch(
+          `/api/session-skills?session=${encodeURIComponent(targetSessionId)}`,
+          { cache: 'no-store', signal },
+        );
+        const data: SessionSkillsApiResponse = await response.json();
+        if (!response.ok || data.error) {
+          throw new Error(data.error || `HTTP ${response.status}`);
+        }
+        const nextSkills = (data.skills || []).map(normalizeSessionSkill);
+        const nextEnabled = sortedEnabledIds(nextSkills);
+        setSkills(nextSkills);
+        setSavedEnabledIds(nextEnabled);
+        setKnownSkillIds(sortedSkillIds(nextSkills));
+        setSessionLabel(data.session?.name || data.session?.id || targetSessionId);
+        setStatus({ message: 'Loaded', type: 'success' });
+      } catch (error: unknown) {
+        if ((error as Error).name === 'AbortError') return;
+        setStatus({ message: `Load failed: ${(error as Error).message}`, type: 'error' });
+      } finally {
+        setLoading(false);
+      }
+    },
+    [targetSessionId],
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadSkills(controller.signal);
+    return () => controller.abort();
+  }, [loadSkills]);
+
+  const currentEnabledIds = useMemo(() => sortedEnabledIds(skills), [skills]);
+  const dirty = !sameStringList(currentEnabledIds, savedEnabledIds);
+  const enabledCount = currentEnabledIds.length;
+  const query = filterText.trim().toLowerCase();
+  const visibleSkills = useMemo(
+    () =>
+      query
+        ? skills.filter((skill) =>
+            [skill.id, skill.name, skill.description || '', skill.path, skill.group || '']
+              .join(' ')
+              .toLowerCase()
+              .includes(query),
+          )
+        : skills,
+    [query, skills],
+  );
+
+  const setSkillEnabled = useCallback((skillId: string, enabled: boolean) => {
+    setSkills((current) =>
+      current.map((skill) => (skill.id === skillId ? { ...skill, enabled } : skill)),
+    );
+  }, []);
+
+  const setAllEnabled = useCallback((enabled: boolean) => {
+    setSkills((current) => current.map((skill) => ({ ...skill, enabled })));
+  }, []);
+
+  const revertSkills = useCallback(() => {
+    const saved = new Set(savedEnabledIds);
+    setSkills((current) => current.map((skill) => ({ ...skill, enabled: saved.has(skill.id) })));
+    setStatus({ message: 'Reverted unsaved skill changes', type: 'idle' });
+  }, [savedEnabledIds]);
+
+  const saveSkills = useCallback(async () => {
+    setSaving(true);
+    setStatus({ message: 'Saving skills...', type: 'loading' });
+    try {
+      const response = await fetch(
+        `/api/session-skills?session=${encodeURIComponent(targetSessionId)}`,
+        {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            enabledSystemSkills: currentEnabledIds,
+            knownSystemSkills: knownSkillIds,
+          }),
+        },
+      );
+      const data: SessionSkillsApiResponse = await response.json();
+      if (!response.ok || data.error) {
+        throw new Error(data.error || `HTTP ${response.status}`);
+      }
+      const nextSkills = (data.skills || skills).map(normalizeSessionSkill);
+      const nextEnabled = sortedEnabledIds(nextSkills);
+      setSkills(nextSkills);
+      setSavedEnabledIds(nextEnabled);
+      setKnownSkillIds(sortedSkillIds(nextSkills));
+      setSessionLabel(data.session?.name || data.session?.id || sessionLabel);
+      setStatus({ message: 'Skills saved', type: 'success' });
+    } catch (error: unknown) {
+      setStatus({ message: `Save failed: ${(error as Error).message}`, type: 'error' });
+    } finally {
+      setSaving(false);
+    }
+  }, [currentEnabledIds, knownSkillIds, sessionLabel, skills, targetSessionId]);
+
+  const statusClass =
+    status.type === 'success'
+      ? 'settings-status success'
+      : status.type === 'error'
+        ? 'settings-status error'
+        : 'settings-status';
+
+  return (
+    <div className="settings-group skills-settings">
+      <div className="settings-group-title">System Skills</div>
+      <div className="skills-toolbar">
+        <div className="skills-session-label">
+          Session: <code>{sessionLabel}</code>
+        </div>
+        <span className={statusClass}>{status.message}</span>
+      </div>
+      <div className="skills-toolbar">
+        <input
+          type="search"
+          value={filterText}
+          placeholder="Search system skills"
+          aria-label="Search system skills"
+          onChange={(event) => setFilterText(event.target.value)}
+        />
+        <button
+          className="btn-secondary"
+          onClick={() => setAllEnabled(true)}
+          disabled={loading || saving}
+        >
+          Enable all
+        </button>
+        <button
+          className="btn-secondary"
+          onClick={() => setAllEnabled(false)}
+          disabled={loading || saving}
+        >
+          Disable all
+        </button>
+        <button
+          className="btn-secondary"
+          onClick={revertSkills}
+          disabled={!dirty || loading || saving}
+        >
+          Revert
+        </button>
+        <button className="btn-primary" onClick={saveSkills} disabled={!dirty || loading || saving}>
+          Save Skills
+        </button>
+      </div>
+      <div className="skills-summary">
+        {enabledCount} of {skills.length} system skills enabled. Global and session-local skills are
+        still discovered automatically.
+      </div>
+      <div className="skills-list">
+        {visibleSkills.length === 0 ? (
+          <div className="skills-empty">
+            {loading ? 'Loading skills...' : 'No matching system skills.'}
+          </div>
+        ) : (
+          visibleSkills.map((skill) => (
+            <label key={skill.id} className="skill-row">
+              <input
+                type="checkbox"
+                checked={skill.enabled}
+                disabled={loading || saving}
+                onChange={(event) => setSkillEnabled(skill.id, event.target.checked)}
+              />
+              <span className="skill-row-body">
+                <span className="skill-row-main">
+                  <span className="skill-row-name">{skill.name}</span>
+                  <code>{skill.id}</code>
+                </span>
+                {skill.description && (
+                  <span className="skill-row-description">{skill.description}</span>
+                )}
+                <span className="skill-row-path">{skill.path}</span>
+              </span>
+            </label>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── S3 Tab ────────────────────────────────────────────────────────────────────
 
 function S3Tab({ config, onChange }: { config: AppConfig; onChange: (c: AppConfig) => void }) {
@@ -1593,7 +1841,7 @@ function CorruptConfigView({
 
 // ── Main SettingsPage component ───────────────────────────────────────────────
 
-type TabId = 'tab-general' | 'tab-agents' | 'tab-models' | 'tab-mcp' | 'tab-s3';
+type TabId = 'tab-general' | 'tab-skills' | 'tab-agents' | 'tab-models' | 'tab-mcp' | 'tab-s3';
 type StatusType = 'idle' | 'loading' | 'success' | 'error';
 
 export function SettingsPage() {
@@ -1603,14 +1851,19 @@ export function SettingsPage() {
   const [status, setStatus] = useState({ message: '', type: 'idle' as StatusType });
   const [corruptData, setCorruptData] = useState<ConfigApiResponse | null>(null);
   const [discoveredAgents, setDiscoveredAgents] = useState<DiscoveredAgentInfo[]>([]);
+  const [settingsSessionId, setSettingsSessionId] = useState('main');
 
   // Register bridge functions
   useEffect(() => {
-    _open = () => setVisible(true);
+    _open = () => {
+      setSettingsSessionId(pendingSessionId || 'main');
+      setVisible(true);
+    };
     _close = () => setVisible(false);
     // Honour any open request that arrived before the lazy chunk finished loading.
     if (pendingOpen) {
       pendingOpen = false;
+      setSettingsSessionId(pendingSessionId || 'main');
       setVisible(true);
     }
     return () => {
@@ -1734,6 +1987,7 @@ export function SettingsPage() {
 
   const tabs: Array<{ id: TabId; label: string }> = [
     { id: 'tab-general', label: 'General' },
+    { id: 'tab-skills', label: 'Skills' },
     { id: 'tab-agents', label: 'Agents' },
     { id: 'tab-models', label: 'Models' },
     { id: 'tab-mcp', label: 'MCP' },
@@ -1756,7 +2010,7 @@ export function SettingsPage() {
           <span className={statusClass} id="settings-status">
             {status.message}
           </span>
-          {!corruptData && (
+          {!corruptData && activeTab !== 'tab-skills' && (
             <button className="btn-primary" id="settings-save-btn" onClick={saveConfig}>
               Save
             </button>
@@ -1804,12 +2058,9 @@ export function SettingsPage() {
           </div>
           <div className="page-body" id="settings-body">
             {activeTab === 'tab-general' && <GeneralTab config={config} onChange={setConfig} />}
+            {activeTab === 'tab-skills' && <SkillsTab sessionId={settingsSessionId} />}
             {activeTab === 'tab-agents' && (
-              <AgentsTab
-                config={config}
-                onChange={setConfig}
-                discoveredAgents={discoveredAgents}
-              />
+              <AgentsTab config={config} onChange={setConfig} discoveredAgents={discoveredAgents} />
             )}
             {activeTab === 'tab-models' && (
               <ModelsTab config={config} onChange={setConfig} onStatus={handleStatus} />

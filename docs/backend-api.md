@@ -21,7 +21,7 @@
 
 后端暴露两类接口：
 
-- HTTP：健康检查、session 摘要、配置读写、todos、模型与 MCP 联通性测试、Usage、图片上传、优雅关停
+- HTTP：健康检查、session 摘要、session 系统 Skills 开关、配置读写、todos、模型与 MCP 联通性测试、Usage、图片上传、优雅关停
 - WebSocket：聊天主通道，承载流式回复、工具事件、推理事件、子代理事件、编排事件
 
 ## 2. 访问与鉴权约束
@@ -153,7 +153,69 @@
 - `tool_calls` 为累计工具调用次数
 - 列表同时覆盖默认 `main` 和其他已创建 session
 
-## 4.3 GET /api/client-config
+## 4.3 GET/PUT /api/session-skills
+
+管理指定 session 可注入的系统内置 Skills。该接口只覆盖 `system` 来源的 Skills；`global` 和 `session` 来源仍按目录自动发现并注入，不在 Settings 页面中启停。
+
+### 查询参数
+
+- `session`：可选 session id，省略时使用 `main`
+
+### GET 响应
+
+```json
+{
+  "session": {
+    "id": "main",
+    "name": "Main"
+  },
+  "skills": [
+    {
+      "id": "anthropics/pdf",
+      "name": "pdf",
+      "description": "PDF processing workflow",
+      "path": "system://skills/anthropics/pdf/SKILL.md",
+      "group": "anthropics",
+      "enabled": true
+    }
+  ],
+  "disabledSystemSkills": []
+}
+```
+
+### PUT 请求体
+
+```json
+{
+  "enabledSystemSkills": ["anthropics/pdf", "anthropics/xlsx"],
+  "knownSystemSkills": ["anthropics/pdf", "anthropics/xlsx", "anthropics/pptx"]
+}
+```
+
+### PUT 成功响应
+
+```json
+{
+  "ok": true,
+  "session": {
+    "id": "main",
+    "name": "Main"
+  },
+  "skills": [],
+  "disabledSystemSkills": ["anthropics/pptx"]
+}
+```
+
+### 说明
+
+- `skill.id` 是系统 Skill 相对目录，如 `anthropics/pdf`
+- 新建和旧 session 默认所有系统 Skills 开启
+- PUT 默认会把未包含在 `enabledSystemSkills` 中的当前已发现系统 Skills 记录到 session 的 `disabled_system_skills`
+- `knownSystemSkills` 可选；提供后，后端只更新这批客户端已加载的 Skills，未包含其中但服务端后来新发现的 Skills 会保留原状态，避免 Settings 页面保存时误关闭新增 Skills
+- 保存后会刷新该 session 的 system prompt；关闭的系统 Skill 不再出现在 `## Skills`
+- 未知 session 返回 `404`，未知 Skill id 返回 `400`
+
+## 4.4 GET /api/client-config
 
 返回前端运行所需的轻量配置。目前主要用于图片上传 token。
 
@@ -170,7 +232,7 @@
 - 仅本地请求可访问
 - `upload_token` 由前端拿到后用于 `POST /api/upload-images`
 
-## 4.4 GET /api/config
+## 4.5 GET /api/config
 
 读取原始配置文件 `~/.lingclaw/.lingclaw.json`，并附带已发现的子代理摘要。
 
@@ -229,7 +291,7 @@
 }
 ```
 
-## 4.5 PUT /api/config
+## 4.6 PUT /api/config
 
 校验并保存配置文件。保存成功后会：
 
@@ -494,7 +556,7 @@
 }
 ```
 
-## 4.6 POST /api/config/test-model
+## 4.7 POST /api/config/test-model
 
 测试模型 provider 连通性。后端会用给定配置发一个最小请求，消息内容固定为 `"Hi"`。
 
@@ -549,7 +611,7 @@
 }
 ```
 
-## 4.7 POST /api/config/test-mcp
+## 4.8 POST /api/config/test-mcp
 
 测试 MCP server 是否可启动并完成 tools 列表发现。
 
@@ -606,7 +668,7 @@
 }
 ```
 
-## 4.8 GET /api/usage
+## 4.9 GET /api/usage
 
 返回当前默认 session（`main`）的 token 统计。
 
@@ -662,7 +724,7 @@
 - `source_scope`: 当前固定为 `latest_update`
 - `providers` / `roles`: 值格式均为 `[input_tokens, output_tokens]`
 
-## 4.9 PUT /api/todos
+## 4.10 PUT /api/todos
 
 原子替换指定 session 的当前 todos 清单。
 
@@ -779,7 +841,7 @@
 - `409 Conflict`：`base_revision` 落后
 - `500 Internal Server Error`：持久化失败
 
-## 4.10 POST /api/upload-images
+## 4.11 POST /api/upload-images
 
 上传本地图片到 S3-compatible 存储，并返回可用 URL 与受信 object key。
 
@@ -874,7 +936,7 @@
 }
 ```
 
-## 4.11 POST /api/shutdown
+## 4.12 POST /api/shutdown
 
 供本地 CLI 调用的优雅关停接口。
 

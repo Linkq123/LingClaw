@@ -66,7 +66,8 @@ use runtime_loop::{
 };
 use session_store::{
     SessionSummary, list_saved_session_summaries_in_dir, load_session_from_disk,
-    refresh_session_system_prompt, save_session_to_disk, sessions_dir,
+    refresh_session_system_prompt, save_session_to_disk, save_session_to_disk_locked,
+    session_persist_gate, sessions_dir,
 };
 use socket_sync::{
     broadcast_session_list_payload, build_session_info_payload, send_command_refresh,
@@ -2860,6 +2861,13 @@ struct SessionQuery {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSkillsUpdateRequest {
+    enabled_system_skills: Vec<String>,
+    known_system_skills: Option<Vec<String>>,
+}
+
+#[derive(Deserialize)]
 struct WsSessionQuery {
     #[serde(default)]
     session: Option<String>,
@@ -3155,6 +3163,249 @@ async fn api_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         b_ts.cmp(&a_ts)
     });
     Json(json!({"sessions": list}))
+}
+
+fn find_loaded_session_id(sessions: &HashMap<String, Session>, session_id: &str) -> Option<String> {
+    sessions
+        .keys()
+        .find(|existing_id| {
+            existing_id.as_str() == session_id
+                || (cfg!(windows) && existing_id.eq_ignore_ascii_case(session_id))
+        })
+        .cloned()
+}
+
+async fn ensure_session_loaded_for_api(
+    state: &AppState,
+    requested_session_id: &str,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    let requested_session_id = crate::session_store::validate_session_id(requested_session_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?
+        .to_string();
+
+    {
+        let sessions = state.sessions.lock().await;
+        if let Some(session_id) = find_loaded_session_id(&sessions, &requested_session_id) {
+            return Ok(session_id);
+        }
+    }
+
+    if let Some(session) = load_session_from_disk(&requested_session_id) {
+        let session_id = session.id.clone();
+        let mut sessions = state.sessions.lock().await;
+        let effective_id = find_loaded_session_id(&sessions, &session_id).unwrap_or(session_id);
+        sessions.entry(effective_id.clone()).or_insert(session);
+        return Ok(effective_id);
+    }
+
+    Err((
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": format!("Session '{}' not found", requested_session_id) })),
+    ))
+}
+
+fn build_session_skill_payloads(
+    workspace: &Path,
+    disabled_system_skills: &HashSet<String>,
+) -> Vec<serde_json::Value> {
+    prompts::discover_skills_by_source(workspace, prompts::SkillSource::System)
+        .into_iter()
+        .filter_map(|skill| {
+            let id = prompts::system_skill_relative_dir(&skill.path)?;
+            let group = id.split('/').next().unwrap_or(id.as_str()).to_string();
+            let enabled = !prompts::is_system_skill_disabled(&skill.path, disabled_system_skills);
+            Some(json!({
+                "id": id,
+                "name": skill.name,
+                "description": skill.description,
+                "path": skill.path,
+                "group": group,
+                "enabled": enabled,
+            }))
+        })
+        .collect()
+}
+
+async fn api_session_skills(
+    Query(query): Query<SessionQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
+    let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
+    let (session_name, workspace, disabled_system_skills) = {
+        let sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get(&session_id) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("Session '{}' not found", session_id) })),
+            ));
+        };
+        (
+            session.name.clone(),
+            session.workspace.clone(),
+            session.disabled_system_skills.clone(),
+        )
+    };
+
+    let mut disabled: Vec<_> = disabled_system_skills.iter().cloned().collect();
+    disabled.sort();
+
+    Ok(Json(json!({
+        "session": {
+            "id": session_id,
+            "name": session_name,
+        },
+        "skills": build_session_skill_payloads(&workspace, &disabled_system_skills),
+        "disabledSystemSkills": disabled,
+    })))
+}
+
+fn normalize_enabled_system_skill_id(id: &str) -> Result<String, String> {
+    let trimmed = id.trim().trim_matches('/');
+    if trimmed.is_empty()
+        || trimmed.contains("..")
+        || trimmed.split('/').any(str::is_empty)
+        || !trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/'))
+    {
+        return Err(format!("Invalid system skill id: {id}"));
+    }
+    Ok(trimmed.to_string())
+}
+
+async fn api_put_session_skills(
+    Query(query): Query<SessionQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SessionSkillsUpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
+    let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
+    let persist_gate = session_persist_gate(&session_id);
+    let _persist_guard = persist_gate.lock().await;
+
+    let (workspace, all_skill_ids, current_disabled_system_skills) = {
+        let sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get(&session_id) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("Session '{}' not found", session_id) })),
+            ));
+        };
+        let workspace = session.workspace.clone();
+        let all_skill_ids =
+            prompts::discover_skills_by_source(&workspace, prompts::SkillSource::System)
+                .iter()
+                .filter_map(|skill| prompts::system_skill_relative_dir(&skill.path))
+                .collect::<HashSet<_>>();
+        (
+            workspace,
+            all_skill_ids,
+            session.disabled_system_skills.clone(),
+        )
+    };
+
+    let managed_skill_ids = match &request.known_system_skills {
+        Some(raw_ids) => {
+            let mut ids = HashSet::new();
+            for raw_id in raw_ids {
+                let id = normalize_enabled_system_skill_id(raw_id)
+                    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+                if !all_skill_ids.contains(&id) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": format!("Unknown system skill id: {id}") })),
+                    ));
+                }
+                ids.insert(id);
+            }
+            ids
+        }
+        None => all_skill_ids.clone(),
+    };
+
+    let mut enabled = HashSet::new();
+    for raw_id in &request.enabled_system_skills {
+        let id = normalize_enabled_system_skill_id(raw_id)
+            .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+        if !all_skill_ids.contains(&id) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Unknown system skill id: {id}") })),
+            ));
+        }
+        if !managed_skill_ids.contains(&id) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({ "error": format!("Enabled system skill id was not loaded by client: {id}") }),
+                ),
+            ));
+        }
+        enabled.insert(id);
+    }
+
+    let disabled_system_skills = all_skill_ids
+        .iter()
+        .filter(|id| {
+            if managed_skill_ids.contains(*id) {
+                !enabled.contains(*id)
+            } else {
+                let path = format!("system://skills/{id}/SKILL.md");
+                prompts::is_system_skill_disabled(&path, &current_disabled_system_skills)
+            }
+        })
+        .cloned()
+        .collect::<HashSet<_>>();
+
+    let (session_to_save, response_payload) = {
+        let mut sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get_mut(&session_id) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("Session '{}' not found", session_id) })),
+            ));
+        };
+        let old_session = session.clone();
+        session.disabled_system_skills = disabled_system_skills.clone();
+        session.updated_at = now_epoch();
+        refresh_session_system_prompt(&state, session);
+
+        let skills = build_session_skill_payloads(&workspace, &session.disabled_system_skills);
+        let mut disabled: Vec<_> = session.disabled_system_skills.iter().cloned().collect();
+        disabled.sort();
+        let payload = json!({
+            "ok": true,
+            "session": {
+                "id": session.id,
+                "name": session.name,
+            },
+            "skills": skills,
+            "disabledSystemSkills": disabled,
+        });
+
+        (session.clone(), (old_session, payload))
+    };
+
+    let (old_session, payload) = response_payload;
+    if let Err(error) = save_session_to_disk_locked(&session_to_save).await {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            *session = old_session;
+        }
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to save session skills: {error}") })),
+        ));
+    }
+
+    Ok(Json(payload))
 }
 
 async fn api_todos(
@@ -4054,6 +4305,10 @@ async fn main() {
         .route("/api/health", get(api_health))
         .route("/api/client-config", get(api_client_config))
         .route("/api/sessions", get(api_sessions))
+        .route(
+            "/api/session-skills",
+            get(api_session_skills).put(api_put_session_skills),
+        )
         .route("/api/todos", put(api_todos))
         .route("/api/config", get(api_get_config).put(api_put_config))
         .route("/api/config/test-model", post(api_test_model))

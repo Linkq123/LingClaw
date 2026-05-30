@@ -5103,6 +5103,286 @@ async fn api_sessions_includes_corrupt_persisted_sessions() {
 }
 
 #[tokio::test]
+async fn api_session_skills_defaults_system_skills_to_enabled() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("skills-default-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+
+    let mut session = test_session(&session_id, "Skills Default", None);
+    session.workspace = workspace;
+    session.version = SESSION_VERSION;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_session_skills(
+        Query(SessionQuery {
+            session: Some(session_id),
+        }),
+        headers,
+        State(state),
+    )
+    .await
+    .expect("session skills should load");
+
+    let skills = payload["skills"]
+        .as_array()
+        .expect("skills should be an array");
+    assert!(!skills.is_empty(), "system skills should be discovered");
+    assert!(skills.iter().all(|skill| skill["enabled"] == true));
+    assert_eq!(payload["disabledSystemSkills"], json!([]));
+}
+
+#[tokio::test]
+async fn api_put_session_skills_persists_disabled_set_and_refreshes_prompt() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("skills-put-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+
+    let mut session = test_session(&session_id, "Skills Put", None);
+    session.workspace = workspace;
+    session.version = SESSION_VERSION;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_put_session_skills(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers,
+        State(state.clone()),
+        Json(SessionSkillsUpdateRequest {
+            enabled_system_skills: vec!["anthropics/pdf".to_string()],
+            known_system_skills: None,
+        }),
+    )
+    .await
+    .expect("session skills should save");
+
+    assert_eq!(payload["ok"], true);
+    let disabled = payload["disabledSystemSkills"]
+        .as_array()
+        .expect("disabled list should be present");
+    assert!(disabled.iter().any(|id| id == "anthropics/xlsx"));
+    assert!(!disabled.iter().any(|id| id == "anthropics/pdf"));
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&session_id)
+        .expect("session should remain loaded");
+    assert!(session.disabled_system_skills.contains("anthropics/xlsx"));
+    assert!(!session.disabled_system_skills.contains("anthropics/pdf"));
+    let system_prompt = session.messages[0]
+        .content
+        .as_deref()
+        .expect("system prompt should be refreshed");
+    assert!(system_prompt.contains("system://skills/anthropics/pdf/SKILL.md"));
+    assert!(!system_prompt.contains("system://skills/anthropics/xlsx/SKILL.md"));
+    drop(sessions);
+
+    let persisted = load_session_from_disk(&session_id).expect("session should persist");
+    assert!(persisted.disabled_system_skills.contains("anthropics/xlsx"));
+}
+
+#[tokio::test]
+async fn api_put_session_skills_only_updates_client_known_skill_ids() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("skills-known-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+
+    let mut session = test_session(&session_id, "Skills Known", None);
+    session.workspace = workspace;
+    session.version = SESSION_VERSION;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_put_session_skills(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers,
+        State(state.clone()),
+        Json(SessionSkillsUpdateRequest {
+            enabled_system_skills: vec!["anthropics/pdf".to_string()],
+            known_system_skills: Some(vec!["anthropics/pdf".to_string()]),
+        }),
+    )
+    .await
+    .expect("session skills should save");
+
+    assert_eq!(payload["ok"], true);
+    assert_eq!(payload["disabledSystemSkills"], json!([]));
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&session_id)
+        .expect("session should remain loaded");
+    assert!(
+        session.disabled_system_skills.is_empty(),
+        "skills outside knownSystemSkills should keep their existing enabled state"
+    );
+    let system_prompt = session.messages[0]
+        .content
+        .as_deref()
+        .expect("system prompt should be refreshed");
+    assert!(system_prompt.contains("system://skills/anthropics/pdf/SKILL.md"));
+    assert!(system_prompt.contains("system://skills/anthropics/xlsx/SKILL.md"));
+}
+
+#[tokio::test]
+async fn api_put_session_skills_rejects_unknown_skill_ids() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("skills-invalid-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+
+    let mut session = test_session(&session_id, "Skills Invalid", None);
+    session.workspace = workspace;
+    session.version = SESSION_VERSION;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let error = api_put_session_skills(
+        Query(SessionQuery {
+            session: Some(session_id),
+        }),
+        headers,
+        State(state),
+        Json(SessionSkillsUpdateRequest {
+            enabled_system_skills: vec!["not-a-real-skill".to_string()],
+            known_system_skills: None,
+        }),
+    )
+    .await
+    .expect_err("unknown skill id should be rejected");
+
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert!(
+        error.1["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("Unknown system skill id"))
+    );
+}
+
+#[tokio::test]
+async fn api_session_skills_returns_not_found_for_unknown_sessions() {
+    let state = Arc::new(test_app_state());
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let error = api_session_skills(
+        Query(SessionQuery {
+            session: Some(format!("missing-skills-{}", now_epoch())),
+        }),
+        headers,
+        State(state),
+    )
+    .await
+    .expect_err("missing session should be rejected");
+
+    assert_eq!(error.0, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn api_session_skills_reflects_skills_system_command_state() {
+    let state = test_app_state();
+    let session_id = format!("skills-command-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+
+    let mut session = test_session(&session_id, "Skills Command", None);
+    session.workspace = workspace;
+    session.version = SESSION_VERSION;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(4);
+    let result = handle_command(
+        "/skills-system uninstall anthropics/pdf",
+        &session_id,
+        1,
+        &state,
+        &tx,
+        &CancellationToken::new(),
+    )
+    .await
+    .expect("skills-system command should resolve");
+    assert_eq!(result.response_type, "system");
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    let Json(payload) = api_session_skills(
+        Query(SessionQuery {
+            session: Some(session_id),
+        }),
+        headers,
+        State(Arc::new(state)),
+    )
+    .await
+    .expect("session skills should load");
+
+    let skills = payload["skills"]
+        .as_array()
+        .expect("skills should be an array");
+    let pdf = skills
+        .iter()
+        .find(|skill| skill["id"] == "anthropics/pdf")
+        .expect("pdf skill should be listed");
+    assert_eq!(pdf["enabled"], false);
+}
+
+#[tokio::test]
 async fn api_usage_loads_persisted_session_not_yet_in_memory() {
     let state = Arc::new(test_app_state());
     let session_id = format!("usage-persisted-{}", now_epoch());

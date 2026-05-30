@@ -954,7 +954,7 @@ const actionHandlers = {
   'toggle-auto-debug': () => toggleAutoDebug(),
   'nav-settings': () => {
     closeMobileMenu();
-    openSettingsPage();
+    openSettingsPage(state.activeSessionId || 'main');
   },
   'nav-usage': () => {
     closeMobileMenu();

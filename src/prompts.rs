@@ -427,10 +427,7 @@ fn skill_relevance(skill: &SkillMeta, query_tokens: &[String]) -> usize {
 ///
 /// A disabled entry matches if it equals the relative dir or is a prefix of it.
 pub(crate) fn is_system_skill_disabled(path: &str, disabled: &HashSet<String>) -> bool {
-    const PREFIX: &str = "system://skills/";
-    let relative = path.strip_prefix(PREFIX).unwrap_or(path);
-    // Strip trailing `/SKILL.md` so we get e.g. `anthropics/pdf`
-    let rel_dir = relative.strip_suffix("/SKILL.md").unwrap_or(relative);
+    let rel_dir = system_skill_relative_dir(path).unwrap_or_else(|| path.to_string());
     for pattern in disabled {
         if rel_dir == pattern.as_str() {
             return true;
@@ -443,6 +440,20 @@ pub(crate) fn is_system_skill_disabled(path: &str, disabled: &HashSet<String>) -
         }
     }
     false
+}
+
+/// Extract the relative system skill directory id from a virtual or relative path.
+///
+/// `system://skills/anthropics/pdf/SKILL.md` → `anthropics/pdf`
+/// `anthropics/pdf/SKILL.md` → `anthropics/pdf`
+pub(crate) fn system_skill_relative_dir(path: &str) -> Option<String> {
+    const PREFIX: &str = "system://skills/";
+    let relative = path.strip_prefix(PREFIX).unwrap_or(path);
+    let rel_dir = relative.strip_suffix("/SKILL.md").unwrap_or(relative);
+    if rel_dir.is_empty() || rel_dir.contains("..") || rel_dir.split('/').any(str::is_empty) {
+        return None;
+    }
+    Some(rel_dir.to_string())
 }
 
 /// List available system skill "groups" (top-level directories) for display.

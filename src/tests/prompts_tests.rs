@@ -694,6 +694,15 @@ fn system_skill_disabled_exact_match() {
 }
 
 #[test]
+fn system_skill_disabled_relative_skill_file_match() {
+    let disabled = HashSet::from(["anthropics/pdf".to_string()]);
+    assert!(is_system_skill_disabled(
+        "anthropics/pdf/SKILL.md",
+        &disabled,
+    ));
+}
+
+#[test]
 fn system_skill_disabled_group_match() {
     let disabled = HashSet::from(["anthropics".to_string()]);
     assert!(is_system_skill_disabled(

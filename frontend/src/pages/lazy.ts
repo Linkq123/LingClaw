@@ -97,12 +97,12 @@ let usageOpenGeneration = 0;
 
 // ── Public bridge ─────────────────────────────────────────────────────────────
 
-export function openSettingsPage(): void {
+export function openSettingsPage(sessionId?: string): void {
   const gen = ++settingsOpenGeneration;
   void loadSettings()
     .then((mod) => {
       if (settingsOpenGeneration !== gen) return; // cancelled by a later close or open
-      mod.openSettingsPage();
+      mod.openSettingsPage(sessionId);
     })
     .catch(() => {
       // Chunk load failed (e.g. network error). The user's click had no effect;

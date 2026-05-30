@@ -55,6 +55,26 @@ export interface DiscoveredAgentInfo {
   source?: string;
 }
 
+export interface SessionSkillInfo {
+  id: string;
+  name: string;
+  description?: string;
+  path: string;
+  group?: string;
+  enabled: boolean;
+}
+
+export interface SessionSkillsApiResponse {
+  ok?: boolean;
+  session?: {
+    id: string;
+    name?: string;
+  };
+  skills?: SessionSkillInfo[];
+  disabledSystemSkills?: string[];
+  error?: string;
+}
+
 export interface McpServerConfig {
   command?: string;
   args?: string[];
