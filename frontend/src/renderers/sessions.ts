@@ -7,6 +7,7 @@ export const SESSION_DRAWER_STORAGE_KEY = 'lingclaw.sessionDrawerExpanded';
 type SessionDrawerCallbacks = {
   onCreate: () => void;
   onDelete: (sessionId: string) => void;
+  onRename?: (sessionId: string) => void;
   onSwitch: (sessionId: string) => void;
 };
 
@@ -51,6 +52,11 @@ function renderableSessions(): RenderableSession[] {
       pending: state.sessionSwitchInFlight,
     });
   }
+  items.sort((a, b) => {
+    if (a.id === 'main' && b.id !== 'main') return -1;
+    if (a.id !== 'main' && b.id === 'main') return 1;
+    return (b.updated_at ?? 0) - (a.updated_at ?? 0) || a.id.localeCompare(b.id);
+  });
   return items;
 }
 
@@ -73,6 +79,15 @@ function isSessionDeleteable(session: RenderableSession): boolean {
     !session.pending &&
     session.id !== 'main' &&
     session.id !== state.activeSessionId
+  );
+}
+
+function isSessionRenameable(session: RenderableSession): boolean {
+  return (
+    !state.sessionSwitchInFlight &&
+    !session.pending &&
+    session.corrupt !== true &&
+    callbacks?.onRename != null
   );
 }
 
@@ -103,7 +118,9 @@ function createSessionRow(session: RenderableSession): HTMLElement {
     !shouldSwitchToSelectedSession(state.sessions, state.activeSessionId, session.id);
   mainButton.setAttribute(
     'aria-label',
-    session.corrupt ? `Unavailable session ${session.name || session.id}` : `Switch to ${session.name || session.id}`,
+    session.corrupt
+      ? `Unavailable session ${session.name || session.id}`
+      : `Switch to ${session.name || session.id}`,
   );
   if (session.id === state.activeSessionId) {
     mainButton.setAttribute('aria-current', 'true');
@@ -142,10 +159,24 @@ function createSessionRow(session: RenderableSession): HTMLElement {
   mainButton.appendChild(content);
   row.appendChild(mainButton);
 
+  const actions: HTMLElement[] = [];
+  if (isSessionRenameable(session)) {
+    const renameButton = document.createElement('button');
+    renameButton.type = 'button';
+    renameButton.className = 'session-drawer-row-action session-drawer-row-rename';
+    renameButton.dataset.sessionAction = 'rename';
+    renameButton.setAttribute('aria-label', `Rename ${session.name || session.id}`);
+    renameButton.title = `Rename ${session.name || session.id}`;
+    renameButton.textContent = '✎';
+    renameButton.addEventListener('click', () => {
+      callbacks?.onRename?.(session.id);
+    });
+    actions.push(renameButton);
+  }
   if (isSessionDeleteable(session)) {
     const deleteButton = document.createElement('button');
     deleteButton.type = 'button';
-    deleteButton.className = 'session-drawer-row-delete';
+    deleteButton.className = 'session-drawer-row-action session-drawer-row-delete';
     deleteButton.dataset.sessionAction = 'delete';
     deleteButton.setAttribute('aria-label', `Delete ${session.name || session.id}`);
     deleteButton.title = `Delete ${session.name || session.id}`;
@@ -153,7 +184,13 @@ function createSessionRow(session: RenderableSession): HTMLElement {
     deleteButton.addEventListener('click', () => {
       callbacks?.onDelete(session.id);
     });
-    row.appendChild(deleteButton);
+    actions.push(deleteButton);
+  }
+  if (actions.length > 0) {
+    const actionGroup = document.createElement('div');
+    actionGroup.className = 'session-drawer-row-actions';
+    actionGroup.append(...actions);
+    row.appendChild(actionGroup);
   }
 
   return row;

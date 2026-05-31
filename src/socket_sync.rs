@@ -92,7 +92,7 @@ pub(crate) fn build_session_list_payload(state: &AppState) -> serde_json::Value 
         }
     }
 
-    summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sort_session_summaries(&mut summaries);
 
     let mut seen_ids = std::collections::HashSet::new();
     let mut list = Vec::new();

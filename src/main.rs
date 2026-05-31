@@ -1382,6 +1382,29 @@ fn generate_shutdown_token() -> Result<String, String> {
     generate_secret_token()
 }
 
+const GENERATED_SESSION_ID_LEN: usize = 6;
+const GENERATED_SESSION_ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+
+fn generate_random_session_id() -> Result<String, String> {
+    let mut id = String::with_capacity(GENERATED_SESSION_ID_LEN);
+    while id.len() < GENERATED_SESSION_ID_LEN {
+        let mut bytes = [0_u8; 16];
+        getrandom::getrandom(&mut bytes)
+            .map_err(|e| format!("failed to get secure random bytes for session id: {e}"))?;
+        for byte in bytes {
+            if byte >= 252 {
+                continue;
+            }
+            let idx = (byte % GENERATED_SESSION_ID_ALPHABET.len() as u8) as usize;
+            id.push(GENERATED_SESSION_ID_ALPHABET[idx] as char);
+            if id.len() == GENERATED_SESSION_ID_LEN {
+                break;
+            }
+        }
+    }
+    Ok(id)
+}
+
 fn forbidden_local_api(message: &str) -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::FORBIDDEN, Json(json!({"error": message})))
 }
@@ -2866,6 +2889,11 @@ struct SessionSkillsUpdateRequest {
 }
 
 #[derive(Deserialize)]
+struct SessionRenameRequest {
+    name: String,
+}
+
+#[derive(Deserialize)]
 struct WsSessionQuery {
     #[serde(default)]
     session: Option<String>,
@@ -3155,12 +3183,189 @@ async fn api_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         list.push(summary.to_json(&config, session.as_ref()));
     }
 
-    list.sort_by(|a, b| {
-        let b_ts = b["updated_at"].as_u64().unwrap_or(0);
-        let a_ts = a["updated_at"].as_u64().unwrap_or(0);
-        b_ts.cmp(&a_ts)
-    });
+    sort_session_json_values(&mut list);
     Json(json!({"sessions": list}))
+}
+
+fn sort_session_json_values(list: &mut [serde_json::Value]) {
+    list.sort_by(|a, b| {
+        let a_id = a["id"].as_str().unwrap_or_default();
+        let b_id = b["id"].as_str().unwrap_or_default();
+        match (a_id == MAIN_SESSION_ID, b_id == MAIN_SESSION_ID) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => {
+                let b_ts = b["updated_at"].as_u64().unwrap_or(0);
+                let a_ts = a["updated_at"].as_u64().unwrap_or(0);
+                b_ts.cmp(&a_ts).then_with(|| a_id.cmp(b_id))
+            }
+        }
+    });
+}
+
+fn validate_session_display_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("Session name cannot be empty.".to_string());
+    }
+    if trimmed.chars().count() > 80 {
+        return Err("Session name must be 80 characters or fewer.".to_string());
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("Session name cannot contain control characters.".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+async fn generate_available_session_id(
+    state: &AppState,
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    for _ in 0..128 {
+        let id = generate_random_session_id().map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": error })),
+            )
+        })?;
+        if crate::session_store::validate_session_id(&id).is_err() {
+            continue;
+        }
+        {
+            let sessions = state.sessions.lock().await;
+            if find_loaded_session_id(&sessions, &id).is_some() {
+                continue;
+            }
+        }
+        if crate::session_store::canonical_saved_session_id(&id).is_some() {
+            continue;
+        }
+        return Ok(id);
+    }
+    Err((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": "Failed to generate a unique session id" })),
+    ))
+}
+
+async fn api_post_session(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let session_id = generate_available_session_id(&state).await?;
+    let persist_gate = session_persist_gate(&session_id);
+    let _persist_guard = persist_gate.lock().await;
+
+    {
+        let sessions = state.sessions.lock().await;
+        if find_loaded_session_id(&sessions, &session_id).is_some() {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({ "error": "Generated session id already exists" })),
+            ));
+        }
+    }
+    if crate::session_store::canonical_saved_session_id(&session_id).is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "Generated session id already exists" })),
+        ));
+    }
+
+    let config = state.config();
+    let session_name = format!("Session {session_id}");
+    let mut session = Session::new_with_id(&session_id, &session_name);
+    let model = session.effective_model(&config.model).to_string();
+    let sys = build_system_prompt(
+        &config,
+        &session.workspace,
+        &model,
+        &session.enabled_system_skills,
+    );
+    session.messages.push(sys);
+
+    if let Err(error) = save_session_to_disk_locked(&session).await {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to save new session: {error}") })),
+        ));
+    }
+
+    let payload = {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session.clone());
+        json!({
+            "ok": true,
+            "session": SessionSummary::from_session(&session).to_json(&config, Some(&session)),
+        })
+    };
+
+    broadcast_session_list_payload(&state).await;
+    Ok(Json(payload))
+}
+
+async fn api_put_session(
+    Query(query): Query<SessionQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SessionRenameRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
+    let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
+    let name = validate_session_display_name(&request.name)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+
+    let persist_gate = session_persist_gate(&session_id);
+    let _persist_guard = persist_gate.lock().await;
+
+    let (session_to_save, old_session, payload, session_event) = {
+        let mut sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get_mut(&session_id) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("Session '{}' not found", session_id) })),
+            ));
+        };
+        let old_session = session.clone();
+        session.name = name.clone();
+        session.updated_at = now_epoch();
+
+        let config = state.config();
+        let model = session.effective_model(&config.model).to_string();
+        let usage = socket_sync::build_session_usage_payload(session);
+        let session_event = socket_sync::build_session_info_payload(
+            &session_id,
+            &session.name,
+            &state,
+            &model,
+            usage,
+        );
+        let payload = json!({
+            "ok": true,
+            "session": SessionSummary::from_session(session).to_json(&config, Some(session)),
+        });
+
+        (session.clone(), old_session, payload, session_event)
+    };
+
+    if let Err(error) = save_session_to_disk_locked(&session_to_save).await {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            *session = old_session;
+        }
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to save session name: {error}") })),
+        ));
+    }
+
+    send_session_client_event(&state, &session_id, session_event).await;
+    broadcast_session_list_payload(&state).await;
+
+    Ok(Json(payload))
 }
 
 fn find_loaded_session_id(sessions: &HashMap<String, Session>, session_id: &str) -> Option<String> {
@@ -4329,6 +4534,7 @@ async fn main() {
         .route("/api/health", get(api_health))
         .route("/api/client-config", get(api_client_config))
         .route("/api/sessions", get(api_sessions))
+        .route("/api/session", post(api_post_session).put(api_put_session))
         .route(
             "/api/session-skills",
             get(api_session_skills).put(api_put_session_skills),

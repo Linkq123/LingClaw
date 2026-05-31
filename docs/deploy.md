@@ -458,8 +458,9 @@ docs/reference/agents/          # 内置 system sub-agents（运行时磁盘发�
 ~/.lingclaw/
   .lingclaw.json                # 配置文件（Setup Wizard 自动创建）
   sessions/                     # 磁盘持久化的会话 JSON
-    main.json                   # 单主会话存档
-  main/workspace/               # 主会话工作区（含 7 个 prompt 文件 + memory/ 日志）
+    main.json                   # 默认会话存档
+    <session-id>.json           # 其他持久化 session 存档
+  <session-id>/workspace/       # 对应 session 工作区（含 7 个 prompt 文件 + memory/ 日志）
 ```
 
 其中 `docs/reference/templates/` 是可选的磁盘覆盖目录：

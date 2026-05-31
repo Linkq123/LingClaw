@@ -82,6 +82,15 @@ describe('socket session binding', () => {
     expect(mockWebSocket).toHaveBeenCalledWith('ws://localhost:3000/ws');
   });
 
+  it('connects to the selected websocket session when active session is restored', async () => {
+    const { connect } = await import('../src/socket.js');
+    stateModule.state.activeSessionId = 'research-notes';
+
+    connect(() => {});
+
+    expect(mockWebSocket).toHaveBeenCalledWith('ws://localhost:3000/ws?session=research-notes');
+  });
+
   it('keeps only a non-current non-main pending delete target', async () => {
     stateModule.state.sessions = [
       { id: 'main', name: 'Main' },
@@ -179,6 +188,48 @@ describe('socket session binding', () => {
     deleteButton?.click();
 
     expect(onDelete).toHaveBeenCalledWith('project-alpha');
+  });
+
+  it('keeps main as the first rendered session regardless of recency order', async () => {
+    stateModule.state.sessions = [
+      { id: 'project-alpha', name: 'Project Alpha', updated_at: 20 },
+      { id: 'main', name: 'Main', updated_at: 1 },
+      { id: 'research-notes', name: 'Research Notes', updated_at: 10 },
+    ];
+    stateModule.state.activeSessionId = 'project-alpha';
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete: vi.fn(),
+      onSwitch: vi.fn(),
+    });
+
+    const rows = stateModule.dom.sessionDrawerList?.querySelectorAll('.session-drawer-row');
+
+    expect(rows?.[0]?.getAttribute('data-session-id')).toBe('main');
+  });
+
+  it('renders a rename action for healthy sessions', async () => {
+    const onRename = vi.fn();
+    stateModule.state.sessions = [
+      { id: 'main', name: 'Main' },
+      { id: 'research-notes', name: 'Research Notes' },
+    ];
+    stateModule.state.activeSessionId = 'main';
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete: vi.fn(),
+      onRename,
+      onSwitch: vi.fn(),
+    });
+
+    const renameButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '[data-session-id="research-notes"] [data-session-action="rename"]',
+    );
+    renameButton?.click();
+
+    expect(onRename).toHaveBeenCalledWith('research-notes');
   });
 
   it('allows deleting a corrupt inactive session but does not switch into it', async () => {
@@ -285,7 +336,9 @@ describe('socket session binding', () => {
       onSwitch: vi.fn(),
     });
 
-    const targetRow = stateModule.dom.sessionDrawerList?.querySelector('[data-session-id="research-notes"]');
+    const targetRow = stateModule.dom.sessionDrawerList?.querySelector(
+      '[data-session-id="research-notes"]',
+    );
     const targetBadge = targetRow?.querySelector('.session-drawer-row-badge');
     const targetSwitchButton = targetRow?.querySelector<HTMLButtonElement>(
       '[data-session-action="switch"]',
@@ -307,7 +360,9 @@ describe('socket session binding', () => {
       onSwitch: vi.fn(),
     });
 
-    const activeRow = stateModule.dom.sessionDrawerList?.querySelector('[data-session-id="research-notes"]');
+    const activeRow = stateModule.dom.sessionDrawerList?.querySelector(
+      '[data-session-id="research-notes"]',
+    );
     const activeBadge = activeRow?.querySelector('.session-drawer-row-badge');
     const activeSwitchButton = activeRow?.querySelector<HTMLButtonElement>(
       '[data-session-action="switch"]',

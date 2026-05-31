@@ -709,8 +709,24 @@ pub(crate) fn list_saved_session_summaries_in_dir(dir: &Path) -> Vec<SessionSumm
             }
         }
     }
-    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sort_session_summaries(&mut out);
     out
+}
+
+pub(crate) fn sort_session_summaries(summaries: &mut [SessionSummary]) {
+    summaries.sort_by(|a, b| {
+        match (
+            a.id == crate::MAIN_SESSION_ID,
+            b.id == crate::MAIN_SESSION_ID,
+        ) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => b
+                .updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.id.cmp(&b.id)),
+        }
+    });
 }
 
 #[cfg(test)]

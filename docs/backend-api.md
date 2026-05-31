@@ -148,10 +148,82 @@
 
 ### 说明
 
-- 返回值按 `updated_at` 倒序排列
+- `main` 固定排在第一；其他 session 按 `updated_at` 倒序排列
 - `messages` 为会话消息条数
 - `tool_calls` 为累计工具调用次数
 - 列表同时覆盖默认 `main` 和其他已创建 session
+
+## 4.2.1 POST /api/session
+
+创建一个新的持久化 session。session id 由后端随机生成，格式为 6 位小写英文字母或数字；用户不需要输入 id，可在创建后通过重命名修改显示名称。
+
+### 请求
+
+无请求体。
+
+### 响应
+
+```json
+{
+  "ok": true,
+  "session": {
+    "id": "a1b2c3",
+    "name": "Session a1b2c3",
+    "messages": 0,
+    "tool_calls": 0,
+    "model": "openai/gpt-4o-mini",
+    "created_at": 1710002222,
+    "updated_at": 1710002222,
+    "corrupt": false
+  }
+}
+```
+
+### 说明
+
+- 新 session 会立即写入 `~/.lingclaw/sessions/<id>.json`
+- 创建成功后会广播新的 session 列表
+- 若随机 id 碰撞，后端会重新生成；连续失败返回 `500`
+
+## 4.2.2 PUT /api/session
+
+修改指定 session 的显示名称；session id 和工作区路径不变。
+
+### 查询参数
+
+- `session`：可选 session id，省略时使用 `main`
+
+### 请求
+
+```json
+{
+  "name": "Research Notes"
+}
+```
+
+### 响应
+
+```json
+{
+  "ok": true,
+  "session": {
+    "id": "research-notes",
+    "name": "Research Notes",
+    "messages": 7,
+    "tool_calls": 2,
+    "model": "openai/gpt-4o-mini",
+    "created_at": 1710002222,
+    "updated_at": 1710004444,
+    "corrupt": false
+  }
+}
+```
+
+### 说明
+
+- `name` 会去除首尾空白，不能为空，最长 80 个字符
+- 保存成功后会持久化 session，并广播新的 session 列表
+- 未知 session 返回 `404`，非法名称返回 `400`
 
 ## 4.3 GET/PUT /api/session-skills
 
@@ -1767,7 +1839,7 @@ WebSocket 下若图片不合法，通常以 `system` 事件返回错误，例如
 
 - `/api/config/test-model` 与 `/api/config/test-mcp` 的“联通性失败”通常返回 `200 + {ok:false}`
 - `/api/config` 在配置文件语法错误时不会返回 4xx，而是返回可恢复信息
-- `/api/sessions` 返回当前已知 session 摘要列表
+- `/api/sessions` 返回当前已知 session 摘要列表，`main` 固定置顶；`POST /api/session` 创建随机 6 位 id 的新 session，`PUT /api/session` 只修改 session 显示名称
 - `/api/todos` 使用整表替换 + revision 冲突语义；冲突时返回 `409 + 当前快照`
 - WebSocket 客户端消息没有显式 `type` 字段，按“纯文本 / slash 命令 / JSON 图片消息”三种形态自动分流
 - 忙碌时普通文本会进入 deferred intervention 队列，不会立即中断主执行

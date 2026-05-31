@@ -5084,6 +5084,122 @@ async fn api_sessions_lists_loaded_non_main_sessions() {
 }
 
 #[tokio::test]
+async fn api_sessions_keeps_main_first_even_when_older() {
+    let state = Arc::new(test_app_state());
+    {
+        let mut main = test_session(MAIN_SESSION_ID, "Main", None);
+        main.updated_at = 1;
+        let mut recent = test_session("recent-session", "Recent", None);
+        recent.updated_at = 999;
+
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(MAIN_SESSION_ID.to_string(), main);
+        sessions.insert("recent-session".to_string(), recent);
+    }
+
+    let response = api_sessions(State(state)).await.into_response();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should be readable");
+    let payload: serde_json::Value =
+        serde_json::from_slice(&body).expect("payload should be valid json");
+    let sessions = payload["sessions"]
+        .as_array()
+        .expect("sessions array should be present");
+
+    assert_eq!(sessions[0]["id"], MAIN_SESSION_ID);
+}
+
+#[tokio::test]
+async fn api_put_session_renames_and_persists_session() {
+    let session_id = format!("rename-session-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+    let state = Arc::new(test_app_state());
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(
+            session_id.clone(),
+            test_session(&session_id, "Original Name", None),
+        );
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_put_session(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers,
+        State(state.clone()),
+        Json(SessionRenameRequest {
+            name: "Renamed Session".to_string(),
+        }),
+    )
+    .await
+    .expect("rename should succeed");
+
+    assert_eq!(payload["session"]["name"], "Renamed Session");
+    assert_eq!(
+        state
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .expect("renamed session should stay loaded")
+            .name,
+        "Renamed Session"
+    );
+    assert_eq!(
+        load_session_from_disk(&session_id)
+            .expect("renamed session should be persisted")
+            .name,
+        "Renamed Session"
+    );
+}
+
+#[tokio::test]
+async fn api_post_session_creates_random_six_character_session_id() {
+    let state = Arc::new(test_app_state());
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_post_session(headers, State(state.clone()))
+        .await
+        .expect("session creation should succeed");
+
+    let session_id = payload["session"]["id"]
+        .as_str()
+        .expect("created session id should be present")
+        .to_string();
+    let workspace = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace,
+    };
+
+    assert_eq!(session_id.len(), 6);
+    assert!(
+        session_id
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+    );
+    assert_eq!(
+        payload["session"]["name"].as_str().unwrap_or_default(),
+        format!("Session {session_id}")
+    );
+    assert!(state.sessions.lock().await.contains_key(&session_id));
+    assert!(
+        load_session_from_disk(&session_id).is_some(),
+        "created session should be persisted"
+    );
+}
+
+#[tokio::test]
 async fn api_sessions_includes_corrupt_persisted_sessions() {
     let session_id = format!(
         "api-sessions-corrupt-{}",

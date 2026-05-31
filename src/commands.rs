@@ -1635,7 +1635,7 @@ async fn handle_sessions_command(current_session_id: &str, state: &AppState) -> 
         }
         summaries.push(SessionSummary::from_session(session));
     }
-    summaries.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    crate::session_store::sort_session_summaries(&mut summaries);
 
     let active_lines =
         crate::session_store::build_active_session_lines(&sessions, &active_ids, &config);

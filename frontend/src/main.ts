@@ -132,12 +132,16 @@ import {
   toggleSessionDrawerExpanded,
 } from './renderers/sessions.js';
 import { applyTodosState, applyTodosVisibility, initTodosPanel } from './renderers/todos.js';
+import { createSession as requestCreateSession } from './sessionApi.js';
+import { loadActiveSessionId, persistActiveSessionId } from './sessionPersistence.js';
 
 // ── Initialize DOM ──
 initDomRefs();
+state.activeSessionId = loadActiveSessionId();
 initSessionDrawer({
-  onCreate: promptAndCreateSession,
+  onCreate: createSession,
   onDelete: deleteSession,
+  onRename: renameSession,
   onSwitch: switchToSession,
 });
 initTodosPanel();
@@ -224,15 +228,23 @@ function updateUsageBadge() {
 }
 
 function normalizeSessionListPayload(payload): SessionSummary[] {
-  return Array.isArray(payload?.sessions)
+  const sessions = Array.isArray(payload?.sessions)
     ? payload.sessions.map((session) => ({
         id: String(session.id ?? ''),
         name: String(session.name ?? session.id ?? ''),
         updated_at:
-          typeof session.updated_at === 'number' ? session.updated_at : Number(session.updated_at ?? 0),
+          typeof session.updated_at === 'number'
+            ? session.updated_at
+            : Number(session.updated_at ?? 0),
         corrupt: session.corrupt === true,
       }))
     : [];
+  sessions.sort((a, b) => {
+    if (a.id === 'main' && b.id !== 'main') return -1;
+    if (a.id !== 'main' && b.id === 'main') return 1;
+    return (b.updated_at ?? 0) - (a.updated_at ?? 0) || a.id.localeCompare(b.id);
+  });
+  return sessions;
 }
 
 async function refreshSessionsList() {
@@ -247,26 +259,52 @@ async function refreshSessionsList() {
   }
 }
 
+function upsertSessionSummary(session: SessionSummary) {
+  const existingIndex = state.sessions.findIndex((existing) => existing.id === session.id);
+  if (existingIndex >= 0) {
+    state.sessions[existingIndex] = { ...state.sessions[existingIndex], ...session };
+  } else {
+    state.sessions.push(session);
+  }
+  state.sessions = normalizeSessionListPayload({ sessions: state.sessions });
+}
+
 function switchToSession(sessionId: string) {
   const nextSessionId = String(sessionId || '').trim();
   if (!nextSessionId || nextSessionId === state.activeSessionId || state.sessionSwitchInFlight) {
     renderSessionDrawer();
     return;
   }
-  state.pendingDeleteSessionId = state.activeSessionId && state.activeSessionId !== 'main'
-    ? state.activeSessionId
-    : '';
+  state.pendingDeleteSessionId =
+    state.activeSessionId && state.activeSessionId !== 'main' ? state.activeSessionId : '';
   state.activeSessionId = nextSessionId;
+  persistActiveSessionId(nextSessionId);
   state.sessionSwitchInFlight = true;
   renderSessionDrawer();
   reconnectToActiveSession(handleMessage);
 }
 
-function promptAndCreateSession() {
-  const raw = window.prompt('New session id');
-  const nextSessionId = raw?.trim();
-  if (!nextSessionId) return;
-  switchToSession(nextSessionId);
+let sessionCreateInFlight = false;
+
+async function createSession() {
+  if (sessionCreateInFlight || state.sessionSwitchInFlight) return;
+  sessionCreateInFlight = true;
+  try {
+    const created = await requestCreateSession();
+    upsertSessionSummary(created);
+    state.pendingDeleteSessionId =
+      state.activeSessionId && state.activeSessionId !== 'main' ? state.activeSessionId : '';
+    state.activeSessionId = created.id;
+    persistActiveSessionId(created.id);
+    state.sessionSwitchInFlight = true;
+    renderSessionDrawer();
+    reconnectToActiveSession(handleMessage);
+  } catch (error) {
+    addError(`Failed to create session: ${error instanceof Error ? error.message : String(error)}`);
+    renderSessionDrawer();
+  } finally {
+    sessionCreateInFlight = false;
+  }
 }
 
 function deleteSession(sessionId: string) {
@@ -279,6 +317,49 @@ function deleteSession(sessionId: string) {
   state.pendingDeleteSessionId = targetSessionId;
   renderSessionDrawer();
   sendCmd(`/delete ${targetSessionId}`);
+}
+
+async function renameSession(sessionId: string) {
+  const targetSessionId = String(sessionId || '').trim();
+  if (!targetSessionId || state.sessionSwitchInFlight) return;
+  const current = state.sessions.find((session) => session.id === targetSessionId);
+  if (current?.corrupt) return;
+  const raw = window.prompt('Session name', current?.name || targetSessionId);
+  const nextName = raw?.trim();
+  if (!nextName || nextName === (current?.name || targetSessionId)) return;
+
+  try {
+    const response = await fetch(`/api/session?session=${encodeURIComponent(targetSessionId)}`, {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: nextName }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(String(payload?.error || `HTTP ${response.status}`));
+    }
+
+    const updated = payload?.session;
+    if (updated?.id) {
+      const updatedSession: SessionSummary = {
+        id: String(updated.id),
+        name: String(updated.name ?? updated.id),
+        updated_at:
+          typeof updated.updated_at === 'number'
+            ? updated.updated_at
+            : Number(updated.updated_at ?? 0),
+        corrupt: updated.corrupt === true,
+      };
+      upsertSessionSummary(updatedSession);
+      if (updatedSession.id === state.activeSessionId) {
+        dom.sessionNameEl.textContent = updatedSession.name || 'Main';
+      }
+      renderSessionDrawer();
+    }
+    void refreshSessionsList();
+  } catch (error) {
+    addError(`Failed to rename session: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 function appendRoundUsage(messageEl, inputTokens, outputTokens, firstTokenMs = null) {
@@ -523,6 +604,7 @@ function handleMessage(data) {
     case 'session':
       clearCompressionOutcome();
       state.activeSessionId = data.id;
+      persistActiveSessionId(state.activeSessionId || 'main');
       state.sessionSwitchInFlight = false;
       dom.sessionNameEl.textContent = data.name || 'Main';
       dom.sessionIdEl.textContent = data.id.slice(0, 12);
@@ -661,7 +743,9 @@ function handleMessage(data) {
       break;
 
     case 'context_pruned':
-      addSystem(`Context pruned to fit budget: removed ${data.messages_removed || 0} additional messages`);
+      addSystem(
+        `Context pruned to fit budget: removed ${data.messages_removed || 0} additional messages`,
+      );
       break;
 
     case 'context_compress_failed':
@@ -1228,7 +1312,7 @@ function handleSessionDrawerToggleClick() {
 }
 
 function handleSessionDrawerNewClick() {
-  promptAndCreateSession();
+  void createSession();
 }
 
 // Throttle the chat scroll handler to one invocation per animation frame.
