@@ -33,6 +33,7 @@ const MCP_DIAGNOSTIC_CHAR_LIMIT: usize = 400;
 const MCP_TOOL_CACHE_TTL_SECS: u64 = 30;
 const MCP_SESSION_IDLE_TTL_SECS: u64 = 300;
 const MCP_SPAWN_FAILURE_COOLDOWN_SECS: u64 = 15;
+#[cfg(test)]
 const MCP_DEFAULT_HTTP_TIMEOUT_SECS: u64 = 30;
 const MCP_MAX_PAGINATION_PAGES: usize = 100;
 const MCP_SESSION_POLICY_FILE: &str = ".lingclaw-mcp-policy.json";
@@ -1070,6 +1071,7 @@ pub(crate) async fn complete_oauth_authorization(
 /// Ensure MCP tool descriptors are cached for all enabled servers.
 /// Triggers async discovery for any server whose cache entry is missing or expired.
 /// Safe to call multiple times 鈥?hits cache on subsequent calls within the TTL window.
+#[cfg(test)]
 pub(crate) async fn ensure_tools_cached(config: &Config, workspace: &Path) {
     let _ = list_tools(config, workspace).await;
 }
@@ -1310,6 +1312,7 @@ pub(crate) fn cached_tool_definitions_anthropic_for_policy(
         .collect()
 }
 
+#[cfg(test)]
 pub(crate) fn cached_server_counts(config: &Config, workspace: &Path) -> (usize, usize) {
     let mut enabled_servers = 0;
     let mut cached_servers = 0;
@@ -3724,6 +3727,7 @@ async fn refresh_bearer_token(
     Ok(access_token)
 }
 
+#[cfg(test)]
 async fn bearer_token_for_server(
     server_name: &str,
     timeout_secs: u64,
@@ -4015,6 +4019,7 @@ fn invalidate_http_server_caches(message: &Value, cache_key: &str) {
     }
 }
 
+#[cfg(test)]
 fn handle_http_server_message(message: &Value, cache_key: &str) {
     invalidate_http_server_caches(message, cache_key);
 }
@@ -4070,6 +4075,7 @@ fn record_sse_event_id(event: &str, cache_key: &str) {
     }
 }
 
+#[cfg(test)]
 fn parse_sse_event(event: &str, cache_key: &str) -> Option<Value> {
     record_sse_event_id(event, cache_key);
     let message = parse_sse_event_message(event)?;
@@ -4477,6 +4483,7 @@ async fn http_post_json(
     serde_json::from_str(&text).map_err(|error| format!("invalid HTTP MCP JSON: {error}"))
 }
 
+#[cfg(test)]
 fn parse_sse_json_response(text: &str, cache_key: &str) -> Result<Value, String> {
     let mut buffer = text.to_string();
     let mut last_response = None;
