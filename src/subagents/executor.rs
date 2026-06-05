@@ -585,10 +585,9 @@ pub(crate) async fn run_subagent(
     let resolved = config.resolve_model(&model_id);
     let provider_name = config.resolve_provider_name(&model_id);
 
-    // Ensure MCP tool cache is warm before building the sub-agent tool set.
-    // The main loop's Analyze phase usually warms it, but cache may have expired
-    // (TTL=30s) if LLM inference was slow, or if this is a re-invocation.
-    tools::mcp::ensure_tools_cached(config, workspace).await;
+    // Warm only the MCP tools that this session has explicitly enabled.
+    // Disabled MCP servers must not be spawned just because a sub-agent runs.
+    tools::mcp::ensure_policy_tools_cached(config, workspace).await;
 
     // Build filtered tool definitions for this sub-agent (includes MCP tools).
     let allowed_tools = super::filter_tools_for_agent_with_mcp(spec, config, workspace);
@@ -1549,11 +1548,16 @@ async fn execute_subagent_tool(
     event_tx: Option<tools::ToolEventSender>,
     bounded_event_tx: Option<tools::BoundedToolEventSender>,
 ) -> tools::ToolOutcome {
-    let mcp_result = if isolated_mcp_session {
-        tools::mcp::execute_tool_isolated(name, args_str, config, workspace).await
-    } else {
-        tools::mcp::execute_tool(name, args_str, config, workspace).await
-    };
+    let mcp_policy = tools::mcp::load_session_policy(workspace);
+    let mcp_result = tools::mcp::execute_tool_for_policy(
+        name,
+        args_str,
+        config,
+        workspace,
+        isolated_mcp_session,
+        &mcp_policy,
+    )
+    .await;
 
     if let Some(result) = mcp_result {
         result

@@ -68,10 +68,27 @@ fn tools_call_response(id: &str, label: &str) -> String {
     )
 }
 
+fn resources_list_response(id: &str) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"resources\":[]}}}}",
+        id
+    )
+}
+
+fn prompts_list_response(id: &str) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{{\"prompts\":[]}}}}",
+        id
+    )
+}
+
 fn main() {
     let mode = env::var("LINGCLAW_MCP_MODE").unwrap_or_else(|_| "default".to_string());
     let log_path = env::var("LINGCLAW_MCP_LOG").ok();
     append_log(log_path.as_deref(), "start");
+    if let Ok(value) = env::var("LINGCLAW_MCP_ENV_CHECK") {
+        append_log(log_path.as_deref(), &format!("env:LINGCLAW_MCP_ENV_CHECK={value}"));
+    }
 
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
@@ -107,6 +124,15 @@ fn main() {
                     ("alpha", "Retrieve the current value")
                 };
                 if let Some(id) = id.as_deref() {
+                    if mode == "roots-id-collision" {
+                        write_line(
+                            &mut stdout,
+                            &format!(
+                                "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"roots/list\",\"params\":{{}}}}",
+                                id
+                            ),
+                        );
+                    }
                     write_line(&mut stdout, &tools_list_response(id, tool_name, description));
                 }
                 if mode == "tool-change" && tools_list_count == 1 {
@@ -132,6 +158,16 @@ fn main() {
                 }
                 if mode == "restart-once" {
                     break;
+                }
+            }
+            Some("resources/list") => {
+                if let Some(id) = id.as_deref() {
+                    write_line(&mut stdout, &resources_list_response(id));
+                }
+            }
+            Some("prompts/list") => {
+                if let Some(id) = id.as_deref() {
+                    write_line(&mut stdout, &prompts_list_response(id));
                 }
             }
             _ => {}

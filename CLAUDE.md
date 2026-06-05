@@ -72,7 +72,7 @@ The runtime uses an explicit ReAct-style state machine:
   - `fs.rs` file tools
   - `exec.rs` shell + think tools
   - `net.rs` HTTP fetch + SSRF protection
-  - `mcp.rs` stdio MCP bridge and caching
+  - `mcp.rs` MCP client for stdio/Streamable HTTP, OAuth, tools/resources/prompts, session policy, caching, and lifecycle
 - `src/subagents/` — agent discovery, isolated execution, and DAG orchestration
 
 ## Frontend map

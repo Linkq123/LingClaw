@@ -76,6 +76,31 @@ function findSkillCheckbox(skillId: string): HTMLInputElement {
   return input;
 }
 
+function findCheckboxByLabel(text: string): HTMLInputElement {
+  const label = Array.from(document.querySelectorAll('label')).find((node) =>
+    node.textContent?.includes(text),
+  );
+  const input = label?.querySelector('input[type="checkbox"]');
+  if (!(input instanceof HTMLInputElement)) {
+    throw new Error(`Checkbox not found: ${text}`);
+  }
+  return input;
+}
+
+function findMcpServerEnabledCheckbox(serverName: string): HTMLInputElement {
+  const card = Array.from(document.querySelectorAll('.provider-card')).find((node) =>
+    node.textContent?.includes(`${serverName} ·`),
+  );
+  const label = Array.from(card?.querySelectorAll('label') || []).find((node) =>
+    node.textContent?.includes('Enabled for session'),
+  );
+  const input = label?.querySelector('input[type="checkbox"]');
+  if (!(input instanceof HTMLInputElement)) {
+    throw new Error(`MCP server checkbox not found: ${serverName}`);
+  }
+  return input;
+}
+
 function findInputByPlaceholder(placeholder: string): HTMLInputElement {
   const input = document.querySelector(`input[placeholder="${placeholder}"]`);
   if (!(input instanceof HTMLInputElement)) {
@@ -91,6 +116,15 @@ function setInputValue(input: HTMLInputElement, value: string): void {
   )?.set;
   valueSetter?.call(input, value);
   input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function setTextareaValue(textarea: HTMLTextAreaElement, value: string): void {
+  const valueSetter = Object.getOwnPropertyDescriptor(
+    window.HTMLTextAreaElement.prototype,
+    'value',
+  )?.set;
+  valueSetter?.call(textarea, value);
+  textarea.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
 function deferred<T>(): {
@@ -512,7 +546,8 @@ describe('SettingsPage test button timers', () => {
   });
 
   it('keeps the latest MCP test result visible until its own reset timer fires', async () => {
-    const fetchMock = vi.fn<typeof fetch>((input) => {
+    let testBody: Record<string, unknown> | undefined;
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
       const url = typeof input === 'string' ? input : input.url;
       if (url === '/api/config') {
         return Promise.resolve(
@@ -522,8 +557,10 @@ describe('SettingsPage test button timers', () => {
               mcpServers: {
                 demo: {
                   command: 'uvx',
+                  url: 'https://legacy.example/mcp',
                   args: ['server'],
                   env: { TOKEN: 'secret' },
+                  auth: { clientId: 'client-id', scopes: ['repo'] },
                   enabled: true,
                 },
               },
@@ -531,8 +568,21 @@ describe('SettingsPage test button timers', () => {
           }),
         );
       }
-      if (url === '/api/config/test-mcp') {
+      if (url === '/api/config/test-mcp?session=main') {
+        testBody = JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>;
         return Promise.resolve(jsonResponse({ ok: true, tools: 3 }));
+      }
+      if (url === '/api/mcp/catalog?session=main') {
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            policy: { enabledServers: [], enabledTools: [] },
+            servers: [],
+            tools: [],
+            resources: [],
+            prompts: [],
+          }),
+        );
       }
       throw new Error(`Unexpected fetch URL: ${url}`);
     });
@@ -552,6 +602,15 @@ describe('SettingsPage test button timers', () => {
     });
 
     expect(findPrimaryTestButton().textContent).toBe('✓ 3 tools');
+    expect(testBody).toMatchObject({
+      server: 'demo',
+      transport: 'stdio',
+      command: 'uvx',
+      url: 'https://legacy.example/mcp',
+      args: ['server'],
+      env: { TOKEN: 'secret' },
+      auth: { clientId: 'client-id', scopes: ['repo'] },
+    });
 
     await act(async () => {
       vi.advanceTimersByTime(2000);
@@ -578,6 +637,1027 @@ describe('SettingsPage test button timers', () => {
     });
 
     expect(findPrimaryTestButton().textContent).toBe('Test');
+  });
+});
+
+describe('SettingsPage MCP auth', () => {
+  let root: Root | null = null;
+
+  beforeEach(() => {
+    (
+      globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
+    ).IS_REACT_ACT_ENVIRONMENT = true;
+  });
+
+  afterEach(async () => {
+    if (root) {
+      await act(async () => {
+        root?.unmount();
+        await flushMicrotasks();
+      });
+      root = null;
+    }
+    document.body.innerHTML = '';
+    delete (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
+      .IS_REACT_ACT_ENVIRONMENT;
+    vi.unstubAllGlobals();
+  });
+
+  it('starts OAuth for streamable-http MCP servers from the catalog', async () => {
+    let authStartBody: unknown;
+    const popup = {
+      closed: false,
+      close: vi.fn(),
+      location: { href: '' },
+      opener: {},
+    };
+    const openMock = vi.fn(() => popup);
+    vi.stubGlobal('open', openMock);
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config') {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              mcpServers: {
+                remote: {
+                  transport: 'streamable-http',
+                  url: 'https://mcp.example/mcp',
+                  enabled: true,
+                },
+              },
+            },
+          }),
+        );
+      }
+      if (url === '/api/mcp/catalog?session=main') {
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            policy: { enabledServers: [], enabledTools: [] },
+            servers: [
+              {
+                id: 'remote',
+                name: 'remote',
+                transport: 'streamable-http',
+                configuredEnabled: true,
+                enabled: false,
+                authenticated: false,
+                toolCount: 0,
+                resourceCount: 0,
+                promptCount: 0,
+              },
+            ],
+            tools: [],
+            resources: [],
+            prompts: [],
+          }),
+        );
+      }
+      if (url === '/api/mcp/auth/start') {
+        authStartBody = JSON.parse(String(init?.body || '{}'));
+        return Promise.resolve(
+          jsonResponse({
+            ok: true,
+            authorizationUrl: 'https://auth.example/authorize',
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      findButtonByText('MCP').click();
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      findButtonByText('Connect').click();
+      await flushMicrotasks();
+    });
+
+    expect(authStartBody).toEqual({ server: 'remote' });
+    expect(openMock).toHaveBeenCalledWith('about:blank', '_blank');
+    expect(popup.opener).toBeNull();
+    expect(popup.location.href).toBe('https://auth.example/authorize');
+  });
+
+  it('disables OAuth connect for globally disabled MCP servers', async () => {
+    const fetchMock = vi.fn<typeof fetch>((input) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config') {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              mcpServers: {
+                remote: {
+                  transport: 'streamable-http',
+                  url: 'https://mcp.example/mcp',
+                  enabled: false,
+                },
+              },
+            },
+          }),
+        );
+      }
+      if (url === '/api/mcp/catalog?session=main') {
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            policy: { enabledServers: [], enabledTools: [] },
+            servers: [
+              {
+                id: 'remote',
+                name: 'remote',
+                transport: 'streamable-http',
+                configuredEnabled: false,
+                enabled: false,
+                authenticated: false,
+                toolCount: 0,
+                resourceCount: 0,
+                promptCount: 0,
+              },
+            ],
+            tools: [],
+            resources: [],
+            prompts: [],
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      findButtonByText('MCP').click();
+      await flushMicrotasks();
+    });
+
+    const connect = findButtonByText('Connect');
+    expect(connect).toBeInstanceOf(HTMLButtonElement);
+    expect((connect as HTMLButtonElement).disabled).toBe(true);
+    expect(fetchMock).not.toHaveBeenCalledWith('/api/mcp/auth/start', expect.anything());
+  });
+
+  it('does not dirty config when the MCP tab renders omitted default fields', async () => {
+    const fetchMock = vi.fn<typeof fetch>((input) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config') {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              mcpServers: {
+                demo: {
+                  command: 'uvx',
+                },
+              },
+            },
+          }),
+        );
+      }
+      if (url === '/api/mcp/catalog?session=main') {
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            policy: { enabledServers: [], enabledTools: [] },
+            servers: [
+              {
+                id: 'demo',
+                name: 'demo',
+                transport: 'stdio',
+                configuredEnabled: true,
+                enabled: false,
+                toolCount: 0,
+                resourceCount: 0,
+                promptCount: 0,
+              },
+            ],
+            tools: [],
+            resources: [],
+            prompts: [],
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      findButtonByText('MCP').click();
+      await flushMicrotasks();
+    });
+
+    const save = document.getElementById('settings-save-btn');
+    if (!(save instanceof HTMLButtonElement)) throw new Error('Save button not found');
+    expect(save.disabled).toBe(true);
+    expect(document.body.textContent).toContain('No unsaved config changes.');
+  });
+
+  it('does not let a late MCP catalog refresh overwrite unsaved policy edits', async () => {
+    const refreshRequest = deferred<Response>();
+    let catalogCalls = 0;
+    const fetchMock = vi.fn<typeof fetch>((input) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config') {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              mcpServers: {
+                remote: {
+                  transport: 'streamable-http',
+                  url: 'https://mcp.example/mcp',
+                  enabled: true,
+                },
+              },
+            },
+          }),
+        );
+      }
+      if (url === '/api/mcp/catalog?session=main') {
+        catalogCalls += 1;
+        if (catalogCalls === 2) return refreshRequest.promise;
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            policy: { enabledServers: [], enabledTools: [] },
+            servers: [
+              {
+                id: 'remote',
+                name: 'remote',
+                transport: 'streamable-http',
+                configuredEnabled: true,
+                enabled: false,
+                authenticated: false,
+                toolCount: 1,
+                resourceCount: 0,
+                promptCount: 0,
+              },
+            ],
+            tools: [],
+            resources: [],
+            prompts: [],
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      findButtonByText('MCP').click();
+      await flushMicrotasks();
+    });
+    expect(findCheckboxByLabel('Enabled for session').checked).toBe(false);
+
+    await act(async () => {
+      findButtonByText('Refresh Catalog').click();
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      findCheckboxByLabel('Enabled for session').click();
+      await flushMicrotasks();
+    });
+    expect(findCheckboxByLabel('Enabled for session').checked).toBe(true);
+
+    await act(async () => {
+      refreshRequest.resolve(
+        jsonResponse({
+          session: { id: 'main', name: 'Main' },
+          policy: { enabledServers: [], enabledTools: [] },
+          servers: [
+            {
+              id: 'remote',
+              name: 'remote',
+              transport: 'streamable-http',
+              configuredEnabled: true,
+              enabled: false,
+              authenticated: false,
+              toolCount: 1,
+              resourceCount: 0,
+              promptCount: 0,
+            },
+          ],
+          tools: [],
+          resources: [],
+          prompts: [],
+        }),
+      );
+      await flushMicrotasks();
+    });
+
+    expect(findCheckboxByLabel('Enabled for session').checked).toBe(true);
+    expect(document.body.textContent).toContain('Unsaved');
+  });
+
+  it('keeps newer MCP policy edits made while a save is in flight', async () => {
+    const saveRequest = deferred<Response>();
+    let catalogCalls = 0;
+    let savedBody: unknown;
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config') {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              mcpServers: {
+                remote: {
+                  transport: 'streamable-http',
+                  url: 'https://mcp.example/mcp',
+                  enabled: true,
+                },
+              },
+            },
+          }),
+        );
+      }
+      if (url === '/api/mcp/catalog?session=main') {
+        catalogCalls += 1;
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            policy: { enabledServers: [], enabledTools: [] },
+            servers: [
+              {
+                id: 'remote',
+                name: 'remote',
+                transport: 'streamable-http',
+                configuredEnabled: true,
+                enabled: false,
+                authenticated: false,
+                toolCount: 0,
+                resourceCount: 0,
+                promptCount: 0,
+              },
+            ],
+            tools: [],
+            resources: [],
+            prompts: [],
+          }),
+        );
+      }
+      if (url === '/api/mcp/session-policy?session=main' && init?.method === 'PUT') {
+        savedBody = JSON.parse(String(init.body || '{}'));
+        return saveRequest.promise;
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      findButtonByText('MCP').click();
+      await flushMicrotasks();
+    });
+    expect(findCheckboxByLabel('Enabled for session').checked).toBe(false);
+
+    await act(async () => {
+      findCheckboxByLabel('Enabled for session').click();
+      await flushMicrotasks();
+    });
+    expect(findCheckboxByLabel('Enabled for session').checked).toBe(true);
+
+    await act(async () => {
+      findButtonByText('Save MCP Permissions').click();
+      await flushMicrotasks();
+    });
+    expect(savedBody).toEqual({
+      enabledServers: ['remote'],
+      enabledTools: [],
+      confirmMutatingTools: false,
+      clientCapabilities: {},
+    });
+    expect(findButtonByText('Saving...').disabled).toBe(true);
+
+    await act(async () => {
+      findCheckboxByLabel('Enabled for session').click();
+      await flushMicrotasks();
+    });
+    expect(findCheckboxByLabel('Enabled for session').checked).toBe(false);
+
+    await act(async () => {
+      saveRequest.resolve(jsonResponse({ ok: true, policy: {} }));
+      await flushMicrotasks();
+    });
+
+    expect(findCheckboxByLabel('Enabled for session').checked).toBe(false);
+    expect(document.body.textContent).toContain('Unsaved');
+    expect(findButtonByText('Save MCP Permissions').disabled).toBe(false);
+    expect(catalogCalls).toBe(1);
+  });
+
+  it('drops stale MCP policy tool ids after a successful catalog refresh', async () => {
+    let savedBody: unknown;
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config') {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              mcpServers: {
+                remote: {
+                  transport: 'streamable-http',
+                  url: 'https://mcp.example/mcp',
+                  enabled: true,
+                },
+                disabled: {
+                  transport: 'streamable-http',
+                  url: 'https://disabled.example/mcp',
+                  enabled: false,
+                },
+              },
+            },
+          }),
+        );
+      }
+      if (url === '/api/mcp/catalog?session=main') {
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            policy: {
+              enabledServers: ['remote', 'disabled', 'missing'],
+              enabledTools: [
+                'mcp__remote__cached__99999999',
+                'mcp__remote__read__abc12345',
+                'mcp__disabled__write__def67890',
+                'mcp__missing__tool__bad00000',
+              ],
+              confirmMutatingTools: false,
+              clientCapabilities: { roots: false },
+            },
+            servers: [
+              {
+                id: 'remote',
+                name: 'remote',
+                transport: 'streamable-http',
+                configuredEnabled: true,
+                enabled: true,
+                authenticated: false,
+                toolCount: 1,
+                resourceCount: 0,
+                promptCount: 0,
+              },
+              {
+                id: 'disabled',
+                name: 'disabled',
+                transport: 'streamable-http',
+                configuredEnabled: false,
+                enabled: true,
+                authenticated: false,
+                toolCount: 0,
+                resourceCount: 0,
+                promptCount: 0,
+              },
+            ],
+            tools: [
+              {
+                id: 'mcp__remote__read__abc12345',
+                server: 'remote',
+                rawName: 'read',
+                name: 'mcp__remote__read__abc12345',
+                readOnly: true,
+                enabled: true,
+              },
+            ],
+            resources: [],
+            prompts: [],
+          }),
+        );
+      }
+      if (url === '/api/mcp/session-policy?session=main' && init?.method === 'PUT') {
+        savedBody = JSON.parse(String(init.body || '{}'));
+        return Promise.resolve(jsonResponse({ ok: true, policy: {} }));
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      findButtonByText('MCP').click();
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      findCheckboxByLabel('Expose this session workspace root').click();
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      findButtonByText('Save MCP Permissions').click();
+      await flushMicrotasks();
+    });
+
+    expect(savedBody).toEqual({
+      enabledServers: ['remote'],
+      enabledTools: ['mcp__remote__read__abc12345'],
+      confirmMutatingTools: false,
+      clientCapabilities: { roots: true },
+    });
+  });
+
+  it('preserves hidden MCP policy tools for enabled servers that failed to refresh', async () => {
+    let savedBody: unknown;
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config') {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              mcpServers: {
+                remote: {
+                  transport: 'streamable-http',
+                  url: 'https://mcp.example/mcp',
+                  enabled: true,
+                },
+              },
+            },
+          }),
+        );
+      }
+      if (url === '/api/mcp/catalog?session=main') {
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            policy: {
+              enabledServers: ['remote'],
+              enabledTools: ['mcp__remote__cached__99999999'],
+              confirmMutatingTools: false,
+              clientCapabilities: {},
+            },
+            servers: [
+              {
+                id: 'remote',
+                name: 'remote',
+                transport: 'streamable-http',
+                configuredEnabled: true,
+                enabled: true,
+                authenticated: false,
+                toolCount: 0,
+                resourceCount: 0,
+                promptCount: 0,
+                error: 'tools/list failed',
+              },
+            ],
+            tools: [],
+            resources: [],
+            prompts: [],
+          }),
+        );
+      }
+      if (url === '/api/mcp/session-policy?session=main' && init?.method === 'PUT') {
+        savedBody = JSON.parse(String(init.body || '{}'));
+        return Promise.resolve(jsonResponse({ ok: true, policy: {} }));
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      findButtonByText('MCP').click();
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      findCheckboxByLabel('Expose this session workspace root').click();
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      findButtonByText('Save MCP Permissions').click();
+      await flushMicrotasks();
+    });
+
+    expect(savedBody).toEqual({
+      enabledServers: ['remote'],
+      enabledTools: ['mcp__remote__cached__99999999'],
+      confirmMutatingTools: false,
+      clientCapabilities: { roots: true },
+    });
+  });
+
+  it('clears hidden enabled tool ids when disabling their MCP server', async () => {
+    let savedBody: unknown;
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config') {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              mcpServers: {
+                remote: {
+                  transport: 'streamable-http',
+                  url: 'https://mcp.example/mcp',
+                  enabled: true,
+                },
+              },
+            },
+          }),
+        );
+      }
+      if (url === '/api/mcp/catalog?session=main') {
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            policy: {
+              enabledServers: ['remote'],
+              enabledTools: ['mcp__remote__cached__99999999', 'mcp__remote__read__abc12345'],
+              confirmMutatingTools: false,
+              clientCapabilities: {},
+            },
+            servers: [
+              {
+                id: 'remote',
+                name: 'remote',
+                transport: 'streamable-http',
+                configuredEnabled: true,
+                enabled: true,
+                authenticated: false,
+                toolCount: 1,
+                resourceCount: 0,
+                promptCount: 0,
+              },
+            ],
+            tools: [
+              {
+                id: 'mcp__remote__read__abc12345',
+                server: 'remote',
+                rawName: 'read',
+                name: 'mcp__remote__read__abc12345',
+                readOnly: true,
+                enabled: true,
+              },
+            ],
+            resources: [],
+            prompts: [],
+          }),
+        );
+      }
+      if (url === '/api/mcp/session-policy?session=main' && init?.method === 'PUT') {
+        savedBody = JSON.parse(String(init.body || '{}'));
+        return Promise.resolve(jsonResponse({ ok: true, policy: {} }));
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      findButtonByText('MCP').click();
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      findCheckboxByLabel('Enabled for session').click();
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      findButtonByText('Save MCP Permissions').click();
+      await flushMicrotasks();
+    });
+
+    expect(savedBody).toEqual({
+      enabledServers: [],
+      enabledTools: [],
+      confirmMutatingTools: false,
+      clientCapabilities: {},
+    });
+  });
+
+  it('uses exact catalog server ownership when disabling sanitized-colliding MCP servers', async () => {
+    let savedBody: unknown;
+    const dashTool = 'mcp__github_repo__list_issues__11111111';
+    const underscoreTool = 'mcp__github_repo__list_issues__22222222';
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config') {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              mcpServers: {
+                'github-repo': {
+                  transport: 'streamable-http',
+                  url: 'https://dash.example/mcp',
+                  enabled: true,
+                },
+                github_repo: {
+                  transport: 'streamable-http',
+                  url: 'https://underscore.example/mcp',
+                  enabled: true,
+                },
+              },
+            },
+          }),
+        );
+      }
+      if (url === '/api/mcp/catalog?session=main') {
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            policy: {
+              enabledServers: ['github-repo', 'github_repo'],
+              enabledTools: [dashTool, underscoreTool],
+              confirmMutatingTools: false,
+              clientCapabilities: {},
+            },
+            servers: [
+              {
+                id: 'github-repo',
+                name: 'github-repo',
+                transport: 'streamable-http',
+                configuredEnabled: true,
+                enabled: true,
+                authenticated: false,
+                toolCount: 1,
+                resourceCount: 0,
+                promptCount: 0,
+              },
+              {
+                id: 'github_repo',
+                name: 'github_repo',
+                transport: 'streamable-http',
+                configuredEnabled: true,
+                enabled: true,
+                authenticated: false,
+                toolCount: 1,
+                resourceCount: 0,
+                promptCount: 0,
+              },
+            ],
+            tools: [
+              {
+                id: dashTool,
+                server: 'github-repo',
+                rawName: 'list issues',
+                name: dashTool,
+                readOnly: true,
+                enabled: true,
+              },
+              {
+                id: underscoreTool,
+                server: 'github_repo',
+                rawName: 'list issues',
+                name: underscoreTool,
+                readOnly: true,
+                enabled: true,
+              },
+            ],
+            resources: [],
+            prompts: [],
+          }),
+        );
+      }
+      if (url === '/api/mcp/session-policy?session=main' && init?.method === 'PUT') {
+        savedBody = JSON.parse(String(init.body || '{}'));
+        return Promise.resolve(jsonResponse({ ok: true, policy: {} }));
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      findButtonByText('MCP').click();
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      findMcpServerEnabledCheckbox('github-repo').click();
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      findButtonByText('Save MCP Permissions').click();
+      await flushMicrotasks();
+    });
+
+    expect(savedBody).toEqual({
+      enabledServers: ['github_repo'],
+      enabledTools: [underscoreTool],
+      confirmMutatingTools: false,
+      clientCapabilities: {},
+    });
+  });
+
+  it('hides MCP resources and prompts for servers not enabled in the session', async () => {
+    const fetchMock = vi.fn<typeof fetch>((input) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config') {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              mcpServers: {
+                docs: {
+                  transport: 'streamable-http',
+                  url: 'https://docs.example/mcp',
+                  enabled: true,
+                },
+              },
+            },
+          }),
+        );
+      }
+      if (url === '/api/mcp/catalog?session=main') {
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            policy: {
+              enabledServers: [],
+              enabledTools: [],
+              confirmMutatingTools: false,
+              clientCapabilities: {},
+            },
+            servers: [
+              {
+                id: 'docs',
+                name: 'docs',
+                transport: 'streamable-http',
+                configuredEnabled: true,
+                enabled: false,
+                authenticated: false,
+                toolCount: 0,
+                resourceCount: 1,
+                promptCount: 1,
+              },
+            ],
+            tools: [],
+            resources: [
+              {
+                server: 'docs',
+                uri: 'docs://guide',
+                name: 'Guide',
+                description: 'Docs guide',
+              },
+            ],
+            prompts: [
+              {
+                server: 'docs',
+                name: 'summarize',
+                description: 'Summarize docs',
+                arguments: [{ name: 'topic', required: true }],
+              },
+            ],
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      findButtonByText('MCP').click();
+      await flushMicrotasks();
+    });
+
+    const buttonLabels = Array.from(document.querySelectorAll('button')).map((button) =>
+      button.textContent?.trim(),
+    );
+    expect(buttonLabels).not.toContain('Read');
+    expect(buttonLabels).not.toContain('Get');
+
+    await act(async () => {
+      findMcpServerEnabledCheckbox('docs').click();
+      await flushMicrotasks();
+    });
+
+    const afterToggleButtonLabels = Array.from(document.querySelectorAll('button')).map((button) =>
+      button.textContent?.trim(),
+    );
+    expect(afterToggleButtonLabels).not.toContain('Read');
+    expect(afterToggleButtonLabels).not.toContain('Get');
+    expect(document.body.textContent).toContain('Unsaved');
+  });
+
+  it('sends edited MCP prompt arguments when getting a prompt', async () => {
+    let promptBody: unknown;
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config') {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              mcpServers: {
+                docs: {
+                  transport: 'streamable-http',
+                  url: 'https://docs.example/mcp',
+                  enabled: true,
+                },
+              },
+            },
+          }),
+        );
+      }
+      if (url === '/api/mcp/catalog?session=main') {
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            policy: {
+              enabledServers: ['docs'],
+              enabledTools: [],
+              confirmMutatingTools: false,
+              clientCapabilities: {},
+            },
+            servers: [
+              {
+                id: 'docs',
+                name: 'docs',
+                transport: 'streamable-http',
+                configuredEnabled: true,
+                enabled: true,
+                authenticated: false,
+                toolCount: 0,
+                resourceCount: 0,
+                promptCount: 1,
+              },
+            ],
+            tools: [],
+            resources: [],
+            prompts: [
+              {
+                server: 'docs',
+                name: 'summarize',
+                description: 'Summarize docs',
+                arguments: [{ name: 'topic', required: true }],
+              },
+            ],
+          }),
+        );
+      }
+      if (url === '/api/mcp/prompt/get?session=main' && init?.method === 'POST') {
+        promptBody = JSON.parse(String(init.body || '{}'));
+        return Promise.resolve(jsonResponse({ ok: true, result: { messages: [] } }));
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      findButtonByText('MCP').click();
+      await flushMicrotasks();
+    });
+
+    const textarea = document.querySelector('textarea[aria-label="Arguments for summarize"]');
+    if (!(textarea instanceof HTMLTextAreaElement)) {
+      throw new Error('Prompt arguments textarea not found');
+    }
+
+    await act(async () => {
+      setTextareaValue(textarea, '{ "topic": "deployment" }');
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      findButtonByText('Get').click();
+      await flushMicrotasks();
+    });
+
+    expect(promptBody).toEqual({
+      server: 'docs',
+      name: 'summarize',
+      arguments: { topic: 'deployment' },
+    });
   });
 });
 

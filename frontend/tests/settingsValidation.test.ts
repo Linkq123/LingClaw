@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
 
-import { isBuiltinProviderName, validateModelsConfigDraftShape } from '../src/settingsValidation.js';
+import {
+  isBuiltinProviderName,
+  validateMcpConfigDraftShape,
+  validateModelsConfigDraftShape,
+} from '../src/settingsValidation.js';
 
 describe('settings validation', () => {
   it('accepts providers with an explicit empty apiKey string', () => {
@@ -128,5 +132,49 @@ describe('settings validation', () => {
         },
       }),
     ).toThrow('thinkingFormat');
+  });
+
+  it('validates MCP effective transport requirements', () => {
+    expect(() =>
+      validateMcpConfigDraftShape({
+        local: { command: 'uvx', args: ['demo'] },
+        remote: { url: 'https://example.com/mcp' },
+        legacy: { command: 'uvx', url: 'not-a-streamable-http-url' },
+      }),
+    ).not.toThrow();
+
+    expect(() => validateMcpConfigDraftShape({ broken: { args: [] } })).toThrow('stdio');
+    expect(() =>
+      validateMcpConfigDraftShape({
+        remote: { transport: 'streamable-http', url: 'ftp://example.com/mcp' },
+      }),
+    ).toThrow('http:// or https://');
+  });
+
+  it('validates MCP auth object shape', () => {
+    expect(() =>
+      validateMcpConfigDraftShape({
+        remote: {
+          url: 'https://example.com/mcp',
+          auth: {
+            clientId: 'client-id',
+            clientSecret: '${MCP_CLIENT_SECRET}',
+            scopes: ['repo', 'read:user'],
+          },
+        },
+      }),
+    ).not.toThrow();
+
+    expect(() =>
+      validateMcpConfigDraftShape({
+        remote: { url: 'https://example.com/mcp', auth: { scopes: 'repo' } },
+      }),
+    ).toThrow('auth.scopes');
+
+    expect(() =>
+      validateMcpConfigDraftShape({
+        remote: { url: 'https://example.com/mcp', auth: { clientId: 123 } },
+      }),
+    ).toThrow('auth.clientId');
   });
 });

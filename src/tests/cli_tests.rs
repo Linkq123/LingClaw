@@ -29,11 +29,15 @@ fn test_config_with_broken_mcp() -> Config {
     mcp_servers.insert(
         "broken".to_string(),
         JsonMcpServerConfig {
+            transport: None,
             command: "definitely-not-a-real-command".to_string(),
+            url: None,
             args: vec![],
             env: HashMap::new(),
+            headers: HashMap::new(),
             cwd: None,
             enabled: true,
+            auth: None,
             timeout_secs: Some(1),
         },
     );

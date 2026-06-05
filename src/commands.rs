@@ -420,23 +420,34 @@ async fn build_runtime_status(session: &Session, state: &AppState) -> String {
     let resolved = config.resolve_model(&active_model);
     let effective_think = status_effective_think_level(session, &resolved, live_round.as_ref());
     let mut extra_tools = Vec::new();
+    let mcp_policy = tools::mcp::load_session_policy(&session.workspace);
     let mut cached_mcp_tools = match resolved.provider {
-        crate::Provider::Anthropic => {
-            tools::mcp::cached_tool_definitions_anthropic(&config, &session.workspace)
-        }
+        crate::Provider::Anthropic => tools::mcp::cached_tool_definitions_anthropic_for_policy(
+            &config,
+            &session.workspace,
+            &mcp_policy,
+        ),
         crate::Provider::OpenAI | crate::Provider::OpenAIResponses => {
-            tools::mcp::cached_tool_definitions_openai(&config, &session.workspace)
+            tools::mcp::cached_tool_definitions_openai_for_policy(
+                &config,
+                &session.workspace,
+                &mcp_policy,
+            )
         }
-        crate::Provider::Ollama => {
-            tools::mcp::cached_tool_definitions_ollama(&config, &session.workspace)
-        }
-        crate::Provider::Gemini => {
-            tools::mcp::cached_tool_definitions_gemini(&config, &session.workspace)
-        }
+        crate::Provider::Ollama => tools::mcp::cached_tool_definitions_ollama_for_policy(
+            &config,
+            &session.workspace,
+            &mcp_policy,
+        ),
+        crate::Provider::Gemini => tools::mcp::cached_tool_definitions_gemini_for_policy(
+            &config,
+            &session.workspace,
+            &mcp_policy,
+        ),
     };
     extra_tools.append(&mut cached_mcp_tools);
     let (cached_mcp_servers, enabled_mcp_servers) =
-        tools::mcp::cached_server_counts(&config, &session.workspace);
+        tools::mcp::cached_server_counts_for_policy(&config, &session.workspace, &mcp_policy);
     let request_budget =
         crate::context::context_input_budget_for_runtime(&config, &active_model, &effective_think);
     let tool_estimate =
@@ -1296,26 +1307,51 @@ async fn toggle_system_skill(
     }
 }
 
-fn format_mcp_reports(reports: &[tools::mcp::McpServerLoadReport]) -> String {
+fn format_mcp_reports(
+    reports: &[tools::mcp::McpServerLoadReport],
+    policy: &tools::mcp::McpSessionPolicy,
+) -> String {
     let mut lines = Vec::with_capacity(reports.len() * 2 + 1);
     lines.push("MCP servers:".to_string());
 
     for report in reports {
+        let session_state = if policy.allows_server(&report.server_name) {
+            "enabled for this session"
+        } else {
+            "disabled for this session"
+        };
         match &report.error {
             Some(error) => {
                 lines.push(format!(
-                    "- {}: failed to load ({error})",
-                    report.server_name
+                    "- {}: failed to load ({error}); {}",
+                    report.server_name, session_state
                 ));
             }
             None if report.tool_names.is_empty() => {
-                lines.push(format!("- {}: loaded 0 tools", report.server_name));
+                lines.push(format!(
+                    "- {}: {} loaded 0 tools, {} resources, {} prompts; {}",
+                    report.server_name,
+                    report.transport,
+                    report.resource_count,
+                    report.prompt_count,
+                    session_state
+                ));
             }
             None => {
+                let enabled_tool_count = report
+                    .tool_names
+                    .iter()
+                    .filter(|name| policy.enabled_tools.contains(*name))
+                    .count();
                 lines.push(format!(
-                    "- {}: loaded {} tools",
+                    "- {}: {} loaded {} tools, {} resources, {} prompts; {}; {} tools enabled",
                     report.server_name,
-                    report.tool_names.len()
+                    report.transport,
+                    report.tool_names.len(),
+                    report.resource_count,
+                    report.prompt_count,
+                    session_state,
+                    enabled_tool_count
                 ));
                 lines.push(format!("  tools: {}", report.tool_names.join(", ")));
             }
@@ -1351,14 +1387,21 @@ async fn handle_mcp_command_with_arg(
     match arg {
         "" => {
             let reports = tools::mcp::inspect_servers(&config, &workspace).await;
-            command_result(format_mcp_reports(&reports), "system", false)
+            let policy = tools::mcp::load_session_policy(&workspace);
+            command_result(format_mcp_reports(&reports, &policy), "system", false)
         }
         "refresh" => match tools::mcp::refresh_servers(&config, &workspace).await {
-            Ok(reports) => command_result(
-                format!("Refreshed MCP cache.\n\n{}", format_mcp_reports(&reports)),
-                "system",
-                false,
-            ),
+            Ok(reports) => {
+                let policy = tools::mcp::load_session_policy(&workspace);
+                command_result(
+                    format!(
+                        "Refreshed MCP cache.\n\n{}",
+                        format_mcp_reports(&reports, &policy)
+                    ),
+                    "system",
+                    false,
+                )
+            }
             Err(error) => command_result(
                 format!("Failed to refresh MCP cache: {error}"),
                 "error",
@@ -2003,8 +2046,9 @@ async fn handle_agents_command(current_session_id: &str, state: &AppState) -> Co
         }
     };
 
-    // Ensure MCP tool cache is warm so the tool listing includes MCP tools.
-    crate::tools::mcp::ensure_tools_cached(&config, &workspace).await;
+    // Warm only the MCP tools enabled for this session so `/agents` does not
+    // contact disabled MCP servers while building the tool listing.
+    crate::tools::mcp::ensure_policy_tools_cached(&config, &workspace).await;
 
     let agents = crate::subagents::discovery::discover_all_agents(&workspace);
     if agents.is_empty() {

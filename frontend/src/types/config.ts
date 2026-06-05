@@ -77,12 +77,82 @@ export interface SessionSkillsApiResponse {
 }
 
 export interface McpServerConfig {
+  transport?: 'stdio' | 'streamable-http';
   command?: string;
+  url?: string;
   args?: string[];
   cwd?: string;
   timeoutSecs?: number;
   enabled?: boolean;
   env?: Record<string, string>;
+  headers?: Record<string, string>;
+  auth?: {
+    clientId?: string;
+    clientSecret?: string;
+    scopes?: string[];
+  };
+}
+
+export interface McpCatalogServer {
+  id: string;
+  name: string;
+  transport: string;
+  configuredEnabled: boolean;
+  enabled: boolean;
+  authenticated?: boolean;
+  toolCount?: number;
+  resourceCount?: number;
+  promptCount?: number;
+  error?: string;
+}
+
+export interface McpCatalogTool {
+  id: string;
+  server: string;
+  rawName: string;
+  name: string;
+  description?: string;
+  readOnly?: boolean;
+  enabled: boolean;
+}
+
+export interface McpCatalogResource {
+  server: string;
+  uri: string;
+  name: string;
+  description?: string;
+  mimeType?: string;
+}
+
+export interface McpCatalogPrompt {
+  server: string;
+  name: string;
+  description?: string;
+  arguments?: unknown;
+}
+
+export interface McpSessionPolicy {
+  enabledServers?: string[];
+  enabledTools?: string[];
+  confirmMutatingTools?: boolean;
+  clientCapabilities?: {
+    roots?: boolean;
+    sampling?: boolean;
+    elicitation?: boolean;
+  };
+}
+
+export interface McpCatalogResponse {
+  session?: {
+    id: string;
+    name?: string;
+  };
+  policy?: McpSessionPolicy;
+  servers?: McpCatalogServer[];
+  tools?: McpCatalogTool[];
+  resources?: McpCatalogResource[];
+  prompts?: McpCatalogPrompt[];
+  error?: string;
 }
 
 export interface S3Config {

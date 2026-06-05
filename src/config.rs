@@ -771,9 +771,28 @@ impl Config {
         };
 
         for (name, server) in servers {
-            if server.command.trim().is_empty() {
+            let transport = server.effective_transport();
+            if transport == "stdio" && server.command.trim().is_empty() {
                 return Err(format!(
-                    "Invalid mcpServers.{name}: command cannot be empty."
+                    "Invalid mcpServers.{name}: command cannot be empty for stdio transport."
+                ));
+            }
+            if transport == "streamable-http" {
+                let url = server.url.as_deref().unwrap_or_default().trim();
+                if url.is_empty() {
+                    return Err(format!(
+                        "Invalid mcpServers.{name}: url cannot be empty for streamable-http transport."
+                    ));
+                }
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    return Err(format!(
+                        "Invalid mcpServers.{name}.url: streamable-http URL must start with http:// or https://."
+                    ));
+                }
+            }
+            if transport != "stdio" && transport != "streamable-http" {
+                return Err(format!(
+                    "Invalid mcpServers.{name}.transport: expected 'stdio' or 'streamable-http'."
                 ));
             }
             if server.timeout_secs == Some(0) {
@@ -1233,8 +1252,23 @@ where
 
     if let Some(servers) = json_cfg.mcp_servers.as_mut() {
         servers.retain(|name, server| {
-            if server.command.trim().is_empty() {
-                eprintln!("WARNING: Ignoring invalid mcpServers.{name}: command cannot be empty.");
+            let transport = server.effective_transport();
+            if transport == "stdio" && server.command.trim().is_empty() {
+                eprintln!(
+                    "WARNING: Ignoring invalid mcpServers.{name}: command cannot be empty for stdio transport."
+                );
+                false
+            } else if transport == "streamable-http"
+                && server.url.as_deref().unwrap_or_default().trim().is_empty()
+            {
+                eprintln!(
+                    "WARNING: Ignoring invalid mcpServers.{name}: url cannot be empty for streamable-http transport."
+                );
+                false
+            } else if transport != "stdio" && transport != "streamable-http" {
+                eprintln!(
+                    "WARNING: Ignoring invalid mcpServers.{name}.transport: expected 'stdio' or 'streamable-http'."
+                );
                 false
             } else if server.timeout_secs == Some(0) {
                 eprintln!(
@@ -1377,18 +1411,61 @@ fn default_mcp_enabled() -> bool {
 }
 
 #[derive(Deserialize, Serialize, Clone, Default)]
+pub(crate) struct JsonMcpAuthConfig {
+    #[serde(rename = "clientId", skip_serializing_if = "Option::is_none")]
+    pub(crate) client_id: Option<String>,
+    #[serde(rename = "clientSecret", skip_serializing_if = "Option::is_none")]
+    pub(crate) client_secret: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) scopes: Vec<String>,
+}
+
+#[derive(Deserialize, Serialize, Clone, Default)]
 pub(crate) struct JsonMcpServerConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) transport: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) url: Option<String>,
     #[serde(default)]
     pub(crate) args: Vec<String>,
     #[serde(default)]
     pub(crate) env: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) headers: HashMap<String, String>,
     #[serde(default)]
     pub(crate) cwd: Option<String>,
     #[serde(default = "default_mcp_enabled")]
     pub(crate) enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) auth: Option<JsonMcpAuthConfig>,
     #[serde(rename = "timeoutSecs")]
     pub(crate) timeout_secs: Option<u64>,
+}
+
+impl JsonMcpServerConfig {
+    pub(crate) fn effective_transport(&self) -> String {
+        let explicit = self
+            .transport
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase());
+        explicit.unwrap_or_else(|| {
+            if !self.command.trim().is_empty() {
+                "stdio".to_string()
+            } else if self
+                .url
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                "streamable-http".to_string()
+            } else {
+                "stdio".to_string()
+            }
+        })
+    }
 }
 
 #[derive(Deserialize, Serialize, Clone, Default)]

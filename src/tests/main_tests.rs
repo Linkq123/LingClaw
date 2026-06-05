@@ -3,8 +3,12 @@ use crate::config::JsonMcpServerConfig;
 use crate::session_store::load_session_from_disk;
 use crate::session_store::replace_session_file_from_temp;
 use axum::http::{HeaderMap, HeaderValue};
-use serde_json::json;
-use std::{collections::HashMap, sync::atomic::AtomicU64};
+use axum::response::IntoResponse;
+use serde_json::{Value, json};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::atomic::AtomicU64,
+};
 
 /// RAII guard that cleans up a saved session's JSON file and workspace directory on drop.
 /// This ensures cleanup runs even if the test panics.
@@ -5443,6 +5447,514 @@ async fn api_put_session_skills_rejects_unknown_skill_ids() {
 }
 
 #[tokio::test]
+async fn api_put_mcp_session_policy_persists_session_policy() {
+    let mut config = test_config();
+    config.tool_timeout = Duration::from_secs(1);
+    config.mcp_servers.insert(
+        "remote".to_string(),
+        JsonMcpServerConfig {
+            transport: Some("streamable-http".to_string()),
+            command: String::new(),
+            url: Some("http://127.0.0.1:9/mcp".to_string()),
+            args: Vec::new(),
+            env: HashMap::new(),
+            headers: HashMap::new(),
+            cwd: None,
+            enabled: true,
+            auth: None,
+            timeout_secs: Some(1),
+        },
+    );
+    let state = Arc::new(test_app_state_with_config(config));
+    let session_id = format!("mcp-policy-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+
+    let mut session = test_session(&session_id, "MCP Policy", None);
+    session.workspace = workspace.clone();
+    session.version = SESSION_VERSION;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_put_mcp_session_policy(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers,
+        State(state),
+        Json(McpSessionPolicyUpdateRequest {
+            enabled_servers: vec!["remote".to_string()],
+            enabled_tools: Vec::new(),
+            confirm_mutating_tools: true,
+            client_capabilities: tools::mcp::McpClientCapabilityPolicy {
+                roots: true,
+                sampling: false,
+                elicitation: false,
+            },
+        }),
+    )
+    .await
+    .expect("MCP session policy should save");
+
+    assert_eq!(payload["ok"], true);
+    let saved = tools::mcp::load_session_policy(&workspace);
+    assert!(saved.enabled_servers.contains("remote"));
+    assert!(saved.enabled_tools.is_empty());
+    assert!(saved.confirm_mutating_tools);
+    assert!(saved.client_capabilities.roots);
+}
+
+#[tokio::test]
+async fn api_put_mcp_session_policy_preserves_previously_enabled_missing_tools() {
+    let mut config = test_config();
+    config.tool_timeout = Duration::from_secs(1);
+    config.mcp_servers.insert(
+        "remote".to_string(),
+        JsonMcpServerConfig {
+            transport: Some("streamable-http".to_string()),
+            command: String::new(),
+            url: Some("http://127.0.0.1:9/mcp".to_string()),
+            args: Vec::new(),
+            env: HashMap::new(),
+            headers: HashMap::new(),
+            cwd: None,
+            enabled: true,
+            auth: None,
+            timeout_secs: Some(1),
+        },
+    );
+    let state = Arc::new(test_app_state_with_config(config));
+    let session_id = format!("mcp-policy-preserve-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+
+    let tool_id = "mcp__remote__read__abc12345".to_string();
+    tools::mcp::save_session_policy(
+        &workspace,
+        &tools::mcp::McpSessionPolicy {
+            enabled_servers: HashSet::from(["remote".to_string()]),
+            enabled_tools: HashSet::from([tool_id.clone()]),
+            confirm_mutating_tools: false,
+            client_capabilities: Default::default(),
+        },
+    )
+    .expect("previous policy should save");
+
+    let mut session = test_session(&session_id, "MCP Policy Preserve", None);
+    session.workspace = workspace.clone();
+    session.version = SESSION_VERSION;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_put_mcp_session_policy(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers,
+        State(state),
+        Json(McpSessionPolicyUpdateRequest {
+            enabled_servers: vec!["remote".to_string()],
+            enabled_tools: vec![tool_id.clone()],
+            confirm_mutating_tools: false,
+            client_capabilities: Default::default(),
+        }),
+    )
+    .await
+    .expect("previously enabled unavailable MCP tool should be preserved");
+
+    assert_eq!(payload["ok"], true);
+    let saved = tools::mcp::load_session_policy(&workspace);
+    assert!(saved.enabled_servers.contains("remote"));
+    assert!(saved.enabled_tools.contains(&tool_id));
+}
+
+async fn policy_tools_http_handler(Json(payload): Json<Value>) -> axum::response::Response {
+    let id = payload.get("id").cloned().unwrap_or_else(|| json!(null));
+    match payload.get("method").and_then(Value::as_str) {
+        Some("initialize") => (
+            [("mcp-session-id", "policy-test-session")],
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {"tools": {"listChanged": true}},
+                    "serverInfo": {"name": "policy-test", "version": "1.0"}
+                }
+            })),
+        )
+            .into_response(),
+        Some("tools/list") => Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": {
+                "tools": [{
+                    "name": "fresh",
+                    "description": "Fresh tool",
+                    "inputSchema": {"type": "object", "properties": {}}
+                }]
+            }
+        }))
+        .into_response(),
+        Some("notifications/initialized") => axum::http::StatusCode::ACCEPTED.into_response(),
+        _ => Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})).into_response(),
+    }
+}
+
+async fn spawn_policy_tools_http_server() -> (String, tokio::task::JoinHandle<()>) {
+    let app = axum::Router::new().route("/", axum::routing::post(policy_tools_http_handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("HTTP policy test listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("HTTP policy test listener address");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}/"), handle)
+}
+
+#[tokio::test]
+async fn api_put_mcp_session_policy_rejects_previously_enabled_tool_missing_after_probe() {
+    let (url, handle) = spawn_policy_tools_http_server().await;
+    let mut config = test_config();
+    config.tool_timeout = Duration::from_secs(1);
+    config.mcp_servers.insert(
+        "remote".to_string(),
+        JsonMcpServerConfig {
+            transport: Some("streamable-http".to_string()),
+            command: String::new(),
+            url: Some(url),
+            args: Vec::new(),
+            env: HashMap::new(),
+            headers: HashMap::new(),
+            cwd: None,
+            enabled: true,
+            auth: None,
+            timeout_secs: Some(1),
+        },
+    );
+    let state = Arc::new(test_app_state_with_config(config));
+    let session_id = format!("mcp-policy-stale-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+
+    let stale_tool = "mcp__remote__old".to_string();
+    tools::mcp::save_session_policy(
+        &workspace,
+        &tools::mcp::McpSessionPolicy {
+            enabled_servers: HashSet::from(["remote".to_string()]),
+            enabled_tools: HashSet::from([stale_tool.clone()]),
+            confirm_mutating_tools: false,
+            client_capabilities: Default::default(),
+        },
+    )
+    .expect("previous policy should save");
+
+    let mut session = test_session(&session_id, "MCP Policy Stale", None);
+    session.workspace = workspace.clone();
+    session.version = SESSION_VERSION;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let error = api_put_mcp_session_policy(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        headers,
+        State(state),
+        Json(McpSessionPolicyUpdateRequest {
+            enabled_servers: vec!["remote".to_string()],
+            enabled_tools: vec![stale_tool],
+            confirm_mutating_tools: false,
+            client_capabilities: Default::default(),
+        }),
+    )
+    .await
+    .expect_err("successfully probed server should reject removed MCP tools");
+
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert!(
+        error.1["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("Unknown MCP tool"))
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn api_mcp_resource_and_prompt_endpoints_require_session_enabled_server() {
+    let mut config = test_config();
+    config.tool_timeout = Duration::from_secs(1);
+    config.mcp_servers.insert(
+        "remote".to_string(),
+        JsonMcpServerConfig {
+            transport: Some("streamable-http".to_string()),
+            command: String::new(),
+            url: Some("http://127.0.0.1:9/mcp".to_string()),
+            args: Vec::new(),
+            env: HashMap::new(),
+            headers: HashMap::new(),
+            cwd: None,
+            enabled: true,
+            auth: None,
+            timeout_secs: Some(1),
+        },
+    );
+    let state = Arc::new(test_app_state_with_config(config));
+    let session_id = format!("mcp-policy-preview-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+
+    let mut session = test_session(&session_id, "MCP Preview Policy", None);
+    session.workspace = workspace;
+    session.version = SESSION_VERSION;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let mut resource_headers = HeaderMap::new();
+    resource_headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    let resource_error = api_mcp_resource_read(
+        Query(SessionQuery {
+            session: Some(session_id.clone()),
+        }),
+        resource_headers,
+        State(state.clone()),
+        Json(McpResourceReadRequest {
+            server: "remote".to_string(),
+            uri: "memo://one".to_string(),
+        }),
+    )
+    .await
+    .expect_err("resource reads require session-enabled MCP server");
+    assert_eq!(resource_error.0, StatusCode::FORBIDDEN);
+    assert!(
+        resource_error.1["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("not enabled for this session"))
+    );
+
+    let mut prompt_headers = HeaderMap::new();
+    prompt_headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    let prompt_error = api_mcp_prompt_get(
+        Query(SessionQuery {
+            session: Some(session_id),
+        }),
+        prompt_headers,
+        State(state),
+        Json(McpPromptGetRequest {
+            server: "remote".to_string(),
+            name: "summarize".to_string(),
+            arguments: json!({}),
+        }),
+    )
+    .await
+    .expect_err("prompt gets require session-enabled MCP server");
+    assert_eq!(prompt_error.0, StatusCode::FORBIDDEN);
+    assert!(
+        prompt_error.1["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("not enabled for this session"))
+    );
+}
+
+#[tokio::test]
+async fn api_mcp_oauth_get_callback_allows_external_referer() {
+    let state = Arc::new(test_app_state_with_config(test_config()));
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    headers.insert("referer", HeaderValue::from_static("https://auth.example/"));
+
+    let response = api_mcp_auth_callback_get(
+        Query(McpAuthCallbackQuery {
+            server: "remote".to_string(),
+            code: None,
+            state: None,
+            error: Some("access_denied".to_string()),
+            error_description: None,
+        }),
+        headers,
+        State(state),
+    )
+    .await
+    .expect("external referer should not be rejected before OAuth state handling");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn api_mcp_auth_start_rejects_disabled_servers() {
+    let mut config = test_config();
+    config.mcp_servers.insert(
+        "remote".to_string(),
+        JsonMcpServerConfig {
+            transport: Some("streamable-http".to_string()),
+            command: String::new(),
+            url: Some("http://127.0.0.1:9/mcp".to_string()),
+            args: Vec::new(),
+            env: HashMap::new(),
+            headers: HashMap::new(),
+            cwd: None,
+            enabled: false,
+            auth: None,
+            timeout_secs: Some(1),
+        },
+    );
+    let state = Arc::new(test_app_state_with_config(config));
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let error = api_mcp_auth_start(
+        headers,
+        State(state),
+        Json(McpServerRequest {
+            server: "remote".to_string(),
+        }),
+    )
+    .await
+    .expect_err("disabled MCP server should not start OAuth");
+
+    assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    assert!(
+        error.1["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("disabled"))
+    );
+}
+
+#[tokio::test]
+async fn api_test_mcp_infers_streamable_http_from_url_without_transport() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("mcp-test-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+    let mut session = test_session(&session_id, "MCP Test", None);
+    session.workspace = workspace;
+    session.version = SESSION_VERSION;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_test_mcp(
+        Query(SessionQuery {
+            session: Some(session_id),
+        }),
+        headers,
+        State(state),
+        Json(json!({
+            "url": "http://127.0.0.1:9/mcp",
+            "timeoutSecs": 1,
+        })),
+    )
+    .await
+    .expect("url-only streamable-http test payload should pass pre-validation");
+
+    assert_eq!(payload["ok"], false);
+    assert!(
+        !payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("command is required")
+    );
+}
+
+#[tokio::test]
+async fn api_test_mcp_resolves_cwd_against_requested_session_workspace() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("mcp-test-workspace-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    let cwd = workspace.join("server");
+    std::fs::create_dir_all(&cwd).expect("workspace cwd should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+    let mut session = test_session(&session_id, "MCP Test Workspace", None);
+    session.workspace = workspace;
+    session.version = SESSION_VERSION;
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(payload) = api_test_mcp(
+        Query(SessionQuery {
+            session: Some(session_id),
+        }),
+        headers,
+        State(state),
+        Json(json!({
+            "command": "definitely-not-a-real-mcp-command",
+            "cwd": cwd.display().to_string(),
+            "timeoutSecs": 1,
+        })),
+    )
+    .await
+    .expect("cwd inside requested session workspace should pass pre-validation");
+
+    assert_eq!(payload["ok"], false);
+    assert!(
+        !payload["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("outside the session workspace"),
+        "test-mcp should resolve cwd against the requested session workspace: {payload:?}"
+    );
+}
+
+#[tokio::test]
 async fn api_session_skills_returns_not_found_for_unknown_sessions() {
     let state = Arc::new(test_app_state());
     let mut headers = HeaderMap::new();
@@ -6188,6 +6700,29 @@ fn validate_local_request_headers_rejects_non_local_origin() {
         err.1.0["error"],
         "Blocked non-local request: Origin/Referer must be localhost or a loopback address"
     );
+}
+
+#[test]
+fn validate_local_request_for_route_allows_oauth_callback_external_referer() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    headers.insert("referer", HeaderValue::from_static("https://auth.example/"));
+
+    assert!(
+        validate_local_request_for_route(&Method::GET, "/api/mcp/auth/callback", &headers).is_ok()
+    );
+}
+
+#[test]
+fn validate_local_request_for_route_keeps_strict_referer_elsewhere() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    headers.insert("referer", HeaderValue::from_static("https://auth.example/"));
+
+    let err = validate_local_request_for_route(&Method::GET, "/api/mcp/catalog", &headers)
+        .expect_err("non-callback routes should keep strict referer validation");
+
+    assert_eq!(err.0, StatusCode::FORBIDDEN);
 }
 
 #[tokio::test]
@@ -7343,11 +7878,15 @@ fn handle_command_reports_mcp_load_failures() {
     config.mcp_servers.insert(
         "broken".to_string(),
         JsonMcpServerConfig {
+            transport: None,
             command: "definitely-not-a-real-command".to_string(),
+            url: None,
             args: vec![],
             env: HashMap::new(),
+            headers: HashMap::new(),
             cwd: None,
             enabled: true,
+            auth: None,
             timeout_secs: Some(1),
         },
     );
@@ -7381,6 +7920,80 @@ fn handle_command_reports_mcp_load_failures() {
         .map(PathBuf::from)
         .expect("session dir should exist");
     let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn status_reports_mcp_cache_counts_for_session_policy_only() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("mcp-status-policy-{}", now_epoch());
+    let workspace = session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+
+    let mut session = test_session(&session_id, "MCP Status Policy", None);
+    session.workspace = workspace.clone();
+    session.version = SESSION_VERSION;
+
+    let mut config = test_config();
+    for name in ["status-allowed", "status-cold"] {
+        config.mcp_servers.insert(
+            name.to_string(),
+            JsonMcpServerConfig {
+                transport: None,
+                command: "npx".to_string(),
+                url: None,
+                args: Vec::new(),
+                env: HashMap::new(),
+                headers: HashMap::new(),
+                cwd: None,
+                enabled: true,
+                auth: None,
+                timeout_secs: Some(1),
+            },
+        );
+    }
+    tools::mcp::save_session_policy(
+        &workspace,
+        &tools::mcp::McpSessionPolicy {
+            enabled_servers: HashSet::from(["status-allowed".to_string()]),
+            enabled_tools: HashSet::from(["mcp__status_allowed__search__abc12345".to_string()]),
+            ..Default::default()
+        },
+    )
+    .expect("MCP session policy should save");
+
+    let state = test_app_state_with_config(config);
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+    let result = rt
+        .block_on(handle_command(
+            "/status",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+
+    assert!(
+        result
+            .response
+            .contains("mcp_schema_cache: 0/1 enabled server(s) cached")
+    );
+    assert!(
+        !result
+            .response
+            .contains("mcp_schema_cache: 0/2 enabled server(s) cached")
+    );
 }
 
 #[test]

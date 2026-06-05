@@ -967,24 +967,49 @@ pub(crate) async fn build_runtime_tools(
         extra_tools.push(orchestrate_def);
     }
 
-    let (cached_servers, enabled_servers) = tools::mcp::cached_server_counts(config, workspace);
+    let mcp_policy = tools::mcp::load_session_policy(workspace);
+    let (cached_servers, enabled_servers) =
+        tools::mcp::cached_server_counts_for_policy(config, workspace, &mcp_policy);
     let mut mcp_tools = match (enabled_servers > 0, cached_servers == enabled_servers) {
         (false, _) => Vec::new(),
         (true, true) => match provider {
-            Provider::Anthropic => tools::mcp::cached_tool_definitions_anthropic(config, workspace),
+            Provider::Anthropic => tools::mcp::cached_tool_definitions_anthropic_for_policy(
+                config,
+                workspace,
+                &mcp_policy,
+            ),
             Provider::OpenAI | Provider::OpenAIResponses => {
-                tools::mcp::cached_tool_definitions_openai(config, workspace)
+                tools::mcp::cached_tool_definitions_openai_for_policy(
+                    config,
+                    workspace,
+                    &mcp_policy,
+                )
             }
-            Provider::Ollama => tools::mcp::cached_tool_definitions_ollama(config, workspace),
-            Provider::Gemini => tools::mcp::cached_tool_definitions_gemini(config, workspace),
+            Provider::Ollama => tools::mcp::cached_tool_definitions_ollama_for_policy(
+                config,
+                workspace,
+                &mcp_policy,
+            ),
+            Provider::Gemini => tools::mcp::cached_tool_definitions_gemini_for_policy(
+                config,
+                workspace,
+                &mcp_policy,
+            ),
         },
         (true, false) => match provider {
-            Provider::Anthropic => tools::mcp::tool_definitions_anthropic(config, workspace).await,
-            Provider::OpenAI | Provider::OpenAIResponses => {
-                tools::mcp::tool_definitions_openai(config, workspace).await
+            Provider::Anthropic => {
+                tools::mcp::tool_definitions_anthropic_for_policy(config, workspace, &mcp_policy)
+                    .await
             }
-            Provider::Ollama => tools::mcp::tool_definitions_ollama(config, workspace).await,
-            Provider::Gemini => tools::mcp::tool_definitions_gemini(config, workspace).await,
+            Provider::OpenAI | Provider::OpenAIResponses => {
+                tools::mcp::tool_definitions_openai_for_policy(config, workspace, &mcp_policy).await
+            }
+            Provider::Ollama => {
+                tools::mcp::tool_definitions_ollama_for_policy(config, workspace, &mcp_policy).await
+            }
+            Provider::Gemini => {
+                tools::mcp::tool_definitions_gemini_for_policy(config, workspace, &mcp_policy).await
+            }
         },
     };
     extra_tools.append(&mut mcp_tools);
@@ -1097,11 +1122,16 @@ async fn execute_tool(
     isolated_mcp_session: bool,
     event_tx: Option<tools::ToolEventSender>,
 ) -> tools::ToolOutcome {
-    let mcp_result = if isolated_mcp_session {
-        tools::mcp::execute_tool_isolated(name, args_str, config, workspace).await
-    } else {
-        tools::mcp::execute_tool(name, args_str, config, workspace).await
-    };
+    let mcp_policy = tools::mcp::load_session_policy(workspace);
+    let mcp_result = tools::mcp::execute_tool_for_policy(
+        name,
+        args_str,
+        config,
+        workspace,
+        isolated_mcp_session,
+        &mcp_policy,
+    )
+    .await;
 
     if let Some(result) = mcp_result {
         result

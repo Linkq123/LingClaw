@@ -184,9 +184,29 @@ export function validateMcpConfigDraftShape(parsed: unknown): void {
   for (const [name, server] of Object.entries(parsed as Record<string, unknown>)) {
     if (!isPlainObject(server)) throw new Error(`MCP JSON field "${name}" must be an object.`);
     const s = server as Record<string, unknown>;
+    ensureOptionalString(s['transport'], `MCP JSON field "${name}.transport"`);
+    const transport = typeof s['transport'] === 'string' ? s['transport'] : undefined;
+    if (transport !== undefined && transport !== 'stdio' && transport !== 'streamable-http') {
+      throw new Error(`MCP JSON field "${name}.transport" must be stdio or streamable-http.`);
+    }
     ensureOptionalString(s['command'], `MCP JSON field "${name}.command"`);
-    if (!isAbsent(s['command']) && (s['command'] as string).trim() === '') {
-      throw new Error(`MCP JSON field "${name}.command" cannot be empty.`);
+    ensureOptionalString(s['url'], `MCP JSON field "${name}.url"`);
+    const command = typeof s['command'] === 'string' ? s['command'].trim() : '';
+    const url = typeof s['url'] === 'string' ? s['url'].trim() : '';
+    const effectiveTransport = transport || (command ? 'stdio' : url ? 'streamable-http' : 'stdio');
+    if (
+      effectiveTransport === 'stdio' &&
+      (isAbsent(s['command']) || (s['command'] as string).trim() === '')
+    ) {
+      throw new Error(`MCP JSON field "${name}.command" cannot be empty for stdio.`);
+    }
+    if (effectiveTransport === 'streamable-http') {
+      if (!url) {
+        throw new Error(`MCP JSON field "${name}.url" is required for streamable-http.`);
+      }
+      if (!/^https?:\/\//.test(url)) {
+        throw new Error(`MCP JSON field "${name}.url" must start with http:// or https://.`);
+      }
     }
     ensureOptionalString(s['cwd'], `MCP JSON field "${name}.cwd"`);
     if (!isAbsent(s['cwd']))
@@ -204,6 +224,23 @@ export function validateMcpConfigDraftShape(parsed: unknown): void {
         if (typeof v !== 'string')
           throw new Error(`MCP JSON field "${name}.env.${k}" must be a string.`);
       }
+    }
+    if (!isAbsent(s['headers'])) {
+      if (!isPlainObject(s['headers']))
+        throw new Error(`MCP JSON field "${name}.headers" must be an object.`);
+      for (const [k, v] of Object.entries(s['headers'] as Record<string, unknown>)) {
+        if (typeof v !== 'string')
+          throw new Error(`MCP JSON field "${name}.headers.${k}" must be a string.`);
+      }
+    }
+    if (!isAbsent(s['auth'])) {
+      if (!isPlainObject(s['auth']))
+        throw new Error(`MCP JSON field "${name}.auth" must be an object.`);
+      const auth = s['auth'] as Record<string, unknown>;
+      ensureOptionalString(auth['clientId'], `MCP JSON field "${name}.auth.clientId"`);
+      ensureOptionalString(auth['clientSecret'], `MCP JSON field "${name}.auth.clientSecret"`);
+      if (!isAbsent(auth['scopes']))
+        ensureStringArray(auth['scopes'], `MCP JSON field "${name}.auth.scopes"`);
     }
   }
 }

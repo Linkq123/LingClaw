@@ -15,7 +15,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 ## Features
 
 - **10 标准工具**：`think`、`todos`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`；另有 2 个动态工具：`task`（子代理委托，发现代理时注册）、`orchestrate`（多代理 DAG 编排，发现代理时注册）
-- **MCP servers（实验性）**：支持通过 `mcpServers` 配置接入 stdio 型 MCP server，使用当前 MCP JSON-RPC 传输约定，并将其 tools 以 `mcp__...` 名称前缀注入到模型工具列表；主 Agent 与子代理都会按需发现并使用这些 MCP tools；运行时会处理 `ping` / `roots/list` 请求，并在收到 `notifications/tools/list_changed` 后失效对应工具缓存；`start` / `restart` 会先做受限的一次性 preflight，`mcp-check` 可用于更深的运行时诊断；server 启动连续失败会进入短暂冷却，避免请求风暴
+- **MCP client（实验性）**：支持通过 `mcpServers` 配置接入 stdio 与 Streamable HTTP MCP server，发现 tools/resources/prompts，并以当前 session 的 Settings → MCP 权限为准手动启用 tools；配置 server 不再等于自动注入模型工具。运行时会处理分页、`ping` / 可选 `roots/list`、Streamable HTTP GET/SSE 通知、`notifications/*/list_changed` 缓存失效、工具超时取消、空闲回收和启动失败冷却；resources/prompts 只做只读浏览，需用户手动插入对话
 - **多会话**：默认会话仍为 `main`，但现在支持创建、切换、重命名、列出和删除其他持久化 session；新增 session 时后端会自动生成 6 位英数字 id，用户只需在需要时重命名；前端使用左侧可折叠的 session drawer 切换，`main` 固定置顶，刷新后会恢复上次选中的 session，WebSocket 连接按 session 绑定并在切换时重连
 - **会话级 Todos**：新增结构化 `todos` 工具，维护每个 session 唯一的一份当前任务清单；采用“整表替换 + revision 乐观并发”协议，支持用户与主代理协同编辑、重连恢复、冲突检测，以及专用 todo 面板展示
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、frontend-coder、backend-coder、general-coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
@@ -25,7 +25,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **会话模型覆盖**：运行时通过 `/model` 切换当前活动 session 使用的模型
 - **会话持久化**：默认 `main` 与其他 session 都会各自保存工作区、消息历史、视图状态和当前 todos 快照
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
-- **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、毛玻璃渐变背景、稳定的 Markdown 分段渲染（表格、代码块、任务列表、引用、数学公式等常见格式）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、主回复右下角显示本轮输入/输出 token 和首 token 耗时、输入框上下键历史导航（最多 10 条）、输入 `/` 时的斜杠命令自动补全菜单（支持键盘上下选择、Tab/Enter 补全和鼠标点击）；左侧 session drawer 支持折叠/展开、切换、重命名和删除非当前 session，todo 面板默认隐藏，可通过 `Todos: On/Off` 本地开关显示，支持增删改、状态切换和上下移动，但不修改 session 数据以外的视图状态；Settings 页面（React 岛屿）支持在线编辑配置、Provider 连接测试、MCP Server 连接测试、当前 session 的系统 Skills 开关，并可在 Models 标签页直接编辑 `compat.thinkingFormat`；顶部提供默认关闭的 `Auto Debug` 本地开关，用于查看最近一条顶层 `think=auto` 决策轨迹；Usage 页面（React 岛屿）显示 Token 用量统计、按 Model Role 拆分的明细卡片与 Canvas 图表
+- **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、毛玻璃渐变背景、稳定的 Markdown 分段渲染（表格、代码块、任务列表、引用、数学公式等常见格式）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、主回复右下角显示本轮输入/输出 token 和首 token 耗时、输入框上下键历史导航（最多 10 条）、输入 `/` 时的斜杠命令自动补全菜单（支持键盘上下选择、Tab/Enter 补全和鼠标点击）；左侧 session drawer 支持折叠/展开、切换、重命名和删除非当前 session，todo 面板默认隐藏，可通过 `Todos: On/Off` 本地开关显示，支持增删改、状态切换和上下移动，但不修改 session 数据以外的视图状态；Settings 页面（React 岛屿）支持在线编辑配置、Provider 连接测试、MCP Server 连接测试、当前 session 的系统 Skills 开关、MCP server/tool 权限、OAuth 连接状态以及 resources/prompts 浏览插入，并可在 Models 标签页直接编辑 `compat.thinkingFormat`；顶部提供默认关闭的 `Auto Debug` 本地开关，用于查看最近一条顶层 `think=auto` 决策轨迹；Usage 页面（React 岛屿）显示 Token 用量统计、按 Model Role 拆分的明细卡片与 Canvas 图表
 - **图片附件**：支持通过 URL 或本地 JPEG/PNG 上传附加图片到用户消息；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；Gemini/Ollama 会由 LingClaw 本地预取为 base64/inlineData 并持久化缓存到会话工作区，因此可配合私网、localhost 或仅局域网可达的网关使用；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
@@ -260,12 +260,16 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 - `compat.thinkingFormat = "doubao"` 时，会显式发送 `thinking.type=enabled|disabled`；开启 thinking 时，`reasoning_effort` 仅支持 `low` / `medium` / `high` 三档，`minimal` 会收敛到 `low`，`xhigh` / `max` 会收敛到 `high`
 - Gemini 3 使用官方 `generationConfig.thinkingConfig`：`includeThoughts` 控制思考摘要是否流式返回，`thinkingLevel` 映射到 `MINIMAL`/`LOW`/`MEDIUM`/`HIGH`；原生 tool calling 会保留并回传 `functionCall.id`、`functionResponse.id`，并在响应提供真实 `thoughtSignature` 时随原始 `functionCall` part 回传，以兼容并行工具调用与 Gemini 的签名校验
 - Ollama 的 thinking / tool calling 依赖模型能力，推荐优先使用 `qwen3`、`gpt-oss`、`deepseek-r1` 等官方支持模型，而不是把任意本地模型都视为支持深度思考和工具调用
-- 可选的 `mcpServers` 顶层对象可声明 MCP server，例如 `command`、`args`、`env`、`cwd`、`timeoutSecs`
+- 可选的 `mcpServers` 顶层对象可声明 MCP server，例如 `transport`、`command`、`url`、`headers`、`auth`、`args`、`env`、`cwd`、`enabled`、`timeoutSecs`
 - `mcpServers.*.cwd` 必须落在当前 session workspace 内；未设置 `timeoutSecs` 时默认继承 `toolTimeout`
+- `transport` 支持 `stdio` 与 `streamable-http`；未配置 `transport` 且存在 `command` 时按 `stdio` 兼容，存在 `url` 时按 `streamable-http`
+- `mcpServers` 只声明 server catalog；新旧 session 默认不注入任何 MCP tools，需要在 Settings → MCP 中为当前 session 手动开启 server/tool 后才会进入模型工具列表
+- Streamable HTTP server 的 OAuth token 存在本地 `~/.lingclaw/mcp-auth.json`，access token 过期时会使用 refresh token 自动刷新；`headers`、`auth.clientId/clientSecret` 和 stdio `env` 值都支持精确 `${ENV_NAME}` 占位符
+- Settings → MCP 中的 client capability 开关目前用于控制是否向 MCP server 暴露当前 session workspace root；关闭时不会在 initialize 中声明 `roots`
 - `start` / `restart` 的 MCP 预检使用受限的一次性探测，不会把预检进程保留为运行时 MCP 会话；`mcp-check` 会按配置的运行时超时做更深诊断
-- `/mcp` 会在聊天页面列出当前已加载的 MCP servers；如果某个 server 失败，页面会显示失败原因，便于排查启动、命令解析或超时问题
-- `/mcp refresh` 会清空当前 workspace 对应的 MCP 工具缓存、空闲会话和最近失败冷却状态，然后重新探测已启用 servers；运行时空闲 MCP 会话也会自动回收，`notifications/tools/list_changed` 会触发下一次工具发现时自动刷新
-- 子代理执行和 `/agents` 展示都会在使用前按需预热 MCP 工具缓存，因此首次使用也能拿到最新的 MCP 工具列表
+- `/mcp` 会在聊天页面列出当前已加载的 MCP servers、transport、auth/capability/cache 概况和当前 session 启用状态；如果某个 server 失败，页面会显示失败原因，便于排查启动、命令解析或超时问题
+- `/mcp refresh` 会清空当前 workspace 对应的 MCP tools/resources/prompts 缓存、空闲会话和最近失败冷却状态，然后重新探测已启用 servers；运行时空闲 MCP 会话也会自动回收，stdio 通知和 Streamable HTTP POST/GET SSE 中的 `notifications/tools/list_changed`、`notifications/resources/list_changed`、`notifications/prompts/list_changed` 会触发对应缓存刷新
+- 子代理只继承当前 session 已启用的 MCP tools，并继续按子代理 frontmatter 的 `mcp_policy` 做只读/全部过滤
 
 聊天页运行时交互说明：
 
@@ -344,7 +348,7 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 | `/agents` | 列出已发现的子代理（含来源标签）以及每个子代理当前可用的有效工具列表（含 MCP 工具） |
 | `/status` | 显示当前有效模型/provider、runtime phase/cycle、上下文估算、最大输出 token、思维级别；当 `/think auto` 时额外显示 live `auto_signals` / `auto_decision` 摘要，token 数值按 K/M 显示 |
 | `/system-prompt` | 输出当前会话的新鲜系统提示词，以及该系统提示词按当前 provider 估算的 token 开销 |
-| `/mcp [refresh]` | 查看当前已加载的 MCP server 状态；加上 `refresh` 时强制刷新工具缓存并重建运行时 MCP 会话 |
+| `/mcp [refresh]` | 查看 MCP server transport、auth、capabilities、cache 和当前 session 启用状态；加上 `refresh` 时强制刷新 tools/resources/prompts 缓存并重建运行时 MCP 会话 |
 | `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；同时附带所有已加载 session 的今日总 token 汇总，按 K/M 显示 |
 | `/clear` | 清空消息和当前 session 的 todos 列表，保留系统提示；todos revision 会前进以拒绝旧写入 |
 | `/memory [stats\|debug]` | 查看当前 structured memory 摘要与 updater 状态；`stats` 仅显示运行状态，`debug` 额外显示最近审计记录 |
@@ -681,7 +685,7 @@ src/
     ├── fs.rs          (~380 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files + 虚拟 skill 路径
     ├── net.rs         (~200 行)  — http_fetch, check_ssrf, is_private_ip
     ├── exec.rs        (~80 行)   — exec (shell), think (scratchpad)
-    └── mcp.rs         (~1780 行) — stdio MCP 工具发现/执行桥接, 会话缓存, preflight
+    └── mcp.rs         (~5180 行) — MCP client (stdio/Streamable HTTP), OAuth, tools/resources/prompts, session policy, cache/session lifecycle
 ├── subagents/
 │   ├── mod.rs         (~640 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, agent 排序/委托建议, 工具过滤（含 MCP）
 │   ├── executor.rs    (~1340 行) — 隔离 mini-ReAct 执行循环, Hook 集成, MCP 工具调度, 父级事件流
@@ -705,7 +709,7 @@ frontend/                         — 前端源码 (TypeScript + React, Vite 构
 │   ├── eventBus.ts               — 泛型事件总线（subagent/orchestrate 面板用）
 │   ├── settingsValidation.ts     — Settings 表单纯验证逻辑
 │   ├── pages/
-│   │   ├── SettingsPage.tsx      — Settings 页面 React 岛屿（配置编辑、Provider 测试、MCP 测试）
+│   │   ├── SettingsPage.tsx      — Settings 页面 React 岛屿（配置编辑、Provider/MCP 测试、session MCP 权限、resources/prompts 浏览）
 │   │   └── UsagePage.tsx         — Usage 页面 React 岛屿（Token 用量统计 + Canvas 图表）
 │   ├── handlers/stream.ts        — 流式响应处理
 │   ├── renderers/                — UI 渲染模块
@@ -1015,7 +1019,14 @@ think_level 映射：
 | `/api/config` | GET | 读取原始 JSON 配置文件（含解析错误回退） |
 | `/api/config` | PUT | 校验并保存 JSON 配置文件（原子写入 + 备份恢复） |
 | `/api/config/test-model` | POST | 测试模型 Provider 连接（发送 "Hi" 并检查响应） |
-| `/api/config/test-mcp` | POST | 测试 MCP Server 连接（spawn + tools/list） |
+| `/api/config/test-mcp` | POST | 测试 MCP Server 连接（stdio/Streamable HTTP + tools/list） |
+| `/api/mcp/catalog?session=<id>` | GET | 返回 MCP server catalog、session policy、tools/resources/prompts 与授权状态 |
+| `/api/mcp/session-policy?session=<id>` | PUT | 保存当前 session 的 MCP server/tool 权限、mutating tool 确认策略和 client capability 开关 |
+| `/api/mcp/auth/start` | POST | 为 Streamable HTTP MCP server 启动 OAuth PKCE 授权 |
+| `/api/mcp/auth/callback` | GET/POST | 完成 MCP OAuth callback/token exchange |
+| `/api/mcp/auth/disconnect` | POST | 清除指定 MCP server 的本地授权并结束远程 session |
+| `/api/mcp/resource/read?session=<id>` | POST | 读取已启用 MCP server 的 resource，用于预览/手动插入 |
+| `/api/mcp/prompt/get?session=<id>` | POST | 获取已启用 MCP server 的 prompt，用于预览/手动插入 |
 | `/api/usage` | GET | 返回 Token 用量统计（今日/累计/来源），并额外提供 `daily_roles`、`total_providers`、`total_roles`，以及按天拆分后的 `usage_history[].providers` / `usage_history[].roles` |
 | `/api/upload-images` | POST | 上传本地图片到 S3（需启用 S3 配置） |
 | `/api/shutdown` | POST | 认证的本地关停端点（CLI 使用） |

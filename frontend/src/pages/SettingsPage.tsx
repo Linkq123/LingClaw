@@ -3,6 +3,11 @@ import type {
   AppConfig,
   ConfigApiResponse,
   DiscoveredAgentInfo,
+  McpCatalogPrompt,
+  McpCatalogResource,
+  McpCatalogResponse,
+  McpCatalogServer,
+  McpCatalogTool,
   McpServerConfig,
   S3Config,
   SessionSkillInfo,
@@ -1084,6 +1089,8 @@ interface McpFormEntry extends McpServerConfig {
   _key: string;
   name: string;
   _argsText: string; // textarea, one per line
+  _transportWasExplicit: boolean;
+  _enabledWasExplicit: boolean;
   testState: 'idle' | 'testing' | 'ok' | 'fail';
   testLabel: string;
 }
@@ -1095,16 +1102,37 @@ function nextMcpFormKey(name: string): string {
   return `${name}-${mcpFormKeyCounter}`;
 }
 
+function inferMcpTransportFromFields(
+  command?: string,
+  url?: string,
+): NonNullable<McpServerConfig['transport']> {
+  if (command?.trim()) return 'stdio';
+  if (url?.trim()) return 'streamable-http';
+  return 'stdio';
+}
+
+function inferMcpTransport(
+  server: Pick<McpServerConfig, 'transport' | 'command' | 'url'>,
+): NonNullable<McpServerConfig['transport']> {
+  return server.transport || inferMcpTransportFromFields(server.command, server.url);
+}
+
 function newMcpForm(name: string, s: McpServerConfig = {}, previous?: McpFormEntry): McpFormEntry {
   return {
     _key: previous?._key || nextMcpFormKey(name),
     name,
+    transport: inferMcpTransport(s),
     command: s.command || '',
+    url: s.url || '',
     _argsText: (s.args || []).join('\n'),
     cwd: s.cwd || '',
     timeoutSecs: s.timeoutSecs,
     enabled: s.enabled !== false,
+    _transportWasExplicit: s.transport !== undefined,
+    _enabledWasExplicit: s.enabled !== undefined,
     env: { ...(s.env || {}) },
+    headers: { ...(s.headers || {}) },
+    auth: s.auth ? { ...s.auth } : undefined,
     testState: previous?.testState || 'idle',
     testLabel: previous?.testLabel || 'Test',
   };
@@ -1119,6 +1147,63 @@ function buildMcpForms(
   return Object.entries(servers || {})
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([name, server]) => newMcpForm(name, server, previousByName.get(name)));
+}
+
+function sanitizeMcpNameSegment(raw: string): string {
+  let sanitized = '';
+  let lastWasUnderscore = false;
+  for (const ch of raw) {
+    const mapped = /^[a-zA-Z0-9]$/.test(ch) ? ch.toLowerCase() : '_';
+    if (mapped === '_') {
+      if (lastWasUnderscore) continue;
+      lastWasUnderscore = true;
+    } else {
+      lastWasUnderscore = false;
+    }
+    sanitized += mapped;
+  }
+  let output = sanitized.replace(/^_+|_+$/g, '') || 'tool';
+  if (!/^[a-z]/.test(output)) output = `t_${output}`;
+  return output;
+}
+
+function mcpToolMatchesServer(toolId: string, serverId: string): boolean {
+  const prefix = 'mcp__';
+  if (!toolId.startsWith(prefix)) return false;
+  const rest = toolId.slice(prefix.length);
+  const separator = rest.indexOf('__');
+  if (separator < 0) return false;
+  return rest.slice(0, separator) === sanitizeMcpNameSegment(serverId);
+}
+
+function mcpToolBelongsToServer(
+  toolId: string,
+  serverId: string,
+  toolServers: Map<string, string>,
+): boolean {
+  const exactServerId = toolServers.get(toolId);
+  return exactServerId ? exactServerId === serverId : mcpToolMatchesServer(toolId, serverId);
+}
+
+function mcpPromptKey(prompt: McpCatalogPrompt): string {
+  return `${prompt.server}:${prompt.name}`;
+}
+
+function buildPromptArgumentsTemplate(argumentsMeta: unknown): string {
+  if (Array.isArray(argumentsMeta)) {
+    const template: Record<string, string> = {};
+    for (const arg of argumentsMeta) {
+      if (
+        arg &&
+        typeof arg === 'object' &&
+        typeof (arg as Record<string, unknown>).name === 'string'
+      ) {
+        template[String((arg as Record<string, unknown>).name)] = '';
+      }
+    }
+    return JSON.stringify(template, null, 2);
+  }
+  return '{}';
 }
 
 function McpServerCardInner({
@@ -1191,11 +1276,32 @@ function McpServerCardInner({
         </div>
       </div>
       <div className="provider-form" style={{ display: 'grid', gap: 8, marginTop: 8 }}>
+        <SettingsRow label="Transport">
+          <select
+            value={server.transport || 'stdio'}
+            onChange={(e) =>
+              onChange({ ...server, transport: e.target.value as McpServerConfig['transport'] })
+            }
+          >
+            <option value="stdio">stdio</option>
+            <option value="streamable-http">streamable-http</option>
+          </select>
+        </SettingsRow>
+        <SettingsRow label="URL">
+          <input
+            type="text"
+            value={server.url || ''}
+            placeholder="https://example.com/mcp"
+            disabled={(server.transport || 'stdio') === 'stdio'}
+            onChange={(e) => onChange({ ...server, url: e.target.value })}
+          />
+        </SettingsRow>
         <SettingsRow label="Command">
           <input
             type="text"
             value={server.command || ''}
             placeholder="uvx"
+            disabled={(server.transport || 'stdio') === 'streamable-http'}
             onChange={(e) => onChange({ ...server, command: e.target.value })}
           />
         </SettingsRow>
@@ -1289,19 +1395,52 @@ const McpServerCard = React.memo(McpServerCardInner);
 
 function McpTab({
   config,
+  sessionId,
   onChange,
   onStatus,
+  onPolicyDirtyChange,
 }: {
   config: AppConfig;
+  sessionId: string;
   onChange: (c: AppConfig) => void;
   onStatus: (msg: string, type?: string) => void;
+  onPolicyDirtyChange?: (dirty: boolean) => void;
 }) {
   const [servers, setServers] = useState<McpFormEntry[]>(() => buildMcpForms(config.mcpServers));
   const [jsonText, setJsonText] = useState(() => JSON.stringify(config.mcpServers || {}, null, 2));
   const [jsonError, setJsonError] = useState('');
   const [jsonDirty, setJsonDirty] = useState(false);
   const [formDirty, setFormDirty] = useState(false);
+  const [catalog, setCatalog] = useState<McpCatalogResponse | null>(null);
+  const [policyDirty, setPolicyDirty] = useState(false);
+  const [policySaving, setPolicySaving] = useState(false);
+  const [enabledServers, setEnabledServers] = useState<Set<string>>(() => new Set());
+  const [enabledTools, setEnabledTools] = useState<Set<string>>(() => new Set());
+  const [confirmMutatingTools, setConfirmMutatingTools] = useState(false);
+  const [clientCapabilities, setClientCapabilities] = useState<{
+    roots?: boolean;
+    sampling?: boolean;
+    elicitation?: boolean;
+  }>(() => ({}));
+  const [promptArgumentText, setPromptArgumentText] = useState<Record<string, string>>({});
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [authBusyServer, setAuthBusyServer] = useState<string | null>(null);
   const mcpResetTimersRef = useRef<Map<string, number>>(new Map());
+  const policyDirtyRef = useRef(false);
+  const policyRevisionRef = useRef(0);
+  const catalogRequestSeqRef = useRef(0);
+
+  const insertIntoComposer = (text: string): boolean => {
+    const input = document.getElementById('input') as HTMLTextAreaElement | null;
+    if (!input) return false;
+    const start = input.selectionStart ?? input.value.length;
+    const end = input.selectionEnd ?? input.value.length;
+    const needsBreak = input.value.length > 0 && !input.value.endsWith('\n');
+    input.setRangeText(`${needsBreak ? '\n\n' : ''}${text}`, start, end, 'end');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.focus();
+    return true;
+  };
 
   useEffect(() => {
     const s = config.mcpServers || {};
@@ -1321,6 +1460,99 @@ function McpTab({
       resetTimers.clear();
     };
   }, []);
+
+  const markPolicyDirty = useCallback(() => {
+    policyRevisionRef.current += 1;
+    policyDirtyRef.current = true;
+    setPolicyDirty(true);
+  }, []);
+
+  const loadCatalog = useCallback(
+    async (options: { forceApply?: boolean; expectedPolicyRevision?: number } = {}) => {
+      const requestId = catalogRequestSeqRef.current + 1;
+      catalogRequestSeqRef.current = requestId;
+      setCatalogLoading(true);
+      try {
+        const resp = await fetch(`/api/mcp/catalog?session=${encodeURIComponent(sessionId)}`);
+        const data: McpCatalogResponse = await resp.json();
+        if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+        if (requestId !== catalogRequestSeqRef.current) return;
+        if (
+          options.expectedPolicyRevision !== undefined &&
+          options.expectedPolicyRevision !== policyRevisionRef.current
+        ) {
+          onStatus(
+            'MCP catalog refreshed but not applied because permissions changed during save.',
+          );
+          return;
+        }
+        if (policyDirtyRef.current && !options.forceApply) {
+          onStatus(
+            'MCP catalog refreshed but not applied because permissions have unsaved changes.',
+          );
+          return;
+        }
+        setCatalog(data);
+        setPromptArgumentText((previous) => {
+          const next: Record<string, string> = {};
+          for (const prompt of data.prompts || []) {
+            const key = mcpPromptKey(prompt);
+            next[key] = previous[key] ?? buildPromptArgumentsTemplate(prompt.arguments);
+          }
+          return next;
+        });
+        const configuredServerIds = new Set(
+          (data.servers || [])
+            .filter((server) => server.configuredEnabled)
+            .map((server) => server.id),
+        );
+        const nextEnabledServers = new Set(
+          (data.policy?.enabledServers || []).filter((serverId) =>
+            configuredServerIds.has(serverId),
+          ),
+        );
+        const toolServers = new Map((data.tools || []).map((tool) => [tool.id, tool.server]));
+        const erroredEnabledServerIds = new Set(
+          (data.servers || [])
+            .filter((server) => nextEnabledServers.has(server.id) && Boolean(server.error))
+            .map((server) => server.id),
+        );
+        const nextEnabledToolIds = new Set(
+          (data.policy?.enabledTools || []).filter((toolId) => {
+            const exactServerId = toolServers.get(toolId);
+            if (exactServerId) return nextEnabledServers.has(exactServerId);
+            return Array.from(erroredEnabledServerIds).some((enabledServerId) =>
+              mcpToolMatchesServer(toolId, enabledServerId),
+            );
+          }),
+        );
+        setEnabledServers(nextEnabledServers);
+        setEnabledTools(nextEnabledToolIds);
+        setConfirmMutatingTools(Boolean(data.policy?.confirmMutatingTools));
+        setClientCapabilities(data.policy?.clientCapabilities || {});
+        policyDirtyRef.current = false;
+        setPolicyDirty(false);
+      } catch (error: unknown) {
+        onStatus(`MCP catalog failed: ${(error as Error).message}`, 'error');
+      } finally {
+        if (requestId === catalogRequestSeqRef.current) setCatalogLoading(false);
+      }
+    },
+    [onStatus, sessionId],
+  );
+
+  useEffect(() => {
+    void loadCatalog();
+  }, [loadCatalog]);
+
+  useEffect(() => {
+    policyDirtyRef.current = policyDirty;
+    onPolicyDirtyChange?.(policyDirty);
+  }, [onPolicyDirtyChange, policyDirty]);
+
+  useEffect(() => {
+    return () => onPolicyDirtyChange?.(false);
+  }, [onPolicyDirtyChange]);
 
   const clearMcpReset = useCallback((rowKey: string) => {
     const timeoutId = mcpResetTimersRef.current.get(rowKey);
@@ -1430,13 +1662,18 @@ function McpTab({
             return;
           }
         }
-        const resp = await fetch('/api/config/test-mcp', {
+        const resp = await fetch(`/api/config/test-mcp?session=${encodeURIComponent(sessionId)}`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+            server: sv.name,
+            transport: inferMcpTransport(sv),
             command: sv.command,
+            url: sv.url || undefined,
             args,
             env: sv.env,
+            headers: sv.headers,
+            auth: sv.auth,
             cwd: sv.cwd || undefined,
             timeoutSecs: sv.timeoutSecs,
           }),
@@ -1453,7 +1690,7 @@ function McpTab({
       }
       scheduleMcpReset(sv._key);
     },
-    [clearMcpReset, onStatus, scheduleMcpReset],
+    [clearMcpReset, onStatus, scheduleMcpReset, sessionId],
   );
 
   // Propagate form state to parent config
@@ -1464,22 +1701,232 @@ function McpTab({
         .split('\n')
         .map((a) => a.trim())
         .filter(Boolean);
+      const inferredTransport = inferMcpTransportFromFields(sv.command, sv.url);
+      const effectiveTransport = sv.transport || inferredTransport;
       const entry: McpServerConfig = {
         command: sv.command || undefined,
+        url: sv.url || undefined,
         args: args.length > 0 ? args : undefined,
         cwd: sv.cwd || undefined,
         timeoutSecs: sv.timeoutSecs,
-        enabled: sv.enabled,
         env: sv.env && Object.keys(sv.env).length > 0 ? sv.env : undefined,
+        headers: sv.headers && Object.keys(sv.headers).length > 0 ? sv.headers : undefined,
+        auth: sv.auth,
       };
+      if (sv._transportWasExplicit || effectiveTransport !== inferredTransport) {
+        entry.transport = effectiveTransport;
+      }
+      if (sv._enabledWasExplicit || sv.enabled !== true) {
+        entry.enabled = sv.enabled;
+      }
       mcpServers[sv.name] = entry;
     }
     const newMcp = servers.length > 0 ? mcpServers : undefined;
-    if (JSON.stringify(newMcp) !== JSON.stringify(config.mcpServers)) {
+    if (
+      JSON.stringify(sortForStableSerialize(newMcp)) !==
+      JSON.stringify(sortForStableSerialize(config.mcpServers))
+    ) {
       onChange({ ...config, mcpServers: newMcp });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [servers]);
+
+  const toggleServerPolicy = (server: McpCatalogServer, enabled: boolean) => {
+    setEnabledServers((prev) => {
+      const next = new Set(prev);
+      if (enabled) next.add(server.id);
+      else next.delete(server.id);
+      return next;
+    });
+    if (!enabled) {
+      const catalogToolServers = new Map(
+        (catalog?.tools || []).map((tool) => [tool.id, tool.server]),
+      );
+      setEnabledTools((prev) => {
+        const next = new Set(prev);
+        for (const toolId of prev) {
+          if (mcpToolBelongsToServer(toolId, server.id, catalogToolServers)) next.delete(toolId);
+        }
+        return next;
+      });
+    }
+    markPolicyDirty();
+  };
+
+  const toggleToolPolicy = (tool: McpCatalogTool, enabled: boolean) => {
+    setEnabledServers((prev) => {
+      const next = new Set(prev);
+      if (enabled) next.add(tool.server);
+      return next;
+    });
+    setEnabledTools((prev) => {
+      const next = new Set(prev);
+      if (enabled) next.add(tool.id);
+      else next.delete(tool.id);
+      return next;
+    });
+    markPolicyDirty();
+  };
+
+  const saveMcpPolicy = async () => {
+    const saveRevision = policyRevisionRef.current;
+    setPolicySaving(true);
+    try {
+      const resp = await fetch(`/api/mcp/session-policy?session=${encodeURIComponent(sessionId)}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          enabledServers: Array.from(enabledServers).sort(),
+          enabledTools: Array.from(enabledTools).sort(),
+          confirmMutatingTools,
+          clientCapabilities,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+      if (saveRevision !== policyRevisionRef.current) {
+        onStatus('Saved MCP session permissions; newer changes are still unsaved.', 'success');
+        return;
+      }
+      onStatus('Saved MCP session permissions', 'success');
+      policyDirtyRef.current = false;
+      setPolicyDirty(false);
+      await loadCatalog({ forceApply: true, expectedPolicyRevision: saveRevision });
+    } catch (error: unknown) {
+      onStatus(`Save MCP permissions failed: ${(error as Error).message}`, 'error');
+    } finally {
+      setPolicySaving(false);
+    }
+  };
+
+  const connectMcpAuth = async (server: McpCatalogServer) => {
+    setAuthBusyServer(server.id);
+    let authWindow: Window | null = null;
+    try {
+      authWindow = window.open('about:blank', '_blank');
+      if (authWindow) {
+        try {
+          authWindow.opener = null;
+        } catch {
+          // Some browsers expose opener as read-only; a valid popup handle is
+          // still better than replacing the LingClaw tab with the OAuth URL.
+        }
+      }
+    } catch {
+      authWindow = null;
+    }
+    try {
+      const resp = await fetch('/api/mcp/auth/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ server: server.id }),
+      });
+      const data = await resp.json();
+      if (!resp.ok || data.error || data.ok === false) {
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+      const authorizationUrl = String(data.authorizationUrl || '');
+      if (!authorizationUrl) throw new Error('OAuth authorization URL was not returned');
+      if (authWindow) {
+        authWindow.location.href = authorizationUrl;
+      } else {
+        window.location.assign(authorizationUrl);
+      }
+      onStatus('Opened MCP OAuth authorization. Refresh catalog after completing it.', 'success');
+    } catch (error: unknown) {
+      if (authWindow && !authWindow.closed) authWindow.close();
+      onStatus(`MCP OAuth start failed: ${(error as Error).message}`, 'error');
+    } finally {
+      setAuthBusyServer(null);
+    }
+  };
+
+  const disconnectMcpAuth = async (server: McpCatalogServer) => {
+    setAuthBusyServer(server.id);
+    try {
+      const resp = await fetch('/api/mcp/auth/disconnect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ server: server.id }),
+      });
+      const data = await resp.json();
+      if (!resp.ok || data.error || data.ok === false) {
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+      onStatus(`Disconnected MCP auth for ${server.name}`, 'success');
+      await loadCatalog();
+    } catch (error: unknown) {
+      onStatus(`MCP OAuth disconnect failed: ${(error as Error).message}`, 'error');
+    } finally {
+      setAuthBusyServer(null);
+    }
+  };
+
+  const readResource = async (resource: McpCatalogResource) => {
+    try {
+      const resp = await fetch(`/api/mcp/resource/read?session=${encodeURIComponent(sessionId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ server: resource.server, uri: resource.uri }),
+      });
+      const data = await resp.json();
+      if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+      const text = JSON.stringify(data.result, null, 2);
+      if (insertIntoComposer(text)) onStatus('Resource inserted into input', 'success');
+      else {
+        await navigator.clipboard?.writeText(text);
+        onStatus('Resource copied to clipboard', 'success');
+      }
+    } catch (error: unknown) {
+      onStatus(`Read resource failed: ${(error as Error).message}`, 'error');
+    }
+  };
+
+  const getPrompt = async (prompt: McpCatalogPrompt) => {
+    try {
+      const promptKey = mcpPromptKey(prompt);
+      const argumentSource = (promptArgumentText[promptKey] || '{}').trim() || '{}';
+      const parsedArguments = JSON.parse(argumentSource) as unknown;
+      if (
+        parsedArguments === null ||
+        Array.isArray(parsedArguments) ||
+        typeof parsedArguments !== 'object'
+      ) {
+        throw new Error('Prompt arguments must be a JSON object.');
+      }
+      const resp = await fetch(`/api/mcp/prompt/get?session=${encodeURIComponent(sessionId)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          server: prompt.server,
+          name: prompt.name,
+          arguments: parsedArguments,
+        }),
+      });
+      const data = await resp.json();
+      if (!resp.ok || data.error) throw new Error(data.error || `HTTP ${resp.status}`);
+      const text = JSON.stringify(data.result, null, 2);
+      if (insertIntoComposer(text)) onStatus('Prompt inserted into input', 'success');
+      else {
+        await navigator.clipboard?.writeText(text);
+        onStatus('Prompt copied to clipboard', 'success');
+      }
+    } catch (error: unknown) {
+      onStatus(`Get prompt failed: ${(error as Error).message}`, 'error');
+    }
+  };
+
+  const catalogEnabledServers = new Set(
+    (catalog?.servers || [])
+      .filter((server) => server.configuredEnabled && server.enabled)
+      .map((server) => server.id),
+  );
+  const sessionResources = (catalog?.resources || []).filter((resource) =>
+    catalogEnabledServers.has(resource.server),
+  );
+  const sessionPrompts = (catalog?.prompts || []).filter((prompt) =>
+    catalogEnabledServers.has(prompt.server),
+  );
 
   return (
     <>
@@ -1495,6 +1942,200 @@ function McpTab({
       <button className="btn-secondary" style={{ marginTop: 10 }} onClick={addServer}>
         + Add MCP Server
       </button>
+      <div className="settings-card" style={{ marginTop: 16 }}>
+        <div className="settings-card-title">
+          Session MCP Permissions
+          <span style={{ color: 'var(--dim)', fontWeight: 400 }}> · {sessionId}</span>
+        </div>
+        <div className="settings-card-description">
+          Configured servers are discovered globally. Tools are injected only after they are enabled
+          for this session.
+        </div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', margin: '10px 0' }}>
+          <button className="btn-secondary" type="button" onClick={() => void loadCatalog()}>
+            {catalogLoading ? 'Loading...' : 'Refresh Catalog'}
+          </button>
+          <button
+            className="btn-primary"
+            type="button"
+            disabled={!policyDirty || policySaving}
+            onClick={() => void saveMcpPolicy()}
+          >
+            {policySaving ? 'Saving...' : 'Save MCP Permissions'}
+          </button>
+          {policyDirty && <span style={{ color: 'var(--warn)', fontSize: 12 }}>Unsaved</span>}
+        </div>
+        <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12 }}>
+          <input
+            type="checkbox"
+            checked={confirmMutatingTools}
+            onChange={(e) => {
+              setConfirmMutatingTools(e.target.checked);
+              markPolicyDirty();
+            }}
+          />
+          Require confirmation for mutating MCP tools
+        </label>
+        <label
+          style={{
+            display: 'flex',
+            gap: 6,
+            alignItems: 'center',
+            fontSize: 12,
+            marginTop: 8,
+          }}
+        >
+          <input
+            type="checkbox"
+            checked={Boolean(clientCapabilities.roots)}
+            onChange={(e) => {
+              setClientCapabilities((prev) => ({ ...prev, roots: e.target.checked }));
+              markPolicyDirty();
+            }}
+          />
+          Expose this session workspace root to MCP servers
+        </label>
+        {(catalog?.servers || []).map((server) => (
+          <div className="provider-card" key={server.id} style={{ marginTop: 10 }}>
+            <div className="provider-card-header">
+              <span className="provider-card-name">
+                {server.name} · {server.transport}
+              </span>
+              <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                {server.transport === 'streamable-http' && (
+                  <button
+                    className="btn-secondary"
+                    type="button"
+                    disabled={
+                      authBusyServer === server.id ||
+                      (!server.configuredEnabled && !server.authenticated)
+                    }
+                    onClick={() =>
+                      void (server.authenticated
+                        ? disconnectMcpAuth(server)
+                        : connectMcpAuth(server))
+                    }
+                  >
+                    {authBusyServer === server.id
+                      ? 'Working...'
+                      : server.authenticated
+                        ? 'Disconnect'
+                        : 'Connect'}
+                  </button>
+                )}
+                <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12 }}>
+                  <input
+                    type="checkbox"
+                    checked={enabledServers.has(server.id)}
+                    disabled={!server.configuredEnabled}
+                    onChange={(e) => toggleServerPolicy(server, e.target.checked)}
+                  />
+                  Enabled for session
+                </label>
+              </div>
+            </div>
+            {server.error && <div className="json-editor-error">{server.error}</div>}
+            <div style={{ color: 'var(--dim)', fontSize: 12, marginTop: 4 }}>
+              {server.toolCount || 0} tools · {server.resourceCount || 0} resources ·{' '}
+              {server.promptCount || 0} prompts
+              {server.transport === 'streamable-http'
+                ? ` · ${server.authenticated ? 'authenticated' : 'not authenticated'}`
+                : ''}
+            </div>
+            {(catalog?.tools || [])
+              .filter((tool) => tool.server === server.id)
+              .map((tool) => (
+                <label
+                  key={tool.id}
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: 'auto 1fr auto',
+                    gap: 8,
+                    alignItems: 'center',
+                    marginTop: 8,
+                    fontSize: 12,
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={enabledTools.has(tool.id)}
+                    onChange={(e) => toggleToolPolicy(tool, e.target.checked)}
+                  />
+                  <span>
+                    <strong>{tool.rawName}</strong>
+                    {tool.description && (
+                      <span style={{ color: 'var(--dim)' }}> · {tool.description}</span>
+                    )}
+                  </span>
+                  <span style={{ color: tool.readOnly ? 'var(--ok)' : 'var(--warn)' }}>
+                    {tool.readOnly ? 'read' : 'mutating'}
+                  </span>
+                </label>
+              ))}
+          </div>
+        ))}
+      </div>
+      {Boolean(sessionResources.length || sessionPrompts.length) && (
+        <div className="settings-card" style={{ marginTop: 16 }}>
+          <div className="settings-card-title">Resources and Prompts</div>
+          <div className="settings-card-description">
+            Read-only preview actions fetch the selected MCP payload and insert it into the chat
+            input for manual use.
+          </div>
+          {sessionResources.map((resource) => (
+            <div className="provider-card" key={`${resource.server}:${resource.uri}`}>
+              <div className="provider-card-header">
+                <span className="provider-card-name">{resource.name || resource.uri}</span>
+                <button className="btn-secondary" onClick={() => void readResource(resource)}>
+                  Read
+                </button>
+              </div>
+              <div style={{ color: 'var(--dim)', fontSize: 12 }}>{resource.uri}</div>
+            </div>
+          ))}
+          {sessionPrompts.map((prompt) => {
+            const promptKey = mcpPromptKey(prompt);
+            return (
+              <div className="provider-card" key={promptKey}>
+                <div className="provider-card-header">
+                  <span className="provider-card-name">{prompt.name}</span>
+                  <button className="btn-secondary" onClick={() => void getPrompt(prompt)}>
+                    Get
+                  </button>
+                </div>
+                {prompt.description && (
+                  <div style={{ color: 'var(--dim)', fontSize: 12 }}>{prompt.description}</div>
+                )}
+                <textarea
+                  aria-label={`Arguments for ${prompt.name}`}
+                  className="json-editor"
+                  style={{ minHeight: 72, marginTop: 8 }}
+                  spellCheck={false}
+                  value={
+                    promptArgumentText[promptKey] ?? buildPromptArgumentsTemplate(prompt.arguments)
+                  }
+                  onChange={(event) =>
+                    setPromptArgumentText((previous) => ({
+                      ...previous,
+                      [promptKey]: event.target.value,
+                    }))
+                  }
+                />
+                {prompt.arguments !== undefined && (
+                  <details style={{ marginTop: 6 }}>
+                    <summary style={{ color: 'var(--dim)', cursor: 'pointer', fontSize: 12 }}>
+                      Arguments schema
+                    </summary>
+                    <pre className="json-editor" style={{ marginTop: 6 }}>
+                      {JSON.stringify(prompt.arguments, null, 2)}
+                    </pre>
+                  </details>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
       <details style={{ marginTop: 16 }}>
         <summary style={{ fontSize: 12, color: 'var(--dim)', cursor: 'pointer' }}>
           Advanced: Raw JSON
@@ -1941,6 +2582,7 @@ function SettingsShell({
   status,
   configDirty,
   skillsDirty,
+  mcpDirty,
   corrupt,
   showDiscardConfirm,
   onTabChange,
@@ -1955,6 +2597,7 @@ function SettingsShell({
   status: { message: string; type: StatusType };
   configDirty: boolean;
   skillsDirty: boolean;
+  mcpDirty: boolean;
   corrupt: boolean;
   showDiscardConfirm: boolean;
   onTabChange: (tab: TabId) => void;
@@ -2012,7 +2655,12 @@ function SettingsShell({
   };
 
   const canSaveConfig = !corrupt && activeMeta.saveMode === 'config';
-  const hasUnsavedChanges = configDirty || skillsDirty;
+  const hasUnsavedChanges = configDirty || skillsDirty || mcpDirty;
+  const dirtySections = [
+    configDirty ? 'Config' : '',
+    skillsDirty ? 'Skills' : '',
+    mcpDirty ? 'MCP' : '',
+  ].filter(Boolean);
 
   return (
     <div className="page-panel settings-panel">
@@ -2080,11 +2728,9 @@ function SettingsShell({
               <div>
                 <strong>Discard unsaved changes?</strong>
                 <span>
-                  {configDirty && skillsDirty
-                    ? ' Config and Skills have unsaved changes.'
-                    : configDirty
-                      ? ' Config has unsaved changes.'
-                      : ' Skills have unsaved changes.'}
+                  {` ${dirtySections.join(', ')} ${
+                    dirtySections.length === 1 ? 'has' : 'have'
+                  } unsaved changes.`}
                 </span>
               </div>
               <div className="settings-discard-actions">
@@ -2143,6 +2789,7 @@ export function SettingsPage() {
   const [discoveredAgents, setDiscoveredAgents] = useState<DiscoveredAgentInfo[]>([]);
   const [settingsSessionId, setSettingsSessionId] = useState('main');
   const [skillsDirty, setSkillsDirty] = useState(false);
+  const [mcpDirty, setMcpDirty] = useState(false);
   const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
   const requestCloseRef = useRef<() => void>(() => setVisible(false));
   const visibleRef = useRef(false);
@@ -2153,7 +2800,7 @@ export function SettingsPage() {
     () => serializeConfigForDirty(config) !== configBaseline,
     [config, configBaseline],
   );
-  const hasUnsavedChanges = configDirty || skillsDirty;
+  const hasUnsavedChanges = configDirty || skillsDirty || mcpDirty;
 
   const closeWithoutPrompt = useCallback(() => {
     setShowDiscardConfirm(false);
@@ -2161,6 +2808,7 @@ export function SettingsPage() {
     setConfigBaseline(serializeConfigForDirty(savedConfig));
     setVisible(false);
     setSkillsDirty(false);
+    setMcpDirty(false);
   }, [savedConfig]);
 
   const requestClose = useCallback(() => {
@@ -2375,6 +3023,7 @@ export function SettingsPage() {
       status={status}
       configDirty={configDirty}
       skillsDirty={skillsDirty}
+      mcpDirty={mcpDirty}
       corrupt={!!corruptData}
       showDiscardConfirm={showDiscardConfirm}
       onTabChange={selectTab}
@@ -2451,7 +3100,13 @@ export function SettingsPage() {
               aria-labelledby="tab-mcp-button"
               hidden={activeTab !== 'tab-mcp'}
             >
-              <McpTab config={config} onChange={setConfig} onStatus={handleStatus} />
+              <McpTab
+                config={config}
+                sessionId={settingsSessionId}
+                onChange={setConfig}
+                onStatus={handleStatus}
+                onPolicyDirtyChange={setMcpDirty}
+              />
             </section>
           )}
           {visitedTabs.has('tab-s3') && (

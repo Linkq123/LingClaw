@@ -618,9 +618,12 @@ pub(crate) fn filter_tools_for_agent_with_mcp(
     workspace: &std::path::Path,
 ) -> Vec<String> {
     let mut allowed = filter_tools_for_agent(spec);
+    let session_policy = crate::tools::mcp::load_session_policy(workspace);
 
     // Add MCP tools from cache, filtered according to policy.
-    for descriptor in crate::tools::mcp::cached_list_tools(config, workspace) {
+    for descriptor in
+        crate::tools::mcp::cached_list_tools_for_policy(config, workspace, &session_policy)
+    {
         let mcp_ok = match spec.mcp_policy {
             Some(McpPolicy::All) => true,
             Some(McpPolicy::ReadOnly) => is_mcp_tool_read_only(&descriptor),

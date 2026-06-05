@@ -203,8 +203,8 @@ lingclaw --version  # 显示版本号
 说明：
 
 - `start` / `restart` 会先执行受限的一次性 MCP preflight；失败只会给出警告，不会阻止服务启动
-- `mcp-check` 会按运行时超时配置做更深的 MCP 诊断，适合排查 `command`、`cwd`、协议握手或工具发现问题
-- 浏览器聊天页可用 `/mcp` 查看当前已加载的 MCP server 状态，`/mcp refresh` 会清空缓存、空闲会话和最近失败冷却状态并重新探测 tools；服务端发出的 `notifications/tools/list_changed` 也会让下一次工具发现自动刷新
+- `mcp-check` 会按运行时超时配置做更深的 MCP 诊断，适合排查 `command`/`url`、OAuth/header、`cwd`、协议握手或 tools/resources/prompts 发现问题
+- 浏览器聊天页可用 `/mcp` 查看当前已加载的 MCP server transport、auth、capabilities、cache 和当前 session 启用状态；`/mcp refresh` 会清空 tools/resources/prompts 缓存、空闲会话和最近失败冷却状态并重新探测；服务端发出的 `notifications/tools/list_changed`、`notifications/resources/list_changed`、`notifications/prompts/list_changed` 会分别触发对应缓存刷新
 - MCP server 连续启动失败后会进入短暂冷却，避免每次请求都反复拉起失败进程；手动执行 `/mcp refresh` 可立即清除该冷却并重试
 - 运行时的 MCP 空闲会话会自动回收，因此 `mcp-check` 的一次性诊断进程和聊天页的长生命周期工具会话不会相互复用
 - `stop` 会优先走本地认证的优雅关停端点 `/api/shutdown`，超时后才回退到强制结束进程
@@ -435,9 +435,13 @@ volumes:
 
 ### mcpServers 与 s3
 
-- `mcpServers` 是顶层对象，每个 server 可配置 `command`、`args`、`env`、`cwd`、`timeoutSecs`
+- `mcpServers` 是顶层对象，每个 server 可配置 `transport`、`command`、`url`、`headers`、`auth`、`args`、`env`、`cwd`、`enabled`、`timeoutSecs`
+- `transport` 支持 `stdio` 与 `streamable-http`；未写 `transport` 且有 `command` 时按旧版 stdio 配置兼容
 - `mcpServers.*.cwd` 必须位于当前主会话工作区 `~/.lingclaw/main/workspace/` 内，否则会被拒绝启动
 - `mcpServers.*.timeoutSecs` 未设置时继承 `toolTimeout`
+- `mcpServers` 只声明 server catalog；升级后不会自动把 MCP tools 暴露给模型，需要在 Settings → MCP 中按 session 手动开启 server/tool
+- Streamable HTTP 的本地授权文件为 `~/.lingclaw/mcp-auth.json`，包含 access/refresh token 与 OAuth client 信息；部署备份时按敏感凭据处理
+- `env`、`headers`、`auth.clientId`、`auth.clientSecret` 支持精确 `${ENV_NAME}` 占位符，适合把 token 放在部署环境变量中
 - 顶层 `s3` 用于本地 JPEG/PNG 上传；OpenAI/Anthropic 需要可被远端 provider 访问的现签 URL，私网 endpoint 推荐配合 Gemini/Ollama 使用
 
 ## 文件结构
@@ -457,10 +461,11 @@ docs/reference/skills/          # 内置 system skills（运行时磁盘发现�
 docs/reference/agents/          # 内置 system sub-agents（运行时磁盘发现）
 ~/.lingclaw/
   .lingclaw.json                # 配置文件（Setup Wizard 自动创建）
+  mcp-auth.json                 # 可选：Streamable HTTP MCP OAuth/token 本地授权文件
   sessions/                     # 磁盘持久化的会话 JSON
     main.json                   # 默认会话存档
     <session-id>.json           # 其他持久化 session 存档
-  <session-id>/workspace/       # 对应 session 工作区（含 7 个 prompt 文件 + memory/ 日志）
+  <session-id>/workspace/       # 对应 session 工作区（含 prompt 文件、.lingclaw-mcp-policy.json、memory/ 日志）
 ```
 
 其中 `docs/reference/templates/` 是可选的磁盘覆盖目录：

@@ -21,7 +21,7 @@
 
 后端暴露两类接口：
 
-- HTTP：健康检查、session 摘要、session 系统 Skills 开关、配置读写、todos、模型与 MCP 联通性测试、Usage、图片上传、优雅关停
+- HTTP：健康检查、session 摘要、session 系统 Skills 开关、session MCP 权限与 catalog、配置读写、todos、模型与 MCP 联通性测试、Usage、图片上传、优雅关停
 - WebSocket：聊天主通道，承载流式回复、工具事件、推理事件、子代理事件、编排事件
 
 ## 2. 访问与鉴权约束
@@ -372,7 +372,7 @@
 - 原子写入配置文件
 - 热重载运行时配置
 - 刷新前端会话能力信息
-- 刷新 MCP server 缓存
+- 刷新 MCP server tools/resources/prompts 缓存与运行时状态
 
 ### 请求体
 
@@ -555,10 +555,20 @@
 
 ```json
 {
+  "transport": "stdio | streamable-http",
   "command": "string",
+  "url": "https://example.com/mcp",
   "args": ["string"],
   "env": {
     "KEY": "VALUE"
+  },
+  "headers": {
+    "Authorization": "Bearer ${TOKEN}"
+  },
+  "auth": {
+    "clientId": "${MCP_CLIENT_ID}",
+    "clientSecret": "${MCP_CLIENT_SECRET}",
+    "scopes": ["read"]
   },
   "cwd": ".",
   "enabled": true,
@@ -568,12 +578,17 @@
 
 约束：
 
-- `command` 不能为空
+- `transport` 可选，支持 `stdio` 和 `streamable-http`
+- 未写 `transport` 且有 `command` 时按 `stdio`；没有 `command` 但有 `url` 时按 `streamable-http`；两者都没有时按 `stdio`
+- `stdio` server 的 `command` 不能为空
+- `streamable-http` server 的 `url` 不能为空，并且必须以 `http://` 或 `https://` 开头
+- `env` 值、`headers` 值、`auth.clientId`、`auth.clientSecret` 支持精确 `${ENV_NAME}` 占位符
 - `timeoutSecs` 不能为 `0`
 - `cwd` 必须位于当前配置测试所使用 session 的 workspace 内
 - `cwd` 不允许逃逸 workspace
 - `cwd` 不允许穿过受保护 symlink
 - `cwd` 不允许指向 `.lingclaw-bootstrap`
+- `mcpServers` 只声明 server；server/tool 是否注入模型由每个 session 的 `/api/mcp/session-policy` 控制，默认不注入任何 MCP tool
 
 #### s3
 
@@ -687,12 +702,18 @@
 
 ## 4.8 POST /api/config/test-mcp
 
-测试 MCP server 是否可启动并完成 tools 列表发现。
+测试 MCP server 是否可连接并完成 tools 列表发现。支持 stdio 与 Streamable HTTP。
+
+查询参数：
+
+- `session`：可选 session id，省略时使用 `main`；用于按该 session workspace 解析 `cwd` 和 MCP roots
 
 ### 请求体
 
 ```json
 {
+  "server": "filesystem",
+  "transport": "stdio",
   "command": "uvx",
   "args": ["mcp-server-filesystem"],
   "env": {
@@ -702,6 +723,28 @@
   "timeoutSecs": 30
 }
 ```
+
+Streamable HTTP 示例：
+
+```json
+{
+  "server": "remote",
+  "transport": "streamable-http",
+  "url": "https://example.com/mcp",
+  "headers": {
+    "X-API-Key": "${REMOTE_MCP_API_KEY}"
+  },
+  "auth": {
+    "clientId": "${REMOTE_MCP_CLIENT_ID}",
+    "clientSecret": "${REMOTE_MCP_CLIENT_SECRET}",
+    "scopes": ["read"]
+  },
+  "timeoutSecs": 30
+}
+```
+
+- `server` 可选；提供后会按该 server 名称复用 `~/.lingclaw/mcp-auth.json` 中已有的 OAuth token。省略时使用临时测试名称，不会匹配已保存的授权状态。
+- `auth` 可选，形状与 `mcpServers.<name>.auth` 相同，用于测试 Streamable HTTP OAuth 客户端配置。
 
 ### 成功响应
 
@@ -741,6 +784,171 @@
   "error": "Connection timed out"
 }
 ```
+
+## 4.8.1 Session MCP APIs
+
+这些接口管理当前 session 的 MCP server/tool 权限，并提供 resources/prompts 的只读浏览。`mcpServers` 配置只负责声明 server；默认不会把任何 MCP tool 注入模型，必须通过 `PUT /api/mcp/session-policy` 为该 session 手动启用。
+
+### GET /api/mcp/catalog
+
+查询参数：
+
+- `session`：可选 session id，省略时使用 `main`
+
+响应示例：
+
+```json
+{
+  "session": {"id": "main", "name": "Main"},
+  "policy": {
+    "enabledServers": ["filesystem"],
+    "enabledTools": ["mcp__filesystem__read_file__abcd1234"],
+    "confirmMutatingTools": false,
+    "clientCapabilities": {"roots": false, "sampling": false, "elicitation": false}
+  },
+  "servers": [
+    {
+      "id": "filesystem",
+      "transport": "stdio",
+      "configuredEnabled": true,
+      "enabled": true,
+      "authenticated": false,
+      "toolCount": 1,
+      "resourceCount": 0,
+      "promptCount": 0,
+      "error": null
+    }
+  ],
+  "tools": [
+    {
+      "id": "mcp__filesystem__read_file__abcd1234",
+      "server": "filesystem",
+      "rawName": "read_file",
+      "description": "Read a file",
+      "readOnly": true,
+      "enabled": true
+    }
+  ],
+  "resources": [],
+  "prompts": []
+}
+```
+
+### PUT /api/mcp/session-policy
+
+查询参数：
+
+- `session`：可选 session id，省略时使用 `main`
+
+请求体：
+
+```json
+{
+  "enabledServers": ["filesystem"],
+  "enabledTools": ["mcp__filesystem__read_file__abcd1234"],
+  "confirmMutatingTools": true,
+  "clientCapabilities": {"roots": true, "sampling": false, "elicitation": false}
+}
+```
+
+说明：
+
+- `enabledServers` 必须是已配置且未禁用的 server
+- `enabledTools` 必须是当前发现到的 MCP tool，且所属 server 必须在 `enabledServers` 中
+- `confirmMutatingTools` 启用后，LingClaw 会阻止自动执行启发式判定为 mutating 的 MCP tool，避免模型绕过确认直接修改外部系统
+- `clientCapabilities.roots` 控制 initialize 时是否向 MCP server 声明 `roots` capability；`sampling` / `elicitation` 字段为兼容预留，后端不会声明尚未实现的 client capability
+- 保存到当前 session workspace 的 `.lingclaw-mcp-policy.json`
+- 子代理只会继承该 session 已启用的 MCP tools，再按子代理 `mcp_policy` 做过滤
+
+### POST /api/mcp/resource/read
+
+查询参数：
+
+- `session`：可选 session id，省略时使用 `main`
+
+请求体：
+
+```json
+{
+  "server": "filesystem",
+  "uri": "file:///workspace/README.md"
+}
+```
+
+响应中的 `result` 是 MCP server 原始 `resources/read` result。请求的 server 必须已在当前 session 的 MCP policy 中启用。该接口不会自动写入 system prompt 或对话历史，前端只提供预览/手动插入。
+
+### POST /api/mcp/prompt/get
+
+查询参数：
+
+- `session`：可选 session id，省略时使用 `main`
+
+请求体：
+
+```json
+{
+  "server": "docs",
+  "name": "summarize",
+  "arguments": {"topic": "deployment"}
+}
+```
+
+响应中的 `result` 是 MCP server 原始 `prompts/get` result。请求的 server 必须已在当前 session 的 MCP policy 中启用。该接口同样只用于用户手动浏览和插入。
+
+### OAuth
+
+- `POST /api/mcp/auth/start`
+- `GET/POST /api/mcp/auth/callback`
+- `POST /api/mcp/auth/disconnect`
+
+`auth/start` 请求体：
+
+```json
+{
+  "server": "remote-docs"
+}
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "server": "remote-docs",
+  "authorizationUrl": "https://auth.example.com/authorize?...",
+  "redirectUri": "http://127.0.0.1:18989/api/mcp/auth/callback",
+  "clientId": "client-id",
+  "scopes": ["read"]
+}
+```
+
+`auth/callback` 支持浏览器 GET query：
+
+```text
+/api/mcp/auth/callback?server=remote-docs&code=...&state=...
+```
+
+也支持前端 POST：
+
+```json
+{
+  "server": "remote-docs",
+  "code": "authorization-code",
+  "state": "oauth-state"
+}
+```
+
+`auth/disconnect` 请求体：
+
+```json
+{
+  "server": "remote-docs"
+}
+```
+
+`auth/start` 会发现 OAuth protected resource metadata 与 authorization server metadata，生成 PKCE 授权 URL，并把 pending state 写入本地授权文件。若授权服务器不支持动态客户端注册，需要在 `mcpServers.<name>.auth.clientId` 中配置客户端 ID；`clientSecret` 可选。callback 支持浏览器 loopback GET，也支持前端 POST `{server, code, state}` 完成 token exchange。OAuth token 存储在本地 `~/.lingclaw/mcp-auth.json`，按 server 分组保存；access token 过期时会使用 refresh token 自动刷新；`auth/disconnect` 会清除对应 server 的本地 token。
+
+Streamable HTTP 运行时会在 initialize 后维护 GET SSE 通知流，并记录 `Last-Event-ID` 用于后续重连；POST/GET SSE 中的 `notifications/tools/list_changed`、`notifications/resources/list_changed`、`notifications/prompts/list_changed` 会分别清理对应缓存。
 
 ## 4.9 GET /api/usage
 

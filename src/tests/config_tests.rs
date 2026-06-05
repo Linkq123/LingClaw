@@ -724,11 +724,15 @@ fn validate_json_mcp_servers_rejects_empty_command() {
     mcp_servers.insert(
         "empty-command".to_string(),
         JsonMcpServerConfig {
+            transport: None,
             command: "".to_string(),
+            url: None,
             args: Vec::new(),
             env: HashMap::new(),
+            headers: HashMap::new(),
             cwd: None,
             enabled: true,
+            auth: None,
             timeout_secs: None,
         },
     );
@@ -743,6 +747,48 @@ fn validate_json_mcp_servers_rejects_empty_command() {
     .expect_err("empty MCP command should be rejected");
 
     assert!(err.contains("mcpServers.empty-command"));
+}
+
+#[test]
+fn validate_json_mcp_servers_allows_streamable_http_without_command() {
+    let json: JsonConfig = serde_json::from_str(
+        r#"{
+            "mcpServers": {
+                "remote": {
+                    "transport": "streamable-http",
+                    "url": "https://example.com/mcp"
+                }
+            }
+        }"#,
+    )
+    .expect("streamable HTTP MCP config should parse without command");
+
+    Config::validate_json_mcp_servers(&json)
+        .expect("streamable HTTP MCP config should validate with url only");
+}
+
+#[test]
+fn validate_json_mcp_servers_keeps_command_configs_stdio_when_transport_omitted() {
+    let json: JsonConfig = serde_json::from_str(
+        r#"{
+            "mcpServers": {
+                "legacy": {
+                    "command": "uvx",
+                    "url": "not-a-streamable-http-url"
+                }
+            }
+        }"#,
+    )
+    .expect("legacy MCP config should parse");
+
+    let server = json
+        .mcp_servers
+        .as_ref()
+        .and_then(|servers| servers.get("legacy"))
+        .expect("legacy server should exist");
+    assert_eq!(server.effective_transport(), "stdio");
+    Config::validate_json_mcp_servers(&json)
+        .expect("omitted transport with command should remain stdio-compatible");
 }
 
 #[test]
@@ -1007,11 +1053,15 @@ fn validate_json_mcp_servers_rejects_zero_timeout() {
     mcp_servers.insert(
         "zero-timeout".to_string(),
         JsonMcpServerConfig {
+            transport: None,
             command: "uvx".to_string(),
+            url: None,
             args: Vec::new(),
             env: HashMap::new(),
+            headers: HashMap::new(),
             cwd: None,
             enabled: true,
+            auth: None,
             timeout_secs: Some(0),
         },
     );

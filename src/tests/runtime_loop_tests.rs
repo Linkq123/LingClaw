@@ -2101,6 +2101,17 @@ async fn run_analyze_phase_emits_context_pruned_after_before_analyze_compression
 
     let state = Arc::new(test_app_state_with_hooks(hooks));
     install_openai_model(&state, "gpt-4o-reasoner", true);
+    {
+        let mut guard = state.config.lock().expect("config lock");
+        let mut config = (**guard).clone();
+        config.max_context_tokens = 1_000;
+        if let Some(provider) = config.providers.get_mut("openai")
+            && let Some(model) = provider.models.first_mut()
+        {
+            model.context_window = Some(1_000);
+        }
+        *guard = Arc::new(config);
+    }
 
     let session_id = "context-compress-before-prune".to_string();
     let workspace = temp_workspace("context-compress-before-prune");

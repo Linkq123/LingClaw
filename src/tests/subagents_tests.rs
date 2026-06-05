@@ -778,6 +778,7 @@ fn test_mcp_tool_classification_defaults_unknown_tools_to_mutating() {
 
 #[tokio::test]
 async fn test_mcp_read_only_tools_are_parallelizable_for_dispatch() {
+    let _guard = crate::tools::mcp::acquire_mcp_test_guard().await;
     let workspace = unique_temp_workspace("lingclaw-subagent-parallel-readonly-mcp");
     let _ = fs::remove_dir_all(&workspace);
     fs::create_dir_all(&workspace).expect("workspace should exist");
@@ -977,7 +978,9 @@ fn base_config_with_mock_mcp_server(mode: &str, log_path: &Path) -> Config {
     config.mcp_servers.insert(
         "mock".to_string(),
         JsonMcpServerConfig {
+            transport: None,
             command: mock_server_binary().display().to_string(),
+            url: None,
             args: Vec::new(),
             env: HashMap::from([
                 ("LINGCLAW_MCP_MODE".to_string(), mode.to_string()),
@@ -986,8 +989,10 @@ fn base_config_with_mock_mcp_server(mode: &str, log_path: &Path) -> Config {
                     log_path.display().to_string(),
                 ),
             ]),
+            headers: HashMap::new(),
             cwd: None,
             enabled: true,
+            auth: None,
             timeout_secs: Some(5),
         },
     );
@@ -2672,6 +2677,7 @@ async fn run_subagent_timeout_during_tool_exec_still_runs_after_tool_exec_hook()
 
 #[tokio::test]
 async fn run_subagent_executes_mcp_tool_allowed_by_policy() {
+    let _guard = crate::tools::mcp::acquire_mcp_test_guard().await;
     let workspace = unique_temp_workspace("lingclaw-subagent-mcp-policy");
     let _ = fs::remove_dir_all(&workspace);
     fs::create_dir_all(&workspace).expect("workspace should exist");
@@ -2686,6 +2692,16 @@ async fn run_subagent_executes_mcp_tool_allowed_by_policy() {
         .first()
         .cloned()
         .expect("mock MCP server should expose a tool");
+    crate::tools::mcp::save_session_policy(
+        &workspace,
+        &crate::tools::mcp::McpSessionPolicy {
+            enabled_servers: std::collections::HashSet::from(["mock".to_string()]),
+            enabled_tools: std::collections::HashSet::from([tool_name.clone()]),
+            confirm_mutating_tools: false,
+            client_capabilities: Default::default(),
+        },
+    )
+    .expect("MCP session policy should save");
 
     let response_body = build_openai_tool_call_stream(
         &tool_name,

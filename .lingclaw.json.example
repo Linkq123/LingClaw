@@ -242,14 +242,16 @@
   },
   "mcpServers": {
     "MiniMax": {
+      "transport": "stdio",
       "command": "uvx",
       "args": ["minimax-coding-plan-mcp", "-y"],
       "env": {
-        "MINIMAX_API_KEY": "",
+        "MINIMAX_API_KEY": "${MINIMAX_API_KEY}",
         "MINIMAX_API_HOST": "https://api.minimaxi.com"
       }
     },
     "github": {
+      "transport": "stdio",
       "command": "docker",
       "args": [
         "run",
@@ -260,8 +262,22 @@
         "ghcr.io/github/github-mcp-server"
       ],
       "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": ""
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}"
       }
+    },
+    "remote-docs": {
+      "transport": "streamable-http",
+      "url": "https://example.com/mcp",
+      "headers": {
+        "X-API-Key": "${REMOTE_MCP_API_KEY}"
+      },
+      "auth": {
+        "clientId": "${REMOTE_MCP_CLIENT_ID}",
+        "clientSecret": "${REMOTE_MCP_CLIENT_SECRET}",
+        "scopes": ["read"]
+      },
+      "timeoutSecs": 30,
+      "enabled": false
     }
   },
   "s3": {

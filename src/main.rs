@@ -4,7 +4,7 @@ use axum::{
         DefaultBodyLimit, Multipart, Query, Request, State,
         ws::{Message as WsMsg, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -345,6 +345,7 @@ struct Session {
     /// Legacy field read from older session files. System skill injection is now
     /// allow-list based through `enabled_system_skills`.
     #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
     disabled_system_skills: HashSet<String>,
     /// Tool call ids whose persisted tool result ended in an error state.
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
@@ -979,7 +980,7 @@ fn build_system_prompt_with_query(
     let prompt_files = prompts::load_session_prompt_files_with_snapshot(workspace, local_snapshot);
     let persona = prompt_files.persona;
     let memory_files = prompt_files.memory;
-    let mcp_note = tools::mcp::runtime_tool_note(config)
+    let mcp_note = tools::mcp::runtime_tool_note(config, workspace)
         .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
         .unwrap_or_default();
 
@@ -1089,7 +1090,7 @@ fn build_system_prompt_with_query_cached(
     let prompt_files = prompts::load_session_prompt_files_with_snapshot(workspace, local_snapshot);
     let persona = prompt_files.persona;
     let memory_files = prompt_files.memory;
-    let mcp_note = tools::mcp::runtime_tool_note(config)
+    let mcp_note = tools::mcp::runtime_tool_note(config, workspace)
         .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
         .unwrap_or_default();
 
@@ -1433,7 +1434,7 @@ fn is_loopback_or_localhost(host: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn validate_local_request_headers(
+fn validate_loopback_host_header(
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let host = headers
@@ -1446,6 +1447,13 @@ fn validate_local_request_headers(
             "Blocked non-local request: Host header must target localhost or a loopback address",
         ));
     }
+    Ok(())
+}
+
+fn validate_local_request_headers(
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    validate_loopback_host_header(headers)?;
 
     for header_name in ["origin", "referer"] {
         if let Some(value) = headers.get(header_name) {
@@ -1469,11 +1477,23 @@ fn validate_local_request_headers(
     Ok(())
 }
 
+fn validate_local_request_for_route(
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if *method == Method::GET && path == "/api/mcp/auth/callback" {
+        validate_loopback_host_header(headers)
+    } else {
+        validate_local_request_headers(headers)
+    }
+}
+
 async fn enforce_local_request(
     request: Request,
     next: Next,
 ) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-    validate_local_request_headers(request.headers())?;
+    validate_local_request_for_route(request.method(), request.uri().path(), request.headers())?;
     Ok(next.run(request).await)
 }
 
@@ -2889,6 +2909,56 @@ struct SessionSkillsUpdateRequest {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpSessionPolicyUpdateRequest {
+    enabled_servers: Vec<String>,
+    enabled_tools: Vec<String>,
+    #[serde(default)]
+    confirm_mutating_tools: bool,
+    #[serde(default)]
+    client_capabilities: tools::mcp::McpClientCapabilityPolicy,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpServerRequest {
+    server: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpAuthCallbackRequest {
+    server: String,
+    code: String,
+    state: String,
+}
+
+#[derive(Deserialize)]
+struct McpAuthCallbackQuery {
+    server: String,
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpResourceReadRequest {
+    server: String,
+    uri: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpPromptGetRequest {
+    server: String,
+    name: String,
+    #[serde(default)]
+    arguments: serde_json::Value,
+}
+
+#[derive(Deserialize)]
 struct SessionRenameRequest {
     name: String,
 }
@@ -3637,6 +3707,490 @@ async fn api_put_session_skills(
     Ok(Json(payload))
 }
 
+async fn api_mcp_catalog(
+    Query(query): Query<SessionQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
+    let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
+    let (session_name, workspace) = {
+        let sessions = state.sessions.lock().await;
+        let Some(session) = sessions.get(&session_id) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("Session '{}' not found", session_id) })),
+            ));
+        };
+        (session.name.clone(), session.workspace.clone())
+    };
+
+    let config = state.config();
+    let policy = tools::mcp::load_session_policy(&workspace);
+    let catalog = tools::mcp::catalog_snapshot(&config, &workspace).await;
+    let auth_state = tools::mcp::load_auth_state();
+
+    let server_reports = catalog
+        .reports
+        .iter()
+        .map(|report| (report.server_name.as_str(), report))
+        .collect::<HashMap<_, _>>();
+    let mut servers = config
+        .mcp_servers
+        .iter()
+        .map(|(name, server)| {
+            let report = server_reports.get(name.as_str());
+            json!({
+                "id": name,
+                "name": name,
+                "transport": server.effective_transport(),
+                "configuredEnabled": server.enabled,
+                "enabled": policy.enabled_servers.contains(name),
+                "authenticated": auth_state
+                    .servers
+                    .get(name)
+                    .is_some_and(|auth| tools::mcp::auth_state_usable_for_server(name, server, auth)),
+                "toolCount": report.map(|r| r.tool_names.len()).unwrap_or(0),
+                "resourceCount": report.map(|r| r.resource_count).unwrap_or(0),
+                "promptCount": report.map(|r| r.prompt_count).unwrap_or(0),
+                "error": report.and_then(|r| r.error.clone()),
+            })
+        })
+        .collect::<Vec<_>>();
+    servers.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["name"].as_str().unwrap_or_default())
+    });
+
+    let mut tools_payload = catalog
+        .tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "id": tool.exposed_name,
+                "server": tool.server_name,
+                "rawName": tool.raw_name,
+                "name": tool.exposed_name,
+                "description": tool.description,
+                "readOnly": tools::mcp::is_read_only_tool_descriptor(tool),
+                "enabled": policy.allows_tool(tool),
+            })
+        })
+        .collect::<Vec<_>>();
+    tools_payload.sort_by(|a, b| {
+        a["id"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["id"].as_str().unwrap_or_default())
+    });
+
+    let mut resources_payload = catalog
+        .resources
+        .iter()
+        .map(|resource| {
+            json!({
+                "server": resource.server_name,
+                "uri": resource.uri,
+                "name": resource.name,
+                "description": resource.description,
+                "mimeType": resource.mime_type,
+            })
+        })
+        .collect::<Vec<_>>();
+    resources_payload.sort_by(|a, b| {
+        a["uri"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["uri"].as_str().unwrap_or_default())
+    });
+
+    let mut prompts_payload = catalog
+        .prompts
+        .iter()
+        .map(|prompt| {
+            json!({
+                "server": prompt.server_name,
+                "name": prompt.raw_name,
+                "description": prompt.description,
+                "arguments": prompt.arguments,
+            })
+        })
+        .collect::<Vec<_>>();
+    prompts_payload.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["name"].as_str().unwrap_or_default())
+    });
+
+    Ok(Json(json!({
+        "session": {
+            "id": session_id,
+            "name": session_name,
+        },
+        "policy": policy,
+        "servers": servers,
+        "tools": tools_payload,
+        "resources": resources_payload,
+        "prompts": prompts_payload,
+    })))
+}
+
+async fn api_put_mcp_session_policy(
+    Query(query): Query<SessionQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<McpSessionPolicyUpdateRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
+    let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
+    let workspace = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .map(|session| session.workspace.clone())
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": format!("Session '{}' not found", session_id) })),
+                )
+            })?
+    };
+
+    let config = state.config();
+    let previous_policy = tools::mcp::load_session_policy(&workspace);
+    let known_servers = config
+        .mcp_servers
+        .iter()
+        .filter(|(_, server)| server.enabled)
+        .map(|(name, _)| name.clone())
+        .collect::<HashSet<_>>();
+
+    let mut enabled_servers = HashSet::new();
+    for server in request.enabled_servers {
+        if !known_servers.contains(&server) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Unknown or disabled MCP server: {server}") })),
+            ));
+        }
+        enabled_servers.insert(server);
+    }
+
+    let requested_tools = request.enabled_tools;
+    let mut servers_to_probe = HashSet::new();
+    for tool in &requested_tools {
+        for server_name in &enabled_servers {
+            if tools::mcp::exposed_tool_matches_server(tool, server_name) {
+                servers_to_probe.insert(server_name.clone());
+            }
+        }
+    }
+
+    let (known_tools, successful_tool_servers) = if servers_to_probe.is_empty() {
+        (HashMap::new(), HashSet::new())
+    } else {
+        let (tools, successful_servers) = tools::mcp::list_tools_for_servers_uncached_with_status(
+            &config,
+            &workspace,
+            &servers_to_probe,
+        )
+        .await;
+        (
+            tools
+                .into_iter()
+                .map(|tool| (tool.exposed_name.clone(), tool.server_name.clone()))
+                .collect::<HashMap<_, _>>(),
+            successful_servers,
+        )
+    };
+
+    let mut enabled_tools = HashSet::new();
+    for tool in requested_tools {
+        if let Some(server_name) = known_tools.get(&tool) {
+            if !enabled_servers.contains(server_name) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(
+                        json!({ "error": format!("MCP tool '{tool}' belongs to disabled server '{server_name}'") }),
+                    ),
+                ));
+            }
+            enabled_tools.insert(tool);
+            continue;
+        }
+
+        let previous_matching_servers = previous_policy
+            .enabled_servers
+            .iter()
+            .filter(|server_name| {
+                enabled_servers.contains(*server_name)
+                    && tools::mcp::exposed_tool_matches_server(&tool, server_name)
+            })
+            .collect::<Vec<_>>();
+        let was_previously_enabled_for_server =
+            previous_policy.enabled_tools.contains(&tool) && !previous_matching_servers.is_empty();
+        let matching_server_successfully_probed = previous_matching_servers
+            .iter()
+            .any(|server_name| successful_tool_servers.contains(*server_name));
+        if was_previously_enabled_for_server && !matching_server_successfully_probed {
+            enabled_tools.insert(tool);
+            continue;
+        }
+
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("Unknown MCP tool: {tool}") })),
+        ));
+    }
+
+    let policy = tools::mcp::McpSessionPolicy {
+        enabled_servers,
+        enabled_tools,
+        confirm_mutating_tools: request.confirm_mutating_tools,
+        client_capabilities: request.client_capabilities,
+    };
+    tools::mcp::save_session_policy(&workspace, &policy).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        )
+    })?;
+    Ok(Json(json!({ "ok": true, "policy": policy })))
+}
+
+fn mcp_oauth_timeout_secs(config: &Config, server_name: &str) -> u64 {
+    config
+        .mcp_servers
+        .get(server_name)
+        .and_then(|server| server.timeout_secs)
+        .unwrap_or_else(|| config.tool_timeout.as_secs())
+        .max(1)
+}
+
+async fn api_mcp_auth_start(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<McpServerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+    let config = state.config();
+    let Some(server) = config.mcp_servers.get(&request.server) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("Unknown MCP server: {}", request.server) })),
+        ));
+    };
+    if !server.enabled {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("MCP server '{}' is disabled", request.server) })),
+        ));
+    }
+    if server.effective_transport() != "streamable-http" {
+        return Ok(Json(json!({
+            "ok": false,
+            "error": "OAuth is only used for streamable-http MCP servers"
+        })));
+    }
+    let timeout_secs = mcp_oauth_timeout_secs(&config, &request.server);
+    let started =
+        tools::mcp::start_oauth_authorization(&request.server, server, config.port, timeout_secs)
+            .await
+            .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    Ok(Json(json!({
+        "ok": true,
+        "server": started.server,
+        "authorizationUrl": started.authorization_url,
+        "redirectUri": started.redirect_uri,
+        "clientId": started.client_id,
+        "scopes": started.scopes,
+    })))
+}
+
+async fn api_mcp_auth_callback_post(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<McpAuthCallbackRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+    let config = state.config();
+    let timeout_secs = mcp_oauth_timeout_secs(&config, &request.server);
+    let completed = tools::mcp::complete_oauth_authorization(
+        &request.server,
+        &request.code,
+        &request.state,
+        timeout_secs,
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    Ok(Json(json!({
+        "ok": true,
+        "server": request.server,
+        "expiresAt": completed.expires_at,
+        "scopes": completed.scopes,
+    })))
+}
+
+async fn api_mcp_auth_callback_get(
+    Query(query): Query<McpAuthCallbackQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    // OAuth authorization redirects often include an external Referer from the
+    // authorization server. The loopback Host plus OAuth state check is the
+    // boundary for this callback.
+    validate_loopback_host_header(&headers)?;
+    if let Some(error) = query.error {
+        let description = query.error_description.unwrap_or_default();
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            format!("MCP OAuth failed: {error} {description}"),
+        )
+            .into_response());
+    }
+    let code = query.code.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing code" })),
+        )
+    })?;
+    let oauth_state = query.state.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing state" })),
+        )
+    })?;
+    let config = state.config();
+    let timeout_secs = mcp_oauth_timeout_secs(&config, &query.server);
+    tools::mcp::complete_oauth_authorization(&query.server, code, oauth_state, timeout_secs)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    Ok("MCP OAuth authorization completed. You can close this window.".into_response())
+}
+
+async fn api_mcp_auth_disconnect(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<McpServerRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+    let config = state.config();
+    if let Some(server) = config.mcp_servers.get(&request.server) {
+        tools::mcp::terminate_http_sessions_for_server(&request.server, server).await;
+    }
+    let mut auth = tools::mcp::load_auth_state();
+    auth.servers.remove(&request.server);
+    tools::mcp::save_auth_state(&auth).map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        )
+    })?;
+    tools::mcp::clear_cached_runtime_state_for_server(&request.server);
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn api_mcp_resource_read(
+    Query(query): Query<SessionQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<McpResourceReadRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+    let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
+    let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
+    let workspace = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .map(|session| session.workspace.clone())
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": format!("Session '{}' not found", session_id) })),
+                )
+            })?
+    };
+    let config = state.config();
+    ensure_mcp_server_enabled_for_session(&config, &workspace, &request.server)?;
+    let result = tools::mcp::read_resource(&request.server, &request.uri, &config, &workspace)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    Ok(Json(json!({ "ok": true, "result": result })))
+}
+
+async fn api_mcp_prompt_get(
+    Query(query): Query<SessionQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<McpPromptGetRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+    let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
+    let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
+    let workspace = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .map(|session| session.workspace.clone())
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": format!("Session '{}' not found", session_id) })),
+                )
+            })?
+    };
+    let config = state.config();
+    ensure_mcp_server_enabled_for_session(&config, &workspace, &request.server)?;
+    let result = tools::mcp::get_prompt(
+        &request.server,
+        &request.name,
+        request.arguments,
+        &config,
+        &workspace,
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    Ok(Json(json!({ "ok": true, "result": result })))
+}
+
+fn ensure_mcp_server_enabled_for_session(
+    config: &Config,
+    workspace: &Path,
+    server_name: &str,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let Some(server) = config.mcp_servers.get(server_name) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("Unknown MCP server: {server_name}") })),
+        ));
+    };
+    if !server.enabled {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("MCP server '{server_name}' is disabled") })),
+        ));
+    }
+    let policy = tools::mcp::load_session_policy(workspace);
+    if policy.enabled_servers.contains(server_name) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": format!("MCP server '{server_name}' is not enabled for this session")
+            })),
+        ))
+    }
+}
+
 async fn api_todos(
     Query(query): Query<SessionQuery>,
     headers: HeaderMap,
@@ -4003,10 +4557,10 @@ async fn api_put_config(
         ws_send(&tx, &session_payload).await;
     }
 
-    // Invalidate cached MCP tool definitions so the next round picks up
-    // any server additions/removals.
-    let workspace = session_workspace_path(MAIN_SESSION_ID);
-    let _ = tools::mcp::refresh_servers(&state.config(), &workspace).await;
+    // Invalidate cached MCP runtime state so the next explicit catalog/agent
+    // round sees config changes without probing session-disabled servers during
+    // Settings Save.
+    tools::mcp::invalidate_runtime_state_without_remote_shutdown().await;
 
     Ok(Json(json!({"ok": true})))
 }
@@ -4121,12 +4675,20 @@ async fn api_test_model(
 
 /// POST /api/config/test-mcp — test an MCP server connection.
 async fn api_test_mcp(
+    Query(query): Query<SessionQuery>,
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_local_request_headers(&headers)?;
 
+    let server_name = body
+        .get("server")
+        .or_else(|| body.get("name"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("__test__");
     let command = body["command"].as_str().unwrap_or_default().to_string();
     let args: Vec<String> = body["args"]
         .as_array()
@@ -4148,20 +4710,83 @@ async fn api_test_mcp(
 
     let cwd = body["cwd"].as_str().map(|s| s.to_string());
 
-    if command.is_empty() {
+    let transport = body["transport"]
+        .as_str()
+        .map(str::trim)
+        .unwrap_or_default();
+    let url = body["url"].as_str().unwrap_or_default();
+    let effective_transport = if transport.is_empty() {
+        if !command.trim().is_empty() {
+            "stdio".to_string()
+        } else if !url.trim().is_empty() {
+            "streamable-http".to_string()
+        } else {
+            "stdio".to_string()
+        }
+    } else {
+        transport.to_ascii_lowercase()
+    };
+    if effective_transport != "stdio" && effective_transport != "streamable-http" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "transport must be stdio or streamable-http"})),
+        ));
+    }
+    if effective_transport == "stdio" && command.is_empty() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "command is required"})),
         ));
     }
+    if effective_transport == "streamable-http" && url.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "url is required"})),
+        ));
+    }
 
-    let workspace = session_workspace_path(MAIN_SESSION_ID);
+    let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
+    let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
+    let workspace = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .map(|session| session.workspace.clone())
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({ "error": format!("Session '{}' not found", session_id) })),
+                )
+            })?
+    };
+    let auth = body
+        .get("auth")
+        .filter(|value| !value.is_null())
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid auth config: {error}")})),
+            )
+        })?;
     let mcp_cfg = config::JsonMcpServerConfig {
+        transport: body["transport"].as_str().map(|s| s.to_string()),
         command,
+        url: body["url"].as_str().map(|s| s.to_string()),
         args,
         env,
+        headers: body["headers"]
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default(),
         cwd,
         enabled: true,
+        auth,
         timeout_secs,
     };
 
@@ -4169,7 +4794,7 @@ async fn api_test_mcp(
     let timeout = Duration::from_secs(timeout_secs.unwrap_or(config.tool_timeout.as_secs()));
     match tokio::time::timeout(
         timeout,
-        tools::mcp::test_mcp_server(&mcp_cfg, &workspace, config.tool_timeout),
+        tools::mcp::test_mcp_server(server_name, &mcp_cfg, &workspace, config.tool_timeout),
     )
     .await
     {
@@ -4539,6 +5164,16 @@ async fn main() {
             "/api/session-skills",
             get(api_session_skills).put(api_put_session_skills),
         )
+        .route("/api/mcp/catalog", get(api_mcp_catalog))
+        .route("/api/mcp/session-policy", put(api_put_mcp_session_policy))
+        .route("/api/mcp/auth/start", post(api_mcp_auth_start))
+        .route(
+            "/api/mcp/auth/callback",
+            get(api_mcp_auth_callback_get).post(api_mcp_auth_callback_post),
+        )
+        .route("/api/mcp/auth/disconnect", post(api_mcp_auth_disconnect))
+        .route("/api/mcp/resource/read", post(api_mcp_resource_read))
+        .route("/api/mcp/prompt/get", post(api_mcp_prompt_get))
         .route("/api/todos", put(api_todos))
         .route("/api/config", get(api_get_config).put(api_put_config))
         .route("/api/config/test-model", post(api_test_model))
