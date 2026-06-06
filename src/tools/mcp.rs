@@ -533,8 +533,12 @@ fn now_unix_secs() -> u64 {
 }
 
 fn reqwest_client_with_timeout(timeout_secs: u64) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(timeout_secs.max(1)))
+    let builder =
+        reqwest::Client::builder().connect_timeout(Duration::from_secs(timeout_secs.max(1)));
+    #[cfg(test)]
+    let builder = builder.no_proxy();
+
+    builder
         .build()
         .map_err(|error| format!("failed to build HTTP client: {error}"))
 }

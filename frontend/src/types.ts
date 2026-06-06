@@ -259,6 +259,51 @@ export interface AutoTraceEvent {
   compression?: CompressionOutcome;
 }
 
+export interface TaskPlanStep {
+  id: string;
+  title: string;
+  status: string;
+}
+
+export interface TaskPlanToolSuggestion {
+  name: string;
+  reason: string;
+  score?: number;
+  source?: string;
+}
+
+export interface TaskPlanAgentSuggestion {
+  name: string;
+  reason: string;
+  score?: number;
+}
+
+export interface TaskPlanVerificationSuggestion {
+  command: string;
+  reason: string;
+  confidence: string;
+  when: string;
+}
+
+export interface TaskPlanPayload {
+  goal: string;
+  intent: string;
+  steps: TaskPlanStep[];
+  openQuestions?: string[];
+  suggestedTools?: TaskPlanToolSuggestion[];
+  suggestedAgents?: TaskPlanAgentSuggestion[];
+  verificationSuggestions?: TaskPlanVerificationSuggestion[];
+  acceptanceCriteria?: string[];
+  status: string;
+}
+
+export interface TaskPlanEvent {
+  type: 'task_plan';
+  round: number;
+  cycle: number;
+  plan: TaskPlanPayload;
+}
+
 export interface UsageEvent {
   type: 'usage';
   daily_input_tokens?: number;
@@ -341,6 +386,7 @@ export type WebSocketMessage =
   | ThinkingDeltaEvent
   | ThinkingDoneEvent
   | AutoTraceEvent
+  | TaskPlanEvent
   | ContextCompressedEvent
   | ContextPrunedEvent
   | ContextCompressSkippedEvent

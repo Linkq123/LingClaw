@@ -28,7 +28,7 @@ use crate::{
     config::Config,
     context::{USAGE_ROLE_MEMORY, UsageUpdate, apply_usage_update, build_usage_labels},
     providers,
-    tools::ToolRankingContext,
+    tools::{ToolRankingContext, ToolRankingSource},
 };
 
 // ── Schema ──────────────────────────────────────────────────────────────────
@@ -1119,23 +1119,43 @@ pub(crate) fn task_tool_ranking_context(
     selected: &RetrievedTaskMemory,
     _intent: TaskIntent,
 ) -> ToolRankingContext {
-    let mut preferred_tools = Vec::new();
+    let mut ranking = ToolRankingContext::default();
 
     if remembered_command_hint(selected).is_some() {
-        preferred_tools.push("exec".to_string());
+        ranking.add_preference(
+            "exec",
+            "remembered command pattern",
+            4,
+            ToolRankingSource::Memory,
+        );
     }
     if remembered_file_anchor(selected).is_some() {
-        preferred_tools.push("read_file".to_string());
-        preferred_tools.push("search_files".to_string());
+        ranking.add_preference(
+            "read_file",
+            "remembered file anchor",
+            4,
+            ToolRankingSource::Memory,
+        );
+        ranking.add_preference(
+            "search_files",
+            "remembered file anchor",
+            4,
+            ToolRankingSource::Memory,
+        );
     }
     if remembered_url_anchor(selected).is_some() {
-        preferred_tools.push("http_fetch".to_string());
+        ranking.add_preference(
+            "http_fetch",
+            "remembered URL anchor",
+            4,
+            ToolRankingSource::Memory,
+        );
     }
     if !selected.open_loops.is_empty() {
-        preferred_tools.push("think".to_string());
+        ranking.add_preference("think", "open memory loop", 3, ToolRankingSource::Memory);
     }
 
-    ToolRankingContext { preferred_tools }
+    ranking
 }
 
 pub(crate) fn task_memory_resolution_anchors(selected: &RetrievedTaskMemory) -> Vec<String> {

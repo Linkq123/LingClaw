@@ -56,7 +56,7 @@ The runtime uses an explicit ReAct-style state machine:
 - `src/main.rs` — server entrypoint, Axum HTTP/WebSocket wiring, shared app types, local-request security checks, top-level live replay state
 - `src/runtime_loop.rs` — main Analyze/Act/Observe/Finish execution loop
 - `src/runtime_loop/socket_input.rs` — socket input handling while idle/busy
-- `src/agent.rs` — phase/state-machine logic, task intent, working state, finish heuristics, observation summarization
+- `src/agent.rs` — phase/state-machine logic, task intent, working state, ephemeral task plan rules, finish heuristics, observation summarization
 - `src/commands.rs` — slash command handlers like `/new`, `/status`, `/mcp`, `/memory`, `/reflection`
 - `src/todos.rs` — session-scoped todos validation, optimistic revision handling, and broadcast payloads
 - `src/providers.rs` — provider abstraction for OpenAI Chat Completions, OpenAI Responses, Anthropic, Ollama, and Gemini request/stream handling
@@ -84,7 +84,7 @@ Frontend source lives in `frontend/` and builds into `static/`, which the Rust s
 - `frontend/src/slashCommands.ts` — slash command catalog, normalization helpers, and autocomplete matching
 - `frontend/src/socket.ts` — connection lifecycle and reconnect behavior
 - `frontend/src/state.ts` — central UI state and DOM refs
-- `frontend/src/renderers/` — chat, todos, tools, reasoning, subagent, orchestration, and auto-trace panels
+- `frontend/src/renderers/` — chat, todos, tools, reasoning, subagent, orchestration, task-plan, and auto-trace panels
 - `frontend/src/renderers/todos.ts` — session-level todos panel and `/api/todos` persistence flow
 - `frontend/src/handlers/stream.ts` — streamed assistant/reasoning text handling
 - `frontend/src/pages/SettingsPage.tsx` and `frontend/src/pages/UsagePage.tsx` — React islands
@@ -102,6 +102,7 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 - The frontend session switcher lives in a collapsible left drawer; the Todos panel is a local visibility toggle and defaults to hidden on first load.
 - Slash command autocomplete is frontend-local UI on top of the existing `/...` command transport: incomplete prefixes can be completed via keyboard or mouse before dispatch.
 - Automatic context compression runs as a `BeforeAnalyze` hook in `src/hooks.rs`.
+- Each top-level Analyze cycle refreshes an ephemeral rule-based `TaskPlan`; it is injected as soft guidance, emitted as a `task_plan` live event, replayed on reconnect, and not persisted as a session message.
 - `/new` compresses the conversation into `memory/YYYY-MM-DD.md` and clears context; it does not create a new session.
 - `/clear` clears the current message context and todo items, while advancing the todos revision so stale in-flight writes cannot repopulate the list.
 - Skills are discovered from three layers: system (`docs/reference/skills/`), global (`~/.lingclaw/skills/`), and session-local (`skills/`).

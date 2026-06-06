@@ -917,6 +917,7 @@ fn render_ranked_tool_recommendations_respects_memory_preferences() {
         None,
         &ToolRankingContext {
             preferred_tools: vec!["exec".into(), "read_file".into(), "search_files".into()],
+            preferences: Vec::new(),
         },
     )
     .expect("memory-aware tool ranking should render");

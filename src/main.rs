@@ -642,6 +642,7 @@ struct LiveRoundState {
     auto_ready_to_finish: Option<bool>,
     auto_has_blocking_uncertainty: Option<bool>,
     latest_auto_trace: Option<agent::AutoThinkTrace>,
+    latest_task_plan: Option<serde_json::Value>,
     latest_compression: LiveCompressionState,
     has_pending_pre_start_context_updates: bool,
     has_observation: bool,
@@ -2294,6 +2295,7 @@ async fn dispatch_live_event(
                             auto_has_blocking_uncertainty: event["auto_has_blocking_uncertainty"]
                                 .as_bool(),
                             latest_auto_trace: None,
+                            latest_task_plan: None,
                             latest_compression,
                             has_pending_pre_start_context_updates: false,
                             has_observation: false,
@@ -2328,6 +2330,14 @@ async fn dispatch_live_event(
                 {
                     round.effective_think = Some(trace.selected_think.clone());
                     round.latest_auto_trace = Some(trace);
+                }
+            }
+            "task_plan" => {
+                if let Some(round) = live_rounds.get_mut(session_id)
+                    && round.connection_id == connection_id
+                    && !is_subagent_live_event(&event)
+                {
+                    round.latest_task_plan = Some(event.clone());
                 }
             }
             "context_compressed" | "context_compress_skipped" | "context_compress_failed" => {
@@ -2814,6 +2824,9 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
         ws_send(tx, &event).await;
     }
     ws_send(tx, &start_event).await;
+    if let Some(event) = live_round.latest_task_plan.as_ref() {
+        ws_send(tx, event).await;
+    }
     if let Some(trace) = live_round.latest_auto_trace.as_ref() {
         ws_send(tx, &trace.to_live_event()).await;
     }

@@ -154,6 +154,109 @@ fn task_intent_classifies_common_queries() {
 }
 
 #[test]
+fn task_plan_generation_matches_intent() {
+    let tools = vec![
+        "think".to_string(),
+        "search_files".to_string(),
+        "read_file".to_string(),
+        "patch_file".to_string(),
+        "exec".to_string(),
+    ];
+    let agents = vec!["backend-coder".to_string(), "reviewer".to_string()];
+
+    let mut state = seeded_state("fix MCP timeout handling in src/tools/mcp.rs");
+    let plan = build_task_plan(
+        &state,
+        Some("fix MCP timeout handling in src/tools/mcp.rs"),
+        &tools,
+        &agents,
+        &[],
+    );
+    assert_eq!(plan.intent, "change");
+    assert!(plan.steps.iter().any(|step| step.id == "change"));
+    assert!(
+        plan.suggested_tools
+            .iter()
+            .any(|tool| tool.name == "patch_file")
+    );
+    assert!(
+        plan.verification_suggestions
+            .iter()
+            .any(|item| item.command == "cargo test mcp")
+    );
+
+    state = seeded_state("diagnose why cargo test is timing out");
+    let plan = build_task_plan(
+        &state,
+        Some("diagnose why cargo test is timing out"),
+        &tools,
+        &agents,
+        &[],
+    );
+    assert_eq!(plan.intent, "investigate");
+    assert!(plan.suggested_tools.iter().any(|tool| tool.name == "exec"));
+}
+
+#[test]
+fn task_plan_updates_step_status_from_working_state() {
+    let tools = vec!["think".to_string(), "exec".to_string()];
+    let mut state = seeded_state("run cargo test mcp");
+    state
+        .completed_steps
+        .push("execution progress: run `cargo test mcp` via exec in 100ms (call c1).".to_string());
+    state.successful_execution_observed = true;
+    state.recompute_ready_to_finish();
+
+    let plan = build_task_plan(&state, Some("run cargo test mcp"), &tools, &[], &[]);
+    assert_eq!(plan.status, "ready");
+    assert!(
+        plan.steps
+            .iter()
+            .any(|step| step.id == "verify" && step.status == "completed")
+    );
+}
+
+#[test]
+fn task_plan_ranking_context_uses_plan_sources() {
+    let tools = vec![
+        "think".to_string(),
+        "search_files".to_string(),
+        "read_file".to_string(),
+        "exec".to_string(),
+    ];
+    let mut state = seeded_state("diagnose frontend typecheck failure");
+    state.uncertainties.push(UncertaintyItem {
+        topic: "exec failure".into(),
+        reason: "previous command failed".into(),
+        blocking: true,
+    });
+    let failed_exec = ToolResultEntry {
+        id: "c1".into(),
+        name: "exec".into(),
+        result: "npm run typecheck failed".into(),
+        duration_ms: 10,
+        is_error: true,
+        call_summary: Some("run `npm run typecheck`".into()),
+        trace: None,
+    };
+    let plan = build_task_plan(
+        &state,
+        Some("diagnose frontend typecheck failure"),
+        &tools,
+        &[],
+        &[failed_exec],
+    );
+    let ranking = task_plan_tool_ranking_context(&plan);
+    assert!(ranking.preferences.iter().any(|preference| {
+        preference.name == "read_file"
+            && preference.source == crate::tools::ToolRankingSource::RecentFailure
+    }));
+    assert!(ranking.preferences.iter().any(|preference| {
+        preference.name == "exec" && preference.source == crate::tools::ToolRankingSource::Plan
+    }));
+}
+
+#[test]
 fn seed_from_query_refreshes_goal_and_intent_for_new_intervention() {
     let mut state = seeded_state("what does config do?");
     state

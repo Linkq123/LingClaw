@@ -13,6 +13,13 @@ use crate::{ChatMessage, agent, tools};
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
 
+fn test_http_client() -> Client {
+    Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test HTTP client should build")
+}
+
 #[test]
 fn test_tool_permissions_basic() {
     let perms = ToolPermissions {
@@ -949,7 +956,10 @@ fn unique_temp_workspace(prefix: &str) -> PathBuf {
 fn mock_server_binary() -> &'static PathBuf {
     static BINARY: OnceLock<PathBuf> = OnceLock::new();
     BINARY.get_or_init(|| {
-        let helper_dir = std::env::temp_dir().join("lingclaw-subagent-mcp-test-helper");
+        let helper_dir = std::env::temp_dir().join(format!(
+            "lingclaw-subagent-mcp-test-helper-{}",
+            std::process::id()
+        ));
         fs::create_dir_all(&helper_dir).expect("helper dir should exist");
 
         let source_path = helper_dir.join("mock_mcp_server.rs");
@@ -1710,7 +1720,7 @@ async fn run_subagent_multi_read_only_batch_executes_after_tool_exec_hooks() {
     }));
 
     let (live_tx, _live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
-    let http = reqwest::Client::new();
+    let http = test_http_client();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
         "Read the file and list the directory.",
@@ -1776,7 +1786,7 @@ async fn run_subagent_emits_tool_result_event_for_completed_tool() {
     };
 
     let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
-    let http = reqwest::Client::new();
+    let http = test_http_client();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
         "Read notes.txt.",
@@ -1877,7 +1887,7 @@ async fn run_subagent_emits_tool_output_event_for_exec() {
     };
 
     let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
-    let http = reqwest::Client::new();
+    let http = test_http_client();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
         "Print a live marker.",
@@ -1980,7 +1990,7 @@ async fn run_subagent_history_snapshot_redacts_exec_arguments() {
     };
 
     let (live_tx, _live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
-    let http = reqwest::Client::new();
+    let http = test_http_client();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
         "Run the command.",
@@ -2052,7 +2062,7 @@ async fn run_subagent_forces_final_summary_after_tool_only_last_turn() {
     };
 
     let (live_tx, _live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
-    let http = reqwest::Client::new();
+    let http = test_http_client();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
         "Review notes.txt.",
@@ -2126,7 +2136,7 @@ async fn run_subagent_configured_openai_gateway_auto_disables_reasoning_controls
     };
 
     let (live_tx, _live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
-    let http = reqwest::Client::new();
+    let http = test_http_client();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
         "Center the modal and polish spacing.",
@@ -2210,7 +2220,7 @@ async fn run_subagent_sequential_tools_emit_interleaved_tool_events() {
     };
 
     let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
-    let http = reqwest::Client::new();
+    let http = test_http_client();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
         "Read notes.txt and echo sequential.",
@@ -2589,7 +2599,7 @@ async fn run_subagent_exec_respects_exec_timeout_before_subagent_deadline() {
         called: called.clone(),
     }));
 
-    let http = reqwest::Client::new();
+    let http = test_http_client();
     let workspace = std::env::temp_dir();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
@@ -2650,7 +2660,7 @@ async fn run_subagent_timeout_during_tool_exec_still_runs_after_tool_exec_hook()
         called: called.clone(),
     }));
 
-    let http = reqwest::Client::new();
+    let http = test_http_client();
     let workspace = std::env::temp_dir();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
@@ -2728,7 +2738,7 @@ async fn run_subagent_executes_mcp_tool_allowed_by_policy() {
     };
 
     let (live_tx, _live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
-    let http = reqwest::Client::new();
+    let http = test_http_client();
     let outcome = crate::subagents::executor::run_subagent(
         &spec,
         "Call the available read-only MCP tool.",
@@ -3156,7 +3166,7 @@ async fn test_execute_orchestration_cancelled_emits_skipped_events_for_remaining
     cancel.cancel();
     let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let workspace = std::env::temp_dir();
-    let http = reqwest::Client::new();
+    let http = test_http_client();
     let hooks = HookRegistry::new();
 
     let outcome = execute_orchestration(
@@ -3231,7 +3241,7 @@ Run the requested command.
     };
 
     let (live_tx, mut live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
-    let http = reqwest::Client::new();
+    let http = test_http_client();
     let hooks = HookRegistry::new();
     let outcome = execute_orchestration(
         &plan,
@@ -3318,7 +3328,7 @@ Run the requested command.
             execute_orchestration(
                 &plan,
                 &config,
-                &reqwest::Client::new(),
+                &test_http_client(),
                 &workspace,
                 &live_tx,
                 CancellationToken::new(),

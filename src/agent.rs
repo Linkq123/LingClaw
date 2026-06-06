@@ -584,6 +584,630 @@ pub(crate) fn render_task_state_for_prompt(state: &WorkingState) -> Option<Strin
     Some(format!("{}{}", crate::truncate(&rendered, keep), marker))
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TaskPlan {
+    pub goal: String,
+    pub intent: String,
+    pub steps: Vec<TaskPlanStep>,
+    pub open_questions: Vec<String>,
+    pub suggested_tools: Vec<TaskPlanToolSuggestion>,
+    pub suggested_agents: Vec<TaskPlanAgentSuggestion>,
+    pub verification_suggestions: Vec<TaskPlanVerificationSuggestion>,
+    pub acceptance_criteria: Vec<String>,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TaskPlanStep {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TaskPlanToolSuggestion {
+    pub name: String,
+    pub reason: String,
+    pub score: usize,
+    pub source: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TaskPlanAgentSuggestion {
+    pub name: String,
+    pub reason: String,
+    pub score: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TaskPlanVerificationSuggestion {
+    pub command: String,
+    pub reason: String,
+    pub confidence: String,
+    pub when: String,
+}
+
+const TASK_PLAN_PROMPT_CHAR_BUDGET: usize = 1_600;
+const TASK_PLAN_MAX_OPEN_QUESTIONS: usize = 3;
+const TASK_PLAN_MAX_TOOL_SUGGESTIONS: usize = 6;
+const TASK_PLAN_MAX_AGENT_SUGGESTIONS: usize = 3;
+const TASK_PLAN_MAX_VERIFICATION_SUGGESTIONS: usize = 5;
+
+pub(crate) fn build_task_plan(
+    state: &WorkingState,
+    current_query: Option<&str>,
+    available_tools: &[String],
+    available_agents: &[String],
+    recent_tool_history: &[ToolResultEntry],
+) -> TaskPlan {
+    let goal = state
+        .primary_goal
+        .clone()
+        .or_else(|| current_query.and_then(|query| sanitize_state_text(query, 180)))
+        .unwrap_or_else(|| "Respond to the current user request".to_string());
+    let intent = state.intent;
+    let mut plan = TaskPlan {
+        goal,
+        intent: task_intent_label(intent).to_string(),
+        steps: task_plan_steps(state),
+        open_questions: task_plan_open_questions(state),
+        suggested_tools: task_plan_tool_suggestions(
+            intent,
+            current_query,
+            available_tools,
+            recent_tool_history,
+        ),
+        suggested_agents: task_plan_agent_suggestions(intent, current_query, available_agents),
+        verification_suggestions: task_plan_verification_suggestions(
+            intent,
+            current_query,
+            state,
+            recent_tool_history,
+        ),
+        acceptance_criteria: task_plan_acceptance_criteria(intent),
+        status: if state.ready_to_finish {
+            "ready"
+        } else {
+            "active"
+        }
+        .to_string(),
+    };
+    plan.open_questions.truncate(TASK_PLAN_MAX_OPEN_QUESTIONS);
+    plan.suggested_tools
+        .truncate(TASK_PLAN_MAX_TOOL_SUGGESTIONS);
+    plan.suggested_agents
+        .truncate(TASK_PLAN_MAX_AGENT_SUGGESTIONS);
+    plan.verification_suggestions
+        .truncate(TASK_PLAN_MAX_VERIFICATION_SUGGESTIONS);
+    plan
+}
+
+pub(crate) fn render_task_plan_for_prompt(plan: &TaskPlan) -> Option<String> {
+    if plan.goal.trim().is_empty() {
+        return None;
+    }
+    let mut lines = vec![
+        "## Task Plan".to_string(),
+        "- Treat this as soft guidance; if evidence or blockers suggest a better route, adapt and explain the reason.".to_string(),
+        format!("- Goal: {}", plan.goal),
+        format!("- Intent: {}", plan.intent),
+        format!("- Status: {}", plan.status),
+    ];
+    if !plan.steps.is_empty() {
+        lines.push("- Steps:".to_string());
+        for step in &plan.steps {
+            lines.push(format!(
+                "  - [{}] {} ({})",
+                step.status, step.title, step.id
+            ));
+        }
+    }
+    if !plan.open_questions.is_empty() {
+        lines.push("- Open questions:".to_string());
+        for question in &plan.open_questions {
+            lines.push(format!("  - {question}"));
+        }
+    }
+    if !plan.suggested_tools.is_empty() {
+        lines.push("- Suggested tools:".to_string());
+        for tool in &plan.suggested_tools {
+            lines.push(format!(
+                "  - `{}`: {} (source {}, score {})",
+                tool.name, tool.reason, tool.source, tool.score
+            ));
+        }
+    }
+    if !plan.suggested_agents.is_empty() {
+        lines.push("- Suggested agents:".to_string());
+        for agent in &plan.suggested_agents {
+            lines.push(format!(
+                "  - `{}`: {} (score {})",
+                agent.name, agent.reason, agent.score
+            ));
+        }
+    }
+    if !plan.verification_suggestions.is_empty() {
+        lines.push(
+            "- Verification suggestions (do not run automatically; choose when useful):"
+                .to_string(),
+        );
+        for item in &plan.verification_suggestions {
+            lines.push(format!(
+                "  - `{}` [{} {}]: {}",
+                item.command, item.confidence, item.when, item.reason
+            ));
+        }
+    }
+    if !plan.acceptance_criteria.is_empty() {
+        lines.push("- Acceptance criteria:".to_string());
+        for item in &plan.acceptance_criteria {
+            lines.push(format!("  - {item}"));
+        }
+    }
+    let rendered = lines.join("\n");
+    if rendered.len() <= TASK_PLAN_PROMPT_CHAR_BUDGET {
+        return Some(rendered);
+    }
+    let marker = "\n*(task plan truncated)*";
+    let keep = TASK_PLAN_PROMPT_CHAR_BUDGET.saturating_sub(marker.len());
+    Some(format!("{}{}", crate::truncate(&rendered, keep), marker))
+}
+
+pub(crate) fn task_plan_tool_ranking_context(plan: &TaskPlan) -> crate::tools::ToolRankingContext {
+    let mut ranking = crate::tools::ToolRankingContext::default();
+    for tool in &plan.suggested_tools {
+        ranking.add_preference(
+            tool.name.clone(),
+            tool.reason.clone(),
+            tool.score,
+            crate::tools::ToolRankingSource::from_label(&tool.source),
+        );
+    }
+    for item in &plan.verification_suggestions {
+        ranking.add_preference(
+            "exec",
+            format!("verification suggestion: {}", item.command),
+            3,
+            crate::tools::ToolRankingSource::Plan,
+        );
+    }
+    ranking
+}
+
+fn task_intent_label(intent: TaskIntent) -> &'static str {
+    match intent {
+        TaskIntent::Inform => "inform",
+        TaskIntent::Change => "change",
+        TaskIntent::Investigate => "investigate",
+        TaskIntent::Execute => "execute",
+    }
+}
+
+fn task_plan_steps(state: &WorkingState) -> Vec<TaskPlanStep> {
+    let intent = state.intent;
+    let inspected = !state.evidence.is_empty() || !state.completed_steps.is_empty();
+    let changed = state.has_successful_change_trace();
+    let executed = state.has_successful_execution_trace();
+    let verified = state.completed_steps.iter().any(|step| {
+        step.to_ascii_lowercase().contains("test")
+            || step.to_ascii_lowercase().contains("build")
+            || step.to_ascii_lowercase().contains("check")
+    });
+    let mut steps = Vec::new();
+    steps.push(TaskPlanStep {
+        id: "inspect".to_string(),
+        title: match intent {
+            TaskIntent::Inform => "Gather enough context to answer accurately",
+            TaskIntent::Change => "Inspect the affected code and constraints",
+            TaskIntent::Investigate => "Reproduce or narrow the issue with focused evidence",
+            TaskIntent::Execute => "Identify the command, target, and success signal",
+        }
+        .to_string(),
+        status: if inspected { "completed" } else { "pending" }.to_string(),
+    });
+    if matches!(intent, TaskIntent::Change) {
+        steps.push(TaskPlanStep {
+            id: "change".to_string(),
+            title: "Apply the smallest coherent code or config change".to_string(),
+            status: if changed {
+                "completed"
+            } else if inspected {
+                "pending"
+            } else {
+                "blocked"
+            }
+            .to_string(),
+        });
+    }
+    if matches!(
+        intent,
+        TaskIntent::Execute | TaskIntent::Change | TaskIntent::Investigate
+    ) {
+        steps.push(TaskPlanStep {
+            id: "verify".to_string(),
+            title: "Validate the result with targeted checks".to_string(),
+            status: if verified {
+                "completed"
+            } else if executed || changed || inspected {
+                "pending"
+            } else {
+                "blocked"
+            }
+            .to_string(),
+        });
+    }
+    steps.push(TaskPlanStep {
+        id: "finish".to_string(),
+        title: "Summarize outcome, evidence, and any remaining risk".to_string(),
+        status: if state.ready_to_finish {
+            "ready"
+        } else {
+            "pending"
+        }
+        .to_string(),
+    });
+    steps
+}
+
+fn task_plan_open_questions(state: &WorkingState) -> Vec<String> {
+    state
+        .open_questions
+        .iter()
+        .cloned()
+        .chain(
+            state
+                .uncertainties
+                .iter()
+                .filter(|item| item.blocking)
+                .map(|item| format!("{}: {}", item.topic, item.reason)),
+        )
+        .filter_map(|item| sanitize_state_text(&item, WORKING_STATE_MAX_TEXT_CHARS))
+        .collect()
+}
+
+fn task_plan_tool_suggestions(
+    intent: TaskIntent,
+    current_query: Option<&str>,
+    available_tools: &[String],
+    recent_tool_history: &[ToolResultEntry],
+) -> Vec<TaskPlanToolSuggestion> {
+    let mut suggestions = Vec::new();
+    let query = current_query.unwrap_or_default().to_ascii_lowercase();
+    let mut push = |name: &str, reason: &str, score: usize, source: &str| {
+        if !available_tools
+            .iter()
+            .any(|tool| tool.eq_ignore_ascii_case(name))
+        {
+            return;
+        }
+        if let Some(existing) = suggestions
+            .iter_mut()
+            .find(|item: &&mut TaskPlanToolSuggestion| item.name.eq_ignore_ascii_case(name))
+        {
+            if source == "recent_failure" {
+                existing.reason = reason.to_string();
+                existing.score = existing.score.max(score);
+                existing.source = source.to_string();
+            }
+            return;
+        }
+        suggestions.push(TaskPlanToolSuggestion {
+            name: name.to_string(),
+            reason: reason.to_string(),
+            score,
+            source: source.to_string(),
+        });
+    };
+    push(
+        "think",
+        "Keep the next action explicit before using tools",
+        2,
+        "intent",
+    );
+    match intent {
+        TaskIntent::Inform => {
+            push(
+                "search_files",
+                "Find relevant local context before answering",
+                4,
+                "intent",
+            );
+            push(
+                "read_file",
+                "Read the strongest matching source directly",
+                4,
+                "intent",
+            );
+            if contains_any(&query, &["http", "https", "docs", "官方", "latest", "最新"]) {
+                push(
+                    "http_fetch",
+                    "Verify referenced external material",
+                    3,
+                    "query",
+                );
+            }
+        }
+        TaskIntent::Change => {
+            push(
+                "search_files",
+                "Locate affected code and tests",
+                5,
+                "intent",
+            );
+            push(
+                "read_file",
+                "Inspect current implementation before editing",
+                5,
+                "intent",
+            );
+            push("patch_file", "Apply a scoped change", 4, "intent");
+            push(
+                "exec",
+                "Run targeted verification when the change is ready",
+                4,
+                "intent",
+            );
+        }
+        TaskIntent::Investigate => {
+            push(
+                "search_files",
+                "Find likely owners and error paths",
+                5,
+                "intent",
+            );
+            push(
+                "read_file",
+                "Inspect evidence instead of guessing",
+                5,
+                "intent",
+            );
+            push(
+                "exec",
+                "Reproduce or validate the suspected failure",
+                4,
+                "intent",
+            );
+            if contains_any(&query, &["http", "https", "docs", "官方", "latest", "最新"]) {
+                push(
+                    "http_fetch",
+                    "Check external docs or referenced URLs",
+                    3,
+                    "query",
+                );
+            }
+        }
+        TaskIntent::Execute => {
+            push(
+                "exec",
+                "Execute the requested command or verification",
+                5,
+                "intent",
+            );
+            push(
+                "read_file",
+                "Read config or scripts when command context is unclear",
+                3,
+                "intent",
+            );
+        }
+    }
+    for result in recent_tool_history
+        .iter()
+        .rev()
+        .filter(|result| result.is_error)
+        .take(2)
+    {
+        match result.name.as_str() {
+            "exec" => push(
+                "read_file",
+                "Recent exec failed; inspect config or scripts before retrying",
+                4,
+                "recent_failure",
+            ),
+            "read_file" => push(
+                "search_files",
+                "Recent read failed; search for the correct path",
+                4,
+                "recent_failure",
+            ),
+            _ => push(
+                "think",
+                "Recent tool failure needs a revised approach",
+                3,
+                "recent_failure",
+            ),
+        }
+    }
+    suggestions.sort_by(|a, b| b.score.cmp(&a.score).then(a.name.cmp(&b.name)));
+    suggestions
+}
+
+fn task_plan_agent_suggestions(
+    intent: TaskIntent,
+    current_query: Option<&str>,
+    available_agents: &[String],
+) -> Vec<TaskPlanAgentSuggestion> {
+    let query = current_query.unwrap_or_default().to_ascii_lowercase();
+    let mut suggestions = Vec::new();
+    for agent in available_agents {
+        let lower = agent.to_ascii_lowercase();
+        let score = match intent {
+            TaskIntent::Inform if contains_any(&lower, &["research", "explore", "review"]) => 3,
+            TaskIntent::Change if contains_any(&lower, &["coder", "backend", "frontend"]) => 4,
+            TaskIntent::Investigate if contains_any(&lower, &["review", "explore", "research"]) => {
+                4
+            }
+            TaskIntent::Execute if contains_any(&lower, &["coder", "general"]) => 2,
+            _ => 0,
+        } + usize::from(!query.is_empty() && query.contains(&lower));
+        if score > 0 {
+            suggestions.push(TaskPlanAgentSuggestion {
+                name: agent.clone(),
+                reason: "Agent specialization appears relevant to the task intent".to_string(),
+                score,
+            });
+        }
+    }
+    suggestions.sort_by(|a, b| b.score.cmp(&a.score).then(a.name.cmp(&b.name)));
+    suggestions
+}
+
+fn task_plan_verification_suggestions(
+    intent: TaskIntent,
+    current_query: Option<&str>,
+    state: &WorkingState,
+    recent_tool_history: &[ToolResultEntry],
+) -> Vec<TaskPlanVerificationSuggestion> {
+    if matches!(intent, TaskIntent::Inform) {
+        return Vec::new();
+    }
+    let signals = task_plan_observed_signal_text(current_query, state, recent_tool_history);
+    let lower = signals.to_ascii_lowercase();
+    let mut items = Vec::new();
+    if contains_any(
+        &lower,
+        &["src/", "src\\", "cargo", "rust", ".rs", "cargo.toml", "mcp"],
+    ) {
+        push_task_plan_verification_suggestion(
+            &mut items,
+            "cargo fmt --check",
+            "Rust code or Cargo metadata appears relevant",
+            "high",
+            "before_finish",
+        );
+        if lower.contains("mcp") {
+            push_task_plan_verification_suggestion(
+                &mut items,
+                "cargo test mcp",
+                "MCP behavior appears relevant",
+                "high",
+                "before_finish",
+            );
+        } else {
+            push_task_plan_verification_suggestion(
+                &mut items,
+                "cargo test",
+                "Rust behavior appears relevant",
+                "medium",
+                "before_finish",
+            );
+        }
+    }
+    if contains_any(
+        &lower,
+        &["frontend/", "frontend\\", ".tsx", ".ts", "npm", "vitest"],
+    ) {
+        push_task_plan_verification_suggestion(
+            &mut items,
+            "npm run typecheck",
+            "Frontend TypeScript appears relevant",
+            "high",
+            "before_finish",
+        );
+        push_task_plan_verification_suggestion(
+            &mut items,
+            "npm test",
+            "Frontend behavior appears relevant",
+            "medium",
+            "before_finish",
+        );
+    }
+    if contains_any(
+        &lower,
+        &["readme", "docs/", "docs\\", ".md", ".json", "config"],
+    ) {
+        push_task_plan_verification_suggestion(
+            &mut items,
+            "git diff --check",
+            "Docs or config text changed or was inspected",
+            "medium",
+            "before_finish",
+        );
+    }
+    if items.is_empty() && matches!(intent, TaskIntent::Change | TaskIntent::Execute) {
+        push_task_plan_verification_suggestion(
+            &mut items,
+            "git diff --check",
+            "Check for whitespace or patch formatting issues",
+            "low",
+            "before_finish",
+        );
+    }
+    items
+}
+
+fn push_task_plan_verification_suggestion(
+    items: &mut Vec<TaskPlanVerificationSuggestion>,
+    command: &str,
+    reason: &str,
+    confidence: &str,
+    when: &str,
+) {
+    if items.iter().any(|item| item.command == command) {
+        return;
+    }
+    items.push(TaskPlanVerificationSuggestion {
+        command: command.to_string(),
+        reason: reason.to_string(),
+        confidence: confidence.to_string(),
+        when: when.to_string(),
+    });
+}
+
+fn task_plan_observed_signal_text(
+    current_query: Option<&str>,
+    state: &WorkingState,
+    recent_tool_history: &[ToolResultEntry],
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(query) = current_query {
+        parts.push(query.to_string());
+    }
+    if let Some(goal) = state.primary_goal.as_ref() {
+        parts.push(goal.clone());
+    }
+    parts.extend(state.completed_steps.iter().cloned());
+    parts.extend(state.evidence.iter().map(|item| item.claim.clone()));
+    parts.extend(state.open_questions.iter().cloned());
+    parts.extend(
+        state
+            .uncertainties
+            .iter()
+            .map(|item| format!("{} {}", item.topic, item.reason)),
+    );
+    for result in recent_tool_history {
+        parts.push(result.name.clone());
+        if let Some(summary) = result.trace_summary() {
+            parts.push(summary.to_string());
+        }
+        parts.push(crate::truncate(&result.result, 400));
+    }
+    parts.join(" ")
+}
+
+fn task_plan_acceptance_criteria(intent: TaskIntent) -> Vec<String> {
+    match intent {
+        TaskIntent::Inform => vec![
+            "Answer directly with the evidence or assumptions used.".to_string(),
+            "Call out uncertainty if the available context is incomplete.".to_string(),
+        ],
+        TaskIntent::Change => vec![
+            "The change is scoped to the requested behavior.".to_string(),
+            "Relevant verification commands are suggested or run before finishing.".to_string(),
+            "The final response states files changed and residual risk.".to_string(),
+        ],
+        TaskIntent::Investigate => vec![
+            "The final answer identifies likely cause or narrowed hypotheses.".to_string(),
+            "Evidence and failed paths are clearly separated.".to_string(),
+        ],
+        TaskIntent::Execute => vec![
+            "The requested command or workflow outcome is reported.".to_string(),
+            "Errors include the next actionable recovery step.".to_string(),
+        ],
+    }
+}
+
 fn contains_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| text.contains(needle))
 }

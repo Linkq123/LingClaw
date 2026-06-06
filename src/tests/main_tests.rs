@@ -8308,6 +8308,38 @@ fn replay_live_round_rehydrates_inflight_round_state() {
         &session_id,
         1,
         json!({
+            "type": "task_plan",
+            "round": 3,
+            "cycle": 2,
+            "plan": {
+                "goal": "Investigate timeout loop",
+                "intent": "investigate",
+                "steps": [
+                    {"id": "inspect", "title": "Inspect relevant code", "status": "pending"}
+                ],
+                "openQuestions": [],
+                "suggestedTools": [
+                    {"name": "read_file", "reason": "Inspect evidence", "score": 5, "source": "intent"}
+                ],
+                "suggestedAgents": [],
+                "verificationSuggestions": [
+                    {
+                        "command": "cargo test runtime_loop",
+                        "reason": "Runtime loop behavior changed",
+                        "confidence": "high",
+                        "when": "before_finish"
+                    }
+                ],
+                "acceptanceCriteria": ["Relevant tests pass"],
+                "status": "active"
+            }
+        }),
+    ));
+    rt.block_on(dispatch_live_event(
+        &state,
+        &session_id,
+        1,
+        json!({
             "type": "auto_trace",
             "round": 3,
             "cycle": 2,
@@ -8404,7 +8436,7 @@ fn replay_live_round_rehydrates_inflight_round_state() {
 
     rt.block_on(finish_session_replay(&state, &session_id, 1));
 
-    for _ in 0..9 {
+    for _ in 0..10 {
         let _ = rt
             .block_on(async { tokio::time::timeout(Duration::from_secs(2), bound_rx.recv()).await })
             .expect("bound replay event should arrive before timeout")
@@ -8414,7 +8446,7 @@ fn replay_live_round_rehydrates_inflight_round_state() {
     let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
     rt.block_on(replay_live_round(&replay_tx, &state, &session_id));
 
-    let replayed = (0..9)
+    let replayed = (0..10)
         .map(|_| {
             let raw = rt
                 .block_on(async {
@@ -8432,29 +8464,37 @@ fn replay_live_round_rehydrates_inflight_round_state() {
     assert_eq!(replayed[0]["phase"], "act");
     assert_eq!(replayed[0]["cycle"], 2);
     assert_eq!(replayed[0]["react_visible"], true);
-    assert_eq!(replayed[1]["type"], "auto_trace");
-    assert_eq!(replayed[1]["selected_think"], "high");
-    assert_eq!(replayed[1]["baseline_reason"], "mid_loop_investigate");
-    assert_eq!(replayed[1]["signals"]["intent"], "investigate");
+    assert_eq!(replayed[1]["type"], "task_plan");
+    assert_eq!(replayed[1]["round"], 3);
+    assert_eq!(replayed[1]["cycle"], 2);
+    assert_eq!(replayed[1]["plan"]["goal"], "Investigate timeout loop");
+    assert_eq!(
+        replayed[1]["plan"]["verificationSuggestions"][0]["command"],
+        "cargo test runtime_loop"
+    );
+    assert_eq!(replayed[2]["type"], "auto_trace");
+    assert_eq!(replayed[2]["selected_think"], "high");
+    assert_eq!(replayed[2]["baseline_reason"], "mid_loop_investigate");
+    assert_eq!(replayed[2]["signals"]["intent"], "investigate");
     assert!(
-        replayed[1]["signals"]
+        replayed[2]["signals"]
             .get("finish_deferral_count")
             .is_none()
     );
-    assert_eq!(replayed[2]["type"], "thinking_start");
-    assert_eq!(replayed[3]["type"], "thinking_delta");
-    assert_eq!(replayed[3]["content"], "step-1");
-    assert_eq!(replayed[4]["type"], "thinking_done");
-    assert_eq!(replayed[5]["type"], "tool_call");
-    assert_eq!(replayed[5]["id"], "tool-1");
-    assert_eq!(replayed[6]["type"], "tool_output");
+    assert_eq!(replayed[3]["type"], "thinking_start");
+    assert_eq!(replayed[4]["type"], "thinking_delta");
+    assert_eq!(replayed[4]["content"], "step-1");
+    assert_eq!(replayed[5]["type"], "thinking_done");
+    assert_eq!(replayed[6]["type"], "tool_call");
     assert_eq!(replayed[6]["id"], "tool-1");
-    assert!(replayed[6].get("stream").is_none());
-    assert_eq!(replayed[6]["chunk"], "\n[stderr]\npartial output");
-    assert_eq!(replayed[7]["type"], "tool_result");
-    assert_eq!(replayed[7]["result"], "file contents");
-    assert_eq!(replayed[8]["type"], "delta");
-    assert_eq!(replayed[8]["content"], "final answer");
+    assert_eq!(replayed[7]["type"], "tool_output");
+    assert_eq!(replayed[7]["id"], "tool-1");
+    assert!(replayed[7].get("stream").is_none());
+    assert_eq!(replayed[7]["chunk"], "\n[stderr]\npartial output");
+    assert_eq!(replayed[8]["type"], "tool_result");
+    assert_eq!(replayed[8]["result"], "file contents");
+    assert_eq!(replayed[9]["type"], "delta");
+    assert_eq!(replayed[9]["content"], "final answer");
 
     rt.block_on(dispatch_live_event(
         &state,
@@ -11658,6 +11698,7 @@ fn dispatch_live_event_allows_live_round_source_after_run_teardown() {
                 auto_ready_to_finish: None,
                 auto_has_blocking_uncertainty: None,
                 latest_auto_trace: None,
+                latest_task_plan: None,
                 latest_compression: LiveCompressionState::default(),
                 has_pending_pre_start_context_updates: false,
                 has_observation: false,

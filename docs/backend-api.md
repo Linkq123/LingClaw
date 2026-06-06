@@ -22,7 +22,7 @@
 后端暴露两类接口：
 
 - HTTP：健康检查、session 摘要、session 系统 Skills 开关、session MCP 权限与 catalog、配置读写、todos、模型与 MCP 联通性测试、Usage、图片上传、优雅关停
-- WebSocket：聊天主通道，承载流式回复、工具事件、推理事件、子代理事件、编排事件
+- WebSocket：聊天主通道，承载流式回复、工具事件、推理事件、临时任务计划、子代理事件、编排事件
 
 ## 2. 访问与鉴权约束
 
@@ -1550,6 +1550,57 @@ ws://127.0.0.1:18989/ws?session=research-notes
 - `selected_think` 为最终发送给模型的思维级别；若 `BeforeLlmCall` Hook 覆盖了 think，trace 会直接反映覆盖后的值，并在 `clamps` 中加入 `hook_think_override`
 - `baseline_*` 描述本轮 runtime auto policy 在未叠加 escalator / dampener / clamp 之前的基线判断
 - `signals` 是用于 auto-think 决策的实时输入快照，也是 `/status` 中 `auto_signals` / `auto_decision` 摘要的来源；其中 `ready_to_finish` / `has_blocking_uncertainty` 现在是 advisory signals，不直接决定主循环是否 finish
+
+### `task_plan`
+
+当前顶层主代理 round/cycle 的临时任务计划。该事件由规则生成，不调用 LLM；输入包括当前用户请求、运行期 `WorkingState`、任务记忆、最近工具结果、已发现子代理以及当前 session policy 允许的内置/MCP 工具。`task_plan` 进入 live replay，刷新或重连后会恢复当前计划面板；它不会写入 session messages，也不会自动执行其中的验证命令。
+
+```json
+{
+  "type": "task_plan",
+  "round": 3,
+  "cycle": 1,
+  "plan": {
+    "goal": "Fix MCP timeout handling",
+    "intent": "change",
+    "steps": [
+      {
+        "id": "inspect",
+        "title": "Inspect relevant code",
+        "status": "pending"
+      }
+    ],
+    "openQuestions": [],
+    "suggestedTools": [
+      {
+        "name": "read_file",
+        "reason": "Inspect current implementation before editing",
+        "score": 5,
+        "source": "intent"
+      }
+    ],
+    "suggestedAgents": [],
+    "verificationSuggestions": [
+      {
+        "command": "cargo test mcp",
+        "reason": "MCP behavior appears relevant",
+        "confidence": "high",
+        "when": "before_finish"
+      }
+    ],
+    "acceptanceCriteria": ["Relevant tests pass"],
+    "status": "active"
+  }
+}
+```
+
+字段说明：
+
+- `intent` 取值为 `inform`、`change`、`investigate` 或 `execute`
+- `steps[].status` 是运行期软状态，例如 `pending`、`done`、`ready`
+- `suggestedTools[].source` 可为 `query`、`memory`、`plan`、`recent_failure`、`intent`；MCP 工具只会来自当前 session policy 已启用集合
+- `verificationSuggestions[]` 只表示建议模型在合适时机选择执行，runtime 不会自动运行、弹确认或改变工具权限模型
+- `status` 为当前计划状态，通常为 `active` 或 `ready`；收到 `done` 后前端可将面板标记为 complete/stale
 
 ### `delta`
 

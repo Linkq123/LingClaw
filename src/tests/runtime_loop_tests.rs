@@ -1378,6 +1378,7 @@ async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
@@ -1490,6 +1491,7 @@ fn phase_state_for_analyze_test() -> AgentPhaseState {
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
@@ -1632,6 +1634,7 @@ async fn run_analyze_phase_emits_start_then_auto_trace_for_auto_rounds() {
     assert!(matches!(control, AgentPhaseControl::Break));
 
     let start = live_rx.recv().await.expect("start event should be emitted");
+    let task_plan = live_rx.recv().await.expect("task plan should follow");
     let auto_trace = live_rx.recv().await.expect("auto trace should follow");
     let error = live_rx
         .recv()
@@ -1639,6 +1642,9 @@ async fn run_analyze_phase_emits_start_then_auto_trace_for_auto_rounds() {
         .expect("budget error should stop the round");
 
     assert_eq!(start["type"].as_str(), Some("start"));
+    assert_eq!(task_plan["type"].as_str(), Some("task_plan"));
+    assert_eq!(task_plan["round"].as_u64(), Some(1));
+    assert_eq!(task_plan["cycle"].as_u64(), Some(0));
     assert_eq!(auto_trace["type"].as_str(), Some("auto_trace"));
     assert_eq!(auto_trace["round"].as_u64(), Some(1));
     assert_eq!(auto_trace["cycle"].as_u64(), Some(0));
@@ -1705,6 +1711,7 @@ async fn run_analyze_phase_emits_post_hook_think_in_auto_trace() {
     assert!(matches!(control, AgentPhaseControl::Break));
 
     let start = live_rx.recv().await.expect("start event should be emitted");
+    let task_plan = live_rx.recv().await.expect("task plan should follow");
     let auto_trace = live_rx.recv().await.expect("auto trace should follow");
     let error = live_rx
         .recv()
@@ -1713,6 +1720,7 @@ async fn run_analyze_phase_emits_post_hook_think_in_auto_trace() {
 
     assert_eq!(start["type"].as_str(), Some("start"));
     assert_eq!(start["think_level"].as_str(), Some("off"));
+    assert_eq!(task_plan["type"].as_str(), Some("task_plan"));
     assert_eq!(auto_trace["type"].as_str(), Some("auto_trace"));
     assert_eq!(auto_trace["selected_think"].as_str(), Some("off"));
     assert!(auto_trace["clamps"].as_array().is_some_and(|clamps| {
@@ -2172,6 +2180,7 @@ async fn run_analyze_phase_emits_context_pruned_after_before_analyze_compression
         .expect("compression event should be emitted");
     let pruned = live_rx.recv().await.expect("prune event should be emitted");
     let start = live_rx.recv().await.expect("start event should be emitted");
+    let task_plan = live_rx.recv().await.expect("task plan should follow start");
     let auto_trace = live_rx.recv().await.expect("auto trace should be emitted");
     let error = live_rx
         .recv()
@@ -2186,6 +2195,7 @@ async fn run_analyze_phase_emits_context_pruned_after_before_analyze_compression
     assert!(compressed["compression_ratio"].as_u64().is_some());
     assert_eq!(pruned["type"].as_str(), Some("context_pruned"));
     assert_eq!(start["type"].as_str(), Some("start"));
+    assert_eq!(task_plan["type"].as_str(), Some("task_plan"));
     assert_eq!(auto_trace["type"].as_str(), Some("auto_trace"));
     assert!(pruned["messages_removed"].as_u64().unwrap_or(0) > 0);
     assert_eq!(error["type"].as_str(), Some("error"));
@@ -2235,6 +2245,7 @@ async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections(
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
@@ -2366,6 +2377,7 @@ async fn prepare_analyze_snapshot_preserves_todos_when_optional_sections_overflo
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
@@ -2480,6 +2492,7 @@ async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
@@ -2614,6 +2627,7 @@ async fn update_working_state_keeps_results_attached_to_their_original_query() {
         }],
         results_origin_query: Some("inspect the timeout wiring".into()),
         working_state: agent::WorkingState::default(),
+        task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
@@ -2718,6 +2732,7 @@ async fn update_working_state_reuses_same_cycle_task_memory_selection() {
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
@@ -2879,6 +2894,7 @@ async fn update_working_state_refreshes_task_memory_after_state_changes() {
         }],
         results_origin_query: Some("inspect the entrypoint wiring".into()),
         working_state: agent::WorkingState::default(),
+        task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
@@ -2964,6 +2980,7 @@ async fn prepare_analyze_snapshot_injects_fresh_task_state_each_time() {
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
@@ -3120,6 +3137,7 @@ async fn prepare_analyze_snapshot_injects_retrieved_task_memory() {
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
@@ -3227,6 +3245,7 @@ async fn prepare_analyze_snapshot_injects_agent_recommendations_and_delegation_g
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,
@@ -3372,6 +3391,7 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,

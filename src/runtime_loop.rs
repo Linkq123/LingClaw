@@ -199,6 +199,7 @@ struct AgentPhaseState {
     collected_results: Vec<agent::ToolResultEntry>,
     results_origin_query: Option<String>,
     working_state: agent::WorkingState,
+    task_plan: Option<agent::TaskPlan>,
     retrieved_task_memory: Option<memory::RetrievedTaskMemory>,
     retrieved_task_memory_key: Option<String>,
     retrieved_task_memory_cycle: Option<usize>,
@@ -694,6 +695,19 @@ async fn prepare_analyze_snapshot(
         false,
     );
     let discovered_agents = crate::subagents::discovery::discover_all_agents(&session.workspace);
+    let available_tools = available_tool_names_for_plan(&config, &session.workspace);
+    let available_agent_names = discovered_agents
+        .iter()
+        .map(|agent| agent.name.clone())
+        .collect::<Vec<_>>();
+    let task_plan = agent::build_task_plan(
+        &phase_state.working_state,
+        latest_query.as_deref(),
+        &available_tools,
+        &available_agent_names,
+        &phase_state.recent_tool_history,
+    );
+    phase_state.task_plan = Some(task_plan.clone());
 
     // Dynamic context injections into the system prompt:
     // - Required session state that must survive optional-context truncation
@@ -711,6 +725,10 @@ async fn prepare_analyze_snapshot(
         );
         if let Some(task_state) = agent::render_task_state_for_prompt(&phase_state.working_state) {
             let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &task_state);
+        }
+        if let Some(task_plan_prompt) = agent::render_task_plan_for_prompt(&task_plan) {
+            let _ =
+                append_dynamic_prompt_section(content, &mut remaining_budget, &task_plan_prompt);
         }
         if let Some(task_memory) =
             phase_state
@@ -741,8 +759,18 @@ async fn prepare_analyze_snapshot(
             .retrieved_task_memory
             .as_ref()
             .and_then(|selection| {
-                let ranking =
-                    memory::task_tool_ranking_context(selection, phase_state.working_state.intent);
+                let ranking = merge_tool_rankings(
+                    memory::task_tool_ranking_context(selection, phase_state.working_state.intent),
+                    agent::task_plan_tool_ranking_context(&task_plan),
+                );
+                tools::render_ranked_tool_recommendations(
+                    config.as_ref(),
+                    latest_query.as_deref(),
+                    &ranking,
+                )
+            })
+            .or_else(|| {
+                let ranking = agent::task_plan_tool_ranking_context(&task_plan);
                 tools::render_ranked_tool_recommendations(
                     config.as_ref(),
                     latest_query.as_deref(),
@@ -933,6 +961,51 @@ async fn build_cycle_tools(
 ) -> Vec<serde_json::Value> {
     let config = ctx.state.config();
     build_runtime_tools(&config, resolved.provider, &phase_state.cycle_workspace).await
+}
+
+fn available_tool_names_for_plan(config: &Config, workspace: &Path) -> Vec<String> {
+    let mut names = tools::tool_specs()
+        .iter()
+        .map(|spec| spec.name.to_string())
+        .collect::<Vec<_>>();
+    let agents = crate::subagents::discovery::discover_all_agents(workspace);
+    if !agents.is_empty() {
+        names.push(tools::TOOL_NAME_TASK.to_string());
+        names.push(tools::TOOL_NAME_ORCHESTRATE.to_string());
+    }
+    let mcp_policy = tools::mcp::load_session_policy(workspace);
+    names.extend(
+        tools::mcp::cached_list_tools_for_policy(config, workspace, &mcp_policy)
+            .into_iter()
+            .map(|tool| tool.exposed_name),
+    );
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn merge_tool_rankings(
+    mut base: tools::ToolRankingContext,
+    extra: tools::ToolRankingContext,
+) -> tools::ToolRankingContext {
+    for preference in extra.preferences {
+        base.add_preference(
+            preference.name,
+            preference.reason,
+            preference.score,
+            preference.source,
+        );
+    }
+    for preferred in extra.preferred_tools {
+        if !base
+            .preferred_tools
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&preferred))
+        {
+            base.preferred_tools.push(preferred);
+        }
+    }
+    base
 }
 
 pub(crate) async fn build_runtime_tools(
@@ -2593,6 +2666,20 @@ async fn run_analyze_phase(
     if !live_send(ctx.live_tx, start_event).await {
         return AgentPhaseControl::Break;
     }
+    if let Some(task_plan) = phase_state.task_plan.as_ref()
+        && !live_send(
+            ctx.live_tx,
+            json!({
+                "type": "task_plan",
+                "round": phase_state.round + 1,
+                "cycle": phase_state.react_ctx.cycles,
+                "plan": task_plan,
+            }),
+        )
+        .await
+    {
+        return AgentPhaseControl::Break;
+    }
     if let Some(auto_trace) = auto_decision.clone().map(|decision| {
         decision.into_trace_with_selected_think(
             phase_state.round + 1,
@@ -3278,6 +3365,7 @@ pub(crate) async fn run_agent_session(
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
         retrieved_task_memory_cycle: None,

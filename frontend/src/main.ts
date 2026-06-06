@@ -127,6 +127,11 @@ import {
   updateAutoDebugToggleButton,
 } from './renderers/auto-trace.js';
 import {
+  applyTaskPlan,
+  finishTaskPlanPanel,
+  supersedeTaskPlanPanel,
+} from './renderers/task-plan.js';
+import {
   initSessionDrawer,
   renderSessionDrawer,
   toggleSessionDrawerExpanded,
@@ -706,6 +711,7 @@ function handleMessage(data) {
       if (data.subagent) break;
       clearCompressionOutcomeForNewRound(data.cycle);
       clearActiveAutoTrace();
+      supersedeTaskPlanPanel(data.round, data.cycle);
       const isNewTurn = !state.busy || state.currentRoundStartedAt === 0;
       setBusy(true);
       if (isNewTurn) {
@@ -722,6 +728,10 @@ function handleMessage(data) {
 
     case 'auto_trace':
       applyTopLevelAutoTrace(data);
+      break;
+
+    case 'task_plan':
+      applyTaskPlan(data);
       break;
 
     case 'context_compressed':
@@ -782,6 +792,7 @@ function handleMessage(data) {
         }
       }
       requestClearReactStatus();
+      finishTaskPlanPanel();
       state.reasoningPanel = null;
       if (data.daily_input_tokens != null) {
         state.dailyInputTokens = data.daily_input_tokens;

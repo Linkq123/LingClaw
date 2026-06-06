@@ -86,7 +86,8 @@ fn unique_temp_workspace(prefix: &str) -> PathBuf {
 fn mock_server_binary() -> &'static PathBuf {
     static BINARY: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     BINARY.get_or_init(|| {
-        let helper_dir = std::env::temp_dir().join("lingclaw-mcp-test-helper");
+        let helper_dir =
+            std::env::temp_dir().join(format!("lingclaw-mcp-test-helper-{}", std::process::id()));
         fs::create_dir_all(&helper_dir).expect("helper dir should exist");
         let source_path = helper_dir.join("mock_mcp_server.rs");
         let binary_path = helper_dir.join(if cfg!(windows) {

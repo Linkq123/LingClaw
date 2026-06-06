@@ -121,6 +121,71 @@ pub(crate) struct ToolSpec {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ToolRankingContext {
     pub preferred_tools: Vec<String>,
+    pub preferences: Vec<ToolRankingPreference>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ToolRankingPreference {
+    pub name: String,
+    pub reason: String,
+    pub score: usize,
+    pub source: ToolRankingSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolRankingSource {
+    Query,
+    Memory,
+    Plan,
+    RecentFailure,
+    Intent,
+}
+
+impl ToolRankingSource {
+    pub(crate) fn from_label(value: &str) -> Self {
+        match value {
+            "query" => Self::Query,
+            "recent_failure" => Self::RecentFailure,
+            "intent" => Self::Intent,
+            "memory" => Self::Memory,
+            _ => Self::Plan,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::Memory => "memory",
+            Self::Plan => "plan",
+            Self::RecentFailure => "recent_failure",
+            Self::Intent => "intent",
+        }
+    }
+}
+
+impl ToolRankingContext {
+    pub(crate) fn add_preference(
+        &mut self,
+        name: impl Into<String>,
+        reason: impl Into<String>,
+        score: usize,
+        source: ToolRankingSource,
+    ) {
+        let name = name.into();
+        if !self
+            .preferred_tools
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&name))
+        {
+            self.preferred_tools.push(name.clone());
+        }
+        self.preferences.push(ToolRankingPreference {
+            name,
+            reason: reason.into(),
+            score,
+            source,
+        });
+    }
 }
 
 const TOOL_FULL_DISPLAY_THRESHOLD: usize = 6;
@@ -1068,7 +1133,30 @@ pub(crate) fn render_ranked_tool_recommendations(
 
     let mut lines = vec!["## Suggested Tool Order".to_string()];
     for (display_idx, idx) in selected.iter().enumerate() {
-        lines.push(format!("{}. {}", display_idx + 1, prompt_lines[*idx]));
+        let tool_name = specs[*idx].name;
+        let reasons = ranking
+            .preferences
+            .iter()
+            .filter(|preference| preference.name.eq_ignore_ascii_case(tool_name))
+            .map(|preference| {
+                format!(
+                    "{}:{}(+{})",
+                    preference.source.label(),
+                    preference.reason,
+                    preference.score
+                )
+            })
+            .collect::<Vec<_>>();
+        if reasons.is_empty() {
+            lines.push(format!("{}. {}", display_idx + 1, prompt_lines[*idx]));
+        } else {
+            lines.push(format!(
+                "{}. {} — {}",
+                display_idx + 1,
+                prompt_lines[*idx],
+                reasons.join("; ")
+            ));
+        }
     }
     Some(lines.join("\n"))
 }
@@ -1159,16 +1247,22 @@ fn tool_relevance(spec: &ToolSpec, prompt_line: &str, query_tokens: &[String]) -
 }
 
 fn tool_preference_boost(name: &str, ranking: Option<&ToolRankingContext>) -> usize {
-    ranking
-        .map(|ranking| {
-            ranking
-                .preferred_tools
-                .iter()
-                .filter(|preferred| preferred.eq_ignore_ascii_case(name))
-                .count()
-                * TOOL_PREFERENCE_BOOST
-        })
-        .unwrap_or(0)
+    let Some(ranking) = ranking else {
+        return 0;
+    };
+    let legacy_boost = ranking
+        .preferred_tools
+        .iter()
+        .filter(|preferred| preferred.eq_ignore_ascii_case(name))
+        .count()
+        * TOOL_PREFERENCE_BOOST;
+    let structured_boost = ranking
+        .preferences
+        .iter()
+        .filter(|preference| preference.name.eq_ignore_ascii_case(name))
+        .map(|preference| preference.score.max(1))
+        .sum::<usize>();
+    legacy_boost + structured_boost
 }
 
 pub(crate) fn tool_definitions() -> serde_json::Value {
