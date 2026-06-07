@@ -45,17 +45,27 @@ function sampleTaskPlan(overrides: Partial<TaskPlanEvent> = {}): TaskPlanEvent {
 
 describe('task plan timeline panel', () => {
   beforeEach(() => {
-    document.body.innerHTML = '<div id="chat"></div>';
+    document.body.innerHTML = `
+      <div id="chat"></div>
+      <div id="tool-drawer" class="tool-drawer"></div>
+      <div id="tool-drawer-backdrop" class="tool-drawer-backdrop"></div>
+    `;
     dom.chat = document.getElementById('chat') as HTMLElement;
+    dom.toolDrawer = document.getElementById('tool-drawer');
+    dom.toolDrawerBackdrop = document.getElementById('tool-drawer-backdrop');
     state.autoFollowChat = false;
     state.bulkRenderingChat = false;
+    state.activeToolPanel = null;
     resetTaskPlanPanel();
   });
 
   afterEach(() => {
     resetTaskPlanPanel();
+    state.activeToolPanel = null;
     document.body.innerHTML = '';
     dom.chat = null;
+    dom.toolDrawer = null;
+    dom.toolDrawerBackdrop = null;
   });
 
   it('creates a timeline panel for task_plan events', () => {
@@ -99,18 +109,15 @@ describe('task plan timeline panel', () => {
     expect(panel?.dataset.toolArgs).toContain('cycle 1');
   });
 
-  it('marks active task plans complete on done', () => {
+  it('removes active task plans on done', () => {
     applyTaskPlan(sampleTaskPlan());
     finishTaskPlanPanel();
 
-    const panel = document.querySelector('[data-task-plan-panel="true"]') as HTMLElement;
-    expect(panel.dataset.taskPlanStatus).toBe('complete');
-    expect(panel.dataset.toolStatus).toBe('complete');
-    expect(panel.classList.contains('task-plan-complete')).toBe(true);
-    expect(panel.textContent).toContain('complete');
+    expect(document.querySelector('[data-task-plan-panel="true"]')).toBeNull();
+    expect(document.querySelector('.timeline-node--task-plan')).toBeNull();
   });
 
-  it('marks ready task plans complete on done', () => {
+  it('removes ready task plans on done', () => {
     applyTaskPlan(
       sampleTaskPlan({
         plan: {
@@ -121,11 +128,26 @@ describe('task plan timeline panel', () => {
     );
     finishTaskPlanPanel();
 
+    expect(document.querySelector('[data-task-plan-panel="true"]')).toBeNull();
+    expect(document.querySelector('.timeline-node--task-plan')).toBeNull();
+  });
+
+  it('closes the tool drawer when the removed task plan is active', () => {
+    applyTaskPlan(sampleTaskPlan());
     const panel = document.querySelector('[data-task-plan-panel="true"]') as HTMLElement;
-    expect(panel.dataset.taskPlanStatus).toBe('complete');
-    expect(panel.dataset.toolStatus).toBe('complete');
-    expect(panel.classList.contains('task-plan-complete')).toBe(true);
-    expect(panel.textContent).toContain('complete');
+    panel.classList.add('tool-panel-active');
+    state.activeToolPanel = panel;
+    dom.toolDrawer?.classList.add('open');
+    dom.toolDrawerBackdrop?.classList.add('open');
+    dom.toolDrawer?.setAttribute('aria-hidden', 'false');
+
+    finishTaskPlanPanel();
+
+    expect(state.activeToolPanel).toBeNull();
+    expect(dom.toolDrawer?.classList.contains('open')).toBe(false);
+    expect(dom.toolDrawerBackdrop?.classList.contains('open')).toBe(false);
+    expect(dom.toolDrawer?.getAttribute('aria-hidden')).toBe('true');
+    expect(document.querySelector('[data-task-plan-panel="true"]')).toBeNull();
   });
 
   it('marks the previous cycle stale before accepting the next plan', () => {

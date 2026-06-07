@@ -1,8 +1,9 @@
 import { invalidateChatScrollCache, scrollDown } from '../scroll.js';
-import { dom } from '../state.js';
+import { dom, state } from '../state.js';
 import type { TaskPlanEvent, TaskPlanPayload } from '../types.js';
 import { escHtml, hideWelcome } from '../utils.js';
 import { animatePanelIn, wrapInTimeline } from './timeline.js';
+import { closeToolDrawer } from './tools.js';
 
 let activeTaskPlanPanel: HTMLElement | null = null;
 let activeTaskPlanKey = '';
@@ -119,7 +120,12 @@ export function applyTaskPlan(event: TaskPlanEvent): HTMLElement | null {
 
 export function finishTaskPlanPanel(): void {
   if (!activeTaskPlanPanel?.isConnected) return;
-  markTaskPlanPanel(activeTaskPlanPanel, 'complete');
+  if (state.activeToolPanel === activeTaskPlanPanel) {
+    closeToolDrawer();
+  }
+  activeTaskPlanPanel.closest('.timeline-node')?.remove();
+  resetTaskPlanPanel();
+  invalidateChatScrollCache();
 }
 
 export function supersedeTaskPlanPanel(nextRound?: number, nextCycle?: number): void {
