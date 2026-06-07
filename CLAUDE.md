@@ -102,7 +102,7 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 - The frontend session switcher lives in a collapsible left drawer; the Todos panel is a local visibility toggle and defaults to hidden on first load.
 - Slash command autocomplete is frontend-local UI on top of the existing `/...` command transport: incomplete prefixes can be completed via keyboard or mouse before dispatch.
 - Automatic context compression runs as a `BeforeAnalyze` hook in `src/hooks.rs`.
-- Each top-level Analyze cycle refreshes an ephemeral rule-based `TaskPlan`; it is injected as soft guidance, emitted as a `task_plan` live event, replayed on reconnect, and not persisted as a session message.
+- When the browser's plan mode is enabled for a run, each top-level Analyze cycle refreshes an ephemeral rule-based `TaskPlan`; it is injected as soft guidance, emitted as a `task_plan` live event, replayed on reconnect, and not persisted as a session message. With plan mode disabled, the run skips TaskPlan generation, prompt injection, and live events.
 - `/new` compresses the conversation into `memory/YYYY-MM-DD.md` and clears context; it does not create a new session.
 - `/clear` clears the current message context and todo items, while advancing the todos revision so stale in-flight writes cannot repopulate the list.
 - Skills are discovered from three layers: system (`docs/reference/skills/`), global (`~/.lingclaw/skills/`), and session-local (`skills/`).

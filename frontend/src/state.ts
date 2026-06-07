@@ -52,6 +52,7 @@ export interface DomRefs {
   attachUrlInput: HTMLElement | null;
   imageUrlField: HTMLInputElement | null;
   imageUrlAddBtn: HTMLButtonElement | null;
+  planModeToggle: HTMLButtonElement | null;
   attachUploadStatus: HTMLElement | null;
   imageFileInput: HTMLInputElement | null;
   [key: string]: HTMLElement | null;
@@ -108,6 +109,7 @@ export interface AppState {
   currentAppVersion: string;
   imageCapable: boolean;
   s3Capable: boolean;
+  planModeEnabled: boolean;
   uploadToken: string;
   uploadTokenPromise: Promise<string> | null;
   uploadTokenRequestSeq: number;
@@ -194,6 +196,7 @@ export const state: AppState = {
   currentAppVersion: '',
   imageCapable: false,
   s3Capable: false,
+  planModeEnabled: false,
   uploadToken: '',
   uploadTokenPromise: null,
   uploadTokenRequestSeq: 0,
@@ -266,6 +269,7 @@ export function initDomRefs() {
   dom.attachUrlInput = document.getElementById('attach-url-input');
   dom.imageUrlField = document.getElementById('image-url-field') as HTMLInputElement | null;
   dom.imageUrlAddBtn = document.getElementById('image-url-add') as HTMLButtonElement | null;
+  dom.planModeToggle = document.getElementById('plan-mode-toggle') as HTMLButtonElement | null;
   dom.attachUploadStatus = document.getElementById('attach-upload-status');
   dom.imageFileInput = document.getElementById('image-file-input') as HTMLInputElement | null;
 }

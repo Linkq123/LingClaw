@@ -1,7 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { ensureUploadTokenInternal } from '../src/images.js';
-import { state } from '../src/state.js';
+import {
+  ensureUploadTokenInternal,
+  openAttachPopup,
+  syncPlanModeToggle,
+  togglePlanMode,
+  updateAttachButton,
+} from '../src/images.js';
+import { dom, initDomRefs, state } from '../src/state.js';
 
 function jsonResponse(payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
@@ -20,9 +26,27 @@ function deferredResponse() {
 
 describe('ensureUploadTokenInternal', () => {
   beforeEach(() => {
+    document.body.innerHTML = `
+      <div class="attach-wrapper">
+        <button id="attach-btn"></button>
+        <div id="attach-popup" style="display: none">
+          <div id="attach-menu">
+            <button id="attach-local-btn"></button>
+            <button id="plan-mode-toggle" class="attach-menu-toggle" aria-checked="false"></button>
+          </div>
+          <div id="attach-upload-status" style="display: none"></div>
+        </div>
+      </div>
+      <div id="image-preview-bar"></div>
+    `;
+    initDomRefs();
     state.uploadToken = '';
     state.uploadTokenPromise = null;
     state.uploadTokenRequestSeq = 0;
+    state.imageCapable = false;
+    state.s3Capable = false;
+    state.planModeEnabled = false;
+    state.pendingImages = [];
   });
 
   afterEach(() => {
@@ -50,5 +74,63 @@ describe('ensureUploadTokenInternal', () => {
     await expect(firstRequest).resolves.toBe('stale-token');
     expect(state.uploadToken).toBe('fresh-token');
     expect(state.uploadTokenPromise).toBeNull();
+  });
+});
+
+describe('attachment menu', () => {
+  beforeEach(() => {
+    document.body.innerHTML = `
+      <div class="attach-wrapper">
+        <button id="attach-btn"></button>
+        <div id="attach-popup" style="display: none">
+          <div id="attach-menu">
+            <button id="attach-local-btn"></button>
+            <button id="plan-mode-toggle" class="attach-menu-toggle" aria-checked="false"></button>
+          </div>
+          <div id="attach-upload-status" style="display: none"></div>
+        </div>
+      </div>
+      <div id="image-preview-bar"></div>
+    `;
+    initDomRefs();
+    state.imageCapable = false;
+    state.s3Capable = false;
+    state.planModeEnabled = false;
+    state.pendingImages = [];
+  });
+
+  it('keeps the plus menu visible and only shows image upload when uploads are available', () => {
+    updateAttachButton();
+
+    expect(dom.attachBtn?.style.display).toBe('');
+    expect(dom.attachLocalBtn?.hidden).toBe(true);
+
+    state.imageCapable = true;
+    updateAttachButton();
+    expect(dom.attachLocalBtn?.hidden).toBe(true);
+
+    state.s3Capable = true;
+    updateAttachButton();
+    expect(dom.attachLocalBtn?.hidden).toBe(false);
+  });
+
+  it('opens the compact menu instead of the legacy URL input', () => {
+    openAttachPopup();
+
+    expect(dom.attachPopup?.style.display).toBe('block');
+    expect(dom.attachMenu?.style.display).toBe('flex');
+    expect(dom.attachUrlInput).toBeNull();
+  });
+
+  it('syncs plan mode switch state', () => {
+    syncPlanModeToggle();
+    expect(dom.planModeToggle?.getAttribute('aria-checked')).toBe('false');
+    expect(dom.planModeToggle?.classList.contains('is-on')).toBe(false);
+
+    togglePlanMode();
+
+    expect(state.planModeEnabled).toBe(true);
+    expect(dom.planModeToggle?.getAttribute('aria-checked')).toBe('true');
+    expect(dom.planModeToggle?.classList.contains('is-on')).toBe(true);
   });
 });

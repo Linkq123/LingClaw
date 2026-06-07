@@ -19,10 +19,13 @@ struct InputImageAttachment {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UserMessagePayload {
     text: String,
     #[serde(default)]
     images: Vec<InputImageAttachment>,
+    #[serde(default)]
+    plan_mode: Option<bool>,
 }
 
 pub(super) fn resolve_input_image_url(
@@ -53,7 +56,9 @@ pub(super) fn resolve_input_image_url(
 
 pub(crate) enum IdleSocketInputAction {
     Continue,
-    StartAgent,
+    StartAgent {
+        task_plan_enabled: bool,
+    },
     SwitchSession {
         session_id: String,
         result: crate::commands::CommandResult,
@@ -407,10 +412,11 @@ pub(crate) async fn handle_idle_socket_input(
         return IdleSocketInputAction::Continue;
     }
 
-    // Try parsing as structured JSON message (with image attachments).
-    let (msg_text, msg_images) = if trimmed.starts_with('{') {
+    // Try parsing as structured JSON message (with image attachments or UI run options).
+    let (msg_text, msg_images, task_plan_enabled) = if trimmed.starts_with('{') {
         match serde_json::from_str::<UserMessagePayload>(trimmed) {
             Ok(payload) => {
+                let requested_task_plan = payload.plan_mode.unwrap_or(true);
                 // Limit images per message to prevent abuse.
                 const MAX_IMAGES_PER_MESSAGE: usize = 10;
                 if payload.images.len() > MAX_IMAGES_PER_MESSAGE {
@@ -543,17 +549,15 @@ pub(crate) async fn handle_idle_socket_input(
                     } else {
                         Some(validated)
                     };
-                    (payload.text, images)
+                    (payload.text, images, requested_task_plan)
                 } else {
-                    // No images — treat the raw input as plain text so
-                    // accidental JSON like {"text":"hello"} is not consumed.
-                    (text, None)
+                    (payload.text, None, requested_task_plan)
                 }
             }
-            Err(_) => (text, None),
+            Err(_) => (text, None, true),
         }
     } else {
-        (text, None)
+        (text, None, true)
     };
 
     {
@@ -573,7 +577,7 @@ pub(crate) async fn handle_idle_socket_input(
         }
     }
 
-    IdleSocketInputAction::StartAgent
+    IdleSocketInputAction::StartAgent { task_plan_enabled }
 }
 
 pub(super) async fn persist_pending_interventions(

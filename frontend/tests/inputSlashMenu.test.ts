@@ -50,7 +50,9 @@ describe('input slash command menu', () => {
     expect(menu.textContent).toContain('/skills-system');
 
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }));
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true }),
+    );
 
     expect(input.value).toBe('/skills-system ');
     expect(menu.hidden).toBe(true);
@@ -70,8 +72,8 @@ describe('input slash command menu', () => {
     input.value = '/sk';
     input.dispatchEvent(new Event('input', { bubbles: true }));
 
-    const target = Array.from(menu.querySelectorAll<HTMLButtonElement>('.slash-command-item')).find((item) =>
-      item.textContent?.includes('/skills-system'),
+    const target = Array.from(menu.querySelectorAll<HTMLButtonElement>('.slash-command-item')).find(
+      (item) => item.textContent?.includes('/skills-system'),
     );
 
     expect(target).toBeDefined();
@@ -102,7 +104,9 @@ describe('input slash command menu', () => {
     input.dispatchEvent(new Event('input', { bubbles: true }));
     scrollIntoViewMock.mockClear();
 
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }));
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true, cancelable: true }),
+    );
 
     expect(scrollIntoViewMock).toHaveBeenCalledWith({ block: 'nearest' });
   });
@@ -124,7 +128,9 @@ describe('input slash command menu', () => {
     const input = stateModule.dom.input!;
     input.value = '/help';
     input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }),
+    );
 
     expect(sendMock).toHaveBeenCalledWith('/help');
     expect(input.value).toBe('');
@@ -147,7 +153,9 @@ describe('input slash command menu', () => {
     const input = stateModule.dom.input!;
     input.value = '/HELP';
     input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }));
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true }),
+    );
 
     expect(sendMock).not.toHaveBeenCalled();
     expect(input.value).toBe('/help');
@@ -227,7 +235,68 @@ describe('input slash command menu', () => {
     expect(sendMock).toHaveBeenCalledWith(
       JSON.stringify({
         text: '/API screenshot',
+        plan_mode: false,
         images: [{ url: 'https://example.com/demo.png' }],
+      }),
+    );
+    expect(input.value).toBe('');
+  });
+
+  it('sends normal messages with plan mode disabled by default', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = {
+      readyState: 1,
+      send: sendMock,
+    } as unknown as WebSocket;
+    stateModule.state.pendingImages = [];
+    stateModule.state.busy = false;
+    stateModule.state.planModeEnabled = false;
+
+    const { initInputListeners } = await import('../src/input.js');
+    initInputListeners();
+
+    const input = stateModule.dom.input!;
+    const sendBtn = stateModule.dom.sendBtn!;
+    input.value = 'hello';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    sendBtn.click();
+
+    expect(sendMock).toHaveBeenCalledWith(
+      JSON.stringify({
+        text: 'hello',
+        plan_mode: false,
+      }),
+    );
+    expect(input.value).toBe('');
+  });
+
+  it('sends normal messages with plan mode enabled when toggled on', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = {
+      readyState: 1,
+      send: sendMock,
+    } as unknown as WebSocket;
+    stateModule.state.pendingImages = [];
+    stateModule.state.busy = false;
+    stateModule.state.planModeEnabled = true;
+
+    const { initInputListeners } = await import('../src/input.js');
+    initInputListeners();
+
+    const input = stateModule.dom.input!;
+    const sendBtn = stateModule.dom.sendBtn!;
+    input.value = 'hello with plan';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    sendBtn.click();
+
+    expect(sendMock).toHaveBeenCalledWith(
+      JSON.stringify({
+        text: 'hello with plan',
+        plan_mode: true,
       }),
     );
     expect(input.value).toBe('');
@@ -253,7 +322,9 @@ describe('input slash command menu', () => {
     expect(menu.hidden).toBe(false);
     expect(menu.textContent).toContain('No matching commands');
 
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true }));
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'ArrowUp', bubbles: true, cancelable: true }),
+    );
 
     expect(input.value).toBe('/status');
     expect(menu.hidden).toBe(true);

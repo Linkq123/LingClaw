@@ -3059,6 +3059,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
     );
 
     let mut rerun_agent = false;
+    let mut task_plan_enabled_for_run = true;
     loop {
         if !rerun_agent {
             let text = tokio::select! {
@@ -3083,7 +3084,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             .await
             {
                 IdleSocketInputAction::Continue => continue,
-                IdleSocketInputAction::StartAgent => {}
+                IdleSocketInputAction::StartAgent { task_plan_enabled } => {
+                    task_plan_enabled_for_run = task_plan_enabled;
+                }
                 IdleSocketInputAction::SwitchSession { session_id, result } => {
                     match switch_socket_session(
                         &state,
@@ -3139,6 +3142,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             &live_tx,
             &mut inbound_rx,
             &stop_requested,
+            task_plan_enabled_for_run,
         )
         .await;
         run_active.store(false, Ordering::Relaxed);

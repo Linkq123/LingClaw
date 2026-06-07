@@ -1273,7 +1273,7 @@ ws://127.0.0.1:18989/ws?session=research-notes
 
 ## 5.2 客户端 -> 服务端
 
-客户端当前支持 4 类输入。
+客户端当前支持 4 类输入。浏览器前端的普通消息会发送 JSON 字符串，以便携带本轮运行选项；旧客户端仍可直接发送纯文本。
 
 ### 5.2.1 纯文本消息
 
@@ -1284,6 +1284,17 @@ ws://127.0.0.1:18989/ws?session=research-notes
 ```
 
 服务端会将其作为当前 WebSocket 绑定 session 的用户消息，然后启动一轮 agent 执行。
+
+也可以发送结构化 JSON 字符串：
+
+```json
+{
+  "text": "帮我检查这个仓库的配置问题",
+  "plan_mode": false
+}
+```
+
+`plan_mode` 为可选布尔值：`true` 表示本轮启用规则生成的 TaskPlan、prompt 注入和 `task_plan` live event；`false` 表示本轮不生成/注入/发送 TaskPlan。省略时按兼容旧客户端处理，默认启用。
 
 ### 5.2.2 Slash 命令
 
@@ -1308,6 +1319,7 @@ ws://127.0.0.1:18989/ws?session=research-notes
 ```json
 {
   "text": "请分析这张图",
+  "plan_mode": true,
   "images": [
     {
       "url": "https://...",
@@ -1334,6 +1346,7 @@ ws://127.0.0.1:18989/ws?session=research-notes
 - 若两者都存在，服务端会把该图当作受信任的已上传对象
 - 若只传 `url`，服务端会按普通远程图片 URL 校验
 - 最多 `10` 张图
+- `plan_mode` 语义同普通消息 JSON；前端关闭计划模式时会发送 `false`
 
 ### 5.2.4 忙碌期干预
 
@@ -1553,7 +1566,7 @@ ws://127.0.0.1:18989/ws?session=research-notes
 
 ### `task_plan`
 
-当前顶层主代理 round/cycle 的临时任务计划。该事件由规则生成，不调用 LLM；输入包括当前用户请求、运行期 `WorkingState`、任务记忆、最近工具结果、已发现子代理以及当前 session policy 允许的内置/MCP 工具。`task_plan` 进入 live replay，刷新或重连后会恢复当前计划面板；它不会写入 session messages，也不会自动执行其中的验证命令。
+当前顶层主代理 round/cycle 的临时任务计划，仅在本轮输入启用 `plan_mode` 时发送。该事件由规则生成，不调用 LLM；输入包括当前用户请求、运行期 `WorkingState`、任务记忆、最近工具结果、已发现子代理以及当前 session policy 允许的内置/MCP 工具。`task_plan` 进入 live replay，刷新或重连后会恢复当前计划面板；它不会写入 session messages，也不会自动执行其中的验证命令。
 
 ```json
 {
@@ -2087,7 +2100,7 @@ WebSocket 下若图片不合法，通常以 `system` 事件返回错误，例如
 1. 轮询或请求 `GET /api/health`，确认服务可用
 2. 建立 `/ws` 连接
 3. 收到 `session`、`view_state`、`todos_state`、`history` 后初始化 UI
-4. 发送纯文本或图片 JSON 消息
+4. 发送纯文本，或发送带 `text` / `plan_mode` / `images` 的 JSON 消息
 5. 处理 `start -> delta/thinking/tool/* -> done`
 6. 如需本地上传图片：
    - 先调用 `GET /api/client-config`
@@ -2100,7 +2113,7 @@ WebSocket 下若图片不合法，通常以 `system` 事件返回错误，例如
 - `/api/config` 在配置文件语法错误时不会返回 4xx，而是返回可恢复信息
 - `/api/sessions` 返回当前已知 session 摘要列表，`main` 固定置顶；`POST /api/session` 创建随机 6 位 id 的新 session，`PUT /api/session` 只修改 session 显示名称
 - `/api/todos` 使用整表替换 + revision 冲突语义；冲突时返回 `409 + 当前快照`
-- WebSocket 客户端消息没有显式 `type` 字段，按“纯文本 / slash 命令 / JSON 图片消息”三种形态自动分流
+- WebSocket 客户端消息没有显式 `type` 字段，按“纯文本 / slash 命令 / JSON 图片或运行选项消息”三种形态自动分流
 - 忙碌时普通文本会进入 deferred intervention 队列，不会立即中断主执行
 
 ## 9. 文档维护建议

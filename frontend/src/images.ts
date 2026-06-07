@@ -45,11 +45,24 @@ export async function ensureUploadTokenInternal(forceRefresh: boolean): Promise<
 // ── Image Attachment ──
 
 export function updateAttachButton() {
-  if (dom.attachBtn) dom.attachBtn.style.display = state.imageCapable ? '' : 'none';
+  if (dom.attachBtn) dom.attachBtn.style.display = '';
+  if (dom.attachLocalBtn) dom.attachLocalBtn.hidden = !(state.imageCapable && state.s3Capable);
+  syncPlanModeToggle();
   if (!state.imageCapable && state.pendingImages.length > 0) {
     state.pendingImages = [];
     renderImagePreviews();
   }
+}
+
+export function syncPlanModeToggle() {
+  if (!dom.planModeToggle) return;
+  dom.planModeToggle.setAttribute('aria-checked', state.planModeEnabled ? 'true' : 'false');
+  dom.planModeToggle.classList.toggle('is-on', state.planModeEnabled);
+}
+
+export function togglePlanMode() {
+  state.planModeEnabled = !state.planModeEnabled;
+  syncPlanModeToggle();
 }
 
 function isUploadedPendingImage(image) {
@@ -66,7 +79,7 @@ export function dropUnavailablePendingUploads(notify = false) {
   if (dom.imageFileInput) dom.imageFileInput.value = '';
   if (notify) {
     addSystem(
-      'Local uploaded images were cleared because S3 uploads are unavailable. Please re-attach them or use an image URL.',
+      'Local uploaded images were cleared because image uploads are unavailable. Please re-attach them after uploads are restored.',
     );
   }
 }
@@ -80,19 +93,11 @@ export function closeAttachPopup() {
 
 export function openAttachPopup() {
   if (!dom.attachPopup) return;
-  if (!state.s3Capable) {
-    if (dom.attachMenu) dom.attachMenu.style.display = 'none';
-    if (dom.attachUrlInput) dom.attachUrlInput.style.display = 'flex';
-    if (dom.attachUploadStatus) dom.attachUploadStatus.style.display = 'none';
-  } else {
-    if (dom.attachMenu) dom.attachMenu.style.display = 'flex';
-    if (dom.attachUrlInput) dom.attachUrlInput.style.display = 'none';
-    if (dom.attachUploadStatus) dom.attachUploadStatus.style.display = 'none';
-  }
+  updateAttachButton();
+  if (dom.attachMenu) dom.attachMenu.style.display = 'flex';
+  if (dom.attachUrlInput) dom.attachUrlInput.style.display = 'none';
+  if (dom.attachUploadStatus) dom.attachUploadStatus.style.display = 'none';
   dom.attachPopup.style.display = 'block';
-  if (!state.s3Capable && dom.imageUrlField) {
-    setTimeout(() => dom.imageUrlField.focus(), 50);
-  }
 }
 
 export function toggleAttachPopup() {
@@ -280,6 +285,11 @@ export function initImageListeners() {
     dom.attachLocalBtn.addEventListener('click', () => {
       if (dom.imageFileInput) dom.imageFileInput.click();
     });
+  if (dom.planModeToggle)
+    dom.planModeToggle.addEventListener('click', (e) => {
+      e.stopPropagation();
+      togglePlanMode();
+    });
   if (dom.imageUrlAddBtn)
     dom.imageUrlAddBtn.addEventListener('click', () => {
       if (dom.imageUrlField) {
@@ -312,4 +322,5 @@ export function initImageListeners() {
       }
     }
   });
+  updateAttachButton();
 }

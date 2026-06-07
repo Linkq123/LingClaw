@@ -232,6 +232,98 @@ async fn recv_json_with_timeout(rx: &mut tokio::sync::mpsc::Receiver<String>) ->
 }
 
 #[tokio::test]
+async fn handle_idle_socket_input_accepts_plan_mode_payload_without_images() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+    }
+
+    let action = handle_idle_socket_input(
+        r#"{"text":"inspect the runtime","plan_mode":false}"#.into(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+    )
+    .await;
+
+    assert!(matches!(
+        action,
+        IdleSocketInputAction::StartAgent {
+            task_plan_enabled: false
+        }
+    ));
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions.get(&session_id).expect("session should exist");
+    let message = session
+        .messages
+        .last()
+        .expect("user message should be stored");
+    assert_eq!(message.role, "user");
+    assert_eq!(message.content.as_deref(), Some("inspect the runtime"));
+    assert!(message.images.is_none());
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_defaults_plan_mode_for_structured_text_payload() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, _rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+    }
+
+    let action = handle_idle_socket_input(
+        r#"{"text":"inspect the runtime"}"#.into(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+    )
+    .await;
+
+    assert!(matches!(
+        action,
+        IdleSocketInputAction::StartAgent {
+            task_plan_enabled: true
+        }
+    ));
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions.get(&session_id).expect("session should exist");
+    let message = session
+        .messages
+        .last()
+        .expect("user message should be stored");
+    assert_eq!(message.role, "user");
+    assert_eq!(message.content.as_deref(), Some("inspect the runtime"));
+    assert!(message.images.is_none());
+}
+
+#[tokio::test]
 async fn handle_idle_socket_input_broadcasts_session_list_when_session_set_changes() {
     let state = Arc::new(test_app_state());
     let session_id = MAIN_SESSION_ID.to_string();
@@ -1226,6 +1318,7 @@ async fn run_agent_session_emits_user_stop_done_for_shared_stop_request() {
         &live_tx,
         &mut inbound_rx,
         &stop_requested,
+        true,
     )
     .await;
 
@@ -1310,6 +1403,7 @@ async fn run_agent_session_stop_preserves_interventions_after_trimming_incomplet
         &live_tx,
         &mut inbound_rx,
         &stop_requested,
+        true,
     )
     .await;
 
@@ -1378,6 +1472,7 @@ async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan_enabled: true,
         task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
@@ -1491,6 +1586,7 @@ fn phase_state_for_analyze_test() -> AgentPhaseState {
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan_enabled: true,
         task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
@@ -1919,6 +2015,63 @@ async fn prepare_analyze_snapshot_preserves_messages_for_before_analyze_compress
 }
 
 #[tokio::test]
+async fn prepare_analyze_snapshot_skips_task_plan_when_plan_mode_disabled() {
+    let state = Arc::new(test_app_state());
+    let session_id = "task-plan-disabled-session".to_string();
+    let workspace = temp_workspace("task-plan-disabled");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    prompts::init_session_prompt_files(&workspace);
+
+    let mut session = test_session(&session_id, "Main", None);
+    session.workspace = workspace.clone();
+    session.messages.push(ChatMessage {
+        role: "user".into(),
+        content: Some("change the runtime loop".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.task_plan_enabled = false;
+
+    prepare_analyze_snapshot(&ctx, &mut phase_state)
+        .await
+        .expect("snapshot should be prepared");
+
+    assert!(phase_state.task_plan.is_none());
+    let prompt = {
+        let sessions = state.sessions.lock().await;
+        sessions
+            .get(&session_id)
+            .and_then(|session| session.messages.first())
+            .and_then(|message| message.content.clone())
+            .expect("system prompt should be present")
+    };
+    assert!(!prompt.contains("## Task Plan"));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
 async fn run_analyze_phase_emits_context_compress_skipped_for_low_savings() {
     let mut hooks = HookRegistry::new();
     hooks.register(Box::new(ForceCompressionSkippedHook));
@@ -1976,12 +2129,21 @@ async fn run_analyze_phase_emits_context_compress_skipped_for_low_savings() {
         "investigate the timeout loop and explain the blockers",
     ));
 
-    let control = run_analyze_phase(&ctx, &mut phase_state).await;
-    assert!(matches!(control, AgentPhaseControl::Break));
+    let analyze = run_analyze_phase(&ctx, &mut phase_state);
+    tokio::pin!(analyze);
 
-    let first = live_rx.recv().await.expect("first event should be emitted");
+    let first = tokio::select! {
+        event = live_rx.recv() => event.expect("first event should be emitted"),
+        _ = &mut analyze => panic!("analyze phase ended before skipped event"),
+    };
     assert_eq!(first["type"].as_str(), Some("context_compress_skipped"));
     assert_eq!(first["reason"].as_str(), Some("insufficient_savings"));
+
+    run_cancel.cancel();
+    let control = tokio::time::timeout(Duration::from_secs(2), analyze)
+        .await
+        .expect("analyze phase should stop promptly after cancellation");
+    assert!(matches!(control, AgentPhaseControl::Break));
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -2245,6 +2407,7 @@ async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections(
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan_enabled: true,
         task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
@@ -2377,6 +2540,7 @@ async fn prepare_analyze_snapshot_preserves_todos_when_optional_sections_overflo
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan_enabled: true,
         task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
@@ -2492,6 +2656,7 @@ async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan_enabled: true,
         task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
@@ -2627,6 +2792,7 @@ async fn update_working_state_keeps_results_attached_to_their_original_query() {
         }],
         results_origin_query: Some("inspect the timeout wiring".into()),
         working_state: agent::WorkingState::default(),
+        task_plan_enabled: true,
         task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
@@ -2732,6 +2898,7 @@ async fn update_working_state_reuses_same_cycle_task_memory_selection() {
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan_enabled: true,
         task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
@@ -2894,6 +3061,7 @@ async fn update_working_state_refreshes_task_memory_after_state_changes() {
         }],
         results_origin_query: Some("inspect the entrypoint wiring".into()),
         working_state: agent::WorkingState::default(),
+        task_plan_enabled: true,
         task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
@@ -2980,6 +3148,7 @@ async fn prepare_analyze_snapshot_injects_fresh_task_state_each_time() {
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan_enabled: true,
         task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
@@ -3137,6 +3306,7 @@ async fn prepare_analyze_snapshot_injects_retrieved_task_memory() {
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan_enabled: true,
         task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
@@ -3245,6 +3415,7 @@ async fn prepare_analyze_snapshot_injects_agent_recommendations_and_delegation_g
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan_enabled: true,
         task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,
@@ -3391,6 +3562,7 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan_enabled: true,
         task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,

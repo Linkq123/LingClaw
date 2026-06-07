@@ -628,6 +628,7 @@ function handleMessage(data) {
           state.uploadTokenPromise = null;
           dropUnavailablePendingUploads(previousS3Capable);
         }
+        updateAttachButton();
       }
       if (data.usage) {
         state.dailyInputTokens = data.usage.daily_input ?? 0;

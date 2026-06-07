@@ -199,6 +199,7 @@ struct AgentPhaseState {
     collected_results: Vec<agent::ToolResultEntry>,
     results_origin_query: Option<String>,
     working_state: agent::WorkingState,
+    task_plan_enabled: bool,
     task_plan: Option<agent::TaskPlan>,
     retrieved_task_memory: Option<memory::RetrievedTaskMemory>,
     retrieved_task_memory_key: Option<String>,
@@ -695,19 +696,23 @@ async fn prepare_analyze_snapshot(
         false,
     );
     let discovered_agents = crate::subagents::discovery::discover_all_agents(&session.workspace);
-    let available_tools = available_tool_names_for_plan(&config, &session.workspace);
-    let available_agent_names = discovered_agents
-        .iter()
-        .map(|agent| agent.name.clone())
-        .collect::<Vec<_>>();
-    let task_plan = agent::build_task_plan(
-        &phase_state.working_state,
-        latest_query.as_deref(),
-        &available_tools,
-        &available_agent_names,
-        &phase_state.recent_tool_history,
-    );
-    phase_state.task_plan = Some(task_plan.clone());
+    let task_plan = if phase_state.task_plan_enabled {
+        let available_tools = available_tool_names_for_plan(&config, &session.workspace);
+        let available_agent_names = discovered_agents
+            .iter()
+            .map(|agent| agent.name.clone())
+            .collect::<Vec<_>>();
+        Some(agent::build_task_plan(
+            &phase_state.working_state,
+            latest_query.as_deref(),
+            &available_tools,
+            &available_agent_names,
+            &phase_state.recent_tool_history,
+        ))
+    } else {
+        None
+    };
+    phase_state.task_plan = task_plan.clone();
 
     // Dynamic context injections into the system prompt:
     // - Required session state that must survive optional-context truncation
@@ -726,7 +731,9 @@ async fn prepare_analyze_snapshot(
         if let Some(task_state) = agent::render_task_state_for_prompt(&phase_state.working_state) {
             let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &task_state);
         }
-        if let Some(task_plan_prompt) = agent::render_task_plan_for_prompt(&task_plan) {
+        if let Some(task_plan) = task_plan.as_ref()
+            && let Some(task_plan_prompt) = agent::render_task_plan_for_prompt(task_plan)
+        {
             let _ =
                 append_dynamic_prompt_section(content, &mut remaining_budget, &task_plan_prompt);
         }
@@ -759,10 +766,14 @@ async fn prepare_analyze_snapshot(
             .retrieved_task_memory
             .as_ref()
             .and_then(|selection| {
-                let ranking = merge_tool_rankings(
-                    memory::task_tool_ranking_context(selection, phase_state.working_state.intent),
-                    agent::task_plan_tool_ranking_context(&task_plan),
-                );
+                let mut ranking =
+                    memory::task_tool_ranking_context(selection, phase_state.working_state.intent);
+                if let Some(task_plan) = task_plan.as_ref() {
+                    ranking = merge_tool_rankings(
+                        ranking,
+                        agent::task_plan_tool_ranking_context(task_plan),
+                    );
+                }
                 tools::render_ranked_tool_recommendations(
                     config.as_ref(),
                     latest_query.as_deref(),
@@ -770,12 +781,14 @@ async fn prepare_analyze_snapshot(
                 )
             })
             .or_else(|| {
-                let ranking = agent::task_plan_tool_ranking_context(&task_plan);
-                tools::render_ranked_tool_recommendations(
-                    config.as_ref(),
-                    latest_query.as_deref(),
-                    &ranking,
-                )
+                task_plan.as_ref().and_then(|task_plan| {
+                    let ranking = agent::task_plan_tool_ranking_context(task_plan);
+                    tools::render_ranked_tool_recommendations(
+                        config.as_ref(),
+                        latest_query.as_deref(),
+                        &ranking,
+                    )
+                })
             })
         {
             let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &tool_order);
@@ -3328,6 +3341,7 @@ pub(crate) async fn run_agent_session(
     live_tx: &LiveTx,
     inbound_rx: &mut mpsc::Receiver<String>,
     stop_requested: &Arc<AtomicBool>,
+    task_plan_enabled: bool,
 ) -> AgentRunOutcome {
     let show_react = {
         let sessions = state.sessions.lock().await;
@@ -3365,6 +3379,7 @@ pub(crate) async fn run_agent_session(
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
+        task_plan_enabled,
         task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,

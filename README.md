@@ -19,7 +19,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **多会话**：默认会话仍为 `main`，但现在支持创建、切换、重命名、列出和删除其他持久化 session；新增 session 时后端会自动生成 6 位英数字 id，用户只需在需要时重命名；前端使用左侧可折叠的 session drawer 切换，`main` 固定置顶，刷新后会恢复上次选中的 session，WebSocket 连接按 session 绑定并在切换时重连
 - **会话级 Todos**：新增结构化 `todos` 工具，维护每个 session 唯一的一份当前任务清单；采用“整表替换 + revision 乐观并发”协议，支持用户与主代理协同编辑、重连恢复、冲突检测，以及专用 todo 面板展示
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、frontend-coder、backend-coder、general-coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
-- **运行期 Task Plan**：每轮 Analyze 前用规则生成临时 `TaskPlan`，结合用户请求、`WorkingState`、任务记忆、最近工具结果、可用工具和子代理，向模型软注入目标、步骤、工具/代理建议、验证建议与验收标准；不会自动执行验证命令，也不会写入会话消息历史
+- **运行期 Task Plan**：聊天页计划模式开启时，每轮 Analyze 前用规则生成临时 `TaskPlan`，结合用户请求、`WorkingState`、任务记忆、最近工具结果、可用工具和子代理，向模型软注入目标、步骤、工具/代理建议、验证建议与验收标准；关闭计划模式时本轮不生成/注入/发送 TaskPlan；不会自动执行验证命令，也不会写入会话消息历史
 - **文档化斜杠命令**：`/new`、`/model`、`/switch`、`/sessions`、`/delete`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/reflection`、`/help`
 - **多 Provider 模型路由**：OpenAI（Chat Completions / Responses）+ Anthropic + Ollama + Gemini，支持 `provider/model` 和纯 model ID
 - **OpenAI 双协议**：OpenAI family 现在支持保留原有 `openai-completions`（`/v1/chat/completions`）并新增 `openai-responses`（`/v1/responses`）；两者共享同一套模型解析与工具权限体系。对话路径下两者都使用原生上游流式调用，`openai-responses` 会设置 `stream: true` 并把 Responses SSE 事件映射为 LingClaw 现有前端事件流
@@ -27,7 +27,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **会话持久化**：默认 `main` 与其他 session 都会各自保存工作区、消息历史、视图状态和当前 todos 快照
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
 - **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、毛玻璃渐变背景、稳定的 Markdown 分段渲染（表格、代码块、任务列表、引用、数学公式等常见格式）、版本号 badge（header + 欢迎页，从 `/api/health` 获取）、主回复右下角显示本轮输入/输出 token 和首 token 耗时、输入框上下键历史导航（最多 10 条）、输入 `/` 时的斜杠命令自动补全菜单（支持键盘上下选择、Tab/Enter 补全和鼠标点击）；左侧 session drawer 支持折叠/展开、切换、重命名和删除非当前 session，todo 面板默认隐藏，可通过 `Todos: On/Off` 本地开关显示，支持增删改、状态切换和上下移动，但不修改 session 数据以外的视图状态；Settings 页面（React 岛屿）支持在线编辑配置、Provider 连接测试、MCP Server 连接测试、当前 session 的系统 Skills 开关、MCP server/tool 权限、OAuth 连接状态以及 resources/prompts 浏览插入，并可在 Models 标签页直接编辑 `compat.thinkingFormat`；顶部提供默认关闭的 `Auto Debug` 本地开关，用于查看最近一条顶层 `think=auto` 决策轨迹；Usage 页面（React 岛屿）显示 Token 用量统计、按 Model Role 拆分的明细卡片与 Canvas 图表
-- **图片附件**：支持通过 URL 或本地 JPEG/PNG 上传附加图片到用户消息；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；Gemini/Ollama 会由 LingClaw 本地预取为 base64/inlineData 并持久化缓存到会话工作区，因此可配合私网、localhost 或仅局域网可达的网关使用；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
+- **图片附件**：聊天页通过 `+` 菜单在上传能力可用时提供本地 JPEG/PNG 图片上传；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；Gemini/Ollama 会由 LingClaw 本地预取为 base64/inlineData 并持久化缓存到会话工作区，因此可配合私网、localhost 或仅局域网可达的网关使用；WebSocket 协议仍可接收受信任上传元信息或远程图片 URL；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
 - **Structured Memory（可选）**：启用 `structuredMemory` 后，Finish 阶段会异步抽取稳定偏好、项目上下文和长期事实，写入 workspace 下的 `structured_memory.json`，并记录 `structured_memory.audit.jsonl` 诊断轨迹；`/memory`、`/memory stats`、`/memory debug` 可查看状态与最近审计信息
@@ -37,7 +37,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环；运行时维护每轮临时 `WorkingState` 与规则生成的 `TaskPlan`，用于汇总 `TaskIntent`、证据、blocker、下一步动作、工具排序和验证建议，辅助 observation 摘要、动态 prompt 注入与 auto-think 信号
 - **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留；错误工具标记 `[FAILED]` 并附带耗时；在多工具、错误或超长结果场景下，还会触发轻量状态摘要来更新当前 `WorkingState`
 - **推理可见性控制**：默认开启 ReAct 阶段转换 WS 事件（`react_phase`），可通过 `/react on|off` 手动切换；浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
-- **Auto 思维可观测性**：当 `/think auto` 且当前模型支持 reasoning effort 时，后端会额外发送 `auto_trace` WebSocket 事件；每轮 Analyze 还会发送 `task_plan` 事件用于前端 timeline 展示当前软计划、工具建议和验证建议；`/status` 会显示 live runtime think、auto signals 与 request budget 摘要，前端 `Auto Debug` 开关只在本地展示最新一条顶层轨迹，不会写回 session 配置
+- **Auto 思维可观测性**：当 `/think auto` 且当前模型支持 reasoning effort 时，后端会额外发送 `auto_trace` WebSocket 事件；计划模式开启时，每轮 Analyze 还会发送 `task_plan` 事件用于前端 timeline 展示当前软计划、工具建议和验证建议；`/status` 会显示 live runtime think、auto signals 与 request budget 摘要，前端 `Auto Debug` 开关只在本地展示最新一条顶层轨迹，不会写回 session 配置
 - **结构化工具结果**：`ToolOutcome`（output + is_error + duration_ms），前缀式错误检测，schema 约束校验（required/type/range/length），`tool_result` WS 事件携带耗时和错误标记
 - **原子持久化**：会话存档先写 `.tmp` 再 rename（Windows 兼容），加载时自动修剪不完整工具调用
 - **会话版本控制**：`SESSION_VERSION = 6`，旧存档自动迁移并补齐 `show_tools` / `show_reasoning` / `show_react` / `todos` / `enabled_system_skills` 等字段默认值
@@ -602,7 +602,7 @@ Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的
 
 - **每轮携带临时 WorkingState**：挂在 `AgentPhaseState` 上，只在当前 run 内存在；核心字段包括 `intent`、`primary_goal`、`completed_steps`、`evidence`、`open_questions`、`uncertainties`、`next_actions`、`ready_to_finish`
 - **Observe 先规则更新，再按需轻量摘要**：成功工具写入完成步骤/证据，失败工具写入 blocker；只有在工具报错、结果超长或本轮工具数大于 2 时，才会调用 fast model 生成 JSON `StateDigestDelta`
-- **Analyze 动态注入任务上下文**：除基础 system prompt 外，还会按预算注入 `## Task State`、`## Task Plan`、Relevant Past Experience、Tool Hints、Suggested Tool Order、Suggested Sub-Agents、Delegation Guidance；这些内容不进入静态 system prompt cache
+- **Analyze 动态注入任务上下文**：除基础 system prompt 外，还会按预算注入 `## Task State`、Relevant Past Experience、Tool Hints、Suggested Tool Order、Suggested Sub-Agents、Delegation Guidance；计划模式开启时额外注入 `## Task Plan` 并使用其中的工具/验证建议；这些内容不进入静态 system prompt cache
 - **Finish 判定保持轻量**：Analyze 阶段通过 `evaluate_finish()` 仅根据“是否有内容 / 是否有 tool_calls”决定进入 Finish 或继续 Act；`WorkingState` 继续服务于上下文构建、auto-think 和 observation 汇总，而不是拦截 finish 出口
 
 **关键设计决策：**
@@ -657,7 +657,7 @@ handle_socket()
   └─ 返回控制权给 WebSocket 读循环
 ```
 
-注：上面的流程图是简化视图。当前实现里，`Observe` 阶段还会同步更新 `WorkingState`、对齐 task memory 命中项，并在满足条件时触发轻量 state digest；下一轮 `Analyze` 会再把 `Task State`、`Task Plan`、任务记忆、工具排序建议、验证建议和子代理/委托建议按预算动态注入。
+注：上面的流程图是简化视图。当前实现里，`Observe` 阶段还会同步更新 `WorkingState`、对齐 task memory 命中项，并在满足条件时触发轻量 state digest；下一轮 `Analyze` 会再把 `Task State`、任务记忆、工具排序建议和子代理/委托建议按预算动态注入；如果本轮启用计划模式，还会注入 `Task Plan` 与验证建议。
 
 ### 模块地图
 
@@ -975,7 +975,7 @@ think_level 映射：
 | `history` | 当前会话历史消息 |
 | `start` | 新一轮回复开始 |
 | `auto_trace` | `think=auto` 的最新顶层决策轨迹（selected think、baseline、signals、escalators/dampeners/clamps） |
-| `task_plan` | 当前 round/cycle 的临时任务计划、工具/代理建议、验证建议与验收标准；进入 live replay，但不写入 session 历史 |
+| `task_plan` | 计划模式开启时发送的当前 round/cycle 临时任务计划、工具/代理建议、验证建议与验收标准；进入 live replay，但不写入 session 历史 |
 | `delta` | 流式文本片段 |
 | `thinking_start` | 思维模式开始 |
 | `thinking_delta` | 思维流式片段 |

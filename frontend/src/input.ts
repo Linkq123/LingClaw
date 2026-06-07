@@ -79,7 +79,9 @@ function renderSlashCommandMenu() {
       ? slashMenuSuggestions.findIndex((spec) => spec.command === previousActiveCommand)
       : -1;
     slashMenuActiveIndex =
-      previousIndex >= 0 ? previousIndex : Math.min(slashMenuActiveIndex, slashMenuSuggestions.length - 1);
+      previousIndex >= 0
+        ? previousIndex
+        : Math.min(slashMenuActiveIndex, slashMenuSuggestions.length - 1);
   }
 
   const fragment = document.createDocumentFragment();
@@ -250,12 +252,17 @@ export function send() {
     setBusy(true);
   }
 
+  const payload: { text: string; plan_mode: boolean; images?: typeof state.pendingImages } = {
+    text: text || '',
+    plan_mode: state.planModeEnabled,
+  };
   if (hasImages) {
-    state.ws.send(JSON.stringify({ text: text || '', images: state.pendingImages }));
+    payload.images = state.pendingImages;
+    state.ws.send(JSON.stringify(payload));
     state.pendingImages = [];
     renderImagePreviews();
   } else {
-    state.ws.send(text);
+    state.ws.send(JSON.stringify(payload));
   }
   pushInputHistory(text);
   dom.input.value = '';
