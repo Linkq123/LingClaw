@@ -11,58 +11,44 @@ function taskPlanKey(round: number, cycle: number): string {
   return `${round}:${cycle}`;
 }
 
-function renderList<T>(
-  items: T[] | undefined,
-  className: string,
-  render: (item: T) => string,
-): string {
-  if (!items || items.length === 0) return '';
-  return `<ul class="${className}">${items.map((item) => `<li>${render(item)}</li>`).join('')}</ul>`;
+function renderPlainSection(title: string, lines: string[]): string {
+  const cleanLines = lines.map((line) => line.trim()).filter(Boolean);
+  if (cleanLines.length === 0) return '';
+  return [`${title}:`, ...cleanLines.map((line) => `- ${line}`)].join('\n');
 }
 
-function renderPlanBody(plan: TaskPlanPayload): string {
-  const steps = renderList(
-    plan.steps,
-    'task-plan-list task-plan-steps',
-    (step) =>
-      `<span class="task-plan-status task-plan-status-${escHtml(step.status)}">${escHtml(step.status)}</span><span>${escHtml(step.title)}</span>`,
-  );
-  const tools = renderList(
-    plan.suggestedTools,
-    'task-plan-list',
-    (tool) =>
-      `<code>${escHtml(tool.name)}</code><span>${escHtml(tool.reason)}</span>${tool.source ? `<span class="task-plan-muted">${escHtml(tool.source)}</span>` : ''}`,
-  );
-  const agents = renderList(
-    plan.suggestedAgents,
-    'task-plan-list',
-    (agent) => `<code>${escHtml(agent.name)}</code><span>${escHtml(agent.reason)}</span>`,
-  );
-  const verification = renderList(
-    plan.verificationSuggestions,
-    'task-plan-list',
-    (item) =>
-      `<code>${escHtml(item.command)}</code><span>${escHtml(item.reason)}</span><span class="task-plan-muted">${escHtml(item.confidence)} · ${escHtml(item.when)}</span>`,
-  );
-  const criteria = renderList(
-    plan.acceptanceCriteria,
-    'task-plan-list',
-    (item) => `<span>${escHtml(item)}</span>`,
-  );
-  const questions = renderList(
-    plan.openQuestions,
-    'task-plan-list',
-    (item) => `<span>${escHtml(item)}</span>`,
-  );
+function renderPlanDetail(plan: TaskPlanPayload): string {
+  const sections = [
+    `Goal: ${plan.goal}`,
+    `Intent: ${plan.intent}`,
+    `Status: ${plan.status}`,
+    renderPlainSection(
+      'Steps',
+      (plan.steps || []).map((step) => `[${step.status}] ${step.title}`),
+    ),
+    renderPlainSection('Open Questions', plan.openQuestions || []),
+    renderPlainSection(
+      'Suggested Tools',
+      (plan.suggestedTools || []).map((tool) =>
+        [tool.name, tool.reason, tool.source ? `source=${tool.source}` : '']
+          .filter(Boolean)
+          .join(' - '),
+      ),
+    ),
+    renderPlainSection(
+      'Suggested Agents',
+      (plan.suggestedAgents || []).map((agent) => `${agent.name} - ${agent.reason}`),
+    ),
+    renderPlainSection(
+      'Verification Suggestions',
+      (plan.verificationSuggestions || []).map(
+        (item) => `${item.command} - ${item.reason} (${item.confidence}, ${item.when})`,
+      ),
+    ),
+    renderPlainSection('Acceptance Criteria', plan.acceptanceCriteria || []),
+  ].filter(Boolean);
 
-  return `
-    ${steps ? `<section><h4>Steps</h4>${steps}</section>` : ''}
-    ${questions ? `<section><h4>Open Questions</h4>${questions}</section>` : ''}
-    ${tools ? `<section><h4>Suggested Tools</h4>${tools}</section>` : ''}
-    ${agents ? `<section><h4>Suggested Agents</h4>${agents}</section>` : ''}
-    ${verification ? `<section><h4>Verification Suggestions</h4>${verification}</section>` : ''}
-    ${criteria ? `<section><h4>Acceptance Criteria</h4>${criteria}</section>` : ''}
-  `;
+  return sections.join('\n\n');
 }
 
 function updatePanel(panel: HTMLElement, event: TaskPlanEvent): void {
@@ -70,15 +56,20 @@ function updatePanel(panel: HTMLElement, event: TaskPlanEvent): void {
   panel.dataset.taskPlanRound = String(event.round);
   panel.dataset.taskPlanCycle = String(event.cycle);
   panel.dataset.taskPlanStatus = event.plan.status;
-  panel.className = `task-plan-panel task-plan-${event.plan.status || 'active'}`;
+  panel.dataset.toolId = taskPlanKey(event.round, event.cycle);
+  panel.dataset.toolName = 'Task Plan';
+  panel.dataset.toolArgs = `round ${event.round}, cycle ${event.cycle}, intent ${event.plan.intent}`;
+  panel.dataset.toolResult = renderPlanDetail(event.plan);
+  panel.dataset.toolHasResult = 'true';
+  panel.dataset.toolStatus = event.plan.status || 'active';
+  panel.className = `tool-panel tool-panel-ready task-plan-panel task-plan-${event.plan.status || 'active'}`;
   panel.innerHTML = `
-    <div class="task-plan-header">
-      <span class="task-plan-tag">Task Plan</span>
-      <span class="task-plan-meta">round ${event.round} · cycle ${event.cycle}</span>
-      <span class="task-plan-meta">${escHtml(event.plan.intent)} · ${escHtml(event.plan.status)}</span>
+    <div class="tool-header task-plan-header" data-action="open-tool-drawer">
+      <span class="tool-icon task-plan-icon">▣</span>
+      <span class="tool-name">Task Plan</span>
+      <span class="tool-args-preview">${escHtml(event.plan.goal)}</span>
+      <span class="tool-status">${escHtml(event.plan.status || 'active')}</span>
     </div>
-    <div class="task-plan-goal">${escHtml(event.plan.goal)}</div>
-    <div class="task-plan-body">${renderPlanBody(event.plan)}</div>
   `;
 }
 
@@ -88,14 +79,15 @@ function markTaskPlanPanel(panel: HTMLElement, status: 'complete' | 'stale'): vo
   if (currentStatus === 'complete' || currentStatus === 'stale') return;
 
   panel.dataset.taskPlanStatus = status;
+  panel.dataset.toolStatus = status;
   panel.classList.remove(`task-plan-${currentStatus}`);
   panel.classList.add(`task-plan-${status}`);
-  const meta = panel.querySelector('.task-plan-header');
-  if (meta && !meta.textContent?.includes(status)) {
-    const marker = document.createElement('span');
-    marker.className = 'task-plan-meta';
-    marker.textContent = status;
-    meta.appendChild(marker);
+  if (status === 'complete') {
+    panel.classList.add('tool-panel-ready');
+  }
+  const statusEl = panel.querySelector('.tool-status');
+  if (statusEl) {
+    statusEl.textContent = status;
   }
 }
 

@@ -64,8 +64,11 @@ describe('task plan timeline panel', () => {
     const panel = document.querySelector('[data-task-plan-panel="true"]');
     expect(panel).not.toBeNull();
     expect(panel?.closest('.timeline-node--task-plan')).not.toBeNull();
+    expect(panel?.classList.contains('tool-panel')).toBe(true);
     expect(panel?.textContent).toContain('Fix MCP timeout handling');
-    expect(panel?.textContent).toContain('cargo test mcp');
+    expect(panel?.textContent).not.toContain('cargo test mcp');
+    expect((panel as HTMLElement | null)?.dataset.toolResult).toContain('cargo test mcp');
+    expect(panel?.querySelector('.task-plan-body')).toBeNull();
   });
 
   it('updates the same round and cycle without appending a duplicate panel', () => {
@@ -83,7 +86,7 @@ describe('task plan timeline panel', () => {
     const panels = document.querySelectorAll('[data-task-plan-panel="true"]');
     expect(panels).toHaveLength(1);
     expect(panels[0].textContent).toContain('Updated plan goal');
-    expect(panels[0].textContent).toContain('Inspect changed files');
+    expect((panels[0] as HTMLElement).dataset.toolResult).toContain('Inspect changed files');
   });
 
   it('renders replayed task plans as the current panel', () => {
@@ -92,8 +95,8 @@ describe('task plan timeline panel', () => {
     const panel = document.querySelector('[data-task-plan-panel="true"]') as HTMLElement;
     expect(panel?.dataset.taskPlanRound).toBe('2');
     expect(panel?.dataset.taskPlanCycle).toBe('1');
-    expect(panel?.textContent).toContain('round 2');
-    expect(panel?.textContent).toContain('cycle 1');
+    expect(panel?.dataset.toolArgs).toContain('round 2');
+    expect(panel?.dataset.toolArgs).toContain('cycle 1');
   });
 
   it('marks active task plans complete on done', () => {
@@ -102,6 +105,7 @@ describe('task plan timeline panel', () => {
 
     const panel = document.querySelector('[data-task-plan-panel="true"]') as HTMLElement;
     expect(panel.dataset.taskPlanStatus).toBe('complete');
+    expect(panel.dataset.toolStatus).toBe('complete');
     expect(panel.classList.contains('task-plan-complete')).toBe(true);
     expect(panel.textContent).toContain('complete');
   });
@@ -119,6 +123,7 @@ describe('task plan timeline panel', () => {
 
     const panel = document.querySelector('[data-task-plan-panel="true"]') as HTMLElement;
     expect(panel.dataset.taskPlanStatus).toBe('complete');
+    expect(panel.dataset.toolStatus).toBe('complete');
     expect(panel.classList.contains('task-plan-complete')).toBe(true);
     expect(panel.textContent).toContain('complete');
   });
@@ -133,6 +138,7 @@ describe('task plan timeline panel', () => {
     ) as HTMLElement[];
     expect(panels).toHaveLength(2);
     expect(panels[0].dataset.taskPlanStatus).toBe('stale');
+    expect(panels[0].dataset.toolStatus).toBe('stale');
     expect(panels[0].classList.contains('task-plan-stale')).toBe(true);
     expect(panels[0].textContent).toContain('stale');
     expect(panels[1].dataset.taskPlanCycle).toBe('1');
@@ -166,7 +172,8 @@ describe('task plan timeline panel', () => {
     applyTaskPlan(sampleTaskPlan());
 
     const panel = document.querySelector('[data-task-plan-panel="true"]') as HTMLElement;
-    expect(panel.textContent).toContain('cargo test mcp');
+    expect(panel.textContent).not.toContain('cargo test mcp');
+    expect(panel.dataset.toolResult).toContain('cargo test mcp');
     expect(panel.querySelector('button')).toBeNull();
     expect(panel.querySelector('[data-command]')).toBeNull();
   });
