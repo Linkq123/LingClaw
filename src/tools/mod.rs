@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 
-use crate::Config;
+use crate::{Config, Provider};
 
 /// Structured tool execution result with metadata.
 pub(crate) struct ToolOutcome {
@@ -1119,6 +1119,17 @@ pub(crate) fn render_tool_prompt_lines_with_query(
         .join("\n")
 }
 
+pub(crate) fn render_read_only_tool_prompt_lines(config: &Config) -> String {
+    tool_specs()
+        .iter()
+        .filter(|spec| is_read_only_tool(spec.name))
+        .map(|spec| (spec.prompt_line)(config))
+        .enumerate()
+        .map(|(idx, line)| format!("{}. {line}", idx + 1))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub(crate) fn render_ranked_tool_recommendations(
     config: &Config,
     current_query: Option<&str>,
@@ -1383,6 +1394,36 @@ pub(crate) fn tool_definitions_anthropic() -> serde_json::Value {
         })
         .collect::<Vec<_>>();
     json!(tools)
+}
+
+pub(crate) fn read_only_tool_definitions_for_provider(
+    provider: Provider,
+) -> Vec<serde_json::Value> {
+    let tools = tool_specs()
+        .iter()
+        .filter(|spec| is_read_only_tool(spec.name))
+        .map(|spec| match provider {
+            Provider::Anthropic => json!({
+                "name": spec.name,
+                "description": spec.description,
+                "input_schema": (spec.parameters)(),
+            }),
+            Provider::Gemini => json!({
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": gemini_tool_parameters((spec.parameters)()),
+            }),
+            Provider::OpenAI | Provider::OpenAIResponses | Provider::Ollama => json!({
+                "type": "function",
+                "function": {
+                    "name": spec.name,
+                    "description": spec.description,
+                    "parameters": (spec.parameters)(),
+                }
+            }),
+        })
+        .collect::<Vec<_>>();
+    tools
 }
 
 pub(crate) fn task_tool_definition_ollama(agent_names: &[String]) -> serde_json::Value {

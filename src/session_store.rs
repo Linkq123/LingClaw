@@ -180,6 +180,8 @@ struct PersistedSessionView<'a> {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     subagent_snapshots: HashMap<String, crate::SubagentHistorySnapshot>,
     todos: &'a crate::todos::TodoSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_plan: Option<&'a crate::PendingPlan>,
     version: u32,
 }
 
@@ -583,6 +585,7 @@ fn build_session_persist_payload(session: &Session) -> Result<String, String> {
         failed_tool_results,
         subagent_snapshots,
         todos: &session.todos,
+        pending_plan: session.pending_plan.as_ref(),
         version: session.version,
     })
     .map_err(|e| e.to_string())
@@ -768,12 +771,17 @@ pub(crate) fn build_history_payload_with_s3(
         normalize_subagent_snapshots_for_messages(&session.messages, &session.subagent_snapshots);
     let mut tool_occurrences: HashMap<String, usize> = HashMap::new();
     let mut tool_names_by_id: HashMap<String, String> = HashMap::new();
-    for msg in &session.messages {
+    for (message_index, msg) in session.messages.iter().enumerate() {
         match msg.role.as_str() {
             "system" => {}
             "user" => {
                 if let Some(c) = &msg.content {
-                    let mut entry = json!({"role":"user","content":c,"timestamp":msg.timestamp});
+                    let mut entry = json!({
+                        "role":"user",
+                        "content":c,
+                        "timestamp":msg.timestamp,
+                        "message_index": message_index,
+                    });
                     if let Some(images) = &msg.images {
                         entry["images"] = json!(
                             images
@@ -798,8 +806,12 @@ pub(crate) fn build_history_payload_with_s3(
                 let has_thinking = msg.thinking.as_deref().is_some_and(|t| !t.is_empty());
                 if has_content || has_thinking {
                     let content_str = msg.content.as_deref().unwrap_or("");
-                    let mut entry =
-                        json!({"role":"assistant","content":content_str,"timestamp":msg.timestamp});
+                    let mut entry = json!({
+                        "role":"assistant",
+                        "content":content_str,
+                        "timestamp":msg.timestamp,
+                        "message_index": message_index,
+                    });
                     if let Some(thinking) = &msg.thinking
                         && !thinking.is_empty()
                     {
@@ -863,7 +875,15 @@ pub(crate) fn build_history_payload_with_s3(
             _ => {}
         }
     }
-    json!({"type":"history","messages":msgs})
+    let mut payload = json!({"type":"history","messages":msgs});
+    if let Some(plan) = session.pending_plan.as_ref() {
+        payload["pending_plan"] = json!({
+            "plan_id": &plan.id,
+            "message_index": plan.assistant_plan_message_index,
+            "created_at": plan.created_at,
+        });
+    }
+    payload
 }
 
 fn sanitize_subagent_snapshot_for_history(

@@ -2780,7 +2780,7 @@ fn maybe_apply_anthropic_message_cache_control(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub(crate) async fn call_llm_stream(
     http: &Client,
     resolved: &ResolvedModel,

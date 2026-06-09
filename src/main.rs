@@ -119,6 +119,7 @@ struct SystemPromptStaticCacheKey {
     query: Option<String>,
     enabled_skills_hash: u64,
     persona_hash: u64,
+    behavior_hash: u64,
     tool_lines_hash: u64,
     mcp_note_hash: u64,
     skills_hash: u64,
@@ -138,6 +139,33 @@ You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools
 - **Error recovery:** When a tool fails, diagnose the cause and try a different approach - different arguments, a different tool, or an alternative path. Do not repeat the same failing call.
 - **Delegation:** For complex, self-contained subtasks, delegate to a sub-agent via the `task` tool. Handle simple, quick work yourself.
 - **Finishing:** When the task is complete, deliver your result. When you are genuinely stuck with no further options, say so honestly. Do not pad with speculative follow-ups.";
+
+const PLAN_ONLY_AGENT_BEHAVIOR_SECTION: &str = "## Agent Behavior
+
+You operate in plan-only mode: **Analyze** the situation, optionally **Act** with read-only exploration tools, **Observe** the results, then **Finish** with a plan.
+
+- **Tool strategy:** Prefer read-only tools to gather information over speculating. Batch independent read-only calls together.
+- **Boundaries:** Do not modify files, run shell commands, update todos, delegate to sub-agents, or claim work has been performed.
+- **Finishing:** Deliver a concrete execution plan with affected areas, validation suggestions, and risks or unknowns. Wait for the user to approve execution before making changes.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SystemPromptToolMode {
+    Execute,
+    PlanOnly,
+}
+
+impl SystemPromptToolMode {
+    fn agent_behavior_section(self) -> &'static str {
+        match self {
+            Self::Execute => AGENT_BEHAVIOR_SECTION,
+            Self::PlanOnly => PLAN_ONLY_AGENT_BEHAVIOR_SECTION,
+        }
+    }
+
+    fn is_plan_only(self) -> bool {
+        matches!(self, Self::PlanOnly)
+    }
+}
 
 // ── Data Models ──────────────────────────────────────────────────────────────
 
@@ -296,7 +324,15 @@ fn now_epoch() -> u64 {
         .as_secs()
 }
 
-const SESSION_VERSION: u32 = 6;
+const SESSION_VERSION: u32 = 7;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingPlan {
+    id: String,
+    original_user_message_index: usize,
+    assistant_plan_message_index: usize,
+    created_at: u64,
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Session {
@@ -355,6 +391,8 @@ struct Session {
     subagent_snapshots: HashMap<String, SubagentHistorySnapshot>,
     #[serde(default)]
     todos: todos::TodoSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pending_plan: Option<PendingPlan>,
     #[serde(default)]
     version: u32,
     #[serde(skip)]
@@ -416,6 +454,9 @@ fn migrate_session(session: &mut Session) {
     if session.version < 6 {
         session.enabled_system_skills = HashSet::new();
     }
+    if session.version < 7 {
+        session.pending_plan = None;
+    }
     todos::normalize_snapshot(&mut session.todos, session.updated_at);
     session.version = SESSION_VERSION;
 }
@@ -460,6 +501,7 @@ impl Session {
             failed_tool_results: HashSet::new(),
             subagent_snapshots: HashMap::new(),
             todos: todos::TodoSnapshot::empty(now_epoch()),
+            pending_plan: None,
             version: SESSION_VERSION,
             workspace,
         }
@@ -634,6 +676,7 @@ struct LiveRoundState {
     cycle: Option<usize>,
     effective_model: Option<String>,
     effective_think: Option<String>,
+    run_mode: Option<String>,
     auto_observation_strength: Option<String>,
     auto_stagnation_streak: Option<usize>,
     auto_error_streak: Option<usize>,
@@ -889,6 +932,7 @@ fn build_system_prompt_static_prefix_cached(
     current_query: Option<&str>,
     enabled_system_skills: &HashSet<String>,
     persona: &str,
+    agent_behavior_section: &str,
     tool_lines: &str,
     mcp_note: &str,
     skills_section: &str,
@@ -900,6 +944,7 @@ fn build_system_prompt_static_prefix_cached(
         .map(ToOwned::to_owned);
     let enabled_skills_hash = hash_enabled_system_skills(enabled_system_skills);
     let persona_hash = hash_prompt_part(&persona);
+    let behavior_hash = hash_prompt_part(&agent_behavior_section);
     let tool_lines_hash = hash_prompt_part(&tool_lines);
     let mcp_note_hash = hash_prompt_part(&mcp_note);
     let skills_hash = hash_prompt_part(&skills_section);
@@ -909,6 +954,7 @@ fn build_system_prompt_static_prefix_cached(
         query,
         enabled_skills_hash,
         persona_hash,
+        behavior_hash,
         tool_lines_hash,
         mcp_note_hash,
         skills_hash,
@@ -936,7 +982,7 @@ fn build_system_prompt_static_prefix_cached(
 {tool_lines}{mcp_note}{skills_section}{agents_section}"#,
         persona = persona,
         prompt_file_note = PROMPT_FILE_NOTE,
-        agent_behavior_section = AGENT_BEHAVIOR_SECTION,
+        agent_behavior_section = agent_behavior_section,
         tool_lines = tool_lines,
         mcp_note = mcp_note,
         skills_section = skills_section,
@@ -1077,6 +1123,24 @@ fn build_system_prompt_with_query_cached(
     enabled_system_skills: &HashSet<String>,
     current_query: Option<&str>,
 ) -> ChatMessage {
+    build_system_prompt_with_query_cached_for_tool_mode(
+        config,
+        workspace,
+        model,
+        enabled_system_skills,
+        current_query,
+        SystemPromptToolMode::Execute,
+    )
+}
+
+pub(crate) fn build_system_prompt_with_query_cached_for_tool_mode(
+    config: &Config,
+    workspace: &Path,
+    model: &str,
+    enabled_system_skills: &HashSet<String>,
+    current_query: Option<&str>,
+    tool_mode: SystemPromptToolMode,
+) -> ChatMessage {
     let os_name = if cfg!(windows) {
         "Windows"
     } else if cfg!(target_os = "macos") {
@@ -1087,13 +1151,22 @@ fn build_system_prompt_with_query_cached(
     let cwd = workspace.display();
     let local_snapshot = prompts::current_local_snapshot();
     let local_time = local_snapshot.datetime_label();
-    let tool_lines = tools::render_tool_prompt_lines_with_query(config, current_query);
+    let agent_behavior_section = tool_mode.agent_behavior_section();
+    let tool_lines = if tool_mode.is_plan_only() {
+        tools::render_read_only_tool_prompt_lines(config)
+    } else {
+        tools::render_tool_prompt_lines_with_query(config, current_query)
+    };
     let prompt_files = prompts::load_session_prompt_files_with_snapshot(workspace, local_snapshot);
     let persona = prompt_files.persona;
     let memory_files = prompt_files.memory;
-    let mcp_note = tools::mcp::runtime_tool_note(config, workspace)
-        .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
-        .unwrap_or_default();
+    let mcp_note = if tool_mode.is_plan_only() {
+        String::new()
+    } else {
+        tools::mcp::runtime_tool_note(config, workspace)
+            .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
+            .unwrap_or_default()
+    };
 
     let skills_section = prompts::discover_all_skills(workspace)
         .into_iter()
@@ -1117,7 +1190,9 @@ fn build_system_prompt_with_query_cached(
         String::new()
     };
 
-    let agents_section = {
+    let agents_section = if tool_mode.is_plan_only() {
+        String::new()
+    } else {
         let agents = subagents::discovery::discover_all_agents(workspace);
         subagents::render_agents_catalog_with_query(&agents, current_query)
             .map(|s| format!("\n\n{s}"))
@@ -1129,6 +1204,7 @@ fn build_system_prompt_with_query_cached(
         current_query,
         enabled_system_skills,
         &persona,
+        agent_behavior_section,
         &tool_lines,
         &mcp_note,
         &skills_section,
@@ -2278,6 +2354,7 @@ async fn dispatch_live_event(
                             cycle: event["cycle"].as_u64().map(|value| value as usize),
                             effective_model: event["model"].as_str().map(str::to_string),
                             effective_think: event["think_level"].as_str().map(str::to_string),
+                            run_mode: event["run_mode"].as_str().map(str::to_string),
                             auto_observation_strength: event["auto_observation_strength"]
                                 .as_str()
                                 .map(str::to_string),
@@ -2792,6 +2869,9 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
         if let Some(value) = live_round.effective_model.as_ref() {
             start_obj.insert("model".to_string(), json!(value));
         }
+        if let Some(value) = live_round.run_mode.as_ref() {
+            start_obj.insert("run_mode".to_string(), json!(value));
+        }
         if let Some(value) = live_round.auto_observation_strength.as_ref() {
             start_obj.insert("auto_observation_strength".to_string(), json!(value));
         }
@@ -3059,7 +3139,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
     );
 
     let mut rerun_agent = false;
-    let mut task_plan_enabled_for_run = true;
+    let mut agent_run_mode = runtime_loop::AgentRunMode::Execute;
     loop {
         if !rerun_agent {
             let text = tokio::select! {
@@ -3084,8 +3164,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             .await
             {
                 IdleSocketInputAction::Continue => continue,
-                IdleSocketInputAction::StartAgent { task_plan_enabled } => {
-                    task_plan_enabled_for_run = task_plan_enabled;
+                IdleSocketInputAction::StartAgent { run_mode } => {
+                    agent_run_mode = run_mode;
                 }
                 IdleSocketInputAction::SwitchSession { session_id, result } => {
                     match switch_socket_session(
@@ -3142,7 +3222,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             &live_tx,
             &mut inbound_rx,
             &stop_requested,
-            task_plan_enabled_for_run,
+            agent_run_mode,
         )
         .await;
         run_active.store(false, Ordering::Relaxed);

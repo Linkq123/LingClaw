@@ -44,6 +44,32 @@
 .msg-row:hover .msg-time { opacity: .6; }
 .msg-row.user .msg-time { text-align: right; }
 
+.plan-execute-action {
+  display: flex;
+  justify-content: flex-start;
+  margin-top: 10px;
+}
+
+.plan-execute-btn {
+  border: 1px solid color-mix(in srgb, var(--accent-success) 28%, var(--border));
+  background: color-mix(in srgb, var(--accent-success) 10%, transparent);
+  color: var(--accent-success);
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.plan-execute-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent-success) 16%, transparent);
+}
+
+.plan-execute-btn:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+
 .msg-usage {
   display: flex;
   justify-content: flex-end;

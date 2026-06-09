@@ -393,6 +393,7 @@
       "structuredMemory": false,
       "dailyReflection": false,
       "enableStateDigest": true,
+      "enableTaskPlan": false,
       "enableS3": true,
       "openaiStreamIncludeUsage": false,
       "anthropicPromptCaching": false
@@ -476,6 +477,7 @@
 - `subAgentTimeout = 0` 表示不限时
 - `maxLlmRetries`: 非负整数
 - `enableStateDigest` 默认可开启
+- `enableTaskPlan` 默认关闭；开启后运行期才生成 `TaskPlan`、注入 `## Task Plan` 动态上下文并发送 `task_plan` live event
 
 #### models.providers
 
@@ -1294,7 +1296,7 @@ ws://127.0.0.1:18989/ws?session=research-notes
 }
 ```
 
-`plan_mode` 为可选布尔值：`true` 表示本轮启用规则生成的 TaskPlan、prompt 注入和 `task_plan` live event；`false` 表示本轮不生成/注入/发送 TaskPlan。省略时按兼容旧客户端处理，默认启用。
+`plan_mode` 为可选布尔值：`true` 表示启动 plan_mode 计划模式，服务端只允许只读探索工具，最终 assistant 消息只产出执行计划，不写文件、不运行命令、不提交推送；`false` 或省略表示直接进入正常执行模式。只规划完成后，服务端会保存一个 `pending_plan` 并发送 `plan_ready`，客户端可再发送 `execute_plan_id` 启动执行。
 
 ### 5.2.2 Slash 命令
 
@@ -1346,9 +1348,35 @@ ws://127.0.0.1:18989/ws?session=research-notes
 - 若两者都存在，服务端会把该图当作受信任的已上传对象
 - 若只传 `url`，服务端会按普通远程图片 URL 校验
 - 最多 `10` 张图
-- `plan_mode` 语义同普通消息 JSON；前端关闭计划模式时会发送 `false`
+- `plan_mode` 语义同普通消息 JSON；开启时只生成计划，关闭或省略时直接执行
 
-### 5.2.4 忙碌期干预
+### 5.2.4 执行已批准计划
+
+只规划模式完成后，客户端可发送：
+
+```json
+{
+  "execute_plan_id": "plan_..."
+}
+```
+
+说明：
+
+- `execute_plan_id` 必须匹配当前 session 的 `pending_plan`
+- 不能与 `text`、`images` 或 `plan_mode` 同时出现；同时出现会返回 `system` 错误
+- 匹配成功后，服务端会清除 `pending_plan`，追加一条内容为 `Proceed with the approved plan.` 的短确认 user 消息，然后以正常执行模式启动 agent
+- 不匹配、已过期或跨 session 使用时会被拒绝
+
+### 5.2.5 只规划模式工具边界
+
+`plan_mode: true` 的运行会调用大模型，但工具集合受限：
+
+- 内置工具只暴露 `think`、`read_file`、`list_dir`、`search_files`、`http_fetch`
+- MCP 工具只暴露当前 session policy 已启用、且缓存描述符被判定为只读的工具
+- 不暴露 `todos`、`exec`、`write_file`、`patch_file`、`delete_file`、`task`、`orchestrate`
+- 如果模型仍尝试调用非只读工具，后端会拒绝该调用，不执行对应 handler
+
+### 5.2.6 忙碌期干预
 
 当主 agent 正在运行时：
 
@@ -1438,6 +1466,7 @@ ws://127.0.0.1:18989/ws?session=research-notes
       "role": "user",
       "content": "你好",
       "timestamp": 1710000000,
+      "message_index": 1,
       "images": [
         {
           "url": "https://..."
@@ -1448,6 +1477,7 @@ ws://127.0.0.1:18989/ws?session=research-notes
       "role": "assistant",
       "content": "你好，我在。",
       "timestamp": 1710000001,
+      "message_index": 2,
       "thinking": "..."
     },
     {
@@ -1485,6 +1515,7 @@ ws://127.0.0.1:18989/ws?session=research-notes
 补充说明：
 
 - `todos` 工具的 `tool_call` / `tool_result` 不会进入这里的可见历史列表
+- `user` / `assistant` 项会包含 `message_index`，用于把 `pending_plan.message_index` 定位回原始 session messages 中的 assistant 计划消息
 - 前端应使用 `todos_state` 渲染 todo 面板，而不是从 `history.messages` 反推
 
 ## 5.3.2 一轮主执行中的基础事件
@@ -1566,7 +1597,7 @@ ws://127.0.0.1:18989/ws?session=research-notes
 
 ### `task_plan`
 
-当前顶层主代理 round/cycle 的临时任务计划，仅在本轮输入启用 `plan_mode` 时发送。该事件由规则生成，不调用 LLM；输入包括当前用户请求、运行期 `WorkingState`、任务记忆、最近工具结果、已发现子代理以及当前 session policy 允许的内置/MCP 工具。`task_plan` 进入 live replay，刷新或重连后会恢复当前计划面板；它不会写入 session messages，也不会自动执行其中的验证命令。
+启用 `settings.enableTaskPlan` 后，当前顶层主代理 round/cycle 会发送临时规则计划。该事件由规则生成，不调用 LLM；输入包括当前用户请求、运行期 `WorkingState`、任务记忆、最近工具结果、已发现子代理以及当前 session policy 允许的内置/MCP 工具。`task_plan` 进入 live replay，刷新或重连后会恢复当前计划面板；它不会写入 session messages，也不会自动执行其中的验证命令。它和 `plan_mode` 计划模式不是同一个概念：`task_plan` 是运行期软指导，`plan_mode: true` 是“先只规划、不执行”的运行模式。
 
 ```json
 {
@@ -1614,6 +1645,25 @@ ws://127.0.0.1:18989/ws?session=research-notes
 - `suggestedTools[].source` 可为 `query`、`memory`、`plan`、`recent_failure`、`intent`；MCP 工具只会来自当前 session policy 已启用集合
 - `verificationSuggestions[]` 只表示建议模型在合适时机选择执行，runtime 不会自动运行、弹确认或改变工具权限模型
 - `status` 为当前计划状态，通常为 `active` 或 `ready`；收到 `done` 后前端可将面板标记为 complete/stale
+
+### `plan_ready`
+
+只规划模式完成并把 assistant 计划消息写入会话历史后发送。该事件也会通过 `history.pending_plan` 恢复，便于刷新或重连后继续显示“开始执行”按钮。
+
+```json
+{
+  "type": "plan_ready",
+  "plan_id": "plan_...",
+  "message_index": 12,
+  "created_at": 1710000000
+}
+```
+
+字段说明：
+
+- `plan_id`: 当前 session 内待执行计划 id
+- `message_index`: assistant 计划消息在 session messages 中的位置
+- `created_at`: 创建时间戳，秒级 Unix time
 
 ### `delta`
 
@@ -2100,7 +2150,7 @@ WebSocket 下若图片不合法，通常以 `system` 事件返回错误，例如
 1. 轮询或请求 `GET /api/health`，确认服务可用
 2. 建立 `/ws` 连接
 3. 收到 `session`、`view_state`、`todos_state`、`history` 后初始化 UI
-4. 发送纯文本，或发送带 `text` / `plan_mode` / `images` 的 JSON 消息
+4. 发送纯文本，或发送带 `text` / `plan_mode` / `images` 的 JSON 消息；若收到 `plan_ready`，可发送 `execute_plan_id` 执行已批准计划
 5. 处理 `start -> delta/thinking/tool/* -> done`
 6. 如需本地上传图片：
    - 先调用 `GET /api/client-config`
@@ -2113,7 +2163,7 @@ WebSocket 下若图片不合法，通常以 `system` 事件返回错误，例如
 - `/api/config` 在配置文件语法错误时不会返回 4xx，而是返回可恢复信息
 - `/api/sessions` 返回当前已知 session 摘要列表，`main` 固定置顶；`POST /api/session` 创建随机 6 位 id 的新 session，`PUT /api/session` 只修改 session 显示名称
 - `/api/todos` 使用整表替换 + revision 冲突语义；冲突时返回 `409 + 当前快照`
-- WebSocket 客户端消息没有显式 `type` 字段，按“纯文本 / slash 命令 / JSON 图片或运行选项消息”三种形态自动分流
+- WebSocket 客户端消息没有显式 `type` 字段，按“纯文本 / slash 命令 / JSON 图片或运行选项消息 / execute_plan_id”自动分流
 - 忙碌时普通文本会进入 deferred intervention 队列，不会立即中断主执行
 
 ## 9. 文档维护建议

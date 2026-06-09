@@ -565,6 +565,7 @@ async fn reset_session_context_and_persist(
                 session.failed_tool_results.clone(),
                 session.tool_calls_count,
                 session.todos.clone(),
+                session.pending_plan.clone(),
                 session.updated_at,
             )
         },
@@ -580,6 +581,7 @@ async fn reset_session_context_and_persist(
             session.tool_calls_count = 0;
             session.todos =
                 crate::todos::TodoSnapshot::cleared_by_user_from(&session.todos, now_epoch());
+            session.pending_plan = None;
         },
         |session,
          (
@@ -588,6 +590,7 @@ async fn reset_session_context_and_persist(
             failed_tool_results,
             tool_calls_count,
             todos,
+            pending_plan,
             updated_at,
         )| {
             session.messages = messages;
@@ -595,6 +598,7 @@ async fn reset_session_context_and_persist(
             session.failed_tool_results = failed_tool_results;
             session.tool_calls_count = tool_calls_count;
             session.todos = todos;
+            session.pending_plan = pending_plan;
             session.updated_at = updated_at;
         },
     )

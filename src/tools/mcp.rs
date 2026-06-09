@@ -328,6 +328,22 @@ pub(crate) fn is_read_only_tool_name(name: &str, config: &Config, workspace: &Pa
         .is_some_and(|descriptor| is_read_only_tool_descriptor(&descriptor))
 }
 
+pub(crate) fn is_read_only_tool_name_for_policy(
+    name: &str,
+    config: &Config,
+    workspace: &Path,
+    policy: &McpSessionPolicy,
+) -> bool {
+    if !is_mcp_tool_name(name) {
+        return false;
+    }
+
+    cached_list_tools_for_policy(config, workspace, policy)
+        .into_iter()
+        .find(|descriptor| descriptor.exposed_name == name)
+        .is_some_and(|descriptor| is_read_only_tool_descriptor(&descriptor))
+}
+
 pub(crate) fn runtime_tool_note(config: &Config, workspace: &Path) -> Option<String> {
     let policy = load_session_policy(workspace);
     if policy.enabled_tools.is_empty() {
@@ -1790,6 +1806,7 @@ pub(crate) async fn test_mcp_server(
         structured_memory: false,
         daily_reflection: false,
         enable_state_digest: true,
+        enable_task_plan: true,
         s3: None,
     };
     let tools = list_server_tools_uncached(server_name, &temp_config, workspace).await?;
@@ -2296,6 +2313,27 @@ pub(crate) fn cached_list_tools_for_policy(
         .into_iter()
         .filter(|tool| policy.allows_tool(tool))
         .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn insert_cached_tool_descriptors_for_test(
+    server_name: &str,
+    config: &Config,
+    workspace: &Path,
+    descriptors: Vec<McpToolDescriptor>,
+) {
+    let server = config
+        .mcp_servers
+        .get(server_name)
+        .expect("test MCP server should exist");
+    let key = cache_key(server_name, server, workspace, config).expect("cache key should build");
+    tool_cache().lock().expect("tool cache lock").insert(
+        key,
+        CachedToolDescriptors {
+            descriptors,
+            loaded_at: Instant::now(),
+        },
+    );
 }
 
 fn cache_key(

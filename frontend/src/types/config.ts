@@ -34,6 +34,7 @@ export interface SettingsConfig {
   structuredMemory?: boolean;
   dailyReflection?: boolean;
   enableStateDigest?: boolean;
+  enableTaskPlan?: boolean;
   enableS3?: boolean;
   openaiStreamIncludeUsage?: boolean;
   anthropicPromptCaching?: boolean;

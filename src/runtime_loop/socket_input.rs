@@ -21,11 +21,35 @@ struct InputImageAttachment {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserMessagePayload {
-    text: String,
+    #[serde(default)]
+    text: Option<String>,
     #[serde(default)]
     images: Vec<InputImageAttachment>,
     #[serde(default)]
     plan_mode: Option<bool>,
+    #[serde(default)]
+    execute_plan_id: Option<String>,
+}
+
+const APPROVED_PLAN_EXECUTION_PREFIX: &str = "Proceed with the approved plan.";
+
+fn approved_plan_execution_message() -> String {
+    APPROVED_PLAN_EXECUTION_PREFIX.to_string()
+}
+
+fn looks_like_structured_user_payload(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix('{') else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    [
+        "\"text\"",
+        "\"images\"",
+        "\"plan_mode\"",
+        "\"execute_plan_id\"",
+    ]
+    .iter()
+    .any(|field| rest.starts_with(field))
 }
 
 pub(super) fn resolve_input_image_url(
@@ -57,7 +81,7 @@ pub(super) fn resolve_input_image_url(
 pub(crate) enum IdleSocketInputAction {
     Continue,
     StartAgent {
-        task_plan_enabled: bool,
+        run_mode: AgentRunMode,
     },
     SwitchSession {
         session_id: String,
@@ -413,10 +437,97 @@ pub(crate) async fn handle_idle_socket_input(
     }
 
     // Try parsing as structured JSON message (with image attachments or UI run options).
-    let (msg_text, msg_images, task_plan_enabled) = if trimmed.starts_with('{') {
+    let (msg_text, msg_images, run_mode) = if trimmed.starts_with('{') {
         match serde_json::from_str::<UserMessagePayload>(trimmed) {
             Ok(payload) => {
-                let requested_task_plan = payload.plan_mode.unwrap_or(true);
+                if let Some(plan_id) = payload.execute_plan_id.as_deref() {
+                    let has_conflicting_fields = payload.text.is_some()
+                        || !payload.images.is_empty()
+                        || payload.plan_mode.is_some();
+                    if has_conflicting_fields {
+                        ws_send(
+                            tx,
+                            &json!({
+                                "type":"system",
+                                "content":"execute_plan_id cannot be combined with text, images, or plan_mode.",
+                                "dismissible": true,
+                            }),
+                        )
+                        .await;
+                        return IdleSocketInputAction::Continue;
+                    }
+
+                    let execute_plan_error = {
+                        let mut sessions = state.sessions.lock().await;
+                        match sessions.get_mut(current_session_id) {
+                            None => Some(json!({
+                                "type":"error",
+                                "content":"Current session not found.",
+                            })),
+                            Some(session) => match session.pending_plan.as_ref().cloned() {
+                                None => Some(json!({
+                                    "type":"system",
+                                    "content":"No pending plan is available to execute.",
+                                    "dismissible": true,
+                                })),
+                                Some(pending_plan) if pending_plan.id != plan_id => Some(json!({
+                                    "type":"system",
+                                    "content":"The requested plan is no longer pending for this session.",
+                                    "dismissible": true,
+                                })),
+                                Some(_) => {
+                                    let execution_message = approved_plan_execution_message();
+                                    session.pending_plan = None;
+                                    session.messages.push(ChatMessage {
+                                        role: "user".into(),
+                                        content: Some(execution_message),
+                                        images: None,
+                                        thinking: None,
+                                        anthropic_thinking_blocks: None,
+                                        tool_calls: None,
+                                        tool_call_id: None,
+                                        timestamp: Some(now_epoch()),
+                                    });
+                                    session.updated_at = now_epoch();
+                                    None
+                                }
+                            },
+                        }
+                    };
+                    if let Some(event) = execute_plan_error {
+                        ws_send(tx, &event).await;
+                        return IdleSocketInputAction::Continue;
+                    }
+                    if let Err(e) = crate::session_store::save_current_session_to_disk(
+                        state,
+                        current_session_id,
+                    )
+                    .await
+                    {
+                        eprintln!("Warning: failed to save session before executing plan: {e}");
+                    }
+                    return IdleSocketInputAction::StartAgent {
+                        run_mode: AgentRunMode::Execute,
+                    };
+                }
+
+                let Some(text) = payload.text else {
+                    ws_send(
+                        tx,
+                        &json!({
+                            "type":"system",
+                            "content":"Structured messages must include text or execute_plan_id.",
+                            "dismissible": true,
+                        }),
+                    )
+                    .await;
+                    return IdleSocketInputAction::Continue;
+                };
+                let requested_run_mode = if payload.plan_mode.unwrap_or(false) {
+                    AgentRunMode::PlanOnly
+                } else {
+                    AgentRunMode::Execute
+                };
                 // Limit images per message to prevent abuse.
                 const MAX_IMAGES_PER_MESSAGE: usize = 10;
                 if payload.images.len() > MAX_IMAGES_PER_MESSAGE {
@@ -549,15 +660,29 @@ pub(crate) async fn handle_idle_socket_input(
                     } else {
                         Some(validated)
                     };
-                    (payload.text, images, requested_task_plan)
+                    (text, images, requested_run_mode)
                 } else {
-                    (payload.text, None, requested_task_plan)
+                    (text, None, requested_run_mode)
                 }
             }
-            Err(_) => (text, None, true),
+            Err(err) => {
+                if looks_like_structured_user_payload(trimmed) {
+                    ws_send(
+                        tx,
+                        &json!({
+                            "type":"system",
+                            "content":format!("Invalid structured message JSON: {err}"),
+                            "dismissible": true,
+                        }),
+                    )
+                    .await;
+                    return IdleSocketInputAction::Continue;
+                }
+                (text, None, AgentRunMode::Execute)
+            }
         }
     } else {
-        (text, None, true)
+        (text, None, AgentRunMode::Execute)
     };
 
     {
@@ -573,39 +698,60 @@ pub(crate) async fn handle_idle_socket_input(
                 tool_call_id: None,
                 timestamp: Some(now_epoch()),
             });
+            session.pending_plan = None;
             session.updated_at = now_epoch();
         }
     }
 
-    IdleSocketInputAction::StartAgent { task_plan_enabled }
+    if let Err(e) =
+        crate::session_store::save_current_session_to_disk(state, current_session_id).await
+    {
+        eprintln!("Warning: failed to save session before starting agent: {e}");
+    }
+
+    IdleSocketInputAction::StartAgent { run_mode }
 }
 
 pub(super) async fn persist_pending_interventions(
     state: &Arc<AppState>,
     current_session_id: &str,
     pending_interventions: &mut Vec<String>,
-) {
+) -> bool {
     if pending_interventions.is_empty() {
-        return;
+        return false;
     }
 
     let drained = std::mem::take(pending_interventions);
-    let mut sessions = state.sessions.lock().await;
-    if let Some(session) = sessions.get_mut(current_session_id) {
-        for text in drained {
-            session.messages.push(ChatMessage {
-                role: "user".into(),
-                content: Some(text),
-                images: None,
-                thinking: None,
-                anthropic_thinking_blocks: None,
-                tool_calls: None,
-                tool_call_id: None,
-                timestamp: Some(now_epoch()),
-            });
+    let changed = {
+        let mut sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(current_session_id) {
+            for text in drained {
+                session.messages.push(ChatMessage {
+                    role: "user".into(),
+                    content: Some(text),
+                    images: None,
+                    thinking: None,
+                    anthropic_thinking_blocks: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                    timestamp: Some(now_epoch()),
+                });
+            }
+            session.pending_plan = None;
+            session.updated_at = now_epoch();
+            true
+        } else {
+            false
         }
-        session.updated_at = now_epoch();
+    };
+
+    if changed
+        && let Err(e) =
+            crate::session_store::save_current_session_to_disk(state, current_session_id).await
+    {
+        eprintln!("Warning: failed to save pending interventions: {e}");
     }
+    changed
 }
 
 pub(super) async fn drain_shared_interventions(
@@ -723,7 +869,7 @@ fn extract_busy_intervention(trimmed: &str) -> Option<(String, bool)> {
 
     if trimmed.starts_with('{') {
         match serde_json::from_str::<UserMessagePayload>(trimmed) {
-            Ok(payload) => Some((payload.text, !payload.images.is_empty())),
+            Ok(payload) => payload.text.map(|text| (text, !payload.images.is_empty())),
             Err(_) => Some((trimmed.to_string(), false)),
         }
     } else {

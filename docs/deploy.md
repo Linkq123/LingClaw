@@ -413,6 +413,7 @@ volumes:
 | `maxFileBytes` | `204800` | 文件读取大小上限 | — |
 | `structuredMemory` | `false` | 启用 Finish 后台结构化记忆抽取与后续 prompt 注入 | `LINGCLAW_STRUCTURED_MEMORY` |
 | `dailyReflection` | `false` | 启用多步任务完成后的后台 reflection 写入 | `LINGCLAW_DAILY_REFLECTION` |
+| `enableTaskPlan` | `false` | 启用运行期规则 `TaskPlan`、`## Task Plan` 动态 prompt 注入和 `task_plan` live event | — |
 | `enableS3` | `true` | 开启本地图片上传能力；仍需顶层 `s3` 配置完整可用 | `LINGCLAW_ENABLE_S3` |
 
 > 优先级：JSON 配置文件 > 环境变量 > 内置默认值

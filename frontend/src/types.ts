@@ -9,6 +9,7 @@ export interface ImageAttachment {
 export interface HistoryMessage {
   role: 'user' | 'assistant' | 'tool_call' | 'tool_result';
   content: string;
+  message_index?: number;
   images?: ImageAttachment[];
   id?: string;
   timestamp?: number;
@@ -95,6 +96,7 @@ export interface SessionEvent {
 export interface HistoryEvent {
   type: 'history';
   messages?: HistoryMessage[];
+  pending_plan?: PlanReadyPayload;
 }
 
 export interface DeltaEvent {
@@ -169,6 +171,7 @@ export interface ReactPhaseEvent {
 
 export interface StartEvent {
   type: 'start';
+  run_mode?: 'execute' | 'plan_only';
 }
 export interface DoneEvent {
   type: 'done';
@@ -304,6 +307,16 @@ export interface TaskPlanEvent {
   plan: TaskPlanPayload;
 }
 
+export interface PlanReadyPayload {
+  plan_id: string;
+  message_index: number;
+  created_at: number;
+}
+
+export interface PlanReadyEvent extends PlanReadyPayload {
+  type: 'plan_ready';
+}
+
 export interface UsageEvent {
   type: 'usage';
   daily_input_tokens?: number;
@@ -387,6 +400,7 @@ export type WebSocketMessage =
   | ThinkingDoneEvent
   | AutoTraceEvent
   | TaskPlanEvent
+  | PlanReadyEvent
   | ContextCompressedEvent
   | ContextPrunedEvent
   | ContextCompressSkippedEvent

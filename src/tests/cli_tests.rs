@@ -71,6 +71,7 @@ fn test_config_with_broken_mcp() -> Config {
         max_file_bytes: 200 * 1024,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     }
 }
 

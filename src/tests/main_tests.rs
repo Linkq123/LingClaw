@@ -56,6 +56,7 @@ fn test_config() -> Config {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     }
 }
 
@@ -267,6 +268,7 @@ fn test_session(id: &str, name: &str, model_override: Option<&str>) -> Session {
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: 0,
         workspace: PathBuf::new(),
     }
@@ -1456,6 +1458,7 @@ fn resolve_model_uses_config_for_plain_model_id() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let resolved = config.resolve_model("gpt-4o-mini");
@@ -1524,6 +1527,21 @@ fn settings_enable_s3_deserializes() {
 
     let settings = cfg.settings.expect("settings should deserialize");
     assert_eq!(settings.enable_s3, Some(true));
+}
+
+#[test]
+fn settings_enable_task_plan_deserializes() {
+    let cfg: JsonConfig = serde_json::from_str(
+        r#"{
+            "settings": {
+                "enableTaskPlan": true
+            }
+        }"#,
+    )
+    .expect("enableTaskPlan should deserialize");
+
+    let settings = cfg.settings.expect("settings should deserialize");
+    assert_eq!(settings.enable_task_plan, Some(true));
 }
 
 #[test]
@@ -1732,6 +1750,12 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: Some(crate::PendingPlan {
+            id: "plan_history".into(),
+            original_user_message_index: 0,
+            assistant_plan_message_index: 1,
+            created_at: 456,
+        }),
         version: 0,
         workspace: PathBuf::new(),
     };
@@ -1750,6 +1774,49 @@ fn build_history_payload_preserves_raw_tool_result_content() {
         Some(long_raw_result.as_str())
     );
     assert_eq!(tool_result["is_error"].as_bool(), Some(false));
+    assert_eq!(
+        payload["pending_plan"]["plan_id"].as_str(),
+        Some("plan_history")
+    );
+    assert_eq!(payload["pending_plan"]["message_index"].as_u64(), Some(1));
+    assert_eq!(payload["pending_plan"]["created_at"].as_u64(), Some(456));
+}
+
+#[test]
+fn build_history_payload_includes_session_message_indexes_for_chat_rows() {
+    let mut session = test_session("history-indexes", "History Indexes", None);
+    session
+        .messages
+        .push(make_message("user", "plan this change"));
+    session
+        .messages
+        .push(make_message("assistant", "Approved plan"));
+    session.messages.push(ChatMessage {
+        role: "tool".into(),
+        content: Some("tool output".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: Some("call_1".into()),
+        timestamp: None,
+    });
+
+    let payload = build_history_payload(&session);
+    let messages = payload["messages"]
+        .as_array()
+        .expect("history payload should contain a messages array");
+    let user = messages
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("history payload should contain user entry");
+    let assistant = messages
+        .iter()
+        .find(|message| message["role"] == "assistant")
+        .expect("history payload should contain assistant entry");
+
+    assert_eq!(user["message_index"].as_u64(), Some(1));
+    assert_eq!(assistant["message_index"].as_u64(), Some(2));
 }
 
 #[test]
@@ -1790,6 +1857,7 @@ fn build_history_payload_marks_failed_tool_result_with_is_error() {
         failed_tool_results: HashSet::from(["task_1".to_string()]),
         subagent_snapshots: HashMap::new(),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -1850,6 +1918,7 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -1907,6 +1976,7 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -1993,6 +2063,7 @@ fn build_history_payload_includes_thinking_only_assistant_messages() {
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2066,6 +2137,7 @@ fn build_history_payload_redacts_exec_tool_call_arguments() {
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2166,6 +2238,7 @@ fn build_history_payload_includes_subagent_snapshot_on_task_results() {
             },
         )]),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2275,6 +2348,7 @@ fn build_history_payload_redacts_exec_args_in_subagent_snapshot() {
             },
         )]),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2361,6 +2435,7 @@ fn build_history_payload_normalizes_legacy_subagent_snapshot_keys() {
             },
         )]),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2485,6 +2560,7 @@ fn build_history_payload_distinguishes_repeated_task_tool_call_ids() {
             ),
         ]),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2625,6 +2701,7 @@ fn replace_session_messages_rekeys_subagent_snapshots_for_remaining_history() {
             ),
         ]),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2806,6 +2883,7 @@ fn build_history_payload_omits_todos_tool_messages() {
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };
@@ -2907,6 +2985,7 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let resolved = config.resolve_model("llama3.2");
@@ -2988,6 +3067,7 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     assert!(crate::cli::is_default_model_row(
@@ -3075,6 +3155,7 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -3154,6 +3235,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -3233,6 +3315,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_anthropic_provider_type() 
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let resolved = config.resolve_model("shared-model");
@@ -3312,6 +3395,7 @@ fn resolve_model_prefers_exact_runtime_match_for_same_ollama_provider_type() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let resolved = config.resolve_model("qwen3");
@@ -3375,6 +3459,7 @@ fn canonical_model_ref_expands_unique_plain_id() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let canonical = config
@@ -3453,6 +3538,7 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let err = config
@@ -3533,6 +3619,7 @@ fn available_models_omits_ambiguous_plain_default_alias() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let available = config.available_models();
@@ -3593,6 +3680,7 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let err = config
@@ -3653,6 +3741,7 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let canonical = config
@@ -3693,6 +3782,7 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let canonical = config
@@ -3733,6 +3823,7 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let resolved = config.resolve_model("anthropic/claude-opus-4-7");
@@ -3773,6 +3864,7 @@ fn resolve_model_accepts_ollama_prefix_without_provider_config() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let resolved = config.resolve_model("ollama/llama3.2");
@@ -3833,6 +3925,7 @@ fn build_session_status_reports_resolved_target() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
     let mut session = test_session("abc", "Test", Some("anthropic/claude-opus-4-7"));
     session.think_level = "medium".to_string();
@@ -4532,6 +4625,7 @@ fn save_session_to_disk_omits_empty_assistant_reply_from_json() {
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: 0,
         workspace: workspace.clone(),
     };
@@ -4682,6 +4776,7 @@ fn save_session_to_disk_redacts_exec_arguments_in_messages_and_snapshots() {
             },
         )]),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: 0,
         workspace,
     };
@@ -4747,6 +4842,7 @@ fn save_session_to_disk_overwrites_existing_file() {
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: 1,
         workspace: workspace.clone(),
     };
@@ -4836,6 +4932,7 @@ fn save_session_to_disk_skips_identical_payload_rewrite() {
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: SESSION_VERSION,
         workspace,
     };
@@ -6861,6 +6958,7 @@ fn observation_summary_does_not_appear_in_persisted_tool_result() {
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: 0,
         workspace: PathBuf::new(),
     };
@@ -7203,6 +7301,12 @@ fn handle_command_persists_clear_changes() {
         last_updated_by: crate::todos::TodoUpdatedBy::User,
         updated_at: 44,
     };
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_clear".into(),
+        original_user_message_index: 1,
+        assistant_plan_message_index: 2,
+        created_at: 123,
+    });
 
     let state = test_app_state();
     {
@@ -7239,7 +7343,18 @@ fn handle_command_persists_clear_changes() {
         persisted.todos.last_updated_by,
         crate::todos::TodoUpdatedBy::User
     );
+    assert!(persisted.pending_plan.is_none());
     assert!(persisted.updated_at > 0);
+    {
+        let sessions = rt.block_on(state.sessions.lock());
+        assert!(
+            sessions
+                .get(&session_id)
+                .expect("session should remain in memory")
+                .pending_plan
+                .is_none()
+        );
+    }
 
     let stale_todo_write = rt
         .block_on(crate::todos::replace_session_todos(
@@ -7517,6 +7632,7 @@ fn resolve_session_target_for_command_accepts_persisted_empty_session_prefix() {
         failed_tool_results: Default::default(),
         subagent_snapshots: HashMap::new(),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: SESSION_VERSION,
         workspace: session_workspace_path(&session_id),
     };
@@ -11690,6 +11806,7 @@ fn dispatch_live_event_allows_live_round_source_after_run_teardown() {
                 cycle: Some(1),
                 effective_model: None,
                 effective_think: None,
+                run_mode: None,
                 auto_observation_strength: None,
                 auto_stagnation_streak: None,
                 auto_error_streak: None,
@@ -12409,6 +12526,7 @@ fn context_input_budget_reserves_headroom() {
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     };
 
     let budget = context_input_budget_for_model(&config, "anthropic/claude-opus-4-7");
@@ -13052,6 +13170,7 @@ fn trim_incomplete_tool_calls_in_session_drops_orphaned_subagent_snapshots() {
             },
         )]),
         todos: crate::todos::TodoSnapshot::default(),
+        pending_plan: None,
         version: SESSION_VERSION,
         workspace: PathBuf::new(),
     };

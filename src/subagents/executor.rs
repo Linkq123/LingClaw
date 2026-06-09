@@ -1613,6 +1613,7 @@ mod tests {
             daily_reflection: false,
             s3: None,
             enable_state_digest: true,
+            enable_task_plan: true,
         }
     }
 

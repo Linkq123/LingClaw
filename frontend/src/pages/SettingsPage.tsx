@@ -361,6 +361,9 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
         <SettingsRow label="State Digest">
           <TriSelect value={s.enableStateDigest} onChange={(v) => set({ enableStateDigest: v })} />
         </SettingsRow>
+        <SettingsRow label="Task Plan">
+          <TriSelect value={s.enableTaskPlan} onChange={(v) => set({ enableTaskPlan: v })} />
+        </SettingsRow>
         <SettingsRow label="Enable S3">
           <TriSelect value={s.enableS3} onChange={(v) => set({ enableS3: v })} />
         </SettingsRow>

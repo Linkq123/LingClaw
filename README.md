@@ -19,7 +19,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **多会话**：默认会话仍为 `main`，但现在支持创建、切换、重命名、列出和删除其他持久化 session；新增 session 时后端会自动生成 6 位英数字 id，用户只需在需要时重命名；前端使用左侧可折叠的 session drawer 切换，`main` 固定置顶，刷新后会恢复上次选中的 session，WebSocket 连接按 session 绑定并在切换时重连
 - **会话级 Todos**：新增结构化 `todos` 工具，维护每个 session 唯一的一份当前任务清单；采用“整表替换 + revision 乐观并发”协议，支持用户与主代理协同编辑、重连恢复、冲突检测，以及专用 todo 面板展示
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、frontend-coder、backend-coder、general-coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
-- **运行期 Task Plan**：聊天页计划模式开启时，每轮 Analyze 前用规则生成临时 `TaskPlan`，结合用户请求、`WorkingState`、任务记忆、最近工具结果、可用工具和子代理，向模型软注入目标、步骤、工具/代理建议、验证建议与验收标准；关闭计划模式时本轮不生成/注入/发送 TaskPlan；不会自动执行验证命令，也不会写入会话消息历史
+- **运行期 Task Plan**：默认关闭；在 Settings → General → Features 开启 `Task Plan` 后，每轮 Analyze 前用规则生成临时 `TaskPlan`，结合用户请求、`WorkingState`、任务记忆、最近工具结果、可用工具和子代理，向模型软注入目标、步骤、工具/代理建议、验证建议与验收标准；它是运行期软指导，不会自动执行验证命令，也不会写入会话消息历史。聊天页“计划模式”对应 `plan_mode` 计划模式：先产出可批准的计划，再由用户点击“开始执行”
 - **文档化斜杠命令**：`/new`、`/model`、`/switch`、`/sessions`、`/delete`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/reflection`、`/help`
 - **多 Provider 模型路由**：OpenAI（Chat Completions / Responses）+ Anthropic + Ollama + Gemini，支持 `provider/model` 和纯 model ID
 - **OpenAI 双协议**：OpenAI family 现在支持保留原有 `openai-completions`（`/v1/chat/completions`）并新增 `openai-responses`（`/v1/responses`）；两者共享同一套模型解析与工具权限体系。对话路径下两者都使用原生上游流式调用，`openai-responses` 会设置 `stream: true` 并把 Responses SSE 事件映射为 LingClaw 现有前端事件流
@@ -34,13 +34,14 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **Daily Reflection（可选）**：启用 `dailyReflection` 后，多步任务完成时会在 Finish 后台异步生成简短 reflection，追加到 workspace 下的 `memory/YYYY-MM-DD.md`；`/reflection`、`/reflection today`、`/reflection yesterday`、`/reflection list` 可查看状态和已过滤的 reflection 条目
 - **更细粒度的 Token 统计**：Primary、Fast、Sub-Agent、Memory、Reflection、Context 六类模型角色都会分别累计 token；`/new` 压缩、自动上下文压缩、Structured Memory 和 Daily Reflection 的非流式调用也会计入 Usage
 - **可关闭的 Slash Command 卡片**：聊天页中由斜杠命令返回的 `success`、`system`、`error` 卡片支持点击关闭；运行进度和自动压缩通知仍保持常驻提示
-- **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环；运行时维护每轮临时 `WorkingState` 与规则生成的 `TaskPlan`，用于汇总 `TaskIntent`、证据、blocker、下一步动作、工具排序和验证建议，辅助 observation 摘要、动态 prompt 注入与 auto-think 信号
+- **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环；运行时维护每轮临时 `WorkingState`，并在 `settings.enableTaskPlan` 开启时生成规则 `TaskPlan`，用于汇总 `TaskIntent`、证据、blocker、下一步动作、工具排序和验证建议，辅助 observation 摘要、动态 prompt 注入与 auto-think 信号
 - **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留；错误工具标记 `[FAILED]` 并附带耗时；在多工具、错误或超长结果场景下，还会触发轻量状态摘要来更新当前 `WorkingState`
 - **推理可见性控制**：默认开启 ReAct 阶段转换 WS 事件（`react_phase`），可通过 `/react on|off` 手动切换；浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
-- **Auto 思维可观测性**：当 `/think auto` 且当前模型支持 reasoning effort 时，后端会额外发送 `auto_trace` WebSocket 事件；计划模式开启时，每轮 Analyze 还会发送 `task_plan` 事件用于前端 timeline 展示当前软计划、工具建议和验证建议；`/status` 会显示 live runtime think、auto signals 与 request budget 摘要，前端 `Auto Debug` 开关只在本地展示最新一条顶层轨迹，不会写回 session 配置
+- **plan_mode 计划模式**：输入框 `+` 菜单中的计划模式开启后，本轮只做理解、只读探索和计划输出；后端只暴露 `think`、`read_file`、`list_dir`、`search_files`、`http_fetch` 以及 session policy 允许的只读 MCP 工具，不会写文件、执行命令、改 todo、调用子代理或提交推送。计划完成后 assistant 计划会进入会话历史，前端显示“开始执行”按钮，点击后发送 `execute_plan_id`，服务端追加 `Proceed with the approved plan.` 短确认 user 消息，再进入正常执行模式
+- **Auto 思维可观测性**：当 `/think auto` 且当前模型支持 reasoning effort 时，后端会额外发送 `auto_trace` WebSocket 事件；启用 `settings.enableTaskPlan` 后，每轮 Analyze 还会发送规则生成的 `task_plan` 事件用于前端 timeline 展示当前软计划、工具建议和验证建议；`/status` 会显示 live runtime think、auto signals 与 request budget 摘要，前端 `Auto Debug` 开关只在本地展示最新一条顶层轨迹，不会写回 session 配置
 - **结构化工具结果**：`ToolOutcome`（output + is_error + duration_ms），前缀式错误检测，schema 约束校验（required/type/range/length），`tool_result` WS 事件携带耗时和错误标记
 - **原子持久化**：会话存档先写 `.tmp` 再 rename（Windows 兼容），加载时自动修剪不完整工具调用
-- **会话版本控制**：`SESSION_VERSION = 6`，旧存档自动迁移并补齐 `show_tools` / `show_reasoning` / `show_react` / `todos` / `enabled_system_skills` 等字段默认值
+- **会话版本控制**：`SESSION_VERSION = 7`，旧存档自动迁移并补齐 `show_tools` / `show_reasoning` / `show_react` / `todos` / `enabled_system_skills` / `pending_plan` 等字段默认值
 - **上下文裁剪追踪**：Analyze 阶段裁剪后发送 `context_pruned` WS 事件，包含移除消息数
 - **安全控制**：危险命令检测、沙盒路径解析、SSRF 阻断、重定向阻断、输出/文件大小上限
 
@@ -123,6 +124,7 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
     "maxFileBytes": 204800,
     "structuredMemory": false,
     "dailyReflection": false,
+    "enableTaskPlan": false,
     "enableS3": true
   },
   "models": {
@@ -247,6 +249,7 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 - 新配置应通过 `models.providers` 定义 provider 实例，并用 `agents.defaults.model.primary` 选择默认模型
 - `structuredMemory` 默认为 `false`；启用后会在 Finish 阶段后台更新结构化记忆，并在后续 system prompt 中注入摘要；若配置了 `agents.defaults.model.memory` 或 `LINGCLAW_MEMORY_MODEL`，后台抽取优先使用该模型，否则回退到当前会话有效模型
 - `dailyReflection` 默认为 `false`；启用后会在满足轮次和冷却条件时，于 Finish 后台生成 post-execution reflection，并追加到 `memory/YYYY-MM-DD.md`；若配置了 `agents.defaults.model.reflection` 或 `LINGCLAW_REFLECTION_MODEL`，reflection 优先使用该模型，否则回退到 memory 模型，再回退到当前会话有效模型
+- `enableTaskPlan` 默认为 `false`；可在 Settings → General → Features 的 `Task Plan` 开关启用。启用后运行期会生成规则 `TaskPlan`，注入 `## Task Plan` 动态上下文并发送 `task_plan` live event；关闭时不生成、不注入、不发送，不影响 `plan_mode` 计划模式本身
 - 顶层 `s3` 为可选项；配置后聊天页会额外启用本地 JPEG/PNG 上传，上传对象以 object key 持久化，历史回放和 provider 请求都会即时重新现签 URL
 - AWS S3 若使用官方 endpoint，建议使用与 `region` 对应的区域 host；设置向导留空 endpoint 时会自动默认到该区域地址
 - OpenAI/Anthropic 直接使用现签 URL，因此 `s3.endpoint` 必须能被远端 provider 访问；Gemini/Ollama 路径会在本地预取并转成 base64/inlineData，可用于私网、localhost 或 VPN-only 网关
@@ -602,7 +605,7 @@ Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的
 
 - **每轮携带临时 WorkingState**：挂在 `AgentPhaseState` 上，只在当前 run 内存在；核心字段包括 `intent`、`primary_goal`、`completed_steps`、`evidence`、`open_questions`、`uncertainties`、`next_actions`、`ready_to_finish`
 - **Observe 先规则更新，再按需轻量摘要**：成功工具写入完成步骤/证据，失败工具写入 blocker；只有在工具报错、结果超长或本轮工具数大于 2 时，才会调用 fast model 生成 JSON `StateDigestDelta`
-- **Analyze 动态注入任务上下文**：除基础 system prompt 外，还会按预算注入 `## Task State`、Relevant Past Experience、Tool Hints、Suggested Tool Order、Suggested Sub-Agents、Delegation Guidance；计划模式开启时额外注入 `## Task Plan` 并使用其中的工具/验证建议；这些内容不进入静态 system prompt cache
+- **Analyze 动态注入任务上下文**：除基础 system prompt 外，还会按预算注入 `## Task State`、Relevant Past Experience、Tool Hints、Suggested Tool Order、Suggested Sub-Agents、Delegation Guidance；启用 `settings.enableTaskPlan` 后，还会额外注入规则生成的 `## Task Plan` 及其中的工具/验证建议。这些内容不进入静态 system prompt cache。`plan_mode: true` 会切换到只规划运行模式，但 `TaskPlan` 本身仍只是辅助上下文
 - **Finish 判定保持轻量**：Analyze 阶段通过 `evaluate_finish()` 仅根据“是否有内容 / 是否有 tool_calls”决定进入 Finish 或继续 Act；`WorkingState` 继续服务于上下文构建、auto-think 和 observation 汇总，而不是拦截 finish 出口
 
 **关键设计决策：**
@@ -657,7 +660,7 @@ handle_socket()
   └─ 返回控制权给 WebSocket 读循环
 ```
 
-注：上面的流程图是简化视图。当前实现里，`Observe` 阶段还会同步更新 `WorkingState`、对齐 task memory 命中项，并在满足条件时触发轻量 state digest；下一轮 `Analyze` 会再把 `Task State`、任务记忆、工具排序建议和子代理/委托建议按预算动态注入；如果本轮启用计划模式，还会注入 `Task Plan` 与验证建议。
+注：上面的流程图是简化视图。当前实现里，`Observe` 阶段还会同步更新 `WorkingState`、对齐 task memory 命中项，并在满足条件时触发轻量 state digest；下一轮 `Analyze` 会再把 `Task State`、任务记忆、工具排序建议、子代理/委托建议按预算动态注入；启用 `settings.enableTaskPlan` 后才会额外注入规则生成的 `Task Plan` 与验证建议。`plan_mode: true` 只切换到 plan_mode 计划模式，不再决定是否生成运行期 `TaskPlan`。
 
 ### 模块地图
 
@@ -763,7 +766,8 @@ struct Session {
     show_react: bool,
     todos: TodoSnapshot,
     enabled_system_skills: HashSet<String>,   // 当前 session 启用注入的系统 Skill 模式
-    version: u32,              // 会话版本 (当前 SESSION_VERSION = 6)
+    pending_plan: Option<PendingPlan>,
+    version: u32,              // 会话版本 (当前 SESSION_VERSION = 7)
 }
 
 struct TodoSnapshot {
@@ -975,7 +979,8 @@ think_level 映射：
 | `history` | 当前会话历史消息 |
 | `start` | 新一轮回复开始 |
 | `auto_trace` | `think=auto` 的最新顶层决策轨迹（selected think、baseline、signals、escalators/dampeners/clamps） |
-| `task_plan` | 计划模式开启时发送的当前 round/cycle 临时任务计划、工具/代理建议、验证建议与验收标准；进入 live replay，但不写入 session 历史 |
+| `task_plan` | 启用 `settings.enableTaskPlan` 后发送的当前 round/cycle 临时规则计划、工具/代理建议、验证建议与验收标准；进入 live replay，但不写入 session 历史 |
+| `plan_ready` | plan_mode 计划模式完成后发送，表示 assistant 计划已写入历史且可通过 `execute_plan_id` 开始执行 |
 | `delta` | 流式文本片段 |
 | `thinking_start` | 思维模式开始 |
 | `thinking_delta` | 思维流式片段 |

@@ -165,6 +165,8 @@ pub(crate) struct Config {
     pub(crate) daily_reflection: bool,
     /// Enable LLM working state digest after tool observations (default: true).
     pub(crate) enable_state_digest: bool,
+    /// Enable rule-based runtime TaskPlan prompt guidance and live events (default: false).
+    pub(crate) enable_task_plan: bool,
     /// Optional S3-compatible storage for image uploads.
     pub(crate) s3: Option<S3Config>,
 }
@@ -754,6 +756,7 @@ impl Config {
                 .or_else(|| parse_boolish_env("LINGCLAW_DAILY_REFLECTION"))
                 .unwrap_or(false),
             enable_state_digest: settings.enable_state_digest.unwrap_or(true),
+            enable_task_plan: settings.enable_task_plan.unwrap_or(false),
             s3,
         };
         align_runtime_provider_config(
@@ -1380,6 +1383,9 @@ pub(crate) struct JsonSettings {
     /// Enable LLM working state digest after tool observations (default: true).
     #[serde(rename = "enableStateDigest")]
     pub(crate) enable_state_digest: Option<bool>,
+    /// Enable rule-based runtime TaskPlan prompt guidance and live events (default: false).
+    #[serde(rename = "enableTaskPlan")]
+    pub(crate) enable_task_plan: Option<bool>,
     /// Enable S3-compatible image upload (default: true when s3 section is configured).
     #[serde(rename = "enableS3")]
     pub(crate) enable_s3: Option<bool>,

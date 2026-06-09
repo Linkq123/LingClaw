@@ -109,6 +109,17 @@ function findInputByPlaceholder(placeholder: string): HTMLInputElement {
   return input;
 }
 
+function findSelectBySettingsLabel(text: string): HTMLSelectElement {
+  const row = Array.from(document.querySelectorAll('.settings-row')).find((node) =>
+    node.querySelector('label')?.textContent?.includes(text),
+  );
+  const select = row?.querySelector('select');
+  if (!(select instanceof HTMLSelectElement)) {
+    throw new Error(`Select not found: ${text}`);
+  }
+  return select;
+}
+
 function setInputValue(input: HTMLInputElement, value: string): void {
   const valueSetter = Object.getOwnPropertyDescriptor(
     window.HTMLInputElement.prototype,
@@ -139,6 +150,15 @@ function deferred<T>(): {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+function setSelectValue(select: HTMLSelectElement, value: string): void {
+  const valueSetter = Object.getOwnPropertyDescriptor(
+    window.HTMLSelectElement.prototype,
+    'value',
+  )?.set;
+  valueSetter?.call(select, value);
+  select.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 describe('SettingsPage shell layout and dirty state', () => {
@@ -222,6 +242,48 @@ describe('SettingsPage shell layout and dirty state', () => {
 
     expect(savedBody).toEqual({ config: { settings: { port: 19000 } } });
     expect(save.disabled).toBe(true);
+  });
+
+  it('saves the Task Plan feature switch as enableTaskPlan', async () => {
+    let savedBody: unknown;
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config' && (!init || !('method' in init) || !init.method)) {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: { settings: { enableTaskPlan: false } },
+          }),
+        );
+      }
+      if (url === '/api/config' && init?.method === 'PUT') {
+        savedBody = JSON.parse(String(init.body || '{}'));
+        return Promise.resolve(jsonResponse({ ok: true }));
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    const save = document.getElementById('settings-save-btn');
+    if (!(save instanceof HTMLButtonElement)) throw new Error('Save button not found');
+    expect(save.disabled).toBe(true);
+
+    await act(async () => {
+      setSelectValue(findSelectBySettingsLabel('Task Plan'), 'true');
+      await flushMicrotasks();
+    });
+
+    expect(save.disabled).toBe(false);
+
+    await act(async () => {
+      save.click();
+      await flushMicrotasks();
+    });
+
+    expect(savedBody).toEqual({ config: { settings: { enableTaskPlan: true } } });
   });
 
   it('does not prompt on tab changes but prompts before closing dirty settings', async () => {

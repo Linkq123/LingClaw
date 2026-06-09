@@ -36,6 +36,7 @@ fn runtime_alignment_config(
         daily_reflection: false,
         s3: None,
         enable_state_digest: true,
+        enable_task_plan: true,
     }
 }
 

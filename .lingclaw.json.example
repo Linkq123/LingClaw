@@ -11,6 +11,7 @@
     "structuredMemory": false,
     "dailyReflection": false,
     "enableStateDigest": true,
+    "enableTaskPlan": false,
     "enableS3": true
   },
   "models": {

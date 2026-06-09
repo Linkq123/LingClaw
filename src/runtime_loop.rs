@@ -185,6 +185,18 @@ pub(crate) struct AgentRunOutcome {
     pub(crate) shutting_down: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AgentRunMode {
+    Execute,
+    PlanOnly,
+}
+
+impl AgentRunMode {
+    fn is_plan_only(self) -> bool {
+        matches!(self, Self::PlanOnly)
+    }
+}
+
 struct AgentRunCtx<'a> {
     state: &'a Arc<AppState>,
     current_session_id: &'a str,
@@ -199,7 +211,7 @@ struct AgentPhaseState {
     collected_results: Vec<agent::ToolResultEntry>,
     results_origin_query: Option<String>,
     working_state: agent::WorkingState,
-    task_plan_enabled: bool,
+    run_mode: AgentRunMode,
     task_plan: Option<agent::TaskPlan>,
     retrieved_task_memory: Option<memory::RetrievedTaskMemory>,
     retrieved_task_memory_key: Option<String>,
@@ -233,7 +245,13 @@ const OBSERVE_SAVE_DEBOUNCE: Duration = Duration::from_secs(5);
 const AUTO_TOOL_HISTORY_CAP: usize = 12;
 const DYNAMIC_PROMPT_OPTIONAL_SECTIONS_CHAR_BUDGET: usize = 4_000;
 const DYNAMIC_PROMPT_TRUNCATION_MARKER: &str = "\n*(additional dynamic context truncated)*";
+const PLAN_ONLY_PROMPT_SECTION: &str = "## Plan Mode\n\
+You are in plan-only mode. Explore with read-only tools when helpful, then stop with a concrete implementation plan.\n\
+- Do not modify files, execute shell commands, update todos, delegate to agents, or claim work has been performed.\n\
+- The final answer must be a plan with goal, key implementation steps, affected areas, verification suggestions, and risks or open questions.\n\
+- Wait for the user to approve execution before making changes.";
 
+#[derive(Debug)]
 enum AgentPhaseControl {
     Continue,
     Break,
@@ -680,12 +698,18 @@ async fn prepare_analyze_snapshot(
         context_has_images,
     );
 
-    let mut fresh_system = build_system_prompt_with_query_cached(
+    let system_prompt_tool_mode = if phase_state.run_mode.is_plan_only() {
+        SystemPromptToolMode::PlanOnly
+    } else {
+        SystemPromptToolMode::Execute
+    };
+    let mut fresh_system = build_system_prompt_with_query_cached_for_tool_mode(
         &config,
         &session.workspace,
         &model_str,
         &enabled_system_skills,
         latest_query.as_deref(),
+        system_prompt_tool_mode,
     );
 
     refresh_retrieved_task_memory(
@@ -696,12 +720,20 @@ async fn prepare_analyze_snapshot(
         false,
     );
     let discovered_agents = crate::subagents::discovery::discover_all_agents(&session.workspace);
-    let task_plan = if phase_state.task_plan_enabled {
-        let available_tools = available_tool_names_for_plan(&config, &session.workspace);
-        let available_agent_names = discovered_agents
-            .iter()
-            .map(|agent| agent.name.clone())
-            .collect::<Vec<_>>();
+    let task_plan = if config.enable_task_plan {
+        let available_tools = if phase_state.run_mode.is_plan_only() {
+            available_tool_names_for_plan_only(&config, &session.workspace)
+        } else {
+            available_tool_names_for_plan(&config, &session.workspace)
+        };
+        let available_agent_names = if phase_state.run_mode.is_plan_only() {
+            Vec::new()
+        } else {
+            discovered_agents
+                .iter()
+                .map(|agent| agent.name.clone())
+                .collect::<Vec<_>>()
+        };
         Some(agent::build_task_plan(
             &phase_state.working_state,
             latest_query.as_deref(),
@@ -721,6 +753,9 @@ async fn prepare_analyze_snapshot(
     if let Some(ref mut content) = fresh_system.content {
         let todos_section = crate::todos::render_prompt_section(&session.todos);
         let _ = append_required_dynamic_prompt_section(content, &todos_section);
+        if phase_state.run_mode.is_plan_only() {
+            let _ = append_required_dynamic_prompt_section(content, PLAN_ONLY_PROMPT_SECTION);
+        }
 
         let mut remaining_budget = DYNAMIC_PROMPT_OPTIONAL_SECTIONS_CHAR_BUDGET;
         append_owned_dynamic_prompt_section(
@@ -750,65 +785,75 @@ async fn prepare_analyze_snapshot(
         {
             let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &task_memory);
         }
-        if let Some(tool_hints) = phase_state
-            .retrieved_task_memory
-            .as_ref()
-            .and_then(|selection| {
-                memory::format_task_tool_hints_for_prompt(
-                    selection,
-                    phase_state.working_state.intent,
-                )
-            })
+        if !phase_state.run_mode.is_plan_only()
+            && let Some(tool_hints) =
+                phase_state
+                    .retrieved_task_memory
+                    .as_ref()
+                    .and_then(|selection| {
+                        memory::format_task_tool_hints_for_prompt(
+                            selection,
+                            phase_state.working_state.intent,
+                        )
+                    })
         {
             let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &tool_hints);
         }
-        if let Some(tool_order) = phase_state
-            .retrieved_task_memory
-            .as_ref()
-            .and_then(|selection| {
-                let mut ranking =
-                    memory::task_tool_ranking_context(selection, phase_state.working_state.intent);
-                if let Some(task_plan) = task_plan.as_ref() {
-                    ranking = merge_tool_rankings(
-                        ranking,
-                        agent::task_plan_tool_ranking_context(task_plan),
+        if !phase_state.run_mode.is_plan_only()
+            && let Some(tool_order) = phase_state
+                .retrieved_task_memory
+                .as_ref()
+                .and_then(|selection| {
+                    let mut ranking = memory::task_tool_ranking_context(
+                        selection,
+                        phase_state.working_state.intent,
                     );
-                }
-                tools::render_ranked_tool_recommendations(
-                    config.as_ref(),
-                    latest_query.as_deref(),
-                    &ranking,
-                )
-            })
-            .or_else(|| {
-                task_plan.as_ref().and_then(|task_plan| {
-                    let ranking = agent::task_plan_tool_ranking_context(task_plan);
+                    if let Some(task_plan) = task_plan.as_ref() {
+                        ranking = merge_tool_rankings(
+                            ranking,
+                            agent::task_plan_tool_ranking_context(task_plan),
+                        );
+                    }
                     tools::render_ranked_tool_recommendations(
                         config.as_ref(),
                         latest_query.as_deref(),
                         &ranking,
                     )
                 })
-            })
+                .or_else(|| {
+                    task_plan.as_ref().and_then(|task_plan| {
+                        let ranking = agent::task_plan_tool_ranking_context(task_plan);
+                        tools::render_ranked_tool_recommendations(
+                            config.as_ref(),
+                            latest_query.as_deref(),
+                            &ranking,
+                        )
+                    })
+                })
         {
             let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &tool_order);
         }
-        if let Some(agent_order) = crate::subagents::render_ranked_agent_recommendations(
-            &discovered_agents,
-            latest_query.as_deref(),
-            Some(&phase_state.working_state),
-        ) {
-            let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &agent_order);
+        if !phase_state.run_mode.is_plan_only() {
+            if let Some(agent_order) = crate::subagents::render_ranked_agent_recommendations(
+                &discovered_agents,
+                latest_query.as_deref(),
+                Some(&phase_state.working_state),
+            ) {
+                let _ = append_dynamic_prompt_section(content, &mut remaining_budget, &agent_order);
+            }
+            if let Some(delegation_guidance) = crate::subagents::render_delegation_guidance(
+                &discovered_agents,
+                latest_query.as_deref(),
+                &phase_state.working_state,
+            ) {
+                let _ = append_dynamic_prompt_section(
+                    content,
+                    &mut remaining_budget,
+                    &delegation_guidance,
+                );
+            }
         }
-        if let Some(delegation_guidance) = crate::subagents::render_delegation_guidance(
-            &discovered_agents,
-            latest_query.as_deref(),
-            &phase_state.working_state,
-        ) {
-            let _ =
-                append_dynamic_prompt_section(content, &mut remaining_budget, &delegation_guidance);
-        }
-        if phase_state.react_ctx.cycles == 0 {
+        if !phase_state.run_mode.is_plan_only() && phase_state.react_ctx.cycles == 0 {
             let _ = append_dynamic_prompt_section(
                 content,
                 &mut remaining_budget,
@@ -973,7 +1018,50 @@ async fn build_cycle_tools(
     resolved: &providers::ResolvedModel,
 ) -> Vec<serde_json::Value> {
     let config = ctx.state.config();
-    build_runtime_tools(&config, resolved.provider, &phase_state.cycle_workspace).await
+    if phase_state.run_mode.is_plan_only() {
+        build_plan_only_tools(&config, resolved.provider, &phase_state.cycle_workspace)
+    } else {
+        build_runtime_tools(&config, resolved.provider, &phase_state.cycle_workspace).await
+    }
+}
+
+fn tool_definition_name(value: &serde_json::Value) -> Option<&str> {
+    value
+        .get("function")
+        .and_then(|function| function.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| value.get("name").and_then(serde_json::Value::as_str))
+}
+
+pub(crate) fn build_plan_only_tools(
+    config: &Config,
+    provider: Provider,
+    workspace: &Path,
+) -> Vec<serde_json::Value> {
+    let mut definitions = tools::read_only_tool_definitions_for_provider(provider);
+    let mcp_policy = tools::mcp::load_session_policy(workspace);
+    let mut mcp_tools = match provider {
+        Provider::Anthropic => {
+            tools::mcp::cached_tool_definitions_anthropic_for_policy(config, workspace, &mcp_policy)
+        }
+        Provider::OpenAI | Provider::OpenAIResponses => {
+            tools::mcp::cached_tool_definitions_openai_for_policy(config, workspace, &mcp_policy)
+        }
+        Provider::Ollama => {
+            tools::mcp::cached_tool_definitions_ollama_for_policy(config, workspace, &mcp_policy)
+        }
+        Provider::Gemini => {
+            tools::mcp::cached_tool_definitions_gemini_for_policy(config, workspace, &mcp_policy)
+        }
+    }
+    .into_iter()
+    .filter(|definition| {
+        tool_definition_name(definition)
+            .is_some_and(|name| tools::mcp::is_read_only_tool_name(name, config, workspace))
+    })
+    .collect::<Vec<_>>();
+    definitions.append(&mut mcp_tools);
+    definitions
 }
 
 fn available_tool_names_for_plan(config: &Config, workspace: &Path) -> Vec<String> {
@@ -990,6 +1078,24 @@ fn available_tool_names_for_plan(config: &Config, workspace: &Path) -> Vec<Strin
     names.extend(
         tools::mcp::cached_list_tools_for_policy(config, workspace, &mcp_policy)
             .into_iter()
+            .map(|tool| tool.exposed_name),
+    );
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn available_tool_names_for_plan_only(config: &Config, workspace: &Path) -> Vec<String> {
+    let mut names = tools::tool_specs()
+        .iter()
+        .filter(|spec| tools::is_read_only_tool(spec.name))
+        .map(|spec| spec.name.to_string())
+        .collect::<Vec<_>>();
+    let mcp_policy = tools::mcp::load_session_policy(workspace);
+    names.extend(
+        tools::mcp::cached_list_tools_for_policy(config, workspace, &mcp_policy)
+            .into_iter()
+            .filter(|tool| tools::mcp::is_read_only_tool_descriptor(tool))
             .map(|tool| tool.exposed_name),
     );
     names.sort();
@@ -1818,6 +1924,15 @@ fn runtime_timeout_for_tool(tool_name: &str, config: &Config) -> Option<Duration
     tools::tool_runtime_timeout(tool_name, config)
 }
 
+fn is_plan_only_allowed_tool(tool_name: &str, config: &Config, workspace: &Path) -> bool {
+    if tools::is_read_only_tool(tool_name) {
+        return true;
+    }
+
+    let mcp_policy = tools::mcp::load_session_policy(workspace);
+    tools::mcp::is_read_only_tool_name_for_policy(tool_name, config, workspace, &mcp_policy)
+}
+
 /// Returns `(outcome, effective_args)` where `effective_args` is `None` when
 /// the tool was rejected by a BeforeToolExec hook (signals record_tool_result
 /// to skip AfterToolExec), or `Some(args_json)` with the actually-executed args.
@@ -1827,6 +1942,36 @@ async fn execute_tool_call(
     tc: &ToolCall,
 ) -> Result<(tools::ToolOutcome, Option<String>), AgentPhaseControl> {
     let config = ctx.state.config();
+    if phase_state.run_mode.is_plan_only()
+        && !is_plan_only_allowed_tool(&tc.function.name, &config, &phase_state.cycle_workspace)
+    {
+        if !tools::is_todos_tool(&tc.function.name) {
+            let display_args =
+                tools::display_tool_arguments(&tc.function.name, &tc.function.arguments);
+            let _ = live_send(
+                ctx.live_tx,
+                json!({
+                    "type":"tool_call",
+                    "id": tc.id,
+                    "name": tc.function.name,
+                    "arguments": display_args,
+                }),
+            )
+            .await;
+        }
+        return Ok((
+            tools::ToolOutcome {
+                output: format!(
+                    "[rejected by plan mode] `{}` is not available while planning. Produce the plan without executing mutating tools.",
+                    tc.function.name
+                ),
+                is_error: true,
+                duration_ms: 0,
+                subagent_snapshot: None,
+            },
+            None,
+        ));
+    }
 
     // ── BeforeToolExec hook (evaluated before the WS event so the frontend
     //    always sees the arguments that will actually be executed) ─────────
@@ -2640,6 +2785,7 @@ async fn run_analyze_phase(
         "model": snapshot.model.clone(),
         "think_level": effective_think.clone(),
         "react_visible": phase_state.react_ctx.show_react,
+        "run_mode": if phase_state.run_mode.is_plan_only() { "plan_only" } else { "execute" },
     });
     if let Some(start_obj) = start_event.as_object_mut()
         && auto_decision.is_some()
@@ -2738,7 +2884,7 @@ async fn run_analyze_phase(
                 apply_run_cancel_outcome(ctx, phase_state).await;
                 return AgentPhaseControl::Break;
             }
-            result = providers::call_llm_stream(
+            result = providers::call_llm_stream_with_tool_mode(
                 &ctx.state.http,
                 &resolved,
                 &final_msgs_snapshot,
@@ -2747,6 +2893,7 @@ async fn run_analyze_phase(
                 ctx.live_tx,
                 &effective_think,
                 &extra_tools,
+                !phase_state.run_mode.is_plan_only(),
                 config.max_llm_retries,
             ) => result,
         };
@@ -3133,11 +3280,65 @@ async fn run_observe_phase(
     AgentPhaseControl::Continue
 }
 
+async fn register_pending_plan(
+    ctx: &AgentRunCtx<'_>,
+    phase_state: &AgentPhaseState,
+) -> Option<serde_json::Value> {
+    if phase_state.react_ctx.finish_reason != Some(agent::FinishReason::Complete) {
+        return None;
+    }
+
+    let mut sessions = ctx.state.sessions.lock().await;
+    let session = sessions.get_mut(ctx.current_session_id)?;
+    let original_user_message_index = session
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, message)| message.role == "user")
+        .map(|(index, _)| index)?;
+    let assistant_plan_message_index = session
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(index, message)| {
+            *index > original_user_message_index
+                && message.role == "assistant"
+                && message.has_nonempty_content()
+        })
+        .map(|(index, _)| index)?;
+    let created_at = now_epoch();
+    let plan_id = format!(
+        "plan_{}_{}_{}",
+        created_at, original_user_message_index, assistant_plan_message_index
+    );
+    session.pending_plan = Some(crate::PendingPlan {
+        id: plan_id.clone(),
+        original_user_message_index,
+        assistant_plan_message_index,
+        created_at,
+    });
+    session.updated_at = created_at;
+    Some(json!({
+        "type": "plan_ready",
+        "plan_id": plan_id,
+        "message_index": assistant_plan_message_index,
+        "created_at": created_at,
+    }))
+}
+
 async fn run_finish_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
     let config = ctx.state.config();
+    let plan_ready_event = if phase_state.run_mode.is_plan_only() {
+        register_pending_plan(ctx, phase_state).await
+    } else {
+        None
+    };
+
     if let Err(e) =
         session_store::save_current_session_to_disk(ctx.state, ctx.current_session_id).await
     {
@@ -3167,10 +3368,15 @@ async fn run_finish_phase(
         let _ = live_send(ctx.live_tx, event).await;
     }
 
+    if let Some(event) = plan_ready_event {
+        let _ = live_send(ctx.live_tx, event).await;
+    }
+
     // Enqueue structured memory update (async, non-blocking).
     // Pre-filter messages to avoid cloning the full session history.
     let memory_queue = ctx.state.memory_queue();
-    if config.structured_memory
+    if !phase_state.run_mode.is_plan_only()
+        && config.structured_memory
         && let (Some(queue), Some(session)) = (memory_queue.as_ref(), &snapshot)
     {
         let fallback_model = session.effective_model(&config.model);
@@ -3190,7 +3396,8 @@ async fn run_finish_phase(
     // NOTE: snapshot check must precede try_claim_reflection() because the
     // CAS has a side-effect; if it fires but the session is gone, nobody
     // would roll back the cooldown slot.
-    if reflection_runtime_enabled()
+    if !phase_state.run_mode.is_plan_only()
+        && reflection_runtime_enabled()
         && let Some(ref session) = snapshot
         && let Some((previous_epoch, claimed_epoch)) = try_claim_reflection(
             phase_state.react_ctx.cycles,
@@ -3341,7 +3548,7 @@ pub(crate) async fn run_agent_session(
     live_tx: &LiveTx,
     inbound_rx: &mut mpsc::Receiver<String>,
     stop_requested: &Arc<AtomicBool>,
-    task_plan_enabled: bool,
+    run_mode: AgentRunMode,
 ) -> AgentRunOutcome {
     let show_react = {
         let sessions = state.sessions.lock().await;
@@ -3379,7 +3586,7 @@ pub(crate) async fn run_agent_session(
         collected_results: Vec::new(),
         results_origin_query: None,
         working_state: agent::WorkingState::default(),
-        task_plan_enabled,
+        run_mode,
         task_plan: None,
         retrieved_task_memory: None,
         retrieved_task_memory_key: None,

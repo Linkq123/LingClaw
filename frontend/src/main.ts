@@ -132,6 +132,13 @@ import {
   supersedeTaskPlanPanel,
 } from './renderers/task-plan.js';
 import {
+  clearPendingPlanAction,
+  confirmPendingPlanExecution,
+  executePendingPlan,
+  renderPendingPlanAction,
+  restorePendingPlanAction,
+} from './renderers/pending-plan.js';
+import {
   initSessionDrawer,
   renderSessionDrawer,
   toggleSessionDrawerExpanded,
@@ -445,11 +452,18 @@ function parseOrchestrationHistoryResult(resultText) {
   };
 }
 
+function markHistoryMessageIndex(messageEl: Element | null, messageIndex: unknown) {
+  if (typeof messageIndex !== 'number') return;
+  const row = messageEl?.closest('.msg-row') as HTMLElement | null;
+  if (row) row.dataset.messageIndex = String(messageIndex);
+}
+
 function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
   const { followMarkdown = true } = options;
   switch (m.role) {
     case 'user': {
       const el = addMsg('user', m.content, m.timestamp);
+      markHistoryMessageIndex(el, m.message_index);
       if (m.images && m.images.length > 0) renderUserImageThumbnails(el, m.images);
       break;
     }
@@ -463,6 +477,7 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
       // Only create a bubble when there is actual message text.
       if (m.content) {
         const el = addMsg('assistant', m.content, m.timestamp);
+        markHistoryMessageIndex(el, m.message_index);
         el._rawText = m.content;
         scheduleMarkdownRender(el, { followScroll: followMarkdown });
       }
@@ -652,6 +667,7 @@ function handleMessage(data) {
       closeOrchestrateTaskModal();
       clearReactStatus();
       clearActiveAutoTrace();
+      clearPendingPlanAction();
       clearBufferedChatUpdates();
       setAutoFollowChat(true);
       state.pendingImages = [];
@@ -698,6 +714,7 @@ function handleMessage(data) {
         requestAnimationFrame(() => {
           state.bulkRenderingChat = false;
           dom.chat.classList.remove('no-animate');
+          if (data.pending_plan) renderPendingPlanAction(data.pending_plan);
           scrollDown(true);
         });
       }
@@ -712,6 +729,8 @@ function handleMessage(data) {
       if (data.subagent) break;
       clearCompressionOutcomeForNewRound(data.cycle);
       clearActiveAutoTrace();
+      if (data.run_mode === 'execute') confirmPendingPlanExecution();
+      clearPendingPlanAction();
       supersedeTaskPlanPanel(data.round, data.cycle);
       const isNewTurn = !state.busy || state.currentRoundStartedAt === 0;
       setBusy(true);
@@ -733,6 +752,10 @@ function handleMessage(data) {
 
     case 'task_plan':
       applyTaskPlan(data);
+      break;
+
+    case 'plan_ready':
+      renderPendingPlanAction(data);
       break;
 
     case 'context_compressed':
@@ -1025,6 +1048,7 @@ function handleMessage(data) {
     case 'system':
       clearReactStatus();
       addSystem(data.content, 'info', { dismissible: data.dismissible === true });
+      restorePendingPlanAction();
       setBusy(false);
       break;
 
@@ -1036,6 +1060,7 @@ function handleMessage(data) {
       addError(data.content, { dismissible: data.dismissible === true });
       state.reasoningPanel = null;
       resetRoundTimers();
+      restorePendingPlanAction();
       setBusy(false);
       break;
   }
@@ -1085,6 +1110,7 @@ const actionHandlers = {
     if (row) row.remove();
   },
   'load-earlier': () => loadEarlierMessages(),
+  'execute-plan': (el) => executePendingPlan(el),
   'open-tool-drawer': (el) => openToolDrawerFromHeader(el),
   'toggle-tool': (el) => toggleTool(el),
   'subagent-copy-summary': (el) => copySubagentSummary(el),

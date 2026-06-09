@@ -110,6 +110,9 @@ export interface AppState {
   imageCapable: boolean;
   s3Capable: boolean;
   planModeEnabled: boolean;
+  pendingPlanId: string;
+  pendingPlanMessageIndex: number | null;
+  pendingPlanExecutionId: string;
   uploadToken: string;
   uploadTokenPromise: Promise<string> | null;
   uploadTokenRequestSeq: number;
@@ -197,6 +200,9 @@ export const state: AppState = {
   imageCapable: false,
   s3Capable: false,
   planModeEnabled: false,
+  pendingPlanId: '',
+  pendingPlanMessageIndex: null,
+  pendingPlanExecutionId: '',
   uploadToken: '',
   uploadTokenPromise: null,
   uploadTokenRequestSeq: 0,
