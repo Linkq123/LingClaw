@@ -14,9 +14,9 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 
 ## Features
 
-- **10 标准工具**：`think`、`todos`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`；另有 2 个动态工具：`task`（子代理委托，发现代理时注册）、`orchestrate`（多代理 DAG 编排，发现代理时注册）
+- **10 标准工具**：`think`、`todos`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`；另有动态工具：`task`（子代理委托，发现代理时注册）、`orchestrate`（多代理 DAG 编排，发现代理时注册）、`session_control`（仅 `main` 正常执行模式注册，用于跨 session/group 调度）
 - **MCP client（实验性）**：支持通过 `mcpServers` 配置接入 stdio 与 Streamable HTTP MCP server，发现 tools/resources/prompts，并以当前 session 的 Settings → MCP 权限为准手动启用 tools；配置 server 不再等于自动注入模型工具。运行时会处理分页、`ping` / 可选 `roots/list`、Streamable HTTP GET/SSE 通知、`notifications/*/list_changed` 缓存失效、工具超时取消、空闲回收和启动失败冷却；resources/prompts 只做只读浏览，需用户手动插入对话
-- **多会话**：默认会话仍为 `main`，但现在支持创建、切换、重命名、列出和删除其他持久化 session；新增 session 时后端会自动生成 6 位英数字 id，用户只需在需要时重命名；前端使用左侧可折叠的 session drawer 切换，`main` 固定置顶，刷新后会恢复上次选中的 session，WebSocket 连接按 session 绑定并在切换时重连
+- **多会话与群聊**：默认会话仍为 `main`，但现在支持创建、切换、重命名、列出和删除其他持久化 session；新增 session 时后端会自动生成 6 位英数字 id，用户只需在需要时重命名；前端使用左侧可折叠的 session drawer 切换，`main` 固定置顶，刷新后会恢复上次选中的 session。Groups 分区可创建持久化 session group，群聊消息写入 group 历史，被点名/广播的成员 session 会收到“群聊摘要 + main 指令”用户消息，并按自身模型、MCP、Skills、TaskPlan 设置异步并发执行
 - **会话级 Todos**：新增结构化 `todos` 工具，维护每个 session 唯一的一份当前任务清单；采用“整表替换 + revision 乐观并发”协议，支持用户与主代理协同编辑、重连恢复、冲突检测，以及专用 todo 面板展示
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、frontend-coder、backend-coder、general-coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
 - **运行期 Task Plan**：默认关闭；在 Settings → General → Features 开启 `Task Plan` 后，每轮 Analyze 前用规则生成临时 `TaskPlan`，结合用户请求、`WorkingState`、任务记忆、最近工具结果、可用工具和子代理，向模型软注入目标、步骤、工具/代理建议、验证建议与验收标准；它是运行期软指导，不会自动执行验证命令，也不会写入会话消息历史。聊天页“计划模式”对应 `plan_mode` 计划模式：先产出可批准的计划，再由用户点击“开始执行”
@@ -385,6 +385,7 @@ Settings → Usage 页面除了现有今日/累计图表外，还会显示按 `P
 | `http_fetch` | HTTP GET，带 SSRF 防护和重定向阻断 |
 | `task` | 委托任务给子代理（当发现代理时动态注册）|
 | `orchestrate` | 按 DAG 计划编排多个子代理任务（当发现多个代理时动态注册）|
+| `session_control` | 仅 `main` session 正常执行模式可用；可列出 session/group、创建或更新群组、派发任务、收集结果和停止目标 run |
 
 ## Skills
 
@@ -927,6 +928,8 @@ think_level 映射：
 ├── sessions/
 │   ├── main.json           — 默认会话存档
 │   └── <session-id>.json   — 其他 session 存档
+├── groups/
+│   └── <group-id>.json     — session group 群聊历史、成员和 run 状态
 ├── <session-id>/workspace/ — 对应 session 工作区
 │   ├── AGENTS.md           — 核心代理行为
 │   ├── IDENTITY.md         — 主代理资料
@@ -964,8 +967,10 @@ think_level 映射：
 客户端 → 服务端：
 
 ```json
-{"type": "chat", "content": "用户消息", "session": "main"}
+{"text": "用户消息", "plan_mode": false}
 ```
+
+旧客户端也可以直接发送纯文本。连接到 `/ws?group=<id>` 时，客户端消息使用 `{"type":"group_message", ...}`；停止 group 内 queued/running 成员 run 使用 `{"type":"group_stop"}`。不要向 group socket 发送普通 session slash 命令。
 
 服务端 → 客户端：
 
@@ -977,6 +982,11 @@ think_level 映射：
 | `view_state` | `show_tools` / `show_reasoning` / `show_react` 状态同步 |
 | `todos_state` | 当前 session 的 todos 快照（revision / items / last_updated_by / updated_at） |
 | `history` | 当前会话历史消息 |
+| `session_group_list` | 当前已知 group 摘要列表，用于 session drawer 的 Groups 分区 |
+| `group` / `group_history` | 进入 `/ws?group=<id>` 时返回 group 元数据、群聊消息和 run 状态 |
+| `group_message` | group 聊天消息；`role=session` 的消息是成员 session 最终摘要 |
+| `group_run_started` / `group_member_status` / `group_run_completed` | 成员 session 被派发、运行状态变化和完成/失败/停止事件 |
+| `group_member_event` | 包装成员 session 的 live event，形如 `{ session_id, run_id, event }`，用于在群聊里展示成员工具链和推理卡片 |
 | `start` | 新一轮回复开始 |
 | `auto_trace` | `think=auto` 的最新顶层决策轨迹（selected think、baseline、signals、escalators/dampeners/clamps） |
 | `task_plan` | 启用 `settings.enableTaskPlan` 后发送的当前 round/cycle 临时规则计划、工具/代理建议、验证建议与验收标准；进入 live replay，但不写入 session 历史 |
@@ -1021,6 +1031,9 @@ think_level 映射：
 | `/api/sessions` | GET | 返回已知 session 列表（`main` 固定置顶） |
 | `/api/session` | POST | 创建新 session；后端随机生成 6 位英数字 id |
 | `/api/session?session=<id>` | PUT | 修改指定 session 的显示名称；不改变 session id 或工作区路径 |
+| `/api/session-groups` | GET | 返回已知 group 摘要列表 |
+| `/api/session-group` | POST | 创建 group，后端随机生成 group id |
+| `/api/session-group?group=<id>` | GET/PUT/DELETE | 读取、更新或删除指定 group；存在 `queued/running` 成员 run 时删除返回 `409` |
 | `/api/todos?session=<id>` | PUT | 原子替换当前 session 的 todos 清单；成功返回最新快照，revision 冲突返回 `409` + 当前快照 |
 | `/api/client-config` | GET | 返回前端配置（上传 token、S3 能力标记等） |
 | `/api/config` | GET | 读取原始 JSON 配置文件（含解析错误回退） |
@@ -1037,7 +1050,7 @@ think_level 映射：
 | `/api/usage` | GET | 返回 Token 用量统计（今日/累计/来源），并额外提供 `daily_roles`、`total_providers`、`total_roles`，以及按天拆分后的 `usage_history[].providers` / `usage_history[].roles` |
 | `/api/upload-images` | POST | 上传本地图片到 S3（需启用 S3 配置） |
 | `/api/shutdown` | POST | 认证的本地关停端点（CLI 使用） |
-| `/ws` | GET | WebSocket 升级端点 |
+| `/ws` | GET | WebSocket 升级端点；`?session=<id>` 绑定单 session，`?group=<id>` 进入 group chat |
 
 ## Session Workspace
 

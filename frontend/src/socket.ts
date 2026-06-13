@@ -20,7 +20,9 @@ function setConnStatus(status: 'connecting' | 'connected' | 'disconnected', labe
 function sessionWebSocketUrl(): string {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   const url = new URL(`${proto}://${location.host}/ws`);
-  if (state.activeSessionId) {
+  if (state.activeGroupId) {
+    url.searchParams.set('group', state.activeGroupId);
+  } else if (state.activeSessionId) {
     url.searchParams.set('session', state.activeSessionId);
   }
   return url.toString();

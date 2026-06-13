@@ -82,6 +82,7 @@ pub(crate) enum IdleSocketInputAction {
     Continue,
     StartAgent {
         run_mode: AgentRunMode,
+        reservation: AgentRunReservation,
     },
     SwitchSession {
         session_id: String,
@@ -271,6 +272,7 @@ pub(crate) async fn handle_idle_socket_input(
     tx: &WsTx,
     _live_tx: &LiveTx,
     cancel: &CancellationToken,
+    stop_requested: &Arc<AtomicBool>,
 ) -> IdleSocketInputAction {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -458,6 +460,52 @@ pub(crate) async fn handle_idle_socket_input(
                     }
 
                     let execute_plan_error = {
+                        let sessions = state.sessions.lock().await;
+                        match sessions.get(current_session_id) {
+                            None => Some(json!({
+                                "type":"error",
+                                "content":"Current session not found.",
+                            })),
+                            Some(session) => match session.pending_plan.as_ref().cloned() {
+                                None => Some(json!({
+                                    "type":"system",
+                                    "content":"No pending plan is available to execute.",
+                                    "dismissible": true,
+                                })),
+                                Some(pending_plan) if pending_plan.id != plan_id => Some(json!({
+                                    "type":"system",
+                                    "content":"The requested plan is no longer pending for this session.",
+                                    "dismissible": true,
+                                })),
+                                Some(_) => None,
+                            },
+                        }
+                    };
+                    if let Some(event) = execute_plan_error {
+                        ws_send(tx, &event).await;
+                        return IdleSocketInputAction::Continue;
+                    }
+                    let Some(reservation) = super::try_reserve_agent_run(
+                        state,
+                        current_session_id,
+                        connection_id,
+                        cancel,
+                        stop_requested,
+                    )
+                    .await
+                    else {
+                        ws_send(
+                            tx,
+                            &json!({
+                                "type":"system",
+                                "content":"Session already has an active run.",
+                                "dismissible": true,
+                            }),
+                        )
+                        .await;
+                        return IdleSocketInputAction::Continue;
+                    };
+                    let execute_plan_error = {
                         let mut sessions = state.sessions.lock().await;
                         match sessions.get_mut(current_session_id) {
                             None => Some(json!({
@@ -495,6 +543,12 @@ pub(crate) async fn handle_idle_socket_input(
                         }
                     };
                     if let Some(event) = execute_plan_error {
+                        super::release_agent_run_reservation(
+                            state,
+                            current_session_id,
+                            &reservation,
+                        )
+                        .await;
                         ws_send(tx, &event).await;
                         return IdleSocketInputAction::Continue;
                     }
@@ -508,6 +562,7 @@ pub(crate) async fn handle_idle_socket_input(
                     }
                     return IdleSocketInputAction::StartAgent {
                         run_mode: AgentRunMode::Execute,
+                        reservation,
                     };
                 }
 
@@ -685,7 +740,28 @@ pub(crate) async fn handle_idle_socket_input(
         (text, None, AgentRunMode::Execute)
     };
 
-    {
+    let Some(reservation) = super::try_reserve_agent_run(
+        state,
+        current_session_id,
+        connection_id,
+        cancel,
+        stop_requested,
+    )
+    .await
+    else {
+        ws_send(
+            tx,
+            &json!({
+                "type":"system",
+                "content":"Session already has an active run.",
+                "dismissible": true,
+            }),
+        )
+        .await;
+        return IdleSocketInputAction::Continue;
+    };
+
+    let appended = {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(current_session_id) {
             session.messages.push(ChatMessage {
@@ -700,7 +776,23 @@ pub(crate) async fn handle_idle_socket_input(
             });
             session.pending_plan = None;
             session.updated_at = now_epoch();
+            true
+        } else {
+            false
         }
+    };
+
+    if !appended {
+        super::release_agent_run_reservation(state, current_session_id, &reservation).await;
+        ws_send(
+            tx,
+            &json!({
+                "type":"error",
+                "content":"Current session not found.",
+            }),
+        )
+        .await;
+        return IdleSocketInputAction::Continue;
     }
 
     if let Err(e) =
@@ -709,7 +801,10 @@ pub(crate) async fn handle_idle_socket_input(
         eprintln!("Warning: failed to save session before starting agent: {e}");
     }
 
-    IdleSocketInputAction::StartAgent { run_mode }
+    IdleSocketInputAction::StartAgent {
+        run_mode,
+        reservation,
+    }
 }
 
 pub(super) async fn persist_pending_interventions(

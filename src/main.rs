@@ -39,6 +39,8 @@ mod prompts;
 mod providers;
 mod runtime_loop;
 mod session_admin;
+mod session_control;
+mod session_group;
 mod session_store;
 mod socket_sync;
 mod socket_tasks;
@@ -521,11 +523,13 @@ struct AppState {
     /// Session IDs with the connection currently attached to live streaming output.
     active_connections: Mutex<HashMap<String, u64>>,
     session_clients: Mutex<HashMap<String, SessionClientBinding>>,
+    group_clients: Mutex<HashMap<String, GroupClientBinding>>,
     live_rounds: Mutex<HashMap<String, LiveRoundState>>,
     /// Per-session active agent runs keyed by the owning connection.
     active_runs: Mutex<HashMap<String, SessionRunBinding>>,
     /// Per-session connection-level cancellation tokens (kick old connection on rebind).
     connection_cancels: Mutex<HashMap<String, ConnectionCancelBinding>>,
+    session_control_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     next_connection_id: AtomicU64,
     shutdown: CancellationToken,
     shutdown_token: String,
@@ -617,6 +621,12 @@ struct SessionClientBinding {
 }
 
 #[derive(Clone)]
+struct GroupClientBinding {
+    connection_id: u64,
+    tx: WsTx,
+}
+
+#[derive(Clone)]
 struct SessionRunBinding {
     connection_id: u64,
     cancel: CancellationToken,
@@ -625,7 +635,7 @@ struct SessionRunBinding {
 }
 
 #[derive(Default)]
-struct DeferredInterventionState {
+pub(crate) struct DeferredInterventionState {
     queue: Vec<String>,
     accepting: bool,
 }
@@ -1753,6 +1763,28 @@ pub(crate) async fn send_session_client_event(
     }
 }
 
+pub(crate) async fn send_group_client_event(
+    state: &AppState,
+    group_id: &str,
+    event: serde_json::Value,
+) {
+    let client = {
+        let clients = state.group_clients.lock().await;
+        clients
+            .get(group_id)
+            .map(|binding| (binding.connection_id, binding.tx.clone()))
+    };
+    let Some((connection_id, tx)) = client else {
+        return;
+    };
+    if tx.try_send(event.to_string()).is_err() {
+        let mut clients = state.group_clients.lock().await;
+        if clients.get(group_id).map(|binding| binding.connection_id) == Some(connection_id) {
+            clients.remove(group_id);
+        }
+    }
+}
+
 pub(crate) async fn forward_tool_output_event_best_effort(
     live_tx: &LiveTx,
     event: serde_json::Value,
@@ -2851,12 +2883,7 @@ fn compression_pruned_replay_event(live_round: &LiveRoundState) -> Option<serde_
     }))
 }
 
-async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
-    let live_round = { state.live_rounds.lock().await.get(session_id).cloned() };
-    let Some(live_round) = live_round else {
-        return;
-    };
-
+fn live_round_replay_events(live_round: &LiveRoundState) -> Vec<serde_json::Value> {
     let mut start_event = json!({
         "type":"start",
         "round": live_round.round,
@@ -2895,94 +2922,113 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
         }
     }
 
+    let mut events = Vec::new();
     let compression_event = compression_replay_event(&live_round);
     let pruned_event = compression_pruned_replay_event(&live_round);
     if let Some(event) = compression_event {
-        ws_send(tx, &event).await;
+        events.push(event);
     }
     if let Some(event) = pruned_event {
-        ws_send(tx, &event).await;
+        events.push(event);
     }
-    ws_send(tx, &start_event).await;
+    events.push(start_event);
     if let Some(event) = live_round.latest_task_plan.as_ref() {
-        ws_send(tx, event).await;
+        events.push(event.clone());
     }
     if let Some(trace) = live_round.latest_auto_trace.as_ref() {
-        ws_send(tx, &trace.to_live_event()).await;
+        events.push(trace.to_live_event());
     }
 
     if !live_round.reasoning_text.is_empty() {
-        ws_send(tx, &json!({"type":"thinking_start"})).await;
-        ws_send(
-            tx,
-            &json!({"type":"thinking_delta","content": live_round.reasoning_text}),
-        )
-        .await;
+        events.push(json!({"type":"thinking_start"}));
+        events.push(json!({"type":"thinking_delta","content": live_round.reasoning_text}));
         if live_round.reasoning_done {
-            ws_send(tx, &json!({"type":"thinking_done"})).await;
+            events.push(json!({"type":"thinking_done"}));
         }
     }
 
     for tool in &live_round.tools {
-        ws_send(
-            tx,
-            &json!({
-                "type":"tool_call",
+        events.push(json!({
+            "type":"tool_call",
+            "id": tool.id,
+            "name": tool.name,
+            "arguments": tool.arguments,
+        }));
+        if !tool.live_output.is_empty() {
+            events.push(json!({
+                "type":"tool_output",
                 "id": tool.id,
                 "name": tool.name,
-                "arguments": tool.arguments,
-            }),
-        )
-        .await;
-        if !tool.live_output.is_empty() {
-            ws_send(
-                tx,
-                &json!({
-                    "type":"tool_output",
-                    "id": tool.id,
-                    "name": tool.name,
-                    "chunk": tool.live_output,
-                }),
-            )
-            .await;
+                "chunk": tool.live_output,
+            }));
         }
         if tool.result.is_none() && tool.elapsed_ms > 0 {
-            ws_send(
-                tx,
-                &json!({
-                    "type":"tool_progress",
-                    "id": tool.id,
-                    "name": tool.name,
-                    "elapsed_ms": tool.elapsed_ms,
-                }),
-            )
-            .await;
+            events.push(json!({
+                "type":"tool_progress",
+                "id": tool.id,
+                "name": tool.name,
+                "elapsed_ms": tool.elapsed_ms,
+            }));
         }
         if let Some(result) = &tool.result {
-            ws_send(
-                tx,
-                &json!({
-                    "type":"tool_result",
-                    "id": tool.id,
-                    "name": tool.name,
-                    "result": result,
-                    "duration_ms": tool.elapsed_ms,
-                }),
-            )
-            .await;
+            events.push(json!({
+                "type":"tool_result",
+                "id": tool.id,
+                "name": tool.name,
+                "result": result,
+                "duration_ms": tool.elapsed_ms,
+            }));
         }
     }
 
     if !live_round.assistant_text.is_empty() {
-        ws_send(
-            tx,
-            &json!({"type":"delta","content": live_round.assistant_text}),
-        )
-        .await;
+        events.push(json!({"type":"delta","content": live_round.assistant_text}));
     }
 
     for event in &live_round.delegated_events {
-        ws_send(tx, event).await;
+        events.push(event.clone());
+    }
+
+    events
+}
+
+async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
+    let live_round = { state.live_rounds.lock().await.get(session_id).cloned() };
+    let Some(live_round) = live_round else {
+        return;
+    };
+
+    for event in live_round_replay_events(&live_round) {
+        ws_send(tx, &event).await;
+    }
+}
+
+async fn replay_group_member_live_round(
+    tx: &WsTx,
+    state: &AppState,
+    group_id: &str,
+    run: &session_group::GroupRun,
+) {
+    if run.status != "running" {
+        return;
+    }
+    let live_round = { state.live_rounds.lock().await.get(&run.session_id).cloned() };
+    let Some(live_round) = live_round else {
+        return;
+    };
+
+    for event in live_round_replay_events(&live_round) {
+        ws_send(
+            tx,
+            &json!({
+                "type": "group_member_event",
+                "group_id": group_id,
+                "run_id": run.id,
+                "session_id": run.session_id,
+                "event": event,
+            }),
+        )
+        .await;
     }
 }
 
@@ -2992,6 +3038,21 @@ async fn replay_live_round(tx: &WsTx, state: &AppState, session_id: &str) {
 struct SessionQuery {
     #[serde(default)]
     session: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GroupQuery {
+    #[serde(default)]
+    group: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionGroupRequest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    members: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -3060,6 +3121,8 @@ struct SessionRenameRequest {
 struct WsSessionQuery {
     #[serde(default)]
     session: Option<String>,
+    #[serde(default)]
+    group: Option<String>,
 }
 
 async fn ws_handler(
@@ -3067,7 +3130,13 @@ async fn ws_handler(
     Query(query): Query<WsSessionQuery>,
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state, query.session))
+    ws.on_upgrade(move |socket| async move {
+        if let Some(group_id) = query.group {
+            handle_group_socket(socket, state, group_id).await;
+        } else {
+            handle_socket(socket, state, query.session).await;
+        }
+    })
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Option<String>) {
@@ -3140,6 +3209,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
 
     let mut rerun_agent = false;
     let mut agent_run_mode = runtime_loop::AgentRunMode::Execute;
+    let mut agent_run_reservation = None;
     loop {
         if !rerun_agent {
             let text = tokio::select! {
@@ -3160,12 +3230,17 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                 &tx,
                 &live_tx,
                 &cancel,
+                &stop_requested,
             )
             .await
             {
                 IdleSocketInputAction::Continue => continue,
-                IdleSocketInputAction::StartAgent { run_mode } => {
+                IdleSocketInputAction::StartAgent {
+                    run_mode,
+                    reservation,
+                } => {
                     agent_run_mode = run_mode;
+                    agent_run_reservation = Some(reservation);
                 }
                 IdleSocketInputAction::SwitchSession { session_id, result } => {
                     match switch_socket_session(
@@ -3223,6 +3298,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             &mut inbound_rx,
             &stop_requested,
             agent_run_mode,
+            agent_run_reservation.take(),
         )
         .await;
         run_active.store(false, Ordering::Relaxed);
@@ -3248,6 +3324,199 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         },
     )
     .await;
+}
+
+#[derive(Deserialize)]
+struct GroupSocketMessage {
+    #[serde(rename = "type")]
+    #[serde(default)]
+    message_type: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    targets: Vec<String>,
+    #[serde(default)]
+    target_mode: Option<String>,
+    #[serde(default)]
+    start_runs: Option<bool>,
+    #[serde(default)]
+    run_mode: Option<String>,
+}
+
+async fn handle_group_socket(socket: WebSocket, state: Arc<AppState>, requested_group_id: String) {
+    let (mut socket_tx, mut rx) = socket.split();
+    let (tx, mut outbound_rx) = mpsc::channel::<String>(256);
+    let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
+    let writer = tokio::spawn(async move {
+        while let Some(msg) = outbound_rx.recv().await {
+            if socket_tx.send(WsMsg::Text(msg.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let group_id = match session_group::validate_group_id(&requested_group_id) {
+        Ok(group_id) => group_id.to_string(),
+        Err(error) => {
+            let _ = ws_send(
+                &tx,
+                &json!({"type":"error","content":error,"dismissible":true}),
+            )
+            .await;
+            drop(tx);
+            let _ = writer.await;
+            return;
+        }
+    };
+    let Some(group) = session_group::load_group_from_disk(&group_id) else {
+        let _ = ws_send(
+            &tx,
+            &json!({
+                "type":"error",
+                "content": format!("Group '{}' not found", group_id),
+                "dismissible": true,
+            }),
+        )
+        .await;
+        drop(tx);
+        let _ = writer.await;
+        return;
+    };
+
+    {
+        let mut clients = state.group_clients.lock().await;
+        clients.insert(
+            group_id.clone(),
+            GroupClientBinding {
+                connection_id,
+                tx: tx.clone(),
+            },
+        );
+    }
+    ws_send(&tx, &session_group::group_info_payload(&group)).await;
+    ws_send(&tx, &session_group::group_history_payload(&group)).await;
+    for run in group
+        .runs
+        .iter()
+        .filter(|run| run.status.as_str() == "running")
+    {
+        replay_group_member_live_round(&tx, &state, &group_id, run).await;
+    }
+    ws_send(&tx, &build_group_list_payload()).await;
+    let session_list = socket_sync::build_session_list_payload(&state);
+    ws_send(&tx, &session_list).await;
+
+    while let Some(result) = rx.next().await {
+        let text = match result {
+            Ok(WsMsg::Text(text)) => text.to_string(),
+            Ok(WsMsg::Close(_)) | Err(_) => break,
+            _ => continue,
+        };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let payload = if trimmed.starts_with('{') {
+            match serde_json::from_str::<GroupSocketMessage>(trimmed) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    ws_send(
+                        &tx,
+                        &json!({
+                            "type":"system",
+                            "content": format!("Invalid group message JSON: {error}"),
+                            "dismissible": true,
+                        }),
+                    )
+                    .await;
+                    continue;
+                }
+            }
+        } else {
+            if trimmed.starts_with('/') {
+                ws_send(
+                    &tx,
+                    &json!({
+                        "type":"system",
+                        "content":"Slash commands are not supported in group chat.",
+                        "dismissible": true,
+                    }),
+                )
+                .await;
+                continue;
+            }
+            GroupSocketMessage {
+                message_type: Some("group_message".to_string()),
+                text: Some(trimmed.to_string()),
+                targets: Vec::new(),
+                target_mode: Some("all".to_string()),
+                start_runs: Some(true),
+                run_mode: Some("execute".to_string()),
+            }
+        };
+        let message_type = payload.message_type.as_deref().unwrap_or("group_message");
+        if message_type == "group_stop" {
+            match session_control::handle_group_socket_stop(&state, &group_id, payload.targets)
+                .await
+            {
+                Ok(content) => {
+                    ws_send(
+                        &tx,
+                        &json!({"type":"system","content":content,"dismissible":true}),
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    ws_send(
+                        &tx,
+                        &json!({"type":"error","content":error,"dismissible":true}),
+                    )
+                    .await;
+                }
+            }
+            continue;
+        }
+        if message_type != "group_message" {
+            ws_send(
+                &tx,
+                &json!({
+                    "type":"system",
+                    "content":"Unsupported group socket message type.",
+                    "dismissible": true,
+                }),
+            )
+            .await;
+            continue;
+        }
+        if let Err(error) = session_control::handle_group_socket_message(
+            &state,
+            &group_id,
+            session_control::GroupSocketDispatch {
+                text: payload.text.unwrap_or_default(),
+                targets: payload.targets,
+                target_mode: payload.target_mode.unwrap_or_else(|| "all".to_string()),
+                start_runs: payload.start_runs.unwrap_or(true),
+                run_mode: payload.run_mode.unwrap_or_else(|| "execute".to_string()),
+            },
+        )
+        .await
+        {
+            ws_send(
+                &tx,
+                &json!({"type":"error","content":error,"dismissible":true}),
+            )
+            .await;
+        }
+    }
+
+    {
+        let mut clients = state.group_clients.lock().await;
+        if clients.get(&group_id).map(|binding| binding.connection_id) == Some(connection_id) {
+            clients.remove(&group_id);
+        }
+    }
+    drop(tx);
+    let _ = writer.await;
 }
 
 async fn switch_socket_session(
@@ -3533,6 +3802,203 @@ async fn api_put_session(
     broadcast_session_list_payload(&state).await;
 
     Ok(Json(payload))
+}
+
+fn build_group_list_payload() -> serde_json::Value {
+    let groups = session_group::list_saved_group_summaries()
+        .into_iter()
+        .map(|summary| summary.to_json())
+        .collect::<Vec<_>>();
+    json!({"type":"session_group_list","groups": groups})
+}
+
+pub(crate) async fn broadcast_group_list_payload(state: &AppState) {
+    let payload = build_group_list_payload();
+    let session_ids = {
+        let clients = state.session_clients.lock().await;
+        clients.keys().cloned().collect::<Vec<_>>()
+    };
+    for session_id in session_ids {
+        send_session_client_event(state, &session_id, payload.clone()).await;
+    }
+    let group_ids = {
+        let clients = state.group_clients.lock().await;
+        clients.keys().cloned().collect::<Vec<_>>()
+    };
+    for group_id in group_ids {
+        send_group_client_event(state, &group_id, payload.clone()).await;
+    }
+}
+
+async fn api_session_groups(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(json!({
+        "groups": session_group::list_saved_group_summaries()
+            .into_iter()
+            .map(|summary| summary.to_json())
+            .collect::<Vec<_>>()
+    }))
+}
+
+async fn generate_available_group_id() -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    session_group::generate_available_group_id().map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        )
+    })
+}
+
+async fn api_post_session_group(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SessionGroupRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let group_id = generate_available_group_id().await?;
+    let name = match request.name.as_deref() {
+        Some(name) => session_group::validate_group_name(name)
+            .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?,
+        None => format!("Group {group_id}"),
+    };
+    let group = session_group::SessionGroup::new(&group_id, &name, request.members);
+    let gate = session_group::group_persist_gate(&group_id);
+    let _guard = gate.lock().await;
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to save group: {error}") })),
+            )
+        })?;
+
+    broadcast_group_list_payload(&state).await;
+    Ok(Json(json!({
+        "ok": true,
+        "group": session_group::SessionGroupSummary::from_group(&group).to_json(),
+    })))
+}
+
+async fn api_get_session_group(
+    Query(query): Query<GroupQuery>,
+    State(_state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let group_id = query.group.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Missing group id" })),
+        )
+    })?;
+    let group_id = session_group::validate_group_id(group_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    let group = session_group::load_group_from_disk(group_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Group '{}' not found", group_id) })),
+        )
+    })?;
+    Ok(Json(json!({"group": session_group::group_to_json(&group)})))
+}
+
+async fn api_put_session_group(
+    Query(query): Query<GroupQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SessionGroupRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let group_id = query.group.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Missing group id" })),
+        )
+    })?;
+    let group_id = session_group::validate_group_id(group_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?
+        .to_string();
+    let gate = session_group::group_persist_gate(&group_id);
+    let _guard = gate.lock().await;
+    let mut group = session_group::load_group_from_disk(&group_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Group '{}' not found", group_id) })),
+        )
+    })?;
+    if let Some(name) = request.name.as_deref() {
+        group.name = session_group::validate_group_name(name)
+            .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    }
+    group.members = session_group::normalize_members(request.members);
+    group.updated_at = now_epoch();
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to save group: {error}") })),
+            )
+        })?;
+
+    let group_event = session_group::group_info_payload(&group);
+    send_group_client_event(&state, &group.id, group_event).await;
+    broadcast_group_list_payload(&state).await;
+    Ok(Json(json!({
+        "ok": true,
+        "group": session_group::SessionGroupSummary::from_group(&group).to_json(),
+    })))
+}
+
+async fn api_delete_session_group(
+    Query(query): Query<GroupQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    validate_local_request_headers(&headers)?;
+
+    let group_id = query.group.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Missing group id" })),
+        )
+    })?;
+    let group_id = session_group::validate_group_id(group_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?
+        .to_string();
+    let gate = session_group::group_persist_gate(&group_id);
+    let _guard = gate.lock().await;
+    let group = session_group::load_group_from_disk(&group_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Group '{}' not found", group_id) })),
+        )
+    })?;
+    if session_group::group_has_active_runs(&group) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "Group '{}' has queued or running session runs. Stop them before deleting the group.",
+                    group_id
+                )
+            })),
+        ));
+    }
+    session_group::delete_group_from_disk_locked(&group_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to delete group: {error}") })),
+            )
+        })?;
+    {
+        let mut clients = state.group_clients.lock().await;
+        clients.remove(&group_id);
+    }
+    broadcast_group_list_payload(&state).await;
+    Ok(Json(json!({"ok": true, "group_id": group_id})))
 }
 
 fn find_loaded_session_id(sessions: &HashMap<String, Session>, session_id: &str) -> Option<String> {
@@ -5229,9 +5695,11 @@ async fn main() {
         sessions,
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
+        group_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
         active_runs: Mutex::new(HashMap::new()),
         connection_cancels: Mutex::new(HashMap::new()),
+        session_control_locks: Mutex::new(HashMap::new()),
         next_connection_id: AtomicU64::new(1),
         shutdown: shutdown.clone(),
         shutdown_token,
@@ -5257,6 +5725,14 @@ async fn main() {
         .route("/api/client-config", get(api_client_config))
         .route("/api/sessions", get(api_sessions))
         .route("/api/session", post(api_post_session).put(api_put_session))
+        .route("/api/session-groups", get(api_session_groups))
+        .route(
+            "/api/session-group",
+            get(api_get_session_group)
+                .post(api_post_session_group)
+                .put(api_put_session_group)
+                .delete(api_delete_session_group),
+        )
         .route(
             "/api/session-skills",
             get(api_session_skills).put(api_put_session_skills),
@@ -5300,6 +5776,16 @@ async fn main() {
             return;
         }
     };
+
+    match session_group::recover_stale_group_runs_on_startup().await {
+        Ok(recovered) if recovered > 0 => {
+            eprintln!("Recovered {recovered} stale session group run(s) from a previous process.");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("WARNING: Failed to recover stale session group runs: {error}");
+        }
+    }
 
     let shutdown_signal = {
         let s = shutdown.clone();

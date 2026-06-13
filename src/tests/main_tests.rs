@@ -177,9 +177,11 @@ fn test_app_state() -> AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
+        group_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
         active_runs: Mutex::new(HashMap::new()),
         connection_cancels: Mutex::new(HashMap::new()),
+        session_control_locks: Mutex::new(HashMap::new()),
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
@@ -196,9 +198,11 @@ fn test_app_state_with_config(config: Config) -> AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
+        group_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
         active_runs: Mutex::new(HashMap::new()),
         connection_cancels: Mutex::new(HashMap::new()),
+        session_control_locks: Mutex::new(HashMap::new()),
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
@@ -515,6 +519,72 @@ fn replay_live_round_replays_compression_before_assistant_delta() {
     assert_eq!(auto_trace["type"], "auto_trace");
     assert_eq!(delta["type"], "delta");
     assert_eq!(delta["content"], "hello replay");
+}
+
+#[test]
+fn replay_group_member_live_round_wraps_running_member_events() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = Arc::new(test_app_state());
+    let group_id = format!("group-replay-{}", now_epoch());
+    let session_id = format!("worker-replay-{}", now_epoch());
+    let run = crate::session_group::GroupRun {
+        id: "grun-test".to_string(),
+        group_id: group_id.clone(),
+        session_id: session_id.clone(),
+        status: "running".to_string(),
+        prompt: "review this".to_string(),
+        result_excerpt: None,
+        error: None,
+        created_at: now_epoch(),
+        updated_at: now_epoch(),
+        completed_at: None,
+    };
+    let (replay_tx, mut replay_rx) = mpsc::channel::<String>(16);
+
+    rt.block_on(async {
+        state.live_rounds.lock().await.insert(
+            session_id.clone(),
+            LiveRoundState {
+                connection_id: 1,
+                round: 1,
+                react_visible: true,
+                phase: Some("analyze".into()),
+                cycle: Some(0),
+                reasoning_text: "thinking".to_string(),
+                tools: vec![LiveToolState {
+                    id: "tool-1".to_string(),
+                    name: "read_file".to_string(),
+                    arguments: "{\"path\":\"README.md\"}".to_string(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        replay_group_member_live_round(&replay_tx, &state, &group_id, &run).await;
+    });
+
+    let mut events = Vec::new();
+    while let Ok(raw) = replay_rx.try_recv() {
+        events.push(serde_json::from_str::<serde_json::Value>(&raw).expect("event should parse"));
+    }
+
+    assert!(events.iter().all(|event| {
+        event["type"] == "group_member_event"
+            && event["group_id"] == group_id
+            && event["run_id"] == "grun-test"
+            && event["session_id"] == session_id
+    }));
+    assert!(events.iter().any(|event| event["event"]["type"] == "start"));
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"]["type"] == "tool_call")
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| event["event"]["type"] == "thinking_delta")
+    );
 }
 
 #[test]
@@ -5298,6 +5368,196 @@ async fn api_post_session_creates_random_six_character_session_id() {
         load_session_from_disk(&session_id).is_some(),
         "created session should be persisted"
     );
+}
+
+#[tokio::test]
+async fn api_session_group_crud_round_trip() {
+    let state = Arc::new(test_app_state());
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(create_payload) = api_post_session_group(
+        headers.clone(),
+        State(state.clone()),
+        Json(SessionGroupRequest {
+            name: Some("Review Group".to_string()),
+            members: vec![
+                "worker-a".to_string(),
+                "worker-b".to_string(),
+                "worker-a".to_string(),
+                "bad/name".to_string(),
+            ],
+        }),
+    )
+    .await
+    .expect("group should be created");
+    let group_id = create_payload["group"]["id"]
+        .as_str()
+        .expect("created group id should be present")
+        .to_string();
+    assert_eq!(
+        create_payload["group"]["name"].as_str(),
+        Some("Review Group")
+    );
+    assert_eq!(create_payload["group"]["members"].as_u64(), Some(2));
+
+    let Json(get_payload) = api_get_session_group(
+        Query(GroupQuery {
+            group: Some(group_id.clone()),
+        }),
+        State(state.clone()),
+    )
+    .await
+    .expect("group should load");
+    assert_eq!(get_payload["group"]["id"].as_str(), Some(group_id.as_str()));
+    assert_eq!(
+        get_payload["group"]["members"],
+        json!(["worker-a", "worker-b"])
+    );
+    assert_eq!(get_payload["group"]["version"].as_u64(), Some(1));
+
+    let Json(update_payload) = api_put_session_group(
+        Query(GroupQuery {
+            group: Some(group_id.clone()),
+        }),
+        headers.clone(),
+        State(state.clone()),
+        Json(SessionGroupRequest {
+            name: Some("Backend Review".to_string()),
+            members: vec!["worker-a".to_string()],
+        }),
+    )
+    .await
+    .expect("group should update");
+    assert_eq!(
+        update_payload["group"]["name"].as_str(),
+        Some("Backend Review")
+    );
+    assert_eq!(update_payload["group"]["members"].as_u64(), Some(1));
+
+    let Json(delete_payload) = api_delete_session_group(
+        Query(GroupQuery {
+            group: Some(group_id.clone()),
+        }),
+        headers,
+        State(state),
+    )
+    .await
+    .expect("group should delete");
+    assert_eq!(delete_payload["ok"].as_bool(), Some(true));
+    assert!(crate::session_group::load_group_from_disk(&group_id).is_none());
+}
+
+#[tokio::test]
+async fn api_delete_session_group_rejects_active_runs() {
+    let state = Arc::new(test_app_state());
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let group_id = format!("group-delete-active-{unique}");
+    let mut group = crate::session_group::SessionGroup::new(
+        &group_id,
+        "Active Group",
+        vec!["worker-a".to_string()],
+    );
+    group.runs.push(crate::session_group::GroupRun {
+        id: "grun-active".to_string(),
+        group_id: group_id.clone(),
+        session_id: "worker-a".to_string(),
+        status: "running".to_string(),
+        prompt: "review this".to_string(),
+        result_excerpt: None,
+        error: None,
+        created_at: now_epoch(),
+        updated_at: now_epoch(),
+        completed_at: None,
+    });
+
+    {
+        let gate = crate::session_group::group_persist_gate(&group_id);
+        let _guard = gate.lock().await;
+        crate::session_group::save_group_to_disk_locked(&group)
+            .await
+            .expect("group should save");
+    }
+
+    let error = api_delete_session_group(
+        Query(GroupQuery {
+            group: Some(group_id.clone()),
+        }),
+        headers,
+        State(state),
+    )
+    .await
+    .expect_err("active group runs should block delete");
+
+    assert_eq!(error.0, StatusCode::CONFLICT);
+    assert!(
+        error.1["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("Stop them before deleting"))
+    );
+    assert!(crate::session_group::load_group_from_disk(&group_id).is_some());
+
+    let gate = crate::session_group::group_persist_gate(&group_id);
+    let _guard = gate.lock().await;
+    crate::session_group::delete_group_from_disk_locked(&group_id)
+        .await
+        .expect("group should clean up");
+}
+
+#[tokio::test]
+async fn group_socket_stop_marks_active_runs_stopped() {
+    let state = Arc::new(test_app_state());
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let group_id = format!("group-socket-stop-{unique}");
+    let mut group = crate::session_group::SessionGroup::new(
+        &group_id,
+        "Stop Group",
+        vec!["worker-a".to_string()],
+    );
+    group.runs.push(crate::session_group::GroupRun {
+        id: "grun-stop".to_string(),
+        group_id: group_id.clone(),
+        session_id: "worker-a".to_string(),
+        status: "running".to_string(),
+        prompt: "review this".to_string(),
+        result_excerpt: None,
+        error: None,
+        created_at: now_epoch(),
+        updated_at: now_epoch(),
+        completed_at: None,
+    });
+
+    {
+        let gate = crate::session_group::group_persist_gate(&group_id);
+        let _guard = gate.lock().await;
+        crate::session_group::save_group_to_disk_locked(&group)
+            .await
+            .expect("group should save");
+    }
+
+    let output = crate::session_control::handle_group_socket_stop(&state, &group_id, Vec::new())
+        .await
+        .expect("group stop should succeed");
+
+    assert!(output.contains("1 group run"));
+    let loaded =
+        crate::session_group::load_group_from_disk(&group_id).expect("group should still exist");
+    assert_eq!(loaded.runs[0].status, "stopped");
+    assert!(loaded.runs[0].completed_at.is_some());
+
+    let gate = crate::session_group::group_persist_gate(&group_id);
+    let _guard = gate.lock().await;
+    crate::session_group::delete_group_from_disk_locked(&group_id)
+        .await
+        .expect("group should clean up");
 }
 
 #[tokio::test]

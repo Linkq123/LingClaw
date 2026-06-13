@@ -240,12 +240,48 @@ header .actions button.is-active {
   background: color-mix(in srgb, var(--panel-surface) 84%, transparent);
 }
 
+.session-drawer-empty-compact {
+  padding: 8px 10px;
+}
+
+.session-drawer-section {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 8px 2px 2px;
+  font-size: 10px;
+  font-weight: 800;
+  color: var(--dim);
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.session-drawer-section-action {
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--panel-border-soft);
+  border-radius: 6px;
+  background: var(--panel-surface);
+  color: var(--text);
+  cursor: pointer;
+  line-height: 1;
+}
+
+.session-drawer-section-action:hover {
+  background: var(--panel-hover);
+}
+
 .session-drawer-row {
   display: flex;
   align-items: stretch;
   gap: 6px;
   min-width: 0;
   max-width: 100%;
+}
+
+.session-drawer-row-group .session-drawer-row-main {
+  background: color-mix(in srgb, var(--panel-surface) 88%, var(--accent2) 4%);
 }
 
 .session-drawer-row-main {
@@ -609,6 +645,58 @@ header .actions button.is-active {
   padding: 4px 8px;
   overflow-x: auto;
   flex-wrap: nowrap;
+}
+.group-target-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 2px 8px;
+  overflow-x: auto;
+}
+.group-target-bar[hidden] {
+  display: none;
+}
+.group-target-modes,
+.group-target-members {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+.group-target-mode,
+.group-target-member {
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 80%, transparent);
+  color: var(--dim);
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1;
+  white-space: nowrap;
+  transition: border-color .15s, background .15s, color .15s;
+}
+.group-target-mode {
+  min-height: 28px;
+  padding: 0 10px;
+}
+.group-target-member {
+  max-width: 180px;
+  min-height: 26px;
+  padding: 0 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.group-target-mode:hover,
+.group-target-member:hover {
+  border-color: color-mix(in srgb, var(--accent2) 32%, var(--border));
+  color: var(--text);
+}
+.group-target-mode.is-active,
+.group-target-member.is-active {
+  border-color: color-mix(in srgb, var(--accent2) 54%, var(--border));
+  background: color-mix(in srgb, var(--accent2) 14%, var(--surface));
+  color: var(--text);
 }
 .image-preview-item {
   position: relative;

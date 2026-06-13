@@ -183,6 +183,53 @@ pub(crate) fn cancel_active_reflections() {
 pub(crate) struct AgentRunOutcome {
     pub(crate) rerun_agent: bool,
     pub(crate) shutting_down: bool,
+    pub(crate) run_stopped: bool,
+}
+
+pub(crate) struct AgentRunReservation {
+    connection_id: u64,
+    run_cancel: CancellationToken,
+    deferred_interventions: Arc<Mutex<DeferredInterventionState>>,
+}
+
+pub(crate) async fn try_reserve_agent_run(
+    state: &Arc<AppState>,
+    session_id: &str,
+    connection_id: u64,
+    cancel: &CancellationToken,
+    stop_requested: &Arc<AtomicBool>,
+) -> Option<AgentRunReservation> {
+    let run_cancel = cancel.child_token();
+    let deferred_interventions = Arc::new(Mutex::new(DeferredInterventionState::open()));
+    let mut runs = state.active_runs.lock().await;
+    if runs.contains_key(session_id) {
+        return None;
+    }
+    runs.insert(
+        session_id.to_string(),
+        SessionRunBinding {
+            connection_id,
+            cancel: run_cancel.clone(),
+            stop_requested: stop_requested.clone(),
+            deferred_interventions: deferred_interventions.clone(),
+        },
+    );
+    Some(AgentRunReservation {
+        connection_id,
+        run_cancel,
+        deferred_interventions,
+    })
+}
+
+pub(crate) async fn release_agent_run_reservation(
+    state: &Arc<AppState>,
+    session_id: &str,
+    reservation: &AgentRunReservation,
+) {
+    let mut runs = state.active_runs.lock().await;
+    if runs.get(session_id).map(|run| run.connection_id) == Some(reservation.connection_id) {
+        runs.remove(session_id);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1021,7 +1068,13 @@ async fn build_cycle_tools(
     if phase_state.run_mode.is_plan_only() {
         build_plan_only_tools(&config, resolved.provider, &phase_state.cycle_workspace)
     } else {
-        build_runtime_tools(&config, resolved.provider, &phase_state.cycle_workspace).await
+        build_runtime_tools(
+            &config,
+            resolved.provider,
+            &phase_state.cycle_workspace,
+            ctx.current_session_id,
+        )
+        .await
     }
 }
 
@@ -1131,6 +1184,7 @@ pub(crate) async fn build_runtime_tools(
     config: &Config,
     provider: Provider,
     workspace: &Path,
+    current_session_id: &str,
 ) -> Vec<serde_json::Value> {
     let mut extra_tools = Vec::new();
 
@@ -1157,6 +1211,18 @@ pub(crate) async fn build_runtime_tools(
             Provider::Gemini => tools::orchestrate_tool_definition_gemini(&agent_names),
         };
         extra_tools.push(orchestrate_def);
+    }
+
+    if current_session_id == crate::MAIN_SESSION_ID {
+        let session_control_def = match provider {
+            Provider::Anthropic => tools::session_control_tool_definition_anthropic(),
+            Provider::OpenAI | Provider::OpenAIResponses => {
+                tools::session_control_tool_definition_openai()
+            }
+            Provider::Ollama => tools::session_control_tool_definition_ollama(),
+            Provider::Gemini => tools::session_control_tool_definition_gemini(),
+        };
+        extra_tools.push(session_control_def);
     }
 
     let mcp_policy = tools::mcp::load_session_policy(workspace);
@@ -2090,6 +2156,20 @@ async fn execute_tool_call(
                 &ctx.state.hooks,
                 ctx.state,
                 ctx.current_session_id,
+            ),
+        )
+        .await
+    } else if tools::is_session_control_tool(&tc.function.name) {
+        run_tool_with_feedback(
+            ctx.live_tx,
+            ctx.run_cancel,
+            &tc.id,
+            &tc.function.name,
+            None,
+            crate::session_control::execute_session_control_tool(
+                ctx.state,
+                ctx.current_session_id,
+                &effective_args,
             ),
         )
         .await
@@ -3520,11 +3600,6 @@ fn fire_stop_command_hook(state: &Arc<AppState>, session_id: &str, live_tx: &Liv
 }
 
 async fn apply_run_cancel_outcome(ctx: &AgentRunCtx<'_>, phase_state: &mut AgentPhaseState) {
-    if ctx.cancel.is_cancelled() {
-        phase_state.shutting_down = true;
-        return;
-    }
-
     let shared_stop_requested = {
         let runs = ctx.state.active_runs.lock().await;
         runs.get(ctx.current_session_id)
@@ -3535,6 +3610,8 @@ async fn apply_run_cancel_outcome(ctx: &AgentRunCtx<'_>, phase_state: &mut Agent
     if shared_stop_requested {
         fire_stop_command_hook(ctx.state, ctx.current_session_id, ctx.live_tx);
         phase_state.run_stopped = true;
+    } else if ctx.cancel.is_cancelled() {
+        phase_state.shutting_down = true;
     } else {
         phase_state.run_detached = true;
     }
@@ -3549,6 +3626,7 @@ pub(crate) async fn run_agent_session(
     inbound_rx: &mut mpsc::Receiver<String>,
     stop_requested: &Arc<AtomicBool>,
     run_mode: AgentRunMode,
+    reservation: Option<AgentRunReservation>,
 ) -> AgentRunOutcome {
     let show_react = {
         let sessions = state.sessions.lock().await;
@@ -3558,20 +3636,38 @@ pub(crate) async fn run_agent_session(
             .unwrap_or(false)
     };
 
-    let run_cancel = cancel.child_token();
-    let deferred_interventions = Arc::new(Mutex::new(DeferredInterventionState::open()));
-    {
-        let mut runs = state.active_runs.lock().await;
-        runs.insert(
-            current_session_id.to_string(),
-            SessionRunBinding {
-                connection_id,
-                cancel: run_cancel.clone(),
-                stop_requested: stop_requested.clone(),
-                deferred_interventions: deferred_interventions.clone(),
-            },
-        );
-    }
+    let reservation = match reservation {
+        Some(reservation) => reservation,
+        None => match try_reserve_agent_run(
+            state,
+            current_session_id,
+            connection_id,
+            cancel,
+            stop_requested,
+        )
+        .await
+        {
+            Some(reservation) => reservation,
+            None => {
+                let _ = live_send(
+                    live_tx,
+                    json!({
+                        "type":"system",
+                        "content":"Session already has an active run.",
+                        "dismissible": true,
+                    }),
+                )
+                .await;
+                return AgentRunOutcome {
+                    rerun_agent: false,
+                    shutting_down: false,
+                    run_stopped: false,
+                };
+            }
+        },
+    };
+    let run_cancel = reservation.run_cancel;
+    let deferred_interventions = reservation.deferred_interventions;
 
     let ctx = AgentRunCtx {
         state,
@@ -3629,16 +3725,16 @@ pub(crate) async fn run_agent_session(
             &mut phase_state.pending_interventions,
         )
         .await;
-        if cancel.is_cancelled() {
-            phase_state.shutting_down = true;
-            break;
-        }
         if stop_requested.swap(false, Ordering::Relaxed) {
             // Cancel first so running tools/LLM see cancellation immediately.
             run_cancel.cancel();
             // Fire OnCommand hook in background — must not block the stop path.
             fire_stop_command_hook(state, current_session_id, live_tx);
             phase_state.run_stopped = true;
+            break;
+        }
+        if cancel.is_cancelled() {
+            phase_state.shutting_down = true;
             break;
         } else if drain_busy_socket_messages(
             state,
@@ -3751,6 +3847,7 @@ pub(crate) async fn run_agent_session(
     AgentRunOutcome {
         rerun_agent,
         shutting_down: phase_state.shutting_down,
+        run_stopped: phase_state.run_stopped,
     }
 }
 

@@ -48,9 +48,11 @@ fn test_app_state() -> AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
+        group_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
         active_runs: Mutex::new(HashMap::new()),
         connection_cancels: Mutex::new(HashMap::new()),
+        session_control_locks: Mutex::new(HashMap::new()),
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
@@ -67,9 +69,11 @@ fn test_app_state_with_hooks(hooks: HookRegistry) -> AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
+        group_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
         active_runs: Mutex::new(HashMap::new()),
         connection_cancels: Mutex::new(HashMap::new()),
+        session_control_locks: Mutex::new(HashMap::new()),
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
@@ -257,13 +261,15 @@ async fn handle_idle_socket_input_accepts_plan_mode_payload_without_images() {
         &tx,
         &live_tx,
         &cancel,
+        &Arc::new(AtomicBool::new(false)),
     )
     .await;
 
     assert!(matches!(
         action,
         IdleSocketInputAction::StartAgent {
-            run_mode: AgentRunMode::Execute
+            run_mode: AgentRunMode::Execute,
+            ..
         }
     ));
 
@@ -276,6 +282,42 @@ async fn handle_idle_socket_input_accepts_plan_mode_payload_without_images() {
     assert_eq!(message.role, "user");
     assert_eq!(message.content.as_deref(), Some("inspect the runtime"));
     assert!(message.images.is_none());
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_releases_reservation_when_session_is_missing() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+
+    let action = handle_idle_socket_input(
+        r#"{"text":"inspect the runtime","plan_mode":false}"#.into(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(event["type"], "error");
+    assert_eq!(event["content"], "Current session not found.");
+
+    let active_runs = state.active_runs.lock().await;
+    assert!(
+        !active_runs.contains_key(&session_id),
+        "reservation should be released when the session cannot receive the message"
+    );
 }
 
 #[tokio::test]
@@ -303,13 +345,15 @@ async fn handle_idle_socket_input_accepts_plan_only_payload() {
         &tx,
         &live_tx,
         &cancel,
+        &Arc::new(AtomicBool::new(false)),
     )
     .await;
 
     assert!(matches!(
         action,
         IdleSocketInputAction::StartAgent {
-            run_mode: AgentRunMode::PlanOnly
+            run_mode: AgentRunMode::PlanOnly,
+            ..
         }
     ));
 
@@ -349,13 +393,15 @@ async fn handle_idle_socket_input_defaults_structured_payload_to_execute_mode() 
         &tx,
         &live_tx,
         &cancel,
+        &Arc::new(AtomicBool::new(false)),
     )
     .await;
 
     assert!(matches!(
         action,
         IdleSocketInputAction::StartAgent {
-            run_mode: AgentRunMode::Execute
+            run_mode: AgentRunMode::Execute,
+            ..
         }
     ));
 }
@@ -412,13 +458,15 @@ async fn handle_idle_socket_input_executes_matching_pending_plan() {
         &tx,
         &live_tx,
         &cancel,
+        &Arc::new(AtomicBool::new(false)),
     )
     .await;
 
     assert!(matches!(
         action,
         IdleSocketInputAction::StartAgent {
-            run_mode: AgentRunMode::Execute
+            run_mode: AgentRunMode::Execute,
+            ..
         }
     ));
     let sessions = state.sessions.lock().await;
@@ -461,6 +509,7 @@ async fn handle_idle_socket_input_rejects_execute_plan_conflicts() {
         &tx,
         &live_tx,
         &cancel,
+        &Arc::new(AtomicBool::new(false)),
     )
     .await;
 
@@ -508,6 +557,7 @@ async fn handle_idle_socket_input_rejects_malformed_structured_json_without_clea
         &tx,
         &live_tx,
         &cancel,
+        &Arc::new(AtomicBool::new(false)),
     )
     .await;
 
@@ -556,13 +606,15 @@ async fn handle_idle_socket_input_treats_non_envelope_brace_text_as_plain_messag
         &tx,
         &live_tx,
         &cancel,
+        &Arc::new(AtomicBool::new(false)),
     )
     .await;
 
     assert!(matches!(
         action,
         IdleSocketInputAction::StartAgent {
-            run_mode: AgentRunMode::Execute
+            run_mode: AgentRunMode::Execute,
+            ..
         }
     ));
     let sessions = state.sessions.lock().await;
@@ -630,6 +682,7 @@ async fn handle_idle_socket_input_broadcasts_session_list_when_session_set_chang
         &tx,
         &live_tx,
         &cancel,
+        &Arc::new(AtomicBool::new(false)),
     )
     .await;
 
@@ -781,6 +834,7 @@ async fn resolve_or_create_socket_session_broadcasts_session_list_for_fresh_sess
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
     ];
     let current_types = current_events
         .iter()
@@ -790,6 +844,7 @@ async fn resolve_or_create_socket_session_broadcasts_session_list_for_fresh_sess
     assert!(current_types.contains(&"view_state".to_string()));
     assert!(current_types.contains(&"todos_state".to_string()));
     assert!(current_types.contains(&"history".to_string()));
+    assert!(current_types.contains(&"session_group_list".to_string()));
     assert!(current_types.contains(&"session_list".to_string()));
 
     let other_parsed = recv_json_with_timeout(&mut other_rx).await;
@@ -849,6 +904,7 @@ async fn resolve_or_create_socket_session_cancels_old_connection_before_replay()
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
     ];
     let current_types = current_events
         .iter()
@@ -857,6 +913,7 @@ async fn resolve_or_create_socket_session_cancels_old_connection_before_replay()
     assert!(current_types.contains(&"session".to_string()));
     assert!(current_types.contains(&"view_state".to_string()));
     assert!(current_types.contains(&"todos_state".to_string()));
+    assert!(current_types.contains(&"session_group_list".to_string()));
     assert!(current_types.contains(&"history".to_string()));
 }
 
@@ -935,6 +992,7 @@ async fn resolve_or_create_socket_session_replays_live_tail_for_running_session(
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
     ];
     let current_types = current_events
         .iter()
@@ -943,6 +1001,7 @@ async fn resolve_or_create_socket_session_replays_live_tail_for_running_session(
     assert!(current_types.contains(&"session".to_string()));
     assert!(current_types.contains(&"view_state".to_string()));
     assert!(current_types.contains(&"todos_state".to_string()));
+    assert!(current_types.contains(&"session_group_list".to_string()));
     assert!(current_types.contains(&"history".to_string()));
     assert!(current_types.contains(&"start".to_string()));
     assert!(current_events.iter().any(|payload| {
@@ -1001,6 +1060,7 @@ async fn switch_session_broadcasts_session_list_when_session_set_changes() {
         &tx,
         &live_tx,
         &cancel,
+        &Arc::new(AtomicBool::new(false)),
     )
     .await;
 
@@ -1108,6 +1168,7 @@ async fn handle_idle_socket_input_stop_cancels_reconnected_run() {
         &tx,
         &live_tx,
         &cancel,
+        &Arc::new(AtomicBool::new(false)),
     )
     .await;
 
@@ -1387,6 +1448,7 @@ async fn handle_idle_socket_input_queues_new_prompt_while_reconnected_run_active
         &tx,
         &live_tx,
         &cancel,
+        &Arc::new(AtomicBool::new(false)),
     )
     .await;
 
@@ -1455,6 +1517,7 @@ async fn handle_idle_socket_input_allows_think_command_while_reconnected_run_act
         &tx,
         &live_tx,
         &cancel,
+        &Arc::new(AtomicBool::new(false)),
     )
     .await;
 
@@ -1529,6 +1592,7 @@ async fn handle_idle_socket_input_rejects_intervention_when_reconnected_run_is_f
         &tx,
         &live_tx,
         &cancel,
+        &Arc::new(AtomicBool::new(false)),
     )
     .await;
 
@@ -1572,6 +1636,7 @@ async fn run_agent_session_emits_user_stop_done_for_shared_stop_request() {
         &mut inbound_rx,
         &stop_requested,
         AgentRunMode::Execute,
+        None,
     )
     .await;
 
@@ -1582,6 +1647,49 @@ async fn run_agent_session_emits_user_stop_done_for_shared_stop_request() {
     assert_eq!(done_event["type"].as_str(), Some("done"));
     assert_eq!(done_event["phase"].as_str(), Some("stopped"));
     assert_eq!(done_event["reason"].as_str(), Some("user_stop"));
+}
+
+#[tokio::test]
+async fn run_agent_session_prioritizes_stop_request_over_cancel() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let stop_requested = Arc::new(AtomicBool::new(true));
+    let (live_tx, mut live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let (_inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<String>(4);
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+    }
+
+    let outcome = run_agent_session(
+        &state,
+        &session_id,
+        1,
+        &cancel,
+        &live_tx,
+        &mut inbound_rx,
+        &stop_requested,
+        AgentRunMode::Execute,
+        None,
+    )
+    .await;
+
+    assert!(!outcome.rerun_agent);
+    assert!(!outcome.shutting_down);
+    assert!(outcome.run_stopped);
+
+    let done_event = live_rx.recv().await.expect("done event should be emitted");
+    assert_eq!(done_event["type"].as_str(), Some("done"));
+    assert_eq!(done_event["phase"].as_str(), Some("stopped"));
+    assert_eq!(done_event["reason"].as_str(), Some("user_stop"));
+    assert!(
+        live_rx.try_recv().is_err(),
+        "stop should not emit a shutdown message"
+    );
 }
 
 #[tokio::test]
@@ -1657,6 +1765,7 @@ async fn run_agent_session_stop_preserves_interventions_after_trimming_incomplet
         &mut inbound_rx,
         &stop_requested,
         AgentRunMode::Execute,
+        None,
     )
     .await;
 
@@ -1767,9 +1876,11 @@ fn test_app_state_with_config(config: Config) -> AppState {
         sessions: Arc::new(Mutex::new(HashMap::new())),
         active_connections: Mutex::new(HashMap::new()),
         session_clients: Mutex::new(HashMap::new()),
+        group_clients: Mutex::new(HashMap::new()),
         live_rounds: Mutex::new(HashMap::new()),
         active_runs: Mutex::new(HashMap::new()),
         connection_cancels: Mutex::new(HashMap::new()),
+        session_control_locks: Mutex::new(HashMap::new()),
         next_connection_id: AtomicU64::new(1),
         shutdown: CancellationToken::new(),
         shutdown_token: "test-shutdown-token".to_string(),
@@ -2409,6 +2520,73 @@ async fn build_plan_only_tools_includes_only_read_only_builtins() {
     assert!(!names.contains(&crate::tools::TOOL_NAME_TODOS));
 
     let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn session_control_tool_is_only_exposed_for_main_execute_tools() {
+    let state = Arc::new(test_app_state());
+    let config = state.config();
+    let workspace = temp_workspace("session-control-tools");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+
+    let main_tools = build_runtime_tools(&config, Provider::OpenAI, &workspace, MAIN_SESSION_ID)
+        .await
+        .into_iter()
+        .filter_map(|tool| tool_definition_name(&tool).map(str::to_string))
+        .collect::<Vec<_>>();
+    let other_tools = build_runtime_tools(&config, Provider::OpenAI, &workspace, "worker")
+        .await
+        .into_iter()
+        .filter_map(|tool| tool_definition_name(&tool).map(str::to_string))
+        .collect::<Vec<_>>();
+    let plan_tools = build_plan_only_tools(&config, Provider::OpenAI, &workspace)
+        .into_iter()
+        .filter_map(|tool| tool_definition_name(&tool).map(str::to_string))
+        .collect::<Vec<_>>();
+
+    assert!(main_tools.contains(&crate::tools::TOOL_NAME_SESSION_CONTROL.to_string()));
+    assert!(!other_tools.contains(&crate::tools::TOOL_NAME_SESSION_CONTROL.to_string()));
+    assert!(!plan_tools.contains(&crate::tools::TOOL_NAME_SESSION_CONTROL.to_string()));
+
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn session_control_tool_rejects_non_main_session_even_if_called() {
+    let state = Arc::new(test_app_state());
+
+    let outcome = crate::session_control::execute_session_control_tool(
+        &state,
+        "worker",
+        r#"{"action":"list_sessions"}"#,
+    )
+    .await;
+
+    assert!(outcome.is_error);
+    assert!(
+        outcome
+            .output
+            .contains("only available in the main session")
+    );
+}
+
+#[tokio::test]
+async fn session_control_tool_rejects_dispatch_to_main_session() {
+    let state = Arc::new(test_app_state());
+
+    let outcome = crate::session_control::execute_session_control_tool(
+        &state,
+        MAIN_SESSION_ID,
+        r#"{"action":"dispatch","targets":[" main "],"message":"review this","wait":true}"#,
+    )
+    .await;
+
+    assert!(outcome.is_error);
+    assert!(
+        outcome
+            .output
+            .contains("cannot dispatch to the main session")
+    );
 }
 
 fn plan_only_mcp_test_config() -> Config {

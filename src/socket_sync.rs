@@ -51,6 +51,7 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
     ws_send(tx, &view_state).await;
     ws_send(tx, &todos_state).await;
     ws_send(tx, &history).await;
+    ws_send(tx, &crate::build_group_list_payload()).await;
 }
 
 /// Build the session info payload including model capabilities.

@@ -62,12 +62,14 @@ describe('socket session binding', () => {
     localStorage.clear();
     mountSessionDrawerDom();
     stateModule.state.activeSessionId = '';
+    stateModule.state.activeGroupId = '';
     stateModule.state.pendingDeleteSessionId = '';
     stateModule.state.reconnectDelay = 1000;
     stateModule.state.reconnectAttempts = 0;
     stateModule.state.sessionSwitchInFlight = false;
     stateModule.state.sessionDrawerExpanded = true;
     stateModule.state.sessions = [];
+    stateModule.state.sessionGroups = [];
 
     (globalThis as unknown as { WebSocket: unknown }).WebSocket =
       mockWebSocket as unknown as typeof WebSocket;
@@ -89,6 +91,16 @@ describe('socket session binding', () => {
     connect(() => {});
 
     expect(mockWebSocket).toHaveBeenCalledWith('ws://localhost:3000/ws?session=research-notes');
+  });
+
+  it('connects to the selected websocket group when active group is restored', async () => {
+    const { connect } = await import('../src/socket.js');
+    stateModule.state.activeSessionId = 'main';
+    stateModule.state.activeGroupId = 'review-group';
+
+    connect(() => {});
+
+    expect(mockWebSocket).toHaveBeenCalledWith('ws://localhost:3000/ws?group=review-group');
   });
 
   it('keeps only a non-current non-main pending delete target', async () => {
@@ -230,6 +242,58 @@ describe('socket session binding', () => {
     renameButton?.click();
 
     expect(onRename).toHaveBeenCalledWith('research-notes');
+  });
+
+  it('renders group rows and wires group actions', async () => {
+    const onSwitchGroup = vi.fn();
+    const onRenameGroup = vi.fn();
+    const onDeleteGroup = vi.fn();
+    const onCreateGroup = vi.fn();
+    stateModule.state.sessions = [{ id: 'main', name: 'Main' }];
+    stateModule.state.sessionGroups = [
+      {
+        id: 'review-group',
+        name: 'Review Group',
+        members: 2,
+        messages: 3,
+        running: 1,
+        updated_at: 40,
+      },
+    ];
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onCreateGroup,
+      onDelete: vi.fn(),
+      onDeleteGroup,
+      onRenameGroup,
+      onSwitch: vi.fn(),
+      onSwitchGroup,
+    });
+
+    const createGroupButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '.session-drawer-section-action',
+    );
+    const switchGroupButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '[data-group-id="review-group"] [data-session-action="switch-group"]',
+    );
+    const renameGroupButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '[data-group-id="review-group"] [data-session-action="rename"]',
+    );
+    const deleteGroupButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '[data-group-id="review-group"] [data-session-action="delete"]',
+    );
+
+    createGroupButton?.click();
+    switchGroupButton?.click();
+    renameGroupButton?.click();
+    deleteGroupButton?.click();
+
+    expect(createGroupButton?.textContent).toBe('+');
+    expect(onCreateGroup).toHaveBeenCalled();
+    expect(onSwitchGroup).toHaveBeenCalledWith('review-group');
+    expect(onRenameGroup).toHaveBeenCalledWith('review-group');
+    expect(onDeleteGroup).toHaveBeenCalledWith('review-group');
   });
 
   it('allows deleting a corrupt inactive session but does not switch into it', async () => {

@@ -99,6 +99,7 @@ pub(crate) const TOOL_NAME_HTTP_FETCH: &str = "http_fetch";
 pub(crate) const TOOL_NAME_DELETE_FILE: &str = "delete_file";
 pub(crate) const TOOL_NAME_TASK: &str = "task";
 pub(crate) const TOOL_NAME_ORCHESTRATE: &str = "orchestrate";
+pub(crate) const TOOL_NAME_SESSION_CONTROL: &str = "session_control";
 
 pub(crate) fn tool_runtime_timeout(tool_name: &str, config: &Config) -> Option<Duration> {
     if matches!(tool_name, TOOL_NAME_EXEC | TOOL_NAME_TODOS) {
@@ -907,6 +908,11 @@ pub(crate) fn build_tool_execution_trace(
     match tool_name {
         TOOL_NAME_TASK => trace_builder_task(&args),
         TOOL_NAME_ORCHESTRATE => trace_builder_orchestrate(&args),
+        TOOL_NAME_SESSION_CONTROL => Some(crate::agent::ToolExecutionTrace {
+            summary: compact_tool_call_summary("session_control"),
+            retry_key: trace_retry_key_from_value("session_control", &args),
+            ..crate::agent::ToolExecutionTrace::default()
+        }),
         _ => None,
     }
 }
@@ -1558,6 +1564,122 @@ pub(crate) fn task_tool_parameters() -> serde_json::Value {
 /// Like `task`, this tool is handled specially by the runtime loop.
 pub(crate) fn is_orchestrate_tool(name: &str) -> bool {
     name == TOOL_NAME_ORCHESTRATE
+}
+
+pub(crate) fn is_session_control_tool(name: &str) -> bool {
+    name == TOOL_NAME_SESSION_CONTROL
+}
+
+pub(crate) fn session_control_tool_parameters() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": [
+                    "list_sessions",
+                    "list_groups",
+                    "create_group",
+                    "update_group",
+                    "dispatch",
+                    "post_group_message",
+                    "collect",
+                    "stop"
+                ],
+                "description": "Control-plane action to perform."
+            },
+            "group_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100,
+                "description": "Target group id for group actions."
+            },
+            "name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 80,
+                "description": "Display name for create_group or update_group."
+            },
+            "members": {
+                "type": "array",
+                "maxItems": 50,
+                "description": "Full group member session id list for create_group or update_group.",
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100
+                }
+            },
+            "targets": {
+                "type": "array",
+                "maxItems": 50,
+                "description": "Target session ids for dispatch or stop. If omitted for a group dispatch, all group members are targeted.",
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 100
+                }
+            },
+            "message": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 50000,
+                "description": "Message or instruction to post or dispatch."
+            },
+            "run_mode": {
+                "type": "string",
+                "enum": ["execute", "plan_only"],
+                "description": "Whether dispatched sessions should execute directly or only produce a plan."
+            },
+            "wait": {
+                "type": "boolean",
+                "description": "For dispatch, wait until started group runs complete or timeout before returning."
+            },
+            "summary_budget": {
+                "type": "integer",
+                "minimum": 500,
+                "maximum": 20000,
+                "description": "Maximum characters of each session result excerpt to collect."
+            }
+        },
+        "required": ["action"]
+    })
+}
+
+fn session_control_tool_description() -> &'static str {
+    "Control other persistent sessions from the main session. Use this to list sessions/groups, create or update session groups, dispatch work to other sessions, collect group results, post group messages, or stop delegated session runs. Only the main session can use this tool; each target session keeps its own model, MCP policy, skills, TaskPlan setting, workspace, and permissions."
+}
+
+pub(crate) fn session_control_tool_definition_openai() -> serde_json::Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": TOOL_NAME_SESSION_CONTROL,
+            "description": session_control_tool_description(),
+            "parameters": session_control_tool_parameters(),
+        }
+    })
+}
+
+pub(crate) fn session_control_tool_definition_anthropic() -> serde_json::Value {
+    json!({
+        "name": TOOL_NAME_SESSION_CONTROL,
+        "description": session_control_tool_description(),
+        "input_schema": session_control_tool_parameters(),
+    })
+}
+
+pub(crate) fn session_control_tool_definition_ollama() -> serde_json::Value {
+    session_control_tool_definition_openai()
+}
+
+pub(crate) fn session_control_tool_definition_gemini() -> serde_json::Value {
+    json!({
+        "name": TOOL_NAME_SESSION_CONTROL,
+        "description": session_control_tool_description(),
+        "parameters": gemini_tool_parameters(session_control_tool_parameters()),
+    })
 }
 
 /// Shared description body for the `orchestrate` tool. Used by both the

@@ -218,6 +218,46 @@ export function send() {
   const text = dom.input.value.trim();
   if (!text && state.pendingImages.length === 0) return;
 
+  if (state.activeGroupId) {
+    if (text.startsWith('/') && state.pendingImages.length === 0) {
+      addSystem('Slash commands are not supported in group chat.');
+      return;
+    }
+    if (state.pendingImages.length > 0) {
+      addSystem('Group chat does not support image attachments yet.');
+      return;
+    }
+    const targetMode = state.groupTargetMode || 'all';
+    const activeMembers = new Set(state.activeGroupMembers);
+    const targets =
+      targetMode === 'selected'
+        ? state.groupSelectedTargets.filter((target) => activeMembers.has(target))
+        : [];
+    if (targetMode === 'selected' && targets.length === 0) {
+      addSystem('Select at least one group member before sending.');
+      return;
+    }
+    state.ws.send(
+      JSON.stringify({
+        type: 'group_message',
+        text,
+        targets,
+        target_mode: targetMode,
+        start_runs: true,
+        run_mode: state.planModeEnabled ? 'plan_only' : 'execute',
+      }),
+    );
+    if (!state.busy) {
+      setBusy(true);
+    }
+    pushInputHistory(text);
+    dom.input.value = '';
+    dom.input.style.height = 'auto';
+    closeSlashCommandMenu();
+    syncToolDrawerBounds();
+    return;
+  }
+
   if (text.startsWith('/') && state.pendingImages.length === 0) {
     if (applyPendingSlashCommandSuggestion(text)) {
       return;
@@ -284,11 +324,19 @@ export function pushInputHistory(text) {
 
 export function stopAgent() {
   if (!state.busy || !state.ws || state.ws.readyState !== 1) return;
+  if (state.activeGroupId) {
+    state.ws.send(JSON.stringify({ type: 'group_stop' }));
+    return;
+  }
   state.ws.send('/stop');
 }
 
 export function sendCmd(cmd) {
   const normalizedCmd = normalizeSlashCommandText(cmd.trim());
+  if (state.activeGroupId) {
+    addSystem('Slash commands are not supported in group chat.');
+    return;
+  }
   if ((!canSendWhileBusy(normalizedCmd) && state.busy) || !state.ws || state.ws.readyState !== 1) {
     return;
   }

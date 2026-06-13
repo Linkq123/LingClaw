@@ -18,7 +18,7 @@ import {
   hideWelcome,
   scheduleBackgroundTask,
 } from './utils.js';
-import type { SessionSummary } from './types.js';
+import type { SessionGroupSummary, SessionSummary } from './types.js';
 import {
   syncToolDrawerBounds,
   cancelToolDrawerBoundsSync,
@@ -144,17 +144,34 @@ import {
   toggleSessionDrawerExpanded,
 } from './renderers/sessions.js';
 import { applyTodosState, applyTodosVisibility, initTodosPanel } from './renderers/todos.js';
-import { createSession as requestCreateSession } from './sessionApi.js';
-import { loadActiveSessionId, persistActiveSessionId } from './sessionPersistence.js';
+import {
+  createSession as requestCreateSession,
+  createSessionGroup as requestCreateSessionGroup,
+  deleteSessionGroup as requestDeleteSessionGroup,
+  getSessionGroup as requestGetSessionGroup,
+  updateSessionGroup as requestUpdateSessionGroup,
+} from './sessionApi.js';
+import {
+  isRecoverableActiveGroupConnectionError,
+  loadActiveGroupId,
+  loadActiveSessionId,
+  persistActiveGroupId,
+  persistActiveSessionId,
+} from './sessionPersistence.js';
 
 // ── Initialize DOM ──
 initDomRefs();
 state.activeSessionId = loadActiveSessionId();
+state.activeGroupId = loadActiveGroupId();
 initSessionDrawer({
   onCreate: createSession,
+  onCreateGroup: createGroup,
   onDelete: deleteSession,
+  onDeleteGroup: deleteGroup,
   onRename: renameSession,
+  onRenameGroup: renameGroup,
   onSwitch: switchToSession,
+  onSwitchGroup: switchToGroup,
 });
 initTodosPanel();
 
@@ -215,6 +232,7 @@ function toggleToolsVisibility() {
   if (!state.ws || state.ws.readyState !== 1) return;
   const nextShowTools = !state.showTools;
   applyViewState({ show_tools: nextShowTools });
+  if (state.activeGroupId) return;
   sendCmd(`/tool ${nextShowTools ? 'on' : 'off'}`);
 }
 
@@ -222,6 +240,7 @@ function toggleReasoningVisibility() {
   if (!state.ws || state.ws.readyState !== 1) return;
   const nextShowReasoning = !state.showReasoning;
   applyViewState({ show_reasoning: nextShowReasoning });
+  if (state.activeGroupId) return;
   sendCmd(`/reasoning ${nextShowReasoning ? 'on' : 'off'}`);
 }
 
@@ -259,6 +278,127 @@ function normalizeSessionListPayload(payload): SessionSummary[] {
   return sessions;
 }
 
+function normalizeSessionGroupListPayload(payload): SessionGroupSummary[] {
+  const groups = Array.isArray(payload?.groups)
+    ? payload.groups.map((group) => ({
+        id: String(group.id ?? ''),
+        name: String(group.name ?? group.id ?? ''),
+        members: typeof group.members === 'number' ? group.members : Number(group.members ?? 0),
+        messages: typeof group.messages === 'number' ? group.messages : Number(group.messages ?? 0),
+        running: typeof group.running === 'number' ? group.running : Number(group.running ?? 0),
+        updated_at:
+          typeof group.updated_at === 'number' ? group.updated_at : Number(group.updated_at ?? 0),
+        corrupt: group.corrupt === true,
+      }))
+    : [];
+  groups.sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0) || a.id.localeCompare(b.id));
+  return groups;
+}
+
+function normalizeGroupMembers(members: unknown): string[] {
+  if (!Array.isArray(members)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const member of members) {
+    const id = String(member || '').trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
+function resetGroupTargetControls() {
+  state.activeGroupMembers = [];
+  state.groupTargetMode = 'all';
+  state.groupSelectedTargets = [];
+  renderGroupTargetControls();
+}
+
+function setActiveGroupMembers(members: unknown) {
+  const normalized = normalizeGroupMembers(members);
+  const memberSet = new Set(normalized);
+  state.activeGroupMembers = normalized;
+  state.groupSelectedTargets = state.groupSelectedTargets.filter((target) => memberSet.has(target));
+  if (state.groupTargetMode === 'selected' && state.groupSelectedTargets.length === 0) {
+    state.groupSelectedTargets = [...normalized];
+  }
+  renderGroupTargetControls();
+}
+
+function selectGroupTargetMode(mode: 'all' | 'selected' | 'mentions') {
+  state.groupTargetMode = mode;
+  if (mode === 'selected' && state.groupSelectedTargets.length === 0) {
+    state.groupSelectedTargets = [...state.activeGroupMembers];
+  }
+  renderGroupTargetControls();
+  syncToolDrawerBounds();
+}
+
+function toggleSelectedGroupTarget(memberId: string) {
+  const selected = new Set(state.groupSelectedTargets);
+  if (selected.has(memberId)) {
+    selected.delete(memberId);
+  } else {
+    selected.add(memberId);
+  }
+  const memberSet = new Set(state.activeGroupMembers);
+  state.groupSelectedTargets = Array.from(selected).filter((target) => memberSet.has(target));
+  renderGroupTargetControls();
+  syncToolDrawerBounds();
+}
+
+function renderGroupTargetControls() {
+  const bar = dom.groupTargetBar;
+  if (!bar) return;
+  bar.replaceChildren();
+  if (!state.activeGroupId) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+
+  const modes = [
+    { id: 'all' as const, label: 'All' },
+    { id: 'selected' as const, label: 'Selected' },
+    { id: 'mentions' as const, label: '@mentions' },
+  ];
+  const modeGroup = document.createElement('div');
+  modeGroup.className = 'group-target-modes';
+  modeGroup.setAttribute('role', 'group');
+  modeGroup.setAttribute('aria-label', 'Group target mode');
+  for (const mode of modes) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'group-target-mode';
+    button.textContent = mode.label;
+    button.dataset.mode = mode.id;
+    button.classList.toggle('is-active', state.groupTargetMode === mode.id);
+    button.setAttribute('aria-pressed', state.groupTargetMode === mode.id ? 'true' : 'false');
+    button.addEventListener('click', () => selectGroupTargetMode(mode.id));
+    modeGroup.appendChild(button);
+  }
+  bar.appendChild(modeGroup);
+
+  if (state.groupTargetMode !== 'selected') return;
+
+  const chips = document.createElement('div');
+  chips.className = 'group-target-members';
+  const selected = new Set(state.groupSelectedTargets);
+  for (const member of state.activeGroupMembers) {
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'group-target-member';
+    chip.classList.toggle('is-active', selected.has(member));
+    chip.setAttribute('aria-pressed', selected.has(member) ? 'true' : 'false');
+    chip.textContent = member;
+    chip.title = member;
+    chip.addEventListener('click', () => toggleSelectedGroupTarget(member));
+    chips.appendChild(chip);
+  }
+  bar.appendChild(chips);
+}
+
 async function refreshSessionsList() {
   try {
     const response = await fetch('/api/sessions', { cache: 'no-store' });
@@ -268,6 +408,18 @@ async function refreshSessionsList() {
     renderSessionDrawer();
   } catch {
     // ignore session list refresh failures; live socket state still works
+  }
+}
+
+async function refreshGroupsList() {
+  try {
+    const response = await fetch('/api/session-groups', { cache: 'no-store' });
+    if (!response.ok) return;
+    const payload = await response.json();
+    state.sessionGroups = normalizeSessionGroupListPayload(payload);
+    renderSessionDrawer();
+  } catch {
+    // ignore group list refresh failures; live socket state still works
   }
 }
 
@@ -283,14 +435,40 @@ function upsertSessionSummary(session: SessionSummary) {
 
 function switchToSession(sessionId: string) {
   const nextSessionId = String(sessionId || '').trim();
-  if (!nextSessionId || nextSessionId === state.activeSessionId || state.sessionSwitchInFlight) {
+  if (
+    !nextSessionId ||
+    (!state.activeGroupId && nextSessionId === state.activeSessionId) ||
+    state.sessionSwitchInFlight
+  ) {
     renderSessionDrawer();
     return;
   }
+  state.activeGroupId = '';
+  persistActiveGroupId('');
+  state.activeGroupRunIds.clear();
+  resetGroupTargetControls();
   state.pendingDeleteSessionId =
     state.activeSessionId && state.activeSessionId !== 'main' ? state.activeSessionId : '';
   state.activeSessionId = nextSessionId;
   persistActiveSessionId(nextSessionId);
+  state.sessionSwitchInFlight = true;
+  renderSessionDrawer();
+  reconnectToActiveSession(handleMessage);
+}
+
+function switchToGroup(groupId: string) {
+  const nextGroupId = String(groupId || '').trim();
+  if (!nextGroupId || nextGroupId === state.activeGroupId || state.sessionSwitchInFlight) {
+    renderSessionDrawer();
+    return;
+  }
+  state.activeGroupId = nextGroupId;
+  persistActiveGroupId(nextGroupId);
+  state.activeGroupMembers = [];
+  state.activeGroupRunIds.clear();
+  state.groupTargetMode = 'all';
+  state.groupSelectedTargets = [];
+  renderGroupTargetControls();
   state.sessionSwitchInFlight = true;
   renderSessionDrawer();
   reconnectToActiveSession(handleMessage);
@@ -313,6 +491,39 @@ async function createSession() {
     reconnectToActiveSession(handleMessage);
   } catch (error) {
     addError(`Failed to create session: ${error instanceof Error ? error.message : String(error)}`);
+    renderSessionDrawer();
+  } finally {
+    sessionCreateInFlight = false;
+  }
+}
+
+async function createGroup() {
+  if (sessionCreateInFlight || state.sessionSwitchInFlight) return;
+  const rawName = window.prompt('Group name', 'Session Group');
+  const name = rawName?.trim();
+  if (!name) return;
+  const defaultMembers = state.sessions
+    .filter((session) => !session.corrupt && session.id !== 'main')
+    .map((session) => session.id)
+    .join(', ');
+  const rawMembers = window.prompt('Member session ids, comma separated', defaultMembers);
+  const members = (rawMembers || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  sessionCreateInFlight = true;
+  try {
+    const created = await requestCreateSessionGroup(name, members);
+    upsertGroupSummary(created);
+    state.activeGroupId = created.id;
+    persistActiveGroupId(created.id);
+    state.activeGroupRunIds.clear();
+    setActiveGroupMembers(members);
+    state.sessionSwitchInFlight = true;
+    renderSessionDrawer();
+    reconnectToActiveSession(handleMessage);
+  } catch (error) {
+    addError(`Failed to create group: ${error instanceof Error ? error.message : String(error)}`);
     renderSessionDrawer();
   } finally {
     sessionCreateInFlight = false;
@@ -374,6 +585,66 @@ async function renameSession(sessionId: string) {
   }
 }
 
+async function renameGroup(groupId: string) {
+  const targetGroupId = String(groupId || '').trim();
+  if (!targetGroupId || state.sessionSwitchInFlight) return;
+  const current = state.sessionGroups.find((group) => group.id === targetGroupId);
+  if (current?.corrupt) return;
+  const rawName = window.prompt('Group name', current?.name || targetGroupId);
+  const nextName = rawName?.trim();
+  if (!nextName) return;
+  let existingMembers: string[] = [];
+  try {
+    existingMembers = (await requestGetSessionGroup(targetGroupId)).members;
+  } catch (error) {
+    addError(`Failed to load group members: ${error instanceof Error ? error.message : String(error)}`);
+    return;
+  }
+  const rawMembers = window.prompt(
+    'Member session ids, comma separated',
+    existingMembers.join(', '),
+  );
+  if (rawMembers == null) return;
+  const members = (rawMembers || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+  try {
+    const updated = await requestUpdateSessionGroup(targetGroupId, nextName, members);
+    upsertGroupSummary(updated);
+    if (updated.id === state.activeGroupId) {
+      dom.sessionNameEl.textContent = updated.name || updated.id;
+      setActiveGroupMembers(members);
+    }
+    renderSessionDrawer();
+    void refreshGroupsList();
+  } catch (error) {
+    addError(`Failed to update group: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function deleteGroup(groupId: string) {
+  const targetGroupId = String(groupId || '').trim();
+  if (!targetGroupId || state.sessionSwitchInFlight) return;
+  const confirmed = window.confirm(`Delete group ${targetGroupId}?`);
+  if (!confirmed) return;
+  try {
+    await requestDeleteSessionGroup(targetGroupId);
+    state.sessionGroups = state.sessionGroups.filter((group) => group.id !== targetGroupId);
+    if (state.activeGroupId === targetGroupId) {
+      state.activeGroupId = '';
+      persistActiveGroupId('');
+      state.activeGroupRunIds.clear();
+      resetGroupTargetControls();
+      state.sessionSwitchInFlight = true;
+      reconnectToActiveSession(handleMessage);
+    }
+    renderSessionDrawer();
+  } catch (error) {
+    addError(`Failed to delete group: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function appendRoundUsage(messageEl, inputTokens, outputTokens, firstTokenMs = null) {
   const lastAssistantRow = messageEl ? messageEl.closest('.msg-row') : null;
   if (!lastAssistantRow) return;
@@ -399,6 +670,16 @@ function appendRoundUsage(messageEl, inputTokens, outputTokens, firstTokenMs = n
     .filter(Boolean)
     .join('\n');
   content.appendChild(label);
+}
+
+function upsertGroupSummary(group: SessionGroupSummary) {
+  const existingIndex = state.sessionGroups.findIndex((existing) => existing.id === group.id);
+  if (existingIndex >= 0) {
+    state.sessionGroups[existingIndex] = { ...state.sessionGroups[existingIndex], ...group };
+  } else {
+    state.sessionGroups.push(group);
+  }
+  state.sessionGroups = normalizeSessionGroupListPayload({ groups: state.sessionGroups });
 }
 
 function markCurrentRoundFirstTokenAt() {
@@ -613,16 +894,365 @@ function loadEarlierMessages() {
   });
 }
 
+function groupMessageText(message): string {
+  const role = String(message?.role || 'system');
+  const sessionId = message?.session_id ? String(message.session_id) : '';
+  const prefix =
+    role === 'session'
+      ? `[${sessionId || 'session'}] `
+      : role === 'main'
+        ? '[main] '
+        : role === 'system'
+          ? '[system] '
+          : '';
+  return `${prefix}${String(message?.content || '')}`;
+}
+
+function renderGroupMessage(message): void {
+  const role = String(message?.role || 'system');
+  const bubbleRole = role === 'user' ? 'user' : role === 'system' ? 'system' : 'assistant';
+  const el = addMsg(bubbleRole, groupMessageText(message), message?.timestamp);
+  if (bubbleRole === 'assistant') {
+    el._rawText = groupMessageText(message);
+    scheduleMarkdownRender(el);
+  }
+}
+
+function renderGroupHistory(data): void {
+  clearCompressionOutcome();
+  closeToolDrawer();
+  closeSubagentModal();
+  closeOrchestrateTaskModal();
+  clearReactStatus();
+  clearActiveAutoTrace();
+  clearPendingPlanAction();
+  clearBufferedChatUpdates();
+  setAutoFollowChat(true);
+  state.pendingImages = [];
+  renderImagePreviews();
+  state.inputHistoryIndex = -1;
+  dom.chat.replaceChildren();
+  invalidateChatScrollCache();
+  state.deferredHistory = [];
+  state.activeSubagentPanels.clear();
+  state.activeOrchestrations.clear();
+  const messages = Array.isArray(data?.messages) ? data.messages : [];
+  if (messages.length === 0) {
+    addSystem('Group chat is ready. Send a message to dispatch work to the members.');
+  } else {
+    for (const message of messages) renderGroupMessage(message);
+  }
+  const messageRunIds = new Set(
+    messages.map((message) => String(message?.run_id || '')).filter(Boolean),
+  );
+  const runs = Array.isArray(data?.runs) ? data.runs : [];
+  state.activeGroupRunIds.clear();
+  for (const run of runs) {
+    const runId = String(run?.id || '');
+    const status = String(run?.status || '');
+    const sessionId = String(run?.session_id || 'session');
+    const isActive = status === 'queued' || status === 'running';
+    if (isActive && runId) {
+      state.activeGroupRunIds.add(runId);
+    }
+    const shouldReplayTerminal =
+      status === 'failed' ||
+      status === 'stopped' ||
+      (status === 'completed' && runId && !messageRunIds.has(runId));
+    if (!isActive && !shouldReplayTerminal) continue;
+    const detail = String(run?.error || run?.result_excerpt || run?.prompt || '');
+    addSystem(`[${sessionId}] ${status}${detail ? `: ${detail}` : ''}`);
+  }
+  setBusy(state.activeGroupRunIds.size > 0);
+  scrollDown(true);
+}
+
+function applyGroupRunStatus(runId: unknown, status: unknown): void {
+  const id = String(runId || '');
+  if (!id) return;
+  const value = String(status || '');
+  if (value === 'queued' || value === 'running') {
+    state.activeGroupRunIds.add(id);
+    setBusy(true);
+    return;
+  }
+  state.activeGroupRunIds.delete(id);
+  if (state.activeGroupRunIds.size === 0) {
+    setBusy(false);
+  }
+}
+
+function handleGroupMemberEvent(data): void {
+  const event = data?.event || {};
+  const sessionId = String(data?.session_id || '');
+  const runId = String(data?.run_id || '');
+  const ns = (id) => (id && runId ? `${runId}:${id}` : id);
+  const memberAgent = sessionId || 'session';
+  const memberRef = { task_id: runId, agent: memberAgent };
+  const nestedRef = {
+    task_id: ns(event.task_id || ''),
+    agent: `${memberAgent}:${event.agent || 'sub-agent'}`,
+  };
+  const ensureMemberPanel = (prompt = '') => {
+    if (runId) createSubagentPanel(memberAgent, prompt, runId);
+  };
+  const namespacedOrchestrateEvent = () => ({
+    ...event,
+    orchestrate_id: ns(event.orchestrate_id || 'orchestrate'),
+    tasks: Array.isArray(event.tasks)
+      ? event.tasks.map((task) => ({
+          ...task,
+          agent: task?.agent ? `${memberAgent}:${task.agent}` : memberAgent,
+        }))
+      : event.tasks,
+  });
+
+  switch (event.type) {
+    case 'start':
+      ensureMemberPanel();
+      addSystem(`[${sessionId}] started`);
+      break;
+    case 'auto_trace':
+      applyTopLevelAutoTrace({ ...event, subagent: null });
+      break;
+    case 'task_plan': {
+      ensureMemberPanel();
+      const planId = ns(`task-plan-${event.round ?? 0}-${event.cycle ?? 0}`);
+      addSubagentTool(
+        memberRef,
+        'Task Plan',
+        planId,
+        `round ${event.round ?? 0}, cycle ${event.cycle ?? 0}`,
+      );
+      updateSubagentToolResult(
+        memberRef,
+        planId,
+        null,
+        JSON.stringify(event.plan || {}, null, 2),
+        false,
+        'Task Plan',
+      );
+      break;
+    }
+    case 'thinking_start':
+      if (event.subagent) {
+        startSubagentReasoning(nestedRef);
+      } else {
+        ensureMemberPanel();
+        startSubagentReasoning(memberRef);
+      }
+      break;
+    case 'thinking_delta':
+      if (event.subagent) {
+        appendSubagentReasoning(nestedRef, event.content || '');
+      } else {
+        ensureMemberPanel();
+        appendSubagentReasoning(memberRef, event.content || '');
+      }
+      break;
+    case 'thinking_done':
+      if (event.subagent) {
+        finishSubagentReasoning(nestedRef);
+      } else {
+        finishSubagentReasoning(memberRef);
+      }
+      break;
+    case 'tool_call':
+      if (event.subagent) {
+        addSubagentTool(nestedRef, event.name || 'tool', event.id || '', event.arguments || '');
+      } else {
+        ensureMemberPanel();
+        addSubagentTool(memberRef, event.name || 'tool', ns(event.id || ''), event.arguments || '');
+      }
+      break;
+    case 'tool_progress':
+      updateToolProgress(ns(event.id || ''), event.elapsed_ms || 0);
+      break;
+    case 'tool_output':
+      if (event.subagent) {
+        appendSubagentToolOutput(
+          nestedRef,
+          event.id || '',
+          event.stream,
+          event.chunk || '',
+          event.name,
+        );
+      } else {
+        ensureMemberPanel();
+        appendSubagentToolOutput(
+          memberRef,
+          ns(event.id || ''),
+          event.stream,
+          event.chunk || '',
+          event.name,
+        );
+      }
+      break;
+    case 'tool_result':
+      if (event.subagent) {
+        updateSubagentToolResult(
+          nestedRef,
+          event.id || '',
+          event.duration_ms,
+          event.result,
+          event.is_error,
+          event.name,
+        );
+      } else {
+        updateSubagentToolResult(
+          memberRef,
+          ns(event.id || ''),
+          event.duration_ms,
+          event.result,
+          event.is_error,
+          event.name,
+        );
+      }
+      break;
+    case 'task_started':
+      createSubagentPanel(`${sessionId}:${event.agent || 'sub-agent'}`, event.prompt || '', ns(event.task_id || ''));
+      break;
+    case 'task_progress':
+      updateSubagentProgress(
+        { task_id: ns(event.task_id || ''), agent: `${sessionId}:${event.agent || 'sub-agent'}` },
+        event.cycle,
+      );
+      break;
+    case 'task_tool':
+      addSubagentTool(nestedRef, event.tool, event.id, event.arguments);
+      break;
+    case 'task_completed':
+    case 'task_failed':
+      finishSubagentPanel(
+        { task_id: ns(event.task_id || ''), agent: `${sessionId}:${event.agent || 'sub-agent'}` },
+        event.type === 'task_completed',
+        event,
+      );
+      break;
+    case 'orchestrate_started':
+      createOrchestratePanel(namespacedOrchestrateEvent());
+      break;
+    case 'orchestrate_layer':
+      updateOrchestrateLayer(namespacedOrchestrateEvent());
+      break;
+    case 'orchestrate_task_started':
+      markOrchestrateTask(namespacedOrchestrateEvent(), 'running');
+      break;
+    case 'orchestrate_task_completed':
+      markOrchestrateTask(namespacedOrchestrateEvent(), 'completed');
+      break;
+    case 'orchestrate_task_failed':
+      markOrchestrateTask(namespacedOrchestrateEvent(), 'failed');
+      break;
+    case 'orchestrate_task_skipped':
+      markOrchestrateTask(namespacedOrchestrateEvent(), 'skipped');
+      break;
+    case 'orchestrate_completed':
+      finishOrchestratePanel(namespacedOrchestrateEvent());
+      break;
+    case 'done':
+      finishSubagentPanel(memberRef, true, {
+        cycles: event.cycles,
+        tool_calls: event.tool_calls,
+        input_tokens: event.round_input_tokens,
+        output_tokens: event.round_output_tokens,
+      });
+      addSystem(`[${sessionId}] done`);
+      break;
+    case 'error':
+      finishSubagentPanel(memberRef, false, {
+        error: event.content || 'error',
+      });
+      addError(`[${sessionId}] ${event.content || 'error'}`);
+      break;
+  }
+}
+
+function isActiveGroupConnectionError(content: string): boolean {
+  return isRecoverableActiveGroupConnectionError(content, state.activeGroupId);
+}
+
+function recoverFromInvalidActiveGroup(): void {
+  state.activeGroupId = '';
+  persistActiveGroupId('');
+  state.activeGroupRunIds.clear();
+  resetGroupTargetControls();
+  state.sessionSwitchInFlight = true;
+  reconnectToActiveSession(handleMessage);
+}
+
 // ── handleMessage ──
 
 function handleMessage(data) {
   switch (data.type) {
+    case 'session_group_list':
+      state.sessionGroups = normalizeSessionGroupListPayload(data);
+      renderSessionDrawer();
+      break;
+
+    case 'group':
+      clearCompressionOutcome();
+      state.activeGroupId = data.id;
+      persistActiveGroupId(state.activeGroupId || '');
+      setActiveGroupMembers(data.members);
+      state.activeGroupRunIds.clear();
+      state.sessionSwitchInFlight = false;
+      dom.sessionNameEl.textContent = data.name || 'Group';
+      dom.sessionIdEl.textContent = data.id.slice(0, 12);
+      renderSessionDrawer();
+      setBusy(false);
+      void refreshGroupsList();
+      break;
+
+    case 'group_history':
+      if (Array.isArray(data.members)) {
+        setActiveGroupMembers(data.members);
+      }
+      renderGroupHistory(data);
+      break;
+
+    case 'group_message':
+      if (data.message) {
+        renderGroupMessage(data.message);
+        scrollDown();
+      }
+      break;
+
+    case 'group_run_started':
+      if (data.run) {
+        applyGroupRunStatus(data.run.id, data.run.status || 'queued');
+        addSystem(`[${data.run.session_id}] queued: ${data.run.prompt || ''}`);
+      }
+      break;
+
+    case 'group_member_event':
+      handleGroupMemberEvent(data);
+      break;
+
+    case 'group_member_status':
+      if (data.status && data.session_id) {
+        applyGroupRunStatus(data.run_id, data.status);
+        addSystem(`[${data.session_id}] ${data.status}`);
+      }
+      break;
+
+    case 'group_run_completed':
+      applyGroupRunStatus(data.run_id, data.status || 'completed');
+      if (data.error) {
+        addError(`[${data.session_id}] ${data.error}`);
+      }
+      break;
+
     case 'session_list':
       state.sessions = normalizeSessionListPayload(data);
       renderSessionDrawer();
       break;
     case 'session':
       clearCompressionOutcome();
+      state.activeGroupId = '';
+      persistActiveGroupId('');
+      state.activeGroupRunIds.clear();
+      resetGroupTargetControls();
       state.activeSessionId = data.id;
       persistActiveSessionId(state.activeSessionId || 'main');
       state.sessionSwitchInFlight = false;
@@ -1062,6 +1692,9 @@ function handleMessage(data) {
       resetRoundTimers();
       restorePendingPlanAction();
       setBusy(false);
+      if (isActiveGroupConnectionError(String(data.content || ''))) {
+        recoverFromInvalidActiveGroup();
+      }
       break;
   }
 }
@@ -1420,6 +2053,7 @@ if (dom.sessionDrawerNewBtn) {
   dom.sessionDrawerNewBtn.addEventListener('click', handleSessionDrawerNewClick);
 }
 void refreshSessionsList();
+void refreshGroupsList();
 
 // Vite HMR: remove global listeners on module dispose so hot reloads don't
 // accumulate duplicate handlers in the dev build. No-op in production.

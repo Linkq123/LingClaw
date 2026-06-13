@@ -59,6 +59,8 @@ The runtime uses an explicit ReAct-style state machine:
 - `src/agent.rs` — phase/state-machine logic, task intent, working state, ephemeral task plan rules, finish heuristics, observation summarization
 - `src/commands.rs` — slash command handlers like `/new`, `/status`, `/mcp`, `/memory`, `/reflection`
 - `src/todos.rs` — session-scoped todos validation, optimistic revision handling, and broadcast payloads
+- `src/session_group.rs` — persistent session group store under `~/.lingclaw/groups`, validation, summaries, and group replay payloads
+- `src/session_control.rs` — main-only cross-session control plane tool and group socket dispatch runtime
 - `src/providers.rs` — provider abstraction for OpenAI Chat Completions, OpenAI Responses, Anthropic, Ollama, and Gemini request/stream handling
 - `src/context.rs` — token estimation, request budgets, pruning
 - `src/hooks.rs` — lifecycle hooks, tool/LLM/command hooks, automatic context compression
@@ -98,11 +100,16 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 - The browser talks to the backend primarily over `/ws`; live reconnect/replay behavior is an important part of correctness.
 - Session-scoped todos are synchronized over the dedicated `todos_state` WebSocket event and persisted with the session; `/api/todos` uses full-list replacement plus revision conflict detection.
 - The app keeps `main` as the default session, but now supports multiple persisted sessions and frontend session switching.
+- Session groups are persistent group chats. A group has its own history and run list; dispatched member sessions also receive a normal user message containing group context plus the main instruction, so both group history and target session history are intentionally written.
+- Group deletion is refused while any member run is `queued` or `running`; callers should stop those runs first with group socket `{"type":"group_stop"}` or `session_control.stop` instead of relying on delete to cancel background work.
+- `session_control` is only available to the `main` session in execute mode. PlanOnly, non-main sessions, and sub-agents must not expose it, and the backend executor still rejects non-main calls.
+- `session_control.dispatch` is for controlling other sessions and must reject `main` as a target, including trimmed/normalized variants, so the main run never waits on a queued run behind itself.
 - OpenAI family currently has two protocol kinds: `openai-completions` (`/v1/chat/completions`) and `openai-responses` (`/v1/responses`). Both conversation paths use native upstream streaming; Responses requests set `stream: true` and map Responses SSE events into LingClaw's existing live events.
 - The frontend session switcher lives in a collapsible left drawer; the Todos panel is a local visibility toggle and defaults to hidden on first load.
 - Slash command autocomplete is frontend-local UI on top of the existing `/...` command transport: incomplete prefixes can be completed via keyboard or mouse before dispatch.
 - Automatic context compression runs as a `BeforeAnalyze` hook in `src/hooks.rs`.
 - Browser `plan_mode: true` starts `AgentRunMode::PlanOnly`: the agent may call the LLM and use only read-only tools (`think`, `read_file`, `list_dir`, `search_files`, `http_fetch`, plus read-only MCP tools enabled by the session policy). It must produce an assistant plan message, store `pending_plan`, and emit `plan_ready`; clicking “开始执行” sends `execute_plan_id`, clears the pending plan, appends a short `Proceed with the approved plan.` user message, and starts normal execute mode.
+- Group dispatch can request `run_mode=plan_only`; each target session still uses its own PlanOnly tool boundary and pending-plan behavior.
 - The rule-based `TaskPlan` is still a runtime advisory signal controlled by `settings.enableTaskPlan` (default false). When enabled, each top-level Analyze cycle refreshes it, injects it as soft guidance, emits it as a `task_plan` live event, and replays it on reconnect. It is not the same as PlanOnly and is not persisted as a session message.
 - `/new` compresses the conversation into `memory/YYYY-MM-DD.md` and clears context; it does not create a new session.
 - `/clear` clears the current message context and todo items, while advancing the todos revision so stale in-flight writes cannot repopulate the list.
@@ -116,6 +123,7 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 - User-controlled paths must go through the checked path-resolution helpers.
 - Network fetches must preserve SSRF protections and redirect restrictions.
 - Local-only request enforcement on HTTP/WebSocket routes is a core security boundary; do not weaken it casually.
+- Cross-session dispatch must never elevate permissions: target sessions keep their own model overrides, MCP session policy, Skills, hooks, and TaskPlan setting.
 
 ## Documentation worth reading before larger changes
 

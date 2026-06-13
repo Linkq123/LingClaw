@@ -53,6 +53,27 @@ export interface SessionSummary {
   corrupt?: boolean;
 }
 
+export interface SessionGroupSummary {
+  id: string;
+  name: string;
+  members?: number;
+  messages?: number;
+  running?: number;
+  updated_at?: number;
+  corrupt?: boolean;
+}
+
+export interface SessionGroupDetail {
+  id: string;
+  name: string;
+  members: string[];
+  messages?: unknown[];
+  runs?: unknown[];
+  created_at?: number;
+  updated_at?: number;
+  version?: number;
+}
+
 export type TodoStatus = 'pending' | 'in_progress' | 'completed';
 
 export interface TodoItem {

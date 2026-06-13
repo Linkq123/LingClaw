@@ -5,6 +5,7 @@ import type {
   HistoryMessage,
   ReactPhase,
   SessionSummary,
+  SessionGroupSummary,
   TodosStateEvent,
 } from './types.js';
 
@@ -53,6 +54,7 @@ export interface DomRefs {
   imageUrlField: HTMLInputElement | null;
   imageUrlAddBtn: HTMLButtonElement | null;
   planModeToggle: HTMLButtonElement | null;
+  groupTargetBar: HTMLElement | null;
   attachUploadStatus: HTMLElement | null;
   imageFileInput: HTMLInputElement | null;
   [key: string]: HTMLElement | null;
@@ -67,8 +69,14 @@ export interface AppState {
   currentMsg: HTMLElement | null;
   busy: boolean;
   activeSessionId: string;
+  activeGroupId: string;
+  activeGroupMembers: string[];
+  activeGroupRunIds: Set<string>;
+  groupTargetMode: 'all' | 'selected' | 'mentions';
+  groupSelectedTargets: string[];
   pendingDeleteSessionId: string;
   sessions: SessionSummary[];
+  sessionGroups: SessionGroupSummary[];
   sessionSwitchInFlight: boolean;
   todos: TodosStateEvent;
   todoDrafts: Map<string, string>;
@@ -150,8 +158,14 @@ export const state: AppState = {
   currentMsg: null,
   busy: false,
   activeSessionId: '',
+  activeGroupId: '',
+  activeGroupMembers: [],
+  activeGroupRunIds: new Set(),
+  groupTargetMode: 'all',
+  groupSelectedTargets: [],
   pendingDeleteSessionId: '',
   sessions: [],
+  sessionGroups: [],
   sessionSwitchInFlight: false,
   todos: {
     type: 'todos_state',
@@ -276,6 +290,7 @@ export function initDomRefs() {
   dom.imageUrlField = document.getElementById('image-url-field') as HTMLInputElement | null;
   dom.imageUrlAddBtn = document.getElementById('image-url-add') as HTMLButtonElement | null;
   dom.planModeToggle = document.getElementById('plan-mode-toggle') as HTMLButtonElement | null;
+  dom.groupTargetBar = document.getElementById('group-target-bar');
   dom.attachUploadStatus = document.getElementById('attach-upload-status');
   dom.imageFileInput = document.getElementById('image-file-input') as HTMLInputElement | null;
 }

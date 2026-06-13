@@ -46,4 +46,118 @@ describe('session API', () => {
 
     await expect(createSession()).rejects.toThrow('failed to create');
   });
+
+  it('loads a session group detail response', async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true,
+      json: async () => ({
+        group: {
+          id: 'reviewers',
+          name: 'Reviewers',
+          members: ['worker-a', ' worker-b ', ''],
+          messages: [{ role: 'user', content: 'check' }],
+          runs: [],
+          created_at: 11,
+          updated_at: 12,
+          version: 1,
+        },
+      }),
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { getSessionGroup } = await import('../src/sessionApi.js');
+    const group = await getSessionGroup('reviewers');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/session-group?group=reviewers', {
+      cache: 'no-store',
+    });
+    expect(group).toEqual({
+      id: 'reviewers',
+      name: 'Reviewers',
+      members: ['worker-a', 'worker-b'],
+      messages: [{ role: 'user', content: 'check' }],
+      runs: [],
+      created_at: 11,
+      updated_at: 12,
+      version: 1,
+    });
+  });
+
+  it('creates, updates, and deletes session groups through the group API', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (url === '/api/session-group' && init?.method === 'POST') {
+        return {
+          ok: true,
+          json: async () => ({
+            group: {
+              id: 'group-a',
+              name: 'Group A',
+              members: 2,
+              messages: 0,
+              running: 0,
+              updated_at: 20,
+            },
+          }),
+        };
+      }
+      if (url === '/api/session-group?group=group-a' && init?.method === 'PUT') {
+        return {
+          ok: true,
+          json: async () => ({
+            group: {
+              id: 'group-a',
+              name: 'Group B',
+              members: 1,
+              messages: 3,
+              running: 1,
+              updated_at: 30,
+            },
+          }),
+        };
+      }
+      if (url === '/api/session-group?group=group-a' && init?.method === 'DELETE') {
+        return { ok: true, json: async () => ({ ok: true }) };
+      }
+      return { ok: false, status: 404, json: async () => ({ error: 'unexpected call' }) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { createSessionGroup, deleteSessionGroup, updateSessionGroup } = await import(
+      '../src/sessionApi.js'
+    );
+
+    await expect(createSessionGroup('Group A', ['worker-a', 'worker-b'])).resolves.toEqual({
+      id: 'group-a',
+      name: 'Group A',
+      members: 2,
+      messages: 0,
+      running: 0,
+      updated_at: 20,
+      corrupt: false,
+    });
+    await expect(updateSessionGroup('group-a', 'Group B', ['worker-a'])).resolves.toEqual({
+      id: 'group-a',
+      name: 'Group B',
+      members: 1,
+      messages: 3,
+      running: 1,
+      updated_at: 30,
+      corrupt: false,
+    });
+    await expect(deleteSessionGroup('group-a')).resolves.toBeUndefined();
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/session-group', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Group A', members: ['worker-a', 'worker-b'] }),
+    });
+    expect(fetchMock).toHaveBeenCalledWith('/api/session-group?group=group-a', {
+      method: 'PUT',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'Group B', members: ['worker-a'] }),
+    });
+    expect(fetchMock).toHaveBeenCalledWith('/api/session-group?group=group-a', {
+      method: 'DELETE',
+    });
+  });
 });

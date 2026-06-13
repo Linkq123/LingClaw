@@ -7,6 +7,7 @@
 - 后端入口：[src/main.rs](../src/main.rs)
 - WebSocket 输入处理：[src/runtime_loop/socket_input.rs](../src/runtime_loop/socket_input.rs)
 - 会话同步与历史回放：[src/socket_sync.rs](../src/socket_sync.rs)、[src/session_store.rs](../src/session_store.rs)
+- Session group 与跨 session 控制：[src/session_group.rs](../src/session_group.rs)、[src/session_control.rs](../src/session_control.rs)
 - 配置结构：[src/config.rs](../src/config.rs)
 - 图片上传：[src/image_uploads.rs](../src/image_uploads.rs)
 - 子代理与编排事件：[src/subagents/executor.rs](../src/subagents/executor.rs)、[src/subagents/orchestrator.rs](../src/subagents/orchestrator.rs)
@@ -17,12 +18,12 @@
 - HTTP 基础地址：`http://127.0.0.1:18989`
 - WebSocket 地址：`ws://127.0.0.1:18989/ws`
 - 服务框架：`axum`
-- 会话模型：默认会话为 `main`，同时支持多个持久化 session
+- 会话模型：默认会话为 `main`，同时支持多个持久化 session 与持久化 session group
 
 后端暴露两类接口：
 
-- HTTP：健康检查、session 摘要、session 系统 Skills 开关、session MCP 权限与 catalog、配置读写、todos、模型与 MCP 联通性测试、Usage、图片上传、优雅关停
-- WebSocket：聊天主通道，承载流式回复、工具事件、推理事件、临时任务计划、子代理事件、编排事件
+- HTTP：健康检查、session/group 摘要、session 系统 Skills 开关、session MCP 权限与 catalog、配置读写、todos、模型与 MCP 联通性测试、Usage、图片上传、优雅关停
+- WebSocket：聊天主通道与 group chat 通道，承载流式回复、工具事件、推理事件、临时任务计划、子代理事件、编排事件和跨 session 成员事件
 
 ## 2. 访问与鉴权约束
 
@@ -89,7 +90,7 @@
 
 ### 3.3 会话范围
 
-服务端默认会话为 `main`，同时支持多个持久化 session。`/api/sessions` 会返回当前已加载或已持久化的 session 摘要；WebSocket 连接可通过查询参数 `?session=<id>` 绑定到指定 session，省略时回退到 `main`。每个 session 还持有一份当前 `todos` 快照（`revision`、`items[]`、`last_updated_by`、`updated_at`），随会话一起持久化；执行 `/clear` 时会清空 `items[]` 并推进 `revision`，从而拒绝旧的 in-flight 写入。
+服务端默认会话为 `main`，同时支持多个持久化 session 和持久化 session group。`/api/sessions` 会返回当前已加载或已持久化的 session 摘要；`/api/session-groups` 返回 group 摘要；WebSocket 连接可通过查询参数 `?session=<id>` 绑定到指定 session，或通过 `?group=<id>` 进入 group chat，省略时回退到 `main`。每个 session 还持有一份当前 `todos` 快照（`revision`、`items[]`、`last_updated_by`、`updated_at`），随会话一起持久化；执行 `/clear` 时会清空 `items[]` 并推进 `revision`，从而拒绝旧的 in-flight 写入。
 
 ## 4. HTTP API
 
@@ -224,6 +225,94 @@
 - `name` 会去除首尾空白，不能为空，最长 80 个字符
 - 保存成功后会持久化 session，并广播新的 session 列表
 - 未知 session 返回 `404`，非法名称返回 `400`
+
+## 4.2.3 Session Group APIs
+
+Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group 元数据、成员 session id、群聊消息和成员 run 状态。Group 有独立历史；被派发的成员 session 也会收到一条固定格式用户消息，内容为 group 上下文摘要和 main 指令，因此 group 历史与成员 session 历史都会被写入。
+
+### GET /api/session-groups
+
+返回已知 group 摘要列表，按 `updated_at` 倒序排列。
+
+```json
+{
+  "groups": [
+    {
+      "id": "a1b2c3",
+      "name": "Review Group",
+      "members": 2,
+      "messages": 4,
+      "running": 1,
+      "created_at": 1710000000,
+      "updated_at": 1710000300,
+      "corrupt": false
+    }
+  ]
+}
+```
+
+### POST /api/session-group
+
+创建 group。`id` 由后端生成；`members[]` 会去重并丢弃非法 session id。
+
+```json
+{
+  "name": "Review Group",
+  "members": ["worker-a", "worker-b"]
+}
+```
+
+成功响应：
+
+```json
+{
+  "ok": true,
+  "group": {
+    "id": "a1b2c3",
+    "name": "Review Group",
+    "members": 2,
+    "messages": 0,
+    "running": 0,
+    "created_at": 1710000000,
+    "updated_at": 1710000000,
+    "corrupt": false
+  }
+}
+```
+
+### GET /api/session-group?group=<id>
+
+返回完整 group：
+
+```json
+{
+  "group": {
+    "id": "a1b2c3",
+    "name": "Review Group",
+    "members": ["worker-a", "worker-b"],
+    "messages": [],
+    "runs": [],
+    "created_at": 1710000000,
+    "updated_at": 1710000000,
+    "version": 1
+  }
+}
+```
+
+### PUT /api/session-group?group=<id>
+
+更新 group 名称和成员列表。`name` 可省略；`members` 是完整替换列表。
+
+```json
+{
+  "name": "Backend Review",
+  "members": ["worker-a"]
+}
+```
+
+### DELETE /api/session-group?group=<id>
+
+删除 group JSON 和残留 `.tmp` 文件，并广播新的 group 列表。不存在返回 `404`。如果 group 里仍有 `queued` 或 `running` 的成员 run，后端会返回 `409 Conflict`；调用方需要先通过 group socket 发送 `{"type":"group_stop"}` 或调用 `session_control.stop` 停止这些 run，再删除 group。
 
 ## 4.3 GET/PUT /api/session-skills
 
@@ -1262,9 +1351,16 @@ ws://127.0.0.1:18989/ws
 ws://127.0.0.1:18989/ws?session=research-notes
 ```
 
+也可以进入指定 group chat：
+
+```text
+ws://127.0.0.1:18989/ws?group=a1b2c3
+```
+
 - `session` 省略时默认绑定 `main`
 - 指定的 session 不存在时，服务端会按该 id 创建新 session（前提是 id 合法）
 - 非法 session id 会回退到 `main`，并额外推送一条 `error` 事件说明原因
+- `group` 存在时进入 group chat，不会自动创建 group；未知或非法 group 会返回 `error` 并关闭该 group socket
 
 建立连接后，服务端通常会按以下顺序推送初始化事件：
 
@@ -1272,10 +1368,18 @@ ws://127.0.0.1:18989/ws?session=research-notes
 2. `view_state`
 3. `todos_state`
 4. `history`
+5. `session_group_list`
+
+Group socket 初始化顺序通常为：
+
+1. `group`
+2. `group_history`
+3. `session_group_list`
+4. `session_list`
 
 ## 5.2 客户端 -> 服务端
 
-客户端当前支持 4 类输入。浏览器前端的普通消息会发送 JSON 字符串，以便携带本轮运行选项；旧客户端仍可直接发送纯文本。
+客户端当前支持普通 session 输入、计划执行输入、忙碌期干预和 group chat 输入。浏览器前端的普通消息会发送 JSON 字符串，以便携带本轮运行选项；旧客户端仍可直接发送纯文本。
 
 ### 5.2.1 纯文本消息
 
@@ -1313,6 +1417,7 @@ ws://127.0.0.1:18989/ws?session=research-notes
 
 - 空闲时可执行命令
 - 忙碌时仅允许一小部分运行期控制命令，尤其是 `/stop`
+- Slash 命令只适用于普通 session socket；连接到 `/ws?group=<id>` 时，`/...` 文本会被拒绝，不会作为 group 消息派发
 
 ### 5.2.3 图片消息 JSON
 
@@ -1383,6 +1488,70 @@ ws://127.0.0.1:18989/ws?session=research-notes
 - 普通文本不会立刻开启新一轮，而是作为 deferred intervention 排队
 - 带图干预只保留文本，图片会被丢弃
 - `/stop` 会立即请求中止当前执行
+
+### 5.2.7 Group chat 输入
+
+连接到 `/ws?group=<id>` 后，客户端发送 group 消息：
+
+```json
+{
+  "type": "group_message",
+  "text": "请分别检查后端和前端风险",
+  "targets": ["worker-a", "worker-b"],
+  "target_mode": "selected",
+  "start_runs": true,
+  "run_mode": "execute"
+}
+```
+
+字段说明：
+
+- `target_mode`: `all` 使用 group 全部成员；`selected` 使用 `targets[]`；`mentions` 从消息中的 `@session-id` 提取，未命中时回退到全部成员
+- `start_runs`: `true` 时立即派发到目标 session；`false` 仅写入 group 消息
+- `run_mode`: `execute` 正常执行，`plan_only` 使用目标 session 的只规划模式
+- group chat 当前不支持图片附件
+- group socket 支持普通非 slash 文本作为快捷 group message；结构化客户端应优先发送 `type:"group_message"` JSON
+
+停止当前 group 内 queued/running 成员 run：
+
+```json
+{
+  "type": "group_stop"
+}
+```
+
+也可以传 `targets` 只停止指定成员：
+
+```json
+{
+  "type": "group_stop",
+  "targets": ["worker-a"]
+}
+```
+
+派发是跨 session 异步并发、同一目标 session 串行排队。目标 session 使用自己的模型覆盖、MCP session policy、Skills 和 `settings.enableTaskPlan` 设置；group 不提升任何权限。每个目标 session 收到的用户消息格式固定为 group 上下文摘要加 main 指令，避免修改系统提示。
+
+### 5.2.8 `session_control` 工具
+
+`session_control` 是模型工具，只在 `main` session 的正常执行模式暴露；`plan_mode: true`、非 `main` session 和子代理都不会拿到该工具。后端执行层也会校验 `current_session_id == "main"`，即使模型或客户端伪造调用也会被拒绝。
+
+支持动作：
+
+- `list_sessions`: 返回 session 摘要
+- `list_groups`: 返回 group 摘要
+- `create_group`: 创建 group
+- `update_group`: 更新 group 名称或成员
+- `post_group_message`: 只向 group 历史写入 main 消息
+- `dispatch`: 向 `targets[]` 或 `group_id` 成员派发任务，支持 `run_mode=execute|plan_only`、`wait` 和 `summary_budget`
+- `collect`: 汇总指定 group 的最近消息和 run 状态
+- `stop`: 停止指定 targets 或 group 内 queued/running run
+
+权限边界：
+
+- `session_control` 只负责跨 session 调度，不改变目标 session 的工具权限、MCP policy、hooks 或 PlanOnly 边界
+- `dispatch` 控制其他 session，不能把任务派发给 `main` 自己；目标包含 `main` 时会被后端拒绝，避免 main 等待自身 queued run 导致超时
+- 目标 session 的 mutating 行为仍由其正常运行模式、工具权限和 hook 链决定
+- group 默认单轮响应，被派发的 session 各自回复一次，不会自动触发无限互相回复
 
 ## 5.3 服务端 -> 客户端事件
 
@@ -1664,6 +1833,109 @@ ws://127.0.0.1:18989/ws?session=research-notes
 - `plan_id`: 当前 session 内待执行计划 id
 - `message_index`: assistant 计划消息在 session messages 中的位置
 - `created_at`: 创建时间戳，秒级 Unix time
+
+### Group events
+
+`/ws?group=<id>` 使用以下事件恢复和更新 group UI。
+
+```json
+{
+  "type": "group",
+  "id": "a1b2c3",
+  "name": "Review Group",
+  "members": ["worker-a", "worker-b"],
+  "created_at": 1710000000,
+  "updated_at": 1710000300
+}
+```
+
+```json
+{
+  "type": "group_history",
+  "group_id": "a1b2c3",
+  "members": ["worker-a", "worker-b"],
+  "messages": [],
+  "runs": []
+}
+```
+
+```json
+{
+  "type": "group_message",
+  "group_id": "a1b2c3",
+  "message": {
+    "id": "gmsg_...",
+    "role": "session",
+    "session_id": "worker-a",
+    "content": "检查结果摘要",
+    "timestamp": 1710000400,
+    "run_id": "grun_..."
+  }
+}
+```
+
+```json
+{
+  "type": "group_run_started",
+  "group_id": "a1b2c3",
+  "run": {
+    "id": "grun_...",
+    "group_id": "a1b2c3",
+    "session_id": "worker-a",
+    "status": "queued",
+    "prompt": "请检查后端风险",
+    "created_at": 1710000400,
+    "updated_at": 1710000400
+  }
+}
+```
+
+```json
+{
+  "type": "group_member_event",
+  "group_id": "a1b2c3",
+  "run_id": "grun_...",
+  "session_id": "worker-a",
+  "event": {
+    "type": "tool_call",
+    "name": "read_file",
+    "id": "call_..."
+  }
+}
+```
+
+```json
+{
+  "type": "group_member_status",
+  "group_id": "a1b2c3",
+  "run_id": "grun_...",
+  "session_id": "worker-a",
+  "status": "completed",
+  "result_excerpt": "检查结果摘要",
+  "error": null,
+  "updated_at": 1710000500
+}
+```
+
+```json
+{
+  "type": "group_run_completed",
+  "group_id": "a1b2c3",
+  "run_id": "grun_...",
+  "session_id": "worker-a",
+  "status": "completed",
+  "result_excerpt": "检查结果摘要",
+  "error": null,
+  "completed_at": 1710000500
+}
+```
+
+说明：
+
+- `group_message.role` 可为 `user`、`main`、`session`、`system`
+- `group_member_event.event` 是目标 session 原 live event 的包装；目标 session 自身 live replay 也会保留这些事件
+- 正常完成时，成员最终摘要会先作为 `group_message` 写入 group 历史；`group_run_completed` 用于状态收敛，前端不需要再把 `result_excerpt` 渲染成第二条消息
+- `status` 可为 `queued`、`running`、`completed`、`failed`、`stopped`
 
 ### `delta`
 
@@ -2163,7 +2435,7 @@ WebSocket 下若图片不合法，通常以 `system` 事件返回错误，例如
 - `/api/config` 在配置文件语法错误时不会返回 4xx，而是返回可恢复信息
 - `/api/sessions` 返回当前已知 session 摘要列表，`main` 固定置顶；`POST /api/session` 创建随机 6 位 id 的新 session，`PUT /api/session` 只修改 session 显示名称
 - `/api/todos` 使用整表替换 + revision 冲突语义；冲突时返回 `409 + 当前快照`
-- WebSocket 客户端消息没有显式 `type` 字段，按“纯文本 / slash 命令 / JSON 图片或运行选项消息 / execute_plan_id”自动分流
+- 普通 session WebSocket 客户端消息没有显式 `type` 字段，按“纯文本 / slash 命令 / JSON 图片或运行选项消息 / execute_plan_id”自动分流；group WebSocket 使用 `type:"group_message"`
 - 忙碌时普通文本会进入 deferred intervention 队列，不会立即中断主执行
 
 ## 9. 文档维护建议
