@@ -152,17 +152,27 @@ import {
   updateSessionGroup as requestUpdateSessionGroup,
 } from './sessionApi.js';
 import {
+  isActiveGroupRunStatus,
   isRecoverableActiveGroupConnectionError,
   loadActiveGroupId,
   loadActiveSessionId,
+  mainSessionStateForGroupControl,
+  normalizeGroupRunUpdatedAt,
   persistActiveGroupId,
   persistActiveSessionId,
+  sessionIdAfterLeavingGroup,
+  shouldApplyGroupRunStatusUpdate,
 } from './sessionPersistence.js';
 
 // ── Initialize DOM ──
 initDomRefs();
 state.activeSessionId = loadActiveSessionId();
 state.activeGroupId = loadActiveGroupId();
+if (state.activeGroupId) {
+  const groupSessionState = mainSessionStateForGroupControl(state.activeSessionId);
+  state.groupReturnSessionId = groupSessionState.groupReturnSessionId;
+  state.activeSessionId = groupSessionState.activeSessionId;
+}
 initSessionDrawer({
   onCreate: createSession,
   onCreateGroup: createGroup,
@@ -315,6 +325,32 @@ function resetGroupTargetControls() {
   renderGroupTargetControls();
 }
 
+function clearGroupRunState() {
+  state.activeGroupRunIds.clear();
+  state.groupRunStatuses.clear();
+}
+
+function enterGroupControlSession() {
+  const groupSessionState = mainSessionStateForGroupControl(
+    state.activeSessionId,
+    state.groupReturnSessionId,
+  );
+  state.groupReturnSessionId = groupSessionState.groupReturnSessionId;
+  state.activeSessionId = groupSessionState.activeSessionId;
+}
+
+function leaveActiveGroupForSession(fallbackSessionId = loadActiveSessionId()): string {
+  const nextSessionId = sessionIdAfterLeavingGroup(state.groupReturnSessionId, fallbackSessionId);
+  state.activeGroupId = '';
+  state.groupReturnSessionId = '';
+  persistActiveGroupId('');
+  clearGroupRunState();
+  resetGroupTargetControls();
+  state.activeSessionId = nextSessionId;
+  persistActiveSessionId(nextSessionId);
+  return nextSessionId;
+}
+
 function setActiveGroupMembers(members: unknown) {
   const normalized = normalizeGroupMembers(members);
   const memberSet = new Set(normalized);
@@ -444,8 +480,9 @@ function switchToSession(sessionId: string) {
     return;
   }
   state.activeGroupId = '';
+  state.groupReturnSessionId = '';
   persistActiveGroupId('');
-  state.activeGroupRunIds.clear();
+  clearGroupRunState();
   resetGroupTargetControls();
   state.pendingDeleteSessionId =
     state.activeSessionId && state.activeSessionId !== 'main' ? state.activeSessionId : '';
@@ -462,10 +499,11 @@ function switchToGroup(groupId: string) {
     renderSessionDrawer();
     return;
   }
+  enterGroupControlSession();
   state.activeGroupId = nextGroupId;
   persistActiveGroupId(nextGroupId);
   state.activeGroupMembers = [];
-  state.activeGroupRunIds.clear();
+  clearGroupRunState();
   state.groupTargetMode = 'all';
   state.groupSelectedTargets = [];
   renderGroupTargetControls();
@@ -484,6 +522,11 @@ async function createSession() {
     upsertSessionSummary(created);
     state.pendingDeleteSessionId =
       state.activeSessionId && state.activeSessionId !== 'main' ? state.activeSessionId : '';
+    state.activeGroupId = '';
+    state.groupReturnSessionId = '';
+    persistActiveGroupId('');
+    clearGroupRunState();
+    resetGroupTargetControls();
     state.activeSessionId = created.id;
     persistActiveSessionId(created.id);
     state.sessionSwitchInFlight = true;
@@ -515,9 +558,10 @@ async function createGroup() {
   try {
     const created = await requestCreateSessionGroup(name, members);
     upsertGroupSummary(created);
+    enterGroupControlSession();
     state.activeGroupId = created.id;
     persistActiveGroupId(created.id);
-    state.activeGroupRunIds.clear();
+    clearGroupRunState();
     setActiveGroupMembers(members);
     state.sessionSwitchInFlight = true;
     renderSessionDrawer();
@@ -632,10 +676,7 @@ async function deleteGroup(groupId: string) {
     await requestDeleteSessionGroup(targetGroupId);
     state.sessionGroups = state.sessionGroups.filter((group) => group.id !== targetGroupId);
     if (state.activeGroupId === targetGroupId) {
-      state.activeGroupId = '';
-      persistActiveGroupId('');
-      state.activeGroupRunIds.clear();
-      resetGroupTargetControls();
+      leaveActiveGroupForSession();
       state.sessionSwitchInFlight = true;
       reconnectToActiveSession(handleMessage);
     }
@@ -946,15 +987,13 @@ function renderGroupHistory(data): void {
     messages.map((message) => String(message?.run_id || '')).filter(Boolean),
   );
   const runs = Array.isArray(data?.runs) ? data.runs : [];
-  state.activeGroupRunIds.clear();
+  clearGroupRunState();
   for (const run of runs) {
     const runId = String(run?.id || '');
     const status = String(run?.status || '');
     const sessionId = String(run?.session_id || 'session');
-    const isActive = status === 'queued' || status === 'running';
-    if (isActive && runId) {
-      state.activeGroupRunIds.add(runId);
-    }
+    const isActive = isActiveGroupRunStatus(status);
+    applyGroupRunStatus(runId, status, run?.updated_at);
     const shouldReplayTerminal =
       status === 'failed' ||
       status === 'stopped' ||
@@ -967,19 +1006,29 @@ function renderGroupHistory(data): void {
   scrollDown(true);
 }
 
-function applyGroupRunStatus(runId: unknown, status: unknown): void {
+function applyGroupRunStatus(runId: unknown, status: unknown, updatedAt: unknown): boolean {
   const id = String(runId || '');
-  if (!id) return;
+  if (!id) return false;
   const value = String(status || '');
-  if (value === 'queued' || value === 'running') {
+  const normalizedUpdatedAt = normalizeGroupRunUpdatedAt(updatedAt);
+  const current = state.groupRunStatuses.get(id);
+  if (!shouldApplyGroupRunStatusUpdate(current, value, normalizedUpdatedAt)) {
+    return false;
+  }
+  state.groupRunStatuses.set(id, {
+    status: value,
+    updatedAt: normalizedUpdatedAt,
+  });
+  if (isActiveGroupRunStatus(value)) {
     state.activeGroupRunIds.add(id);
     setBusy(true);
-    return;
+    return true;
   }
   state.activeGroupRunIds.delete(id);
   if (state.activeGroupRunIds.size === 0) {
     setBusy(false);
   }
+  return true;
 }
 
 function handleGroupMemberEvent(data): void {
@@ -1173,10 +1222,7 @@ function isActiveGroupConnectionError(content: string): boolean {
 }
 
 function recoverFromInvalidActiveGroup(): void {
-  state.activeGroupId = '';
-  persistActiveGroupId('');
-  state.activeGroupRunIds.clear();
-  resetGroupTargetControls();
+  leaveActiveGroupForSession();
   state.sessionSwitchInFlight = true;
   reconnectToActiveSession(handleMessage);
 }
@@ -1195,7 +1241,7 @@ function handleMessage(data) {
       state.activeGroupId = data.id;
       persistActiveGroupId(state.activeGroupId || '');
       setActiveGroupMembers(data.members);
-      state.activeGroupRunIds.clear();
+      clearGroupRunState();
       state.sessionSwitchInFlight = false;
       dom.sessionNameEl.textContent = data.name || 'Group';
       dom.sessionIdEl.textContent = data.id.slice(0, 12);
@@ -1220,8 +1266,14 @@ function handleMessage(data) {
 
     case 'group_run_started':
       if (data.run) {
-        applyGroupRunStatus(data.run.id, data.run.status || 'queued');
-        addSystem(`[${data.run.session_id}] queued: ${data.run.prompt || ''}`);
+        const applied = applyGroupRunStatus(
+          data.run.id,
+          data.run.status || 'queued',
+          data.run.updated_at,
+        );
+        if (applied) {
+          addSystem(`[${data.run.session_id}] queued: ${data.run.prompt || ''}`);
+        }
       }
       break;
 
@@ -1231,17 +1283,24 @@ function handleMessage(data) {
 
     case 'group_member_status':
       if (data.status && data.session_id) {
-        applyGroupRunStatus(data.run_id, data.status);
-        addSystem(`[${data.session_id}] ${data.status}`);
+        const applied = applyGroupRunStatus(data.run_id, data.status, data.updated_at);
+        if (applied) {
+          addSystem(`[${data.session_id}] ${data.status}`);
+        }
       }
       break;
 
-    case 'group_run_completed':
-      applyGroupRunStatus(data.run_id, data.status || 'completed');
-      if (data.error) {
+    case 'group_run_completed': {
+      const applied = applyGroupRunStatus(
+        data.run_id,
+        data.status || 'completed',
+        data.updated_at ?? data.completed_at,
+      );
+      if (applied && data.error) {
         addError(`[${data.session_id}] ${data.error}`);
       }
       break;
+    }
 
     case 'session_list':
       state.sessions = normalizeSessionListPayload(data);
@@ -1250,8 +1309,9 @@ function handleMessage(data) {
     case 'session':
       clearCompressionOutcome();
       state.activeGroupId = '';
+      state.groupReturnSessionId = '';
       persistActiveGroupId('');
-      state.activeGroupRunIds.clear();
+      clearGroupRunState();
       resetGroupTargetControls();
       state.activeSessionId = data.id;
       persistActiveSessionId(state.activeSessionId || 'main');

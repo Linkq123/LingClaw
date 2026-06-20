@@ -184,6 +184,7 @@ pub(crate) struct AgentRunOutcome {
     pub(crate) rerun_agent: bool,
     pub(crate) shutting_down: bool,
     pub(crate) run_stopped: bool,
+    pub(crate) run_failed: bool,
 }
 
 pub(crate) struct AgentRunReservation {
@@ -230,6 +231,24 @@ pub(crate) async fn release_agent_run_reservation(
     if runs.get(session_id).map(|run| run.connection_id) == Some(reservation.connection_id) {
         runs.remove(session_id);
     }
+}
+
+pub(crate) async fn release_agent_run_for_stop_requested(
+    state: &AppState,
+    session_id: &str,
+    stop_requested: &Arc<AtomicBool>,
+) -> bool {
+    let mut runs = state.active_runs.lock().await;
+    let should_remove = runs
+        .get(session_id)
+        .is_some_and(|run| Arc::ptr_eq(&run.stop_requested, stop_requested));
+    let removed = should_remove.then(|| runs.remove(session_id)).flatten();
+    drop(runs);
+    if let Some(run) = removed {
+        run.cancel.cancel();
+        return true;
+    }
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,6 +299,7 @@ struct AgentPhaseState {
     react_ctx: agent::AgentLoopCtx,
     shutting_down: bool,
     run_stopped: bool,
+    run_failed: bool,
     run_detached: bool,
     last_save_instant: Option<std::time::Instant>,
     /// Token counters snapshotted at loop start for per-round delta calculation.
@@ -2160,6 +2180,17 @@ async fn execute_tool_call(
         )
         .await
     } else if tools::is_session_control_tool(&tc.function.name) {
+        if phase_state.run_mode.is_plan_only() {
+            return Ok((
+                tools::ToolOutcome {
+                    output: "[rejected by plan mode] `session_control` is not available while planning. Produce the plan without controlling other sessions.".to_string(),
+                    is_error: true,
+                    duration_ms: 0,
+                    subagent_snapshot: None,
+                },
+                None,
+            ));
+        }
         run_tool_with_feedback(
             ctx.live_tx,
             ctx.run_cancel,
@@ -2934,6 +2965,7 @@ async fn run_analyze_phase(
     }
 
     if request_estimate > request_budget {
+        phase_state.run_failed = true;
         let _ = live_send(
             ctx.live_tx,
             json!({
@@ -3018,6 +3050,7 @@ async fn run_analyze_phase(
             AgentPhaseControl::Continue
         }
         Err(error) => {
+            phase_state.run_failed = true;
             let _ = live_send(ctx.live_tx, json!({"type":"error","content":error})).await;
             AgentPhaseControl::Break
         }
@@ -3662,6 +3695,7 @@ pub(crate) async fn run_agent_session(
                     rerun_agent: false,
                     shutting_down: false,
                     run_stopped: false,
+                    run_failed: false,
                 };
             }
         },
@@ -3704,6 +3738,7 @@ pub(crate) async fn run_agent_session(
         react_ctx: agent::AgentLoopCtx::new(show_react),
         shutting_down: false,
         run_stopped: false,
+        run_failed: false,
         run_detached: false,
         last_save_instant: None,
         usage_snap_input: 0,
@@ -3848,6 +3883,7 @@ pub(crate) async fn run_agent_session(
         rerun_agent,
         shutting_down: phase_state.shutting_down,
         run_stopped: phase_state.run_stopped,
+        run_failed: phase_state.run_failed,
     }
 }
 

@@ -1856,6 +1856,7 @@ async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
+        run_failed: false,
         run_detached: false,
         last_save_instant: None,
         usage_snap_input: 0,
@@ -1973,6 +1974,7 @@ fn phase_state_for_analyze_test() -> AgentPhaseState {
         react_ctx: agent::AgentLoopCtx::new(true),
         shutting_down: false,
         run_stopped: false,
+        run_failed: false,
         run_detached: false,
         last_save_instant: None,
         usage_snap_input: 0,
@@ -2577,7 +2579,7 @@ async fn session_control_tool_rejects_dispatch_to_main_session() {
     let outcome = crate::session_control::execute_session_control_tool(
         &state,
         MAIN_SESSION_ID,
-        r#"{"action":"dispatch","targets":[" main "],"message":"review this","wait":true}"#,
+        r#"{"action":"dispatch","targets":[" Main "],"message":"review this","wait":true}"#,
     )
     .await;
 
@@ -2587,6 +2589,70 @@ async fn session_control_tool_rejects_dispatch_to_main_session() {
             .output
             .contains("cannot dispatch to the main session")
     );
+}
+
+#[tokio::test]
+async fn release_agent_run_for_stop_requested_requires_matching_token() {
+    let state = Arc::new(test_app_state());
+    let cancel = CancellationToken::new();
+    let matching_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let other_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reservation = try_reserve_agent_run(&state, "worker-a", 42, &cancel, &matching_stop)
+        .await
+        .expect("run should reserve");
+
+    assert!(
+        !release_agent_run_for_stop_requested(&state, "worker-a", &other_stop).await,
+        "non-matching stop token must not remove an active run"
+    );
+    assert!(state.active_runs.lock().await.contains_key("worker-a"));
+    assert!(!reservation.run_cancel.is_cancelled());
+
+    assert!(
+        release_agent_run_for_stop_requested(&state, "worker-a", &matching_stop).await,
+        "matching stop token should remove the active run"
+    );
+    assert!(!state.active_runs.lock().await.contains_key("worker-a"));
+    assert!(reservation.run_cancel.is_cancelled());
+}
+
+#[tokio::test]
+async fn execute_tool_call_rejects_session_control_in_plan_only_mode() {
+    let state = Arc::new(test_app_state());
+    let workspace = temp_workspace("plan-only-session-control");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        current_session_id: MAIN_SESSION_ID,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.run_mode = AgentRunMode::PlanOnly;
+    phase_state.cycle_workspace = workspace.clone();
+    let tc = ToolCall {
+        id: "call-session-control".into(),
+        call_type: "function".into(),
+        gemini_thought_signature: None,
+        function: FunctionCall {
+            name: crate::tools::TOOL_NAME_SESSION_CONTROL.into(),
+            arguments: r#"{"action":"create_session","name":"Should Not Create"}"#.into(),
+        },
+    };
+
+    let (outcome, effective_args) = execute_tool_call(&ctx, &mut phase_state, &tc)
+        .await
+        .expect("plan-only session_control rejection should be recorded");
+
+    assert!(outcome.is_error);
+    assert!(outcome.output.contains("rejected by plan mode"));
+    assert!(effective_args.is_none());
+    let _ = std::fs::remove_dir_all(&workspace);
 }
 
 fn plan_only_mcp_test_config() -> Config {
@@ -3352,6 +3418,7 @@ async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections(
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
+        run_failed: false,
         run_detached: false,
         last_save_instant: None,
         usage_snap_input: 0,
@@ -3485,6 +3552,7 @@ async fn prepare_analyze_snapshot_preserves_todos_when_optional_sections_overflo
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
+        run_failed: false,
         run_detached: false,
         last_save_instant: None,
         usage_snap_input: 0,
@@ -3609,6 +3677,7 @@ async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
+        run_failed: false,
         run_detached: false,
         last_save_instant: None,
         usage_snap_input: 0,
@@ -3737,6 +3806,7 @@ async fn update_working_state_keeps_results_attached_to_their_original_query() {
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
+        run_failed: false,
         run_detached: false,
         last_save_instant: None,
         usage_snap_input: 0,
@@ -3843,6 +3913,7 @@ async fn update_working_state_reuses_same_cycle_task_memory_selection() {
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
+        run_failed: false,
         run_detached: false,
         last_save_instant: None,
         usage_snap_input: 0,
@@ -4006,6 +4077,7 @@ async fn update_working_state_refreshes_task_memory_after_state_changes() {
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
+        run_failed: false,
         run_detached: false,
         last_save_instant: None,
         usage_snap_input: 0,
@@ -4093,6 +4165,7 @@ async fn prepare_analyze_snapshot_injects_fresh_task_state_each_time() {
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
+        run_failed: false,
         run_detached: false,
         last_save_instant: None,
         usage_snap_input: 0,
@@ -4251,6 +4324,7 @@ async fn prepare_analyze_snapshot_injects_retrieved_task_memory() {
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
+        run_failed: false,
         run_detached: false,
         last_save_instant: None,
         usage_snap_input: 0,
@@ -4360,6 +4434,7 @@ async fn prepare_analyze_snapshot_injects_agent_recommendations_and_delegation_g
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
+        run_failed: false,
         run_detached: false,
         last_save_instant: None,
         usage_snap_input: 0,
@@ -4507,6 +4582,7 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
         react_ctx: agent::AgentLoopCtx::new(false),
         shutting_down: false,
         run_stopped: false,
+        run_failed: false,
         run_detached: false,
         last_save_instant: None,
         usage_snap_input: 0,

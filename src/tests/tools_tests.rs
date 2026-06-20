@@ -1073,3 +1073,84 @@ fn display_tool_arguments_redacts_exec_secrets() {
     assert!(!rendered.contains("quoted-secret"));
     assert!(rendered.contains("https://example.com"));
 }
+
+#[test]
+fn display_tool_arguments_redacts_create_session_profiles() {
+    let rendered = display_tool_arguments(
+        TOOL_NAME_SESSION_CONTROL,
+        r#"{"action":"create_session","name":"Reviewer","purpose":"contains API_KEY=secret","identity_profile":"token is abc","user_profile":"private user context","style_profile":"concise","agent_notes":"Bearer super-secret","group_id":"group-a"}"#,
+    );
+
+    assert!(rendered.contains(r#""action":"create_session""#));
+    assert!(rendered.contains(r#""name":"Reviewer""#));
+    assert!(rendered.contains(r#""group_id":"group-a""#));
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("API_KEY=secret"));
+    assert!(!rendered.contains("token is abc"));
+    assert!(!rendered.contains("private user context"));
+    assert!(!rendered.contains("Bearer super-secret"));
+
+    let rendered = display_tool_arguments(
+        TOOL_NAME_SESSION_CONTROL,
+        r#"{"action":"create_session","api_key":"sk-live-1234567890abcdefghijklmnop","meta":{"token":"ghp_supersecretvalue"},"name":"Reviewer"}"#,
+    );
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("sk-live-1234567890abcdefghijklmnop"));
+    assert!(!rendered.contains("ghp_supersecretvalue"));
+
+    let rendered = display_tool_arguments(
+        TOOL_NAME_SESSION_CONTROL,
+        r#"{"action":"Create_Session","identity_profile":"private user context","agent_notes":"Bearer super-secret"}"#,
+    );
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("private user context"));
+    assert!(!rendered.contains("super-secret"));
+
+    let rendered = display_tool_arguments(
+        TOOL_NAME_SESSION_CONTROL,
+        r#"{"action":"create_session","payload":{"Identity_Profile":"private nested context","items":[{"agent_notes":"nested secret"}]}}"#,
+    );
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("private nested context"));
+    assert!(!rendered.contains("nested secret"));
+
+    let rendered = display_tool_arguments(
+        TOOL_NAME_SESSION_CONTROL,
+        r#"{"action":"create_session","agent_notes":"Bearer super-secret""#,
+    );
+
+    assert!(rendered.contains(r#""action":"<unknown>""#));
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("super-secret"));
+
+    let rendered = display_tool_arguments(
+        TOOL_NAME_SESSION_CONTROL,
+        r#"{"identity_profile":"private user context""#,
+    );
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("private user context"));
+    assert!(rendered.contains(r#""action":"<unknown>""#));
+
+    let rendered = display_tool_arguments(
+        TOOL_NAME_SESSION_CONTROL,
+        r#""create_session agent_notes Bearer super-secret""#,
+    );
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("super-secret"));
+
+    let rendered = display_tool_arguments(
+        TOOL_NAME_SESSION_CONTROL,
+        r#"["create_session","agent_notes","Bearer super-secret"]"#,
+    );
+    assert!(rendered.contains(r#""agent_notes""#));
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("super-secret"));
+
+    let rendered = display_tool_arguments(
+        TOOL_NAME_SESSION_CONTROL,
+        r#"["create_session","agent_notes",{"comment":"x"},"Bearer hunter2"]"#,
+    );
+    assert!(rendered.contains(r#""agent_notes""#));
+    assert!(rendered.contains("[REDACTED]"));
+    assert!(!rendered.contains("hunter2"));
+}

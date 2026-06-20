@@ -3132,7 +3132,7 @@ async fn ws_handler(
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| async move {
         if let Some(group_id) = query.group {
-            handle_group_socket(socket, state, group_id).await;
+            handle_group_socket(socket, state, group_id, query.session).await;
         } else {
             handle_socket(socket, state, query.session).await;
         }
@@ -3343,7 +3343,12 @@ struct GroupSocketMessage {
     run_mode: Option<String>,
 }
 
-async fn handle_group_socket(socket: WebSocket, state: Arc<AppState>, requested_group_id: String) {
+async fn handle_group_socket(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    requested_group_id: String,
+    requested_session_id: Option<String>,
+) {
     let (mut socket_tx, mut rx) = socket.split();
     let (tx, mut outbound_rx) = mpsc::channel::<String>(256);
     let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
@@ -3354,6 +3359,21 @@ async fn handle_group_socket(socket: WebSocket, state: Arc<AppState>, requested_
             }
         }
     });
+
+    if !group_socket_requested_session_is_main(requested_session_id.as_deref()) {
+        let _ = ws_send(
+            &tx,
+            &json!({
+                "type":"error",
+                "content":"Group chat sockets require the UI connection query parameter session=main.",
+                "dismissible":true,
+            }),
+        )
+        .await;
+        drop(tx);
+        let _ = writer.await;
+        return;
+    }
 
     let group_id = match session_group::validate_group_id(&requested_group_id) {
         Ok(group_id) => group_id.to_string(),
@@ -3517,6 +3537,12 @@ async fn handle_group_socket(socket: WebSocket, state: Arc<AppState>, requested_
     }
     drop(tx);
     let _ = writer.await;
+}
+
+fn group_socket_requested_session_is_main(requested_session_id: Option<&str>) -> bool {
+    requested_session_id
+        .map(str::trim)
+        .is_some_and(|session_id| session_id.eq_ignore_ascii_case(MAIN_SESSION_ID))
 }
 
 async fn switch_socket_session(

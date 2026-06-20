@@ -30,6 +30,7 @@ struct PersistedSessionCacheEntry {
 pub(crate) struct SessionSummary {
     pub(crate) id: String,
     pub(crate) name: String,
+    pub(crate) model_override: Option<String>,
     pub(crate) messages: usize,
     pub(crate) tool_calls: usize,
     pub(crate) created_at: u64,
@@ -42,6 +43,7 @@ impl SessionSummary {
         Self {
             id: session.id.clone(),
             name: session.name.clone(),
+            model_override: session.model_override.clone(),
             messages: sanitized_non_system_message_count(session),
             tool_calls: session.tool_calls_count,
             created_at: session.created_at,
@@ -53,6 +55,7 @@ impl SessionSummary {
     pub(crate) fn to_json(&self, config: &Config, session: Option<&Session>) -> serde_json::Value {
         let model = session
             .map(|session| session.effective_model(&config.model).to_string())
+            .or_else(|| self.model_override.clone())
             .unwrap_or_else(|| config.model.clone());
         json!({
             "id": self.id,
@@ -702,6 +705,7 @@ pub(crate) fn list_saved_session_summaries_in_dir(dir: &Path) -> Vec<SessionSumm
                     out.push(SessionSummary {
                         id: id.to_string(),
                         name: "[Corrupt Session]".to_string(),
+                        model_override: None,
                         messages: 0,
                         tool_calls: 0,
                         created_at: 0,

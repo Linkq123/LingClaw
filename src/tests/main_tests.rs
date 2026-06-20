@@ -5560,6 +5560,14 @@ async fn group_socket_stop_marks_active_runs_stopped() {
         .expect("group should clean up");
 }
 
+#[test]
+fn group_socket_requires_main_session_query() {
+    assert!(group_socket_requested_session_is_main(Some("main")));
+    assert!(group_socket_requested_session_is_main(Some(" MAIN ")));
+    assert!(!group_socket_requested_session_is_main(None));
+    assert!(!group_socket_requested_session_is_main(Some("worker-a")));
+}
+
 #[tokio::test]
 async fn api_sessions_includes_corrupt_persisted_sessions() {
     let session_id = format!(
@@ -7822,6 +7830,7 @@ fn recoverable_session_ids_skip_empty_and_corrupt_sessions() {
         crate::session_store::SessionSummary {
             id: "empty-session".to_string(),
             name: "Empty".to_string(),
+            model_override: None,
             messages: 0,
             tool_calls: 0,
             created_at: 0,
@@ -7831,6 +7840,7 @@ fn recoverable_session_ids_skip_empty_and_corrupt_sessions() {
         crate::session_store::SessionSummary {
             id: "corrupt-session".to_string(),
             name: "[Corrupt Session]".to_string(),
+            model_override: None,
             messages: 99,
             tool_calls: 0,
             created_at: 0,
@@ -7840,6 +7850,7 @@ fn recoverable_session_ids_skip_empty_and_corrupt_sessions() {
         crate::session_store::SessionSummary {
             id: "real-session".to_string(),
             name: "Real".to_string(),
+            model_override: None,
             messages: 3,
             tool_calls: 0,
             created_at: 0,

@@ -918,15 +918,23 @@ pub(crate) fn build_tool_execution_trace(
 }
 
 pub(crate) fn display_tool_arguments(tool_name: &str, raw_args: &str) -> String {
-    if tool_name != TOOL_NAME_EXEC {
-        return raw_args.to_string();
+    match tool_name {
+        TOOL_NAME_EXEC => {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_args) else {
+                return exec::sanitize_exec_command_for_display(raw_args);
+            };
+            serde_json::to_string(&sanitize_exec_argument_value(None, &value))
+                .unwrap_or_else(|_| exec::sanitize_exec_command_for_display(raw_args))
+        }
+        TOOL_NAME_SESSION_CONTROL => {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_args) else {
+                return sanitize_session_control_raw_arguments(raw_args);
+            };
+            serde_json::to_string(&sanitize_session_control_argument_value(&value))
+                .unwrap_or_else(|_| sanitize_session_control_raw_arguments(raw_args))
+        }
+        _ => raw_args.to_string(),
     }
-
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw_args) else {
-        return exec::sanitize_exec_command_for_display(raw_args);
-    };
-    serde_json::to_string(&sanitize_exec_argument_value(None, &value))
-        .unwrap_or_else(|_| exec::sanitize_exec_command_for_display(raw_args))
 }
 
 pub(crate) fn sanitize_chat_message_tool_calls_in_place(message: &mut crate::ChatMessage) {
@@ -976,6 +984,82 @@ fn sanitize_exec_argument_value(
         }
         _ => value.clone(),
     }
+}
+
+fn sanitize_session_control_argument_value(value: &serde_json::Value) -> serde_json::Value {
+    let sanitized = sanitize_exec_argument_value(None, value);
+    match sanitized {
+        serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+            sanitize_session_control_profile_fields(sanitized)
+        }
+        other => {
+            serde_json::Value::String(sanitize_session_control_raw_arguments(&other.to_string()))
+        }
+    }
+}
+
+fn sanitize_session_control_profile_fields(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| {
+                    let value = if is_session_control_profile_field(&key) {
+                        serde_json::Value::String(exec::REDACTED_VALUE.to_string())
+                    } else {
+                        sanitize_session_control_profile_fields(value)
+                    };
+                    (key, value)
+                })
+                .collect(),
+        ),
+        serde_json::Value::Array(values) => {
+            let mut sanitized = Vec::with_capacity(values.len());
+            let mut redact_next = false;
+            for value in values {
+                let is_profile_field_token =
+                    value.as_str().is_some_and(is_session_control_profile_field);
+                let consumes_redaction = value.is_string();
+                let sanitized_value = if is_profile_field_token {
+                    sanitize_session_control_profile_fields(value)
+                } else if redact_next {
+                    serde_json::Value::String(exec::REDACTED_VALUE.to_string())
+                } else {
+                    sanitize_session_control_profile_fields(value)
+                };
+                redact_next = is_profile_field_token || (redact_next && !consumes_redaction);
+                sanitized.push(sanitized_value);
+            }
+            serde_json::Value::Array(sanitized)
+        }
+        other => other,
+    }
+}
+
+fn is_session_control_profile_field(key: &str) -> bool {
+    session_control_profile_fields()
+        .iter()
+        .any(|field| key.eq_ignore_ascii_case(field))
+}
+
+fn sanitize_session_control_raw_arguments(raw_args: &str) -> String {
+    let lower = raw_args.to_ascii_lowercase();
+    if session_control_profile_fields()
+        .iter()
+        .any(|field| lower.contains(field))
+    {
+        return r#"{"action":"<unknown>","arguments":"[REDACTED]"}"#.to_string();
+    }
+    exec::sanitize_exec_command_for_display(raw_args)
+}
+
+fn session_control_profile_fields() -> &'static [&'static str] {
+    &[
+        "purpose",
+        "identity_profile",
+        "user_profile",
+        "style_profile",
+        "agent_notes",
+    ]
 }
 
 fn sanitize_exec_argument_array(values: &[serde_json::Value]) -> Vec<serde_json::Value> {
@@ -1579,6 +1663,8 @@ pub(crate) fn session_control_tool_parameters() -> serde_json::Value {
                 "type": "string",
                 "enum": [
                     "list_sessions",
+                    "create_session",
+                    "describe_session",
                     "list_groups",
                     "create_group",
                     "update_group",
@@ -1599,11 +1685,62 @@ pub(crate) fn session_control_tool_parameters() -> serde_json::Value {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 80,
-                "description": "Display name for create_group or update_group."
+                "description": "Display name for create_session, create_group, or update_group."
+            },
+            "target": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100,
+                "description": "Target session id for describe_session."
+            },
+            "session_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100,
+                "description": "Alias for target when action is describe_session."
+            },
+            "sections": {
+                "type": "array",
+                "maxItems": 4,
+                "description": "Sections to return for describe_session. Defaults to profile, capabilities, and runtime.",
+                "items": {
+                    "type": "string",
+                    "enum": ["profile", "capabilities", "runtime", "groups"]
+                }
+            },
+            "purpose": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4000,
+                "description": "Purpose for create_session; also becomes the new session agent summary."
+            },
+            "identity_profile": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4000,
+                "description": "Optional identity/profile text for create_session."
+            },
+            "user_profile": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4000,
+                "description": "Optional durable user/context profile text for create_session."
+            },
+            "style_profile": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4000,
+                "description": "Optional working style profile text for create_session."
+            },
+            "agent_notes": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 8000,
+                "description": "Optional additional agent notes appended to the new session AGENTS.md controlled profile section."
             },
             "members": {
                 "type": "array",
-                "maxItems": 50,
+                "maxItems": 64,
                 "description": "Full group member session id list for create_group or update_group.",
                 "items": {
                     "type": "string",
@@ -1613,7 +1750,7 @@ pub(crate) fn session_control_tool_parameters() -> serde_json::Value {
             },
             "targets": {
                 "type": "array",
-                "maxItems": 50,
+                "maxItems": 16,
                 "description": "Target session ids for dispatch or stop. If omitted for a group dispatch, all group members are targeted.",
                 "items": {
                     "type": "string",
@@ -1624,7 +1761,7 @@ pub(crate) fn session_control_tool_parameters() -> serde_json::Value {
             "message": {
                 "type": "string",
                 "minLength": 1,
-                "maxLength": 50000,
+                "maxLength": 32000,
                 "description": "Message or instruction to post or dispatch."
             },
             "run_mode": {
@@ -1641,6 +1778,12 @@ pub(crate) fn session_control_tool_parameters() -> serde_json::Value {
                 "minimum": 500,
                 "maximum": 20000,
                 "description": "Maximum characters of each session result excerpt to collect."
+            },
+            "max_chars": {
+                "type": "integer",
+                "minimum": 1000,
+                "maximum": 20000,
+                "description": "Maximum characters returned by describe_session."
             }
         },
         "required": ["action"]
@@ -1648,7 +1791,7 @@ pub(crate) fn session_control_tool_parameters() -> serde_json::Value {
 }
 
 fn session_control_tool_description() -> &'static str {
-    "Control other persistent sessions from the main session. Use this to list sessions/groups, create or update session groups, dispatch work to other sessions, collect group results, post group messages, or stop delegated session runs. Only the main session can use this tool; each target session keeps its own model, MCP policy, skills, TaskPlan setting, workspace, and permissions."
+    "Control other persistent sessions from the main session. Use this to list lightweight session cards, create sessions, describe one session's profile/capabilities/runtime details on demand, manage groups, dispatch work, collect group results, post group messages, or stop delegated session runs. Only the main session can use this tool; each target session keeps its own model, MCP policy, skills, TaskPlan setting, workspace, and permissions."
 }
 
 pub(crate) fn session_control_tool_definition_openai() -> serde_json::Value {

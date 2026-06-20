@@ -90,7 +90,7 @@
 
 ### 3.3 会话范围
 
-服务端默认会话为 `main`，同时支持多个持久化 session 和持久化 session group。`/api/sessions` 会返回当前已加载或已持久化的 session 摘要；`/api/session-groups` 返回 group 摘要；WebSocket 连接可通过查询参数 `?session=<id>` 绑定到指定 session，或通过 `?group=<id>` 进入 group chat，省略时回退到 `main`。每个 session 还持有一份当前 `todos` 快照（`revision`、`items[]`、`last_updated_by`、`updated_at`），随会话一起持久化；执行 `/clear` 时会清空 `items[]` 并推进 `revision`，从而拒绝旧的 in-flight 写入。
+服务端默认会话为 `main`，同时支持多个持久化 session 和持久化 session group。`/api/sessions` 会返回当前已加载或已持久化的 session 摘要；`/api/session-groups` 返回 group 摘要；普通 WebSocket 连接可通过查询参数 `?session=<id>` 绑定到指定 session，省略时回退到 `main`；group chat 使用 `?group=<id>&session=main` 连接。每个 session 还持有一份当前 `todos` 快照（`revision`、`items[]`、`last_updated_by`、`updated_at`），随会话一起持久化；执行 `/clear` 时会清空 `items[]` 并推进 `revision`，从而拒绝旧的 in-flight 写入。
 
 ## 4. HTTP API
 
@@ -1351,16 +1351,16 @@ ws://127.0.0.1:18989/ws
 ws://127.0.0.1:18989/ws?session=research-notes
 ```
 
-也可以进入指定 group chat：
+也可以进入指定 group chat（前端使用 `session=main` 连接参数）：
 
 ```text
-ws://127.0.0.1:18989/ws?group=a1b2c3
+ws://127.0.0.1:18989/ws?group=a1b2c3&session=main
 ```
 
-- `session` 省略时默认绑定 `main`
+- 普通 session socket 省略 `session` 时默认绑定 `main`；group socket 必须显式传 `session=main` 作为前端 group 控制 UI 的连接要求
 - 指定的 session 不存在时，服务端会按该 id 创建新 session（前提是 id 合法）
 - 非法 session id 会回退到 `main`，并额外推送一条 `error` 事件说明原因
-- `group` 存在时进入 group chat，不会自动创建 group；未知或非法 group 会返回 `error` 并关闭该 group socket
+- `group` 存在时进入 group chat，不会自动创建 group；未知/非法 group 或未携带 `session=main` 的 group socket 会返回 `error` 并关闭。`session=main` 是 UI 防误用约束，不是浏览器/本地进程之间的安全授权边界
 
 建立连接后，服务端通常会按以下顺序推送初始化事件：
 
@@ -1417,7 +1417,7 @@ Group socket 初始化顺序通常为：
 
 - 空闲时可执行命令
 - 忙碌时仅允许一小部分运行期控制命令，尤其是 `/stop`
-- Slash 命令只适用于普通 session socket；连接到 `/ws?group=<id>` 时，`/...` 文本会被拒绝，不会作为 group 消息派发
+- Slash 命令只适用于普通 session socket；连接到 `/ws?group=<id>&session=main` 时，`/...` 文本会被拒绝，不会作为 group 消息派发
 
 ### 5.2.3 图片消息 JSON
 
@@ -1491,7 +1491,7 @@ Group socket 初始化顺序通常为：
 
 ### 5.2.7 Group chat 输入
 
-连接到 `/ws?group=<id>` 后，客户端发送 group 消息：
+连接到 `/ws?group=<id>&session=main` 后，客户端发送 group 消息：
 
 ```json
 {
@@ -1506,7 +1506,7 @@ Group socket 初始化顺序通常为：
 
 字段说明：
 
-- `target_mode`: `all` 使用 group 全部成员；`selected` 使用 `targets[]`；`mentions` 从消息中的 `@session-id` 提取，未命中时回退到全部成员
+- `target_mode`: `all` 使用 group 全部成员；`selected` 使用 `targets[]`；`mentions` 从消息中的 `@session-id` 提取，未命中时返回错误，不会回退成全员广播
 - `start_runs`: `true` 时立即派发到目标 session；`false` 仅写入 group 消息
 - `run_mode`: `execute` 正常执行，`plan_only` 使用目标 session 的只规划模式
 - group chat 当前不支持图片附件
@@ -1537,7 +1537,9 @@ Group socket 初始化顺序通常为：
 
 支持动作：
 
-- `list_sessions`: 返回 session 摘要
+- `list_sessions`: 返回轻量 session 名片；每行包含 `model`、`status` 和 `updated_at`，列表级别额外显示 `TaskPlan: enabled/disabled (global setting)`。为避免每次列表查询扫描所有 workspace，`agent` / `user` 摘要与 `skills` / `mcp_tools` 精确计数固定显示为 `unknown`；需要能力详情时使用 `describe_session`
+- `create_session`: 创建一个新的持久化 session；后端生成随机 session id，可传入 `name`、`purpose`、`identity_profile`、`user_profile`、`style_profile`、`agent_notes` 初始化新 session 的 prompt 文件
+- `describe_session`: 按需查询单个 session 详情；参数为 `target`（兼容别名 `session_id`）、可选 `sections=["profile","capabilities","runtime","groups"]` 和 `max_chars`；未提供 `sections` 时默认返回 `profile`、`capabilities`、`runtime`
 - `list_groups`: 返回 group 摘要
 - `create_group`: 创建 group
 - `update_group`: 更新 group 名称或成员
@@ -1546,9 +1548,28 @@ Group socket 初始化顺序通常为：
 - `collect`: 汇总指定 group 的最近消息和 run 状态
 - `stop`: 停止指定 targets 或 group 内 queued/running run
 
+输入上限与兼容说明：
+
+- `message` / group socket `group_message.text` 最多 32,000 字符
+- `dispatch`/`stop` 的显式 `targets[]` 最多 16 个；group 广播可省略 `targets`，`all`/`mentions` 解析后的目标集合按 group members 上限最多 64 个
+- `create_group`/`update_group` 的 `members[]` 最多 64 个
+- `dispatch` 目标 session 必须已经存在；需要新 worker 时先调用 `create_session`，再使用 `list_sessions` 返回的精确 session id 派发
+- session id 当前不做跨平台大小写归一；调用方应使用 `list_sessions` / group members 返回的精确大小写
+- `target_mode="mentions"` 没有解析到合法 `@session-id` 时返回错误，不会回退成全员广播
+
+`describe_session` 的分区语义：
+
+- `profile`: 返回 `AGENTS.md`/`AGENT.md`、`IDENTITY.md`、`USER.md`、`SOUL.md` 的规则摘要；优先使用 frontmatter `summary`，其次提取结构化字段，再 fallback 到短段落摘要；模板未填写会标记 `template_unfilled=true`
+- `capabilities`: 返回目标 session 当前模型、图片输入能力、内置工具名、启用的 Skills、当前 session policy 已启用且缓存可见的 MCP tools 以及只读/变更分类
+- `runtime`: 返回 queued/running/idle 状态、直接派发 run、最近 group run 和最近失败工具调用 id 摘要
+- `groups`: 返回该 session 所属或参与过的 group 摘要
+
+`describe_session` 不返回 API key、MCP headers、环境变量、完整 system prompt 或完整 persona 文件。`list_sessions` 用于“选 session”，不读取每个 session 的 prompt/Skills/MCP workspace；`describe_session` 用于调度前确认单个 session 的详细能力，避免每次列表查询都消耗大量 token。
+
 权限边界：
 
 - `session_control` 只负责跨 session 调度，不改变目标 session 的工具权限、MCP policy、hooks 或 PlanOnly 边界
+- `create_session` 只创建新 session，不修改已有 session 的身份文件；初始化文本只写入新 session workspace 的受控 prompt 文件
 - `dispatch` 控制其他 session，不能把任务派发给 `main` 自己；目标包含 `main` 时会被后端拒绝，避免 main 等待自身 queued run 导致超时
 - 目标 session 的 mutating 行为仍由其正常运行模式、工具权限和 hook 链决定
 - group 默认单轮响应，被派发的 session 各自回复一次，不会自动触发无限互相回复
@@ -1836,7 +1857,7 @@ Group socket 初始化顺序通常为：
 
 ### Group events
 
-`/ws?group=<id>` 使用以下事件恢复和更新 group UI。
+`/ws?group=<id>&session=main` 使用以下事件恢复和更新 group UI。
 
 ```json
 {
@@ -1926,7 +1947,8 @@ Group socket 初始化顺序通常为：
   "status": "completed",
   "result_excerpt": "检查结果摘要",
   "error": null,
-  "completed_at": 1710000500
+  "completed_at": 1710000500,
+  "updated_at": 1710000500
 }
 ```
 
@@ -1934,7 +1956,7 @@ Group socket 初始化顺序通常为：
 
 - `group_message.role` 可为 `user`、`main`、`session`、`system`
 - `group_member_event.event` 是目标 session 原 live event 的包装；目标 session 自身 live replay 也会保留这些事件
-- 正常完成时，成员最终摘要会先作为 `group_message` 写入 group 历史；`group_run_completed` 用于状态收敛，前端不需要再把 `result_excerpt` 渲染成第二条消息
+- 正常完成或失败但已有成员输出时，成员最终摘要会先作为 `group_message` 写入 group 历史；`group_run_completed` 用于状态收敛，前端不需要再把 `result_excerpt` 渲染成第二条消息
 - `status` 可为 `queued`、`running`、`completed`、`failed`、`stopped`
 
 ### `delta`

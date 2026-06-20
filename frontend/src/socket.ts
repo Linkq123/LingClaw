@@ -22,6 +22,7 @@ function sessionWebSocketUrl(): string {
   const url = new URL(`${proto}://${location.host}/ws`);
   if (state.activeGroupId) {
     url.searchParams.set('group', state.activeGroupId);
+    url.searchParams.set('session', 'main');
   } else if (state.activeSessionId) {
     url.searchParams.set('session', state.activeSessionId);
   }

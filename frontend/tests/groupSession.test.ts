@@ -16,15 +16,33 @@ describe('group sessions', () => {
   it('persists and clears the active group id', async () => {
     const {
       ACTIVE_GROUP_STORAGE_KEY,
+      ACTIVE_SESSION_STORAGE_KEY,
       isRecoverableActiveGroupConnectionError,
       loadActiveGroupId,
+      loadActiveSessionId,
+      mainSessionStateForGroupControl,
       persistActiveGroupId,
+      persistActiveSessionId,
+      sessionIdAfterLeavingGroup,
+      shouldApplyGroupRunStatusUpdate,
     } = await import('../src/sessionPersistence.js');
 
+    persistActiveSessionId('worker-a');
     persistActiveGroupId(' review-group ');
 
+    const groupSessionState = mainSessionStateForGroupControl(loadActiveSessionId());
+
     expect(localStorage.getItem(ACTIVE_GROUP_STORAGE_KEY)).toBe('review-group');
+    expect(localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY)).toBe('worker-a');
     expect(loadActiveGroupId()).toBe('review-group');
+    expect(groupSessionState).toEqual({
+      activeSessionId: 'main',
+      groupReturnSessionId: 'worker-a',
+    });
+    expect('pendingDeleteSessionId' in groupSessionState).toBe(false);
+    expect(sessionIdAfterLeavingGroup(groupSessionState.groupReturnSessionId, '')).toBe(
+      'worker-a',
+    );
 
     persistActiveGroupId('');
 
@@ -38,6 +56,23 @@ describe('group sessions', () => {
       true,
     );
     expect(isRecoverableActiveGroupConnectionError('Invalid session id.', '')).toBe(false);
+    expect(mainSessionStateForGroupControl('worker-a')).toEqual({
+      activeSessionId: 'main',
+      groupReturnSessionId: 'worker-a',
+    });
+    expect(mainSessionStateForGroupControl(' main ')).toEqual({
+      activeSessionId: 'main',
+      groupReturnSessionId: '',
+    });
+    expect(
+      shouldApplyGroupRunStatusUpdate({ status: 'completed', updatedAt: 10 }, 'running', 10),
+    ).toBe(false);
+    expect(
+      shouldApplyGroupRunStatusUpdate({ status: 'completed', updatedAt: 10 }, 'running', 9),
+    ).toBe(false);
+    expect(
+      shouldApplyGroupRunStatusUpdate({ status: 'running', updatedAt: 10 }, 'completed', 10),
+    ).toBe(true);
   });
 
   it('renders group drawer rows and exposes group callbacks', async () => {

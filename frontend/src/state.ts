@@ -72,6 +72,8 @@ export interface AppState {
   activeGroupId: string;
   activeGroupMembers: string[];
   activeGroupRunIds: Set<string>;
+  groupReturnSessionId: string;
+  groupRunStatuses: Map<string, { status: string; updatedAt: number }>;
   groupTargetMode: 'all' | 'selected' | 'mentions';
   groupSelectedTargets: string[];
   pendingDeleteSessionId: string;
@@ -161,6 +163,8 @@ export const state: AppState = {
   activeGroupId: '',
   activeGroupMembers: [],
   activeGroupRunIds: new Set(),
+  groupReturnSessionId: '',
+  groupRunStatuses: new Map(),
   groupTargetMode: 'all',
   groupSelectedTargets: [],
   pendingDeleteSessionId: '',

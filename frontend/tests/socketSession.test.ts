@@ -100,7 +100,21 @@ describe('socket session binding', () => {
 
     connect(() => {});
 
-    expect(mockWebSocket).toHaveBeenCalledWith('ws://localhost:3000/ws?group=review-group');
+    expect(mockWebSocket).toHaveBeenCalledWith(
+      'ws://localhost:3000/ws?group=review-group&session=main',
+    );
+  });
+
+  it('uses main session query for group sockets even when another session is active', async () => {
+    const { connect } = await import('../src/socket.js');
+    stateModule.state.activeSessionId = 'worker-a';
+    stateModule.state.activeGroupId = 'review-group';
+
+    connect(() => {});
+
+    expect(mockWebSocket).toHaveBeenCalledWith(
+      'ws://localhost:3000/ws?group=review-group&session=main',
+    );
   });
 
   it('keeps only a non-current non-main pending delete target', async () => {

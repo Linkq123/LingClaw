@@ -22,6 +22,66 @@ export function persistActiveSessionId(sessionId: string): void {
   }
 }
 
+export interface GroupControlSessionState {
+  activeSessionId: string;
+  groupReturnSessionId: string;
+}
+
+export interface GroupRunStatusSnapshot {
+  status: string;
+  updatedAt: number;
+}
+
+export function mainSessionStateForGroupControl(
+  activeSessionId: string,
+  currentReturnSessionId = '',
+): GroupControlSessionState {
+  const previousSessionId = activeSessionId.trim();
+  const existingReturnSessionId = currentReturnSessionId.trim();
+  const isMainSession = previousSessionId.toLowerCase() === 'main';
+  return {
+    activeSessionId: 'main',
+    groupReturnSessionId:
+      previousSessionId && !isMainSession
+        ? previousSessionId
+        : existingReturnSessionId,
+  };
+}
+
+export function sessionIdAfterLeavingGroup(
+  groupReturnSessionId: string,
+  fallbackSessionId: string,
+): string {
+  return groupReturnSessionId.trim() || fallbackSessionId.trim() || 'main';
+}
+
+export function normalizeGroupRunUpdatedAt(value: unknown): number {
+  const updatedAt = Number(value);
+  return Number.isFinite(updatedAt) && updatedAt >= 0 ? updatedAt : 0;
+}
+
+export function isActiveGroupRunStatus(status: string): boolean {
+  return status === 'queued' || status === 'running';
+}
+
+export function isTerminalGroupRunStatus(status: string): boolean {
+  return status === 'completed' || status === 'failed' || status === 'stopped';
+}
+
+export function shouldApplyGroupRunStatusUpdate(
+  current: GroupRunStatusSnapshot | undefined,
+  status: string,
+  updatedAt: number,
+): boolean {
+  if (!current) return true;
+  if (updatedAt < current.updatedAt) return false;
+  return !(
+    updatedAt === current.updatedAt &&
+    isTerminalGroupRunStatus(current.status) &&
+    isActiveGroupRunStatus(status)
+  );
+}
+
 export function loadActiveGroupId(): string {
   try {
     return globalThis.localStorage?.getItem(ACTIVE_GROUP_STORAGE_KEY)?.trim() || '';
