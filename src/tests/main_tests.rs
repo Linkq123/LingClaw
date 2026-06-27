@@ -8,7 +8,7 @@ use crate::session_control::{
 use crate::session_store::load_session_from_disk;
 use crate::session_store::replace_session_file_from_temp;
 use crate::tools::fs::{format_size, matches_glob};
-use crate::tools::safety::{check_dangerous_command, resolve_path, resolve_path_checked};
+use crate::tools::safety::{check_dangerous_command, resolve_path_checked};
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::IntoResponse;
 use serde_json::{Value, json};
@@ -5151,18 +5151,6 @@ fn load_session_from_disk_trims_incomplete_tool_transaction() {
         .map(PathBuf::from)
         .expect("session dir should exist");
     let _ = std::fs::remove_dir_all(workspace);
-}
-
-#[test]
-fn resolve_path_clamps_parent_escape_attempts() {
-    let base = std::env::temp_dir().join(format!("lingclaw-resolve-{}", now_epoch()));
-    std::fs::create_dir_all(&base).expect("temp dir should be created");
-
-    let resolved = resolve_path("../../outside.txt", &base);
-
-    assert_eq!(resolved, base.canonicalize().unwrap_or(base.clone()));
-
-    let _ = std::fs::remove_dir_all(&base);
 }
 
 #[test]
