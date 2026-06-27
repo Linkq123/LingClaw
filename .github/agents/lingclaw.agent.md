@@ -92,7 +92,7 @@ Key files:
 
 ## Constraints
 
-- DO NOT exceed 6000 lines in `src/main.rs` (use `wc -l` to verify)
+- DO NOT exceed 10000 lines in `src/main.rs` (use `wc -l` to verify)
 - Keep the backend compact: `src/main.rs` for the app loop, `src/providers.rs` for LLM streaming, `src/tools/` for tool registry + implementations. Avoid unnecessary module sprawl.
 - DO NOT add Telegram, Slack, WhatsApp, or any external channel integration
 - DO NOT introduce a plugin or extension system
@@ -116,7 +116,7 @@ Key files:
 
 1. Read existing code first — understand the module map before changing anything
 2. Classify your change: **Skill** (prompt/context/LLM), **CLI** (tools/security), or **Loop** (handler/session/commands)
-3. When adding features, check line count — budget is 6000, verify the current count instead of relying on stale notes
+3. When adding features, check line count — budget is 10000, verify the current count instead of relying on stale notes
 4. Test changes: `cargo clippy` then `cargo test` then `cargo build`
 5. For Skill issues: check `build_system_prompt()` in `src/main.rs`; token/context logic in `src/context.rs`; `call_llm_stream()` and provider-specific streaming helpers in `src/providers.rs`; prompt loading in `src/prompts.rs`; template content in `docs/reference/templates/`
 6. For CLI issues: check `src/tools/mod.rs` for built-in tools, `src/tools/mcp.rs` for MCP-backed tools, plus `check_dangerous_command()`, `resolve_path()`, and `resolve_path_checked()` in `src/main.rs`

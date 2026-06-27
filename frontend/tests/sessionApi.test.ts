@@ -55,6 +55,24 @@ describe('session API', () => {
           id: 'reviewers',
           name: 'Reviewers',
           members: ['worker-a', ' worker-b ', ''],
+          admins: ['worker-b'],
+          pending_votes: [
+            {
+              id: 'vote-1',
+              action: 'remove_member',
+              target_session_id: 'worker-a',
+              requester_session_id: 'worker-b',
+              approvals: ['worker-b'],
+              threshold: 2,
+              created_at: 13,
+              updated_at: 14,
+            },
+          ],
+          member_details: [
+            { id: 'main', name: 'Main', role: 'owner' },
+            { id: 'worker-a', name: 'Worker A', role: 'member' },
+            { id: 'worker-b', name: 'Worker B', role: 'admin' },
+          ],
           messages: [{ role: 'user', content: 'check' }],
           runs: [],
           created_at: 11,
@@ -75,12 +93,80 @@ describe('session API', () => {
       id: 'reviewers',
       name: 'Reviewers',
       members: ['worker-a', 'worker-b'],
+      admins: ['worker-b'],
+      pending_votes: [
+        {
+          id: 'vote-1',
+          action: 'remove_member',
+          target_session_id: 'worker-a',
+          requester_session_id: 'worker-b',
+          approvals: ['worker-b'],
+          threshold: 2,
+          created_at: 13,
+          updated_at: 14,
+        },
+      ],
+      member_details: [
+        { id: 'main', name: 'Main', role: 'owner' },
+        { id: 'worker-a', name: 'Worker A', role: 'member' },
+        { id: 'worker-b', name: 'Worker B', role: 'admin' },
+      ],
       messages: [{ role: 'user', content: 'check' }],
       runs: [],
       created_at: 11,
       updated_at: 12,
       version: 1,
     });
+  });
+
+  it('normalizes invalid group vote thresholds to finite positive values', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        json: async () => ({
+          group: {
+            id: 'reviewers',
+            name: 'Reviewers',
+            members: ['worker-a'],
+            admins: ['worker-a'],
+            pending_votes: [
+              {
+                id: 'vote-bad',
+                action: 'remove_member',
+                target_session_id: 'worker-a',
+                requester_session_id: 'worker-a',
+                approvals: ['worker-a'],
+                threshold: 'not-a-number',
+                created_at: 1,
+                updated_at: 1,
+              },
+              {
+                id: 'vote-zero',
+                action: 'remove_member',
+                target_session_id: 'worker-a',
+                requester_session_id: 'worker-a',
+                approvals: [],
+                threshold: 0,
+                created_at: 1,
+                updated_at: 1,
+              },
+            ],
+            member_details: [],
+            messages: [],
+            runs: [],
+            created_at: 1,
+            updated_at: 1,
+            version: 2,
+          },
+        }),
+      })),
+    );
+
+    const { getSessionGroup } = await import('../src/sessionApi.js');
+    const group = await getSessionGroup('reviewers');
+
+    expect(group.pending_votes.map((vote) => vote.threshold)).toEqual([1, 1]);
   });
 
   it('creates, updates, and deletes session groups through the group API', async () => {
@@ -158,6 +244,67 @@ describe('session API', () => {
     });
     expect(fetchMock).toHaveBeenCalledWith('/api/session-group?group=group-a', {
       method: 'DELETE',
+    });
+  });
+
+  it('promotes and removes group members through the member API', async () => {
+    const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+      if (
+        url === '/api/session-group/member?group=group-a&session=worker-a' &&
+        init?.method === 'PUT'
+      ) {
+        return {
+          ok: true,
+          json: async () => ({
+            group: {
+              id: 'group-a',
+              name: 'Group A',
+              members: ['worker-a'],
+              admins: ['worker-a'],
+              pending_votes: [],
+              member_details: [
+                { id: 'main', name: 'Main', role: 'owner' },
+                { id: 'worker-a', name: 'Worker A', role: 'admin' },
+              ],
+            },
+          }),
+        };
+      }
+      if (
+        url === '/api/session-group/member?group=group-a&session=worker-a' &&
+        init?.method === 'DELETE'
+      ) {
+        return {
+          ok: true,
+          json: async () => ({
+            group: {
+              id: 'group-a',
+              name: 'Group A',
+              members: [],
+              admins: [],
+              pending_votes: [],
+              member_details: [{ id: 'main', name: 'Main', role: 'owner' }],
+            },
+          }),
+        };
+      }
+      return { ok: false, status: 404, json: async () => ({ error: 'unexpected call' }) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const { promoteSessionGroupAdmin, removeSessionGroupMember } = await import(
+      '../src/sessionApi.js'
+    );
+
+    await expect(promoteSessionGroupAdmin('group-a', 'worker-a')).resolves.toMatchObject({
+      id: 'group-a',
+      admins: ['worker-a'],
+      member_details: [{ id: 'main', name: 'Main', role: 'owner' }, expect.any(Object)],
+    });
+    await expect(removeSessionGroupMember('group-a', 'worker-a')).resolves.toMatchObject({
+      id: 'group-a',
+      members: [],
+      admins: [],
     });
   });
 });

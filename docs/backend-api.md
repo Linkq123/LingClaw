@@ -228,7 +228,7 @@
 
 ## 4.2.3 Session Group APIs
 
-Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group 元数据、成员 session id、群聊消息和成员 run 状态。Group 有独立历史；被派发的成员 session 也会收到一条固定格式用户消息，内容为 group 上下文摘要和 main 指令，因此 group 历史与成员 session 历史都会被写入。
+Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group 元数据、成员 session id、升级管理员、待投票项、群聊消息和成员 run 状态。`main` 是每个 group 的隐式 owner/admin，不放入 `members[]`，因此不会被 group dispatch 派发。Group 有独立历史；被派发的成员 session 也会收到一条固定格式用户消息，内容为 group 上下文摘要和 main 指令，因此 group 历史与成员 session 历史都会被写入。
 
 ### GET /api/session-groups
 
@@ -290,11 +290,18 @@ Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group �
     "id": "a1b2c3",
     "name": "Review Group",
     "members": ["worker-a", "worker-b"],
+    "admins": ["worker-b"],
+    "pending_votes": [],
+    "member_details": [
+      { "id": "main", "name": "Main", "role": "owner" },
+      { "id": "worker-a", "name": "Worker A", "role": "member" },
+      { "id": "worker-b", "name": "Worker B", "role": "admin" }
+    ],
     "messages": [],
     "runs": [],
     "created_at": 1710000000,
     "updated_at": 1710000000,
-    "version": 1
+    "version": 2
   }
 }
 ```
@@ -313,6 +320,14 @@ Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group �
 ### DELETE /api/session-group?group=<id>
 
 删除 group JSON 和残留 `.tmp` 文件，并广播新的 group 列表。不存在返回 `404`。如果 group 里仍有 `queued` 或 `running` 的成员 run，后端会返回 `409 Conflict`；调用方需要先通过 group socket 发送 `{"type":"group_stop"}` 或调用 `session_control.stop` 停止这些 run，再删除 group。
+
+### PUT /api/session-group/member?group=<id>&session=<session-id>
+
+把成员 session 升级为 group admin。`main` 是隐式 owner，不需要也不能升级。成功响应返回完整 group JSON，并通过 group socket 广播新的 `group` payload。
+
+### DELETE /api/session-group/member?group=<id>&session=<session-id>
+
+用户 UI 以 owner 视角直接移除 group 成员，同时把该成员从 `members[]`、`admins[]`、相关 `pending_votes[]` 中移除，并停止该成员在本 group 内仍处于 `queued/running` 的 run。通过 `session_control.remove_group_member` 且带非 `main` 的 `requester_session_id` 时，会按升级管理员 2/3 投票规则处理。
 
 ## 4.3 GET/PUT /api/session-skills
 
@@ -1509,6 +1524,9 @@ Group socket 初始化顺序通常为：
 - `target_mode`: `all` 使用 group 全部成员；`selected` 使用 `targets[]`；`mentions` 从消息中的 `@session-id` 提取，未命中时返回错误，不会回退成全员广播
 - `start_runs`: `true` 时立即派发到目标 session；`false` 仅写入 group 消息
 - `run_mode`: `execute` 正常执行，`plan_only` 使用目标 session 的只规划模式
+- 只有 `@session-id` 是派发协议；前端可把合法 token 显示为 `@Session Name`，但显示名本身不参与解析
+- `@all` 需要 owner/admin 语义；当前浏览器 group UI 使用 `session=main` owner 连接，因此可广播。直接 `@session-id` 的成员必须回复；`@all` 覆盖但未直接点名的成员以可选回复派发，成员返回空或 `NO_REPLY` 时不会写入 group message
+- 成员最终回复中的 `@session-id` 会触发一次后续派发；普通成员回复最多触发一个其他成员，避免无限互相唤起
 - group chat 当前不支持图片附件
 - group socket 支持普通非 slash 文本作为快捷 group message；结构化客户端应优先发送 `type:"group_message"` JSON
 
@@ -1539,10 +1557,14 @@ Group socket 初始化顺序通常为：
 
 - `list_sessions`: 返回轻量 session 名片；每行包含 `model`、`status` 和 `updated_at`，列表级别额外显示 `TaskPlan: enabled/disabled (global setting)`。为避免每次列表查询扫描所有 workspace，`agent` / `user` 摘要与 `skills` / `mcp_tools` 精确计数固定显示为 `unknown`；需要能力详情时使用 `describe_session`
 - `create_session`: 创建一个新的持久化 session；后端生成随机 session id，可传入 `name`、`purpose`、`identity_profile`、`user_profile`、`style_profile`、`agent_notes` 初始化新 session 的 prompt 文件
+- `delete_session`: 删除已存在的非 `main` session；复用 `/delete` 安全约束，拒绝 `main`、当前 active 连接以及有 active/queued delegated work 的 session，成功后删除 session JSON 与 workspace 并广播 session list
 - `describe_session`: 按需查询单个 session 详情；参数为 `target`（兼容别名 `session_id`）、可选 `sections=["profile","capabilities","runtime","groups"]` 和 `max_chars`；未提供 `sections` 时默认返回 `profile`、`capabilities`、`runtime`
 - `list_groups`: 返回 group 摘要
 - `create_group`: 创建 group
 - `update_group`: 更新 group 名称或成员
+- `delete_group`: 删除 group；有 `queued/running` 成员 run 时拒绝
+- `promote_group_admin`: 把 group 成员升级为 promoted admin；`main` 始终是隐式 owner
+- `remove_group_member`: 移除 group 成员；省略 `requester_session_id` 或传 `main` 时直接移除，传 promoted admin id 时进入/追加 2/3 投票，达到阈值后自动移除
 - `post_group_message`: 只向 group 历史写入 main 消息
 - `dispatch`: 向 `targets[]` 或 `group_id` 成员派发任务，支持 `run_mode=execute|plan_only`、`wait` 和 `summary_budget`
 - `collect`: 汇总指定 group 的最近消息和 run 状态
@@ -1865,6 +1887,13 @@ Group socket 初始化顺序通常为：
   "id": "a1b2c3",
   "name": "Review Group",
   "members": ["worker-a", "worker-b"],
+  "admins": ["worker-b"],
+  "pending_votes": [],
+  "member_details": [
+    { "id": "main", "name": "Main", "role": "owner" },
+    { "id": "worker-a", "name": "Worker A", "role": "member" },
+    { "id": "worker-b", "name": "Worker B", "role": "admin" }
+  ],
   "created_at": 1710000000,
   "updated_at": 1710000300
 }
@@ -1875,6 +1904,13 @@ Group socket 初始化顺序通常为：
   "type": "group_history",
   "group_id": "a1b2c3",
   "members": ["worker-a", "worker-b"],
+  "admins": ["worker-b"],
+  "pending_votes": [],
+  "member_details": [
+    { "id": "main", "name": "Main", "role": "owner" },
+    { "id": "worker-a", "name": "Worker A", "role": "member" },
+    { "id": "worker-b", "name": "Worker B", "role": "admin" }
+  ],
   "messages": [],
   "runs": []
 }
@@ -1956,6 +1992,7 @@ Group socket 初始化顺序通常为：
 
 - `group_message.role` 可为 `user`、`main`、`session`、`system`
 - `group_member_event.event` 是目标 session 原 live event 的包装；目标 session 自身 live replay 也会保留这些事件
+- 当前前端群聊默认隐藏 `group_run_started`、普通 `group_member_status` 和成员 live 过程卡片，只渲染错误、管理/投票 system 消息和最终 `role=session` 回复；客户端仍可消费这些事件构建更详细的运行视图
 - 正常完成或失败但已有成员输出时，成员最终摘要会先作为 `group_message` 写入 group 历史；`group_run_completed` 用于状态收敛，前端不需要再把 `result_excerpt` 渲染成第二条消息
 - `status` 可为 `queued`、`running`、`completed`、`failed`、`stopped`
 

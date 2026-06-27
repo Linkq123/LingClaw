@@ -5,17 +5,15 @@ use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
+use crate::prompts::{build_system_prompt, build_system_prompt_with_query_cached};
 use crate::{
-    AppState, MAIN_SESSION_ID, Session, WsTx, agent, build_system_prompt,
-    build_system_prompt_with_query_cached, default_show_react, default_show_reasoning,
+    AppState, MAIN_SESSION_ID, Session, WsTx, agent, default_show_react, default_show_reasoning,
     default_show_tools,
     hooks::{
         build_compression_call_prompt, estimate_summary_output_tokens, extract_existing_summary,
     },
     memory, now_epoch, prompts, providers,
-    runtime_loop::{
-        ensure_session_ready, resolve_session_target_for_command, resolve_session_target_for_delete,
-    },
+    runtime_loop::{ensure_session_ready, resolve_session_target_for_command},
     session_admin::gather_global_today_usage,
     session_store::{
         SessionSummary, build_session_status, build_usage_report,
@@ -1724,98 +1722,19 @@ async fn handle_delete_command(
     if arg.is_empty() {
         return command_result("Usage: /delete <session-id>", "system", false);
     }
-    let target_session_id = match resolve_session_target_for_delete(state, arg).await {
-        Ok(session_id) => session_id,
-        Err(err) => return command_result(err, "error", false),
-    };
-    if target_session_id == current_session_id {
-        return command_result("Cannot delete the current session.", "error", false);
-    }
-    if target_session_id == MAIN_SESSION_ID {
-        return command_result("Cannot delete the default main session.", "error", false);
-    }
-    if state
-        .active_connections
-        .lock()
-        .await
-        .contains_key(&target_session_id)
-    {
-        return command_result(
-            format!("Cannot delete active session: {target_session_id}"),
-            "error",
-            false,
-        );
-    }
-    if state
-        .active_runs
-        .lock()
-        .await
-        .contains_key(&target_session_id)
-    {
-        return command_result(
-            format!("Cannot delete running session: {target_session_id}"),
-            "error",
-            false,
-        );
-    }
-
-    let session_file = sessions_dir().join(format!("{target_session_id}.json"));
-    let workspace_root = crate::session_workspace_path(&target_session_id)
-        .parent()
-        .map(|path| path.to_path_buf());
-
-    if let Some(workspace_root) = workspace_root {
-        let workspace_exists = match tokio::fs::try_exists(&workspace_root).await {
-            Ok(exists) => exists,
-            Err(err) => {
-                return command_result(
-                    format!("Failed to inspect session workspace: {err}"),
-                    "error",
-                    false,
-                );
-            }
-        };
-        if workspace_exists && let Err(err) = tokio::fs::remove_dir_all(&workspace_root).await {
-            return command_result(
-                format!("Failed to delete session workspace for {target_session_id}: {err}"),
-                "error",
-                false,
-            );
-        }
-    }
-
-    let session_file_exists = match tokio::fs::try_exists(&session_file).await {
-        Ok(exists) => exists,
-        Err(err) => {
-            return command_result(
-                format!("Failed to inspect session file: {err}"),
-                "error",
-                false,
-            );
-        }
-    };
-    if session_file_exists && let Err(err) = tokio::fs::remove_file(&session_file).await {
-        return command_result(
-            format!("Failed to delete session file for {target_session_id}: {err}"),
-            "error",
-            false,
-        );
-    }
-
-    let removed = {
-        let mut sessions = state.sessions.lock().await;
-        sessions.remove(&target_session_id).is_some()
-    };
-
-    command_result_with_session_list_change(
-        if removed {
-            format!("Deleted session: {target_session_id}")
-        } else {
-            format!("Deleted saved session: {target_session_id}")
-        },
-        "system",
-        true,
+    // Route through the shared `/delete` safety model so this command and
+    // `session_control.delete_session` cannot drift; passing the current session as
+    // `reject_current` keeps the "cannot delete the current session" guard.
+    match crate::session_control::delete_session_with_safety_checks(
+        state,
+        arg,
+        Some(current_session_id),
     )
+    .await
+    {
+        Ok(message) => command_result_with_session_list_change(message, "system", true),
+        Err(error) => command_result(error, "error", false),
+    }
 }
 
 async fn handle_memory_command(

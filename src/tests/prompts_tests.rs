@@ -927,13 +927,78 @@ fn prompt_cache_invalidates_on_file_change() {
     let first = load_session_prompt_files_with_snapshot(&workspace, snapshot);
     assert!(first.persona.contains("identity-v1"));
 
-    // Modify IDENTITY.md — mtime changes → cache miss
-    fs::write(workspace.join("IDENTITY.md"), "identity-v2").unwrap();
+    // Modify IDENTITY.md to a different-length body — the metadata-only (mtime + len)
+    // fingerprint detects the length change and misses the cache, even if both writes
+    // land within one coarse filesystem mtime tick.
+    fs::write(workspace.join("IDENTITY.md"), "identity-v2-longer").unwrap();
     let second = load_session_prompt_files_with_snapshot(&workspace, snapshot);
     assert!(
-        second.persona.contains("identity-v2"),
+        second.persona.contains("identity-v2-longer"),
         "changed file should invalidate prompt cache"
     );
 
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn prompt_cache_detects_length_change_at_same_mtime() {
+    // The persona/memory fingerprint is intentionally metadata-only (mtime + len)
+    // so the Analyze hot path never reads prompt-file contents. A real edit bumps
+    // mtime, but adding `len` to the signature also catches the (artificial) case
+    // where mtime is unchanged but the file length differs. Simulate a stale cache
+    // entry whose mtime matches the current file but whose recorded len differs,
+    // and assert it is treated as a miss (fresh content injected).
+    let workspace = std::env::temp_dir().join("lingclaw-prompt-cache-len-test");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(workspace.join("memory")).unwrap();
+    fs::write(workspace.join("AGENTS.md"), "agent").unwrap();
+    fs::write(workspace.join("IDENTITY.md"), "identity-v1-longer").unwrap();
+
+    // Stale fingerprints keep the current mtime but carry a different (shorter)
+    // recorded length, mimicking a length-changing edit at the same mtime.
+    let mut stale_fingerprints = collect_persona_fingerprints(&workspace);
+    for fp in stale_fingerprints.iter_mut() {
+        if let Some(len) = fp.len.as_mut() {
+            *len = len.saturating_sub(1);
+        }
+    }
+    let cache = PERSONA_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(PersonaCache {
+            workspace: workspace.clone(),
+            fingerprints: stale_fingerprints,
+            result: "stale persona".to_string(),
+        });
+    }
+
+    let persona = load_persona(&workspace);
+    assert!(persona.contains("identity-v1-longer"));
+    assert!(!persona.contains("stale persona"));
+    let _ = fs::remove_dir_all(&workspace);
+}
+
+#[test]
+fn prompt_cache_signature_is_metadata_only() {
+    // Guard the performance contract: the fingerprint must not depend on file
+    // contents. Two files of equal length with different bytes under the same
+    // mtime are intentionally indistinguishable to the cache (accepted blind
+    // spot). We assert the recorded len is identical for same-length bodies so a
+    // future re-introduction of a content read would have to change this test.
+    let workspace = std::env::temp_dir().join("lingclaw-prompt-cache-metaonly-test");
+    let _ = fs::remove_dir_all(&workspace);
+    fs::create_dir_all(workspace.join("memory")).unwrap();
+    fs::write(workspace.join("IDENTITY.md"), "identity-v1").unwrap();
+    let a = collect_persona_fingerprints(&workspace);
+    fs::write(workspace.join("IDENTITY.md"), "identity-v2").unwrap();
+    let b = collect_persona_fingerprints(&workspace);
+    // Same length, so len matches; mtime may differ depending on filesystem
+    // resolution, so compare only the field this test is about.
+    let lens_a: Vec<_> = a.iter().map(|f| f.len).collect();
+    let lens_b: Vec<_> = b.iter().map(|f| f.len).collect();
+    assert_eq!(
+        lens_a, lens_b,
+        "same-length edit must keep identical len signature"
+    );
     let _ = fs::remove_dir_all(&workspace);
 }

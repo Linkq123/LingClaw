@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::prompts::{SystemPromptToolMode, build_system_prompt_with_query_cached_for_tool_mode};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use tokio::time::MissedTickBehavior;
@@ -1168,7 +1169,7 @@ fn available_tool_names_for_plan_only(config: &Config, workspace: &Path) -> Vec<
     names.extend(
         tools::mcp::cached_list_tools_for_policy(config, workspace, &mcp_policy)
             .into_iter()
-            .filter(|tool| tools::mcp::is_read_only_tool_descriptor(tool))
+            .filter(tools::mcp::is_read_only_tool_descriptor)
             .map(|tool| tool.exposed_name),
     );
     names.sort();
@@ -1233,7 +1234,7 @@ pub(crate) async fn build_runtime_tools(
         extra_tools.push(orchestrate_def);
     }
 
-    if current_session_id == crate::MAIN_SESSION_ID {
+    if crate::is_main(current_session_id) {
         let session_control_def = match provider {
             Provider::Anthropic => tools::session_control_tool_definition_anthropic(),
             Provider::OpenAI | Provider::OpenAIResponses => {
@@ -1368,6 +1369,7 @@ async fn advance_after_llm_response(
     phase_state.round += 1;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_llm_response(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
@@ -1478,6 +1480,7 @@ async fn execute_todos_tool(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool_with_live_output(
     live_tx: &LiveTx,
     tool_id: &str,
@@ -2477,6 +2480,7 @@ async fn update_working_state(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn summarize_working_state_with_llm(
     ctx: &AgentRunCtx<'_>,
     config: &Config,
@@ -3650,6 +3654,7 @@ async fn apply_run_cancel_outcome(ctx: &AgentRunCtx<'_>, phase_state: &mut Agent
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_agent_session(
     state: &Arc<AppState>,
     current_session_id: &str,

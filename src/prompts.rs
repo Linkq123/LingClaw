@@ -1,10 +1,12 @@
 use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, Local};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, hash_map::DefaultHasher};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime};
 
-use crate::config_dir_path;
+use crate::{ChatMessage, Config, config_dir_path, memory, subagents, tools};
 
 // ── Skills ───────────────────────────────────────────────────────────────────────────────
 
@@ -819,6 +821,27 @@ pub(crate) fn file_mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PromptFileFingerprint {
+    modified: Option<SystemTime>,
+    len: Option<u64>,
+}
+
+/// Cheap, read-free signature for a watched prompt file: (mtime, len), both
+/// taken from a single `metadata()` call. This is collected once per top-level
+/// Analyze cycle, so it must NOT read file contents — doing so re-read every
+/// persona/memory file on every cycle (and twice on a cache miss). Adding `len`
+/// to mtime catches same-mtime edits that change the file length. The only
+/// blind spot is an edit that keeps both mtime and len identical, which is
+/// unreachable for real text edits: any save bumps mtime.
+fn prompt_file_fingerprint(path: &Path) -> PromptFileFingerprint {
+    let metadata = std::fs::metadata(path).ok();
+    let modified = metadata.as_ref().and_then(|m| m.modified().ok());
+    let len = metadata.as_ref().map(|m| m.len());
+
+    PromptFileFingerprint { modified, len }
+}
+
 /// Collect mtimes for a directory and its immediate subdirectories.
 /// Returns root mtime followed by sorted child-directory mtimes so that
 /// structural changes one level below the root (e.g. a new skill added
@@ -852,17 +875,17 @@ const PERSONA_WATCH_FILES: &[&str] = &[
 
 struct PersonaCache {
     workspace: PathBuf,
-    mtimes: Vec<Option<SystemTime>>,
+    fingerprints: Vec<PromptFileFingerprint>,
     result: String,
 }
 
 type PersonaCacheLock = OnceLock<Mutex<Option<PersonaCache>>>;
 static PERSONA_CACHE: PersonaCacheLock = OnceLock::new();
 
-fn collect_persona_mtimes(workspace: &Path) -> Vec<Option<SystemTime>> {
+fn collect_persona_fingerprints(workspace: &Path) -> Vec<PromptFileFingerprint> {
     PERSONA_WATCH_FILES
         .iter()
-        .map(|name| file_mtime(&workspace.join(name)))
+        .map(|name| prompt_file_fingerprint(&workspace.join(name)))
         .collect()
 }
 
@@ -893,13 +916,21 @@ fn load_persona_uncached(workspace: &Path) -> String {
 }
 
 fn load_persona(workspace: &Path) -> String {
-    let mtimes = collect_persona_mtimes(workspace);
+    // Fingerprint (mtime + len) every watched file before loading. This is a
+    // read-free metadata check: on a cache hit no persona file is read, and on a
+    // miss each file is read exactly once (in load_persona_uncached). Collecting
+    // the fingerprint *before* the uncached read means an edit landing mid-load
+    // yields a stale signature that simply misses on the next call
+    // (self-correcting) rather than caching a result keyed to content it was
+    // never built from. Same-mtime edits that change length are detected; the
+    // identical-mtime-and-identical-len case is an accepted blind spot.
+    let fingerprints = collect_persona_fingerprints(workspace);
     let cache = PERSONA_CACHE.get_or_init(|| Mutex::new(None));
     {
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref c) = *guard
             && c.workspace == workspace
-            && c.mtimes == mtimes
+            && c.fingerprints == fingerprints
         {
             return c.result.clone();
         }
@@ -909,7 +940,7 @@ fn load_persona(workspace: &Path) -> String {
         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(PersonaCache {
             workspace: workspace.to_path_buf(),
-            mtimes,
+            fingerprints,
             result: result.clone(),
         });
     }
@@ -921,23 +952,23 @@ fn load_persona(workspace: &Path) -> String {
 struct MemoryCache {
     workspace: PathBuf,
     today: String,
-    mtimes: Vec<Option<SystemTime>>,
+    fingerprints: Vec<PromptFileFingerprint>,
     result: String,
 }
 
 type MemoryCacheLock = OnceLock<Mutex<Option<MemoryCache>>>;
 static MEMORY_CACHE: MemoryCacheLock = OnceLock::new();
 
-fn collect_memory_mtimes(
+fn collect_memory_fingerprints(
     workspace: &Path,
     today: &str,
     yesterday: &str,
-) -> Vec<Option<SystemTime>> {
+) -> Vec<PromptFileFingerprint> {
     vec![
-        file_mtime(&workspace.join("BOOTSTRAP.md")), // bootstrap gate
-        file_mtime(&workspace.join("MEMORY.md")),
-        file_mtime(&workspace.join("memory").join(format!("{today}.md"))),
-        file_mtime(&workspace.join("memory").join(format!("{yesterday}.md"))),
+        prompt_file_fingerprint(&workspace.join("BOOTSTRAP.md")), // bootstrap gate
+        prompt_file_fingerprint(&workspace.join("MEMORY.md")),
+        prompt_file_fingerprint(&workspace.join("memory").join(format!("{today}.md"))),
+        prompt_file_fingerprint(&workspace.join("memory").join(format!("{yesterday}.md"))),
     ]
 }
 
@@ -964,14 +995,19 @@ fn load_memory_uncached(workspace: &Path, today: &str, yesterday: &str) -> Strin
 }
 
 fn load_memory(workspace: &Path, today: &str, yesterday: &str) -> String {
-    let mtimes = collect_memory_mtimes(workspace, today, yesterday);
+    // See load_persona: a read-free (mtime + len) signature collected before the
+    // load keeps the cache hit path content-read-free and avoids the double read
+    // on a miss. Note the whole daily memory file is signed even though only the
+    // first DAILY_MEMORY_CHAR_BUDGET chars are injected, so edits past the
+    // truncation point still invalidate the cache.
+    let fingerprints = collect_memory_fingerprints(workspace, today, yesterday);
     let cache = MEMORY_CACHE.get_or_init(|| Mutex::new(None));
     {
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref c) = *guard
             && c.workspace == workspace
             && c.today == today
-            && c.mtimes == mtimes
+            && c.fingerprints == fingerprints
         {
             return c.result.clone();
         }
@@ -982,7 +1018,7 @@ fn load_memory(workspace: &Path, today: &str, yesterday: &str) -> String {
         *guard = Some(MemoryCache {
             workspace: workspace.to_path_buf(),
             today: today.to_string(),
-            mtimes,
+            fingerprints,
             result: result.clone(),
         });
     }
@@ -1128,6 +1164,298 @@ fn format_local_hhmm(date_time: DateTime<FixedOffset>) -> String {
 
 fn format_local_datetime_label(date_time: DateTime<FixedOffset>) -> String {
     date_time.format("%Y-%m-%d %H:%M %:z").to_string()
+}
+
+// ── System Prompt ──────────────────────────────────────────────────────────
+
+static SYSTEM_PROMPT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+static SYSTEM_PROMPT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+
+const SYSTEM_PROMPT_CACHE_MAX_ENTRIES: usize = 64;
+
+type SystemPromptCacheLock =
+    OnceLock<std::sync::Mutex<HashMap<SystemPromptStaticCacheKey, String>>>;
+static SYSTEM_PROMPT_STATIC_CACHE: SystemPromptCacheLock = OnceLock::new();
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SystemPromptStaticCacheKey {
+    workspace: PathBuf,
+    query: Option<String>,
+    enabled_skills_hash: u64,
+    persona_hash: u64,
+    behavior_hash: u64,
+    tool_lines_hash: u64,
+    mcp_note_hash: u64,
+    skills_hash: u64,
+    agents_hash: u64,
+}
+
+const PROMPT_FILE_NOTE: &str = "## Preloaded Prompt Files\n\
+These prompt-file contents were already loaded into this system prompt from the session workspace.\n\
+Do not call file tools just to verify or re-read BOOTSTRAP.md, AGENTS.md, AGENT.md, IDENTITY.md, USER.md, or SOUL.md when their content is already present below.\n\
+Only read those files if the user explicitly asks to inspect them, if you need to edit them, or if a task depends on checking whether the on-disk file has changed.";
+
+const AGENT_BEHAVIOR_SECTION: &str = "## Agent Behavior
+
+You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools, **Observe** the results, then either loop or **Finish**.
+
+- **Tool strategy:** Prefer calling tools to gather information over speculating. Batch independent read-only calls together. Run write operations one at a time.
+- **Error recovery:** When a tool fails, diagnose the cause and try a different approach - different arguments, a different tool, or an alternative path. Do not repeat the same failing call.
+- **Delegation:** For complex, self-contained subtasks, delegate to a sub-agent via the `task` tool. Handle simple, quick work yourself.
+- **Finishing:** When the task is complete, deliver your result. When you are genuinely stuck with no further options, say so honestly. Do not pad with speculative follow-ups.";
+
+const PLAN_ONLY_AGENT_BEHAVIOR_SECTION: &str = "## Agent Behavior
+
+You operate in plan-only mode: **Analyze** the situation, optionally **Act** with read-only exploration tools, **Observe** the results, then **Finish** with a plan.
+
+- **Tool strategy:** Prefer read-only tools to gather information over speculating. Batch independent read-only calls together.
+- **Boundaries:** Do not modify files, run shell commands, update todos, delegate to sub-agents, or claim work has been performed.
+- **Finishing:** Deliver a concrete execution plan with affected areas, validation suggestions, and risks or unknowns. Wait for the user to approve execution before making changes.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SystemPromptToolMode {
+    Execute,
+    PlanOnly,
+}
+
+impl SystemPromptToolMode {
+    fn agent_behavior_section(self) -> &'static str {
+        match self {
+            Self::Execute => AGENT_BEHAVIOR_SECTION,
+            Self::PlanOnly => PLAN_ONLY_AGENT_BEHAVIOR_SECTION,
+        }
+    }
+
+    fn is_plan_only(self) -> bool {
+        matches!(self, Self::PlanOnly)
+    }
+}
+
+pub(crate) fn build_system_prompt(
+    config: &Config,
+    workspace: &Path,
+    model: &str,
+    enabled_system_skills: &HashSet<String>,
+) -> ChatMessage {
+    build_system_prompt_with_query_cached(config, workspace, model, enabled_system_skills, None)
+}
+
+fn hash_prompt_part<T: Hash>(value: &T) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn hash_enabled_system_skills(enabled_system_skills: &HashSet<String>) -> u64 {
+    let mut items: Vec<&str> = enabled_system_skills.iter().map(String::as_str).collect();
+    items.sort_unstable();
+    hash_prompt_part(&items)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_system_prompt_static_prefix_cached(
+    workspace: &Path,
+    current_query: Option<&str>,
+    enabled_system_skills: &HashSet<String>,
+    persona: &str,
+    agent_behavior_section: &str,
+    tool_lines: &str,
+    mcp_note: &str,
+    skills_section: &str,
+    agents_section: &str,
+) -> String {
+    let query = current_query
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(ToOwned::to_owned);
+    let enabled_skills_hash = hash_enabled_system_skills(enabled_system_skills);
+    let persona_hash = hash_prompt_part(&persona);
+    let behavior_hash = hash_prompt_part(&agent_behavior_section);
+    let tool_lines_hash = hash_prompt_part(&tool_lines);
+    let mcp_note_hash = hash_prompt_part(&mcp_note);
+    let skills_hash = hash_prompt_part(&skills_section);
+    let agents_hash = hash_prompt_part(&agents_section);
+    let key = SystemPromptStaticCacheKey {
+        workspace: workspace.to_path_buf(),
+        query,
+        enabled_skills_hash,
+        persona_hash,
+        behavior_hash,
+        tool_lines_hash,
+        mcp_note_hash,
+        skills_hash,
+        agents_hash,
+    };
+    let cache = SYSTEM_PROMPT_STATIC_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(stable_prefix) = guard.get(&key) {
+            SYSTEM_PROMPT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+            return stable_prefix.clone();
+        }
+    }
+
+    SYSTEM_PROMPT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+    let stable_prefix = format!(
+        r#"{persona}
+
+{prompt_file_note}
+
+{agent_behavior_section}
+
+## Available Tools
+{tool_lines}{mcp_note}{skills_section}{agents_section}"#,
+        persona = persona,
+        prompt_file_note = PROMPT_FILE_NOTE,
+        agent_behavior_section = agent_behavior_section,
+        tool_lines = tool_lines,
+        mcp_note = mcp_note,
+        skills_section = skills_section,
+        agents_section = agents_section,
+    );
+
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.len() >= SYSTEM_PROMPT_CACHE_MAX_ENTRIES {
+        guard.clear();
+    }
+    guard.insert(key, stable_prefix.clone());
+    stable_prefix
+}
+
+pub(crate) fn system_prompt_cache_metrics() -> (u64, u64) {
+    (
+        SYSTEM_PROMPT_CACHE_HITS.load(Ordering::Relaxed),
+        SYSTEM_PROMPT_CACHE_MISSES.load(Ordering::Relaxed),
+    )
+}
+
+pub(crate) fn build_system_prompt_with_query_cached(
+    config: &Config,
+    workspace: &Path,
+    model: &str,
+    enabled_system_skills: &HashSet<String>,
+    current_query: Option<&str>,
+) -> ChatMessage {
+    build_system_prompt_with_query_cached_for_tool_mode(
+        config,
+        workspace,
+        model,
+        enabled_system_skills,
+        current_query,
+        SystemPromptToolMode::Execute,
+    )
+}
+
+pub(crate) fn build_system_prompt_with_query_cached_for_tool_mode(
+    config: &Config,
+    workspace: &Path,
+    model: &str,
+    enabled_system_skills: &HashSet<String>,
+    current_query: Option<&str>,
+    tool_mode: SystemPromptToolMode,
+) -> ChatMessage {
+    let os_name = if cfg!(windows) {
+        "Windows"
+    } else if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "Linux"
+    };
+    let cwd = workspace.display();
+    let local_snapshot = current_local_snapshot();
+    let local_time = local_snapshot.datetime_label();
+    let agent_behavior_section = tool_mode.agent_behavior_section();
+    let tool_lines = if tool_mode.is_plan_only() {
+        tools::render_read_only_tool_prompt_lines(config)
+    } else {
+        tools::render_tool_prompt_lines_with_query(config, current_query)
+    };
+    let prompt_files = load_session_prompt_files_with_snapshot(workspace, local_snapshot);
+    let persona = prompt_files.persona;
+    let memory_files = prompt_files.memory;
+    let mcp_note = if tool_mode.is_plan_only() {
+        String::new()
+    } else {
+        tools::mcp::runtime_tool_note(config, workspace)
+            .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
+            .unwrap_or_default()
+    };
+
+    let skills_section = discover_all_skills(workspace)
+        .into_iter()
+        .filter(|s| {
+            s.source != SkillSource::System
+                || is_system_skill_enabled(&s.path, enabled_system_skills)
+        })
+        .collect::<Vec<_>>();
+    let skills_section = render_skills_catalog(&skills_section, current_query)
+        .map(|s| format!("\n\n{s}"))
+        .unwrap_or_default();
+
+    let structured_memory_section = if config.structured_memory {
+        memory::format_memory_for_injection(
+            &memory::load_structured_memory(workspace),
+            current_query,
+        )
+        .map(|s| format!("\n\n{s}"))
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let agents_section = if tool_mode.is_plan_only() {
+        String::new()
+    } else {
+        let agents = subagents::discovery::discover_all_agents(workspace);
+        subagents::render_agents_catalog_with_query(&agents, current_query)
+            .map(|s| format!("\n\n{s}"))
+            .unwrap_or_default()
+    };
+
+    let stable_prefix = build_system_prompt_static_prefix_cached(
+        workspace,
+        current_query,
+        enabled_system_skills,
+        &persona,
+        agent_behavior_section,
+        &tool_lines,
+        &mcp_note,
+        &skills_section,
+        &agents_section,
+    );
+    let prompt = format!(
+        r#"{stable_prefix}
+
+---
+## Memory
+{memory_files}{structured_memory_section}
+
+## Environment
+- OS: {os_name}
+- Current system local time: {local_time}
+- Working directory: {cwd}
+- Model: {model}"#, // The `---\n## Memory\n` prefix above is used as the cache-split
+        // delimiter by ENV_BLOCK_DELIMITER in providers.rs - keep them in sync.
+        stable_prefix = stable_prefix,
+        memory_files = memory_files,
+        structured_memory_section = structured_memory_section,
+        os_name = os_name,
+        local_time = local_time,
+        cwd = cwd,
+        model = model,
+    );
+
+    ChatMessage {
+        role: "system".into(),
+        content: Some(prompt),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }
 }
 
 #[cfg(test)]

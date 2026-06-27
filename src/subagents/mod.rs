@@ -394,7 +394,7 @@ fn work_track_tokens(text: &str) -> HashSet<String> {
 }
 
 fn is_high_signal_work_track_token(token: &str) -> bool {
-    (token.len() >= 4 || token.chars().any(|ch| !ch.is_ascii()))
+    (token.len() >= 4 || !token.is_ascii())
         && !matches!(
             token,
             "this"

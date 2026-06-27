@@ -1,3 +1,9 @@
+// These tests serialize against the global control registries (DIRECT_RUNS /
+// GROUP_RUN_CONTROLS) via `control_registry_test_guard()`, a std Mutex held for
+// the whole async test body on purpose. Dropping it before each `.await` (what
+// the lint suggests) would break that serialization, so suppress it module-wide.
+#![allow(clippy::await_holding_lock)]
+
 use super::*;
 
 static TEST_CONTROL_REGISTRY_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -110,6 +116,7 @@ fn group_target_prompt_includes_context_and_instruction() {
         Some("review-group"),
         "Check backend risk",
         Some("Recent messages:\n- main: split the review"),
+        false,
     );
 
     assert!(prompt.contains("[Session group: review-group]"));
@@ -193,6 +200,77 @@ async fn record_group_session_result_redacts_persisted_message() {
     assert!(message.content.contains("[redacted]"));
     assert!(!message.content.contains("super-secret"));
     group_cleanup.cleanup_now();
+}
+
+#[tokio::test]
+async fn record_group_session_result_suppresses_no_reply() {
+    let state = test_app_state();
+    let group_id = format!(
+        "result-no-reply-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut group_cleanup = CreatedGroupCleanup::track(group_id.clone());
+    let group = SessionGroup::new(&group_id, "No Reply", vec!["worker-a".to_string()]);
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .expect("group should save");
+
+    let recorded = record_group_session_result(
+        &state,
+        &group_id,
+        "run-no-reply",
+        "worker-a",
+        "NO_REPLY".to_string(),
+    )
+    .await;
+
+    assert!(!recorded);
+    let loaded = session_group::load_group_from_disk(&group_id).expect("group should load");
+    assert!(loaded.messages.is_empty());
+    group_cleanup.cleanup_now();
+}
+
+#[test]
+fn no_reply_result_accepts_fenced_and_punctuated_variants() {
+    for value in [
+        "",
+        "  `NO_REPLY`  ",
+        "NO_REPLY.",
+        "(no_reply)",
+        "```text\nNO_REPLY\n```",
+        "```\nno_reply\n```",
+    ] {
+        assert!(is_no_reply_result(value), "{value:?} should be suppressed");
+    }
+    assert!(!is_no_reply_result("NO_REPLY with context"));
+}
+
+#[test]
+fn group_mentions_accept_surrounding_punctuation() {
+    let members = vec!["worker-a".to_string(), "worker-b".to_string()];
+    assert_eq!(
+        mentions_from_text("Please ask (@worker-a), then @worker-b.", &members),
+        vec!["worker-a".to_string(), "worker-b".to_string()]
+    );
+}
+
+#[test]
+fn group_mention_followup_prompt_redacts_member_output() {
+    let prompt = group_mention_followup_prompt(
+        "worker-a",
+        "Authorization: Bearer super-secret and @worker-b should review.",
+    );
+
+    assert!(prompt.contains("[redacted]"));
+    assert!(!prompt.contains("super-secret"));
+}
+
+#[test]
+fn only_completed_group_runs_record_session_results() {
+    assert!(group_run_status_records_result("completed"));
+    assert!(!group_run_status_records_result("failed"));
+    assert!(!group_run_status_records_result("stopped"));
+    assert!(!group_run_status_records_result("running"));
 }
 
 #[test]
@@ -428,14 +506,70 @@ fn latest_assistant_content_after_ignores_previous_assistant() {
         test_message("user", "delegated task"),
     ];
 
-    assert!(latest_assistant_content_after(&messages, 2, 1_000).is_none());
+    assert!(latest_assistant_content_after(&messages, "delegated task", 1_000).is_none());
 
     let mut messages_with_reply = messages;
     messages_with_reply.push(test_message("assistant", "new answer"));
 
     assert_eq!(
-        latest_assistant_content_after(&messages_with_reply, 2, 1_000).as_deref(),
+        latest_assistant_content_after(&messages_with_reply, "delegated task", 1_000).as_deref(),
         Some("new answer")
+    );
+}
+
+#[test]
+fn latest_assistant_content_after_survives_compression_and_reindex() {
+    let boundary = "delegated task";
+    // Simulate post-compression: messages[0] kept, auto-summary inserted, then
+    // the kept tail (delegated user msg + this run's reply). The original absolute
+    // index would have been >> messages.len() here.
+    let messages = vec![
+        test_message("system", "system prompt"),
+        test_message(
+            "assistant",
+            "## Context Summary (auto-generated)\nearlier turns incl old answer",
+        ),
+        test_message("user", boundary),
+        test_message("assistant", "fresh reply"),
+    ];
+    assert_eq!(
+        latest_assistant_content_after(&messages, boundary, 1_000).as_deref(),
+        Some("fresh reply"),
+    );
+}
+
+#[test]
+fn latest_assistant_content_after_skips_tool_only_final_turn() {
+    let boundary = "delegated task";
+    let mut tool_only = test_message("assistant", "");
+    tool_only.content = None;
+    tool_only.tool_calls = Some(Vec::new());
+    let messages = vec![
+        test_message("user", boundary),
+        test_message("assistant", "the real answer"),
+        tool_only,
+        test_message("tool", "tool output"),
+    ];
+    assert_eq!(
+        latest_assistant_content_after(&messages, boundary, 1_000).as_deref(),
+        Some("the real answer"),
+    );
+}
+
+#[test]
+fn latest_assistant_content_after_falls_back_when_boundary_compressed_away() {
+    // Delegated user msg was folded into the summary; kept tail is all this run.
+    let messages = vec![
+        test_message("system", "system prompt"),
+        test_message(
+            "assistant",
+            "## Context Summary (auto-generated)\nfolded delegated task + early output",
+        ),
+        test_message("assistant", "post-compression reply"),
+    ];
+    assert_eq!(
+        latest_assistant_content_after(&messages, "delegated task", 1_000).as_deref(),
+        Some("post-compression reply"),
     );
 }
 
@@ -1157,6 +1291,56 @@ async fn active_group_run_statuses_preserves_queued_runs() {
     group_cleanup.cleanup_now();
 }
 
+#[tokio::test]
+async fn active_group_run_statuses_reports_unknown_when_group_missing() {
+    let _guard = control_registry_test_guard();
+    clear_group_run_controls_for_test();
+    let group_id = format!(
+        "missing-group-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    // Intentionally do NOT save any group file: load_group_from_disk(&group_id) returns None.
+    let control = test_direct_control();
+    register_group_run_control("missing-run", &group_id, "worker-a", &control);
+
+    let statuses = active_group_run_statuses_by_session();
+
+    // The load-None fallback now reports "unknown" rather than a false "running".
+    assert_eq!(
+        statuses.get("worker-a").map(String::as_str),
+        Some("unknown")
+    );
+    clear_group_run_control("missing-run");
+}
+
+#[tokio::test]
+async fn missing_group_run_blocks_delete_but_not_list_status() {
+    let _guard = control_registry_test_guard();
+    clear_group_run_controls_for_test();
+    let group_id = format!(
+        "missing-gate-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let control = test_direct_control();
+    register_group_run_control("missing-gate-run", &group_id, "worker-a", &control);
+
+    // Delete gate: "unknown" must still count as active so delete is refused (safe side).
+    assert!(session_has_active_delegated_work("worker-a"));
+
+    // List path: "unknown" must collapse to "idle", not falsely report the session busy.
+    let active_session_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    assert_eq!(
+        session_runtime_status_from_snapshots(
+            &active_session_ids,
+            "worker-a",
+            None,
+            Some("unknown")
+        ),
+        "idle"
+    );
+    clear_group_run_control("missing-gate-run");
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn stop_group_runs_matches_windows_case_variant_targets() {
@@ -1300,6 +1484,8 @@ async fn reserved_direct_run_stop_releases_before_prompt_append() {
     let run = StartedRun {
         run_id: "run-stop-after-reserve".to_string(),
         group_id: None,
+        optional_reply: false,
+        mention_depth: 0,
         session_id: "worker-stop-after-reserve".to_string(),
         control: control.clone(),
     };
@@ -1644,6 +1830,7 @@ async fn group_dispatch_revalidates_current_members_before_writing() {
         DispatchRequest {
             group_id: Some(group_id.clone()),
             targets: vec!["worker-a".to_string()],
+            optional_targets: HashSet::new(),
             message: "should not persist".to_string(),
             group_message: Some(DispatchGroupMessage {
                 role: "main".to_string(),
@@ -1653,6 +1840,7 @@ async fn group_dispatch_revalidates_current_members_before_writing() {
             run_mode: AgentRunMode::Execute,
             wait: false,
             summary_budget: 4_000,
+            mention_depth: 0,
         },
     )
     .await;
@@ -1676,7 +1864,11 @@ fn session_control_schema_includes_discovery_and_create_actions() {
 
     assert!(actions.contains(&"list_sessions"));
     assert!(actions.contains(&"create_session"));
+    assert!(actions.contains(&"delete_session"));
     assert!(actions.contains(&"describe_session"));
+    assert!(actions.contains(&"delete_group"));
+    assert!(actions.contains(&"promote_group_admin"));
+    assert!(actions.contains(&"remove_group_member"));
     assert!(
         schema["properties"]
             .as_object()
@@ -1707,4 +1899,591 @@ fn session_control_schema_includes_discovery_and_create_actions() {
         schema["properties"]["members"]["maxItems"].as_u64(),
         Some(64)
     );
+}
+
+#[tokio::test]
+async fn session_control_delete_session_rejects_main_and_removes_saved_session() {
+    let state = Arc::new(test_app_state());
+    let main = execute_session_control_tool(
+        &state,
+        MAIN_SESSION_ID,
+        r#"{"action":"delete_session","target":"main"}"#,
+    )
+    .await;
+
+    assert!(main.is_error);
+    assert!(main.output.contains("cannot delete the main session"));
+
+    let session_id = format!(
+        "delete-control-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    cleanup_created_session_for_test(&session_id);
+    let workspace = crate::session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    std::fs::write(workspace.join("AGENTS.md"), "delete me").expect("prompt file should write");
+    let session = test_session_with_workspace(&session_id, "Delete Control", workspace.clone());
+    session_store::save_session_to_disk(&session)
+        .await
+        .expect("session should save");
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let outcome = execute_session_control_tool(
+        &state,
+        MAIN_SESSION_ID,
+        &json!({"action":"delete_session","target": session_id}).to_string(),
+    )
+    .await;
+
+    assert!(!outcome.is_error, "{}", outcome.output);
+    assert!(
+        !session_store::sessions_dir()
+            .join(format!("{session_id}.json"))
+            .exists()
+    );
+    assert!(!crate::session_workspace_path(&session_id).exists());
+    cleanup_created_session_for_test(&session_id);
+}
+
+#[tokio::test]
+async fn session_control_delete_session_rejects_active_and_case_variant_targets() {
+    let state = Arc::new(test_app_state());
+    let active_id = format!(
+        "delete-active-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    cleanup_created_session_for_test(&active_id);
+    let active_workspace = crate::session_workspace_path(&active_id);
+    std::fs::create_dir_all(&active_workspace).expect("workspace should be created");
+    let active_session =
+        test_session_with_workspace(&active_id, "Delete Active", active_workspace.clone());
+    session_store::save_session_to_disk(&active_session)
+        .await
+        .expect("active session should save");
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(active_id.clone(), active_session);
+    }
+    {
+        let mut active = state.active_connections.lock().await;
+        active.insert(active_id.clone(), 42);
+    }
+
+    let active = execute_session_control_tool(
+        &state,
+        MAIN_SESSION_ID,
+        &json!({"action":"delete_session","target": active_id}).to_string(),
+    )
+    .await;
+
+    assert!(active.is_error);
+    assert!(active.output.contains("Cannot delete active session"));
+    assert!(
+        session_store::sessions_dir()
+            .join(format!("{active_id}.json"))
+            .exists()
+    );
+
+    let case_id = format!(
+        "delete-case-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    cleanup_created_session_for_test(&case_id);
+    let case_workspace = crate::session_workspace_path(&case_id);
+    std::fs::create_dir_all(&case_workspace).expect("workspace should be created");
+    let case_session = test_session_with_workspace(&case_id, "Delete Case", case_workspace);
+    session_store::save_session_to_disk(&case_session)
+        .await
+        .expect("case session should save");
+    let case_variant = case_id.to_ascii_uppercase();
+
+    let variant = execute_session_control_tool(
+        &state,
+        MAIN_SESSION_ID,
+        &json!({"action":"delete_session","target": case_variant}).to_string(),
+    )
+    .await;
+
+    assert!(variant.is_error);
+    assert!(variant.output.contains("not found"));
+    assert!(
+        session_store::sessions_dir()
+            .join(format!("{case_id}.json"))
+            .exists()
+    );
+    assert!(crate::session_workspace_path(&case_id).exists());
+    cleanup_created_session_for_test(&active_id);
+    cleanup_created_session_for_test(&case_id);
+}
+
+#[tokio::test]
+async fn session_control_delete_session_rejects_queued_delegated_runs() {
+    let _guard = control_registry_test_guard();
+    clear_direct_runs_for_test();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "delete-queued-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    cleanup_created_session_for_test(&session_id);
+    let workspace = crate::session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let session = test_session_with_workspace(&session_id, "Delete Queued", workspace);
+    session_store::save_session_to_disk(&session)
+        .await
+        .expect("session should save");
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let direct_control = test_direct_control();
+    register_direct_run("delete-queued-direct", &session_id, &direct_control);
+    let direct = execute_session_control_tool(
+        &state,
+        MAIN_SESSION_ID,
+        &json!({"action":"delete_session","target": session_id}).to_string(),
+    )
+    .await;
+
+    assert!(direct.is_error);
+    assert!(direct.output.contains("Cannot delete running session"));
+    clear_direct_runs_for_test();
+
+    let group_id = format!(
+        "delete-queued-group-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut group_cleanup = CreatedGroupCleanup::track(group_id.clone());
+    let mut group = SessionGroup::new(&group_id, "Delete Queued Group", vec![session_id.clone()]);
+    group.runs.push(GroupRun {
+        id: "delete-queued-group-run".to_string(),
+        group_id: group_id.clone(),
+        session_id: session_id.clone(),
+        status: "queued".to_string(),
+        prompt: "review".to_string(),
+        result_excerpt: None,
+        error: None,
+        created_at: 1,
+        updated_at: 1,
+        completed_at: None,
+    });
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .expect("group should save");
+
+    let group_run = execute_session_control_tool(
+        &state,
+        MAIN_SESSION_ID,
+        &json!({"action":"delete_session","target": session_id}).to_string(),
+    )
+    .await;
+
+    assert!(group_run.is_error);
+    assert!(group_run.output.contains("Cannot delete running session"));
+    assert!(
+        session_store::sessions_dir()
+            .join(format!("{session_id}.json"))
+            .exists()
+    );
+    group_cleanup.cleanup_now();
+    cleanup_created_session_for_test(&session_id);
+}
+
+#[tokio::test]
+async fn delete_session_with_safety_checks_guards_current_and_delegated_work() {
+    // The `/delete` command and `session_control.delete_session` share this helper, so the
+    // command path now also enforces the current-session guard and the delegated-work guard.
+    let _guard = control_registry_test_guard();
+    clear_direct_runs_for_test();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "delete-shared-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    cleanup_created_session_for_test(&session_id);
+    let workspace = crate::session_workspace_path(&session_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let session = test_session_with_workspace(&session_id, "Delete Shared", workspace);
+    session_store::save_session_to_disk(&session)
+        .await
+        .expect("session should save");
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    // The `/delete` command passes its own session as `reject_current`.
+    let current = delete_session_with_safety_checks(&state, &session_id, Some(&session_id)).await;
+    assert_eq!(
+        current.expect_err("deleting the current session should be rejected"),
+        "Cannot delete the current session."
+    );
+    assert!(
+        session_store::sessions_dir()
+            .join(format!("{session_id}.json"))
+            .exists(),
+        "rejected deletion must not remove the saved session"
+    );
+
+    // Active delegated work must block deletion regardless of the calling path.
+    let direct_control = test_direct_control();
+    register_direct_run("delete-shared-direct", &session_id, &direct_control);
+    let delegated = delete_session_with_safety_checks(&state, &session_id, Some(MAIN_SESSION_ID))
+        .await
+        .expect_err("delegated work should block deletion");
+    assert!(delegated.contains("Cannot delete running session"));
+    clear_direct_runs_for_test();
+
+    // With no guard tripped, deletion succeeds and removes the persisted state.
+    let removed = delete_session_with_safety_checks(&state, &session_id, Some(MAIN_SESSION_ID))
+        .await
+        .expect("deletion should succeed once delegated work is cleared");
+    assert!(removed.contains("Deleted"));
+    assert!(
+        !session_store::sessions_dir()
+            .join(format!("{session_id}.json"))
+            .exists()
+    );
+    assert!(!crate::session_workspace_path(&session_id).exists());
+    cleanup_created_session_for_test(&session_id);
+}
+
+#[tokio::test]
+async fn delete_session_prunes_ghost_member_from_all_groups() {
+    let _guard = control_registry_test_guard();
+    clear_direct_runs_for_test();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+
+    // Worker session that will be deleted.
+    let worker = format!(
+        "ghost-worker-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    cleanup_created_session_for_test(&worker);
+    let workspace = crate::session_workspace_path(&worker);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let session = test_session_with_workspace(&worker, "Ghost Worker", workspace);
+    session_store::save_session_to_disk(&session)
+        .await
+        .expect("session should save");
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(worker.clone(), session);
+    }
+
+    // Group that lists the worker as a member + admin + pending vote target.
+    let group_id = format!(
+        "ghost-group-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut group_cleanup = CreatedGroupCleanup::track(group_id.clone());
+    let mut group = SessionGroup::new(
+        &group_id,
+        "Ghost Group",
+        vec![worker.clone(), "worker-keep".to_string()],
+    );
+    group.admins = vec![worker.clone()];
+    group.pending_votes.push(session_group::GroupVote {
+        id: "vote-ghost".to_string(),
+        action: "remove_member".to_string(),
+        target_session_id: worker.clone(),
+        requester_session_id: "worker-keep".to_string(),
+        approvals: vec!["worker-keep".to_string()],
+        threshold: 1,
+        created_at: 1,
+        updated_at: 1,
+    });
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .expect("group should save");
+
+    let message = delete_session_with_safety_checks(&state, &worker, Some(MAIN_SESSION_ID))
+        .await
+        .expect("deletion should succeed");
+    assert!(message.contains("Deleted"));
+
+    // Both JSON and workspace are gone.
+    assert!(
+        !session_store::sessions_dir()
+            .join(format!("{worker}.json"))
+            .exists()
+    );
+    assert!(!crate::session_workspace_path(&worker).exists());
+
+    // The group no longer references the deleted worker anywhere.
+    let loaded = session_group::load_group_from_disk(&group_id).expect("group should load");
+    assert!(
+        !loaded.members.iter().any(|m| m == &worker),
+        "member not pruned"
+    );
+    assert!(
+        !loaded.admins.iter().any(|a| a == &worker),
+        "admin not pruned"
+    );
+    assert!(
+        !loaded
+            .pending_votes
+            .iter()
+            .any(|v| v.target_session_id == worker),
+        "pending vote not pruned"
+    );
+    // Unrelated member is retained.
+    assert!(loaded.members.iter().any(|m| m == "worker-keep"));
+
+    group_cleanup.cleanup_now();
+    cleanup_created_session_for_test(&worker);
+}
+
+#[tokio::test]
+async fn session_control_delete_group_rejects_active_runs_then_deletes_group() {
+    let state = Arc::new(test_app_state());
+    let group_id = format!(
+        "delete-group-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut group_cleanup = CreatedGroupCleanup::track(group_id.clone());
+    let mut group = SessionGroup::new(&group_id, "Delete Group", vec!["worker-a".to_string()]);
+    group.runs.push(GroupRun {
+        id: "active-run".to_string(),
+        group_id: group_id.clone(),
+        session_id: "worker-a".to_string(),
+        status: "queued".to_string(),
+        prompt: "inspect".to_string(),
+        result_excerpt: None,
+        error: None,
+        created_at: 1,
+        updated_at: 1,
+        completed_at: None,
+    });
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .expect("group should save");
+
+    let active = execute_session_control_tool(
+        &state,
+        MAIN_SESSION_ID,
+        &json!({"action":"delete_group","group_id": group_id}).to_string(),
+    )
+    .await;
+
+    assert!(active.is_error);
+    assert!(active.output.contains("queued or running"));
+
+    let mut group = session_group::load_group_from_disk(&group_id).expect("group should load");
+    group.runs[0].status = "stopped".to_string();
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .expect("group should save");
+
+    let deleted = execute_session_control_tool(
+        &state,
+        MAIN_SESSION_ID,
+        &json!({"action":"delete_group","group_id": group_id}).to_string(),
+    )
+    .await;
+
+    assert!(!deleted.is_error, "{}", deleted.output);
+    assert!(session_group::load_group_from_disk(&group_id).is_none());
+    group_cleanup.cleanup_now();
+}
+
+#[tokio::test]
+async fn group_admin_vote_merges_approvals_and_removes_member_at_threshold() {
+    let state = Arc::new(test_app_state());
+    let group_id = format!(
+        "governance-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut group_cleanup = CreatedGroupCleanup::track(group_id.clone());
+    let mut group = SessionGroup::new(
+        &group_id,
+        "Governance",
+        vec![
+            "worker-a".to_string(),
+            "worker-b".to_string(),
+            "worker-c".to_string(),
+        ],
+    );
+    group.admins = vec![
+        "worker-a".to_string(),
+        "worker-b".to_string(),
+        "worker-c".to_string(),
+    ];
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .expect("group should save");
+
+    let first = request_group_member_removal_vote(&state, &group_id, "worker-a", "worker-c").await;
+
+    assert!(!first.expect("first vote should open").is_empty());
+    let loaded = session_group::load_group_from_disk(&group_id).expect("group should load");
+    assert!(loaded.members.iter().any(|member| member == "worker-c"));
+    assert_eq!(loaded.pending_votes.len(), 1);
+    assert_eq!(
+        loaded.pending_votes[0].approvals,
+        vec!["worker-a".to_string()]
+    );
+    assert_eq!(loaded.pending_votes[0].threshold, 2);
+
+    let second = request_group_member_removal_vote(&state, &group_id, "worker-b", "worker-c").await;
+
+    assert!(
+        second
+            .expect("second vote should remove")
+            .contains("Removed worker-c")
+    );
+    let loaded = session_group::load_group_from_disk(&group_id).expect("group should load");
+    assert!(!loaded.members.iter().any(|member| member == "worker-c"));
+    assert!(!loaded.admins.iter().any(|member| member == "worker-c"));
+    assert!(loaded.pending_votes.is_empty());
+    group_cleanup.cleanup_now();
+}
+
+#[tokio::test]
+async fn direct_group_member_removal_stops_runs_and_prunes_votes() {
+    let _guard = control_registry_test_guard();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let group_id = format!(
+        "remove-member-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut group_cleanup = CreatedGroupCleanup::track(group_id.clone());
+    let mut group = SessionGroup::new(
+        &group_id,
+        "Remove Member",
+        vec![
+            "worker-a".to_string(),
+            "worker-b".to_string(),
+            "worker-c".to_string(),
+        ],
+    );
+    group.admins = vec!["worker-a".to_string(), "worker-b".to_string()];
+    group.pending_votes.push(session_group::GroupVote {
+        id: "vote-remove-c".to_string(),
+        action: "remove_member".to_string(),
+        target_session_id: "worker-c".to_string(),
+        requester_session_id: "worker-b".to_string(),
+        approvals: vec!["worker-a".to_string(), "worker-b".to_string()],
+        threshold: 2,
+        created_at: 1,
+        updated_at: 1,
+    });
+    group.runs.push(GroupRun {
+        id: "run-worker-b".to_string(),
+        group_id: group_id.clone(),
+        session_id: "worker-b".to_string(),
+        status: "running".to_string(),
+        prompt: "inspect".to_string(),
+        result_excerpt: None,
+        error: None,
+        created_at: 1,
+        updated_at: 1,
+        completed_at: None,
+    });
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .expect("group should save");
+    let control = test_direct_control();
+    register_group_run_control("run-worker-b", &group_id, "worker-b", &control);
+
+    let (removed, _group) = remove_group_member_direct(&state, &group_id, "worker-b")
+        .await
+        .expect("member should be removed");
+
+    assert!(removed.contains("worker-b"));
+    let loaded = session_group::load_group_from_disk(&group_id).expect("group should load");
+    assert!(!loaded.members.iter().any(|member| member == "worker-b"));
+    assert!(!loaded.members.iter().any(|member| member == "worker-c"));
+    assert!(!loaded.admins.iter().any(|admin| admin == "worker-b"));
+    assert!(loaded.pending_votes.is_empty());
+    let run = loaded
+        .runs
+        .iter()
+        .find(|run| run.id == "run-worker-b")
+        .expect("run should remain in group history");
+    assert_eq!(run.status, "stopped");
+    assert!(run.completed_at.is_some());
+    assert!(with_group_run_controls(
+        |controls| !controls.contains_key("run-worker-b")
+    ));
+    group_cleanup.cleanup_now();
+}
+
+#[tokio::test]
+async fn vote_removal_does_not_cascade_below_threshold_when_admin_target_removed() {
+    let state = Arc::new(test_app_state());
+    let group_id = format!(
+        "cascade-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut group_cleanup = CreatedGroupCleanup::track(group_id.clone());
+    let mut group = SessionGroup::new(
+        &group_id,
+        "Cascade",
+        vec![
+            "worker-a".to_string(),
+            "worker-b".to_string(),
+            "worker-c".to_string(),
+            "worker-d".to_string(),
+        ],
+    );
+    // Four promoted admins -> threshold is ceil(4 * 2 / 3) = 3.
+    group.admins = vec![
+        "worker-a".to_string(),
+        "worker-b".to_string(),
+        "worker-c".to_string(),
+        "worker-d".to_string(),
+    ];
+    // vote-c is one approval short of the 3-vote bar; vote-d sits two short.
+    group.pending_votes.push(session_group::GroupVote {
+        id: "vote-remove-c".to_string(),
+        action: "remove_member".to_string(),
+        target_session_id: "worker-c".to_string(),
+        requester_session_id: "worker-a".to_string(),
+        approvals: vec!["worker-a".to_string(), "worker-b".to_string()],
+        threshold: 3,
+        created_at: 1,
+        updated_at: 1,
+    });
+    group.pending_votes.push(session_group::GroupVote {
+        id: "vote-remove-d".to_string(),
+        action: "remove_member".to_string(),
+        target_session_id: "worker-d".to_string(),
+        requester_session_id: "worker-a".to_string(),
+        approvals: vec!["worker-a".to_string(), "worker-b".to_string()],
+        threshold: 3,
+        created_at: 1,
+        updated_at: 1,
+    });
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .expect("group should save");
+
+    // worker-d (an admin) approves removing worker-c, pushing vote-c to 3 approvals.
+    // Removing admin worker-c shrinks the admin count to 3, which must NOT lower the
+    // bar for the still-pending worker-d vote within the same settlement pass.
+    let result = request_group_member_removal_vote(&state, &group_id, "worker-d", "worker-c")
+        .await
+        .expect("vote should resolve");
+
+    assert!(result.contains("Removed worker-c"));
+    let loaded = session_group::load_group_from_disk(&group_id).expect("group should load");
+    assert!(!loaded.members.iter().any(|member| member == "worker-c"));
+    // worker-d must remain: its vote only had 2/3 approvals under the original count.
+    assert!(loaded.members.iter().any(|member| member == "worker-d"));
+    let pending_d = loaded
+        .pending_votes
+        .iter()
+        .find(|vote| vote.target_session_id == "worker-d")
+        .expect("worker-d removal vote should still be pending");
+    assert_eq!(pending_d.approvals.len(), 2);
+    group_cleanup.cleanup_now();
 }

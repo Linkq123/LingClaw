@@ -2709,7 +2709,7 @@ fn anthropic_prompt_caching_enabled(resolved: &ResolvedModel) -> bool {
 }
 
 /// Delimiter that separates the stable system-prompt prefix from the per-round
-/// dynamic suffix.  Must match the template in `build_system_prompt_with_query`.
+/// dynamic suffix.  Must match the template in `build_system_prompt_with_query_cached_for_tool_mode`.
 const ENV_BLOCK_DELIMITER: &str = "\n\n---\n## Memory\n";
 
 fn anthropic_system_payload(system_prompt: &str, cache_enabled: bool) -> serde_json::Value {

@@ -2,6 +2,7 @@ pub(crate) mod exec;
 pub(crate) mod fs;
 pub(crate) mod mcp;
 pub(crate) mod net;
+pub(crate) mod safety;
 
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -1173,7 +1174,7 @@ pub(crate) fn render_tool_prompt_lines_with_query(
         .map(|spec| (spec.prompt_line)(config))
         .collect();
 
-    if let Some(selected) = select_ranked_tool_indices(&specs, &prompt_lines, current_query, None) {
+    if let Some(selected) = select_ranked_tool_indices(specs, &prompt_lines, current_query, None) {
         let mut display_order = selected.clone();
         display_order.sort_unstable();
 
@@ -1230,7 +1231,7 @@ pub(crate) fn render_ranked_tool_recommendations(
         .iter()
         .map(|spec| (spec.prompt_line)(config))
         .collect();
-    let selected = select_ranked_tool_indices(&specs, &prompt_lines, current_query, Some(ranking))?;
+    let selected = select_ranked_tool_indices(specs, &prompt_lines, current_query, Some(ranking))?;
 
     let mut lines = vec!["## Suggested Tool Order".to_string()];
     for (display_idx, idx) in selected.iter().enumerate() {
@@ -1489,7 +1490,7 @@ pub(crate) fn tool_definitions_anthropic() -> serde_json::Value {
 pub(crate) fn read_only_tool_definitions_for_provider(
     provider: Provider,
 ) -> Vec<serde_json::Value> {
-    let tools = tool_specs()
+    tool_specs()
         .iter()
         .filter(|spec| is_read_only_tool(spec.name))
         .map(|spec| match provider {
@@ -1512,8 +1513,7 @@ pub(crate) fn read_only_tool_definitions_for_provider(
                 }
             }),
         })
-        .collect::<Vec<_>>();
-    tools
+        .collect::<Vec<_>>()
 }
 
 pub(crate) fn task_tool_definition_ollama(agent_names: &[String]) -> serde_json::Value {
@@ -1664,10 +1664,14 @@ pub(crate) fn session_control_tool_parameters() -> serde_json::Value {
                 "enum": [
                     "list_sessions",
                     "create_session",
+                    "delete_session",
                     "describe_session",
                     "list_groups",
                     "create_group",
                     "update_group",
+                    "delete_group",
+                    "promote_group_admin",
+                    "remove_group_member",
                     "dispatch",
                     "post_group_message",
                     "collect",
@@ -1691,13 +1695,19 @@ pub(crate) fn session_control_tool_parameters() -> serde_json::Value {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 100,
-                "description": "Target session id for describe_session."
+                "description": "Target session id for describe_session, delete_session, promote_group_admin, or remove_group_member."
             },
             "session_id": {
                 "type": "string",
                 "minLength": 1,
                 "maxLength": 100,
-                "description": "Alias for target when action is describe_session."
+                "description": "Alias for target when action is describe_session, delete_session, promote_group_admin, or remove_group_member."
+            },
+            "requester_session_id": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 100,
+                "description": "Promoted admin approving or requesting a remove_group_member vote. Omit for main-owner direct removal."
             },
             "sections": {
                 "type": "array",
@@ -1791,7 +1801,7 @@ pub(crate) fn session_control_tool_parameters() -> serde_json::Value {
 }
 
 fn session_control_tool_description() -> &'static str {
-    "Control other persistent sessions from the main session. Use this to list lightweight session cards, create sessions, describe one session's profile/capabilities/runtime details on demand, manage groups, dispatch work, collect group results, post group messages, or stop delegated session runs. Only the main session can use this tool; each target session keeps its own model, MCP policy, skills, TaskPlan setting, workspace, and permissions."
+    "Control other persistent sessions from the main session. Use this to list lightweight session cards, create/delete sessions, describe one session's profile/capabilities/runtime details on demand, manage groups and group admins, dispatch work, collect group results, post group messages, remove group members, or stop delegated session runs. Only the main session can use this tool; each target session keeps its own model, MCP policy, skills, TaskPlan setting, workspace, and permissions."
 }
 
 pub(crate) fn session_control_tool_definition_openai() -> serde_json::Value {

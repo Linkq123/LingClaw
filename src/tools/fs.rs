@@ -8,7 +8,28 @@ use futures::stream::{self, StreamExt};
 
 use regex::Regex;
 
-use crate::{Config, format_size, matches_glob, resolve_path_checked, truncate};
+use crate::tools::safety::resolve_path_checked;
+use crate::{Config, truncate};
+
+pub(crate) fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+pub(crate) fn matches_glob(name: &str, pattern: &str) -> bool {
+    if let Some(ext) = pattern.strip_prefix("*.") {
+        name.ends_with(&format!(".{ext}"))
+    } else if let Some(prefix) = pattern.strip_suffix('*') {
+        name.starts_with(prefix)
+    } else {
+        name == pattern
+    }
+}
 
 fn resolve_tool_path(path_str: &str, workspace: &Path, tool_name: &str) -> Result<PathBuf, String> {
     resolve_path_checked(path_str, workspace)

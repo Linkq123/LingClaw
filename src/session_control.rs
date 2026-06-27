@@ -1,5 +1,11 @@
+use axum::{
+    Json,
+    extract::{Query, State},
+    http::{HeaderMap, StatusCode},
+};
 use futures::FutureExt;
 use regex::Regex;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
@@ -94,11 +100,13 @@ pub(crate) struct GroupSocketDispatch {
 struct DispatchRequest {
     group_id: Option<String>,
     targets: Vec<String>,
+    optional_targets: HashSet<String>,
     message: String,
     group_message: Option<DispatchGroupMessage>,
     run_mode: AgentRunMode,
     wait: bool,
     summary_budget: usize,
+    mention_depth: u8,
 }
 
 #[derive(Clone, Debug)]
@@ -113,6 +121,8 @@ struct StartedRun {
     run_id: String,
     group_id: Option<String>,
     session_id: String,
+    optional_reply: bool,
+    mention_depth: u8,
     control: DelegatedRunControl,
 }
 
@@ -159,11 +169,10 @@ fn validate_group_targets(
     let non_members = targets
         .iter()
         .filter(|target| {
-            !member_set.contains(*target)
-                && !(cfg!(windows)
-                    && members
-                        .iter()
-                        .any(|member| member.eq_ignore_ascii_case(target)))
+            !(member_set.contains(*target)
+                || members
+                    .iter()
+                    .any(|member| crate::session_ids_match(member, target)))
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -189,7 +198,7 @@ async fn resolve_existing_target_session_ids(
             crate::find_loaded_session_id(&sessions, &target)
         };
         if let Some(session_id) = loaded_id {
-            if session_id.eq_ignore_ascii_case(MAIN_SESSION_ID) {
+            if crate::is_main(&session_id) {
                 return Err(
                     "session_control error: cannot dispatch to the main session from session_control."
                         .to_string(),
@@ -208,7 +217,7 @@ async fn resolve_existing_target_session_ids(
             ));
         };
         let session_id = session.id.clone();
-        if session_id.eq_ignore_ascii_case(MAIN_SESSION_ID) {
+        if crate::is_main(&session_id) {
             return Err(
                 "session_control error: cannot dispatch to the main session from session_control."
                     .to_string(),
@@ -218,7 +227,7 @@ async fn resolve_existing_target_session_ids(
             let mut sessions = state.sessions.lock().await;
             let effective_id =
                 crate::find_loaded_session_id(&sessions, &session_id).unwrap_or(session_id);
-            if effective_id.eq_ignore_ascii_case(MAIN_SESSION_ID) {
+            if crate::is_main(&effective_id) {
                 return Err(
                     "session_control error: cannot dispatch to the main session from session_control."
                         .to_string(),
@@ -259,10 +268,7 @@ async fn prepare_dispatch_targets(
     if let Some(members) = group_members.as_ref() {
         validate_group_targets(group_id.unwrap_or_default(), members, &targets)?;
     }
-    if targets
-        .iter()
-        .any(|target| target.eq_ignore_ascii_case(MAIN_SESSION_ID))
-    {
+    if targets.iter().any(|target| crate::is_main(target)) {
         return Err(
             "session_control error: cannot dispatch to the main session from session_control."
                 .to_string(),
@@ -353,17 +359,36 @@ fn active_group_run_statuses_by_session() -> HashMap<String, String> {
         let group = groups
             .entry(group_id.clone())
             .or_insert_with(|| session_group::load_group_from_disk(&group_id));
+        // A control entry exists, so a run was registered and is likely in-flight. If the
+        // group cannot be read (transient IO / parse error / concurrent rename) or the run
+        // is missing from the loaded group, report "unknown" rather than "running": the
+        // delete gate (session_has_active_delegated_work) treats "unknown" as active so a
+        // legitimate delete is still refused on the safe side, while the session list
+        // (session_runtime_status_from_snapshots / merge_group_session_status) treats any
+        // non queued/running status as inactive, so the session is not shown falsely busy.
         let status = group
             .as_ref()
             .and_then(|group| group.runs.iter().find(|run| run.id == run_id))
             .map(|run| run.status.as_str())
-            .unwrap_or("running");
+            .unwrap_or("unknown");
         merge_group_session_status(&mut statuses, session_id, status.to_string(), now_epoch());
     }
     statuses
         .into_iter()
         .map(|(session_id, (status, _))| (session_id, status))
         .collect()
+}
+
+fn saved_group_has_active_run_for_session(session_id: &str) -> bool {
+    session_group::list_saved_group_summaries()
+        .into_iter()
+        .filter_map(|summary| session_group::load_group_from_disk(&summary.id))
+        .any(|group| {
+            group.runs.iter().any(|run| {
+                run.session_id == session_id
+                    && session_group::is_active_group_run_status(&run.status)
+            })
+        })
 }
 
 fn clear_group_run_control(run_id: &str) {
@@ -419,10 +444,9 @@ fn direct_run_is_active(run_id: &str) -> bool {
 
 fn target_set_contains_session(target_set: &HashSet<String>, session_id: &str) -> bool {
     target_set.contains(session_id)
-        || (cfg!(windows)
-            && target_set
-                .iter()
-                .any(|target| target.eq_ignore_ascii_case(session_id)))
+        || target_set
+            .iter()
+            .any(|target| crate::session_ids_match(target, session_id))
 }
 
 fn stop_direct_runs_for_targets(targets: &[String]) -> usize {
@@ -733,9 +757,7 @@ fn redact_profile_token(token: &str) -> String {
 }
 
 fn profile_secret_key_from_label(token: &str) -> Option<String> {
-    let label = token
-        .trim_start_matches(|ch| matches!(ch, '-' | '*'))
-        .trim();
+    let label = token.trim_start_matches(['-', '*']).trim();
     let key = label.trim_end_matches(':').trim();
     if key.is_empty() || !is_profile_secret_key(key) {
         return None;
@@ -755,9 +777,7 @@ fn profile_secret_label_from_tokens(current: &str, next: Option<&str>) -> Option
     if let Some(label) = profile_secret_key_from_label(current) {
         return Some((label, 1));
     }
-    let Some(next) = next else {
-        return None;
-    };
+    let next = next?;
     if is_profile_secret_compound_label(current, next) {
         return Some((format!("{current} {next}:"), 2));
     }
@@ -1224,25 +1244,48 @@ fn format_profile_line(name: &str, field: &ProfileFieldSummary) -> String {
     }
 }
 
+fn protocol_mention_token(token: &str, member_set: &HashSet<&str>) -> Option<String> {
+    let token = token.trim_matches(|ch: char| {
+        !ch.is_ascii_alphanumeric() && !matches!(ch, '@' | '-' | '_' | '.')
+    });
+    let raw = token.strip_prefix('@')?;
+    if raw.is_empty()
+        || !raw
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return None;
+    }
+    if member_set.contains(raw) {
+        return Some(raw.to_string());
+    }
+    let without_sentence_dot = raw.trim_end_matches('.');
+    if without_sentence_dot != raw && member_set.contains(without_sentence_dot) {
+        return Some(without_sentence_dot.to_string());
+    }
+    None
+}
+
 fn mentions_from_text(text: &str, members: &[String]) -> Vec<String> {
-    let member_set = members.iter().collect::<HashSet<_>>();
+    let member_set = members.iter().map(String::as_str).collect::<HashSet<_>>();
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for token in text.split_whitespace() {
-        let Some(raw) = token.strip_prefix('@') else {
-            continue;
-        };
-        let candidate = raw
-            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && !matches!(ch, '-' | '_' | '.'));
-        if candidate.is_empty() {
-            continue;
-        }
-        let candidate = candidate.to_string();
-        if member_set.contains(&candidate) && seen.insert(candidate.clone()) {
+        if let Some(candidate) = protocol_mention_token(token, &member_set)
+            && seen.insert(candidate.clone())
+        {
             out.push(candidate);
         }
     }
     out
+}
+
+fn text_mentions_all(text: &str) -> bool {
+    text.split_whitespace().any(|token| {
+        token
+            .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '@')
+            .eq_ignore_ascii_case("@all")
+    })
 }
 
 async fn mutate_group<F, R>(group_id: &str, f: F) -> Result<(SessionGroup, R), String>
@@ -1336,12 +1379,17 @@ fn apply_group_run_status_transition(
 }
 
 async fn emit_group_run_status_events(state: &AppState, group_id: &str, run: &GroupRun) {
-    crate::send_group_client_event(state, group_id, run_status_event(group_id, run)).await;
+    crate::send_group_client_event(
+        state,
+        group_id,
+        GroupClientEvent::reliable(run_status_event(group_id, run)),
+    )
+    .await;
     if matches!(run.status.as_str(), "completed" | "failed" | "stopped") {
         crate::send_group_client_event(
             state,
             group_id,
-            json!({
+            GroupClientEvent::reliable(json!({
                 "type": "group_run_completed",
                 "group_id": group_id,
                 "run_id": run.id,
@@ -1351,7 +1399,7 @@ async fn emit_group_run_status_events(state: &AppState, group_id: &str, run: &Gr
                 "error": run.error,
                 "completed_at": run.completed_at,
                 "updated_at": run.updated_at,
-            }),
+            })),
         )
         .await;
     }
@@ -1463,16 +1511,25 @@ fn target_prompt(
     group_id: Option<&str>,
     source_message: &str,
     group_context: Option<&str>,
+    optional_reply: bool,
 ) -> String {
     match group_id {
-        Some(group_id) => format!(
-            "[Session group: {group_id}]\n\
-             Main session asked this session to contribute one response to the group conversation.\n\
-             Respond in your own session using your normal tools and permissions. Do not assume other sessions can see private tool outputs unless you summarize them.\n\n\
-             Group context summary:\n{}\n\n\
-             Main instruction:\n{source_message}",
-            group_context.unwrap_or("No group context is available.")
-        ),
+        Some(group_id) => {
+            let reply_policy = if optional_reply {
+                "Your reply is optional. If you have no useful contribution, respond exactly `NO_REPLY` and do not add extra text."
+            } else {
+                "You must reply with one useful group contribution."
+            };
+            format!(
+                "[Session group: {group_id}]\n\
+                 Main session asked this session to contribute one response to the group conversation.\n\
+                 {reply_policy}\n\
+                 Respond in your own session using your normal tools and permissions. Do not assume other sessions can see private tool outputs unless you summarize them.\n\n\
+                 Group context summary:\n{}\n\n\
+                 Main instruction:\n{source_message}",
+                group_context.unwrap_or("No group context is available.")
+            )
+        }
         None => format!(
             "[Main session delegation]\n\
              Main session asked this session to complete this delegated task. Respond in your own session using your normal tools and permissions.\n\n\
@@ -1496,24 +1553,51 @@ fn stored_group_run_prompt(message: &str) -> String {
 async fn latest_assistant_excerpt_after(
     state: &AppState,
     session_id: &str,
-    user_message_index: usize,
+    boundary_user_message: &str,
     budget: usize,
 ) -> Option<String> {
     let sessions = state.sessions.lock().await;
     let session = sessions.get(session_id)?;
-    latest_assistant_content_after(&session.messages, user_message_index, budget)
+    latest_assistant_content_after(&session.messages, boundary_user_message, budget)
 }
 
+/// True for the auto-generated compression summary assistant message, which is
+/// not a genuine reply and must never be returned as this run's answer.
+fn is_auto_compress_summary(message: &ChatMessage) -> bool {
+    message
+        .content
+        .as_deref()
+        .is_some_and(|content| content.starts_with("## Context Summary (auto-generated)"))
+}
+
+/// Return the text of the last assistant turn produced AFTER the delegated user
+/// message identified by `boundary_user_message`.
+///
+/// Uses the appended message's identity (not an absolute index) so it stays
+/// correct after `AutoCompressContextHook` shrinks/re-indexes `messages`
+/// mid-run. If that boundary message survived compression we scan strictly
+/// after it; if it was folded into the auto-summary, `build_compressed_messages`
+/// guarantees the entire kept tail is from this run, so we scan all messages.
+/// Either way we take the last assistant message with non-empty content,
+/// skipping the auto-summary and tool-call-only (content:None) turns.
 fn latest_assistant_content_after(
     messages: &[ChatMessage],
-    user_message_index: usize,
+    boundary_user_message: &str,
     budget: usize,
 ) -> Option<String> {
+    let boundary = messages.iter().rposition(|message| {
+        message.role == "user" && message.content.as_deref() == Some(boundary_user_message)
+    });
+    let start = boundary.map(|index| index + 1).unwrap_or(0);
     let mut content = messages
+        .get(start..)?
         .iter()
-        .skip(user_message_index.saturating_add(1))
         .rev()
-        .find(|message| message.role == "assistant")
+        .find(|message| {
+            message.role == "assistant"
+                && message.has_nonempty_content()
+                && !is_auto_compress_summary(message)
+        })
         .and_then(|message| message.content.clone())?;
     crate::truncate_safe(&mut content, budget.max(1));
     Some(content)
@@ -1525,7 +1609,10 @@ async fn record_group_session_result(
     run_id: &str,
     session_id: &str,
     content: String,
-) {
+) -> bool {
+    if is_no_reply_result(&content) {
+        return false;
+    }
     let content = redact_profile_summary_text(&content);
     let message = mutate_group(group_id, |group| {
         append_group_message(
@@ -1543,15 +1630,148 @@ async fn record_group_session_result(
         Ok(message) => message,
         Err(error) => {
             eprintln!("ERROR: failed to persist group session result: {error}");
-            return;
+            return false;
         }
     };
     crate::send_group_client_event(
         state,
         group_id,
-        json!({"type":"group_message","group_id": group_id,"message": message}),
+        GroupClientEvent::reliable(json!({
+            "type": "group_message",
+            "group_id": group_id,
+            "message": message,
+        })),
     )
     .await;
+    true
+}
+
+fn is_no_reply_result(content: &str) -> bool {
+    if content.trim().is_empty() {
+        return true;
+    }
+    // Reuse the shared fence stripper instead of re-implementing it here.
+    let trimmed = crate::strip_json_fences(content);
+    let normalized = trimmed.trim_matches(|ch: char| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '`' | '"'
+                    | '\''
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '.'
+                    | ','
+                    | ';'
+                    | ':'
+                    | '!'
+                    | '?'
+            )
+    });
+    normalized.eq_ignore_ascii_case("NO_REPLY")
+}
+
+fn group_run_status_records_result(status: &str) -> bool {
+    status == "completed"
+}
+
+fn group_mention_followup_prompt(source_session_id: &str, content: &str) -> String {
+    let redacted_content = redact_profile_summary_text(content);
+    format!(
+        "[Group mention from {source_session_id}]\n{redacted_content}\n\nReply because this message mentioned your session id or used @all."
+    )
+}
+
+async fn dispatch_group_mentions_from_session_result(
+    state: &Arc<AppState>,
+    group_id: &str,
+    source_session_id: &str,
+    content: &str,
+    run_mode: AgentRunMode,
+    summary_budget: usize,
+    mention_depth: u8,
+) {
+    if mention_depth >= 1 || is_no_reply_result(content) {
+        return;
+    }
+    let Some(group) = session_group::load_group_from_disk(group_id) else {
+        return;
+    };
+    let is_admin = group.admins.iter().any(|admin| admin == source_session_id);
+    let direct_mentions = mentions_from_text(content, &group.members)
+        .into_iter()
+        .filter(|target| target != source_session_id)
+        .collect::<Vec<_>>();
+    let mentions_all = is_admin && text_mentions_all(content);
+    let mut targets = if mentions_all {
+        group
+            .members
+            .iter()
+            .filter(|member| member.as_str() != source_session_id)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        direct_mentions.clone()
+    };
+    if !is_admin && targets.len() > 1 {
+        targets.truncate(1);
+    }
+    targets.sort();
+    targets.dedup();
+    if targets.is_empty() {
+        return;
+    }
+    let optional_targets = if mentions_all {
+        let forced = direct_mentions.into_iter().collect::<HashSet<_>>();
+        targets
+            .iter()
+            .filter(|target| !forced.contains(*target))
+            .cloned()
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let targets = match prepare_dispatch_targets(
+        state,
+        Some(group_id),
+        targets,
+        if mentions_all {
+            SESSION_CONTROL_MEMBERS_MAX_ITEMS
+        } else {
+            SESSION_CONTROL_TARGETS_MAX_ITEMS
+        },
+    )
+    .await
+    {
+        Ok(targets) => targets,
+        Err(error) => {
+            eprintln!("ERROR: failed to dispatch group mention follow-up: {error}");
+            return;
+        }
+    };
+    let message = group_mention_followup_prompt(source_session_id, content);
+    if let Err(error) = dispatch_to_sessions(
+        state,
+        DispatchRequest {
+            group_id: Some(group_id.to_string()),
+            targets,
+            optional_targets,
+            message,
+            group_message: None,
+            run_mode,
+            wait: false,
+            summary_budget,
+            mention_depth: mention_depth.saturating_add(1),
+        },
+    )
+    .await
+    {
+        eprintln!("ERROR: failed to dispatch group mention follow-up: {error}");
+    }
 }
 
 async fn group_run_is_active(group_id: &str, run_id: &str) -> bool {
@@ -1561,6 +1781,34 @@ async fn group_run_is_active(group_id: &str, run_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// A group websocket event plus whether it may be dropped under backpressure. Producers
+/// declare droppability where the event's meaning is known (instead of the send path
+/// guessing from the payload type), so a new high-frequency event can never silently cancel
+/// slow sockets by being forgotten in a drop list.
+pub(crate) struct GroupClientEvent {
+    pub(crate) payload: Value,
+    pub(crate) droppable: bool,
+}
+
+impl GroupClientEvent {
+    /// Must reach the client; a full channel cancels the slow socket.
+    pub(crate) fn reliable(payload: Value) -> Self {
+        Self {
+            payload,
+            droppable: false,
+        }
+    }
+
+    /// May be dropped when the channel is full because it is also recovered through live
+    /// replay (member live events).
+    pub(crate) fn droppable(payload: Value) -> Self {
+        Self {
+            payload,
+            droppable: true,
+        }
+    }
+}
+
 async fn forward_group_live_event(
     state: &AppState,
     group_id: &str,
@@ -1568,16 +1816,78 @@ async fn forward_group_live_event(
     session_id: &str,
     event: Value,
 ) {
+    // Member live events are high-frequency and recoverable via live replay, so they are
+    // droppable under client backpressure rather than cancelling the slow socket.
     crate::send_group_client_event(
         state,
         group_id,
-        json!({
+        GroupClientEvent::droppable(json!({
             "type": "group_member_event",
             "group_id": group_id,
             "run_id": run_id,
             "session_id": session_id,
             "event": event,
-        }),
+        })),
+    )
+    .await;
+}
+
+/// Resolve the id->display-name map for a group's members and the main owner, preferring
+/// in-memory loaded sessions and only reading persisted session summaries for ids that are
+/// not currently loaded. This keeps the common group broadcast path off the filesystem.
+pub(crate) async fn group_member_name_map(
+    state: &AppState,
+    group: &SessionGroup,
+) -> HashMap<String, String> {
+    let mut names = HashMap::new();
+    let mut needs_disk_fallback = false;
+    {
+        let sessions = state.sessions.lock().await;
+        if let Some(session) = sessions.get(MAIN_SESSION_ID) {
+            names.insert(MAIN_SESSION_ID.to_string(), session.name.clone());
+        } else {
+            needs_disk_fallback = true;
+        }
+        for member in &group.members {
+            if let Some(session) = sessions.get(member) {
+                names.insert(member.clone(), session.name.clone());
+            } else {
+                needs_disk_fallback = true;
+            }
+        }
+    }
+    if needs_disk_fallback {
+        for (id, name) in session_group::saved_session_name_map() {
+            names.entry(id).or_insert(name);
+        }
+    }
+    names
+}
+
+/// Build the full group JSON (for HTTP responses) with member names resolved once.
+pub(crate) async fn group_json(state: &AppState, group: &SessionGroup) -> Value {
+    let names = group_member_name_map(state, group).await;
+    session_group::group_to_json(group, &names)
+}
+
+/// Broadcast a reliable `group` info payload with member names resolved once.
+pub(crate) async fn send_group_info(state: &AppState, group: &SessionGroup) {
+    let names = group_member_name_map(state, group).await;
+    crate::send_group_client_event(
+        state,
+        &group.id,
+        GroupClientEvent::reliable(session_group::group_info_payload(group, &names)),
+    )
+    .await;
+}
+
+/// Broadcast a reliable `group_history` payload with member names resolved once.
+pub(crate) async fn send_group_history(state: &AppState, group_id: &str, group: &SessionGroup) {
+    let names = group_member_name_map(state, group).await;
+    crate::send_group_client_event(
+        state,
+        group_id,
+        GroupClientEvent::reliable(session_group::group_history_payload(group, &names)),
     )
     .await;
 }
@@ -1693,6 +2003,26 @@ async fn run_target_run(
     let stop_requested = Arc::clone(&run.control.stop_requested);
     let lock = session_control_lock(&state, &run.session_id).await;
     let _guard = lock.lock().await;
+    // `delete_session_with_safety_checks` holds this same session-control lock across its
+    // destructive ops, so if a delete completed while this run waited on the lock the target
+    // is gone. Abort instead of recreating it as an orphan via `ensure_session_ready`. This
+    // closes the residual window left after the delete gate's under-lock re-check.
+    let target_exists = state.sessions.lock().await.contains_key(&run.session_id)
+        || session_store::load_session_from_disk(&run.session_id).is_some();
+    if !target_exists {
+        if let Some(group_id) = run.group_id.as_deref() {
+            mark_group_run_failed(
+                state.as_ref(),
+                group_id,
+                &run.run_id,
+                "Target session no longer exists.".to_string(),
+            )
+            .await;
+        } else {
+            update_direct_run_status(&run.run_id, DirectRunStatus::Failed);
+        }
+        return;
+    }
     if let Some(group_id) = run.group_id.as_deref()
         && !group_run_is_active(group_id, &run.run_id).await
     {
@@ -1716,26 +2046,12 @@ async fn run_target_run(
     if run.group_id.is_none() && !direct_run_is_active(&run.run_id) {
         return;
     }
-    if let Some(group_id) = run.group_id.as_deref() {
-        match update_run_status(&state, group_id, &run.run_id, "running", None, None).await {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                clear_group_run_control(&run.run_id);
-                return;
-            }
-            Err(error) => {
-                eprintln!("ERROR: failed to mark group run as running: {error}");
-                clear_group_run_control(&run.run_id);
-                return;
-            }
-        }
-    } else {
-        if !update_direct_run_status(&run.run_id, DirectRunStatus::Running) {
-            return;
-        }
-    }
-
     let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
+    // Acquire the agent-run reservation BEFORE persisting/broadcasting the
+    // queued->running transition. A group's "running" transition both writes to
+    // disk and emits a reliable group_run_status event to every group socket; if
+    // we advertised "running" first and then lost the reservation race we would
+    // broadcast a phantom running->failed for a run that executed zero cycles.
     let reservation = match runtime_loop::try_reserve_agent_run(
         &state,
         &run.session_id,
@@ -1748,6 +2064,8 @@ async fn run_target_run(
         Some(reservation) => reservation,
         None => {
             if let Some(group_id) = run.group_id.as_deref() {
+                // The run is still "queued" here, so this is a direct
+                // queued->failed transition; "running" is never advertised.
                 mark_group_run_failed(
                     state.as_ref(),
                     group_id,
@@ -1762,26 +2080,52 @@ async fn run_target_run(
         }
     };
 
+    if let Some(group_id) = run.group_id.as_deref() {
+        match update_run_status(&state, group_id, &run.run_id, "running", None, None).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                runtime_loop::release_agent_run_reservation(&state, &run.session_id, &reservation)
+                    .await;
+                clear_group_run_control(&run.run_id);
+                return;
+            }
+            Err(error) => {
+                eprintln!("ERROR: failed to mark group run as running: {error}");
+                runtime_loop::release_agent_run_reservation(&state, &run.session_id, &reservation)
+                    .await;
+                clear_group_run_control(&run.run_id);
+                return;
+            }
+        }
+    } else if !update_direct_run_status(&run.run_id, DirectRunStatus::Running) {
+        runtime_loop::release_agent_run_reservation(&state, &run.session_id, &reservation).await;
+        return;
+    }
+
     if release_reserved_run_if_stopped(&state, &run, &reservation, &run_cancel, &stop_requested)
         .await
     {
         return;
     }
 
-    let user_message_index =
-        match append_target_session_message(&state, &run.session_id, prompt).await {
-            Ok(index) => index,
-            Err(error) => {
-                runtime_loop::release_agent_run_reservation(&state, &run.session_id, &reservation)
-                    .await;
-                if let Some(group_id) = run.group_id.as_deref() {
-                    mark_group_run_failed(state.as_ref(), group_id, &run.run_id, error).await;
-                } else {
-                    update_direct_run_status(&run.run_id, DirectRunStatus::Failed);
-                }
-                return;
+    // Capture the delegated user message's content as a stable boundary before it
+    // is moved into the session. We use its identity (not an absolute index) to
+    // locate this run's reply afterwards, so the lookup survives mid-run context
+    // compression that shrinks/re-indexes the message list.
+    let boundary_user_message = prompt.clone();
+    match append_target_session_message(&state, &run.session_id, prompt).await {
+        Ok(_index) => {}
+        Err(error) => {
+            runtime_loop::release_agent_run_reservation(&state, &run.session_id, &reservation)
+                .await;
+            if let Some(group_id) = run.group_id.as_deref() {
+                mark_group_run_failed(state.as_ref(), group_id, &run.run_id, error).await;
+            } else {
+                update_direct_run_status(&run.run_id, DirectRunStatus::Failed);
             }
-        };
+            return;
+        }
+    };
 
     let (live_tx, mut live_rx) = mpsc::channel::<Value>(crate::LIVE_EVENT_CHANNEL_CAPACITY);
     let dispatch_state = Arc::clone(&state);
@@ -1838,16 +2182,20 @@ async fn run_target_run(
         eprintln!("ERROR: delegated live-event dispatcher task failed: {error}");
     }
 
-    let result_excerpt =
-        latest_assistant_excerpt_after(&state, &run.session_id, user_message_index, summary_budget)
-            .await
-            .unwrap_or_else(|| {
-                if outcome.shutting_down {
-                    "Server shutdown before session produced a final response.".to_string()
-                } else {
-                    "Session run finished without assistant text.".to_string()
-                }
-            });
+    let assistant_excerpt = latest_assistant_excerpt_after(
+        &state,
+        &run.session_id,
+        &boundary_user_message,
+        summary_budget,
+    )
+    .await;
+    let result_excerpt = assistant_excerpt.clone().unwrap_or_else(|| {
+        if outcome.shutting_down {
+            "Server shutdown before session produced a final response.".to_string()
+        } else {
+            "Session run finished without assistant text.".to_string()
+        }
+    });
     if let Some(group_id) = run.group_id.as_deref() {
         let (status, error) = if outcome.shutting_down || outcome.run_stopped {
             ("stopped", None)
@@ -1867,14 +2215,43 @@ async fn run_target_run(
         .await
         {
             Ok(Some(_)) => {
-                record_group_session_result(
-                    &state,
-                    group_id,
-                    &run.run_id,
-                    &run.session_id,
-                    result_excerpt,
-                )
-                .await;
+                if group_run_status_records_result(status) {
+                    let recorded = record_group_session_result(
+                        &state,
+                        group_id,
+                        &run.run_id,
+                        &run.session_id,
+                        result_excerpt.clone(),
+                    )
+                    .await;
+                    if recorded {
+                        dispatch_group_mentions_from_session_result(
+                            &state,
+                            group_id,
+                            &run.session_id,
+                            &result_excerpt,
+                            run_mode,
+                            summary_budget,
+                            run.mention_depth,
+                        )
+                        .await;
+                    }
+                } else if status == "failed"
+                    && let Some(output) = assistant_excerpt.as_deref()
+                {
+                    // A failed run may still have produced a useful partial answer.
+                    // Persist that genuine output as a group message (the generic
+                    // failure error is surfaced separately) but do not trigger
+                    // @mention follow-ups for a failed run.
+                    record_group_session_result(
+                        &state,
+                        group_id,
+                        &run.run_id,
+                        &run.session_id,
+                        output.to_string(),
+                    )
+                    .await;
+                }
             }
             Ok(_) => {}
             Err(error) => {
@@ -1944,16 +2321,15 @@ async fn dispatch_to_sessions(
             crate::send_group_client_event(
                 state,
                 group_id,
-                json!({"type":"group_message","group_id": group_id,"message": message}),
+                GroupClientEvent::reliable(json!({
+                    "type": "group_message",
+                    "group_id": group_id,
+                    "message": message,
+                })),
             )
             .await;
             if let Some(group) = session_group::load_group_from_disk(group_id) {
-                crate::send_group_client_event(
-                    state,
-                    group_id,
-                    session_group::group_history_payload(&group),
-                )
-                .await;
+                send_group_history(state, group_id, &group).await;
             }
         }
         for group_run in group_runs {
@@ -1965,16 +2341,21 @@ async fn dispatch_to_sessions(
             crate::send_group_client_event(
                 state,
                 group_id,
-                json!({
+                GroupClientEvent::reliable(json!({
                     "type": "group_run_started",
                     "group_id": group_id,
                     "run": group_run,
-                }),
+                })),
             )
             .await;
             runs.push(StartedRun {
                 run_id: group_run.id,
                 group_id: Some(group_id.to_string()),
+                optional_reply: target_set_contains_session(
+                    &request.optional_targets,
+                    &group_run.session_id,
+                ),
+                mention_depth: request.mention_depth,
                 session_id: group_run.session_id,
                 control,
             });
@@ -1990,6 +2371,8 @@ async fn dispatch_to_sessions(
             StartedRun {
                 run_id,
                 group_id: None,
+                optional_reply: false,
+                mention_depth: 0,
                 session_id,
                 control,
             }
@@ -2000,17 +2383,18 @@ async fn dispatch_to_sessions(
         .group_id
         .as_deref()
         .map(|group_id| target_group_context(group_id, request.summary_budget));
-    let prompt = target_prompt(
-        request.group_id.as_deref(),
-        &request.message,
-        group_context.as_deref(),
-    );
 
     for run in runs.clone() {
+        let prompt = target_prompt(
+            request.group_id.as_deref(),
+            &request.message,
+            group_context.as_deref(),
+            run.optional_reply,
+        );
         spawn_target_run(
             Arc::clone(state),
             run,
-            prompt.clone(),
+            prompt,
             request.run_mode,
             request.summary_budget,
         );
@@ -2082,6 +2466,7 @@ pub(crate) async fn handle_group_socket_message(
     validate_message_len(&text)?;
     let group = session_group::load_group_from_disk(group_id)
         .ok_or_else(|| format!("Group '{}' not found", group_id))?;
+    let mut optional_targets = HashSet::new();
     let dispatch_targets = if payload.start_runs {
         if payload.target_mode == "selected"
             && payload.targets.len() > SESSION_CONTROL_TARGETS_MAX_ITEMS
@@ -2091,9 +2476,12 @@ pub(crate) async fn handle_group_socket_message(
                 SESSION_CONTROL_TARGETS_MAX_ITEMS
             ));
         }
+        let direct_mentions = mentions_from_text(&text, &group.members);
+        let mentions_all = text_mentions_all(&text);
         let targets = match payload.target_mode.as_str() {
             "selected" => normalize_target_ids(payload.targets),
-            "mentions" => mentions_from_text(&text, &group.members),
+            "mentions" if mentions_all => group.members.clone(),
+            "mentions" => direct_mentions.clone(),
             "all" | "" => group.members.clone(),
             other => {
                 return Err(format!(
@@ -2104,6 +2492,19 @@ pub(crate) async fn handle_group_socket_message(
         };
         if payload.target_mode == "mentions" && targets.is_empty() {
             return Err("No valid @session-id mentions were found.".to_string());
+        }
+        // Optional replies (a member may answer NO_REPLY without persisting a group
+        // message) apply only to the `@all` overflow: members covered by an `@all`
+        // mention but not directly `@session-id`'d. A plain "all"/"selected" broadcast
+        // — or a stray "@all" in a non-mentions message — must still require every
+        // dispatched target to reply.
+        if payload.target_mode == "mentions" && mentions_all {
+            let forced = direct_mentions.into_iter().collect::<HashSet<_>>();
+            optional_targets = targets
+                .iter()
+                .filter(|target| !forced.contains(*target))
+                .cloned()
+                .collect();
         }
         let max_targets = if payload.target_mode == "selected" {
             SESSION_CONTROL_TARGETS_MAX_ITEMS
@@ -2131,6 +2532,7 @@ pub(crate) async fn handle_group_socket_message(
             DispatchRequest {
                 group_id: Some(group_id.to_string()),
                 targets,
+                optional_targets,
                 message: text,
                 group_message: Some(DispatchGroupMessage {
                     role: "user".to_string(),
@@ -2140,6 +2542,7 @@ pub(crate) async fn handle_group_socket_message(
                 run_mode,
                 wait: false,
                 summary_budget: 4_000,
+                mention_depth: 0,
             },
         )
         .await?;
@@ -2159,16 +2562,18 @@ pub(crate) async fn handle_group_socket_message(
         crate::send_group_client_event(
             state,
             group_id,
-            json!({"type":"group_message","group_id": group_id,"message": message}),
+            GroupClientEvent::reliable(json!({
+                "type": "group_message",
+                "group_id": group_id,
+                "message": message,
+            })),
         )
         .await;
-        crate::send_group_client_event(
+        send_group_history(
             state,
             group_id,
-            session_group::group_history_payload(
-                &session_group::load_group_from_disk(group_id)
-                    .ok_or_else(|| format!("Group '{}' not found", group_id))?,
-            ),
+            &session_group::load_group_from_disk(group_id)
+                .ok_or_else(|| format!("Group '{}' not found", group_id))?,
         )
         .await;
     }
@@ -2675,13 +3080,8 @@ fn redact_profile_persisted_text(value: &str) -> String {
 }
 
 fn profile_secret_value_continuation(line: &str) -> Option<SecretValueContinuation> {
-    let trimmed = line
-        .trim()
-        .trim_start_matches(|ch| matches!(ch, '-' | '*'))
-        .trim();
-    let Some((key, value)) = trimmed.split_once(':') else {
-        return None;
-    };
+    let trimmed = line.trim().trim_start_matches(['-', '*']).trim();
+    let (key, value) = trimmed.split_once(':')?;
     let value = value.trim();
     if !is_profile_secret_key(key.trim()) {
         return None;
@@ -2948,7 +3348,7 @@ async fn create_session_from_tool(state: &Arc<AppState>, args: &Value) -> Result
 
     let config = state.config();
     let model = session.effective_model(&config.model).to_string();
-    let sys = crate::build_system_prompt(
+    let sys = crate::prompts::build_system_prompt(
         &config,
         &session.workspace,
         &model,
@@ -3044,6 +3444,620 @@ fn validate_message_len(message: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Shared `/delete` safety model and deletion routine used by both the `/delete` slash
+/// command (`handle_delete_command` in `commands.rs`) and `session_control.delete_session`.
+/// Rejects the caller's own session, the main session, an active connected session, a
+/// running session, or any session with active/queued delegated work (direct runs,
+/// in-flight group runs, or saved group runs), then removes the persisted JSON and the
+/// default workspace directory. Returns the success message; callers are responsible for
+/// broadcasting the updated session list.
+pub(crate) async fn delete_session_with_safety_checks(
+    state: &AppState,
+    target: &str,
+    reject_current: Option<&str>,
+) -> Result<String, String> {
+    let target_session_id = runtime_loop::resolve_session_target_for_delete(state, target).await?;
+    if let Some(current) = reject_current
+        && target_session_id == current
+    {
+        return Err("Cannot delete the current session.".to_string());
+    }
+    if crate::is_main(&target_session_id) {
+        return Err("Cannot delete the default main session.".to_string());
+    }
+    if state
+        .active_connections
+        .lock()
+        .await
+        .contains_key(&target_session_id)
+    {
+        return Err(format!("Cannot delete active session: {target_session_id}"));
+    }
+    if state
+        .active_runs
+        .lock()
+        .await
+        .contains_key(&target_session_id)
+    {
+        return Err(format!(
+            "Cannot delete running session: {target_session_id}"
+        ));
+    }
+    if session_has_active_delegated_work(&target_session_id) {
+        return Err(format!(
+            "Cannot delete running session: {target_session_id}"
+        ));
+    }
+
+    // Hold the target's session-control lock across the final delegated-work re-check
+    // and the destructive operations. `run_target_run` takes this same lock before it
+    // writes an orphan session JSON via `append_target_session_message`, so serializing
+    // here closes the TOCTOU window where a group/direct dispatch registers a run after
+    // the checks above pass. Lock order matches `run_target_run` (session_control_lock
+    // first, group_persist_gate later), so the group prune below cannot deadlock.
+    let target_lock = session_control_lock(state, &target_session_id).await;
+    let _target_guard = target_lock.lock().await;
+    // Re-check under the lock: a run that started between the initial checks and
+    // acquiring the lock is now visible (its queued/running state is registered).
+    if state
+        .active_runs
+        .lock()
+        .await
+        .contains_key(&target_session_id)
+    {
+        return Err(format!(
+            "Cannot delete running session: {target_session_id}"
+        ));
+    }
+    if session_has_active_delegated_work(&target_session_id) {
+        return Err(format!(
+            "Cannot delete running session: {target_session_id}"
+        ));
+    }
+
+    let session_file = session_store::sessions_dir().join(format!("{target_session_id}.json"));
+    let workspace_root = crate::session_workspace_path(&target_session_id)
+        .parent()
+        .map(|path| path.to_path_buf());
+    // Remove the persisted JSON and the in-memory entry before the workspace directory.
+    // The session list is built from saved JSON files plus the in-memory map, so doing
+    // this first means a later workspace-removal failure can no longer leave a session
+    // that is still listed but has no workspace; at worst an orphan workspace dir remains.
+    match tokio::fs::try_exists(&session_file).await {
+        Ok(true) => tokio::fs::remove_file(&session_file)
+            .await
+            .map_err(|error| {
+                format!("Failed to delete session file for {target_session_id}: {error}")
+            })?,
+        Ok(false) => {}
+        Err(error) => return Err(format!("Failed to inspect session file: {error}")),
+    }
+    let removed = {
+        let mut sessions = state.sessions.lock().await;
+        sessions.remove(&target_session_id).is_some()
+    };
+    // The session is now unlisted (JSON + in-memory entry gone), so prune it from every
+    // saved group before the workspace step. Doing this here (rather than after) means a
+    // workspace-removal failure that returns early still cannot leave a ghost group member
+    // that fails `all`/`@member` dispatch resolution or shows as a phantom in member lists.
+    prune_session_from_all_groups(state, &target_session_id).await;
+    if let Some(workspace_root) = workspace_root {
+        match tokio::fs::try_exists(&workspace_root).await {
+            Ok(true) => tokio::fs::remove_dir_all(&workspace_root)
+                .await
+                .map_err(|error| {
+                    format!("Failed to delete session workspace for {target_session_id}: {error}")
+                })?,
+            Ok(false) => {}
+            Err(error) => return Err(format!("Failed to inspect session workspace: {error}")),
+        }
+    }
+    Ok(if removed {
+        format!("Deleted session: {target_session_id}")
+    } else {
+        format!("Deleted saved session: {target_session_id}")
+    })
+}
+
+/// True when the session has active or queued delegated work that must be stopped before
+/// the session can be safely deleted: an active direct run, an in-flight group run, or a
+/// queued/running run recorded in a saved group on disk.
+fn session_has_active_delegated_work(session_id: &str) -> bool {
+    direct_run_status_for_session(session_id).is_some_and(DirectRunStatus::is_active)
+        || active_group_run_statuses_by_session()
+            .get(session_id)
+            // "unknown" means a control entry exists but the group file could not be read;
+            // treat it as active so a likely in-flight run is not deleted out from under.
+            .is_some_and(|status| matches!(status.as_str(), "queued" | "running" | "unknown"))
+        || saved_group_has_active_run_for_session(session_id)
+}
+
+async fn delete_session_from_control(
+    state: &AppState,
+    target_session_id: &str,
+) -> Result<String, String> {
+    if crate::is_main(session_store::validate_session_id(target_session_id)?) {
+        return Err("session_control error: cannot delete the main session.".to_string());
+    }
+    let message = delete_session_with_safety_checks(state, target_session_id, None).await?;
+    crate::broadcast_session_list_payload(state).await;
+    Ok(message)
+}
+
+pub(crate) async fn delete_group_from_control(
+    state: &AppState,
+    group_id: &str,
+) -> Result<String, String> {
+    let group_id = session_group::validate_group_id(group_id)?.to_string();
+    let gate = session_group::group_persist_gate(&group_id);
+    let _guard = gate.lock().await;
+    let group = session_group::load_group_from_disk(&group_id)
+        .ok_or_else(|| format!("Group '{}' not found", group_id))?;
+    if session_group::group_has_active_runs(&group) {
+        return Err(format!(
+            "Group '{}' has queued or running session runs. Stop them before deleting the group.",
+            group_id
+        ));
+    }
+    session_group::delete_group_from_disk_locked(&group_id).await?;
+    crate::close_group_client(state, &group_id).await;
+    crate::broadcast_group_list_payload(state).await;
+    Ok(format!("Deleted group: {group_id}"))
+}
+
+fn group_admin_vote_threshold(admin_count: usize) -> usize {
+    (admin_count * 2).div_ceil(3)
+}
+
+fn stop_active_group_runs_for_member(
+    group: &mut SessionGroup,
+    target_session_id: &str,
+    now: u64,
+    run_ids: &mut Vec<String>,
+    updated_runs: &mut Vec<GroupRun>,
+) {
+    for run in &mut group.runs {
+        if run.session_id == target_session_id
+            && session_group::is_active_group_run_status(&run.status)
+            && let Some(updated) =
+                apply_group_run_status_transition(run, "stopped", None, None, now)
+        {
+            run_ids.push(updated.id.clone());
+            updated_runs.push(updated);
+        }
+    }
+}
+
+fn apply_group_member_removal_locked(
+    group: &mut SessionGroup,
+    target_session_id: &str,
+    now: u64,
+    run_ids: &mut Vec<String>,
+    updated_runs: &mut Vec<GroupRun>,
+) -> bool {
+    if !group
+        .members
+        .iter()
+        .any(|member| member == target_session_id)
+    {
+        return false;
+    }
+    stop_active_group_runs_for_member(group, target_session_id, now, run_ids, updated_runs);
+    remove_member_from_group(group, target_session_id);
+    true
+}
+
+fn reconcile_pending_group_votes_locked(
+    group: &mut SessionGroup,
+    now: u64,
+    run_ids: &mut Vec<String>,
+    updated_runs: &mut Vec<GroupRun>,
+) -> Vec<String> {
+    let mut removed = Vec::new();
+    // Capture the approval threshold once for the whole settlement pass. Removing an
+    // admin-target inside the loop shrinks `group.admins`; recomputing the threshold
+    // each iteration would retroactively lower the bar for other pending votes that
+    // were cast under the original (larger) admin count, removing a member who never
+    // reached the required 2/3-of-admins approval.
+    session_group::normalize_group(group);
+    let threshold = group_admin_vote_threshold(group.admins.len()).max(1);
+    loop {
+        session_group::normalize_group(group);
+        let member_set = group.members.iter().cloned().collect::<HashSet<_>>();
+        let admins = group.admins.clone();
+        let mut achieved = Vec::new();
+        let mut retained = Vec::new();
+        for mut vote in std::mem::take(&mut group.pending_votes) {
+            if vote.action != "remove_member" || !member_set.contains(&vote.target_session_id) {
+                continue;
+            }
+            vote.approvals = session_group::normalize_vote_approvals(vote.approvals, &admins);
+            if vote.approvals.is_empty() {
+                continue;
+            }
+            vote.threshold = threshold;
+            vote.updated_at = now;
+            if vote.approvals.len() >= vote.threshold {
+                if !achieved
+                    .iter()
+                    .any(|target| target == &vote.target_session_id)
+                {
+                    achieved.push(vote.target_session_id);
+                }
+            } else {
+                retained.push(vote);
+            }
+        }
+        group.pending_votes = retained;
+        if achieved.is_empty() {
+            break;
+        }
+        for target in achieved {
+            if apply_group_member_removal_locked(group, &target, now, run_ids, updated_runs) {
+                removed.push(target);
+            }
+        }
+    }
+    removed
+}
+
+pub(crate) async fn promote_group_admin_from_control(
+    state: &AppState,
+    group_id: &str,
+    target_session_id: &str,
+) -> Result<(String, SessionGroup), String> {
+    let target_session_id = session_store::validate_session_id(target_session_id)?.to_string();
+    if crate::is_main(&target_session_id) {
+        return Err("session_control error: main is already the group owner.".to_string());
+    }
+    let group_id = session_group::validate_group_id(group_id)?.to_string();
+    let (run_ids, updated_runs, group) = {
+        let gate = session_group::group_persist_gate(&group_id);
+        let _guard = gate.lock().await;
+        let mut group = session_group::load_group_from_disk(&group_id)
+            .ok_or_else(|| format!("Group '{}' not found", group_id))?;
+        if !group
+            .members
+            .iter()
+            .any(|member| member == &target_session_id)
+        {
+            return Err(format!(
+                "Target session '{}' is not a member of group {}.",
+                target_session_id, group_id
+            ));
+        }
+        if !group.admins.iter().any(|admin| admin == &target_session_id) {
+            group.admins.push(target_session_id.clone());
+            group.admins =
+                session_group::normalize_admins(std::mem::take(&mut group.admins), &group.members);
+        }
+        let now = now_epoch();
+        let mut run_ids = Vec::new();
+        let mut updated_runs = Vec::new();
+        reconcile_pending_group_votes_locked(&mut group, now, &mut run_ids, &mut updated_runs);
+        group.updated_at = now;
+        session_group::save_group_to_disk_locked(&group).await?;
+        (run_ids, updated_runs, group)
+    };
+    stop_group_run_controls(&group_id, &run_ids);
+    for run in &updated_runs {
+        emit_group_run_status_events(state, &group_id, run).await;
+    }
+    send_group_info(state, &group).await;
+    crate::broadcast_group_list_payload(state).await;
+    Ok((
+        format!(
+            "Promoted {} to group admin in {}.",
+            target_session_id, group_id
+        ),
+        group,
+    ))
+}
+
+fn remove_member_from_group(group: &mut SessionGroup, target_session_id: &str) {
+    group.members.retain(|member| member != target_session_id);
+    group.admins.retain(|admin| admin != target_session_id);
+    group
+        .pending_votes
+        .retain(|vote| vote.target_session_id != target_session_id);
+}
+
+/// Remove a now-deleted session id from every saved group's members/admins/pending_votes
+/// so it cannot become a ghost member. Each group is mutated under its own persist gate via
+/// `mutate_group_result`; groups that fail to load or no longer reference the id are left
+/// untouched. Failures are logged, never propagated: the session is already deleted and a
+/// stale group reference must not turn a successful delete into an error.
+async fn prune_session_from_all_groups(state: &AppState, deleted_session_id: &str) {
+    // `main` is never a group member and is never deletable, so this only runs for workers.
+    let mut pruned_any = false;
+    for summary in session_group::list_saved_group_summaries() {
+        if summary.corrupt {
+            continue;
+        }
+        // Cheap pre-filter: only touch (and re-save) groups that actually reference the id.
+        let references = session_group::load_group_from_disk(&summary.id).is_some_and(|group| {
+            group.members.iter().any(|m| m == deleted_session_id)
+                || group.admins.iter().any(|a| a == deleted_session_id)
+                || group
+                    .pending_votes
+                    .iter()
+                    .any(|vote| vote.target_session_id == deleted_session_id)
+        });
+        if !references {
+            continue;
+        }
+        match mutate_group_result(&summary.id, |group| {
+            remove_member_from_group(group, deleted_session_id);
+            session_group::normalize_group(group);
+            Ok::<(), String>(())
+        })
+        .await
+        {
+            Ok((group, ())) => {
+                send_group_info(state, &group).await;
+                pruned_any = true;
+            }
+            Err(error) => {
+                eprintln!(
+                    "WARN: failed to prune deleted session {deleted_session_id} from group {}: {error}",
+                    summary.id
+                );
+            }
+        }
+    }
+    // Only refresh the group list when something actually changed, so a delete that
+    // touches no group emits no spurious broadcast.
+    if pruned_any {
+        crate::broadcast_group_list_payload(state).await;
+    }
+}
+
+pub(crate) async fn remove_group_member_direct(
+    state: &AppState,
+    group_id: &str,
+    target_session_id: &str,
+) -> Result<(String, SessionGroup), String> {
+    let target_session_id = session_store::validate_session_id(target_session_id)?.to_string();
+    if crate::is_main(&target_session_id) {
+        return Err("session_control error: cannot remove the main group owner.".to_string());
+    }
+    let group_id = session_group::validate_group_id(group_id)?.to_string();
+    let (run_ids, updated_runs, group) = {
+        let gate = session_group::group_persist_gate(&group_id);
+        let _guard = gate.lock().await;
+        let mut group = session_group::load_group_from_disk(&group_id)
+            .ok_or_else(|| format!("Group '{}' not found", group_id))?;
+        if !group
+            .members
+            .iter()
+            .any(|member| member == &target_session_id)
+        {
+            return Err(format!(
+                "Target session '{}' is not a member of group {}.",
+                target_session_id, group_id
+            ));
+        }
+        let now = now_epoch();
+        let mut run_ids = Vec::new();
+        let mut updated_runs = Vec::new();
+        apply_group_member_removal_locked(
+            &mut group,
+            &target_session_id,
+            now,
+            &mut run_ids,
+            &mut updated_runs,
+        );
+        reconcile_pending_group_votes_locked(&mut group, now, &mut run_ids, &mut updated_runs);
+        group.updated_at = now;
+        session_group::save_group_to_disk_locked(&group).await?;
+        (run_ids, updated_runs, group)
+    };
+    stop_group_run_controls(&group_id, &run_ids);
+    for run in &updated_runs {
+        emit_group_run_status_events(state, &group_id, run).await;
+    }
+    send_group_info(state, &group).await;
+    crate::send_group_client_event(
+        state,
+        &group.id,
+        GroupClientEvent::reliable(json!({
+            "type":"system",
+            "content": format!("Removed {target_session_id} from group {group_id}."),
+            "dismissible": true
+        })),
+    )
+    .await;
+    crate::broadcast_group_list_payload(state).await;
+    Ok((
+        format!("Removed {} from group {}.", target_session_id, group_id),
+        group,
+    ))
+}
+
+async fn request_group_member_removal_vote(
+    state: &AppState,
+    group_id: &str,
+    requester_session_id: &str,
+    target_session_id: &str,
+) -> Result<String, String> {
+    let requester_session_id =
+        session_store::validate_session_id(requester_session_id)?.to_string();
+    let target_session_id = session_store::validate_session_id(target_session_id)?.to_string();
+    if crate::is_main(&target_session_id) {
+        return Err("session_control error: cannot remove the main group owner.".to_string());
+    }
+    let group_id = session_group::validate_group_id(group_id)?.to_string();
+    let mut removed_by_vote = false;
+    let mut approval_count: usize;
+    let mut threshold_count: usize;
+    let (run_ids, updated_runs, group) = {
+        let gate = session_group::group_persist_gate(&group_id);
+        let _guard = gate.lock().await;
+        let mut group = session_group::load_group_from_disk(&group_id)
+            .ok_or_else(|| format!("Group '{}' not found", group_id))?;
+        if !group
+            .admins
+            .iter()
+            .any(|admin| admin == &requester_session_id)
+        {
+            return Err(format!(
+                "Requester '{}' is not a promoted admin of group {}.",
+                requester_session_id, group_id
+            ));
+        }
+        if !group
+            .members
+            .iter()
+            .any(|member| member == &target_session_id)
+        {
+            return Err(format!(
+                "Target session '{}' is not a member of group {}.",
+                target_session_id, group_id
+            ));
+        }
+        let threshold = group_admin_vote_threshold(group.admins.len()).max(1);
+        threshold_count = threshold;
+        let now = now_epoch();
+        let mut run_ids = Vec::new();
+        let mut updated_runs = Vec::new();
+        if threshold <= 1 {
+            approval_count = 1;
+            removed_by_vote = apply_group_member_removal_locked(
+                &mut group,
+                &target_session_id,
+                now,
+                &mut run_ids,
+                &mut updated_runs,
+            );
+            // The unconditional reconcile after this if/else (below) settles any
+            // remaining pending votes for every branch, so a second call here is
+            // redundant: the direct removal already set `removed_by_vote`.
+        } else if let Some(vote) = group.pending_votes.iter_mut().find(|vote| {
+            vote.action == "remove_member" && vote.target_session_id == target_session_id
+        }) {
+            vote.threshold = threshold;
+            if !vote
+                .approvals
+                .iter()
+                .any(|approval| approval == &requester_session_id)
+            {
+                vote.approvals.push(requester_session_id.clone());
+            }
+            vote.updated_at = now;
+            approval_count = vote.approvals.len();
+        } else {
+            let vote_id = next_id("gvote");
+            group.pending_votes.push(session_group::GroupVote {
+                id: vote_id,
+                action: "remove_member".to_string(),
+                target_session_id: target_session_id.clone(),
+                requester_session_id: requester_session_id.clone(),
+                approvals: vec![requester_session_id.clone()],
+                threshold,
+                created_at: now,
+                updated_at: now,
+            });
+            approval_count = 1;
+        }
+        let removed =
+            reconcile_pending_group_votes_locked(&mut group, now, &mut run_ids, &mut updated_runs);
+        removed_by_vote =
+            removed_by_vote || removed.iter().any(|target| target == &target_session_id);
+        if !removed_by_vote
+            && let Some(vote) = group.pending_votes.iter().find(|vote| {
+                vote.action == "remove_member" && vote.target_session_id == target_session_id
+            })
+        {
+            approval_count = vote.approvals.len();
+            threshold_count = vote.threshold;
+        }
+        group.updated_at = now;
+        session_group::save_group_to_disk_locked(&group).await?;
+        Ok::<_, String>((run_ids, updated_runs, group))
+    }?;
+    stop_group_run_controls(&group_id, &run_ids);
+    for run in &updated_runs {
+        emit_group_run_status_events(state, &group_id, run).await;
+    }
+    if removed_by_vote {
+        send_group_info(state, &group).await;
+        crate::send_group_client_event(
+            state,
+            &group.id,
+            GroupClientEvent::reliable(json!({
+                "type":"system",
+                "content": format!("Removed {target_session_id} from group {group_id}."),
+                "dismissible": true
+            })),
+        )
+        .await;
+        crate::broadcast_group_list_payload(state).await;
+        return Ok(format!(
+            "Removed {} from group {}.",
+            target_session_id, group_id
+        ));
+    }
+    send_group_info(state, &group).await;
+    crate::send_group_client_event(
+        state,
+        &group.id,
+        GroupClientEvent::reliable(json!({
+            "type":"system",
+            "content": format!(
+                "Removal vote for {} has {}/{} promoted admin approval(s).",
+                target_session_id, approval_count, threshold_count
+            ),
+            "dismissible": true
+        })),
+    )
+    .await;
+    Ok(format!(
+        "Removal vote opened for {} in group {}.",
+        target_session_id, group_id
+    ))
+}
+
+async fn delete_session_from_tool(state: &AppState, args: &Value) -> Result<String, String> {
+    let target = tool_args_string(args, "target")
+        .or_else(|| tool_args_string(args, "session_id"))
+        .ok_or_else(|| "session_control error: target is required".to_string())?;
+    delete_session_from_control(state, &target).await
+}
+
+async fn delete_group_from_tool(state: &AppState, args: &Value) -> Result<String, String> {
+    let group_id = tool_args_string(args, "group_id")
+        .ok_or_else(|| "session_control error: group_id is required".to_string())?;
+    delete_group_from_control(state, &group_id).await
+}
+
+async fn promote_group_admin_from_tool(state: &AppState, args: &Value) -> Result<String, String> {
+    let group_id = tool_args_string(args, "group_id")
+        .ok_or_else(|| "session_control error: group_id is required".to_string())?;
+    let target = tool_args_string(args, "target")
+        .or_else(|| tool_args_string(args, "session_id"))
+        .ok_or_else(|| "session_control error: target is required".to_string())?;
+    promote_group_admin_from_control(state, &group_id, &target)
+        .await
+        .map(|(message, _group)| message)
+}
+
+async fn remove_group_member_from_tool(state: &AppState, args: &Value) -> Result<String, String> {
+    let group_id = tool_args_string(args, "group_id")
+        .ok_or_else(|| "session_control error: group_id is required".to_string())?;
+    let target = tool_args_string(args, "target")
+        .or_else(|| tool_args_string(args, "session_id"))
+        .ok_or_else(|| "session_control error: target is required".to_string())?;
+    let requester = tool_args_string(args, "requester_session_id")
+        .unwrap_or_else(|| MAIN_SESSION_ID.to_string());
+    if crate::is_main(&requester) {
+        remove_group_member_direct(state, &group_id, &target)
+            .await
+            .map(|(message, _group)| message)
+    } else {
+        request_group_member_removal_vote(state, &group_id, &requester, &target).await
+    }
+}
+
 async fn create_group_from_tool(state: &AppState, args: &Value) -> Result<String, String> {
     validate_tool_array_len(args, "members", SESSION_CONTROL_MEMBERS_MAX_ITEMS)?;
     let group_id = session_group::generate_available_group_id()?;
@@ -3078,14 +4092,16 @@ async fn update_group_from_tool(state: &AppState, args: &Value) -> Result<String
             group.name = name;
         }
         if let Some(members) = members {
-            group.members = session_group::normalize_members(members);
+            // normalize_group re-normalizes members, filters admins to the new member
+            // set, and prunes stale votes, so one normalize pass is sufficient.
+            group.members = members;
+            session_group::normalize_group(group);
         }
         group.clone()
     })
     .await?
     .1;
-    crate::send_group_client_event(state, &group.id, session_group::group_info_payload(&group))
-        .await;
+    send_group_info(state, &group).await;
     crate::broadcast_group_list_payload(state).await;
     Ok(format!(
         "Updated group {} ({}) with {} member(s).",
@@ -3107,7 +4123,11 @@ async fn post_group_message_from_tool(state: &AppState, args: &Value) -> Result<
     crate::send_group_client_event(
         state,
         &group_id,
-        json!({"type":"group_message","group_id": group_id,"message": msg}),
+        GroupClientEvent::reliable(json!({
+            "type": "group_message",
+            "group_id": group_id,
+            "message": msg,
+        })),
     )
     .await;
     crate::broadcast_group_list_payload(state).await;
@@ -3148,11 +4168,13 @@ async fn dispatch_from_tool(state: &Arc<AppState>, args: &Value) -> Result<Strin
         DispatchRequest {
             group_id,
             targets,
+            optional_targets: HashSet::new(),
             message,
             group_message,
             run_mode,
             wait,
             summary_budget,
+            mention_depth: 0,
         },
     )
     .await?;
@@ -3245,7 +4267,7 @@ pub(crate) async fn execute_session_control_tool(
     current_session_id: &str,
     args_str: &str,
 ) -> crate::tools::ToolOutcome {
-    if current_session_id != MAIN_SESSION_ID {
+    if !crate::is_main(current_session_id) {
         return crate::tools::ToolOutcome {
             output: "session_control error: this tool is only available in the main session."
                 .to_string(),
@@ -3273,10 +4295,14 @@ pub(crate) async fn execute_session_control_tool(
     let result = match action {
         "list_sessions" => Ok(session_list_output(state).await),
         "create_session" => create_session_from_tool(state, &args).await,
+        "delete_session" => delete_session_from_tool(state, &args).await,
         "describe_session" => describe_session_from_tool(state, &args).await,
         "list_groups" => Ok(group_list_output()),
         "create_group" => create_group_from_tool(state, &args).await,
         "update_group" => update_group_from_tool(state, &args).await,
+        "delete_group" => delete_group_from_tool(state, &args).await,
+        "promote_group_admin" => promote_group_admin_from_tool(state, &args).await,
+        "remove_group_member" => remove_group_member_from_tool(state, &args).await,
         "post_group_message" => post_group_message_from_tool(state, &args).await,
         "dispatch" => dispatch_from_tool(state, &args).await,
         "collect" => {
@@ -3301,6 +4327,262 @@ pub(crate) async fn execute_session_control_tool(
         duration_ms: started.elapsed().as_millis() as u64,
         subagent_snapshot: None,
     }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct GroupQuery {
+    #[serde(default)]
+    pub(crate) group: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct GroupMemberQuery {
+    #[serde(default)]
+    pub(crate) group: Option<String>,
+    #[serde(default)]
+    pub(crate) session: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct SessionGroupRequest {
+    #[serde(default)]
+    pub(crate) name: Option<String>,
+    /// Absent (`None`) means "leave members unchanged" on update. A name-only
+    /// PUT must not wipe the existing roster, so this is `Option` rather than a
+    /// bare `Vec` that would default to empty.
+    #[serde(default)]
+    pub(crate) members: Option<Vec<String>>,
+}
+
+pub(crate) async fn api_session_groups(
+    State(_state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    Json(json!({
+        "groups": session_group::list_saved_group_summaries()
+            .into_iter()
+            .map(|summary| summary.to_json())
+            .collect::<Vec<_>>()
+    }))
+}
+
+async fn generate_available_group_id() -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    session_group::generate_available_group_id().map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error })),
+        )
+    })
+}
+
+pub(crate) async fn api_post_session_group(
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SessionGroupRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::validate_local_request_headers(&headers)?;
+
+    let group_id = generate_available_group_id().await?;
+    let name = match request.name.as_deref() {
+        Some(name) => session_group::validate_group_name(name)
+            .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?,
+        None => format!("Group {group_id}"),
+    };
+    let group =
+        session_group::SessionGroup::new(&group_id, &name, request.members.unwrap_or_default());
+    let gate = session_group::group_persist_gate(&group_id);
+    let _guard = gate.lock().await;
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to save group: {error}") })),
+            )
+        })?;
+
+    crate::broadcast_group_list_payload(&state).await;
+    Ok(Json(json!({
+        "ok": true,
+        "group": session_group::SessionGroupSummary::from_group(&group).to_json(),
+    })))
+}
+
+pub(crate) async fn api_get_session_group(
+    Query(query): Query<GroupQuery>,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let group_id = query.group.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Missing group id" })),
+        )
+    })?;
+    let group_id = session_group::validate_group_id(group_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    let group = session_group::load_group_from_disk(group_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Group '{}' not found", group_id) })),
+        )
+    })?;
+    Ok(Json(json!({"group": group_json(&state, &group).await})))
+}
+
+pub(crate) async fn api_put_session_group(
+    Query(query): Query<GroupQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SessionGroupRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::validate_local_request_headers(&headers)?;
+
+    let group_id = query.group.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Missing group id" })),
+        )
+    })?;
+    let group_id = session_group::validate_group_id(group_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?
+        .to_string();
+    let gate = session_group::group_persist_gate(&group_id);
+    let _guard = gate.lock().await;
+    let mut group = session_group::load_group_from_disk(&group_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Group '{}' not found", group_id) })),
+        )
+    })?;
+    if let Some(name) = request.name.as_deref() {
+        group.name = session_group::validate_group_name(name)
+            .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    }
+    // A name-only PUT (members omitted) must preserve the existing roster, so we
+    // only replace members when the request actually supplies them. normalize_group
+    // re-normalizes members, filters admins to the member set, prunes stale votes,
+    // and bumps the version; it is idempotent on the already-normalized members we
+    // loaded from disk, so running it once is sufficient either way.
+    if let Some(members) = request.members {
+        group.members = members;
+    }
+    session_group::normalize_group(&mut group);
+    group.updated_at = now_epoch();
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to save group: {error}") })),
+            )
+        })?;
+
+    send_group_info(&state, &group).await;
+    crate::broadcast_group_list_payload(&state).await;
+    Ok(Json(json!({
+        "ok": true,
+        "group": session_group::SessionGroupSummary::from_group(&group).to_json(),
+    })))
+}
+
+pub(crate) async fn api_delete_session_group(
+    Query(query): Query<GroupQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::validate_local_request_headers(&headers)?;
+
+    let group_id = query.group.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Missing group id" })),
+        )
+    })?;
+    let group_id = session_group::validate_group_id(group_id)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?
+        .to_string();
+    let gate = session_group::group_persist_gate(&group_id);
+    let _guard = gate.lock().await;
+    let group = session_group::load_group_from_disk(&group_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("Group '{}' not found", group_id) })),
+        )
+    })?;
+    if session_group::group_has_active_runs(&group) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!(
+                    "Group '{}' has queued or running session runs. Stop them before deleting the group.",
+                    group_id
+                )
+            })),
+        ));
+    }
+    session_group::delete_group_from_disk_locked(&group_id)
+        .await
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Failed to delete group: {error}") })),
+            )
+        })?;
+    crate::close_group_client(&state, &group_id).await;
+    crate::broadcast_group_list_payload(&state).await;
+    Ok(Json(json!({"ok": true, "group_id": group_id})))
+}
+
+pub(crate) async fn api_promote_session_group_admin(
+    Query(query): Query<GroupMemberQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::validate_local_request_headers(&headers)?;
+    let group_id = query.group.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Missing group id" })),
+        )
+    })?;
+    let session_id = query.session.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Missing session id" })),
+        )
+    })?;
+    let (_, group) = promote_group_admin_from_control(&state, group_id, session_id)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    Ok(Json(
+        json!({"ok": true, "group": group_json(&state, &group).await}),
+    ))
+}
+
+pub(crate) async fn api_delete_session_group_member(
+    Query(query): Query<GroupMemberQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    crate::validate_local_request_headers(&headers)?;
+    let group_id = query.group.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Missing group id" })),
+        )
+    })?;
+    let session_id = query.session.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Missing session id" })),
+        )
+    })?;
+    let (_, group) = remove_group_member_direct(&state, group_id, session_id)
+        .await
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
+    Ok(Json(
+        json!({"ok": true, "group": group_json(&state, &group).await}),
+    ))
 }
 
 #[cfg(test)]

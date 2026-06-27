@@ -1,14 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
 
-use crate::{config_dir_path, now_epoch};
+use crate::{MAIN_SESSION_ID, config_dir_path, now_epoch};
 
-pub(crate) const GROUP_VERSION: u32 = 1;
+pub(crate) const GROUP_VERSION: u32 = 2;
 
 const GENERATED_GROUP_ID_LEN: usize = 6;
 const GENERATED_GROUP_ID_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
@@ -25,6 +25,10 @@ pub(crate) struct SessionGroup {
     #[serde(default)]
     pub(crate) members: Vec<String>,
     #[serde(default)]
+    pub(crate) admins: Vec<String>,
+    #[serde(default)]
+    pub(crate) pending_votes: Vec<GroupVote>,
+    #[serde(default)]
     pub(crate) messages: Vec<GroupMessage>,
     #[serde(default)]
     pub(crate) runs: Vec<GroupRun>,
@@ -32,6 +36,26 @@ pub(crate) struct SessionGroup {
     pub(crate) updated_at: u64,
     #[serde(default)]
     pub(crate) version: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct GroupVote {
+    pub(crate) id: String,
+    pub(crate) action: String,
+    pub(crate) target_session_id: String,
+    pub(crate) requester_session_id: String,
+    #[serde(default)]
+    pub(crate) approvals: Vec<String>,
+    pub(crate) threshold: usize,
+    pub(crate) created_at: u64,
+    pub(crate) updated_at: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct GroupMemberDetail {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) role: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,6 +108,8 @@ impl SessionGroup {
             id: id.to_string(),
             name: name.to_string(),
             members: normalize_members(members),
+            admins: Vec::new(),
+            pending_votes: Vec::new(),
             messages: Vec::new(),
             runs: Vec::new(),
             created_at: now,
@@ -200,7 +226,7 @@ pub(crate) fn normalize_members(members: Vec<String>) -> Vec<String> {
     let mut out = Vec::new();
     for member in members {
         let trimmed = member.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(MAIN_SESSION_ID) {
             continue;
         }
         let Ok(valid) = crate::session_store::validate_session_id(trimmed) else {
@@ -211,6 +237,41 @@ pub(crate) fn normalize_members(members: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+pub(crate) fn normalize_admins(admins: Vec<String>, members: &[String]) -> Vec<String> {
+    let member_set = members.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for admin in admins {
+        let trimmed = admin.trim();
+        if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(MAIN_SESSION_ID) {
+            continue;
+        }
+        let Ok(valid) = crate::session_store::validate_session_id(trimmed) else {
+            continue;
+        };
+        if member_set.contains(&valid) && seen.insert(valid.to_string()) {
+            out.push(valid.to_string());
+        }
+    }
+    out
+}
+
+pub(crate) fn normalize_vote_approvals(approvals: Vec<String>, admins: &[String]) -> Vec<String> {
+    let admin_set = admins.iter().map(String::as_str).collect::<HashSet<_>>();
+    let mut seen = HashSet::new();
+    approvals
+        .into_iter()
+        .filter_map(|approval| {
+            let valid = crate::session_store::validate_session_id(approval.trim()).ok()?;
+            if admin_set.contains(&valid) && seen.insert(valid.to_string()) {
+                Some(valid.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn generate_random_group_id() -> Result<String, String> {
@@ -288,6 +349,27 @@ pub(crate) fn load_group_from_path(path: &Path) -> Option<SessionGroup> {
 
 pub(crate) fn normalize_group(group: &mut SessionGroup) {
     group.members = normalize_members(std::mem::take(&mut group.members));
+    group.admins = normalize_admins(std::mem::take(&mut group.admins), &group.members);
+    let member_set = group.members.iter().collect::<HashSet<_>>();
+    let admins = group.admins.clone();
+    group.pending_votes = std::mem::take(&mut group.pending_votes)
+        .into_iter()
+        .filter_map(|mut vote| {
+            if vote.action != "remove_member" {
+                return None;
+            }
+            if !member_set.contains(&vote.target_session_id) {
+                return None;
+            }
+            vote.approvals = normalize_vote_approvals(vote.approvals, &admins);
+            vote.threshold = vote.threshold.max(1);
+            if vote.approvals.is_empty() {
+                None
+            } else {
+                Some(vote)
+            }
+        })
+        .collect();
     group.version = GROUP_VERSION;
     if group.name.trim().is_empty() {
         group.name = group.id.clone();
@@ -434,11 +516,118 @@ pub(crate) async fn delete_group_from_disk_locked(id: &str) -> Result<(), String
     Ok(())
 }
 
-pub(crate) fn group_to_json(group: &SessionGroup) -> serde_json::Value {
+/// Content-derived fingerprint of one persisted session file. Including the parsed
+/// display name and `updated_at` (instead of just filesystem mtime/len) guarantees that
+/// a rename always changes the signature, even when the serialized byte length is
+/// unchanged within the same coarse filesystem mtime tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SavedSessionNameSignature {
+    id: String,
+    name: String,
+    updated_at: u64,
+    corrupt: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SavedSessionNameCache {
+    signatures: Vec<SavedSessionNameSignature>,
+    names: HashMap<String, String>,
+}
+
+type SavedSessionNameCacheLock = OnceLock<Mutex<Option<SavedSessionNameCache>>>;
+static SAVED_SESSION_NAME_CACHE: SavedSessionNameCacheLock = OnceLock::new();
+
+/// Build the content-derived signature from already-parsed session summaries. Pure (no I/O)
+/// so it can be unit-tested directly without touching the global sessions dir or cache.
+fn signatures_from_summaries(
+    summaries: &[crate::session_store::SessionSummary],
+) -> Vec<SavedSessionNameSignature> {
+    let mut signatures = summaries
+        .iter()
+        .map(|summary| SavedSessionNameSignature {
+            id: summary.id.clone(),
+            name: summary.name.clone(),
+            updated_at: summary.updated_at,
+            corrupt: summary.corrupt,
+        })
+        .collect::<Vec<_>>();
+    signatures.sort_by(|a, b| a.id.cmp(&b.id));
+    signatures
+}
+
+pub(crate) fn saved_session_name_map() -> HashMap<String, String> {
+    // Parse the sessions directory once; derive both the content signature and the name
+    // map from the same summaries so renames (even same-length, same-mtime-tick) always
+    // invalidate the cache, and so no second directory pass is performed on a miss.
+    let summaries = crate::session_store::list_saved_session_summaries_in_dir(
+        &crate::session_store::sessions_dir(),
+    );
+    let signatures = signatures_from_summaries(&summaries);
+    let cache = SAVED_SESSION_NAME_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(cached) = guard.as_ref()
+            && cached.signatures == signatures
+        {
+            return cached.names.clone();
+        }
+    }
+    let names = summaries
+        .into_iter()
+        .map(|summary| (summary.id, summary.name))
+        .collect::<HashMap<_, _>>();
+    {
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(SavedSessionNameCache {
+            signatures,
+            names: names.clone(),
+        });
+    }
+    names
+}
+
+pub(crate) fn group_member_details(
+    group: &SessionGroup,
+    names: &HashMap<String, String>,
+) -> Vec<GroupMemberDetail> {
+    let mut details = Vec::with_capacity(group.members.len() + 1);
+    details.push(GroupMemberDetail {
+        id: MAIN_SESSION_ID.to_string(),
+        name: names
+            .get(MAIN_SESSION_ID)
+            .cloned()
+            .unwrap_or_else(|| "Main".to_string()),
+        role: "owner".to_string(),
+    });
+    for member in &group.members {
+        details.push(GroupMemberDetail {
+            id: member.clone(),
+            name: names.get(member).cloned().unwrap_or_else(|| member.clone()),
+            role: if group.admins.iter().any(|admin| admin == member) {
+                "admin".to_string()
+            } else {
+                "member".to_string()
+            },
+        });
+    }
+    details
+}
+
+pub(crate) fn group_to_json(
+    group: &SessionGroup,
+    names: &HashMap<String, String>,
+) -> serde_json::Value {
     json!({
         "id": group.id,
         "name": group.name,
         "members": group.members,
+        "admins": group.admins,
+        "pending_votes": group.pending_votes,
+        "member_details": group_member_details(group, names),
         "messages": group.messages,
         "runs": group.runs,
         "created_at": group.created_at,
@@ -447,22 +636,34 @@ pub(crate) fn group_to_json(group: &SessionGroup) -> serde_json::Value {
     })
 }
 
-pub(crate) fn group_history_payload(group: &SessionGroup) -> serde_json::Value {
+pub(crate) fn group_history_payload(
+    group: &SessionGroup,
+    names: &HashMap<String, String>,
+) -> serde_json::Value {
     json!({
         "type": "group_history",
         "group_id": group.id,
         "members": group.members,
+        "admins": group.admins,
+        "pending_votes": group.pending_votes,
+        "member_details": group_member_details(group, names),
         "messages": group.messages,
         "runs": group.runs,
     })
 }
 
-pub(crate) fn group_info_payload(group: &SessionGroup) -> serde_json::Value {
+pub(crate) fn group_info_payload(
+    group: &SessionGroup,
+    names: &HashMap<String, String>,
+) -> serde_json::Value {
     json!({
         "type": "group",
         "id": group.id,
         "name": group.name,
         "members": group.members,
+        "admins": group.admins,
+        "pending_votes": group.pending_votes,
+        "member_details": group_member_details(group, names),
         "created_at": group.created_at,
         "updated_at": group.updated_at,
     })
@@ -480,17 +681,106 @@ mod tests {
         format!("{prefix}-{unique}")
     }
 
+    fn summary(id: &str, name: &str, updated_at: u64) -> crate::session_store::SessionSummary {
+        crate::session_store::SessionSummary {
+            id: id.to_string(),
+            name: name.to_string(),
+            model_override: None,
+            messages: 0,
+            tool_calls: 0,
+            created_at: 0,
+            updated_at,
+            corrupt: false,
+        }
+    }
+
+    #[test]
+    fn saved_session_name_signature_changes_when_name_changes_at_same_updated_at() {
+        // Same id + same updated_at + same length name: a rename that the old
+        // (file_name, mtime, len) signature could not distinguish.
+        let before = signatures_from_summaries(&[summary("worker-a", "Cat", 5)]);
+        let after = signatures_from_summaries(&[summary("worker-a", "Dog", 5)]);
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn saved_session_name_signature_is_stable_and_order_independent() {
+        let a = signatures_from_summaries(&[summary("b", "Beta", 2), summary("a", "Alpha", 1)]);
+        let b = signatures_from_summaries(&[summary("a", "Alpha", 1), summary("b", "Beta", 2)]);
+        assert_eq!(a, b);
+    }
+
     #[test]
     fn normalize_members_dedupes_and_drops_invalid_ids() {
         let members = normalize_members(vec![
             " alpha ".to_string(),
             "alpha".to_string(),
+            "main".to_string(),
+            "MAIN".to_string(),
             "bad/name".to_string(),
             "beta.1".to_string(),
             "".to_string(),
         ]);
 
         assert_eq!(members, vec!["alpha".to_string(), "beta.1".to_string()]);
+    }
+
+    #[test]
+    fn normalize_group_defaults_v2_metadata_and_injects_main_owner_detail() {
+        let group_id = unique_group_id("group-v1-load");
+        let mut group: SessionGroup = serde_json::from_value(json!({
+            "id": group_id,
+            "name": "Legacy Group",
+            "members": ["main", "worker-a", "worker-a"],
+            "messages": [],
+            "runs": [],
+            "created_at": 1,
+            "updated_at": 1,
+            "version": 1
+        }))
+        .expect("legacy group should deserialize");
+
+        normalize_group(&mut group);
+
+        assert_eq!(group.version, GROUP_VERSION);
+        assert_eq!(group.members, vec!["worker-a".to_string()]);
+        assert!(group.admins.is_empty());
+        assert!(group.pending_votes.is_empty());
+        let details = group_member_details(&group, &HashMap::new());
+        assert_eq!(details[0].id, MAIN_SESSION_ID);
+        assert_eq!(details[0].role, "owner");
+        assert_eq!(details[1].id, "worker-a");
+        assert_eq!(details[1].role, "member");
+    }
+
+    #[test]
+    fn normalize_group_keeps_vote_when_requester_is_no_longer_admin() {
+        let mut group = SessionGroup::new(
+            "group-vote-normalize",
+            "Vote Normalize",
+            vec![
+                "worker-a".to_string(),
+                "worker-b".to_string(),
+                "worker-c".to_string(),
+            ],
+        );
+        group.admins = vec!["worker-a".to_string()];
+        group.pending_votes.push(GroupVote {
+            id: "vote-1".to_string(),
+            action: "remove_member".to_string(),
+            target_session_id: "worker-c".to_string(),
+            requester_session_id: "worker-b".to_string(),
+            approvals: vec!["worker-a".to_string(), "worker-b".to_string()],
+            threshold: 2,
+            created_at: 1,
+            updated_at: 1,
+        });
+
+        normalize_group(&mut group);
+
+        assert_eq!(group.pending_votes.len(), 1);
+        assert_eq!(group.pending_votes[0].requester_session_id, "worker-b");
+        assert_eq!(group.pending_votes[0].approvals, vec!["worker-a"]);
     }
 
     #[test]

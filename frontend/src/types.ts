@@ -63,10 +63,30 @@ export interface SessionGroupSummary {
   corrupt?: boolean;
 }
 
+export interface GroupMemberDetail {
+  id: string;
+  name: string;
+  role: 'owner' | 'admin' | 'member';
+}
+
+export interface GroupVote {
+  id: string;
+  action: string;
+  target_session_id: string;
+  requester_session_id: string;
+  approvals: string[];
+  threshold: number;
+  created_at: number;
+  updated_at: number;
+}
+
 export interface SessionGroupDetail {
   id: string;
   name: string;
   members: string[];
+  admins?: string[];
+  pending_votes?: GroupVote[];
+  member_details?: GroupMemberDetail[];
   messages?: unknown[];
   runs?: unknown[];
   created_at?: number;

@@ -227,6 +227,13 @@ pub(crate) fn validate_session_id(id: &str) -> Result<&str, String> {
                 .to_string(),
         );
     }
+    // Canonicalize any case-variant of the main session id ("Main", "MAIN", ...)
+    // to the literal "main". Without this, a case-variant id is creatable via /ws
+    // and becomes a DISTINCT session on a case-sensitive filesystem, which every
+    // case-insensitive main guard then permanently over-rejects from dispatch/group.
+    if crate::is_main(trimmed) {
+        return Ok(crate::MAIN_SESSION_ID);
+    }
     let lowered = trimmed.to_ascii_lowercase();
     if RESERVED_SESSION_IDS.contains(&lowered.as_str()) {
         return Err("Invalid session id. This name is reserved.".to_string());
@@ -670,7 +677,7 @@ pub(crate) fn load_session_from_disk(id: &str) -> Option<Session> {
 pub(crate) fn refresh_session_system_prompt(state: &AppState, session: &mut Session) {
     let config = state.config();
     let model = session.effective_model(&config.model).to_string();
-    let sys = super::build_system_prompt(
+    let sys = crate::prompts::build_system_prompt(
         &config,
         &session.workspace,
         &model,
@@ -721,19 +728,16 @@ pub(crate) fn list_saved_session_summaries_in_dir(dir: &Path) -> Vec<SessionSumm
 }
 
 pub(crate) fn sort_session_summaries(summaries: &mut [SessionSummary]) {
-    summaries.sort_by(|a, b| {
-        match (
-            a.id == crate::MAIN_SESSION_ID,
-            b.id == crate::MAIN_SESSION_ID,
-        ) {
+    summaries.sort_by(
+        |a, b| match (crate::is_main(&a.id), crate::is_main(&b.id)) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
             _ => b
                 .updated_at
                 .cmp(&a.updated_at)
                 .then_with(|| a.id.cmp(&b.id)),
-        }
-    });
+        },
+    );
 }
 
 #[cfg(test)]
@@ -983,7 +987,7 @@ pub(crate) fn build_session_status(session: &Session, config: &Config) -> String
         .max_tokens
         .map(format_token_count)
         .unwrap_or_else(|| "-".into());
-    let (prompt_cache_hits, prompt_cache_misses) = super::system_prompt_cache_metrics();
+    let (prompt_cache_hits, prompt_cache_misses) = crate::prompts::system_prompt_cache_metrics();
     let (session_save_writes, session_save_skips) = session_persist_metrics();
 
     format!(

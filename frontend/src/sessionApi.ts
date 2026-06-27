@@ -1,4 +1,10 @@
-import type { SessionGroupDetail, SessionGroupSummary, SessionSummary } from './types.js';
+import type {
+  GroupMemberDetail,
+  GroupVote,
+  SessionGroupDetail,
+  SessionGroupSummary,
+  SessionSummary,
+} from './types.js';
 
 function normalizeSessionSummary(session: unknown): SessionSummary {
   const raw = (session ?? {}) as Record<string, unknown>;
@@ -40,6 +46,58 @@ function normalizeGroupSummary(group: unknown): SessionGroupSummary {
   };
 }
 
+function normalizeStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.map((item) => String(item).trim()).filter(Boolean) : [];
+}
+
+function normalizeGroupMemberDetails(value: unknown): GroupMemberDetail[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      const raw = (item ?? {}) as Record<string, unknown>;
+      const id = String(raw.id ?? '').trim();
+      if (!id) return null;
+      const role = String(raw.role ?? 'member');
+      return {
+        id,
+        name: String(raw.name ?? id),
+        role: role === 'owner' || role === 'admin' ? role : 'member',
+      } satisfies GroupMemberDetail;
+    })
+    .filter((item): item is GroupMemberDetail => item != null);
+}
+
+function normalizeGroupVotes(value: unknown): GroupVote[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => {
+      const raw = (item ?? {}) as Record<string, unknown>;
+      const id = String(raw.id ?? '').trim();
+      const target = String(raw.target_session_id ?? '').trim();
+      if (!id || !target) return null;
+      const approvals = normalizeStringArray(raw.approvals);
+      const rawThreshold =
+        typeof raw.threshold === 'number' ? raw.threshold : Number(raw.threshold ?? 0);
+      const threshold =
+        Number.isFinite(rawThreshold) && rawThreshold >= 1
+          ? Math.floor(rawThreshold)
+          : Math.max(1, approvals.length);
+      return {
+        id,
+        action: String(raw.action ?? ''),
+        target_session_id: target,
+        requester_session_id: String(raw.requester_session_id ?? '').trim(),
+        approvals,
+        threshold,
+        created_at:
+          typeof raw.created_at === 'number' ? raw.created_at : Number(raw.created_at ?? 0),
+        updated_at:
+          typeof raw.updated_at === 'number' ? raw.updated_at : Number(raw.updated_at ?? 0),
+      } satisfies GroupVote;
+    })
+    .filter((item): item is GroupVote => item != null);
+}
+
 function normalizeGroupDetail(group: unknown): SessionGroupDetail {
   const raw = (group ?? {}) as Record<string, unknown>;
   const id = String(raw.id ?? '').trim();
@@ -49,9 +107,10 @@ function normalizeGroupDetail(group: unknown): SessionGroupDetail {
   return {
     id,
     name: String(raw.name ?? id),
-    members: Array.isArray(raw.members)
-      ? raw.members.map((member) => String(member).trim()).filter(Boolean)
-      : [],
+    members: normalizeStringArray(raw.members),
+    admins: normalizeStringArray(raw.admins),
+    pending_votes: normalizeGroupVotes(raw.pending_votes),
+    member_details: normalizeGroupMemberDetails(raw.member_details),
     messages: Array.isArray(raw.messages) ? raw.messages : [],
     runs: Array.isArray(raw.runs) ? raw.runs : [],
     created_at: typeof raw.created_at === 'number' ? raw.created_at : Number(raw.created_at ?? 0),
@@ -112,4 +171,34 @@ export async function deleteSessionGroup(groupId: string): Promise<void> {
   if (!response.ok) {
     throw new Error(String(payload?.error || `HTTP ${response.status}`));
   }
+}
+
+export async function promoteSessionGroupAdmin(
+  groupId: string,
+  sessionId: string,
+): Promise<SessionGroupDetail> {
+  const response = await fetch(
+    `/api/session-group/member?group=${encodeURIComponent(groupId)}&session=${encodeURIComponent(sessionId)}`,
+    { method: 'PUT' },
+  );
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(String(payload?.error || `HTTP ${response.status}`));
+  }
+  return normalizeGroupDetail(payload?.group);
+}
+
+export async function removeSessionGroupMember(
+  groupId: string,
+  sessionId: string,
+): Promise<SessionGroupDetail | null> {
+  const response = await fetch(
+    `/api/session-group/member?group=${encodeURIComponent(groupId)}&session=${encodeURIComponent(sessionId)}`,
+    { method: 'DELETE' },
+  );
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(String(payload?.error || `HTTP ${response.status}`));
+  }
+  return payload?.group ? normalizeGroupDetail(payload.group) : null;
 }

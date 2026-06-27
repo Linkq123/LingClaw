@@ -1,4 +1,5 @@
-use crate::{Config, check_dangerous_command, resolve_path_checked};
+use crate::Config;
+use crate::tools::safety::{check_dangerous_command, resolve_path_checked};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -594,7 +595,7 @@ fn truncate_capture_tail(bytes: &mut Vec<u8>, max: usize) {
 
     let keep = max - prefix.len();
     let mut start = bytes.len().saturating_sub(keep);
-    while start < bytes.len() && !std::str::from_utf8(&bytes[start..]).is_ok() {
+    while start < bytes.len() && std::str::from_utf8(&bytes[start..]).is_err() {
         start += 1;
     }
 

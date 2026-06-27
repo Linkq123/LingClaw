@@ -18,7 +18,7 @@ import {
   hideWelcome,
   scheduleBackgroundTask,
 } from './utils.js';
-import type { SessionGroupSummary, SessionSummary } from './types.js';
+import type { GroupMemberDetail, GroupVote, SessionGroupSummary, SessionSummary } from './types.js';
 import {
   syncToolDrawerBounds,
   cancelToolDrawerBoundsSync,
@@ -149,10 +149,13 @@ import {
   createSessionGroup as requestCreateSessionGroup,
   deleteSessionGroup as requestDeleteSessionGroup,
   getSessionGroup as requestGetSessionGroup,
+  promoteSessionGroupAdmin as requestPromoteSessionGroupAdmin,
+  removeSessionGroupMember as requestRemoveSessionGroupMember,
   updateSessionGroup as requestUpdateSessionGroup,
 } from './sessionApi.js';
 import {
   isActiveGroupRunStatus,
+  isTerminalGroupRunStatus,
   isRecoverableActiveGroupConnectionError,
   loadActiveGroupId,
   loadActiveSessionId,
@@ -318,16 +321,113 @@ function normalizeGroupMembers(members: unknown): string[] {
   return out;
 }
 
+function normalizeGroupMemberDetails(details: unknown, members: string[] = []): GroupMemberDetail[] {
+  const seen = new Set<string>();
+  const out: GroupMemberDetail[] = [];
+  const allowed = new Set(['main', ...members]);
+  const sessionsById = new Map(state.sessions.map((session) => [session.id, session.name]));
+  if (Array.isArray(details)) {
+    for (const item of details) {
+      const raw = (item ?? {}) as Record<string, unknown>;
+      const id = String(raw.id ?? '').trim();
+      if (!id || seen.has(id) || !allowed.has(id)) continue;
+      const role = String(raw.role ?? 'member');
+      const rawName = String(raw.name ?? '').trim();
+      out.push({
+        id,
+        name: rawName && rawName !== id ? rawName : sessionsById.get(id) || id,
+        role: role === 'owner' || role === 'admin' ? role : 'member',
+      });
+      seen.add(id);
+    }
+  }
+  if (!seen.has('main')) {
+    out.unshift({
+      id: 'main',
+      name: sessionsById.get('main') || 'Main',
+      role: 'owner',
+    });
+    seen.add('main');
+  }
+  for (const member of members) {
+    if (seen.has(member)) continue;
+    out.push({
+      id: member,
+      name: sessionsById.get(member) || member,
+      role: 'member',
+    });
+    seen.add(member);
+  }
+  return out;
+}
+
+function normalizeGroupVotes(votes: unknown): GroupVote[] {
+  if (!Array.isArray(votes)) return [];
+  return votes
+    .map((item) => {
+      const raw = (item ?? {}) as Record<string, unknown>;
+      const id = String(raw.id ?? '').trim();
+      const target = String(raw.target_session_id ?? '').trim();
+      if (!id || !target) return null;
+      const approvals = normalizeGroupMembers(raw.approvals);
+      const rawThreshold =
+        typeof raw.threshold === 'number' ? raw.threshold : Number(raw.threshold ?? 0);
+      const threshold =
+        Number.isFinite(rawThreshold) && rawThreshold >= 1
+          ? Math.floor(rawThreshold)
+          : Math.max(1, approvals.length);
+      return {
+        id,
+        action: String(raw.action ?? ''),
+        target_session_id: target,
+        requester_session_id: String(raw.requester_session_id ?? '').trim(),
+        approvals,
+        threshold,
+        created_at:
+          typeof raw.created_at === 'number' ? raw.created_at : Number(raw.created_at ?? 0),
+        updated_at:
+          typeof raw.updated_at === 'number' ? raw.updated_at : Number(raw.updated_at ?? 0),
+      } satisfies GroupVote;
+    })
+    .filter((item): item is GroupVote => item != null);
+}
+
+function groupMemberName(sessionId: string): string {
+  const id = String(sessionId || '').trim();
+  if (!id) return 'session';
+  const detail = state.activeGroupMemberDetails.find((member) => member.id === id);
+  if (detail?.name) return detail.name;
+  const summary = state.sessions.find((session) => session.id === id);
+  return summary?.name || id;
+}
+
+function renderProtocolMentions(text: string): string {
+  return String(text || '').replace(
+    /(^|[\s([{<"'`])@([A-Za-z0-9_.-]*[A-Za-z0-9_-])(?=$|[\s)\]}>.,;:!?'"`])/g,
+    (match, prefix, rawId) => {
+      const id = String(rawId || '');
+      if (id.toLowerCase() === 'all') return `${prefix}@All`;
+      if (!state.activeGroupMembers.includes(id)) return match;
+      return `${prefix}@${groupMemberName(id)}`;
+    },
+  );
+}
+
 function resetGroupTargetControls() {
   state.activeGroupMembers = [];
+  state.activeGroupMemberDetails = [];
+  state.activeGroupPendingVotes = [];
+  state.groupMembersDrawerOpen = false;
   state.groupTargetMode = 'all';
   state.groupSelectedTargets = [];
   renderGroupTargetControls();
+  renderGroupMemberDrawer();
 }
 
 function clearGroupRunState() {
   state.activeGroupRunIds.clear();
   state.groupRunStatuses.clear();
+  state.groupRunSessions.clear();
 }
 
 function enterGroupControlSession() {
@@ -351,15 +451,22 @@ function leaveActiveGroupForSession(fallbackSessionId = loadActiveSessionId()): 
   return nextSessionId;
 }
 
-function setActiveGroupMembers(members: unknown) {
+function setActiveGroupMembers(
+  members: unknown,
+  memberDetails: unknown = state.activeGroupMemberDetails,
+  pendingVotes: unknown = state.activeGroupPendingVotes,
+) {
   const normalized = normalizeGroupMembers(members);
   const memberSet = new Set(normalized);
   state.activeGroupMembers = normalized;
+  state.activeGroupMemberDetails = normalizeGroupMemberDetails(memberDetails, normalized);
+  state.activeGroupPendingVotes = normalizeGroupVotes(pendingVotes);
   state.groupSelectedTargets = state.groupSelectedTargets.filter((target) => memberSet.has(target));
   if (state.groupTargetMode === 'selected' && state.groupSelectedTargets.length === 0) {
     state.groupSelectedTargets = [...normalized];
   }
   renderGroupTargetControls();
+  renderGroupMemberDrawer();
 }
 
 function selectGroupTargetMode(mode: 'all' | 'selected' | 'mentions') {
@@ -384,6 +491,28 @@ function toggleSelectedGroupTarget(memberId: string) {
   syncToolDrawerBounds();
 }
 
+function insertGroupMention(sessionId: string) {
+  if (!dom.input) return;
+  const token = sessionId === 'all' ? '@all' : `@${sessionId}`;
+  const value = dom.input.value;
+  const start = dom.input.selectionStart ?? value.length;
+  const end = dom.input.selectionEnd ?? value.length;
+  const before = value.slice(0, start);
+  const after = value.slice(end);
+  const prefix = before && !/\s$/.test(before) ? ' ' : '';
+  const suffix = after && !/^\s/.test(after) ? ' ' : '';
+  dom.input.value = `${before}${prefix}${token}${suffix}${after}`;
+  const cursor = before.length + prefix.length + token.length + suffix.length;
+  dom.input.focus();
+  dom.input.setSelectionRange(cursor, cursor);
+  dom.input.dispatchEvent(new Event('input', { bubbles: true }));
+}
+
+function toggleGroupMemberDrawer() {
+  state.groupMembersDrawerOpen = !state.groupMembersDrawerOpen;
+  renderGroupMemberDrawer();
+}
+
 function renderGroupTargetControls() {
   const bar = dom.groupTargetBar;
   if (!bar) return;
@@ -393,6 +522,14 @@ function renderGroupTargetControls() {
     return;
   }
   bar.hidden = false;
+
+  const memberButton = document.createElement('button');
+  memberButton.type = 'button';
+  memberButton.className = 'group-members-toggle';
+  memberButton.textContent = `Members ${state.activeGroupMembers.length}`;
+  memberButton.setAttribute('aria-expanded', String(state.groupMembersDrawerOpen));
+  memberButton.addEventListener('click', toggleGroupMemberDrawer);
+  bar.appendChild(memberButton);
 
   const modes = [
     { id: 'all' as const, label: 'All' },
@@ -427,12 +564,126 @@ function renderGroupTargetControls() {
     chip.className = 'group-target-member';
     chip.classList.toggle('is-active', selected.has(member));
     chip.setAttribute('aria-pressed', selected.has(member) ? 'true' : 'false');
-    chip.textContent = member;
+    chip.textContent = groupMemberName(member);
     chip.title = member;
     chip.addEventListener('click', () => toggleSelectedGroupTarget(member));
     chips.appendChild(chip);
   }
   bar.appendChild(chips);
+}
+
+function renderGroupMemberDrawer() {
+  let drawer = document.getElementById('group-member-drawer');
+  if (!state.activeGroupId) {
+    drawer?.remove();
+    return;
+  }
+  if (!drawer) {
+    drawer = document.createElement('aside');
+    drawer.id = 'group-member-drawer';
+    drawer.className = 'group-member-drawer';
+    document.body.appendChild(drawer);
+  }
+  drawer.classList.toggle('is-open', state.groupMembersDrawerOpen);
+  drawer.setAttribute('aria-hidden', state.groupMembersDrawerOpen ? 'false' : 'true');
+  // Skip the (expensive) DOM rebuild while the drawer is closed; it is rebuilt when
+  // reopened via toggleGroupMemberDrawer. This avoids an O(events x members) re-render
+  // storm when member status events stream in during an @all dispatch.
+  if (!state.groupMembersDrawerOpen) return;
+
+  const header = document.createElement('div');
+  header.className = 'group-member-drawer-header';
+  const title = document.createElement('div');
+  title.className = 'group-member-drawer-title';
+  title.textContent = 'Group members';
+  const closeButton = document.createElement('button');
+  closeButton.type = 'button';
+  closeButton.className = 'group-member-drawer-close';
+  closeButton.textContent = '×';
+  closeButton.setAttribute('aria-label', 'Close group members');
+  closeButton.addEventListener('click', () => {
+    state.groupMembersDrawerOpen = false;
+    renderGroupMemberDrawer();
+    renderGroupTargetControls();
+  });
+  header.append(title, closeButton);
+
+  const list = document.createElement('div');
+  list.className = 'group-member-list';
+  for (const detail of state.activeGroupMemberDetails) {
+    const row = document.createElement('div');
+    row.className = 'group-member-row';
+    row.dataset.sessionId = detail.id;
+
+    const main = document.createElement('div');
+    main.className = 'group-member-main';
+    const name = document.createElement('div');
+    name.className = 'group-member-name';
+    name.textContent = detail.name || detail.id;
+    const meta = document.createElement('div');
+    meta.className = 'group-member-meta';
+    meta.textContent = `${detail.id} · ${detail.role} · ${groupMemberStatus(detail.id)}`;
+    main.append(name, meta);
+
+    const actions = document.createElement('div');
+    actions.className = 'group-member-actions';
+    if (detail.id !== 'main') {
+      const mentionButton = document.createElement('button');
+      mentionButton.type = 'button';
+      mentionButton.className = 'group-member-action';
+      mentionButton.textContent = '@';
+      mentionButton.title = `Mention ${detail.name || detail.id}`;
+      mentionButton.addEventListener('click', () => insertGroupMention(detail.id));
+      actions.appendChild(mentionButton);
+
+      if (detail.role === 'member') {
+        const promoteButton = document.createElement('button');
+        promoteButton.type = 'button';
+        promoteButton.className = 'group-member-action';
+        promoteButton.textContent = 'Admin';
+        promoteButton.title = `Promote ${detail.name || detail.id}`;
+        promoteButton.addEventListener('click', () => void promoteGroupMember(detail.id));
+        actions.appendChild(promoteButton);
+      }
+
+      const removeButton = document.createElement('button');
+      removeButton.type = 'button';
+      removeButton.className = 'group-member-action danger';
+      removeButton.textContent = 'Remove';
+      removeButton.title = `Remove ${detail.name || detail.id}`;
+      removeButton.addEventListener('click', () => void removeGroupMember(detail.id));
+      actions.appendChild(removeButton);
+    } else {
+      const mentionAllButton = document.createElement('button');
+      mentionAllButton.type = 'button';
+      mentionAllButton.className = 'group-member-action';
+      mentionAllButton.textContent = '@all';
+      mentionAllButton.title = 'Mention all members';
+      mentionAllButton.addEventListener('click', () => insertGroupMention('all'));
+      actions.appendChild(mentionAllButton);
+    }
+
+    row.append(main, actions);
+    list.appendChild(row);
+  }
+
+  const votes = document.createElement('div');
+  votes.className = 'group-vote-list';
+  if (state.activeGroupPendingVotes.length > 0) {
+    const voteTitle = document.createElement('div');
+    voteTitle.className = 'group-vote-title';
+    voteTitle.textContent = 'Pending votes';
+    votes.appendChild(voteTitle);
+    for (const vote of state.activeGroupPendingVotes) {
+      const item = document.createElement('div');
+      item.className = 'group-vote-item';
+      const targetName = groupMemberName(vote.target_session_id);
+      item.textContent = `${targetName}: ${vote.approvals.length}/${vote.threshold} approvals`;
+      votes.appendChild(item);
+    }
+  }
+
+  drawer.replaceChildren(header, list, votes);
 }
 
 async function refreshSessionsList() {
@@ -683,6 +934,50 @@ async function deleteGroup(groupId: string) {
     renderSessionDrawer();
   } catch (error) {
     addError(`Failed to delete group: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function applyGroupDetail(detail: {
+  id?: string;
+  name?: string;
+  members?: unknown;
+  member_details?: unknown;
+  pending_votes?: unknown;
+}) {
+  if (!detail?.id || detail.id !== state.activeGroupId) return;
+  if (detail.name) {
+    dom.sessionNameEl.textContent = detail.name;
+  }
+  setActiveGroupMembers(detail.members, detail.member_details, detail.pending_votes);
+}
+
+async function promoteGroupMember(sessionId: string) {
+  if (!state.activeGroupId) return;
+  try {
+    const detail = await requestPromoteSessionGroupAdmin(state.activeGroupId, sessionId);
+    applyGroupDetail(detail);
+    void refreshGroupsList();
+  } catch (error) {
+    addError(`Failed to promote group member: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function removeGroupMember(sessionId: string) {
+  if (!state.activeGroupId || sessionId === 'main') return;
+  const label = groupMemberName(sessionId);
+  const confirmed = window.confirm(`Remove ${label} from this group?`);
+  if (!confirmed) return;
+  try {
+    const detail = await requestRemoveSessionGroupMember(state.activeGroupId, sessionId);
+    if (detail) {
+      applyGroupDetail(detail);
+    } else {
+      state.activeGroupMembers = state.activeGroupMembers.filter((member) => member !== sessionId);
+      setActiveGroupMembers(state.activeGroupMembers);
+    }
+    void refreshGroupsList();
+  } catch (error) {
+    addError(`Failed to remove group member: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -940,13 +1235,15 @@ function groupMessageText(message): string {
   const sessionId = message?.session_id ? String(message.session_id) : '';
   const prefix =
     role === 'session'
-      ? `[${sessionId || 'session'}] `
+      ? `[${groupMemberName(sessionId)}] `
       : role === 'main'
-        ? '[main] '
+        ? '[Main] '
+        : role === 'user'
+          ? '[You] '
         : role === 'system'
           ? '[system] '
           : '';
-  return `${prefix}${String(message?.content || '')}`;
+  return `${prefix}${renderProtocolMentions(String(message?.content || ''))}`;
 }
 
 function renderGroupMessage(message): void {
@@ -957,6 +1254,23 @@ function renderGroupMessage(message): void {
     el._rawText = groupMessageText(message);
     scheduleMarkdownRender(el);
   }
+}
+
+function isNoReplyGroupResult(value: unknown): boolean {
+  let normalized = String(value ?? '').trim();
+  if (!normalized) return true;
+  if (normalized.startsWith('```')) {
+    let inner = normalized.slice(3);
+    const newline = inner.indexOf('\n');
+    if (newline >= 0) inner = inner.slice(newline + 1);
+    inner = inner.trim();
+    if (inner.endsWith('```')) inner = inner.slice(0, -3);
+    normalized = inner.trim();
+  }
+  normalized = normalized
+    .replace(/^[\s`"'()[\]{}.,;:!?]+|[\s`"'()[\]{}.,;:!?]+$/g, '')
+    .toLowerCase();
+  return normalized === 'no_reply';
 }
 
 function renderGroupHistory(data): void {
@@ -978,9 +1292,7 @@ function renderGroupHistory(data): void {
   state.activeSubagentPanels.clear();
   state.activeOrchestrations.clear();
   const messages = Array.isArray(data?.messages) ? data.messages : [];
-  if (messages.length === 0) {
-    addSystem('Group chat is ready. Send a message to dispatch work to the members.');
-  } else {
+  if (messages.length > 0) {
     for (const message of messages) renderGroupMessage(message);
   }
   const messageRunIds = new Set(
@@ -992,228 +1304,90 @@ function renderGroupHistory(data): void {
     const runId = String(run?.id || '');
     const status = String(run?.status || '');
     const sessionId = String(run?.session_id || 'session');
-    const isActive = isActiveGroupRunStatus(status);
-    applyGroupRunStatus(runId, status, run?.updated_at);
-    const shouldReplayTerminal =
-      status === 'failed' ||
-      status === 'stopped' ||
-      (status === 'completed' && runId && !messageRunIds.has(runId));
-    if (!isActive && !shouldReplayTerminal) continue;
-    const detail = String(run?.error || run?.result_excerpt || run?.prompt || '');
-    addSystem(`[${sessionId}] ${status}${detail ? `: ${detail}` : ''}`);
+    const resultExcerpt = String(run?.result_excerpt ?? '');
+    applyGroupRunStatus(runId, status, run?.updated_at, sessionId);
+    if (status === 'failed' && run?.error) {
+      addError(`[${groupMemberName(sessionId)}] ${run.error}`);
+    } else if (
+      status === 'completed' &&
+      runId &&
+      !messageRunIds.has(runId) &&
+      !isNoReplyGroupResult(resultExcerpt)
+    ) {
+      renderGroupMessage({
+        role: 'session',
+        session_id: sessionId,
+        content: resultExcerpt,
+        timestamp: run.completed_at || run.updated_at,
+        run_id: runId,
+      });
+    }
   }
   setBusy(state.activeGroupRunIds.size > 0);
   scrollDown(true);
 }
 
-function applyGroupRunStatus(runId: unknown, status: unknown, updatedAt: unknown): boolean {
+function groupMemberStatus(sessionId: string): string {
+  for (const runId of state.activeGroupRunIds) {
+    if (state.groupRunSessions.get(runId) === sessionId) return 'running';
+  }
+  return 'idle';
+}
+
+function applyGroupRunStatus(
+  runId: unknown,
+  status: unknown,
+  updatedAt: unknown,
+  sessionId: unknown = '',
+): boolean {
   const id = String(runId || '');
   if (!id) return false;
   const value = String(status || '');
   const normalizedUpdatedAt = normalizeGroupRunUpdatedAt(updatedAt);
+  const normalizedSessionId = String(sessionId || '').trim();
   const current = state.groupRunStatuses.get(id);
   if (!shouldApplyGroupRunStatusUpdate(current, value, normalizedUpdatedAt)) {
+    // A terminal status is final. Even if it arrives out of order (older updated_at
+    // than the cached status), drop the run from the active set so it can't leave a
+    // phantom "running" member or a stuck busy indicator.
+    if (isTerminalGroupRunStatus(value)) {
+      state.groupRunSessions.delete(id);
+      if (state.activeGroupRunIds.delete(id) && state.activeGroupRunIds.size === 0) {
+        setBusy(false);
+      }
+      renderGroupMemberDrawer();
+    }
     return false;
+  }
+  if (normalizedSessionId && !isTerminalGroupRunStatus(value)) {
+    state.groupRunSessions.set(id, normalizedSessionId);
   }
   state.groupRunStatuses.set(id, {
     status: value,
     updatedAt: normalizedUpdatedAt,
   });
+  if (isTerminalGroupRunStatus(value)) {
+    state.groupRunSessions.delete(id);
+  }
   if (isActiveGroupRunStatus(value)) {
     state.activeGroupRunIds.add(id);
     setBusy(true);
+    renderGroupMemberDrawer();
     return true;
   }
   state.activeGroupRunIds.delete(id);
   if (state.activeGroupRunIds.size === 0) {
     setBusy(false);
   }
+  renderGroupMemberDrawer();
   return true;
 }
 
 function handleGroupMemberEvent(data): void {
   const event = data?.event || {};
   const sessionId = String(data?.session_id || '');
-  const runId = String(data?.run_id || '');
-  const ns = (id) => (id && runId ? `${runId}:${id}` : id);
-  const memberAgent = sessionId || 'session';
-  const memberRef = { task_id: runId, agent: memberAgent };
-  const nestedRef = {
-    task_id: ns(event.task_id || ''),
-    agent: `${memberAgent}:${event.agent || 'sub-agent'}`,
-  };
-  const ensureMemberPanel = (prompt = '') => {
-    if (runId) createSubagentPanel(memberAgent, prompt, runId);
-  };
-  const namespacedOrchestrateEvent = () => ({
-    ...event,
-    orchestrate_id: ns(event.orchestrate_id || 'orchestrate'),
-    tasks: Array.isArray(event.tasks)
-      ? event.tasks.map((task) => ({
-          ...task,
-          agent: task?.agent ? `${memberAgent}:${task.agent}` : memberAgent,
-        }))
-      : event.tasks,
-  });
-
-  switch (event.type) {
-    case 'start':
-      ensureMemberPanel();
-      addSystem(`[${sessionId}] started`);
-      break;
-    case 'auto_trace':
-      applyTopLevelAutoTrace({ ...event, subagent: null });
-      break;
-    case 'task_plan': {
-      ensureMemberPanel();
-      const planId = ns(`task-plan-${event.round ?? 0}-${event.cycle ?? 0}`);
-      addSubagentTool(
-        memberRef,
-        'Task Plan',
-        planId,
-        `round ${event.round ?? 0}, cycle ${event.cycle ?? 0}`,
-      );
-      updateSubagentToolResult(
-        memberRef,
-        planId,
-        null,
-        JSON.stringify(event.plan || {}, null, 2),
-        false,
-        'Task Plan',
-      );
-      break;
-    }
-    case 'thinking_start':
-      if (event.subagent) {
-        startSubagentReasoning(nestedRef);
-      } else {
-        ensureMemberPanel();
-        startSubagentReasoning(memberRef);
-      }
-      break;
-    case 'thinking_delta':
-      if (event.subagent) {
-        appendSubagentReasoning(nestedRef, event.content || '');
-      } else {
-        ensureMemberPanel();
-        appendSubagentReasoning(memberRef, event.content || '');
-      }
-      break;
-    case 'thinking_done':
-      if (event.subagent) {
-        finishSubagentReasoning(nestedRef);
-      } else {
-        finishSubagentReasoning(memberRef);
-      }
-      break;
-    case 'tool_call':
-      if (event.subagent) {
-        addSubagentTool(nestedRef, event.name || 'tool', event.id || '', event.arguments || '');
-      } else {
-        ensureMemberPanel();
-        addSubagentTool(memberRef, event.name || 'tool', ns(event.id || ''), event.arguments || '');
-      }
-      break;
-    case 'tool_progress':
-      updateToolProgress(ns(event.id || ''), event.elapsed_ms || 0);
-      break;
-    case 'tool_output':
-      if (event.subagent) {
-        appendSubagentToolOutput(
-          nestedRef,
-          event.id || '',
-          event.stream,
-          event.chunk || '',
-          event.name,
-        );
-      } else {
-        ensureMemberPanel();
-        appendSubagentToolOutput(
-          memberRef,
-          ns(event.id || ''),
-          event.stream,
-          event.chunk || '',
-          event.name,
-        );
-      }
-      break;
-    case 'tool_result':
-      if (event.subagent) {
-        updateSubagentToolResult(
-          nestedRef,
-          event.id || '',
-          event.duration_ms,
-          event.result,
-          event.is_error,
-          event.name,
-        );
-      } else {
-        updateSubagentToolResult(
-          memberRef,
-          ns(event.id || ''),
-          event.duration_ms,
-          event.result,
-          event.is_error,
-          event.name,
-        );
-      }
-      break;
-    case 'task_started':
-      createSubagentPanel(`${sessionId}:${event.agent || 'sub-agent'}`, event.prompt || '', ns(event.task_id || ''));
-      break;
-    case 'task_progress':
-      updateSubagentProgress(
-        { task_id: ns(event.task_id || ''), agent: `${sessionId}:${event.agent || 'sub-agent'}` },
-        event.cycle,
-      );
-      break;
-    case 'task_tool':
-      addSubagentTool(nestedRef, event.tool, event.id, event.arguments);
-      break;
-    case 'task_completed':
-    case 'task_failed':
-      finishSubagentPanel(
-        { task_id: ns(event.task_id || ''), agent: `${sessionId}:${event.agent || 'sub-agent'}` },
-        event.type === 'task_completed',
-        event,
-      );
-      break;
-    case 'orchestrate_started':
-      createOrchestratePanel(namespacedOrchestrateEvent());
-      break;
-    case 'orchestrate_layer':
-      updateOrchestrateLayer(namespacedOrchestrateEvent());
-      break;
-    case 'orchestrate_task_started':
-      markOrchestrateTask(namespacedOrchestrateEvent(), 'running');
-      break;
-    case 'orchestrate_task_completed':
-      markOrchestrateTask(namespacedOrchestrateEvent(), 'completed');
-      break;
-    case 'orchestrate_task_failed':
-      markOrchestrateTask(namespacedOrchestrateEvent(), 'failed');
-      break;
-    case 'orchestrate_task_skipped':
-      markOrchestrateTask(namespacedOrchestrateEvent(), 'skipped');
-      break;
-    case 'orchestrate_completed':
-      finishOrchestratePanel(namespacedOrchestrateEvent());
-      break;
-    case 'done':
-      finishSubagentPanel(memberRef, true, {
-        cycles: event.cycles,
-        tool_calls: event.tool_calls,
-        input_tokens: event.round_input_tokens,
-        output_tokens: event.round_output_tokens,
-      });
-      addSystem(`[${sessionId}] done`);
-      break;
-    case 'error':
-      finishSubagentPanel(memberRef, false, {
-        error: event.content || 'error',
-      });
-      addError(`[${sessionId}] ${event.content || 'error'}`);
-      break;
+  if (event.type === 'error') {
+    addError(`[${groupMemberName(sessionId)}] ${event.content || 'error'}`);
   }
 }
 
@@ -1238,21 +1412,27 @@ function handleMessage(data) {
 
     case 'group':
       clearCompressionOutcome();
-      state.activeGroupId = data.id;
+      {
+        const nextGroupId = String(data.id || '').trim();
+        if (!nextGroupId) break;
+        const groupChanged = state.activeGroupId !== '' && state.activeGroupId !== nextGroupId;
+        state.activeGroupId = nextGroupId;
+        if (groupChanged) {
+          clearGroupRunState();
+        }
+      }
       persistActiveGroupId(state.activeGroupId || '');
-      setActiveGroupMembers(data.members);
-      clearGroupRunState();
+      setActiveGroupMembers(data.members, data.member_details, data.pending_votes);
       state.sessionSwitchInFlight = false;
       dom.sessionNameEl.textContent = data.name || 'Group';
-      dom.sessionIdEl.textContent = data.id.slice(0, 12);
+      dom.sessionIdEl.textContent = state.activeGroupId.slice(0, 12);
       renderSessionDrawer();
-      setBusy(false);
       void refreshGroupsList();
       break;
 
     case 'group_history':
       if (Array.isArray(data.members)) {
-        setActiveGroupMembers(data.members);
+        setActiveGroupMembers(data.members, data.member_details, data.pending_votes);
       }
       renderGroupHistory(data);
       break;
@@ -1266,14 +1446,12 @@ function handleMessage(data) {
 
     case 'group_run_started':
       if (data.run) {
-        const applied = applyGroupRunStatus(
+        applyGroupRunStatus(
           data.run.id,
           data.run.status || 'queued',
           data.run.updated_at,
+          data.run.session_id,
         );
-        if (applied) {
-          addSystem(`[${data.run.session_id}] queued: ${data.run.prompt || ''}`);
-        }
       }
       break;
 
@@ -1283,10 +1461,7 @@ function handleMessage(data) {
 
     case 'group_member_status':
       if (data.status && data.session_id) {
-        const applied = applyGroupRunStatus(data.run_id, data.status, data.updated_at);
-        if (applied) {
-          addSystem(`[${data.session_id}] ${data.status}`);
-        }
+        applyGroupRunStatus(data.run_id, data.status, data.updated_at, data.session_id);
       }
       break;
 
@@ -1295,15 +1470,19 @@ function handleMessage(data) {
         data.run_id,
         data.status || 'completed',
         data.updated_at ?? data.completed_at,
+        data.session_id,
       );
       if (applied && data.error) {
-        addError(`[${data.session_id}] ${data.error}`);
+        addError(`[${groupMemberName(String(data.session_id || ''))}] ${data.error}`);
       }
       break;
     }
 
     case 'session_list':
       state.sessions = normalizeSessionListPayload(data);
+      if (state.activeGroupId) {
+        setActiveGroupMembers(state.activeGroupMembers);
+      }
       renderSessionDrawer();
       break;
     case 'session':

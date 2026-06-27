@@ -22,7 +22,8 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::{Config, VERSION, config::JsonMcpServerConfig, config_dir_path, resolve_path_checked};
+use crate::tools::safety::resolve_path_checked;
+use crate::{Config, VERSION, config::JsonMcpServerConfig, config_dir_path};
 
 use super::ToolOutcome;
 
@@ -758,15 +759,10 @@ async fn discover_resource_metadata(
         return Ok(metadata);
     }
 
-    let mut candidates = Vec::new();
-    candidates.push(path_well_known(
-        &server_url,
-        "/.well-known/oauth-protected-resource",
-    )?);
-    candidates.push(origin_well_known(
-        &server_url,
-        "/.well-known/oauth-protected-resource",
-    )?);
+    let candidates = vec![
+        path_well_known(&server_url, "/.well-known/oauth-protected-resource")?,
+        origin_well_known(&server_url, "/.well-known/oauth-protected-resource")?,
+    ];
     for candidate in candidates {
         if let Ok(metadata) = fetch_json_url(client, candidate, timeout_secs).await {
             return Ok(metadata);
@@ -3852,10 +3848,10 @@ pub(crate) fn auth_state_usable_for_server(
     server: &JsonMcpServerConfig,
     state: &McpServerAuthState,
 ) -> bool {
-    if !state
+    if state
         .access_token
         .as_deref()
-        .is_some_and(|value| !value.trim().is_empty())
+        .is_none_or(|value| value.trim().is_empty())
         || validate_bearer_token_binding(server_name, server, state).is_err()
     {
         return false;
@@ -4551,6 +4547,7 @@ fn parse_sse_json_response(text: &str, cache_key: &str) -> Result<Value, String>
     last_response.ok_or_else(|| "HTTP MCP SSE response did not contain data".to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn parse_sse_json_response_stream(
     response: reqwest::Response,
     cache_key: &str,
@@ -5041,6 +5038,7 @@ where
     stdin.flush().await.map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_response<R, W>(
     reader: &mut BufReader<R>,
     stdin: &mut W,

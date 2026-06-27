@@ -14,16 +14,15 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
-    collections::{HashMap, hash_map::DefaultHasher},
-    hash::{Hash, Hasher},
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock,
+        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, mpsc::error::TrySendError};
 use tokio_util::sync::CancellationToken;
 use tower_http::services::ServeDir;
 
@@ -103,71 +102,22 @@ use std::collections::{HashSet, VecDeque};
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub(crate) const MAIN_SESSION_ID: &str = "main";
+
+/// True when `id` denotes the main session, case-insensitively. Main protection
+/// must be uniform across OSes, so this never depends on `cfg!(windows)`.
+pub(crate) fn is_main(id: &str) -> bool {
+    id.eq_ignore_ascii_case(MAIN_SESSION_ID)
+}
+
+/// Whether two session ids refer to the same session under the existing policy:
+/// exact match always, or case-insensitive only on Windows (case-insensitive FS).
+pub(crate) fn session_ids_match(a: &str, b: &str) -> bool {
+    a == b || (cfg!(windows) && a.eq_ignore_ascii_case(b))
+}
+
 const INBOUND_BUFFER_CAPACITY: usize = 128;
 static CONFIG_FILE_LOCK: std::sync::LazyLock<tokio::sync::RwLock<()>> =
     std::sync::LazyLock::new(|| tokio::sync::RwLock::new(()));
-static SYSTEM_PROMPT_CACHE_HITS: AtomicU64 = AtomicU64::new(0);
-static SYSTEM_PROMPT_CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
-
-const SYSTEM_PROMPT_CACHE_MAX_ENTRIES: usize = 64;
-
-type SystemPromptCacheLock =
-    OnceLock<std::sync::Mutex<HashMap<SystemPromptStaticCacheKey, String>>>;
-static SYSTEM_PROMPT_STATIC_CACHE: SystemPromptCacheLock = OnceLock::new();
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct SystemPromptStaticCacheKey {
-    workspace: PathBuf,
-    query: Option<String>,
-    enabled_skills_hash: u64,
-    persona_hash: u64,
-    behavior_hash: u64,
-    tool_lines_hash: u64,
-    mcp_note_hash: u64,
-    skills_hash: u64,
-    agents_hash: u64,
-}
-
-const PROMPT_FILE_NOTE: &str = "## Preloaded Prompt Files\n\
-These prompt-file contents were already loaded into this system prompt from the session workspace.\n\
-Do not call file tools just to verify or re-read BOOTSTRAP.md, AGENTS.md, AGENT.md, IDENTITY.md, USER.md, or SOUL.md when their content is already present below.\n\
-Only read those files if the user explicitly asks to inspect them, if you need to edit them, or if a task depends on checking whether the on-disk file has changed.";
-
-const AGENT_BEHAVIOR_SECTION: &str = "## Agent Behavior
-
-You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools, **Observe** the results, then either loop or **Finish**.
-
-- **Tool strategy:** Prefer calling tools to gather information over speculating. Batch independent read-only calls together. Run write operations one at a time.
-- **Error recovery:** When a tool fails, diagnose the cause and try a different approach - different arguments, a different tool, or an alternative path. Do not repeat the same failing call.
-- **Delegation:** For complex, self-contained subtasks, delegate to a sub-agent via the `task` tool. Handle simple, quick work yourself.
-- **Finishing:** When the task is complete, deliver your result. When you are genuinely stuck with no further options, say so honestly. Do not pad with speculative follow-ups.";
-
-const PLAN_ONLY_AGENT_BEHAVIOR_SECTION: &str = "## Agent Behavior
-
-You operate in plan-only mode: **Analyze** the situation, optionally **Act** with read-only exploration tools, **Observe** the results, then **Finish** with a plan.
-
-- **Tool strategy:** Prefer read-only tools to gather information over speculating. Batch independent read-only calls together.
-- **Boundaries:** Do not modify files, run shell commands, update todos, delegate to sub-agents, or claim work has been performed.
-- **Finishing:** Deliver a concrete execution plan with affected areas, validation suggestions, and risks or unknowns. Wait for the user to approve execution before making changes.";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SystemPromptToolMode {
-    Execute,
-    PlanOnly,
-}
-
-impl SystemPromptToolMode {
-    fn agent_behavior_section(self) -> &'static str {
-        match self {
-            Self::Execute => AGENT_BEHAVIOR_SECTION,
-            Self::PlanOnly => PLAN_ONLY_AGENT_BEHAVIOR_SECTION,
-        }
-    }
-
-    fn is_plan_only(self) -> bool {
-        matches!(self, Self::PlanOnly)
-    }
-}
 
 // ── Data Models ──────────────────────────────────────────────────────────────
 
@@ -624,6 +574,7 @@ struct SessionClientBinding {
 struct GroupClientBinding {
     connection_id: u64,
     tx: WsTx,
+    cancel: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -914,551 +865,6 @@ const TOOL_PROGRESS_HEARTBEAT_SECS: u64 = 1;
 const LIVE_CLIENT_SEND_BACKPRESSURE_TIMEOUT_MS: u64 = 25;
 const LIVE_CLIENT_SEND_BACKPRESSURE_MAX_TIMEOUTS: usize = 4;
 
-// ── System Prompt ────────────────────────────────────────────────────────────
-
-fn build_system_prompt(
-    config: &Config,
-    workspace: &Path,
-    model: &str,
-    enabled_system_skills: &HashSet<String>,
-) -> ChatMessage {
-    build_system_prompt_with_query_cached(config, workspace, model, enabled_system_skills, None)
-}
-
-fn hash_prompt_part<T: Hash>(value: &T) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn hash_enabled_system_skills(enabled_system_skills: &HashSet<String>) -> u64 {
-    let mut items: Vec<&str> = enabled_system_skills.iter().map(String::as_str).collect();
-    items.sort_unstable();
-    hash_prompt_part(&items)
-}
-
-fn build_system_prompt_static_prefix_cached(
-    workspace: &Path,
-    current_query: Option<&str>,
-    enabled_system_skills: &HashSet<String>,
-    persona: &str,
-    agent_behavior_section: &str,
-    tool_lines: &str,
-    mcp_note: &str,
-    skills_section: &str,
-    agents_section: &str,
-) -> String {
-    let query = current_query
-        .map(str::trim)
-        .filter(|query| !query.is_empty())
-        .map(ToOwned::to_owned);
-    let enabled_skills_hash = hash_enabled_system_skills(enabled_system_skills);
-    let persona_hash = hash_prompt_part(&persona);
-    let behavior_hash = hash_prompt_part(&agent_behavior_section);
-    let tool_lines_hash = hash_prompt_part(&tool_lines);
-    let mcp_note_hash = hash_prompt_part(&mcp_note);
-    let skills_hash = hash_prompt_part(&skills_section);
-    let agents_hash = hash_prompt_part(&agents_section);
-    let key = SystemPromptStaticCacheKey {
-        workspace: workspace.to_path_buf(),
-        query,
-        enabled_skills_hash,
-        persona_hash,
-        behavior_hash,
-        tool_lines_hash,
-        mcp_note_hash,
-        skills_hash,
-        agents_hash,
-    };
-    let cache = SYSTEM_PROMPT_STATIC_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-
-    {
-        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(stable_prefix) = guard.get(&key) {
-            SYSTEM_PROMPT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-            return stable_prefix.clone();
-        }
-    }
-
-    SYSTEM_PROMPT_CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-    let stable_prefix = format!(
-        r#"{persona}
-
-{prompt_file_note}
-
-{agent_behavior_section}
-
-## Available Tools
-{tool_lines}{mcp_note}{skills_section}{agents_section}"#,
-        persona = persona,
-        prompt_file_note = PROMPT_FILE_NOTE,
-        agent_behavior_section = agent_behavior_section,
-        tool_lines = tool_lines,
-        mcp_note = mcp_note,
-        skills_section = skills_section,
-        agents_section = agents_section,
-    );
-
-    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if guard.len() >= SYSTEM_PROMPT_CACHE_MAX_ENTRIES {
-        guard.clear();
-    }
-    guard.insert(key, stable_prefix.clone());
-    stable_prefix
-}
-
-pub(crate) fn system_prompt_cache_metrics() -> (u64, u64) {
-    (
-        SYSTEM_PROMPT_CACHE_HITS.load(Ordering::Relaxed),
-        SYSTEM_PROMPT_CACHE_MISSES.load(Ordering::Relaxed),
-    )
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-fn build_system_prompt_with_query(
-    config: &Config,
-    workspace: &Path,
-    model: &str,
-    enabled_system_skills: &HashSet<String>,
-    current_query: Option<&str>,
-) -> ChatMessage {
-    let os_name = if cfg!(windows) {
-        "Windows"
-    } else if cfg!(target_os = "macos") {
-        "macOS"
-    } else {
-        "Linux"
-    };
-    let cwd = workspace.display();
-    let local_snapshot = prompts::current_local_snapshot();
-    let local_time = local_snapshot.datetime_label();
-    let tool_lines = tools::render_tool_prompt_lines_with_query(config, current_query);
-    let prompt_files = prompts::load_session_prompt_files_with_snapshot(workspace, local_snapshot);
-    let persona = prompt_files.persona;
-    let memory_files = prompt_files.memory;
-    let mcp_note = tools::mcp::runtime_tool_note(config, workspace)
-        .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
-        .unwrap_or_default();
-
-    let skills_section = prompts::discover_all_skills(workspace)
-        .into_iter()
-        .filter(|s| {
-            s.source != prompts::SkillSource::System
-                || prompts::is_system_skill_enabled(&s.path, enabled_system_skills)
-        })
-        .collect::<Vec<_>>();
-    let skills_section = prompts::render_skills_catalog(&skills_section, current_query)
-        .map(|s| format!("\n\n{s}"))
-        .unwrap_or_default();
-
-    // Structured memory injection (coexists with MEMORY.md and daily memory)
-    let structured_memory_section = if config.structured_memory {
-        memory::format_memory_for_injection(
-            &memory::load_structured_memory(workspace),
-            current_query,
-        )
-        .map(|s| format!("\n\n{s}"))
-        .unwrap_or_default()
-    } else {
-        String::new()
-    };
-
-    // Sub-agent catalog (discovered from system/global/session layers)
-    let agents_section = {
-        let agents = subagents::discovery::discover_all_agents(workspace);
-        subagents::render_agents_catalog_with_query(&agents, current_query)
-            .map(|s| format!("\n\n{s}"))
-            .unwrap_or_default()
-    };
-
-    let prompt = format!(
-        r#"{persona}
-
-{prompt_file_note}
-
-## Agent Behavior
-
-You operate in a ReAct loop: **Analyze** the situation, **Act** by calling tools, **Observe** the results, then either loop or **Finish**.
-
-- **Tool strategy:** Prefer calling tools to gather information over speculating. Batch independent read-only calls together. Run write operations one at a time.
-- **Error recovery:** When a tool fails, diagnose the cause and try a different approach — different arguments, a different tool, or an alternative path. Do not repeat the same failing call.
-- **Delegation:** For complex, self-contained subtasks, delegate to a sub-agent via the `task` tool. Handle simple, quick work yourself.
-- **Finishing:** When the task is complete, deliver your result. When you are genuinely stuck with no further options, say so honestly. Do not pad with speculative follow-ups.
-
-## Available Tools
-{tool_lines}{mcp_note}{skills_section}{agents_section}
-
----
-
-## Memory
-{memory_files}{structured_memory_section}
-
-## Environment
-- OS: {os_name}
-- Current system local time: {local_time}
-- Working directory: {cwd}
-- Model: {model}"#, // The `---\n## Memory\n` prefix above is used as the cache-split
-        // delimiter by ENV_BLOCK_DELIMITER in providers.rs — keep them in sync.
-        model = model,
-        local_time = local_time,
-        tool_lines = tool_lines,
-        persona = persona,
-        prompt_file_note = PROMPT_FILE_NOTE,
-        mcp_note = mcp_note,
-        skills_section = skills_section,
-        memory_files = memory_files,
-        structured_memory_section = structured_memory_section,
-        agents_section = agents_section,
-    );
-
-    ChatMessage {
-        role: "system".into(),
-        content: Some(prompt),
-        images: None,
-        thinking: None,
-        anthropic_thinking_blocks: None,
-        tool_calls: None,
-        tool_call_id: None,
-        timestamp: None,
-    }
-}
-
-// ── Security ─────────────────────────────────────────────────────────────────────────────
-
-fn build_system_prompt_with_query_cached(
-    config: &Config,
-    workspace: &Path,
-    model: &str,
-    enabled_system_skills: &HashSet<String>,
-    current_query: Option<&str>,
-) -> ChatMessage {
-    build_system_prompt_with_query_cached_for_tool_mode(
-        config,
-        workspace,
-        model,
-        enabled_system_skills,
-        current_query,
-        SystemPromptToolMode::Execute,
-    )
-}
-
-pub(crate) fn build_system_prompt_with_query_cached_for_tool_mode(
-    config: &Config,
-    workspace: &Path,
-    model: &str,
-    enabled_system_skills: &HashSet<String>,
-    current_query: Option<&str>,
-    tool_mode: SystemPromptToolMode,
-) -> ChatMessage {
-    let os_name = if cfg!(windows) {
-        "Windows"
-    } else if cfg!(target_os = "macos") {
-        "macOS"
-    } else {
-        "Linux"
-    };
-    let cwd = workspace.display();
-    let local_snapshot = prompts::current_local_snapshot();
-    let local_time = local_snapshot.datetime_label();
-    let agent_behavior_section = tool_mode.agent_behavior_section();
-    let tool_lines = if tool_mode.is_plan_only() {
-        tools::render_read_only_tool_prompt_lines(config)
-    } else {
-        tools::render_tool_prompt_lines_with_query(config, current_query)
-    };
-    let prompt_files = prompts::load_session_prompt_files_with_snapshot(workspace, local_snapshot);
-    let persona = prompt_files.persona;
-    let memory_files = prompt_files.memory;
-    let mcp_note = if tool_mode.is_plan_only() {
-        String::new()
-    } else {
-        tools::mcp::runtime_tool_note(config, workspace)
-            .map(|note| format!("\n\n## MCP Runtime\n- {note}"))
-            .unwrap_or_default()
-    };
-
-    let skills_section = prompts::discover_all_skills(workspace)
-        .into_iter()
-        .filter(|s| {
-            s.source != prompts::SkillSource::System
-                || prompts::is_system_skill_enabled(&s.path, enabled_system_skills)
-        })
-        .collect::<Vec<_>>();
-    let skills_section = prompts::render_skills_catalog(&skills_section, current_query)
-        .map(|s| format!("\n\n{s}"))
-        .unwrap_or_default();
-
-    let structured_memory_section = if config.structured_memory {
-        memory::format_memory_for_injection(
-            &memory::load_structured_memory(workspace),
-            current_query,
-        )
-        .map(|s| format!("\n\n{s}"))
-        .unwrap_or_default()
-    } else {
-        String::new()
-    };
-
-    let agents_section = if tool_mode.is_plan_only() {
-        String::new()
-    } else {
-        let agents = subagents::discovery::discover_all_agents(workspace);
-        subagents::render_agents_catalog_with_query(&agents, current_query)
-            .map(|s| format!("\n\n{s}"))
-            .unwrap_or_default()
-    };
-
-    let stable_prefix = build_system_prompt_static_prefix_cached(
-        workspace,
-        current_query,
-        enabled_system_skills,
-        &persona,
-        agent_behavior_section,
-        &tool_lines,
-        &mcp_note,
-        &skills_section,
-        &agents_section,
-    );
-    let prompt = format!(
-        r#"{stable_prefix}
-
----
-## Memory
-{memory_files}{structured_memory_section}
-
-## Environment
-- OS: {os_name}
-- Current system local time: {local_time}
-- Working directory: {cwd}
-- Model: {model}"#, // The `---\n## Memory\n` prefix above is used as the cache-split
-        // delimiter by ENV_BLOCK_DELIMITER in providers.rs - keep them in sync.
-        stable_prefix = stable_prefix,
-        memory_files = memory_files,
-        structured_memory_section = structured_memory_section,
-        os_name = os_name,
-        local_time = local_time,
-        cwd = cwd,
-        model = model,
-    );
-
-    ChatMessage {
-        role: "system".into(),
-        content: Some(prompt),
-        images: None,
-        thinking: None,
-        anthropic_thinking_blocks: None,
-        tool_calls: None,
-        tool_call_id: None,
-        timestamp: None,
-    }
-}
-
-const DANGEROUS_PATTERNS: &[&str] = &[
-    "rm -rf /",
-    "rm -rf /*",
-    "rm -rf ~",
-    "mkfs.",
-    "dd if=/dev",
-    ":(){ :|:&",
-    "> /dev/sda",
-    "chmod -r 777 /",
-    "chown -r root",
-    "format c:",
-    "del /f /s /q c:\\",
-    "rd /s /q c:\\",
-    "reg delete hk",
-];
-
-/// Collapse repeated whitespace to a single space for robust pattern matching.
-fn normalize_command_whitespace(cmd: &str) -> String {
-    cmd.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn check_dangerous_command(cmd: &str) -> Option<&'static str> {
-    let lower = normalize_command_whitespace(cmd).to_lowercase();
-    DANGEROUS_PATTERNS
-        .iter()
-        .find(|&&pattern| lower.contains(pattern))
-        .copied()
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn resolve_path(path_str: &str, workspace: &Path) -> PathBuf {
-    let ws_canonical = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    let raw = Path::new(path_str);
-    let relative = if raw.is_absolute() {
-        match raw.strip_prefix(&ws_canonical) {
-            Ok(rel) => rel.to_path_buf(),
-            Err(_) => {
-                eprintln!("SECURITY: path '{}' escapes workspace, clamped", path_str);
-                return ws_canonical;
-            }
-        }
-    } else {
-        raw.to_path_buf()
-    };
-
-    let mut resolved = ws_canonical.clone();
-    for comp in relative.components() {
-        match comp {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if resolved == ws_canonical {
-                    eprintln!("SECURITY: path '{}' escapes workspace, clamped", path_str);
-                    return ws_canonical;
-                }
-                resolved.pop();
-            }
-            std::path::Component::Normal(part) => {
-                let candidate = resolved.join(part);
-                if let Ok(meta) = std::fs::symlink_metadata(&candidate)
-                    && meta.file_type().is_symlink()
-                {
-                    let escaped_workspace = candidate
-                        .canonicalize()
-                        .ok()
-                        .is_some_and(|target| !target.starts_with(&ws_canonical));
-                    eprintln!(
-                        "SECURITY: path '{}' traverses symlink '{}'{}clamped",
-                        path_str,
-                        candidate.display(),
-                        if escaped_workspace {
-                            " that escapes workspace, "
-                        } else {
-                            ", "
-                        }
-                    );
-                    return ws_canonical;
-                }
-                if let Ok(canon) = candidate.canonicalize()
-                    && !canon.starts_with(&ws_canonical)
-                {
-                    eprintln!(
-                        "SECURITY: path '{}' resolves outside workspace via '{}', clamped",
-                        path_str,
-                        candidate.display()
-                    );
-                    return ws_canonical;
-                }
-                resolved = candidate;
-            }
-            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
-                eprintln!(
-                    "SECURITY: absolute path '{}' is not allowed, clamped",
-                    path_str
-                );
-                return ws_canonical;
-            }
-        }
-    }
-
-    resolved
-}
-
-fn resolve_path_checked(path_str: &str, workspace: &Path) -> Result<PathBuf, String> {
-    let workspace_root = workspace
-        .canonicalize()
-        .unwrap_or_else(|_| workspace.to_path_buf());
-    let raw = Path::new(path_str);
-    let relative = if raw.is_absolute() {
-        if let Ok(relative) = raw.strip_prefix(workspace) {
-            relative.to_path_buf()
-        } else if let Ok(relative) = raw.strip_prefix(&workspace_root) {
-            relative.to_path_buf()
-        } else if let Ok(canonical_raw) = raw.canonicalize() {
-            canonical_raw
-                .strip_prefix(&workspace_root)
-                .map(PathBuf::from)
-                .map_err(|_| {
-                    format!(
-                        "path '{}' is outside the session workspace '{}'",
-                        path_str,
-                        workspace_root.display()
-                    )
-                })?
-        } else {
-            return Err(format!(
-                "path '{}' is outside the session workspace '{}'",
-                path_str,
-                workspace_root.display()
-            ));
-        }
-    } else {
-        raw.to_path_buf()
-    };
-
-    if relative.components().any(|component| {
-        matches!(component, std::path::Component::Normal(part) if part == ".lingclaw-bootstrap")
-    }) {
-        return Err(format!(
-            "path '{}' targets protected internal workspace data",
-            path_str
-        ));
-    }
-
-    let mut resolved = workspace_root.clone();
-    for component in relative.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if resolved == workspace_root {
-                    return Err(format!(
-                        "path '{}' is outside the session workspace '{}'",
-                        path_str,
-                        workspace_root.display()
-                    ));
-                }
-                resolved.pop();
-            }
-            std::path::Component::Normal(part) => {
-                let candidate = resolved.join(part);
-                if let Ok(meta) = std::fs::symlink_metadata(&candidate)
-                    && meta.file_type().is_symlink()
-                {
-                    let escaped_workspace = candidate
-                        .canonicalize()
-                        .ok()
-                        .is_some_and(|target| !target.starts_with(&workspace_root));
-                    return Err(format!(
-                        "path '{}' traverses symlink '{}'{}outside the session workspace '{}'",
-                        path_str,
-                        candidate.display(),
-                        if escaped_workspace {
-                            " that resolves "
-                        } else {
-                            " "
-                        },
-                        workspace_root.display()
-                    ));
-                }
-                if let Ok(canon) = candidate.canonicalize()
-                    && !canon.starts_with(&workspace_root)
-                {
-                    return Err(format!(
-                        "path '{}' resolves outside the session workspace '{}' via '{}'",
-                        path_str,
-                        workspace_root.display(),
-                        candidate.display()
-                    ));
-                }
-                resolved = candidate;
-            }
-            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
-                return Err(format!(
-                    "path '{}' is outside the session workspace '{}'",
-                    path_str,
-                    workspace_root.display()
-                ));
-            }
-        }
-    }
-
-    Ok(resolved)
-}
-
 fn generate_secret_token() -> Result<String, String> {
     let mut bytes = [0_u8; 32];
     getrandom::getrandom(&mut bytes)
@@ -1537,7 +943,7 @@ fn validate_loopback_host_header(
     Ok(())
 }
 
-fn validate_local_request_headers(
+pub(crate) fn validate_local_request_headers(
     headers: &HeaderMap,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     validate_loopback_host_header(headers)?;
@@ -1700,26 +1106,6 @@ fn is_cjk_char(c: char) -> bool {
     )
 }
 
-fn format_size(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    }
-}
-
-fn matches_glob(name: &str, pattern: &str) -> bool {
-    if let Some(ext) = pattern.strip_prefix("*.") {
-        name.ends_with(&format!(".{ext}"))
-    } else if let Some(prefix) = pattern.strip_suffix('*') {
-        name.starts_with(prefix)
-    } else {
-        name == pattern
-    }
-}
-
 pub(crate) type WsTx = mpsc::Sender<String>;
 pub(crate) type LiveTx = mpsc::Sender<serde_json::Value>;
 pub(crate) const LIVE_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -1766,8 +1152,9 @@ pub(crate) async fn send_session_client_event(
 pub(crate) async fn send_group_client_event(
     state: &AppState,
     group_id: &str,
-    event: serde_json::Value,
+    event: session_control::GroupClientEvent,
 ) {
+    let session_control::GroupClientEvent { payload, droppable } = event;
     let client = {
         let clients = state.group_clients.lock().await;
         clients
@@ -1777,11 +1164,33 @@ pub(crate) async fn send_group_client_event(
     let Some((connection_id, tx)) = client else {
         return;
     };
-    if tx.try_send(event.to_string()).is_err() {
-        let mut clients = state.group_clients.lock().await;
-        if clients.get(group_id).map(|binding| binding.connection_id) == Some(connection_id) {
-            clients.remove(group_id);
+    match tx.try_send(payload.to_string()) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) if droppable => {}
+        Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+            let stale = {
+                let mut clients = state.group_clients.lock().await;
+                if clients.get(group_id).map(|binding| binding.connection_id) == Some(connection_id)
+                {
+                    clients.remove(group_id)
+                } else {
+                    None
+                }
+            };
+            if let Some(binding) = stale {
+                binding.cancel.cancel();
+            }
         }
+    }
+}
+
+pub(crate) async fn close_group_client(state: &AppState, group_id: &str) {
+    let binding = {
+        let mut clients = state.group_clients.lock().await;
+        clients.remove(group_id)
+    };
+    if let Some(binding) = binding {
+        binding.cancel.cancel();
     }
 }
 
@@ -1808,9 +1217,7 @@ async fn queue_live_client_events(
     events: Vec<serde_json::Value>,
 ) -> Option<QueueLiveClientEventsResult> {
     let mut clients = state.session_clients.lock().await;
-    let Some(binding) = clients.get_mut(session_id) else {
-        return None;
-    };
+    let binding = clients.get_mut(session_id)?;
 
     queue_live_client_events_for_binding(binding, events)
 }
@@ -2012,9 +1419,7 @@ async fn take_live_client_events_for_send(
     event: serde_json::Value,
 ) -> Option<QueueLiveClientEventsResult> {
     let mut clients = state.session_clients.lock().await;
-    let Some(binding) = clients.get_mut(session_id) else {
-        return None;
-    };
+    let binding = clients.get_mut(session_id)?;
     if binding.connection_id != connection_id {
         return None;
     }
@@ -2108,11 +1513,10 @@ async fn record_tool_output_event_for_replay_and_client(
                 let stream = event["stream"].as_str();
                 if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
                     merge_live_tool_output(&mut tool.live_output, stream, chunk);
-                    if tool.arguments.is_empty() {
-                        if let Some(tool_call_event) = synthetic_tool_call_event_for_output(&event)
-                        {
-                            client_events.push(tool_call_event);
-                        }
+                    if tool.arguments.is_empty()
+                        && let Some(tool_call_event) = synthetic_tool_call_event_for_output(&event)
+                    {
+                        client_events.push(tool_call_event);
                     }
                 } else {
                     if let Some(tool_call_event) = synthetic_tool_call_event_for_output(&event) {
@@ -2923,8 +2327,8 @@ fn live_round_replay_events(live_round: &LiveRoundState) -> Vec<serde_json::Valu
     }
 
     let mut events = Vec::new();
-    let compression_event = compression_replay_event(&live_round);
-    let pruned_event = compression_pruned_replay_event(&live_round);
+    let compression_event = compression_replay_event(live_round);
+    let pruned_event = compression_pruned_replay_event(live_round);
     if let Some(event) = compression_event {
         events.push(event);
     }
@@ -3038,21 +2442,6 @@ async fn replay_group_member_live_round(
 struct SessionQuery {
     #[serde(default)]
     session: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct GroupQuery {
-    #[serde(default)]
-    group: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionGroupRequest {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    members: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -3352,9 +2741,12 @@ async fn handle_group_socket(
     let (mut socket_tx, mut rx) = socket.split();
     let (tx, mut outbound_rx) = mpsc::channel::<String>(256);
     let connection_id = state.next_connection_id.fetch_add(1, Ordering::Relaxed);
+    let connection_cancel = CancellationToken::new();
+    let writer_cancel = connection_cancel.clone();
     let writer = tokio::spawn(async move {
         while let Some(msg) = outbound_rx.recv().await {
             if socket_tx.send(WsMsg::Text(msg.into())).await.is_err() {
+                writer_cancel.cancel();
                 break;
             }
         }
@@ -3388,7 +2780,29 @@ async fn handle_group_socket(
             return;
         }
     };
-    let Some(group) = session_group::load_group_from_disk(&group_id) else {
+    let group = {
+        let gate = session_group::group_persist_gate(&group_id);
+        let _guard = gate.lock().await;
+        let group = session_group::load_group_from_disk(&group_id);
+        if group.is_some() {
+            let mut clients = state.group_clients.lock().await;
+            // Cancel any prior connection bound to this group before replacing it, so a
+            // displaced socket (a second tab, or a reconnect racing teardown) is told to
+            // stop instead of lingering as a half-dead listener.
+            if let Some(previous) = clients.insert(
+                group_id.clone(),
+                GroupClientBinding {
+                    connection_id,
+                    tx: tx.clone(),
+                    cancel: connection_cancel.clone(),
+                },
+            ) {
+                previous.cancel.cancel();
+            }
+        }
+        group
+    };
+    let Some(group) = group else {
         let _ = ws_send(
             &tx,
             &json!({
@@ -3402,19 +2816,17 @@ async fn handle_group_socket(
         let _ = writer.await;
         return;
     };
-
-    {
-        let mut clients = state.group_clients.lock().await;
-        clients.insert(
-            group_id.clone(),
-            GroupClientBinding {
-                connection_id,
-                tx: tx.clone(),
-            },
-        );
-    }
-    ws_send(&tx, &session_group::group_info_payload(&group)).await;
-    ws_send(&tx, &session_group::group_history_payload(&group)).await;
+    let member_names = session_control::group_member_name_map(&state, &group).await;
+    ws_send(
+        &tx,
+        &session_group::group_info_payload(&group, &member_names),
+    )
+    .await;
+    ws_send(
+        &tx,
+        &session_group::group_history_payload(&group, &member_names),
+    )
+    .await;
     for run in group
         .runs
         .iter()
@@ -3426,10 +2838,15 @@ async fn handle_group_socket(
     let session_list = socket_sync::build_session_list_payload(&state);
     ws_send(&tx, &session_list).await;
 
-    while let Some(result) = rx.next().await {
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = connection_cancel.cancelled() => break,
+            result = rx.next() => result,
+        };
         let text = match result {
-            Ok(WsMsg::Text(text)) => text.to_string(),
-            Ok(WsMsg::Close(_)) | Err(_) => break,
+            Some(Ok(WsMsg::Text(text))) => text.to_string(),
+            Some(Ok(WsMsg::Close(_))) | Some(Err(_)) | None => break,
             _ => continue,
         };
         let trimmed = text.trim();
@@ -3540,9 +2957,7 @@ async fn handle_group_socket(
 }
 
 fn group_socket_requested_session_is_main(requested_session_id: Option<&str>) -> bool {
-    requested_session_id
-        .map(str::trim)
-        .is_some_and(|session_id| session_id.eq_ignore_ascii_case(MAIN_SESSION_ID))
+    requested_session_id.map(str::trim).is_some_and(is_main)
 }
 
 async fn switch_socket_session(
@@ -3653,7 +3068,7 @@ fn sort_session_json_values(list: &mut [serde_json::Value]) {
     list.sort_by(|a, b| {
         let a_id = a["id"].as_str().unwrap_or_default();
         let b_id = b["id"].as_str().unwrap_or_default();
-        match (a_id == MAIN_SESSION_ID, b_id == MAIN_SESSION_ID) {
+        match (is_main(a_id), is_main(b_id)) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
             _ => {
@@ -3739,7 +3154,7 @@ async fn api_post_session(
     let session_name = format!("Session {session_id}");
     let mut session = Session::new_with_id(&session_id, &session_name);
     let model = session.effective_model(&config.model).to_string();
-    let sys = build_system_prompt(
+    let sys = prompts::build_system_prompt(
         &config,
         &session.workspace,
         &model,
@@ -3852,188 +3267,19 @@ pub(crate) async fn broadcast_group_list_payload(state: &AppState) {
         clients.keys().cloned().collect::<Vec<_>>()
     };
     for group_id in group_ids {
-        send_group_client_event(state, &group_id, payload.clone()).await;
+        send_group_client_event(
+            state,
+            &group_id,
+            session_control::GroupClientEvent::reliable(payload.clone()),
+        )
+        .await;
     }
-}
-
-async fn api_session_groups(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(json!({
-        "groups": session_group::list_saved_group_summaries()
-            .into_iter()
-            .map(|summary| summary.to_json())
-            .collect::<Vec<_>>()
-    }))
-}
-
-async fn generate_available_group_id() -> Result<String, (StatusCode, Json<serde_json::Value>)> {
-    session_group::generate_available_group_id().map_err(|error| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "error": error })),
-        )
-    })
-}
-
-async fn api_post_session_group(
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<SessionGroupRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    validate_local_request_headers(&headers)?;
-
-    let group_id = generate_available_group_id().await?;
-    let name = match request.name.as_deref() {
-        Some(name) => session_group::validate_group_name(name)
-            .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?,
-        None => format!("Group {group_id}"),
-    };
-    let group = session_group::SessionGroup::new(&group_id, &name, request.members);
-    let gate = session_group::group_persist_gate(&group_id);
-    let _guard = gate.lock().await;
-    session_group::save_group_to_disk_locked(&group)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to save group: {error}") })),
-            )
-        })?;
-
-    broadcast_group_list_payload(&state).await;
-    Ok(Json(json!({
-        "ok": true,
-        "group": session_group::SessionGroupSummary::from_group(&group).to_json(),
-    })))
-}
-
-async fn api_get_session_group(
-    Query(query): Query<GroupQuery>,
-    State(_state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let group_id = query.group.as_deref().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Missing group id" })),
-        )
-    })?;
-    let group_id = session_group::validate_group_id(group_id)
-        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
-    let group = session_group::load_group_from_disk(group_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("Group '{}' not found", group_id) })),
-        )
-    })?;
-    Ok(Json(json!({"group": session_group::group_to_json(&group)})))
-}
-
-async fn api_put_session_group(
-    Query(query): Query<GroupQuery>,
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<SessionGroupRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    validate_local_request_headers(&headers)?;
-
-    let group_id = query.group.as_deref().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Missing group id" })),
-        )
-    })?;
-    let group_id = session_group::validate_group_id(group_id)
-        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?
-        .to_string();
-    let gate = session_group::group_persist_gate(&group_id);
-    let _guard = gate.lock().await;
-    let mut group = session_group::load_group_from_disk(&group_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("Group '{}' not found", group_id) })),
-        )
-    })?;
-    if let Some(name) = request.name.as_deref() {
-        group.name = session_group::validate_group_name(name)
-            .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
-    }
-    group.members = session_group::normalize_members(request.members);
-    group.updated_at = now_epoch();
-    session_group::save_group_to_disk_locked(&group)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to save group: {error}") })),
-            )
-        })?;
-
-    let group_event = session_group::group_info_payload(&group);
-    send_group_client_event(&state, &group.id, group_event).await;
-    broadcast_group_list_payload(&state).await;
-    Ok(Json(json!({
-        "ok": true,
-        "group": session_group::SessionGroupSummary::from_group(&group).to_json(),
-    })))
-}
-
-async fn api_delete_session_group(
-    Query(query): Query<GroupQuery>,
-    headers: HeaderMap,
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    validate_local_request_headers(&headers)?;
-
-    let group_id = query.group.as_deref().ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "Missing group id" })),
-        )
-    })?;
-    let group_id = session_group::validate_group_id(group_id)
-        .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?
-        .to_string();
-    let gate = session_group::group_persist_gate(&group_id);
-    let _guard = gate.lock().await;
-    let group = session_group::load_group_from_disk(&group_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("Group '{}' not found", group_id) })),
-        )
-    })?;
-    if session_group::group_has_active_runs(&group) {
-        return Err((
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": format!(
-                    "Group '{}' has queued or running session runs. Stop them before deleting the group.",
-                    group_id
-                )
-            })),
-        ));
-    }
-    session_group::delete_group_from_disk_locked(&group_id)
-        .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to delete group: {error}") })),
-            )
-        })?;
-    {
-        let mut clients = state.group_clients.lock().await;
-        clients.remove(&group_id);
-    }
-    broadcast_group_list_payload(&state).await;
-    Ok(Json(json!({"ok": true, "group_id": group_id})))
 }
 
 fn find_loaded_session_id(sessions: &HashMap<String, Session>, session_id: &str) -> Option<String> {
     sessions
         .keys()
-        .find(|existing_id| {
-            existing_id.as_str() == session_id
-                || (cfg!(windows) && existing_id.eq_ignore_ascii_case(session_id))
-        })
+        .find(|existing_id| session_ids_match(existing_id, session_id))
         .cloned()
 }
 
@@ -4559,7 +3805,7 @@ fn mcp_oauth_timeout_secs(config: &Config, server_name: &str) -> u64 {
         .mcp_servers
         .get(server_name)
         .and_then(|server| server.timeout_secs)
-        .unwrap_or_else(|| config.tool_timeout.as_secs())
+        .unwrap_or(config.tool_timeout.as_secs())
         .max(1)
 }
 
@@ -5409,10 +4655,10 @@ async fn api_usage(
     };
 
     let mut sessions = state.sessions.lock().await;
-    if !sessions.contains_key(session_id.as_str()) {
-        if let Some(session) = load_session_from_disk(&session_id) {
-            sessions.insert(session_id.clone(), session);
-        }
+    if !sessions.contains_key(session_id.as_str())
+        && let Some(session) = load_session_from_disk(&session_id)
+    {
+        sessions.insert(session_id.clone(), session);
     }
     let session = sessions.get_mut(session_id.as_str());
     let (
@@ -5751,13 +4997,21 @@ async fn main() {
         .route("/api/client-config", get(api_client_config))
         .route("/api/sessions", get(api_sessions))
         .route("/api/session", post(api_post_session).put(api_put_session))
-        .route("/api/session-groups", get(api_session_groups))
+        .route(
+            "/api/session-groups",
+            get(session_control::api_session_groups),
+        )
         .route(
             "/api/session-group",
-            get(api_get_session_group)
-                .post(api_post_session_group)
-                .put(api_put_session_group)
-                .delete(api_delete_session_group),
+            get(session_control::api_get_session_group)
+                .post(session_control::api_post_session_group)
+                .put(session_control::api_put_session_group)
+                .delete(session_control::api_delete_session_group),
+        )
+        .route(
+            "/api/session-group/member",
+            put(session_control::api_promote_session_group_admin)
+                .delete(session_control::api_delete_session_group_member),
         )
         .route(
             "/api/session-skills",
@@ -5832,9 +5086,8 @@ async fn main() {
         let guard = state.sessions.lock().await;
         guard
             .iter()
-            .filter_map(|(session_id, session)| {
-                (session.messages.len() > 1).then(|| session_id.clone())
-            })
+            .filter(|&(_, session)| session.messages.len() > 1)
+            .map(|(session_id, _)| session_id.clone())
             .collect()
     };
     for session_id in &session_ids {

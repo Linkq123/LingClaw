@@ -28,7 +28,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project-wide constraints
 
-- `src/main.rs` must stay under 6000 lines.
+- `src/main.rs` must stay under 10000 lines.
 - Do not add new dependencies without justification.
 - Production Rust code should avoid `.unwrap()`.
 - Run `cargo clippy` and `cargo fmt` before finalizing backend changes.
@@ -102,9 +102,13 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 - The app keeps `main` as the default session, but now supports multiple persisted sessions and frontend session switching.
 - Session groups are persistent group chats. A group has its own history and run list; dispatched member sessions also receive a normal user message containing group context plus the main instruction, so both group history and target session history are intentionally written.
 - Group deletion is refused while any member run is `queued` or `running`; callers should stop those runs first with group socket `{"type":"group_stop"}` or `session_control.stop` instead of relying on delete to cancel background work.
+- `main` is the implicit owner/admin for every group and must not be included in group dispatch `members`. Promoted admins live in `admins[]`; promoted-admin member removal uses a 2/3 approval threshold over promoted admins only, while `main`/owner UI removal is direct.
+- Group mentions use only `@session-id` as protocol. The UI may render valid tokens as `@Session Name`, but display names must not be parsed as routing targets. `@all` may dispatch optional replies; empty or `NO_REPLY` member outputs are not persisted as group messages.
+- Group chat UI should keep process noise low: queued/running/done cards and normal member live events are not rendered as chat cards; errors, management/vote system messages, and final member replies remain visible.
 - `session_control` is only available to the `main` session in execute mode. PlanOnly, non-main sessions, and sub-agents must not expose it, and the backend executor still rejects non-main calls.
 - `session_control.list_sessions` is intentionally lightweight: it must not scan every session workspace for prompt summaries, Skills, MCP tools, or persona details. Use `session_control.describe_session` for one target session when detailed capability discovery is needed.
 - `session_control.create_session` may create a new session with initial purpose/profile text, but must not modify an existing session's prompt identity files. Generated profile summaries must not expose secrets, MCP headers, environment variables, complete system prompts, or full persona files.
+- `session_control.delete_session` must keep the `/delete` safety model: never delete `main`, an active connected session, or a session with active/queued delegated work; successful deletion removes both persisted JSON and the default workspace directory.
 - `session_control.dispatch` is for controlling other sessions and must reject `main` as a target, including trimmed/normalized variants, so the main run never waits on a queued run behind itself.
 - OpenAI family currently has two protocol kinds: `openai-completions` (`/v1/chat/completions`) and `openai-responses` (`/v1/responses`). Both conversation paths use native upstream streaming; Responses requests set `stream: true` and map Responses SSE events into LingClaw's existing live events.
 - The frontend session switcher lives in a collapsible left drawer; the Todos panel is a local visibility toggle and defaults to hidden on first load.

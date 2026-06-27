@@ -2,6 +2,7 @@ use super::*;
 
 use std::collections::HashSet;
 
+use crate::prompts::build_system_prompt;
 use crate::session_store::load_session_from_disk;
 use crate::socket_sync::broadcast_session_list_payload;
 use serde::Deserialize;
@@ -109,10 +110,7 @@ pub(crate) async fn ensure_session_ready(
         let mut sessions = state.sessions.lock().await;
         if let Some(existing_session_id) = sessions
             .keys()
-            .find(|existing_id| {
-                *existing_id == &effective_session_id
-                    || (cfg!(windows) && existing_id.eq_ignore_ascii_case(&effective_session_id))
-            })
+            .find(|existing_id| crate::session_ids_match(existing_id, &effective_session_id))
             .cloned()
         {
             let session = sessions
@@ -124,7 +122,7 @@ pub(crate) async fn ensure_session_ready(
     }
 
     let config = state.config();
-    let display_name = if effective_session_id == MAIN_SESSION_ID {
+    let display_name = if crate::is_main(&effective_session_id) {
         "Main".to_string()
     } else {
         effective_session_id.clone()

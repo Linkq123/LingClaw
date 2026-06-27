@@ -1,7 +1,14 @@
 use super::*;
 use crate::config::JsonMcpServerConfig;
+use crate::prompts::{build_system_prompt_with_query_cached, system_prompt_cache_metrics};
+use crate::session_control::{
+    GroupQuery, SessionGroupRequest, api_delete_session_group, api_get_session_group,
+    api_post_session_group, api_put_session_group,
+};
 use crate::session_store::load_session_from_disk;
 use crate::session_store::replace_session_file_from_temp;
+use crate::tools::fs::{format_size, matches_glob};
+use crate::tools::safety::{check_dangerous_command, resolve_path, resolve_path_checked};
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::IntoResponse;
 use serde_json::{Value, json};
@@ -4248,6 +4255,44 @@ fn resolve_session_target_rejects_ambiguous_prefix() {
 }
 
 #[test]
+fn validate_session_id_canonicalizes_case_variant_main() {
+    // Every case/whitespace variant of the main id canonicalizes to the literal
+    // "main", so a distinct "Main" session can never be created on any filesystem.
+    for id in ["main", "Main", "MAIN", "mAiN", "  Main  "] {
+        let resolved =
+            crate::session_store::validate_session_id(id).expect("main variants must validate");
+        assert_eq!(resolved, crate::MAIN_SESSION_ID, "{id}");
+    }
+}
+
+#[test]
+fn is_main_is_case_insensitive_and_word_exact() {
+    // Never false-accept a genuinely different session (mainframe/main2) as main.
+    assert!(crate::is_main("main"));
+    assert!(crate::is_main("Main"));
+    assert!(crate::is_main("MAIN"));
+    assert!(!crate::is_main("main2"));
+    assert!(!crate::is_main("mainframe"));
+    assert!(!crate::is_main(""));
+}
+
+#[test]
+fn session_ids_match_preserves_existing_policy() {
+    assert!(crate::session_ids_match("abc", "abc"));
+    assert!(!crate::session_ids_match("abc", "def"));
+    // Case-insensitive equality only when running on Windows.
+    assert_eq!(crate::session_ids_match("Abc", "abc"), cfg!(windows));
+}
+
+#[test]
+fn resolve_session_target_canonicalizes_main_variant() {
+    let known_ids = HashSet::from(["main".to_string(), "other".to_string()]);
+    let resolved = resolve_session_target("Main", &known_ids)
+        .expect("main variant should resolve to canonical main");
+    assert_eq!(resolved, "main");
+}
+
+#[test]
 fn list_saved_session_ids_in_dir_uses_filenames_even_for_invalid_json() {
     let base = std::env::temp_dir().join(format!("lingclaw-test-{}", now_epoch()));
     std::fs::create_dir_all(&base).expect("temp dir should be created");
@@ -4329,7 +4374,7 @@ fn resolve_or_create_socket_session_honors_requested_session() {
         session_id: session_id.clone(),
         workspace: session_workspace,
     };
-    let (tx, mut rx) = mpsc::channel::<String>(4);
+    let (tx, mut rx) = mpsc::channel::<String>(8);
 
     let connection_cancel = CancellationToken::new();
     let resolved = rt.block_on(resolve_or_create_socket_session(
@@ -5381,12 +5426,13 @@ async fn api_session_group_crud_round_trip() {
         State(state.clone()),
         Json(SessionGroupRequest {
             name: Some("Review Group".to_string()),
-            members: vec![
+            members: Some(vec![
                 "worker-a".to_string(),
                 "worker-b".to_string(),
                 "worker-a".to_string(),
+                "main".to_string(),
                 "bad/name".to_string(),
-            ],
+            ]),
         }),
     )
     .await
@@ -5414,7 +5460,9 @@ async fn api_session_group_crud_round_trip() {
         get_payload["group"]["members"],
         json!(["worker-a", "worker-b"])
     );
-    assert_eq!(get_payload["group"]["version"].as_u64(), Some(1));
+    assert_eq!(get_payload["group"]["version"].as_u64(), Some(2));
+    assert_eq!(get_payload["group"]["member_details"][0]["id"], "main");
+    assert_eq!(get_payload["group"]["member_details"][0]["role"], "owner");
 
     let Json(update_payload) = api_put_session_group(
         Query(GroupQuery {
@@ -5424,7 +5472,7 @@ async fn api_session_group_crud_round_trip() {
         State(state.clone()),
         Json(SessionGroupRequest {
             name: Some("Backend Review".to_string()),
-            members: vec!["worker-a".to_string()],
+            members: Some(vec!["worker-a".to_string()]),
         }),
     )
     .await
@@ -5446,6 +5494,69 @@ async fn api_session_group_crud_round_trip() {
     .expect("group should delete");
     assert_eq!(delete_payload["ok"].as_bool(), Some(true));
     assert!(crate::session_group::load_group_from_disk(&group_id).is_none());
+}
+
+#[tokio::test]
+async fn api_put_session_group_name_only_preserves_members() {
+    let state = Arc::new(test_app_state());
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let Json(create_payload) = api_post_session_group(
+        headers.clone(),
+        State(state.clone()),
+        Json(SessionGroupRequest {
+            name: Some("Keep Members".to_string()),
+            members: Some(vec!["worker-a".to_string(), "worker-b".to_string()]),
+        }),
+    )
+    .await
+    .expect("group should be created");
+    let group_id = create_payload["group"]["id"]
+        .as_str()
+        .expect("created group id should be present")
+        .to_string();
+
+    // Name-only update: members omitted (None) must NOT wipe the roster.
+    let Json(update_payload) = api_put_session_group(
+        Query(GroupQuery {
+            group: Some(group_id.clone()),
+        }),
+        headers.clone(),
+        State(state.clone()),
+        Json(SessionGroupRequest {
+            name: Some("Renamed".to_string()),
+            members: None,
+        }),
+    )
+    .await
+    .expect("group should update");
+    assert_eq!(update_payload["group"]["name"].as_str(), Some("Renamed"));
+    assert_eq!(update_payload["group"]["members"].as_u64(), Some(2));
+
+    // Confirm the persisted roster survived the rename.
+    let Json(get_payload) = api_get_session_group(
+        Query(GroupQuery {
+            group: Some(group_id.clone()),
+        }),
+        State(state.clone()),
+    )
+    .await
+    .expect("group should load");
+    assert_eq!(
+        get_payload["group"]["members"],
+        json!(["worker-a", "worker-b"])
+    );
+
+    let _ = api_delete_session_group(
+        Query(GroupQuery {
+            group: Some(group_id.clone()),
+        }),
+        headers,
+        State(state),
+    )
+    .await
+    .expect("group should delete");
 }
 
 #[tokio::test]
@@ -5507,6 +5618,144 @@ async fn api_delete_session_group_rejects_active_runs() {
     crate::session_group::delete_group_from_disk_locked(&group_id)
         .await
         .expect("group should clean up");
+}
+
+#[tokio::test]
+async fn close_group_client_removes_binding_and_cancels_socket() {
+    let state = test_app_state();
+    let (tx, _rx) = mpsc::channel::<String>(1);
+    let cancel = CancellationToken::new();
+    {
+        let mut clients = state.group_clients.lock().await;
+        clients.insert(
+            "close-client-test".to_string(),
+            GroupClientBinding {
+                connection_id: 7,
+                tx,
+                cancel: cancel.clone(),
+            },
+        );
+    }
+
+    close_group_client(&state, "close-client-test").await;
+
+    assert!(cancel.is_cancelled());
+    assert!(
+        !state
+            .group_clients
+            .lock()
+            .await
+            .contains_key("close-client-test")
+    );
+}
+
+#[tokio::test]
+async fn full_group_client_channel_drops_live_event_and_keeps_socket_alive() {
+    let state = test_app_state();
+    let (tx, mut rx) = mpsc::channel::<String>(1);
+    tx.try_send("queued".to_string())
+        .expect("test channel should accept first event");
+    let cancel = CancellationToken::new();
+    {
+        let mut clients = state.group_clients.lock().await;
+        clients.insert(
+            "full-client-test".to_string(),
+            GroupClientBinding {
+                connection_id: 8,
+                tx,
+                cancel: cancel.clone(),
+            },
+        );
+    }
+
+    send_group_client_event(
+        &state,
+        "full-client-test",
+        crate::session_control::GroupClientEvent::droppable(json!({"type":"group_member_event"})),
+    )
+    .await;
+
+    assert!(!cancel.is_cancelled());
+    assert!(
+        state
+            .group_clients
+            .lock()
+            .await
+            .contains_key("full-client-test")
+    );
+    assert_eq!(rx.recv().await.as_deref(), Some("queued"));
+}
+
+#[tokio::test]
+async fn full_group_client_channel_cancels_socket_for_durable_event() {
+    let state = test_app_state();
+    let (tx, mut rx) = mpsc::channel::<String>(1);
+    tx.try_send("queued".to_string())
+        .expect("test channel should accept first event");
+    let cancel = CancellationToken::new();
+    {
+        let mut clients = state.group_clients.lock().await;
+        clients.insert(
+            "full-durable-client-test".to_string(),
+            GroupClientBinding {
+                connection_id: 10,
+                tx,
+                cancel: cancel.clone(),
+            },
+        );
+    }
+
+    send_group_client_event(
+        &state,
+        "full-durable-client-test",
+        crate::session_control::GroupClientEvent::reliable(json!({"type":"group_message"})),
+    )
+    .await;
+
+    assert!(cancel.is_cancelled());
+    assert!(
+        !state
+            .group_clients
+            .lock()
+            .await
+            .contains_key("full-durable-client-test")
+    );
+    assert_eq!(rx.recv().await.as_deref(), Some("queued"));
+}
+
+#[tokio::test]
+async fn closed_group_client_channel_removes_binding_and_cancels_socket() {
+    let state = test_app_state();
+    let (tx, rx) = mpsc::channel::<String>(1);
+    drop(rx);
+    let cancel = CancellationToken::new();
+    {
+        let mut clients = state.group_clients.lock().await;
+        clients.insert(
+            "closed-client-test".to_string(),
+            GroupClientBinding {
+                connection_id: 9,
+                tx,
+                cancel: cancel.clone(),
+            },
+        );
+    }
+
+    send_group_client_event(
+        &state,
+        "closed-client-test",
+        crate::session_control::GroupClientEvent::droppable(json!({"type":"group_member_event"})),
+    )
+    .await;
+
+    assert!(cancel.is_cancelled());
+    assert!(
+        !state
+            .group_clients
+            .lock()
+            .await
+            .contains_key("closed-client-test")
+    );
 }
 
 #[tokio::test]
@@ -8132,13 +8381,24 @@ fn switch_socket_session_binds_new_session_before_replay_so_live_events_are_not_
 
     let payloads = rt.block_on(async {
         let mut events = Vec::new();
-        for _ in 0..6 {
-            let payload = tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv())
-                .await
-                .expect("payload should arrive before timeout")
-                .expect("channel should stay open during switch replay");
-            events.push(serde_json::from_str::<serde_json::Value>(&payload).expect("payload json"));
-        }
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                let payload = rx
+                    .recv()
+                    .await
+                    .expect("channel should stay open during switch replay");
+                let event =
+                    serde_json::from_str::<serde_json::Value>(&payload).expect("payload json");
+                let saw_tail_delta =
+                    event["type"] == "delta" && event["content"] == "tail after switch";
+                events.push(event);
+                if saw_tail_delta {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("tail delta should arrive before timeout");
         events
     });
 
@@ -11035,21 +11295,19 @@ fn live_dispatch_serializes_normal_events_after_recovered_tool_output_flush() {
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
-    let forward = rt.block_on(async {
-        tokio::spawn(async move {
-            forward_tool_output_event_best_effort(
-                &dummy_live_tx,
-                json!({
-                    "type":"tool_output",
-                    "id":"tool-1",
-                    "name":"exec",
-                    "stream":"stdout",
-                    "chunk":"queued output",
-                }),
-                Some(&replay_ctx),
-            )
-            .await;
-        })
+    let forward = rt.spawn(async move {
+        forward_tool_output_event_best_effort(
+            &dummy_live_tx,
+            json!({
+                "type":"tool_output",
+                "id":"tool-1",
+                "name":"exec",
+                "stream":"stdout",
+                "chunk":"queued output",
+            }),
+            Some(&replay_ctx),
+        )
+        .await;
     });
 
     for _ in 0..writer_capacity {
@@ -11402,21 +11660,19 @@ fn best_effort_tool_output_preserves_order_after_writer_queue_recovers() {
         state: Arc::clone(&state),
         session_id: session_id.clone(),
     };
-    let forward = rt.block_on(async {
-        tokio::spawn(async move {
-            forward_tool_output_event_best_effort(
-                &dummy_live_tx,
-                json!({
-                    "type":"tool_output",
-                    "id":"tool-1",
-                    "name":"exec",
-                    "stream":"stdout",
-                    "chunk":"queued output",
-                }),
-                Some(&replay_ctx),
-            )
-            .await;
-        })
+    let forward = rt.spawn(async move {
+        forward_tool_output_event_best_effort(
+            &dummy_live_tx,
+            json!({
+                "type":"tool_output",
+                "id":"tool-1",
+                "name":"exec",
+                "stream":"stdout",
+                "chunk":"queued output",
+            }),
+            Some(&replay_ctx),
+        )
+        .await;
     });
 
     for _ in 0..writer_capacity {
@@ -11516,10 +11772,10 @@ fn best_effort_tool_output_flushes_after_writer_queue_recovers_without_followup_
         session_id: session_id.clone(),
     };
 
-    let forward = rt.block_on(async {
+    let forward = {
         let state = Arc::clone(&state);
         let session_id = session_id.clone();
-        tokio::spawn(async move {
+        rt.spawn(async move {
             forward_tool_output_event_best_effort(
                 &dummy_live_tx,
                 json!({
@@ -11539,7 +11795,7 @@ fn best_effort_tool_output_flushes_after_writer_queue_recovers_without_followup_
             assert!(binding.pending_events.is_empty());
             assert!(!binding.live_send_in_progress);
         })
-    });
+    };
 
     let sentinel = rt.block_on(async {
         tokio::time::timeout(Duration::from_secs(2), bound_rx.recv())

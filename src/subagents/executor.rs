@@ -291,6 +291,7 @@ async fn emit_subagent_tool_result_event(
     .await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_subagent_tool_output_event(
     live_tx: &LiveTx,
     task_id: &str,
@@ -1538,6 +1539,7 @@ fn build_filtered_tool_defs(
     defs
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_subagent_tool(
     name: &str,
     args_str: &str,

@@ -1,6 +1,8 @@
 import type {
   AutoTraceEvent,
   CompressionOutcome,
+  GroupMemberDetail,
+  GroupVote,
   ImageAttachment,
   HistoryMessage,
   ReactPhase,
@@ -71,9 +73,13 @@ export interface AppState {
   activeSessionId: string;
   activeGroupId: string;
   activeGroupMembers: string[];
+  activeGroupMemberDetails: GroupMemberDetail[];
+  activeGroupPendingVotes: GroupVote[];
   activeGroupRunIds: Set<string>;
   groupReturnSessionId: string;
   groupRunStatuses: Map<string, { status: string; updatedAt: number }>;
+  groupRunSessions: Map<string, string>;
+  groupMembersDrawerOpen: boolean;
   groupTargetMode: 'all' | 'selected' | 'mentions';
   groupSelectedTargets: string[];
   pendingDeleteSessionId: string;
@@ -162,9 +168,13 @@ export const state: AppState = {
   activeSessionId: '',
   activeGroupId: '',
   activeGroupMembers: [],
+  activeGroupMemberDetails: [],
+  activeGroupPendingVotes: [],
   activeGroupRunIds: new Set(),
   groupReturnSessionId: '',
   groupRunStatuses: new Map(),
+  groupRunSessions: new Map(),
+  groupMembersDrawerOpen: false,
   groupTargetMode: 'all',
   groupSelectedTargets: [],
   pendingDeleteSessionId: '',

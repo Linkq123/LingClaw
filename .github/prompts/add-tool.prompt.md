@@ -31,5 +31,5 @@ If the new capability is coming from an external stdio MCP server rather than a 
 - [ ] Timeout semantics are correct: shell execution uses `exec_timeout`; generic Act/MCP defaults use `tool_timeout` unless explicitly overridden
 - [ ] Run `cargo clippy` after implementation
 - [ ] Run `cargo test` to verify existing tests pass
-- [ ] Run `wc -l src/main.rs` to check line budget (≤ 6000)
+- [ ] Run `wc -l src/main.rs` to check line budget (≤ 10000)
 - [ ] Perform code review before committing

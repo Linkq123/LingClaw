@@ -10,13 +10,13 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **CLI** — 工具执行层：安全的命令/文件/网络工具、沙盒路径、SSRF 防护、安装与更新
 - **Loop** — 连接层：WebSocket 多会话运行时、流式输出、斜杠命令、持久化、异步记忆更新
 
-整个后端约 19900 行 Rust（`src/main.rs` 以 6000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
+整个后端约 19900 行 Rust（`src/main.rs` 以 10000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
 
 ## Features
 
 - **10 标准工具**：`think`、`todos`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`；另有动态工具：`task`（子代理委托，发现代理时注册）、`orchestrate`（多代理 DAG 编排，发现代理时注册）、`session_control`（仅 `main` 正常执行模式注册，用于跨 session/group 调度）
 - **MCP client（实验性）**：支持通过 `mcpServers` 配置接入 stdio 与 Streamable HTTP MCP server，发现 tools/resources/prompts，并以当前 session 的 Settings → MCP 权限为准手动启用 tools；配置 server 不再等于自动注入模型工具。运行时会处理分页、`ping` / 可选 `roots/list`、Streamable HTTP GET/SSE 通知、`notifications/*/list_changed` 缓存失效、工具超时取消、空闲回收和启动失败冷却；resources/prompts 只做只读浏览，需用户手动插入对话
-- **多会话与群聊**：默认会话仍为 `main`，但现在支持创建、切换、重命名、列出和删除其他持久化 session；新增 session 时后端会自动生成 6 位英数字 id，用户只需在需要时重命名；`main` 的 `session_control` 可创建带初始身份/用途的 session，`list_sessions` 只返回轻量名片且不扫描每个 workspace，`describe_session` 才按需查询单个 session 的 profile、能力和运行反馈，避免一次性消耗过多 token。Groups 分区可创建持久化 session group，群聊消息写入 group 历史，被点名/广播的成员 session 会收到“群聊摘要 + main 指令”用户消息，并按自身模型、MCP、Skills、TaskPlan 设置异步并发执行
+- **多会话与群聊**：默认会话仍为 `main`，但现在支持创建、切换、重命名、列出和删除其他持久化 session；新增 session 时后端会自动生成 6 位英数字 id，用户只需在需要时重命名；`main` 的 `session_control` 可创建/删除 session、查询单 session profile/能力/运行反馈，并可删除 group、升级群管理员、移除群成员。Groups 分区可创建持久化 session group，群聊消息写入 group 历史，被点名/广播的成员 session 会收到“群聊摘要 + main 指令”用户消息，并按自身模型、MCP、Skills、TaskPlan 设置异步并发执行；群聊 UI 使用 session 名称展示成员，协议仍以 `@session-id` 为准
 - **会话级 Todos**：新增结构化 `todos` 工具，维护每个 session 唯一的一份当前任务清单；采用“整表替换 + revision 乐观并发”协议，支持用户与主代理协同编辑、重连恢复、冲突检测，以及专用 todo 面板展示
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、frontend-coder、backend-coder、general-coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
 - **运行期 Task Plan**：默认关闭；在 Settings → General → Features 开启 `Task Plan` 后，每轮 Analyze 前用规则生成临时 `TaskPlan`，结合用户请求、`WorkingState`、任务记忆、最近工具结果、可用工具和子代理，向模型软注入目标、步骤、工具/代理建议、验证建议与验收标准；它是运行期软指导，不会自动执行验证命令，也不会写入会话消息历史。聊天页“计划模式”对应 `plan_mode` 计划模式：先产出可批准的计划，再由用户点击“开始执行”
@@ -385,7 +385,7 @@ Settings → Usage 页面除了现有今日/累计图表外，还会显示按 `P
 | `http_fetch` | HTTP GET，带 SSRF 防护和重定向阻断 |
 | `task` | 委托任务给子代理（当发现代理时动态注册）|
 | `orchestrate` | 按 DAG 计划编排多个子代理任务（当发现多个代理时动态注册）|
-| `session_control` | 仅 `main` session 正常执行模式可用；可列出轻量 session 名片、创建 session、按需查询单 session 能力详情、管理群组、派发任务、收集结果和停止目标 run |
+| `session_control` | 仅 `main` session 正常执行模式可用；可列出轻量 session 名片、创建/删除 session、按需查询单 session 能力详情、创建/删除/治理群组、派发任务、收集结果和停止目标 run |
 
 ## Skills
 
@@ -667,7 +667,7 @@ handle_socket()
 
 ```text
 src/
-├── main.rs            (~2970 行) — 共享类型, WebSocket/HTTP 处理, 系统提示构建, 安全检查, JSON fence/分词等通用辅助
+├── main.rs            (~5900 行) — 共享类型, WebSocket/HTTP 处理, 系统提示构建, 安全检查, JSON fence/分词等通用辅助
 ├── runtime_loop.rs    (~3060 行) — 阶段执行循环, WorkingState/session 协调, 动态 prompt 注入, 轻量 state digest, 干预持久化, orchestrate 执行
 │   └── runtime_loop/socket_input.rs (~550 行) — socket 空闲/忙碌输入辅助
 ├── agent.rs           (~2340 行) — AgentPhase 状态机, TaskIntent/WorkingState, finish heuristic, 证据/不确定性归并, 观察结果摘要
@@ -972,7 +972,7 @@ think_level 映射：
 
 旧客户端也可以直接发送纯文本。连接到 `/ws?group=<id>&session=main` 时，客户端消息使用 `{"type":"group_message", ...}`；停止 group 内 queued/running 成员 run 使用 `{"type":"group_stop"}`。`session=main` 是前端 group 控制 UI 的连接要求，不是浏览器/本地进程之间的安全授权边界；不要向 group socket 发送普通 session slash 命令。
 
-`session_control` 兼容提醒：显式 `targets[]` 最多 16 个、`message` 最多 32,000 字符；group 广播可省略 `targets` 并按 group members 上限派发；目标 session 必须先创建，调用方应使用 `list_sessions` 返回的精确大小写 id；`target_mode="mentions"` 未命中合法 `@session-id` 时会报错，不会回退成全员广播。
+`session_control` 兼容提醒：显式 `targets[]` 最多 16 个、`message` 最多 32,000 字符；group 广播可省略 `targets` 并按 group members 上限派发；目标 session 必须先创建，调用方应使用 `list_sessions` 返回的精确大小写 id；`target_mode="mentions"` 未命中合法 `@session-id` 时会报错，不会回退成全员广播。群聊只把 `@session-id` 当作有效协议，前端会显示为 `@Session Name`；`@all` 覆盖但未直接点名的成员是可选回复，返回空或 `NO_REPLY` 不会写入群聊。
 
 服务端 → 客户端：
 
@@ -988,7 +988,7 @@ think_level 映射：
 | `group` / `group_history` | 进入 `/ws?group=<id>&session=main` 时返回 group 元数据、群聊消息和 run 状态 |
 | `group_message` | group 聊天消息；`role=session` 的消息是成员 session 最终摘要 |
 | `group_run_started` / `group_member_status` / `group_run_completed` | 成员 session 被派发、运行状态变化和完成/失败/停止事件 |
-| `group_member_event` | 包装成员 session 的 live event，形如 `{ session_id, run_id, event }`，用于在群聊里展示成员工具链和推理卡片 |
+| `group_member_event` | 包装成员 session 的 live event，形如 `{ session_id, run_id, event }`；当前群聊 UI 默认隐藏普通过程卡片，只保留错误、管理/投票结果和成员最终回复 |
 | `start` | 新一轮回复开始 |
 | `auto_trace` | `think=auto` 的最新顶层决策轨迹（selected think、baseline、signals、escalators/dampeners/clamps） |
 | `task_plan` | 启用 `settings.enableTaskPlan` 后发送的当前 round/cycle 临时规则计划、工具/代理建议、验证建议与验收标准；进入 live replay，但不写入 session 历史 |
@@ -1036,6 +1036,7 @@ think_level 映射：
 | `/api/session-groups` | GET | 返回已知 group 摘要列表 |
 | `/api/session-group` | POST | 创建 group，后端随机生成 group id |
 | `/api/session-group?group=<id>` | GET/PUT/DELETE | 读取、更新或删除指定 group；存在 `queued/running` 成员 run 时删除返回 `409` |
+| `/api/session-group/member?group=<id>&session=<id>` | PUT/DELETE | 升级 group admin 或从 group 移除成员；owner UI 直接生效，promoted admin 发起移除时走 2/3 投票 |
 | `/api/todos?session=<id>` | PUT | 原子替换当前 session 的 todos 清单；成功返回最新快照，revision 冲突返回 `409` + 当前快照 |
 | `/api/client-config` | GET | 返回前端配置（上传 token、S3 能力标记等） |
 | `/api/config` | GET | 读取原始 JSON 配置文件（含解析错误回退） |

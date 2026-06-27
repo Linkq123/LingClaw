@@ -1515,6 +1515,7 @@ fn project_signal_relevance_score(
     composite_memory_relevance_score(&[&signal.key, &signal.value], query_tokens, query_lower)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_ranked_items<T, FScore, FRecency, FKey>(
     items: &[T],
     current_query: Option<&str>,

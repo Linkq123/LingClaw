@@ -688,6 +688,7 @@ impl AgentHook for AutoCompressContextHook {
 ///   3. Re-lock, apply any `ReplaceMessages` mutations.
 ///
 /// Returns how many hooks actually fired.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_hooks(
     registry: &HookRegistry,
     point: agent::HookPoint,
