@@ -1,0 +1,20 @@
+# Consistent line endings across platforms.
+# The repo index is already LF-only; storing and checking out text as LF
+# (rather than letting core.autocrlf rewrite to CRLF on Windows) stops the
+# "LF will be replaced by CRLF the next time Git touches it" churn warnings.
+* text=auto eol=lf
+
+# Binary assets: never apply text/EOL conversion or textual diff.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pdf   binary
+*.gz    binary
+*.zip   binary
+*.wasm  binary
+*.ttf   binary
+*.otf   binary
+*.woff  binary
+*.woff2 binary
