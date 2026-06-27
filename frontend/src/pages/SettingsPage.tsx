@@ -395,7 +395,12 @@ function AgentsTab({
   onChange: (c: AppConfig) => void;
   discoveredAgents: DiscoveredAgentInfo[];
 }) {
-  const model = (config.agents?.defaults?.model || {}) as Record<string, string | undefined>;
+  const modelRaw = config.agents?.defaults?.model;
+  // Stabilise the model reference so downstream memoization deps are stable.
+  const model = useMemo(
+    () => (modelRaw || {}) as Record<string, string | undefined>,
+    [modelRaw],
+  );
   const providersRaw = config.models?.providers;
   // Stabilise the providers reference so downstream memoization deps are stable.
   const providers = useMemo(() => providersRaw || {}, [providersRaw]);
