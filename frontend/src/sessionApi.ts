@@ -67,7 +67,10 @@ function normalizeGroupMemberDetails(value: unknown): GroupMemberDetail[] {
     .filter((item): item is GroupMemberDetail => item != null);
 }
 
-function normalizeGroupVotes(value: unknown): GroupVote[] {
+export function normalizeGroupVotes(
+  value: unknown,
+  normalizeApprovals: (value: unknown) => string[] = normalizeStringArray,
+): GroupVote[] {
   if (!Array.isArray(value)) return [];
   return value
     .map((item) => {
@@ -75,7 +78,7 @@ function normalizeGroupVotes(value: unknown): GroupVote[] {
       const id = String(raw.id ?? '').trim();
       const target = String(raw.target_session_id ?? '').trim();
       if (!id || !target) return null;
-      const approvals = normalizeStringArray(raw.approvals);
+      const approvals = normalizeApprovals(raw.approvals);
       const rawThreshold =
         typeof raw.threshold === 'number' ? raw.threshold : Number(raw.threshold ?? 0);
       const threshold =

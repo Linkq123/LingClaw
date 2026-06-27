@@ -18,7 +18,7 @@ import {
   hideWelcome,
   scheduleBackgroundTask,
 } from './utils.js';
-import type { GroupMemberDetail, GroupVote, SessionGroupSummary, SessionSummary } from './types.js';
+import type { GroupMemberDetail, SessionGroupSummary, SessionSummary } from './types.js';
 import {
   syncToolDrawerBounds,
   cancelToolDrawerBoundsSync,
@@ -152,6 +152,7 @@ import {
   promoteSessionGroupAdmin as requestPromoteSessionGroupAdmin,
   removeSessionGroupMember as requestRemoveSessionGroupMember,
   updateSessionGroup as requestUpdateSessionGroup,
+  normalizeGroupVotes,
 } from './sessionApi.js';
 import {
   isActiveGroupRunStatus,
@@ -361,37 +362,6 @@ function normalizeGroupMemberDetails(details: unknown, members: string[] = []): 
   return out;
 }
 
-function normalizeGroupVotes(votes: unknown): GroupVote[] {
-  if (!Array.isArray(votes)) return [];
-  return votes
-    .map((item) => {
-      const raw = (item ?? {}) as Record<string, unknown>;
-      const id = String(raw.id ?? '').trim();
-      const target = String(raw.target_session_id ?? '').trim();
-      if (!id || !target) return null;
-      const approvals = normalizeGroupMembers(raw.approvals);
-      const rawThreshold =
-        typeof raw.threshold === 'number' ? raw.threshold : Number(raw.threshold ?? 0);
-      const threshold =
-        Number.isFinite(rawThreshold) && rawThreshold >= 1
-          ? Math.floor(rawThreshold)
-          : Math.max(1, approvals.length);
-      return {
-        id,
-        action: String(raw.action ?? ''),
-        target_session_id: target,
-        requester_session_id: String(raw.requester_session_id ?? '').trim(),
-        approvals,
-        threshold,
-        created_at:
-          typeof raw.created_at === 'number' ? raw.created_at : Number(raw.created_at ?? 0),
-        updated_at:
-          typeof raw.updated_at === 'number' ? raw.updated_at : Number(raw.updated_at ?? 0),
-      } satisfies GroupVote;
-    })
-    .filter((item): item is GroupVote => item != null);
-}
-
 function groupMemberName(sessionId: string): string {
   const id = String(sessionId || '').trim();
   if (!id) return 'session';
@@ -460,7 +430,7 @@ function setActiveGroupMembers(
   const memberSet = new Set(normalized);
   state.activeGroupMembers = normalized;
   state.activeGroupMemberDetails = normalizeGroupMemberDetails(memberDetails, normalized);
-  state.activeGroupPendingVotes = normalizeGroupVotes(pendingVotes);
+  state.activeGroupPendingVotes = normalizeGroupVotes(pendingVotes, normalizeGroupMembers);
   state.groupSelectedTargets = state.groupSelectedTargets.filter((target) => memberSet.has(target));
   if (state.groupTargetMode === 'selected' && state.groupSelectedTargets.length === 0) {
     state.groupSelectedTargets = [...normalized];
