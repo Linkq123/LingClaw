@@ -176,7 +176,7 @@ async fn streamable_http_test_handler(
     log.lock()
         .await
         .push(json!({"method": method, "sessionId": session_id, "payload": payload}));
-    let id = payload.get("id").cloned().unwrap_or_else(|| json!(null));
+    let id = payload.get("id").cloned().unwrap_or(json!(null));
 
     match payload.get("method").and_then(Value::as_str) {
         Some("initialize") => (
@@ -226,7 +226,7 @@ async fn streamable_http_get_stream_handler(
 }
 
 async fn resources_only_streamable_http_handler(Json(payload): Json<Value>) -> Response {
-    let id = payload.get("id").cloned().unwrap_or_else(|| json!(null));
+    let id = payload.get("id").cloned().unwrap_or(json!(null));
 
     match payload.get("method").and_then(Value::as_str) {
         Some("initialize") => (
@@ -301,7 +301,7 @@ async fn repeating_cursor_streamable_http_handler(
     log.lock()
         .await
         .push(json!({"method": method, "sessionId": session_id, "payload": payload}));
-    let id = payload.get("id").cloned().unwrap_or_else(|| json!(null));
+    let id = payload.get("id").cloned().unwrap_or(json!(null));
 
     match payload.get("method").and_then(Value::as_str) {
         Some("initialize") => (
@@ -342,7 +342,7 @@ async fn filtered_cursor_streamable_http_handler(
     log.lock()
         .await
         .push(json!({"method": method, "payload": payload}));
-    let id = payload.get("id").cloned().unwrap_or_else(|| json!(null));
+    let id = payload.get("id").cloned().unwrap_or(json!(null));
 
     match payload.get("method").and_then(Value::as_str) {
         Some("initialize") => (
@@ -414,7 +414,7 @@ async fn session_bound_cursor_streamable_http_handler(
         .get("mcp-session-id")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let id = payload.get("id").cloned().unwrap_or_else(|| json!(null));
+    let id = payload.get("id").cloned().unwrap_or(json!(null));
 
     {
         let mut guard = state.lock().await;
@@ -498,7 +498,7 @@ async fn session_bound_cursor_streamable_http_handler(
 }
 
 async fn hanging_streamable_http_handler(Json(payload): Json<Value>) -> Response {
-    let id = payload.get("id").cloned().unwrap_or_else(|| json!(null));
+    let id = payload.get("id").cloned().unwrap_or(json!(null));
     tokio::time::sleep(Duration::from_secs(30)).await;
     Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})).into_response()
 }
@@ -520,7 +520,7 @@ async fn open_sse_streamable_http_handler(
     log.lock()
         .await
         .push(json!({"method": method, "sessionId": session_id, "payload": payload}));
-    let id = payload.get("id").cloned().unwrap_or_else(|| json!(null));
+    let id = payload.get("id").cloned().unwrap_or(json!(null));
 
     match payload.get("method").and_then(Value::as_str) {
         Some("initialize") => (
@@ -598,7 +598,7 @@ async fn auth_recording_streamable_http_handler(
     log.lock()
         .await
         .push(json!({"method": method, "authorization": authorization}));
-    let id = payload.get("id").cloned().unwrap_or_else(|| json!(null));
+    let id = payload.get("id").cloned().unwrap_or(json!(null));
 
     match payload.get("method").and_then(Value::as_str) {
         Some("initialize") => (
@@ -672,7 +672,7 @@ async fn timeout_sse_streamable_http_handler(
     log.lock()
         .await
         .push(json!({"method": method, "sessionId": session_id}));
-    let id = payload.get("id").cloned().unwrap_or_else(|| json!(null));
+    let id = payload.get("id").cloned().unwrap_or(json!(null));
 
     match payload.get("method").and_then(Value::as_str) {
         Some("initialize") => (

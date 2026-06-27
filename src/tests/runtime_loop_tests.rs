@@ -688,7 +688,7 @@ async fn handle_idle_socket_input_broadcasts_session_list_when_session_set_chang
 
     assert!(matches!(action, IdleSocketInputAction::Continue));
 
-    let current_events = vec![
+    let current_events = [
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
@@ -828,7 +828,7 @@ async fn resolve_or_create_socket_session_broadcasts_session_list_for_fresh_sess
 
     assert_eq!(resolved, session_id);
 
-    let current_events = vec![
+    let current_events = [
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
@@ -899,7 +899,7 @@ async fn resolve_or_create_socket_session_cancels_old_connection_before_replay()
         assert!(!binding.cancel.is_cancelled());
     }
 
-    let current_events = vec![
+    let current_events = [
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
@@ -985,7 +985,7 @@ async fn resolve_or_create_socket_session_replays_live_tail_for_running_session(
     )
     .await;
 
-    let current_events = vec![
+    let current_events = [
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,
         recv_json_with_timeout(&mut rx).await,

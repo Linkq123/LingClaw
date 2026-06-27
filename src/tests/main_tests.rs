@@ -4046,11 +4046,11 @@ fn build_system_prompt_uses_cached_static_prefix_on_repeat_query() {
     let after = system_prompt_cache_metrics();
 
     assert!(
-        middle.1 >= before.1 + 1,
+        middle.1 > before.1,
         "first render should miss the prompt cache"
     );
     assert!(
-        after.0 >= middle.0 + 1,
+        after.0 > middle.0,
         "second render should hit the prompt cache"
     );
 
@@ -4391,7 +4391,7 @@ fn resolve_or_create_socket_session_honors_requested_session() {
             .contains_key(session_id.as_str())
     );
 
-    let payloads = vec![
+    let payloads = [
         rt.block_on(rx.recv())
             .expect("first payload should be sent"),
         rt.block_on(rx.recv())
@@ -6203,7 +6203,7 @@ async fn api_put_mcp_session_policy_preserves_previously_enabled_missing_tools()
 }
 
 async fn policy_tools_http_handler(Json(payload): Json<Value>) -> axum::response::Response {
-    let id = payload.get("id").cloned().unwrap_or_else(|| json!(null));
+    let id = payload.get("id").cloned().unwrap_or(json!(null));
     match payload.get("method").and_then(Value::as_str) {
         Some("initialize") => (
             [("mcp-session-id", "policy-test-session")],
