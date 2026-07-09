@@ -74,6 +74,25 @@ header .session-id { font-size: 11px; color: var(--dim); font-family: var(--font
   background: color-mix(in srgb, var(--surface) 76%, transparent);
   box-shadow: inset 0 1px 0 rgba(255,255,255,.35);
 }
+.language-toggle-btn {
+  flex-shrink: 0;
+  border: 1px solid color-mix(in srgb, var(--accent2) 18%, var(--border));
+  border-radius: 999px;
+  min-width: 76px;
+  padding: 4px 12px;
+  color: var(--dim);
+  background: color-mix(in srgb, var(--surface) 76%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.35);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  transition: border-color .18s ease, background .18s ease, color .18s ease;
+}
+.language-toggle-btn:hover {
+  border-color: var(--accent2);
+  color: var(--text);
+  background: rgba(45,139,207,.06);
+}
 header .actions { display: flex; gap: 6px; position: relative; align-items: center; }
 header .actions button,
 .header-theme-toggle {

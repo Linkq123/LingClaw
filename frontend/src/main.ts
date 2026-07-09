@@ -9,6 +9,7 @@ import './css/pages.css';
 import './css/responsive.css';
 
 import { initTheme, cycleTheme, disposeTheme } from './theme.js';
+import { initI18n, tr, toggleLanguage, subscribeLanguageChange, translateDom } from './i18n.js';
 import { dom, initDomRefs, state } from './state.js';
 import { HISTORY_LOAD_CHUNK_SIZE, HISTORY_RENDER_LIMIT } from './constants.js';
 import { findHistoryRenderStart, splitHistoryLoadChunk } from './historyWindow.js';
@@ -60,6 +61,7 @@ import {
   addToolResult,
   openToolDrawerFromHeader,
   closeToolDrawer,
+  syncToolDrawer,
   toggleTool,
 } from './renderers/tools.js';
 import { preloadMarkdownEngine, scheduleMarkdownRender } from './markdown.js';
@@ -69,7 +71,12 @@ import {
   finishReasoningStream,
   scheduleFlush,
 } from './handlers/stream.js';
-import { connect, cancelReconnect, reconnectToActiveSession } from './socket.js';
+import {
+  connect,
+  cancelReconnect,
+  reconnectToActiveSession,
+  refreshConnectionStatus,
+} from './socket.js';
 import {
   ensureUploadTokenInternal,
   updateAttachButton,
@@ -143,7 +150,12 @@ import {
   renderSessionDrawer,
   toggleSessionDrawerExpanded,
 } from './renderers/sessions.js';
-import { applyTodosState, applyTodosVisibility, initTodosPanel } from './renderers/todos.js';
+import {
+  applyTodosState,
+  applyTodosVisibility,
+  initTodosPanel,
+  renderTodosPanel,
+} from './renderers/todos.js';
 import {
   createSession as requestCreateSession,
   createSessionGroup as requestCreateSessionGroup,
@@ -170,6 +182,7 @@ import {
 
 // ── Initialize DOM ──
 initDomRefs();
+initI18n();
 state.activeSessionId = loadActiveSessionId();
 state.activeGroupId = loadActiveGroupId();
 if (state.activeGroupId) {
@@ -197,18 +210,33 @@ initTodosPanel();
 
 function updateViewToggleButtons() {
   if (dom.toggleTodosBtn) {
-    dom.toggleTodosBtn.textContent = `Todos: ${state.showTodos ? 'On' : 'Off'}`;
+    dom.toggleTodosBtn.textContent = `${tr('todos.title')}: ${state.showTodos ? tr('common.on') : tr('common.off')}`;
     dom.toggleTodosBtn.classList.toggle('is-active', state.showTodos);
   }
   if (dom.toggleToolsBtn) {
-    dom.toggleToolsBtn.textContent = `Tools: ${state.showTools ? 'On' : 'Off'}`;
+    dom.toggleToolsBtn.textContent = `${tr('common.tools')}: ${state.showTools ? tr('common.on') : tr('common.off')}`;
     dom.toggleToolsBtn.classList.toggle('is-active', state.showTools);
   }
   if (dom.toggleReasoningBtn) {
-    dom.toggleReasoningBtn.textContent = `Reasoning: ${state.showReasoning ? 'On' : 'Off'}`;
+    dom.toggleReasoningBtn.textContent = `${tr('common.reasoning')}: ${state.showReasoning ? tr('common.on') : tr('common.off')}`;
     dom.toggleReasoningBtn.classList.toggle('is-active', state.showReasoning);
   }
   updateAutoDebugToggleButton();
+}
+
+function refreshLocalizedUi() {
+  translateDom();
+  refreshConnectionStatus();
+  updateViewToggleButtons();
+  updateUsageBadge();
+  renderSessionDrawer();
+  renderGroupTargetControls();
+  renderGroupMemberDrawer();
+  renderTodosPanel();
+  renderReactStatus();
+  if (state.activeToolPanel) {
+    syncToolDrawer(state.activeToolPanel);
+  }
 }
 
 function applyViewState(viewState) {
@@ -266,10 +294,19 @@ function updateUsageBadge() {
   const out = state.dailyOutputTokens;
   if (inp === 0 && out === 0) {
     dom.usageBadge.textContent = '';
+    dom.usageBadge.removeAttribute('title');
     return;
   }
-  dom.usageBadge.textContent = `📊 ${formatTokenCount(inp)} in / ${formatTokenCount(out)} out`;
-  dom.usageBadge.title = `今日: ${formatTokenCount(inp)} input, ${formatTokenCount(out)} output\n累计: ${formatTokenCount(state.totalInputTokens)} input, ${formatTokenCount(state.totalOutputTokens)} output`;
+  dom.usageBadge.textContent = `📊 ${tr('usage.inOut', {
+    input: formatTokenCount(inp),
+    output: formatTokenCount(out),
+  })}`;
+  dom.usageBadge.title = tr('header.usageBadgeTitle', {
+    dailyInput: formatTokenCount(inp),
+    dailyOutput: formatTokenCount(out),
+    totalInput: formatTokenCount(state.totalInputTokens),
+    totalOutput: formatTokenCount(state.totalOutputTokens),
+  });
 }
 
 function normalizeSessionListPayload(payload): SessionSummary[] {
@@ -322,7 +359,10 @@ function normalizeGroupMembers(members: unknown): string[] {
   return out;
 }
 
-function normalizeGroupMemberDetails(details: unknown, members: string[] = []): GroupMemberDetail[] {
+function normalizeGroupMemberDetails(
+  details: unknown,
+  members: string[] = [],
+): GroupMemberDetail[] {
   const seen = new Set<string>();
   const out: GroupMemberDetail[] = [];
   const allowed = new Set(['main', ...members]);
@@ -345,7 +385,7 @@ function normalizeGroupMemberDetails(details: unknown, members: string[] = []): 
   if (!seen.has('main')) {
     out.unshift({
       id: 'main',
-      name: sessionsById.get('main') || 'Main',
+      name: sessionsById.get('main') || tr('common.main'),
       role: 'owner',
     });
     seen.add('main');
@@ -376,7 +416,7 @@ function renderProtocolMentions(text: string): string {
     /(^|[\s([{<"'`])@([A-Za-z0-9_.-]*[A-Za-z0-9_-])(?=$|[\s)\]}>.,;:!?'"`])/g,
     (match, prefix, rawId) => {
       const id = String(rawId || '');
-      if (id.toLowerCase() === 'all') return `${prefix}@All`;
+      if (id.toLowerCase() === 'all') return `${prefix}@${tr('common.all')}`;
       if (!state.activeGroupMembers.includes(id)) return match;
       return `${prefix}@${groupMemberName(id)}`;
     },
@@ -496,20 +536,20 @@ function renderGroupTargetControls() {
   const memberButton = document.createElement('button');
   memberButton.type = 'button';
   memberButton.className = 'group-members-toggle';
-  memberButton.textContent = `Members ${state.activeGroupMembers.length}`;
+  memberButton.textContent = tr('common.members', { count: state.activeGroupMembers.length });
   memberButton.setAttribute('aria-expanded', String(state.groupMembersDrawerOpen));
   memberButton.addEventListener('click', toggleGroupMemberDrawer);
   bar.appendChild(memberButton);
 
   const modes = [
-    { id: 'all' as const, label: 'All' },
-    { id: 'selected' as const, label: 'Selected' },
-    { id: 'mentions' as const, label: '@mentions' },
+    { id: 'all' as const, label: tr('common.all') },
+    { id: 'selected' as const, label: tr('common.selected') },
+    { id: 'mentions' as const, label: tr('group.mentions') },
   ];
   const modeGroup = document.createElement('div');
   modeGroup.className = 'group-target-modes';
   modeGroup.setAttribute('role', 'group');
-  modeGroup.setAttribute('aria-label', 'Group target mode');
+  modeGroup.setAttribute('aria-label', tr('group.modeLabel'));
   for (const mode of modes) {
     const button = document.createElement('button');
     button.type = 'button';
@@ -565,12 +605,12 @@ function renderGroupMemberDrawer() {
   header.className = 'group-member-drawer-header';
   const title = document.createElement('div');
   title.className = 'group-member-drawer-title';
-  title.textContent = 'Group members';
+  title.textContent = tr('group.members');
   const closeButton = document.createElement('button');
   closeButton.type = 'button';
   closeButton.className = 'group-member-drawer-close';
   closeButton.textContent = '×';
-  closeButton.setAttribute('aria-label', 'Close group members');
+  closeButton.setAttribute('aria-label', tr('group.closeMembers'));
   closeButton.addEventListener('click', () => {
     state.groupMembersDrawerOpen = false;
     renderGroupMemberDrawer();
@@ -592,7 +632,11 @@ function renderGroupMemberDrawer() {
     name.textContent = detail.name || detail.id;
     const meta = document.createElement('div');
     meta.className = 'group-member-meta';
-    meta.textContent = `${detail.id} · ${detail.role} · ${groupMemberStatus(detail.id)}`;
+    meta.textContent = tr('group.memberMeta', {
+      id: detail.id,
+      role: groupMemberRoleLabel(detail.role),
+      status: groupMemberStatus(detail.id),
+    });
     main.append(name, meta);
 
     const actions = document.createElement('div');
@@ -602,7 +646,7 @@ function renderGroupMemberDrawer() {
       mentionButton.type = 'button';
       mentionButton.className = 'group-member-action';
       mentionButton.textContent = '@';
-      mentionButton.title = `Mention ${detail.name || detail.id}`;
+      mentionButton.title = tr('group.mention', { name: detail.name || detail.id });
       mentionButton.addEventListener('click', () => insertGroupMention(detail.id));
       actions.appendChild(mentionButton);
 
@@ -610,8 +654,8 @@ function renderGroupMemberDrawer() {
         const promoteButton = document.createElement('button');
         promoteButton.type = 'button';
         promoteButton.className = 'group-member-action';
-        promoteButton.textContent = 'Admin';
-        promoteButton.title = `Promote ${detail.name || detail.id}`;
+        promoteButton.textContent = tr('common.admin');
+        promoteButton.title = tr('group.promote', { name: detail.name || detail.id });
         promoteButton.addEventListener('click', () => void promoteGroupMember(detail.id));
         actions.appendChild(promoteButton);
       }
@@ -619,8 +663,8 @@ function renderGroupMemberDrawer() {
       const removeButton = document.createElement('button');
       removeButton.type = 'button';
       removeButton.className = 'group-member-action danger';
-      removeButton.textContent = 'Remove';
-      removeButton.title = `Remove ${detail.name || detail.id}`;
+      removeButton.textContent = tr('common.remove');
+      removeButton.title = tr('group.remove', { name: detail.name || detail.id });
       removeButton.addEventListener('click', () => void removeGroupMember(detail.id));
       actions.appendChild(removeButton);
     } else {
@@ -628,7 +672,7 @@ function renderGroupMemberDrawer() {
       mentionAllButton.type = 'button';
       mentionAllButton.className = 'group-member-action';
       mentionAllButton.textContent = '@all';
-      mentionAllButton.title = 'Mention all members';
+      mentionAllButton.title = tr('group.mentionAll');
       mentionAllButton.addEventListener('click', () => insertGroupMention('all'));
       actions.appendChild(mentionAllButton);
     }
@@ -642,13 +686,17 @@ function renderGroupMemberDrawer() {
   if (state.activeGroupPendingVotes.length > 0) {
     const voteTitle = document.createElement('div');
     voteTitle.className = 'group-vote-title';
-    voteTitle.textContent = 'Pending votes';
+    voteTitle.textContent = tr('group.pendingVotes');
     votes.appendChild(voteTitle);
     for (const vote of state.activeGroupPendingVotes) {
       const item = document.createElement('div');
       item.className = 'group-vote-item';
       const targetName = groupMemberName(vote.target_session_id);
-      item.textContent = `${targetName}: ${vote.approvals.length}/${vote.threshold} approvals`;
+      item.textContent = tr('group.voteApprovals', {
+        name: targetName,
+        approvals: vote.approvals.length,
+        threshold: vote.threshold,
+      });
       votes.appendChild(item);
     }
   }
@@ -754,7 +802,9 @@ async function createSession() {
     renderSessionDrawer();
     reconnectToActiveSession(handleMessage);
   } catch (error) {
-    addError(`Failed to create session: ${error instanceof Error ? error.message : String(error)}`);
+    addError(
+      tr('session.errorCreate', { error: error instanceof Error ? error.message : String(error) }),
+    );
     renderSessionDrawer();
   } finally {
     sessionCreateInFlight = false;
@@ -763,14 +813,14 @@ async function createSession() {
 
 async function createGroup() {
   if (sessionCreateInFlight || state.sessionSwitchInFlight) return;
-  const rawName = window.prompt('Group name', 'Session Group');
+  const rawName = window.prompt(tr('session.promptGroupName'), tr('session.defaultGroupName'));
   const name = rawName?.trim();
   if (!name) return;
   const defaultMembers = state.sessions
     .filter((session) => !session.corrupt && session.id !== 'main')
     .map((session) => session.id)
     .join(', ');
-  const rawMembers = window.prompt('Member session ids, comma separated', defaultMembers);
+  const rawMembers = window.prompt(tr('session.promptGroupMembers'), defaultMembers);
   const members = (rawMembers || '')
     .split(',')
     .map((item) => item.trim())
@@ -788,7 +838,11 @@ async function createGroup() {
     renderSessionDrawer();
     reconnectToActiveSession(handleMessage);
   } catch (error) {
-    addError(`Failed to create group: ${error instanceof Error ? error.message : String(error)}`);
+    addError(
+      tr('session.errorCreateGroup', {
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    );
     renderSessionDrawer();
   } finally {
     sessionCreateInFlight = false;
@@ -800,7 +854,7 @@ function deleteSession(sessionId: string) {
   if (!targetSessionId || state.sessionSwitchInFlight) return;
   if (targetSessionId === 'main' || targetSessionId === state.activeSessionId) return;
   if (!targetSessionId) return;
-  const confirmed = window.confirm(`Delete session ${targetSessionId}?`);
+  const confirmed = window.confirm(tr('session.confirmDelete', { id: targetSessionId }));
   if (!confirmed) return;
   state.pendingDeleteSessionId = targetSessionId;
   renderSessionDrawer();
@@ -812,7 +866,7 @@ async function renameSession(sessionId: string) {
   if (!targetSessionId || state.sessionSwitchInFlight) return;
   const current = state.sessions.find((session) => session.id === targetSessionId);
   if (current?.corrupt) return;
-  const raw = window.prompt('Session name', current?.name || targetSessionId);
+  const raw = window.prompt(tr('session.promptName'), current?.name || targetSessionId);
   const nextName = raw?.trim();
   if (!nextName || nextName === (current?.name || targetSessionId)) return;
 
@@ -840,13 +894,15 @@ async function renameSession(sessionId: string) {
       };
       upsertSessionSummary(updatedSession);
       if (updatedSession.id === state.activeSessionId) {
-        dom.sessionNameEl.textContent = updatedSession.name || 'Main';
+        dom.sessionNameEl.textContent = updatedSession.name || tr('common.main');
       }
       renderSessionDrawer();
     }
     void refreshSessionsList();
   } catch (error) {
-    addError(`Failed to rename session: ${error instanceof Error ? error.message : String(error)}`);
+    addError(
+      tr('session.errorRename', { error: error instanceof Error ? error.message : String(error) }),
+    );
   }
 }
 
@@ -855,20 +911,21 @@ async function renameGroup(groupId: string) {
   if (!targetGroupId || state.sessionSwitchInFlight) return;
   const current = state.sessionGroups.find((group) => group.id === targetGroupId);
   if (current?.corrupt) return;
-  const rawName = window.prompt('Group name', current?.name || targetGroupId);
+  const rawName = window.prompt(tr('session.promptGroupName'), current?.name || targetGroupId);
   const nextName = rawName?.trim();
   if (!nextName) return;
   let existingMembers: string[] = [];
   try {
     existingMembers = (await requestGetSessionGroup(targetGroupId)).members;
   } catch (error) {
-    addError(`Failed to load group members: ${error instanceof Error ? error.message : String(error)}`);
+    addError(
+      tr('session.errorLoadGroupMembers', {
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    );
     return;
   }
-  const rawMembers = window.prompt(
-    'Member session ids, comma separated',
-    existingMembers.join(', '),
-  );
+  const rawMembers = window.prompt(tr('session.promptGroupMembers'), existingMembers.join(', '));
   if (rawMembers == null) return;
   const members = (rawMembers || '')
     .split(',')
@@ -884,14 +941,18 @@ async function renameGroup(groupId: string) {
     renderSessionDrawer();
     void refreshGroupsList();
   } catch (error) {
-    addError(`Failed to update group: ${error instanceof Error ? error.message : String(error)}`);
+    addError(
+      tr('session.errorUpdateGroup', {
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    );
   }
 }
 
 async function deleteGroup(groupId: string) {
   const targetGroupId = String(groupId || '').trim();
   if (!targetGroupId || state.sessionSwitchInFlight) return;
-  const confirmed = window.confirm(`Delete group ${targetGroupId}?`);
+  const confirmed = window.confirm(tr('session.confirmDeleteGroup', { id: targetGroupId }));
   if (!confirmed) return;
   try {
     await requestDeleteSessionGroup(targetGroupId);
@@ -903,7 +964,11 @@ async function deleteGroup(groupId: string) {
     }
     renderSessionDrawer();
   } catch (error) {
-    addError(`Failed to delete group: ${error instanceof Error ? error.message : String(error)}`);
+    addError(
+      tr('session.errorDeleteGroup', {
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    );
   }
 }
 
@@ -928,14 +993,16 @@ async function promoteGroupMember(sessionId: string) {
     applyGroupDetail(detail);
     void refreshGroupsList();
   } catch (error) {
-    addError(`Failed to promote group member: ${error instanceof Error ? error.message : String(error)}`);
+    addError(
+      tr('group.errorPromote', { error: error instanceof Error ? error.message : String(error) }),
+    );
   }
 }
 
 async function removeGroupMember(sessionId: string) {
   if (!state.activeGroupId || sessionId === 'main') return;
   const label = groupMemberName(sessionId);
-  const confirmed = window.confirm(`Remove ${label} from this group?`);
+  const confirmed = window.confirm(tr('group.confirmRemove', { name: label }));
   if (!confirmed) return;
   try {
     const detail = await requestRemoveSessionGroupMember(state.activeGroupId, sessionId);
@@ -947,7 +1014,9 @@ async function removeGroupMember(sessionId: string) {
     }
     void refreshGroupsList();
   } catch (error) {
-    addError(`Failed to remove group member: ${error instanceof Error ? error.message : String(error)}`);
+    addError(
+      tr('group.errorRemove', { error: error instanceof Error ? error.message : String(error) }),
+    );
   }
 }
 
@@ -1008,8 +1077,8 @@ function createLoadMoreRow(count: number): HTMLElement {
   btn.className = 'load-more-btn';
   btn.dataset.action = 'load-earlier';
   btn.type = 'button';
-  btn.textContent = `\u2191 \u52a0\u8f7d\u66f4\u65e9\u7684\u6d88\u606f (${count} \u6761)`;
-  btn.setAttribute('aria-label', `Load ${count} earlier messages`);
+  btn.textContent = tr('composer.loadEarlier', { count });
+  btn.setAttribute('aria-label', tr('composer.loadEarlierAria', { count }));
   loadMoreRow.appendChild(btn);
   return loadMoreRow;
 }
@@ -1207,12 +1276,12 @@ function groupMessageText(message): string {
     role === 'session'
       ? `[${groupMemberName(sessionId)}] `
       : role === 'main'
-        ? '[Main] '
+        ? `[${tr('common.main')}] `
         : role === 'user'
-          ? '[You] '
-        : role === 'system'
-          ? '[system] '
-          : '';
+          ? `[${tr('common.you')}] `
+          : role === 'system'
+            ? `[${tr('common.system')}] `
+            : '';
   return `${prefix}${renderProtocolMentions(String(message?.content || ''))}`;
 }
 
@@ -1297,11 +1366,17 @@ function renderGroupHistory(data): void {
   scrollDown(true);
 }
 
+function groupMemberRoleLabel(role: GroupMemberDetail['role']): string {
+  if (role === 'owner') return tr('common.main');
+  if (role === 'admin') return tr('common.admin');
+  return tr('common.member');
+}
+
 function groupMemberStatus(sessionId: string): string {
   for (const runId of state.activeGroupRunIds) {
-    if (state.groupRunSessions.get(runId) === sessionId) return 'running';
+    if (state.groupRunSessions.get(runId) === sessionId) return tr('common.running');
   }
-  return 'idle';
+  return tr('common.idle');
 }
 
 function applyGroupRunStatus(
@@ -1394,7 +1469,7 @@ function handleMessage(data) {
       persistActiveGroupId(state.activeGroupId || '');
       setActiveGroupMembers(data.members, data.member_details, data.pending_votes);
       state.sessionSwitchInFlight = false;
-      dom.sessionNameEl.textContent = data.name || 'Group';
+      dom.sessionNameEl.textContent = data.name || tr('group.nameFallback');
       dom.sessionIdEl.textContent = state.activeGroupId.slice(0, 12);
       renderSessionDrawer();
       void refreshGroupsList();
@@ -1465,7 +1540,7 @@ function handleMessage(data) {
       state.activeSessionId = data.id;
       persistActiveSessionId(state.activeSessionId || 'main');
       state.sessionSwitchInFlight = false;
-      dom.sessionNameEl.textContent = data.name || 'Main';
+      dom.sessionNameEl.textContent = data.name || tr('common.main');
       dom.sessionIdEl.textContent = data.id.slice(0, 12);
       renderSessionDrawer();
       if (data.capabilities && typeof data.capabilities.image === 'boolean') {
@@ -1941,6 +2016,10 @@ const actionHandlers = {
   },
   'toggle-mobile-menu': () => toggleMobileMenu(),
   'toggle-theme': () => cycleTheme(),
+  'toggle-language': () => {
+    toggleLanguage();
+    closeMobileMenu();
+  },
   'show-shortcuts': () => {
     closeMobileMenu();
     toggleShortcutsOverlay();
@@ -2228,6 +2307,7 @@ function installChatResizeObserver(): void {
 }
 
 document.addEventListener('click', handleDocumentClick);
+const unsubscribeLanguageChange = subscribeLanguageChange(refreshLocalizedUi);
 
 // ── Init ──
 initTheme();
@@ -2278,6 +2358,7 @@ if (import.meta.hot) {
       chatResizeObserver = null;
     }
     disposeTheme();
+    unsubscribeLanguageChange();
     cancelReconnect();
     document.removeEventListener('click', handleDocumentClick);
     document.removeEventListener('keydown', handleDocumentKeydown);

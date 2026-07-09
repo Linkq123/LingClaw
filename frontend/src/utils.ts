@@ -1,4 +1,5 @@
 import type { SessionSummary } from './types.js';
+import { language, tr } from './i18n.js';
 
 export function escHtml(s) {
   s = String(s ?? '');
@@ -15,20 +16,20 @@ export function truncateStr(s, max) {
 }
 
 export function formatTime(d) {
-  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  return d.toLocaleTimeString(language(), { hour: '2-digit', minute: '2-digit' });
 }
 
 export function timeAgo(ts) {
   const diff = Date.now() - ts * 1000;
   const sec = Math.floor(diff / 1000);
-  if (sec < 60) return '刚刚';
+  if (sec < 60) return tr('time.justNow');
   const min = Math.floor(sec / 60);
-  if (min < 60) return `${min}分钟前`;
+  if (min < 60) return tr('time.minutesAgo', { count: min });
   const hr = Math.floor(min / 60);
-  if (hr < 24) return `${hr}小时前`;
+  if (hr < 24) return tr('time.hoursAgo', { count: hr });
   const day = Math.floor(hr / 24);
-  if (day < 30) return `${day}天前`;
-  return new Date(ts * 1000).toLocaleDateString('zh-CN');
+  if (day < 30) return tr('time.daysAgo', { count: day });
+  return new Date(ts * 1000).toLocaleDateString(language());
 }
 
 export function formatToolDuration(durationMs) {
@@ -95,12 +96,17 @@ export function stripDelegatedPromptRuntimeContext(text) {
     return raw;
   }
 
-  const taskHeaderIdx = lines.findIndex((line, idx) => idx >= 2 && line.trim() === '## Delegated Task');
+  const taskHeaderIdx = lines.findIndex(
+    (line, idx) => idx >= 2 && line.trim() === '## Delegated Task',
+  );
   if (taskHeaderIdx < 0) {
     return raw;
   }
 
-  const taskBody = lines.slice(taskHeaderIdx + 1).join('\n').trim();
+  const taskBody = lines
+    .slice(taskHeaderIdx + 1)
+    .join('\n')
+    .trim();
   return taskBody || raw;
 }
 
@@ -119,16 +125,17 @@ export async function copyButtonText(button, text, idleLabel) {
   const payload = String(text ?? '').trim();
   if (!button || !payload) return;
 
-  const original = button.dataset.idleLabel || idleLabel || button.textContent || '复制摘要';
+  const original =
+    button.dataset.idleLabel || idleLabel || button.textContent || tr('common.copySummary');
   button.dataset.idleLabel = original;
   button.disabled = true;
-  button.textContent = '复制中…';
+  button.textContent = tr('common.copying');
 
   try {
     await copyText(payload);
-    button.textContent = '已复制';
+    button.textContent = tr('common.copied');
   } catch {
-    button.textContent = '复制失败';
+    button.textContent = tr('common.copyFailed');
   }
 
   if (button._resetLabelTimer) window.clearTimeout(button._resetLabelTimer);
@@ -165,12 +172,12 @@ export function isAsciiDigit(ch) {
 export function reactPhaseLabel(phase) {
   return (
     {
-      analyze: 'Analyze',
-      act: 'Act',
-      observe: 'Observe',
+      analyze: tr('react.analyze'),
+      act: tr('react.act'),
+      observe: tr('react.observe'),
     }[phase] ||
     phase ||
-    'Analyze'
+    tr('react.analyze')
   );
 }
 

@@ -1,0 +1,805 @@
+export type Language = 'en' | 'zh-CN';
+
+const STORAGE_KEY = 'lingclaw.language';
+const LANGUAGE_EVENT = 'lingclaw:languagechange';
+
+type TranslationVars = Record<string, string | number | boolean | null | undefined>;
+
+const STRINGS: Record<Language, Record<string, string>> = {
+  en: {
+    'common.add': 'Add',
+    'common.admin': 'Admin',
+    'common.all': 'All',
+    'common.arguments': 'Arguments',
+    'common.autoDebug': 'Auto Debug',
+    'common.assistant': 'Assistant',
+    'common.cancel': 'Cancel',
+    'common.clear': 'Clear',
+    'common.close': 'Close',
+    'common.connected': 'Connected.',
+    'common.connecting': 'Connecting...',
+    'common.copied': 'Copied',
+    'common.copyFailed': 'Copy failed',
+    'common.copying': 'Copying...',
+    'common.copySummary': 'Copy summary',
+    'common.corrupt': 'Corrupt',
+    'common.current': 'Current',
+    'common.default': 'Default',
+    'common.delete': 'Delete',
+    'common.disabled': 'Disabled',
+    'common.dismiss': 'Dismiss',
+    'common.enabled': 'Enabled',
+    'common.error': 'Error',
+    'common.failed': 'Failed',
+    'common.help': 'Help',
+    'common.idle': 'idle',
+    'common.language': '中文',
+    'common.languageTitle': 'Switch language',
+    'common.live': 'Live',
+    'common.loading': 'Loading...',
+    'common.main': 'Main',
+    'common.member': 'member',
+    'common.members': 'Members {count}',
+    'common.moreActions': 'More actions',
+    'common.newConversation': 'New Conversation',
+    'common.none': 'none',
+    'common.off': 'Off',
+    'common.on': 'On',
+    'common.online': 'Online',
+    'common.offline': 'Offline',
+    'common.read': 'read',
+    'common.refresh': 'Refresh',
+    'common.remove': 'Remove',
+    'common.result': 'Result',
+    'common.reasoning': 'Reasoning',
+    'common.running': 'running',
+    'common.save': 'Save',
+    'common.selected': 'Selected',
+    'common.settings': 'Settings',
+    'common.status': 'Status',
+    'common.switching': 'Switching',
+    'common.system': 'System',
+    'common.tools': 'Tools',
+    'common.usage': 'Usage',
+    'common.you': 'You',
+    'time.justNow': 'just now',
+    'time.minutesAgo': '{count} min ago',
+    'time.hoursAgo': '{count} hr ago',
+    'time.daysAgo': '{count} days ago',
+    'react.analyze': 'Analyze',
+    'react.act': 'Act',
+    'react.observe': 'Observe',
+
+    'header.skipToInput': 'Skip to message input',
+    'header.toggleTodos': 'Toggle todos visibility',
+    'header.toggleTools': 'Toggle tools visibility',
+    'header.toggleReasoning': 'Toggle reasoning visibility',
+    'header.toggleAutoDebug': 'Toggle auto debug visibility',
+    'header.showStatus': 'Show status',
+    'header.clearChat': 'Clear chat',
+    'header.showHelp': 'Show help',
+    'header.shortcuts': 'Shortcuts',
+    'header.usageBadgeTitle':
+      'Today: {dailyInput} input, {dailyOutput} output\nAll-time: {totalInput} input, {totalOutput} output',
+
+    'theme.auto': 'Auto',
+    'theme.light': 'Light',
+    'theme.dark': 'Dark',
+    'theme.aria': 'Theme: {current}. Click to switch to {next}.',
+    'theme.title': 'Theme: {current} (click to cycle)',
+    'theme.toggle': 'Toggle theme',
+
+    'session.drawerLabel': 'Sessions',
+    'session.collapseDrawer': 'Collapse sessions drawer',
+    'session.expandDrawer': 'Expand sessions drawer',
+    'session.newSession': 'New Session',
+    'session.newSessionShort': 'New session',
+    'session.noSessions': 'No sessions yet',
+    'session.noGroups': 'No groups',
+    'session.sectionSessions': 'Sessions',
+    'session.sectionGroups': 'Groups',
+    'session.switchTo': 'Switch to {name}',
+    'session.unavailable': 'Unavailable session {name}',
+    'session.rename': 'Rename {name}',
+    'session.delete': 'Delete {name}',
+    'session.openGroup': 'Open group {name}',
+    'session.renameGroup': 'Rename group {name}',
+    'session.deleteGroup': 'Delete group {name}',
+    'session.newGroup': 'New group',
+    'session.groupMembersMeta': '{id} · {count} members',
+    'session.groupRunning': '{count} running',
+    'session.confirmDelete': 'Delete session {id}?',
+    'session.confirmDeleteGroup': 'Delete group {id}?',
+    'session.promptName': 'Session name',
+    'session.promptGroupName': 'Group name',
+    'session.defaultGroupName': 'Session Group',
+    'session.promptGroupMembers': 'Member session ids, comma separated',
+    'session.errorCreate': 'Failed to create session: {error}',
+    'session.errorCreateGroup': 'Failed to create group: {error}',
+    'session.errorRename': 'Failed to rename session: {error}',
+    'session.errorLoadGroupMembers': 'Failed to load group members: {error}',
+    'session.errorUpdateGroup': 'Failed to update group: {error}',
+    'session.errorDeleteGroup': 'Failed to delete group: {error}',
+
+    'group.nameFallback': 'Group',
+    'group.members': 'Group members',
+    'group.closeMembers': 'Close group members',
+    'group.modeLabel': 'Group target mode',
+    'group.mentions': '@mentions',
+    'group.memberMeta': '{id} · {role} · {status}',
+    'group.mention': 'Mention {name}',
+    'group.mentionAll': 'Mention all members',
+    'group.promote': 'Promote {name}',
+    'group.remove': 'Remove {name}',
+    'group.confirmRemove': 'Remove {name} from this group?',
+    'group.pendingVotes': 'Pending votes',
+    'group.voteApprovals': '{name}: {approvals}/{threshold} approvals',
+    'group.errorPromote': 'Failed to promote group member: {error}',
+    'group.errorRemove': 'Failed to remove group member: {error}',
+    'group.slashUnsupported': 'Slash commands are not supported in group chat.',
+    'group.imagesUnsupported': 'Group chat does not support image attachments yet.',
+    'group.selectMember': 'Select at least one group member before sending.',
+
+    'composer.placeholder': 'Message LingClaw... (/ for commands)',
+    'composer.aria': 'Message input',
+    'composer.moreOptions': 'More options',
+    'composer.addImage': 'Add image',
+    'composer.planMode': 'Plan mode',
+    'composer.uploading': 'Uploading...',
+    'composer.stop': 'Stop agent',
+    'composer.send': 'Send message',
+    'composer.jumpLatest': 'Jump to latest messages',
+    'composer.jumpBottom': 'Back to bottom',
+    'composer.loadEarlier': '↑ Load earlier messages ({count})',
+    'composer.loadEarlierAria': 'Load {count} earlier messages',
+    'composer.invalidUrl': 'Invalid URL format.',
+    'composer.httpOnly': 'Only http:// and https:// URLs are allowed.',
+    'composer.imageFormats': 'Only PNG and JPEG image URLs are supported.',
+    'composer.notImageUrl': 'URL does not appear to be an image.',
+    'composer.uploadFailed': 'Upload failed: {error}',
+    'composer.uploadError': 'Upload error: {error}',
+    'composer.noImagesUploaded': 'No images uploaded.',
+    'composer.uploadUnavailable':
+      'Local uploaded images were cleared because image uploads are unavailable. Please re-attach them after uploads are restored.',
+
+    'welcome.ready': 'Your private AI assistant is ready',
+    'welcome.hintPrefix': 'Type a message to start, or use ',
+    'welcome.hintSuffix': ' commands',
+
+    'tool.drawerKicker': 'Tool',
+    'tool.details': 'Tool details',
+    'tool.closeDrawer': 'Close tool drawer',
+    'tool.argumentsEmpty': '(empty)',
+    'tool.running': 'Running',
+    'tool.runningWithSeconds': 'Running {seconds}s',
+    'tool.resultReturned': 'Result returned',
+    'tool.resultReturnedWithDuration': 'Result returned ({duration})',
+
+    'socket.reconnecting': 'Reconnecting in {seconds}s (#{attempt})',
+    'socket.disconnectedReconnecting': 'Disconnected. Reconnecting...',
+    'socket.lostRefresh': 'Connection lost. Please refresh the page.',
+
+    'slash.noMatches': 'No matching commands',
+    'slash.busyLimited':
+      'While the agent is running, only /stop, /tool, and /reasoning are allowed.',
+    'slash.new': 'Compress conversation to memory and clear the current context.',
+    'slash.status': 'Show the current session status.',
+    'slash.systemPrompt': 'Show the current system prompt and estimated token cost.',
+    'slash.mcp': 'Show MCP server status or refresh the cache.',
+    'slash.usage': 'Show session token usage.',
+    'slash.model': 'List available models or switch the current session model.',
+    'slash.switch': 'Switch to or create a session.',
+    'slash.sessions': 'List saved sessions.',
+    'slash.delete': 'Delete a non-current session.',
+    'slash.think': 'Set thinking mode: auto, off, minimal, low, medium, high, xhigh, or max.',
+    'slash.react': 'Toggle ReAct phase visibility.',
+    'slash.tool': 'Toggle tool card visibility.',
+    'slash.reasoning': 'Toggle reasoning panel visibility.',
+    'slash.stop': 'Stop the running agent.',
+    'slash.skills': 'List available tools and installed skills.',
+    'slash.skillsSystem': 'Show system skill status or install and uninstall built-in skills.',
+    'slash.skillsGlobal': 'List global skills.',
+    'slash.skillsSession': 'List session-local skills.',
+    'slash.agents': 'List discovered sub-agents and their effective tools.',
+    'slash.clear': 'Clear messages and the current session todos.',
+    'slash.memory': 'Show structured memory status or updater diagnostics.',
+    'slash.reflection': 'Show daily reflection status and reflection entries.',
+    'slash.help': 'Show command help.',
+
+    'todos.title': 'Todos',
+    'todos.defaultNew': 'New todo',
+    'todos.panelAria': 'Session todos',
+    'todos.notSaved': 'Not saved yet',
+    'todos.updatedBy': 'Updated by {by} · {time}',
+    'todos.saving': 'Saving...',
+    'todos.add': 'Add todo',
+    'todos.empty': 'No todos yet',
+    'todos.todoPlaceholder': 'Todo',
+    'todos.moveUp': 'Move up',
+    'todos.moveDown': 'Move down',
+    'todos.delete': 'Delete todo',
+    'todos.statusFor': 'Status for {content}',
+    'todos.status.pending': 'pending',
+    'todos.status.in_progress': 'in progress',
+    'todos.status.completed': 'completed',
+    'todos.emptyError': 'Todo text cannot be empty.',
+    'todos.changed': 'Todo list changed on the server. Continue from revision {revision}.',
+    'todos.saveFailed': 'Failed to save todos.',
+
+    'settings.title': 'Settings',
+    'settings.subtitle': 'Configure runtime, providers, agents, tools, and storage.',
+    'settings.sectionsAria': 'Settings sections',
+    'settings.configError': 'Config File Error',
+    'settings.configErrorSubtitle': 'Repair the JSON config before editing other settings.',
+    'settings.discardTitle': 'Discard unsaved changes?',
+    'settings.discardBody': '{sections} {verb} unsaved changes.',
+    'settings.keepEditing': 'Keep Editing',
+    'settings.discardChanges': 'Discard Changes',
+    'settings.unsaved': 'You have unsaved changes.',
+    'settings.skillsIndependent': 'Skills save independently for the current session.',
+    'settings.noUnsaved': 'No unsaved config changes.',
+    'settings.save': 'Save',
+    'settings.loading': 'Loading...',
+    'settings.loaded': 'Loaded',
+    'settings.loadedFrom': 'Loaded from {path}',
+    'settings.loadFailed': 'Load failed: {error}',
+    'settings.syntaxErrors': 'Config file has syntax errors',
+    'settings.saving': 'Saving...',
+    'settings.saveFailed': 'Save failed',
+    'settings.saveFailedWithError': 'Save failed: {error}',
+    'settings.saved':
+      'Saved successfully! Most changes apply immediately. Restart LingClaw only for port changes.',
+    'settings.tab.general': 'General',
+    'settings.tab.generalDesc': 'Server, timeouts, context limits, and feature switches.',
+    'settings.tab.skills': 'Skills',
+    'settings.tab.skillsDesc': 'Session-scoped system skill availability.',
+    'settings.tab.agents': 'Agents',
+    'settings.tab.agentsDesc': 'Default model routing for the main agent and sub-agents.',
+    'settings.tab.models': 'Models',
+    'settings.tab.modelsDesc':
+      'Provider endpoints, API keys, model capabilities, and test actions.',
+    'settings.tab.mcp': 'MCP',
+    'settings.tab.mcpDesc': 'MCP server commands, environment, and connectivity checks.',
+    'settings.tab.s3': 'S3',
+    'settings.tab.s3Desc': 'S3-compatible file storage settings.',
+    'settings.server': 'Server',
+    'settings.timeouts': 'Timeouts (seconds)',
+    'settings.context': 'Context',
+    'settings.features': 'Features',
+    'settings.agentDefaults': 'Agent Default Models',
+    'settings.agentDefaultsHelp':
+      'Models must reference a provider configured in the Models tab (format: provider/model-id).',
+    'settings.subAgentOrder':
+      'Sub-agent resolution order is sub-agent-<name> -> sub-agent -> primary.',
+    'settings.perSubAgentOverrides': 'Per-Sub-Agent Overrides',
+    'settings.noDiscoveredAgents': 'No discovered sub-agents available',
+    'settings.addSubAgentOverride': '+ Add Sub-Agent Override',
+    'settings.addModelFirst':
+      'Add at least one model in the Models tab before creating a sub-agent-specific override.',
+    'settings.noSubAgentOverrides': 'No sub-agent-specific model overrides configured.',
+    'settings.notDiscovered': 'not currently discovered',
+    'settings.removeOverride': 'Remove override for {agent}',
+    'settings.addModel': '+ Add Model',
+    'settings.addProvider': '+ Add Provider',
+    'settings.advancedRawJson': 'Advanced: Raw JSON',
+    'settings.applyJson': 'Apply JSON',
+    'settings.addMcpServer': '+ Add MCP Server',
+    'settings.sessionMcpPermissions': 'Session MCP Permissions',
+    'settings.mcpPermissionsDesc':
+      'Configured servers are discovered globally. Tools are injected only after they are enabled for this session.',
+    'settings.refreshCatalog': 'Refresh Catalog',
+    'settings.saveMcpPermissions': 'Save MCP Permissions',
+    'settings.unsavedShort': 'Unsaved',
+    'settings.confirmMutatingTools': 'Require confirmation for mutating MCP tools',
+    'settings.exposeWorkspaceRoot': 'Expose this session workspace root to MCP servers',
+    'settings.enabledForSession': 'Enabled for session',
+    'settings.resourcesAndPrompts': 'Resources and Prompts',
+    'settings.resourcesAndPromptsDesc':
+      'Read-only preview actions fetch the selected MCP payload and insert it into the chat input for manual use.',
+    'settings.readResource': 'Read',
+    'settings.getPrompt': 'Get',
+    'settings.argumentsSchema': 'Arguments schema',
+    'settings.systemSkills': 'System Skills',
+    'settings.sessionLabel': 'Session:',
+    'settings.searchSkills': 'Search system skills',
+    'settings.enableAll': 'Enable all',
+    'settings.disableAll': 'Disable all',
+    'settings.revert': 'Revert',
+    'settings.saveSkills': 'Save Skills',
+    'settings.skillsSummary':
+      '{enabled} of {total} system skills enabled. System skills are off by default and are injected only after you enable and save them here. Global and session-local skills are still discovered automatically.',
+    'settings.noMatchingSkills': 'No matching system skills.',
+    'settings.loadingSkills': 'Loading skills...',
+    'settings.skillsLoaded': 'Loaded',
+    'settings.skillsLoadFailed': 'Load failed: {error}',
+    'settings.skillsSaving': 'Saving skills...',
+    'settings.skillsSaved': 'Skills saved',
+    'settings.skillsSaveFailed': 'Save failed: {error}',
+    'settings.skillsReverted': 'Reverted unsaved skill changes',
+    'settings.s3Title': 'S3-Compatible File Storage',
+    'settings.configFileErrorTitle': 'Config File Error',
+    'settings.configFileErrorBody':
+      'The config file has a JSON syntax error. Fix it below and save, or edit the file manually.',
+    'settings.file': 'File:',
+    'settings.saveRecover': 'Save & Recover',
+
+    'usage.title': 'Token Usage',
+    'usage.refresh': 'Refresh',
+    'usage.loading': 'Loading...',
+    'usage.loadFailed': 'Failed to load usage data: {error}',
+    'usage.todayTotal': 'Today Total',
+    'usage.todayInput': 'Today Input',
+    'usage.todayOutput': 'Today Output',
+    'usage.allTimeTotal': 'All-Time Total',
+    'usage.allTimeInput': 'All-Time Input',
+    'usage.allTimeOutput': 'All-Time Output',
+    'usage.latestSource':
+      'Latest recorded token source: input {input}, output {output}. Cumulative totals may still include earlier estimates.',
+    'usage.source': 'Token source: input {input}, output {output}.',
+    'usage.noRoleData': 'No role usage data yet.',
+    'usage.today': 'Today',
+    'usage.allTime': 'All-Time',
+    'usage.inOut': '{input} in / {output} out',
+    'usage.input': 'Input',
+    'usage.output': 'Output',
+    'usage.noProviderData': 'No per-provider data available yet',
+    'usage.roleBreakdown': 'Model Role Breakdown',
+    'usage.dailyUsage': 'Daily Usage',
+    'usage.byProvider': 'By Provider',
+    'usage.days': '{count} days',
+  },
+  'zh-CN': {
+    'common.add': '添加',
+    'common.admin': '管理员',
+    'common.all': '全部',
+    'common.arguments': '参数',
+    'common.autoDebug': '自动调试',
+    'common.assistant': '助手',
+    'common.cancel': '取消',
+    'common.clear': '清空',
+    'common.close': '关闭',
+    'common.connected': '已连接。',
+    'common.connecting': '连接中...',
+    'common.copied': '已复制',
+    'common.copyFailed': '复制失败',
+    'common.copying': '复制中...',
+    'common.copySummary': '复制摘要',
+    'common.corrupt': '损坏',
+    'common.current': '当前',
+    'common.default': '默认',
+    'common.delete': '删除',
+    'common.disabled': '禁用',
+    'common.dismiss': '关闭',
+    'common.enabled': '启用',
+    'common.error': '错误',
+    'common.failed': '失败',
+    'common.help': '帮助',
+    'common.idle': '空闲',
+    'common.language': 'English',
+    'common.languageTitle': '切换语言',
+    'common.live': '实时',
+    'common.loading': '加载中...',
+    'common.main': '主代理',
+    'common.member': '成员',
+    'common.members': '成员 {count}',
+    'common.moreActions': '更多操作',
+    'common.newConversation': '新对话',
+    'common.none': '无',
+    'common.off': '关',
+    'common.on': '开',
+    'common.online': '在线',
+    'common.offline': '离线',
+    'common.read': '只读',
+    'common.refresh': '刷新',
+    'common.remove': '移除',
+    'common.result': '结果',
+    'common.reasoning': '推理',
+    'common.running': '运行中',
+    'common.save': '保存',
+    'common.selected': '已选',
+    'common.settings': '设置',
+    'common.status': '状态',
+    'common.switching': '切换中',
+    'common.system': '系统',
+    'common.tools': '工具',
+    'common.usage': '用量',
+    'common.you': '你',
+    'time.justNow': '刚刚',
+    'time.minutesAgo': '{count} 分钟前',
+    'time.hoursAgo': '{count} 小时前',
+    'time.daysAgo': '{count} 天前',
+    'react.analyze': '分析',
+    'react.act': '行动',
+    'react.observe': '观察',
+
+    'header.skipToInput': '跳到消息输入框',
+    'header.toggleTodos': '切换待办显示',
+    'header.toggleTools': '切换工具显示',
+    'header.toggleReasoning': '切换推理显示',
+    'header.toggleAutoDebug': '切换自动调试显示',
+    'header.showStatus': '显示状态',
+    'header.clearChat': '清空聊天',
+    'header.showHelp': '显示帮助',
+    'header.shortcuts': '快捷操作',
+    'header.usageBadgeTitle':
+      '今日：{dailyInput} 输入，{dailyOutput} 输出\n累计：{totalInput} 输入，{totalOutput} 输出',
+
+    'theme.auto': '自动',
+    'theme.light': '浅色',
+    'theme.dark': '深色',
+    'theme.aria': '主题：{current}。点击切换到{next}。',
+    'theme.title': '主题：{current}（点击循环切换）',
+    'theme.toggle': '切换主题',
+
+    'session.drawerLabel': '会话',
+    'session.collapseDrawer': '收起会话栏',
+    'session.expandDrawer': '展开会话栏',
+    'session.newSession': '新会话',
+    'session.newSessionShort': '新建会话',
+    'session.noSessions': '暂无会话',
+    'session.noGroups': '暂无群聊',
+    'session.sectionSessions': '会话',
+    'session.sectionGroups': '群聊',
+    'session.switchTo': '切换到 {name}',
+    'session.unavailable': '不可用会话 {name}',
+    'session.rename': '重命名 {name}',
+    'session.delete': '删除 {name}',
+    'session.openGroup': '打开群聊 {name}',
+    'session.renameGroup': '重命名群聊 {name}',
+    'session.deleteGroup': '删除群聊 {name}',
+    'session.newGroup': '新建群聊',
+    'session.groupMembersMeta': '{id} · {count} 名成员',
+    'session.groupRunning': '{count} 个运行中',
+    'session.confirmDelete': '删除会话 {id}？',
+    'session.confirmDeleteGroup': '删除群聊 {id}？',
+    'session.promptName': '会话名称',
+    'session.promptGroupName': '群聊名称',
+    'session.defaultGroupName': '会话群聊',
+    'session.promptGroupMembers': '成员 session id，用逗号分隔',
+    'session.errorCreate': '创建会话失败：{error}',
+    'session.errorCreateGroup': '创建群聊失败：{error}',
+    'session.errorRename': '重命名会话失败：{error}',
+    'session.errorLoadGroupMembers': '加载群成员失败：{error}',
+    'session.errorUpdateGroup': '更新群聊失败：{error}',
+    'session.errorDeleteGroup': '删除群聊失败：{error}',
+
+    'group.nameFallback': '群聊',
+    'group.members': '群成员',
+    'group.closeMembers': '关闭群成员',
+    'group.modeLabel': '群聊目标模式',
+    'group.mentions': '@提及',
+    'group.memberMeta': '{id} · {role} · {status}',
+    'group.mention': '提及 {name}',
+    'group.mentionAll': '提及所有成员',
+    'group.promote': '升级 {name}',
+    'group.remove': '移除 {name}',
+    'group.confirmRemove': '将 {name} 移出这个群聊？',
+    'group.pendingVotes': '待表决',
+    'group.voteApprovals': '{name}：{approvals}/{threshold} 同意',
+    'group.errorPromote': '升级群成员失败：{error}',
+    'group.errorRemove': '移除群成员失败：{error}',
+    'group.slashUnsupported': '群聊暂不支持斜杠命令。',
+    'group.imagesUnsupported': '群聊暂不支持图片附件。',
+    'group.selectMember': '发送前至少选择一个群成员。',
+
+    'composer.placeholder': '给 LingClaw 发消息...（/ 打开命令）',
+    'composer.aria': '消息输入框',
+    'composer.moreOptions': '更多选项',
+    'composer.addImage': '添加图片',
+    'composer.planMode': '计划模式',
+    'composer.uploading': '上传中...',
+    'composer.stop': '停止代理',
+    'composer.send': '发送消息',
+    'composer.jumpLatest': '跳到最新消息',
+    'composer.jumpBottom': '回到底部',
+    'composer.loadEarlier': '↑ 加载更早的消息（{count} 条）',
+    'composer.loadEarlierAria': '加载 {count} 条更早的消息',
+    'composer.invalidUrl': 'URL 格式无效。',
+    'composer.httpOnly': '只允许 http:// 和 https:// URL。',
+    'composer.imageFormats': '仅支持 PNG 和 JPEG 图片 URL。',
+    'composer.notImageUrl': '这个 URL 看起来不是图片。',
+    'composer.uploadFailed': '上传失败：{error}',
+    'composer.uploadError': '上传错误：{error}',
+    'composer.noImagesUploaded': '没有图片被上传。',
+    'composer.uploadUnavailable': '本地上传图片已清除，因为图片上传当前不可用。恢复后请重新附加。',
+
+    'welcome.ready': '你的私人 AI 助手已就绪',
+    'welcome.hintPrefix': '输入消息开始对话，或使用 ',
+    'welcome.hintSuffix': ' 命令',
+
+    'tool.drawerKicker': '工具',
+    'tool.details': '工具详情',
+    'tool.closeDrawer': '关闭工具抽屉',
+    'tool.argumentsEmpty': '（空）',
+    'tool.running': '执行中',
+    'tool.runningWithSeconds': '执行中 {seconds}s',
+    'tool.resultReturned': '已返回结果',
+    'tool.resultReturnedWithDuration': '已返回结果（{duration}）',
+
+    'socket.reconnecting': '{seconds} 秒后重连（第 {attempt} 次）',
+    'socket.disconnectedReconnecting': '连接已断开，正在重连...',
+    'socket.lostRefresh': '连接丢失，请刷新页面。',
+
+    'slash.noMatches': '没有匹配的命令',
+    'slash.busyLimited': '代理运行中时，只允许 /stop、/tool 和 /reasoning。',
+    'slash.new': '将对话压缩到记忆并清空当前上下文。',
+    'slash.status': '显示当前会话状态。',
+    'slash.systemPrompt': '显示当前系统提示词和预估 token 成本。',
+    'slash.mcp': '显示 MCP 服务状态或刷新缓存。',
+    'slash.usage': '显示会话 token 用量。',
+    'slash.model': '列出可用模型或切换当前会话模型。',
+    'slash.switch': '切换或创建会话。',
+    'slash.sessions': '列出已保存会话。',
+    'slash.delete': '删除非当前会话。',
+    'slash.think': '设置思考模式：auto、off、minimal、low、medium、high、xhigh 或 max。',
+    'slash.react': '切换 ReAct 阶段显示。',
+    'slash.tool': '切换工具卡片显示。',
+    'slash.reasoning': '切换推理面板显示。',
+    'slash.stop': '停止正在运行的代理。',
+    'slash.skills': '列出可用工具和已安装技能。',
+    'slash.skillsSystem': '显示系统技能状态，或安装/卸载内置技能。',
+    'slash.skillsGlobal': '列出全局技能。',
+    'slash.skillsSession': '列出会话本地技能。',
+    'slash.agents': '列出已发现子代理及其有效工具。',
+    'slash.clear': '清空消息和当前会话待办。',
+    'slash.memory': '显示结构化记忆状态或更新器诊断。',
+    'slash.reflection': '显示每日反思状态和反思条目。',
+    'slash.help': '显示命令帮助。',
+
+    'todos.title': '待办',
+    'todos.defaultNew': '新待办',
+    'todos.panelAria': '会话待办',
+    'todos.notSaved': '尚未保存',
+    'todos.updatedBy': '{by} 更新 · {time}',
+    'todos.saving': '保存中...',
+    'todos.add': '添加待办',
+    'todos.empty': '暂无待办',
+    'todos.todoPlaceholder': '待办',
+    'todos.moveUp': '上移',
+    'todos.moveDown': '下移',
+    'todos.delete': '删除待办',
+    'todos.statusFor': '{content} 的状态',
+    'todos.status.pending': '待处理',
+    'todos.status.in_progress': '进行中',
+    'todos.status.completed': '已完成',
+    'todos.emptyError': '待办内容不能为空。',
+    'todos.changed': '服务端待办列表已变化。请从修订 {revision} 继续。',
+    'todos.saveFailed': '保存待办失败。',
+
+    'settings.title': '设置',
+    'settings.subtitle': '配置运行时、模型服务商、代理、工具和存储。',
+    'settings.sectionsAria': '设置分区',
+    'settings.configError': '配置文件错误',
+    'settings.configErrorSubtitle': '修复 JSON 配置后才能编辑其他设置。',
+    'settings.discardTitle': '丢弃未保存更改？',
+    'settings.discardBody': '{sections} 有未保存更改。',
+    'settings.keepEditing': '继续编辑',
+    'settings.discardChanges': '丢弃更改',
+    'settings.unsaved': '你有未保存更改。',
+    'settings.skillsIndependent': '技能会按当前会话单独保存。',
+    'settings.noUnsaved': '没有未保存配置更改。',
+    'settings.save': '保存',
+    'settings.loading': '加载中...',
+    'settings.loaded': '已加载',
+    'settings.loadedFrom': '已从 {path} 加载',
+    'settings.loadFailed': '加载失败：{error}',
+    'settings.syntaxErrors': '配置文件存在语法错误',
+    'settings.saving': '保存中...',
+    'settings.saveFailed': '保存失败',
+    'settings.saveFailedWithError': '保存失败：{error}',
+    'settings.saved': '保存成功！大多数更改会立即生效；只有端口变更需要重启 LingClaw。',
+    'settings.tab.general': '通用',
+    'settings.tab.generalDesc': '服务、超时、上下文限制和功能开关。',
+    'settings.tab.skills': '技能',
+    'settings.tab.skillsDesc': '当前会话可用的系统技能。',
+    'settings.tab.agents': '代理',
+    'settings.tab.agentsDesc': '主代理和子代理的默认模型路由。',
+    'settings.tab.models': '模型',
+    'settings.tab.modelsDesc': '模型服务商端点、API Key、模型能力和测试操作。',
+    'settings.tab.mcp': 'MCP',
+    'settings.tab.mcpDesc': 'MCP 服务命令、环境和连通性检查。',
+    'settings.tab.s3': 'S3',
+    'settings.tab.s3Desc': 'S3 兼容文件存储设置。',
+    'settings.server': '服务',
+    'settings.timeouts': '超时（秒）',
+    'settings.context': '上下文',
+    'settings.features': '功能',
+    'settings.agentDefaults': '代理默认模型',
+    'settings.agentDefaultsHelp': '模型必须引用模型页中配置的服务商（格式：provider/model-id）。',
+    'settings.subAgentOrder': '子代理解析顺序：sub-agent-<name> -> sub-agent -> primary。',
+    'settings.perSubAgentOverrides': '子代理专用覆盖',
+    'settings.noDiscoveredAgents': '没有可用的已发现子代理',
+    'settings.addSubAgentOverride': '+ 添加子代理覆盖',
+    'settings.addModelFirst': '请先在模型页至少添加一个模型，再创建子代理专用覆盖。',
+    'settings.noSubAgentOverrides': '暂无子代理专用模型覆盖。',
+    'settings.notDiscovered': '当前未发现',
+    'settings.removeOverride': '移除 {agent} 的覆盖',
+    'settings.addModel': '+ 添加模型',
+    'settings.addProvider': '+ 添加服务商',
+    'settings.advancedRawJson': '高级：原始 JSON',
+    'settings.applyJson': '应用 JSON',
+    'settings.addMcpServer': '+ 添加 MCP 服务',
+    'settings.sessionMcpPermissions': '会话 MCP 权限',
+    'settings.mcpPermissionsDesc': '已配置服务会全局发现；工具只会在当前会话启用后注入。',
+    'settings.refreshCatalog': '刷新目录',
+    'settings.saveMcpPermissions': '保存 MCP 权限',
+    'settings.unsavedShort': '未保存',
+    'settings.confirmMutatingTools': '变更型 MCP 工具需要确认',
+    'settings.exposeWorkspaceRoot': '向 MCP 服务暴露当前会话工作区根目录',
+    'settings.enabledForSession': '当前会话启用',
+    'settings.resourcesAndPrompts': '资源和提示词',
+    'settings.resourcesAndPromptsDesc':
+      '只读预览操作会读取所选 MCP 内容并插入聊天输入框供手动使用。',
+    'settings.readResource': '读取',
+    'settings.getPrompt': '获取',
+    'settings.argumentsSchema': '参数 schema',
+    'settings.systemSkills': '系统技能',
+    'settings.sessionLabel': '会话：',
+    'settings.searchSkills': '搜索系统技能',
+    'settings.enableAll': '全部启用',
+    'settings.disableAll': '全部禁用',
+    'settings.revert': '还原',
+    'settings.saveSkills': '保存技能',
+    'settings.skillsSummary':
+      '已启用 {enabled}/{total} 个系统技能。系统技能默认关闭，只会在这里启用并保存后注入。全局技能和会话本地技能仍会自动发现。',
+    'settings.noMatchingSkills': '没有匹配的系统技能。',
+    'settings.loadingSkills': '正在加载技能...',
+    'settings.skillsLoaded': '已加载',
+    'settings.skillsLoadFailed': '加载失败：{error}',
+    'settings.skillsSaving': '正在保存技能...',
+    'settings.skillsSaved': '技能已保存',
+    'settings.skillsSaveFailed': '保存失败：{error}',
+    'settings.skillsReverted': '已还原未保存的技能更改',
+    'settings.s3Title': 'S3 兼容文件存储',
+    'settings.configFileErrorTitle': '配置文件错误',
+    'settings.configFileErrorBody':
+      '配置文件存在 JSON 语法错误。请在下方修复并保存，或手动编辑文件。',
+    'settings.file': '文件：',
+    'settings.saveRecover': '保存并恢复',
+
+    'usage.title': 'Token 用量',
+    'usage.refresh': '刷新',
+    'usage.loading': '加载中...',
+    'usage.loadFailed': '加载用量数据失败：{error}',
+    'usage.todayTotal': '今日总计',
+    'usage.todayInput': '今日输入',
+    'usage.todayOutput': '今日输出',
+    'usage.allTimeTotal': '累计总计',
+    'usage.allTimeInput': '累计输入',
+    'usage.allTimeOutput': '累计输出',
+    'usage.latestSource':
+      '最近记录的 token 来源：输入 {input}，输出 {output}。累计值可能仍包含早期估算。',
+    'usage.source': 'Token 来源：输入 {input}，输出 {output}。',
+    'usage.noRoleData': '暂无角色用量数据。',
+    'usage.today': '今日',
+    'usage.allTime': '累计',
+    'usage.inOut': '{input} 输入 / {output} 输出',
+    'usage.input': '输入',
+    'usage.output': '输出',
+    'usage.noProviderData': '暂无服务商维度数据',
+    'usage.roleBreakdown': '模型角色拆分',
+    'usage.dailyUsage': '每日用量',
+    'usage.byProvider': '按服务商',
+    'usage.days': '{count} 天',
+  },
+};
+
+let currentLanguage: Language = detectInitialLanguage();
+
+function normalizeLanguage(value: unknown): Language | null {
+  const raw = String(value ?? '')
+    .trim()
+    .toLowerCase();
+  if (raw === 'zh' || raw === 'zh-cn' || raw === 'zh_hans' || raw === 'zh-hans') return 'zh-CN';
+  if (raw === 'en' || raw === 'en-us' || raw === 'en-gb') return 'en';
+  return null;
+}
+
+function detectInitialLanguage(): Language {
+  if (typeof localStorage !== 'undefined') {
+    try {
+      const stored = normalizeLanguage(localStorage.getItem(STORAGE_KEY));
+      if (stored) return stored;
+    } catch {
+      // Ignore blocked localStorage.
+    }
+  }
+  if (typeof navigator !== 'undefined') {
+    const candidates = [navigator.language, ...(navigator.languages || [])];
+    for (const candidate of candidates) {
+      const normalized = normalizeLanguage(candidate);
+      if (normalized) return normalized;
+    }
+  }
+  return 'en';
+}
+
+function writeStoredLanguage(language: Language): void {
+  try {
+    localStorage.setItem(STORAGE_KEY, language);
+  } catch {
+    // Language preference can remain session-only when storage is blocked.
+  }
+}
+
+function applyDocumentLanguage(): void {
+  if (typeof document === 'undefined') return;
+  document.documentElement.lang = currentLanguage;
+}
+
+function interpolate(template: string, vars?: TranslationVars): string {
+  if (!vars) return template;
+  return template.replace(/\{([a-zA-Z0-9_]+)\}/g, (match, key) => {
+    const value = vars[key];
+    return value == null ? '' : String(value);
+  });
+}
+
+export function language(): Language {
+  return currentLanguage;
+}
+
+export function isChinese(): boolean {
+  return currentLanguage === 'zh-CN';
+}
+
+export function tr(key: string, vars?: TranslationVars): string {
+  const dictionary = STRINGS[currentLanguage] || STRINGS.en;
+  const fallback = STRINGS.en;
+  return interpolate(dictionary[key] ?? fallback[key] ?? key, vars);
+}
+
+export function setLanguage(language: Language): void {
+  if (currentLanguage === language) return;
+  currentLanguage = language;
+  writeStoredLanguage(language);
+  applyDocumentLanguage();
+  translateDom();
+  if (typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent(LANGUAGE_EVENT, { detail: { language } }));
+  }
+}
+
+export function toggleLanguage(): void {
+  setLanguage(currentLanguage === 'zh-CN' ? 'en' : 'zh-CN');
+}
+
+export function initI18n(): void {
+  currentLanguage = detectInitialLanguage();
+  applyDocumentLanguage();
+  translateDom();
+}
+
+export function subscribeLanguageChange(callback: () => void): () => void {
+  if (typeof window === 'undefined') return () => {};
+  const listener = () => callback();
+  window.addEventListener(LANGUAGE_EVENT, listener);
+  return () => window.removeEventListener(LANGUAGE_EVENT, listener);
+}
+
+export function translateDom(root: ParentNode = document): void {
+  if (typeof document === 'undefined') return;
+  const translateText = (element: Element) => {
+    const key = element.getAttribute('data-i18n');
+    if (key) element.textContent = tr(key);
+  };
+  const translateAttribute = (element: Element, dataAttr: string, attr: string) => {
+    const key = element.getAttribute(dataAttr);
+    if (key) element.setAttribute(attr, tr(key));
+  };
+
+  const elements = [
+    ...(root instanceof Element ? [root] : []),
+    ...Array.from(
+      root.querySelectorAll(
+        '[data-i18n], [data-i18n-title], [data-i18n-aria-label], [data-i18n-placeholder]',
+      ),
+    ),
+  ];
+  for (const element of elements) {
+    translateText(element);
+    translateAttribute(element, 'data-i18n-title', 'title');
+    translateAttribute(element, 'data-i18n-aria-label', 'aria-label');
+    translateAttribute(element, 'data-i18n-placeholder', 'placeholder');
+  }
+}

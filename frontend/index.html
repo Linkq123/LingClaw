@@ -9,7 +9,7 @@
   <body>
     <!-- Skip link — lets keyboard users jump past the header straight to the
      composer. Visible only on focus. -->
-    <a class="skip-link" href="#input">Skip to message input</a>
+    <a class="skip-link" href="#input" data-i18n="header.skipToInput">Skip to message input</a>
 
     <!-- Main -->
     <div class="main">
@@ -26,29 +26,53 @@
             id="theme-toggle-btn"
             class="theme-toggle-btn header-theme-toggle"
             data-action="toggle-theme"
+            data-i18n-aria-label="theme.toggle"
+            data-i18n-title="theme.toggle"
             aria-label="Toggle theme"
             title="Toggle theme"
           >
             ◐ Auto
           </button>
+          <button
+            id="language-toggle-btn"
+            class="language-toggle-btn"
+            data-action="toggle-language"
+            data-i18n="common.language"
+            data-i18n-aria-label="common.languageTitle"
+            data-i18n-title="common.languageTitle"
+            aria-label="Switch language"
+            title="Switch language"
+          >
+            中文
+          </button>
           <span class="app-version-badge header-version" id="app-version-header" hidden></span>
         </div>
         <div class="actions">
-          <span class="usage-badge" id="usage-badge" title="今日 Token 用量"></span>
+          <span class="usage-badge" id="usage-badge"></span>
           <button
             id="nav-settings-btn"
             data-action="nav-settings"
+            data-i18n="common.settings"
+            data-i18n-aria-label="common.settings"
             aria-label="Settings"
             class="mobile-hide"
           >
             Settings
           </button>
-          <button id="nav-usage-btn" data-action="nav-usage" aria-label="Usage" class="mobile-hide">
+          <button
+            id="nav-usage-btn"
+            data-action="nav-usage"
+            data-i18n="common.usage"
+            data-i18n-aria-label="common.usage"
+            aria-label="Usage"
+            class="mobile-hide"
+          >
             Usage
           </button>
           <button
             id="toggle-todos-btn"
             data-action="toggle-todos"
+            data-i18n-aria-label="header.toggleTodos"
             aria-label="Toggle todos visibility"
           >
             Todos: Off
@@ -56,6 +80,7 @@
           <button
             id="toggle-tools-btn"
             data-action="toggle-tools"
+            data-i18n-aria-label="header.toggleTools"
             aria-label="Toggle tools visibility"
           >
             Tools: On
@@ -63,6 +88,7 @@
           <button
             id="toggle-reasoning-btn"
             data-action="toggle-reasoning"
+            data-i18n-aria-label="header.toggleReasoning"
             aria-label="Toggle reasoning visibility"
           >
             Reasoning: On
@@ -70,24 +96,46 @@
           <button
             id="toggle-auto-debug-btn"
             data-action="toggle-auto-debug"
-            aria-label="Toggle auto debug visibility"
+            data-i18n-aria-label="header.toggleAutoDebug"
             class="mobile-hide"
           >
             Auto Debug: Off
           </button>
-          <button class="mobile-hide" data-action="cmd" data-cmd="/status" aria-label="Show status">
+          <button
+            class="mobile-hide"
+            data-action="cmd"
+            data-cmd="/status"
+            data-i18n="common.status"
+            data-i18n-aria-label="header.showStatus"
+            aria-label="Show status"
+          >
             Status
           </button>
-          <button class="mobile-hide" data-action="cmd" data-cmd="/clear" aria-label="Clear chat">
+          <button
+            class="mobile-hide"
+            data-action="cmd"
+            data-cmd="/clear"
+            data-i18n="common.clear"
+            data-i18n-aria-label="header.clearChat"
+            aria-label="Clear chat"
+          >
             Clear
           </button>
-          <button class="mobile-hide" data-action="cmd" data-cmd="/help" aria-label="Show help">
+          <button
+            class="mobile-hide"
+            data-action="cmd"
+            data-cmd="/help"
+            data-i18n="common.help"
+            data-i18n-aria-label="header.showHelp"
+            aria-label="Show help"
+          >
             Help
           </button>
           <button
             class="mobile-menu-toggle"
             id="mobile-menu-toggle"
             data-action="toggle-mobile-menu"
+            data-i18n-aria-label="common.moreActions"
             aria-label="More actions"
             aria-expanded="false"
             aria-controls="mobile-menu"
@@ -95,32 +143,41 @@
             ⋯
           </button>
           <div class="mobile-menu" id="mobile-menu" role="menu">
-            <button data-action="toggle-theme">Toggle theme</button>
-            <button data-action="show-shortcuts">Shortcuts</button>
-            <button data-action="nav-settings">Settings</button>
-            <button data-action="nav-usage">Usage</button>
-            <button data-action="toggle-auto-debug">Auto Debug</button>
-            <button data-action="cmd-close-menu" data-cmd="/status">Status</button>
-            <button data-action="cmd-close-menu" data-cmd="/clear">Clear</button>
-            <button data-action="cmd-close-menu" data-cmd="/help">Help</button>
+            <button data-action="toggle-theme" data-i18n="theme.toggle">Toggle theme</button>
+            <button data-action="toggle-language" data-i18n="common.language">中文</button>
+            <button data-action="show-shortcuts" data-i18n="header.shortcuts">Shortcuts</button>
+            <button data-action="nav-settings" data-i18n="common.settings">Settings</button>
+            <button data-action="nav-usage" data-i18n="common.usage">Usage</button>
+            <button data-action="toggle-auto-debug" data-i18n="common.autoDebug">Auto Debug</button>
+            <button data-action="cmd-close-menu" data-cmd="/status" data-i18n="common.status">Status</button>
+            <button data-action="cmd-close-menu" data-cmd="/clear" data-i18n="common.clear">Clear</button>
+            <button data-action="cmd-close-menu" data-cmd="/help" data-i18n="common.help">Help</button>
           </div>
         </div>
       </header>
       <div class="app-shell">
-        <aside class="session-drawer" id="session-drawer" aria-label="Sessions">
+        <aside
+          class="session-drawer"
+          id="session-drawer"
+          data-i18n-aria-label="session.drawerLabel"
+          aria-label="Sessions"
+        >
           <div class="session-drawer-header">
             <button
               id="session-drawer-toggle-btn"
               class="session-drawer-toggle-btn"
+              data-i18n-aria-label="session.collapseDrawer"
               aria-label="Collapse sessions drawer"
               aria-expanded="true"
             >
               &lt;
             </button>
-            <h2 class="session-drawer-heading">Sessions</h2>
+            <h2 class="session-drawer-heading" data-i18n="session.drawerLabel">Sessions</h2>
             <button
               id="session-drawer-new-btn"
               class="session-drawer-new-btn"
+              data-i18n="session.newSession"
+              data-i18n-aria-label="session.newSessionShort"
               aria-label="New session"
             >
               New Session
@@ -135,18 +192,24 @@
               <div class="welcome-logo"><img src="/branding/logo-wordmark.png" alt="LingClaw" /></div>
               <div class="app-version-badge welcome-version" id="app-version-welcome" hidden></div>
               <div class="welcome-hint">
-                你的私人 AI 助手已就绪<br />
-                输入消息开始对话，或使用 <strong>/</strong> 命令
+                <span data-i18n="welcome.ready">Your private AI assistant is ready</span><br />
+                <span data-i18n="welcome.hintPrefix">Type a message to start, or use </span><strong>/</strong><span data-i18n="welcome.hintSuffix"> commands</span>
               </div>
               <div class="welcome-shortcuts">
-                <button data-action="cmd" data-cmd="/clear">New Conversation</button>
-                <button data-action="cmd" data-cmd="/status">Status</button>
-                <button data-action="cmd" data-cmd="/help">Help</button>
+                <button data-action="cmd" data-cmd="/clear" data-i18n="common.newConversation">New Conversation</button>
+                <button data-action="cmd" data-cmd="/status" data-i18n="common.status">Status</button>
+                <button data-action="cmd" data-cmd="/help" data-i18n="common.help">Help</button>
               </div>
             </div>
           </div>
-          <button id="jump-to-latest" type="button" hidden aria-label="Jump to latest messages">
-            <span class="jump-to-latest-label">回到底部</span>
+          <button
+            id="jump-to-latest"
+            type="button"
+            hidden
+            data-i18n-aria-label="composer.jumpLatest"
+            aria-label="Jump to latest messages"
+          >
+            <span class="jump-to-latest-label" data-i18n="composer.jumpBottom">Back to bottom</span>
             <span class="jump-to-latest-badge" id="jump-to-latest-badge" hidden></span>
           </button>
           <div id="input-area">
@@ -164,6 +227,8 @@
                 <button
                   id="attach-btn"
                   class="attach-btn"
+                  data-i18n-aria-label="composer.moreOptions"
+                  data-i18n-title="composer.moreOptions"
                   aria-label="More options"
                   title="More options"
                 >
@@ -173,7 +238,7 @@
                   <div id="attach-menu" class="attach-menu">
                     <button class="attach-menu-item" id="attach-local-btn" type="button" hidden>
                       <span class="attach-menu-icon">+</span>
-                      <span>添加图片</span>
+                      <span data-i18n="composer.addImage">Add image</span>
                     </button>
                     <button
                       class="attach-menu-item attach-menu-toggle"
@@ -182,18 +247,20 @@
                       role="switch"
                       aria-checked="false"
                     >
-                      <span>计划模式</span>
+                      <span data-i18n="composer.planMode">Plan mode</span>
                       <span class="toggle-switch" aria-hidden="true"><span></span></span>
                     </button>
                   </div>
                   <div id="attach-upload-status" class="attach-upload-status" style="display: none">
-                    <span class="upload-spinner"></span> 上传中...
+                    <span class="upload-spinner"></span> <span data-i18n="composer.uploading">Uploading...</span>
                   </div>
                 </div>
               </div>
               <input type="file" id="image-file-input" accept="image/jpeg,image/png" multiple hidden />
               <textarea
                 id="input"
+                data-i18n-placeholder="composer.placeholder"
+                data-i18n-aria-label="composer.aria"
                 placeholder="Message LingClaw... (/ for commands)"
                 rows="1"
                 aria-label="Message input"
@@ -202,10 +269,17 @@
                 autocapitalize="sentences"
                 spellcheck="true"
               ></textarea>
-              <button id="stop" aria-label="Stop agent" title="Stop" style="display: none">
+              <button
+                id="stop"
+                data-i18n-aria-label="composer.stop"
+                data-i18n-title="composer.stop"
+                aria-label="Stop agent"
+                title="Stop"
+                style="display: none"
+              >
                 <span id="stop-icon">■</span>
               </button>
-              <button id="send" aria-label="Send message"><span id="send-icon">↑</span></button>
+              <button id="send" data-i18n-aria-label="composer.send" aria-label="Send message"><span id="send-icon">↑</span></button>
             </div>
           </div>
         </div>
@@ -226,12 +300,13 @@
     <aside class="tool-drawer" id="tool-drawer" aria-hidden="true">
       <div class="tool-drawer-header">
         <div class="tool-drawer-title-wrap">
-          <span class="tool-drawer-kicker">Tool</span>
-          <h3 class="tool-drawer-title" id="tool-drawer-title">Tool details</h3>
+          <span class="tool-drawer-kicker" data-i18n="tool.drawerKicker">Tool</span>
+          <h3 class="tool-drawer-title" id="tool-drawer-title" data-i18n="tool.details">Tool details</h3>
         </div>
         <button
           class="tool-drawer-close"
           data-action="close-tool-drawer"
+          data-i18n-aria-label="tool.closeDrawer"
           aria-label="Close tool drawer"
         >
           ×
@@ -240,11 +315,11 @@
       <div class="tool-drawer-meta" id="tool-drawer-meta"></div>
       <div class="tool-drawer-content">
         <section class="tool-drawer-section">
-          <div class="tool-drawer-section-title">Arguments</div>
+          <div class="tool-drawer-section-title" data-i18n="common.arguments">Arguments</div>
           <pre class="tool-drawer-code" id="tool-drawer-args"></pre>
         </section>
         <section class="tool-drawer-section" id="tool-drawer-result-section" hidden>
-          <div class="tool-drawer-section-title">Result</div>
+          <div class="tool-drawer-section-title" data-i18n="common.result">Result</div>
           <pre class="tool-drawer-code" id="tool-drawer-result"></pre>
         </section>
       </div>

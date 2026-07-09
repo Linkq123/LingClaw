@@ -1,9 +1,10 @@
 import { canSendWhileBusy } from './utils.js';
+import { tr } from './i18n.js';
 
 export interface SlashCommandSpec {
   command: string;
   args?: string;
-  description: string;
+  description: () => string;
   keywords?: string[];
 }
 
@@ -16,128 +17,128 @@ export interface SlashCommandMenuState {
 export const SLASH_COMMANDS: SlashCommandSpec[] = [
   {
     command: '/new',
-    description: 'Compress conversation to memory and clear the current context.',
+    description: () => tr('slash.new'),
     keywords: ['reset', 'conversation', 'memory'],
   },
   {
     command: '/status',
-    description: 'Show the current session status.',
+    description: () => tr('slash.status'),
     keywords: ['model', 'runtime', 'context'],
   },
   {
     command: '/system-prompt',
-    description: 'Show the current system prompt and estimated token cost.',
+    description: () => tr('slash.systemPrompt'),
     keywords: ['prompt', 'tokens'],
   },
   {
     command: '/mcp',
     args: '[refresh]',
-    description: 'Show MCP server status or refresh the cache.',
+    description: () => tr('slash.mcp'),
     keywords: ['tools', 'server', 'cache'],
   },
   {
     command: '/usage',
-    description: 'Show session token usage.',
+    description: () => tr('slash.usage'),
     keywords: ['tokens', 'cost'],
   },
   {
     command: '/model',
     args: '[name]',
-    description: 'List available models or switch the current session model.',
+    description: () => tr('slash.model'),
     keywords: ['provider', 'switch'],
   },
   {
     command: '/switch',
     args: '<id>',
-    description: 'Switch to or create a session.',
+    description: () => tr('slash.switch'),
     keywords: ['session', 'workspace'],
   },
   {
     command: '/sessions',
-    description: 'List saved sessions.',
+    description: () => tr('slash.sessions'),
     keywords: ['session', 'list'],
   },
   {
     command: '/delete',
     args: '<id>',
-    description: 'Delete a non-current session.',
+    description: () => tr('slash.delete'),
     keywords: ['session', 'remove'],
   },
   {
     command: '/think',
     args: '[level]',
-    description: 'Set thinking mode: auto, off, minimal, low, medium, high, xhigh, or max.',
+    description: () => tr('slash.think'),
     keywords: ['reasoning', 'mode'],
   },
   {
     command: '/react',
     args: '[on|off]',
-    description: 'Toggle ReAct phase visibility.',
+    description: () => tr('slash.react'),
     keywords: ['timeline', 'debug'],
   },
   {
     command: '/tool',
     args: '[on|off]',
-    description: 'Toggle tool card visibility.',
+    description: () => tr('slash.tool'),
     keywords: ['panels', 'tools'],
   },
   {
     command: '/reasoning',
     args: '[on|off]',
-    description: 'Toggle reasoning panel visibility.',
+    description: () => tr('slash.reasoning'),
     keywords: ['thinking', 'panels'],
   },
   {
     command: '/stop',
-    description: 'Stop the running agent.',
+    description: () => tr('slash.stop'),
     keywords: ['cancel', 'interrupt'],
   },
   {
     command: '/skills',
-    description: 'List available tools and installed skills.',
+    description: () => tr('slash.skills'),
     keywords: ['tools', 'plugins'],
   },
   {
     command: '/skills-system',
     args: '[install|uninstall <pattern>]',
-    description: 'Show system skill status or install and uninstall built-in skills.',
+    description: () => tr('slash.skillsSystem'),
     keywords: ['skills', 'system'],
   },
   {
     command: '/skills-global',
-    description: 'List global skills.',
+    description: () => tr('slash.skillsGlobal'),
     keywords: ['skills', 'global'],
   },
   {
     command: '/skills-session',
-    description: 'List session-local skills.',
+    description: () => tr('slash.skillsSession'),
     keywords: ['skills', 'session'],
   },
   {
     command: '/agents',
-    description: 'List discovered sub-agents and their effective tools.',
+    description: () => tr('slash.agents'),
     keywords: ['subagents', 'delegation'],
   },
   {
     command: '/clear',
-    description: 'Clear messages and the current session todos.',
+    description: () => tr('slash.clear'),
     keywords: ['reset', 'todos', 'chat'],
   },
   {
     command: '/memory',
     args: '[stats|debug]',
-    description: 'Show structured memory status or updater diagnostics.',
+    description: () => tr('slash.memory'),
     keywords: ['memory', 'debug'],
   },
   {
     command: '/reflection',
     args: '[today|yesterday|list]',
-    description: 'Show daily reflection status and reflection entries.',
+    description: () => tr('slash.reflection'),
     keywords: ['reflection', 'daily'],
   },
   {
     command: '/help',
-    description: 'Show command help.',
+    description: () => tr('slash.help'),
     keywords: ['commands', 'docs'],
   },
 ];
@@ -203,7 +204,8 @@ export function normalizeSlashCommandText(value: string): string {
   const rest = firstWhitespaceIndex >= 0 ? raw.slice(firstWhitespaceIndex) : '';
   const lowerCommand = command.toLowerCase();
   const canonicalCommand =
-    SLASH_COMMANDS.find((spec) => spec.command.toLowerCase() === lowerCommand)?.command || lowerCommand;
+    SLASH_COMMANDS.find((spec) => spec.command.toLowerCase() === lowerCommand)?.command ||
+    lowerCommand;
 
   return `${canonicalCommand}${rest}`;
 }

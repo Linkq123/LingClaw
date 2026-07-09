@@ -3,6 +3,7 @@ import { DEFAULT_BRAND_AVATAR, DEFAULT_WELCOME_LOGO } from '../constants.js';
 import { formatTime, hideWelcome } from '../utils.js';
 import { scrollDown, queueUnreadContent, invalidateChatScrollCache } from '../scroll.js';
 import { pinReactStatusToBottom } from './react-status.js';
+import { tr } from '../i18n.js';
 
 function setVersionBadge(el, version) {
   if (!el) return;
@@ -127,7 +128,7 @@ function buildDismissButton(): HTMLButtonElement {
   btn.className = 'system-dismiss';
   btn.type = 'button';
   btn.dataset.action = 'dismiss-system-card';
-  btn.setAttribute('aria-label', 'Dismiss');
+  btn.setAttribute('aria-label', tr('common.dismiss'));
   btn.textContent = '×';
   return btn;
 }
@@ -161,7 +162,7 @@ export function addSystem(t, kind = 'info', options: { dismissible?: boolean } =
     header.className = 'system-header';
     header.appendChild(buildIconSpan('📋'));
     const label = document.createElement('span');
-    label.textContent = 'System';
+    label.textContent = tr('common.system');
     header.appendChild(label);
     if (dismissible) header.appendChild(buildDismissButton());
     const body = document.createElement('pre');
@@ -229,21 +230,21 @@ export function showWelcome() {
   // welcome-hint
   const hint = document.createElement('div');
   hint.className = 'welcome-hint';
-  hint.appendChild(document.createTextNode('你的私人 AI 助手已就绪'));
+  hint.appendChild(document.createTextNode(tr('welcome.ready')));
   hint.appendChild(document.createElement('br'));
-  hint.appendChild(document.createTextNode('输入消息开始对话，或使用 '));
+  hint.appendChild(document.createTextNode(tr('welcome.hintPrefix')));
   const slash = document.createElement('strong');
   slash.textContent = '/';
   hint.appendChild(slash);
-  hint.appendChild(document.createTextNode(' 命令'));
+  hint.appendChild(document.createTextNode(tr('welcome.hintSuffix')));
 
   // welcome-shortcuts
   const shortcuts = document.createElement('div');
   shortcuts.className = 'welcome-shortcuts';
   const shortcutDefs: Array<[string, string]> = [
-    ['/clear', 'New Conversation'],
-    ['/status', 'Status'],
-    ['/help', 'Help'],
+    ['/clear', tr('common.newConversation')],
+    ['/status', tr('common.status')],
+    ['/help', tr('common.help')],
   ];
   for (const [cmd, label] of shortcutDefs) {
     const btn = document.createElement('button');

@@ -84,6 +84,21 @@ describe('socket session binding', () => {
     expect(mockWebSocket).toHaveBeenCalledWith('ws://localhost:3000/ws');
   });
 
+  it('retranslates the current connection state without resetting it to offline', async () => {
+    const { setLanguage } = await import('../src/i18n.js');
+    const { connect, refreshConnectionStatus } = await import('../src/socket.js');
+
+    setLanguage('en');
+    connect(() => {});
+    expect(stateModule.dom.connLabel?.textContent).toBe('Connecting...');
+
+    setLanguage('zh-CN');
+    refreshConnectionStatus();
+
+    expect(stateModule.dom.connDot?.className).toBe('conn-dot connecting');
+    expect(stateModule.dom.connLabel?.textContent).toBe('连接中...');
+  });
+
   it('connects to the selected websocket session when active session is restored', async () => {
     const { connect } = await import('../src/socket.js');
     stateModule.state.activeSessionId = 'research-notes';

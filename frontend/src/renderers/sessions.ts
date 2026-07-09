@@ -1,6 +1,7 @@
 import { dom, state } from '../state.js';
 import type { SessionGroupSummary, SessionSummary } from '../types.js';
 import { normalizePendingDeleteSessionId, shouldSwitchToSelectedSession } from '../utils.js';
+import { tr } from '../i18n.js';
 
 export const SESSION_DRAWER_STORAGE_KEY = 'lingclaw.sessionDrawerExpanded';
 
@@ -79,22 +80,22 @@ function renderableGroups(): RenderableGroup[] {
 
 function currentBadgeLabel(session: RenderableSession): string {
   if (session.pending) {
-    return 'Switching';
+    return tr('common.switching');
   }
   if (session.corrupt) {
-    return 'Corrupt';
+    return tr('common.corrupt');
   }
   if (!state.activeGroupId && session.id === state.activeSessionId) {
-    return 'Current';
+    return tr('common.current');
   }
   return '';
 }
 
 function currentGroupBadgeLabel(group: RenderableGroup): string {
-  if (group.pending) return 'Switching';
-  if (group.corrupt) return 'Corrupt';
-  if (group.id === state.activeGroupId) return 'Current';
-  if ((group.running ?? 0) > 0) return `${group.running} running`;
+  if (group.pending) return tr('common.switching');
+  if (group.corrupt) return tr('common.corrupt');
+  if (group.id === state.activeGroupId) return tr('common.current');
+  if ((group.running ?? 0) > 0) return tr('session.groupRunning', { count: group.running ?? 0 });
   return '';
 }
 
@@ -145,8 +146,8 @@ function createSessionRow(session: RenderableSession): HTMLElement {
   mainButton.setAttribute(
     'aria-label',
     session.corrupt
-      ? `Unavailable session ${session.name || session.id}`
-      : `Switch to ${session.name || session.id}`,
+      ? tr('session.unavailable', { name: session.name || session.id })
+      : tr('session.switchTo', { name: session.name || session.id }),
   );
   if (session.id === state.activeSessionId) {
     mainButton.setAttribute('aria-current', 'true');
@@ -191,8 +192,11 @@ function createSessionRow(session: RenderableSession): HTMLElement {
     renameButton.type = 'button';
     renameButton.className = 'session-drawer-row-action session-drawer-row-rename';
     renameButton.dataset.sessionAction = 'rename';
-    renameButton.setAttribute('aria-label', `Rename ${session.name || session.id}`);
-    renameButton.title = `Rename ${session.name || session.id}`;
+    renameButton.setAttribute(
+      'aria-label',
+      tr('session.rename', { name: session.name || session.id }),
+    );
+    renameButton.title = tr('session.rename', { name: session.name || session.id });
     renameButton.textContent = '✎';
     renameButton.addEventListener('click', () => {
       callbacks?.onRename?.(session.id);
@@ -204,8 +208,11 @@ function createSessionRow(session: RenderableSession): HTMLElement {
     deleteButton.type = 'button';
     deleteButton.className = 'session-drawer-row-action session-drawer-row-delete';
     deleteButton.dataset.sessionAction = 'delete';
-    deleteButton.setAttribute('aria-label', `Delete ${session.name || session.id}`);
-    deleteButton.title = `Delete ${session.name || session.id}`;
+    deleteButton.setAttribute(
+      'aria-label',
+      tr('session.delete', { name: session.name || session.id }),
+    );
+    deleteButton.title = tr('session.delete', { name: session.name || session.id });
     deleteButton.textContent = '×';
     deleteButton.addEventListener('click', () => {
       callbacks?.onDelete(session.id);
@@ -233,8 +240,11 @@ function createSectionHeader(label: string, count: number, action?: () => void):
     button.type = 'button';
     button.className = 'session-drawer-section-action';
     button.textContent = '+';
-    button.title = `New ${label.toLowerCase()}`;
-    button.setAttribute('aria-label', `New ${label.toLowerCase()}`);
+    button.title =
+      label === tr('session.sectionGroups')
+        ? tr('session.newGroup')
+        : tr('session.newSessionShort');
+    button.setAttribute('aria-label', button.title);
     button.addEventListener('click', action);
     header.appendChild(button);
   }
@@ -254,8 +264,9 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
   mainButton.type = 'button';
   mainButton.className = 'session-drawer-row-main';
   mainButton.dataset.sessionAction = 'switch-group';
-  mainButton.disabled = state.sessionSwitchInFlight || group.pending === true || group.corrupt === true;
-  mainButton.setAttribute('aria-label', `Open group ${group.name || group.id}`);
+  mainButton.disabled =
+    state.sessionSwitchInFlight || group.pending === true || group.corrupt === true;
+  mainButton.setAttribute('aria-label', tr('session.openGroup', { name: group.name || group.id }));
   if (group.id === state.activeGroupId) mainButton.setAttribute('aria-current', 'true');
   mainButton.addEventListener('click', () => {
     if (!mainButton.disabled) callbacks?.onSwitchGroup?.(group.id);
@@ -279,19 +290,30 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
   }
   const meta = document.createElement('div');
   meta.className = 'session-drawer-row-meta';
-  meta.textContent = `${group.id} · ${group.members ?? 0} members`;
+  meta.textContent = tr('session.groupMembersMeta', {
+    id: group.id,
+    count: group.members ?? 0,
+  });
   content.append(titleRow, meta);
   mainButton.appendChild(content);
   row.appendChild(mainButton);
 
   const actions: HTMLElement[] = [];
-  if (!state.sessionSwitchInFlight && !group.pending && !group.corrupt && callbacks?.onRenameGroup) {
+  if (
+    !state.sessionSwitchInFlight &&
+    !group.pending &&
+    !group.corrupt &&
+    callbacks?.onRenameGroup
+  ) {
     const renameButton = document.createElement('button');
     renameButton.type = 'button';
     renameButton.className = 'session-drawer-row-action session-drawer-row-rename';
     renameButton.dataset.sessionAction = 'rename';
-    renameButton.setAttribute('aria-label', `Rename group ${group.name || group.id}`);
-    renameButton.title = `Rename group ${group.name || group.id}`;
+    renameButton.setAttribute(
+      'aria-label',
+      tr('session.renameGroup', { name: group.name || group.id }),
+    );
+    renameButton.title = tr('session.renameGroup', { name: group.name || group.id });
     renameButton.textContent = '✎';
     renameButton.addEventListener('click', () => callbacks?.onRenameGroup?.(group.id));
     actions.push(renameButton);
@@ -301,8 +323,11 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
     deleteButton.type = 'button';
     deleteButton.className = 'session-drawer-row-action session-drawer-row-delete';
     deleteButton.dataset.sessionAction = 'delete';
-    deleteButton.setAttribute('aria-label', `Delete group ${group.name || group.id}`);
-    deleteButton.title = `Delete group ${group.name || group.id}`;
+    deleteButton.setAttribute(
+      'aria-label',
+      tr('session.deleteGroup', { name: group.name || group.id }),
+    );
+    deleteButton.title = tr('session.deleteGroup', { name: group.name || group.id });
     deleteButton.textContent = '×';
     deleteButton.addEventListener('click', () => callbacks?.onDeleteGroup?.(group.id));
     actions.push(deleteButton);
@@ -328,16 +353,18 @@ function applyDrawerChrome(): void {
     dom.sessionDrawerToggleBtn.textContent = state.sessionDrawerExpanded ? '<' : '>';
     dom.sessionDrawerToggleBtn.setAttribute(
       'aria-label',
-      state.sessionDrawerExpanded ? 'Collapse sessions drawer' : 'Expand sessions drawer',
+      state.sessionDrawerExpanded ? tr('session.collapseDrawer') : tr('session.expandDrawer'),
     );
     dom.sessionDrawerToggleBtn.setAttribute('aria-expanded', String(state.sessionDrawerExpanded));
   }
 
   if (dom.sessionDrawerNewBtn) {
-    dom.sessionDrawerNewBtn.textContent = state.sessionDrawerExpanded ? 'New Session' : '+';
+    dom.sessionDrawerNewBtn.textContent = state.sessionDrawerExpanded
+      ? tr('session.newSession')
+      : '+';
     dom.sessionDrawerNewBtn.disabled = state.sessionSwitchInFlight;
-    dom.sessionDrawerNewBtn.setAttribute('aria-label', 'New session');
-    dom.sessionDrawerNewBtn.title = 'New session';
+    dom.sessionDrawerNewBtn.setAttribute('aria-label', tr('session.newSessionShort'));
+    dom.sessionDrawerNewBtn.title = tr('session.newSessionShort');
   }
 }
 
@@ -378,21 +405,23 @@ export function renderSessionDrawer(): void {
   if (sessions.length === 0 && groups.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'session-drawer-empty';
-    empty.textContent = 'No sessions yet';
+    empty.textContent = tr('session.noSessions');
     dom.sessionDrawerList.replaceChildren(empty);
     return;
   }
 
   const nodes: HTMLElement[] = [];
-  nodes.push(createSectionHeader('Sessions', sessions.length));
+  nodes.push(createSectionHeader(tr('session.sectionSessions'), sessions.length));
   nodes.push(...sessions.map(createSessionRow));
-  nodes.push(createSectionHeader('Groups', groups.length, callbacks?.onCreateGroup));
+  nodes.push(
+    createSectionHeader(tr('session.sectionGroups'), groups.length, callbacks?.onCreateGroup),
+  );
   if (groups.length > 0) {
     nodes.push(...groups.map(createGroupRow));
   } else {
     const empty = document.createElement('div');
     empty.className = 'session-drawer-empty session-drawer-empty-compact';
-    empty.textContent = 'No groups';
+    empty.textContent = tr('session.noGroups');
     nodes.push(empty);
   }
   dom.sessionDrawerList.replaceChildren(...nodes);

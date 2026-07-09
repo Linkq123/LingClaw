@@ -13,6 +13,7 @@
 // Vite `?url` imports resolve to the bundled asset URL at build time.
 import githubLightHref from 'highlight.js/styles/github.css?url';
 import githubDarkHref from 'highlight.js/styles/github-dark.css?url';
+import { subscribeLanguageChange, tr } from './i18n.js';
 
 export type ThemeChoice = 'auto' | 'light' | 'dark';
 export type ResolvedTheme = 'light' | 'dark';
@@ -24,6 +25,7 @@ let lightLink: HTMLLinkElement | null = null;
 let darkLink: HTMLLinkElement | null = null;
 let systemMql: MediaQueryList | null = null;
 let systemListener: ((e: MediaQueryListEvent) => void) | null = null;
+let unsubscribeLanguageChange: (() => void) | null = null;
 
 function readStoredChoice(): ThemeChoice {
   try {
@@ -84,16 +86,20 @@ function updateThemeButton(): void {
   if (typeof document === 'undefined') return;
   const btn = document.getElementById('theme-toggle-btn');
   if (!btn) return;
-  const labels: Record<ThemeChoice, string> = { auto: 'Auto', light: 'Light', dark: 'Dark' };
+  const labels: Record<ThemeChoice, string> = {
+    auto: tr('theme.auto'),
+    light: tr('theme.light'),
+    dark: tr('theme.dark'),
+  };
   const icons: Record<ThemeChoice, string> = { auto: '◐', light: '☀', dark: '☾' };
   btn.textContent = `${icons[currentChoice]} ${labels[currentChoice]}`;
   const nextChoice: ThemeChoice =
     currentChoice === 'auto' ? 'light' : currentChoice === 'light' ? 'dark' : 'auto';
   btn.setAttribute(
     'aria-label',
-    `Theme: ${labels[currentChoice]}. Click to switch to ${labels[nextChoice]}.`,
+    tr('theme.aria', { current: labels[currentChoice], next: labels[nextChoice] }),
   );
-  btn.setAttribute('title', `Theme: ${labels[currentChoice]} (click to cycle)`);
+  btn.setAttribute('title', tr('theme.title', { current: labels[currentChoice] }));
   btn.setAttribute('data-theme-choice', currentChoice);
 }
 
@@ -102,6 +108,8 @@ export function initTheme(): void {
   applyEffective(resolve(currentChoice));
 
   if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+  unsubscribeLanguageChange?.();
+  unsubscribeLanguageChange = subscribeLanguageChange(updateThemeButton);
 
   systemMql = window.matchMedia('(prefers-color-scheme: dark)');
   systemListener = () => {
@@ -152,4 +160,6 @@ export function disposeTheme(): void {
   }
   systemMql = null;
   systemListener = null;
+  unsubscribeLanguageChange?.();
+  unsubscribeLanguageChange = null;
 }

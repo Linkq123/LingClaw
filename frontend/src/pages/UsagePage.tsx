@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { UsageData } from '../types/config.js';
+import { subscribeLanguageChange, tr } from '../i18n.js';
 
 // ── Module-level bridge ───────────────────────────────────────────────────────
 
@@ -23,11 +24,7 @@ export function closeUsagePage(): void {
 // ── Format helpers ────────────────────────────────────────────────────────────
 
 const ROLE_ORDER = ['Primary', 'Fast', 'Sub-Agent', 'Memory', 'Reflection', 'Context'];
-const RANGE_OPTIONS: ReadonlyArray<{ value: number; label: string }> = [
-  { value: 7, label: '7 days' },
-  { value: 14, label: '14 days' },
-  { value: 30, label: '30 days' },
-];
+const RANGE_OPTIONS: ReadonlyArray<number> = [7, 14, 30];
 const PROVIDER_COLORS = [
   '#2d8bcf',
   '#c06b9e',
@@ -64,6 +61,12 @@ function formatDateLabel(d: Date): string {
   return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 
+function useLanguageVersion(): number {
+  const [version, setVersion] = useState(0);
+  useEffect(() => subscribeLanguageChange(() => setVersion((current) => current + 1)), []);
+  return version;
+}
+
 // ── Summary section ───────────────────────────────────────────────────────────
 
 function UsageSummary({ data }: { data: UsageData }) {
@@ -73,16 +76,16 @@ function UsageSummary({ data }: { data: UsageData }) {
   const sourceScope = data.source_scope || 'latest_update';
   const sourceNote =
     sourceScope === 'latest_update'
-      ? `Latest recorded token source: input ${inputSource}, output ${outputSource}. Cumulative totals may still include earlier estimates.`
-      : `Token source: input ${inputSource}, output ${outputSource}.`;
+      ? tr('usage.latestSource', { input: inputSource, output: outputSource })
+      : tr('usage.source', { input: inputSource, output: outputSource });
 
   const stats = [
-    { value: (data.daily_input || 0) + (data.daily_output || 0), label: 'Today Total' },
-    { value: data.daily_input || 0, label: 'Today Input' },
-    { value: data.daily_output || 0, label: 'Today Output' },
-    { value: total, label: 'All-Time Total' },
-    { value: data.total_input || 0, label: 'All-Time Input' },
-    { value: data.total_output || 0, label: 'All-Time Output' },
+    { value: (data.daily_input || 0) + (data.daily_output || 0), label: tr('usage.todayTotal') },
+    { value: data.daily_input || 0, label: tr('usage.todayInput') },
+    { value: data.daily_output || 0, label: tr('usage.todayOutput') },
+    { value: total, label: tr('usage.allTimeTotal') },
+    { value: data.total_input || 0, label: tr('usage.allTimeInput') },
+    { value: data.total_output || 0, label: tr('usage.allTimeOutput') },
   ];
 
   return (
@@ -115,7 +118,7 @@ function RoleBreakdown({ data }: { data: UsageData }) {
   if (names.length === 0) {
     return (
       <div className="usage-role-breakdown">
-        <p className="usage-empty-note">No role usage data yet.</p>
+        <p className="usage-empty-note">{tr('usage.noRoleData')}</p>
       </div>
     );
   }
@@ -133,17 +136,23 @@ function RoleBreakdown({ data }: { data: UsageData }) {
             </div>
             <div className="usage-role-metrics">
               <div className="usage-role-metric">
-                <span className="usage-role-kicker">Today</span>
+                <span className="usage-role-kicker">{tr('usage.today')}</span>
                 <strong>{formatTokenCount(today.input + today.output)}</strong>
                 <span>
-                  {formatTokenCount(today.input)} in / {formatTokenCount(today.output)} out
+                  {tr('usage.inOut', {
+                    input: formatTokenCount(today.input),
+                    output: formatTokenCount(today.output),
+                  })}
                 </span>
               </div>
               <div className="usage-role-metric">
-                <span className="usage-role-kicker">All-Time</span>
+                <span className="usage-role-kicker">{tr('usage.allTime')}</span>
                 <strong>{formatTokenCount(tot.input + tot.output)}</strong>
                 <span>
-                  {formatTokenCount(tot.input)} in / {formatTokenCount(tot.output)} out
+                  {tr('usage.inOut', {
+                    input: formatTokenCount(tot.input),
+                    output: formatTokenCount(tot.output),
+                  })}
                 </span>
               </div>
             </div>
@@ -237,6 +246,7 @@ function drawDataLine(
 
 function DailyChart({ data, days }: { data: UsageData; days: number }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const languageVersion = useLanguageVersion();
 
   // Memoize the timeline so that unrelated parent re-renders (e.g. range
   // selector on the sibling chart, loading flag flips) don't force us to
@@ -334,12 +344,12 @@ function DailyChart({ data, days }: { data: UsageData; days: number }) {
     ctx.fillRect(padding.left, legendY - 6, 10, 3);
     ctx.fillStyle = textColor;
     ctx.textAlign = 'left';
-    ctx.fillText('Input', padding.left + 14, legendY);
+    ctx.fillText(tr('usage.input'), padding.left + 14, legendY);
     ctx.fillStyle = '#c06b9e';
     ctx.fillRect(padding.left + 60, legendY - 6, 10, 3);
     ctx.fillStyle = textColor;
-    ctx.fillText('Output', padding.left + 74, legendY);
-  }, [timeline]);
+    ctx.fillText(tr('usage.output'), padding.left + 74, legendY);
+  }, [languageVersion, timeline]);
 
   return <canvas ref={canvasRef} />;
 }
@@ -390,6 +400,7 @@ function truncateLabel(name: string, maxChars: number): string {
 
 function ProviderChart({ data, days }: { data: UsageData; days: number }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const languageVersion = useLanguageVersion();
 
   // Memoize the aggregated provider totals so the effect only re-runs when
   // the underlying data actually changes. `data` identity is stable between
@@ -426,7 +437,7 @@ function ProviderChart({ data, days }: { data: UsageData; days: number }) {
       ctx.fillStyle = textColor;
       ctx.font = '13px system-ui';
       ctx.textAlign = 'center';
-      ctx.fillText('No per-provider data available yet', w / 2, h / 2);
+      ctx.fillText(tr('usage.noProviderData'), w / 2, h / 2);
       return;
     }
 
@@ -502,14 +513,14 @@ function ProviderChart({ data, days }: { data: UsageData; days: number }) {
     ctx.globalAlpha = 1;
     ctx.fillStyle = textColor;
     ctx.textAlign = 'left';
-    ctx.fillText('Input', padding.left + 14, legendY);
+    ctx.fillText(tr('usage.input'), padding.left + 14, legendY);
     ctx.fillStyle = '#2d8bcf';
     ctx.globalAlpha = 0.5;
     ctx.fillRect(padding.left + 60, legendY - 7, 10, 6);
     ctx.globalAlpha = 1;
     ctx.fillStyle = textColor;
-    ctx.fillText('Output', padding.left + 74, legendY);
-  }, [providerTotals]);
+    ctx.fillText(tr('usage.output'), padding.left + 74, legendY);
+  }, [languageVersion, providerTotals]);
 
   return <canvas ref={canvasRef} />;
 }
@@ -517,6 +528,7 @@ function ProviderChart({ data, days }: { data: UsageData; days: number }) {
 // ── Main UsagePage component ──────────────────────────────────────────────────
 
 export function UsagePage() {
+  useLanguageVersion();
   const [visible, setVisible] = useState(false);
   const [usageData, setUsageData] = useState<UsageData | null>(null);
   const [loading, setLoading] = useState(false);
@@ -551,24 +563,27 @@ export function UsagePage() {
   // Shared loader: used by both the visibility effect and the manual refresh
   // button. Accepts an optional AbortSignal so the visibility effect can cancel
   // in-flight requests when the overlay closes mid-load.
-  const loadUsage = useCallback(async (signal?: AbortSignal) => {
-    setLoading(true);
-    setError('');
-    try {
-      const usageUrl = usageSessionId
-        ? `/api/usage?session=${encodeURIComponent(usageSessionId)}`
-        : '/api/usage';
-      const resp = await fetch(usageUrl, signal ? { signal } : undefined);
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const data: UsageData = await resp.json();
-      setUsageData(data);
-    } catch (e: unknown) {
-      if ((e as Error).name === 'AbortError') return;
-      setError(`Failed to load usage data: ${(e as Error).message}`);
-    } finally {
-      if (!signal || !signal.aborted) setLoading(false);
-    }
-  }, [usageSessionId]);
+  const loadUsage = useCallback(
+    async (signal?: AbortSignal) => {
+      setLoading(true);
+      setError('');
+      try {
+        const usageUrl = usageSessionId
+          ? `/api/usage?session=${encodeURIComponent(usageSessionId)}`
+          : '/api/usage';
+        const resp = await fetch(usageUrl, signal ? { signal } : undefined);
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data: UsageData = await resp.json();
+        setUsageData(data);
+      } catch (e: unknown) {
+        if ((e as Error).name === 'AbortError') return;
+        setError(tr('usage.loadFailed', { error: (e as Error).message }));
+      } finally {
+        if (!signal || !signal.aborted) setLoading(false);
+      }
+    },
+    [usageSessionId],
+  );
 
   useEffect(() => {
     if (!visible) return;
@@ -590,15 +605,15 @@ export function UsagePage() {
   return (
     <div className="page-panel page-panel-wide usage-panel">
       <div className="page-header">
-        <h2>Token Usage</h2>
+        <h2>{tr('usage.title')}</h2>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <button className="btn-secondary" onClick={refreshUsage} disabled={loading}>
-            {loading ? 'Loading...' : 'Refresh'}
+            {loading ? tr('usage.loading') : tr('usage.refresh')}
           </button>
           <button
             className="page-close"
-            title="Close"
-            aria-label="Close"
+            title={tr('common.close')}
+            aria-label={tr('common.close')}
             onClick={() => setVisible(false)}
           >
             ×
@@ -608,14 +623,16 @@ export function UsagePage() {
 
       <div className="page-body usage-page-body" id="usage-body">
         {error && <p style={{ color: 'var(--accent-error)' }}>{error}</p>}
-        {!usageData && !error && loading && <p style={{ color: 'var(--dim)' }}>Loading...</p>}
+        {!usageData && !error && loading && (
+          <p style={{ color: 'var(--dim)' }}>{tr('usage.loading')}</p>
+        )}
         {usageData && (
           <>
             <UsageSummary data={usageData} />
 
             <div className="usage-role-section">
               <div className="usage-chart-header">
-                <h3>Model Role Breakdown</h3>
+                <h3>{tr('usage.roleBreakdown')}</h3>
               </div>
               <RoleBreakdown data={usageData} />
             </div>
@@ -623,14 +640,14 @@ export function UsagePage() {
             <div className="usage-charts-section">
               <div className="usage-chart-wrap">
                 <div className="usage-chart-header">
-                  <h3>Daily Usage</h3>
+                  <h3>{tr('usage.dailyUsage')}</h3>
                   <select
                     value={dailyRange}
                     onChange={(e) => setDailyRange(Number(e.target.value))}
                   >
-                    {RANGE_OPTIONS.map((o) => (
-                      <option key={o.value} value={o.value}>
-                        {o.label}
+                    {RANGE_OPTIONS.map((value) => (
+                      <option key={value} value={value}>
+                        {tr('usage.days', { count: value })}
                       </option>
                     ))}
                   </select>
@@ -642,14 +659,14 @@ export function UsagePage() {
 
               <div className="usage-chart-wrap">
                 <div className="usage-chart-header">
-                  <h3>By Provider</h3>
+                  <h3>{tr('usage.byProvider')}</h3>
                   <select
                     value={providerRange}
                     onChange={(e) => setProviderRange(Number(e.target.value))}
                   >
-                    {RANGE_OPTIONS.map((o) => (
-                      <option key={o.value} value={o.value}>
-                        {o.label}
+                    {RANGE_OPTIONS.map((value) => (
+                      <option key={value} value={value}>
+                        {tr('usage.days', { count: value })}
                       </option>
                     ))}
                   </select>

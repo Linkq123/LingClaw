@@ -1,7 +1,7 @@
 import { dom, state } from '../state.js';
 import type { TodoItem, TodoStatus, TodosStateEvent, TodosUpdateResponse } from '../types.js';
+import { tr } from '../i18n.js';
 
-const DEFAULT_NEW_TODO_CONTENT = 'New todo';
 const MAX_TODO_ITEMS = 12;
 const MAX_TODO_CONTENT_CHARS = 200;
 
@@ -40,7 +40,7 @@ function normalizeStatus(status: unknown): TodoStatus {
 }
 
 function formatUpdatedAt(updatedAt: number): string {
-  if (!updatedAt) return 'Not saved yet';
+  if (!updatedAt) return tr('todos.notSaved');
   return new Date(updatedAt * 1000).toLocaleString(undefined, {
     hour12: false,
     year: 'numeric',
@@ -79,7 +79,7 @@ function ensureTodosPanel(): HTMLElement | null {
     const panel = document.createElement('section');
     panel.id = 'todos-panel';
     panel.className = 'todos-panel';
-    panel.setAttribute('aria-label', 'Session todos');
+    panel.setAttribute('aria-label', tr('todos.panelAria'));
     dom.todosHost.replaceChildren(panel);
     dom.todosPanel = panel;
   }
@@ -98,7 +98,9 @@ async function parseJsonResponse(response: Response): Promise<Record<string, unk
   }
 }
 
-function responseToTodosState(payload: TodosUpdateResponse | Record<string, unknown>): TodosStateEvent {
+function responseToTodosState(
+  payload: TodosUpdateResponse | Record<string, unknown>,
+): TodosStateEvent {
   return normalizeTodosState({
     revision: Number(payload.revision ?? 0),
     items: payload.items as TodoItem[] | undefined,
@@ -107,14 +109,20 @@ function responseToTodosState(payload: TodosUpdateResponse | Record<string, unkn
   });
 }
 
-function shouldIgnoreResponseForSession(requestSessionId: string, snapshotRevision?: number): boolean {
+function shouldIgnoreResponseForSession(
+  requestSessionId: string,
+  snapshotRevision?: number,
+): boolean {
   if (currentSessionId() !== requestSessionId) {
     return true;
   }
   return snapshotRevision != null && state.todos.revision > snapshotRevision;
 }
 
-async function persistTodos(nextItems: TodoItem[], options: { focusId?: string | null; savingItemId?: string | null } = {}): Promise<boolean> {
+async function persistTodos(
+  nextItems: TodoItem[],
+  options: { focusId?: string | null; savingItemId?: string | null } = {},
+): Promise<boolean> {
   if (state.todoSaving || state.sessionSwitchInFlight) return false;
 
   const requestSessionId = currentSessionId();
@@ -145,16 +153,13 @@ async function persistTodos(nextItems: TodoItem[], options: { focusId?: string |
         return false;
       }
       applyTodosState(nextSnapshot, { preserveFeedback: true });
-      setTodoFeedback(
-        `Todo list changed on the server. Continue from revision ${Number(payload.revision ?? 0)}.`,
-        'conflict',
-      );
+      setTodoFeedback(tr('todos.changed', { revision: Number(payload.revision ?? 0) }), 'conflict');
       renderTodosPanel();
       return false;
     }
 
     if (!response.ok) {
-      throw new Error(String(payload.error ?? 'Failed to save todos.'));
+      throw new Error(String(payload.error ?? tr('todos.saveFailed')));
     }
 
     const nextSnapshot = responseToTodosState(payload);
@@ -171,7 +176,7 @@ async function persistTodos(nextItems: TodoItem[], options: { focusId?: string |
     state.todoSaving = false;
     state.todoSavingItemId = null;
     state.todoPendingFocusId = null;
-    setTodoFeedback(error instanceof Error ? error.message : 'Failed to save todos.', 'error');
+    setTodoFeedback(error instanceof Error ? error.message : tr('todos.saveFailed'), 'error');
     renderTodosPanel();
     return false;
   }
@@ -212,7 +217,7 @@ function commitTodoContent(id: string, nextValue: string): void {
   const trimmed = nextValue.trim();
   if (!trimmed) {
     state.todoDrafts.set(id, current.content);
-    setTodoFeedback('Todo text cannot be empty.', 'error');
+    setTodoFeedback(tr('todos.emptyError'), 'error');
     renderTodosPanel();
     return;
   }
@@ -236,15 +241,20 @@ function addTodo(): void {
     ...cloneTodoItems(state.todos.items),
     {
       id,
-      content: DEFAULT_NEW_TODO_CONTENT,
+      content: tr('todos.defaultNew'),
       status: 'pending' as TodoStatus,
     },
   ];
-  state.todoDrafts.set(id, DEFAULT_NEW_TODO_CONTENT);
+  state.todoDrafts.set(id, tr('todos.defaultNew'));
   void persistTodos(items, { focusId: id, savingItemId: id });
 }
 
-function createIconButton(label: string, title: string, onClick: () => void, disabled: boolean): HTMLButtonElement {
+function createIconButton(
+  label: string,
+  title: string,
+  onClick: () => void,
+  disabled: boolean,
+): HTMLButtonElement {
   const button = document.createElement('button');
   button.type = 'button';
   button.className = 'todo-row-btn';
@@ -256,7 +266,12 @@ function createIconButton(label: string, title: string, onClick: () => void, dis
   return button;
 }
 
-function renderTodoRow(item: TodoItem, index: number, total: number, disabled: boolean): HTMLElement {
+function renderTodoRow(
+  item: TodoItem,
+  index: number,
+  total: number,
+  disabled: boolean,
+): HTMLElement {
   const row = document.createElement('li');
   row.className = 'todo-row';
   if (state.todoSaving && state.todoSavingItemId === item.id) {
@@ -266,11 +281,11 @@ function renderTodoRow(item: TodoItem, index: number, total: number, disabled: b
   const statusSelect = document.createElement('select');
   statusSelect.className = 'todo-row-status';
   statusSelect.disabled = disabled;
-  statusSelect.setAttribute('aria-label', `Status for ${item.content}`);
+  statusSelect.setAttribute('aria-label', tr('todos.statusFor', { content: item.content }));
   for (const status of ['pending', 'in_progress', 'completed'] as TodoStatus[]) {
     const option = document.createElement('option');
     option.value = status;
-    option.textContent = status.replace('_', ' ');
+    option.textContent = tr(`todos.status.${status}`);
     option.selected = item.status === status;
     statusSelect.appendChild(option);
   }
@@ -284,7 +299,7 @@ function renderTodoRow(item: TodoItem, index: number, total: number, disabled: b
   input.maxLength = MAX_TODO_CONTENT_CHARS;
   input.value = state.todoDrafts.get(item.id) ?? item.content;
   input.disabled = disabled;
-  input.placeholder = 'Todo';
+  input.placeholder = tr('todos.todoPlaceholder');
   input.dataset.todoInputId = item.id;
   input.addEventListener('input', () => {
     state.todoDrafts.set(item.id, input.value);
@@ -301,12 +316,19 @@ function renderTodoRow(item: TodoItem, index: number, total: number, disabled: b
   const actions = document.createElement('div');
   actions.className = 'todo-row-actions';
   actions.appendChild(
-    createIconButton('↑', 'Move up', () => moveTodo(item.id, -1), disabled || index === 0),
+    createIconButton('↑', tr('todos.moveUp'), () => moveTodo(item.id, -1), disabled || index === 0),
   );
   actions.appendChild(
-    createIconButton('↓', 'Move down', () => moveTodo(item.id, 1), disabled || index === total - 1),
+    createIconButton(
+      '↓',
+      tr('todos.moveDown'),
+      () => moveTodo(item.id, 1),
+      disabled || index === total - 1,
+    ),
   );
-  actions.appendChild(createIconButton('×', 'Delete todo', () => removeTodo(item.id), disabled));
+  actions.appendChild(
+    createIconButton('×', tr('todos.delete'), () => removeTodo(item.id), disabled),
+  );
 
   row.appendChild(statusSelect);
   row.appendChild(input);
@@ -330,11 +352,14 @@ export function renderTodosPanel(): void {
 
   const title = document.createElement('h2');
   title.className = 'todos-panel-title';
-  title.textContent = 'Todos';
+  title.textContent = tr('todos.title');
 
   const meta = document.createElement('div');
   meta.className = 'todos-panel-meta';
-  meta.textContent = `Updated by ${snapshot.last_updated_by} · ${formatUpdatedAt(snapshot.updated_at)}`;
+  meta.textContent = tr('todos.updatedBy', {
+    by: snapshot.last_updated_by === 'user' ? tr('common.you') : tr('common.assistant'),
+    time: formatUpdatedAt(snapshot.updated_at),
+  });
 
   heading.appendChild(title);
   heading.appendChild(meta);
@@ -345,7 +370,7 @@ export function renderTodosPanel(): void {
   if (state.todoSaving) {
     const saving = document.createElement('span');
     saving.className = 'todos-panel-saving';
-    saving.textContent = 'Saving...';
+    saving.textContent = tr('todos.saving');
     headerActions.appendChild(saving);
   }
 
@@ -353,8 +378,8 @@ export function renderTodosPanel(): void {
   addButton.type = 'button';
   addButton.className = 'todos-add-btn';
   addButton.textContent = '+';
-  addButton.title = 'Add todo';
-  addButton.setAttribute('aria-label', 'Add todo');
+  addButton.title = tr('todos.add');
+  addButton.setAttribute('aria-label', tr('todos.add'));
   addButton.disabled = disabled || snapshot.items.length >= MAX_TODO_ITEMS;
   addButton.addEventListener('click', () => addTodo());
   headerActions.appendChild(addButton);
@@ -375,12 +400,12 @@ export function renderTodosPanel(): void {
     empty.className = 'todos-empty';
 
     const emptyText = document.createElement('span');
-    emptyText.textContent = 'No todos yet';
+    emptyText.textContent = tr('todos.empty');
 
     const emptyAdd = document.createElement('button');
     emptyAdd.type = 'button';
     emptyAdd.className = 'todos-empty-btn';
-    emptyAdd.textContent = 'Add';
+    emptyAdd.textContent = tr('common.add');
     emptyAdd.disabled = disabled;
     emptyAdd.addEventListener('click', () => addTodo());
 
@@ -429,7 +454,10 @@ export function resetTodosUiState(): void {
   renderTodosPanel();
 }
 
-export function applyTodosState(snapshot: Partial<TodosStateEvent> | TodosStateEvent, options: { preserveFeedback?: boolean } = {}): void {
+export function applyTodosState(
+  snapshot: Partial<TodosStateEvent> | TodosStateEvent,
+  options: { preserveFeedback?: boolean } = {},
+): void {
   state.todos = normalizeTodosState(snapshot);
   syncDrafts(state.todos.items);
   state.todoSaving = false;

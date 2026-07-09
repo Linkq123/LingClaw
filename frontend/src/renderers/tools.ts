@@ -3,6 +3,7 @@ import { escHtml, truncateStr, formatToolDuration, hideWelcome } from '../utils.
 import { scrollDown, syncToolDrawerBounds } from '../scroll.js';
 import { wrapInTimeline, animatePanelIn, animateCollapsibleSection } from './timeline.js';
 import { pinReactStatusToBottom } from './react-status.js';
+import { tr } from '../i18n.js';
 
 const TOOL_LIVE_OUTPUT_MAX_CHARS = 60000;
 const TOOL_LIVE_OUTPUT_TRUNCATED_PREFIX = '[live output truncated]\n';
@@ -62,14 +63,14 @@ export function addToolCall(name, args, id) {
   panel.dataset.toolResult = '';
   panel.dataset.toolLiveOutput = '';
   panel.dataset.toolHasResult = 'false';
-  panel.dataset.toolStatus = '执行中';
+  panel.dataset.toolStatus = tr('tool.running');
 
   panel.innerHTML = `
     <div class="tool-header" data-action="open-tool-drawer">
       <span class="tool-icon">⚡</span>
       <span class="tool-name">${escHtml(name)}</span>
       <span class="tool-args-preview">${escHtml(truncateStr(args, 80))}</span>
-      <span class="tool-status">执行中</span>
+      <span class="tool-status">${escHtml(tr('tool.running'))}</span>
     </div>
   `;
   const wrapper = wrapInTimeline(panel, 'tool');
@@ -92,7 +93,7 @@ export function updateToolProgress(id, elapsedMs) {
   const panel = findToolPanel(id);
   if (!panel || panel.dataset.toolHasResult === 'true') return;
   const seconds = Math.max(1, Math.floor((elapsedMs || 0) / 1000));
-  const statusText = `执行中 ${seconds}s`;
+  const statusText = tr('tool.runningWithSeconds', { seconds });
   panel.dataset.toolStatus = statusText;
   const statusEl = panel.querySelector('.tool-status');
   if (statusEl) {
@@ -106,7 +107,11 @@ export function updateToolProgress(id, elapsedMs) {
 export function appendToolOutput(id, stream, chunk) {
   const panel = findToolPanel(id);
   if (!panel || panel.dataset.toolHasResult === 'true' || !chunk) return;
-  panel.dataset.toolLiveOutput = mergeToolLiveOutput(panel.dataset.toolLiveOutput || '', stream, chunk);
+  panel.dataset.toolLiveOutput = mergeToolLiveOutput(
+    panel.dataset.toolLiveOutput || '',
+    stream,
+    chunk,
+  );
   if (state.activeToolPanel === panel) {
     syncToolDrawer(panel);
   }
@@ -119,7 +124,9 @@ export function addToolResult(name, result, id, durationMs = null) {
     panel.dataset.toolLiveOutput = '';
     panel.dataset.toolHasResult = 'true';
     const durationLabel = formatToolDuration(durationMs);
-    panel.dataset.toolStatus = durationLabel ? `已返回结果 (${durationLabel})` : '已返回结果';
+    panel.dataset.toolStatus = durationLabel
+      ? tr('tool.resultReturnedWithDuration', { duration: durationLabel })
+      : tr('tool.resultReturned');
     const statusEl = panel.querySelector('.tool-status');
     if (statusEl) {
       statusEl.textContent = panel.dataset.toolStatus;
@@ -139,7 +146,9 @@ export function addToolResult(name, result, id, durationMs = null) {
   el.dataset.toolResult = result;
   el.dataset.toolHasResult = 'true';
   const durationLabel = formatToolDuration(durationMs);
-  el.dataset.toolStatus = durationLabel ? `已返回结果 (${durationLabel})` : '已返回结果';
+  el.dataset.toolStatus = durationLabel
+    ? tr('tool.resultReturnedWithDuration', { duration: durationLabel })
+    : tr('tool.resultReturned');
   el.innerHTML = `
     <div class="tool-header" data-action="open-tool-drawer">
       <span class="tool-icon">📋</span>
@@ -169,11 +178,12 @@ export function syncToolDrawer(panel) {
   const hasResult = panel.dataset.toolHasResult === 'true';
   const detailText = hasResult ? toolResult : toolLiveOutput;
   const hasDetail = detailText.trim().length > 0;
-  const statusText = panel.dataset.toolStatus || (hasResult ? '已返回结果' : '执行中');
+  const statusText =
+    panel.dataset.toolStatus || (hasResult ? tr('tool.resultReturned') : tr('tool.running'));
 
   if (dom.toolDrawerTitle) dom.toolDrawerTitle.textContent = toolName;
   if (dom.toolDrawerMeta) dom.toolDrawerMeta.textContent = statusText;
-  if (dom.toolDrawerArgs) dom.toolDrawerArgs.textContent = toolArgs || '(empty)';
+  if (dom.toolDrawerArgs) dom.toolDrawerArgs.textContent = toolArgs || tr('tool.argumentsEmpty');
   if (dom.toolDrawerResult) dom.toolDrawerResult.textContent = detailText;
   if (dom.toolDrawerResultSection) dom.toolDrawerResultSection.hidden = !hasDetail;
 }

@@ -1,5 +1,6 @@
 import { dom, state } from './state.js';
 import { addSystem } from './renderers/chat.js';
+import { tr } from './i18n.js';
 
 // Guard: prevent double-registration on Vite HMR re-execution of main.ts.
 let _listenerInit = false;
@@ -78,9 +79,7 @@ export function dropUnavailablePendingUploads(notify = false) {
   closeAttachPopup();
   if (dom.imageFileInput) dom.imageFileInput.value = '';
   if (notify) {
-    addSystem(
-      'Local uploaded images were cleared because image uploads are unavailable. Please re-attach them after uploads are restored.',
-    );
+    addSystem(tr('composer.uploadUnavailable'));
   }
 }
 
@@ -116,11 +115,11 @@ export function addImageUrl(url) {
   try {
     parsed = new URL(trimmed);
   } catch {
-    addSystem('Invalid URL format.');
+    addSystem(tr('composer.invalidUrl'));
     return;
   }
   if (!trimmed.startsWith('http://') && !trimmed.startsWith('https://')) {
-    addSystem('Only http:// and https:// URLs are allowed.');
+    addSystem(tr('composer.httpOnly'));
     return;
   }
   const path = parsed.pathname;
@@ -138,10 +137,10 @@ export function addImageUrl(url) {
     if (/\.(png|jpe?g)$/.test(lastSegment)) {
       // Accepted explicit image suffix.
     } else if (/\.(gif|webp|svg|bmp|ico|tif|tiff|avif)$/.test(lastSegment)) {
-      addSystem('Only PNG and JPEG image URLs are supported.');
+      addSystem(tr('composer.imageFormats'));
       return;
     } else {
-      addSystem('URL does not appear to be an image.');
+      addSystem(tr('composer.notImageUrl'));
       return;
     }
   }
@@ -161,7 +160,7 @@ export async function uploadLocalImages(files) {
   try {
     token = await ensureUploadToken();
   } catch (e) {
-    addSystem('Upload failed: ' + e.message);
+    addSystem(tr('composer.uploadFailed', { error: e.message }));
     closeAttachPopup();
     if (dom.imageFileInput) dom.imageFileInput.value = '';
     return;
@@ -189,7 +188,7 @@ export async function uploadLocalImages(files) {
         state.uploadToken = '';
       }
       const errText = await resp.text().catch(() => resp.statusText);
-      addSystem('Upload failed: ' + errText);
+      addSystem(tr('composer.uploadFailed', { error: errText }));
       closeAttachPopup();
       if (dom.imageFileInput) dom.imageFileInput.value = '';
       return;
@@ -212,16 +211,16 @@ export async function uploadLocalImages(files) {
     }
     if (data.errors && data.errors.length > 0) {
       for (const err of data.errors) {
-        addSystem('Upload error: ' + err);
+        addSystem(tr('composer.uploadError', { error: err }));
       }
     }
     if (!data.urls || data.urls.length === 0) {
       if (!data.errors || data.errors.length === 0) {
-        addSystem('No images uploaded.');
+        addSystem(tr('composer.noImagesUploaded'));
       }
     }
   } catch (e) {
-    addSystem('Upload failed: ' + e.message);
+    addSystem(tr('composer.uploadFailed', { error: e.message }));
   }
   closeAttachPopup();
   if (dom.imageFileInput) dom.imageFileInput.value = '';

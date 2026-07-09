@@ -11,6 +11,7 @@ import {
   normalizeSlashCommandText,
   type SlashCommandSpec,
 } from './slashCommands.js';
+import { tr } from './i18n.js';
 
 // Guard: prevent double-registration on Vite HMR re-execution of main.ts.
 let _listenerInit = false;
@@ -88,7 +89,7 @@ function renderSlashCommandMenu() {
   if (slashMenuSuggestions.length === 0) {
     const empty = document.createElement('div');
     empty.className = 'slash-command-empty';
-    empty.textContent = 'No matching commands';
+    empty.textContent = tr('slash.noMatches');
     fragment.appendChild(empty);
   } else {
     for (const [index, spec] of slashMenuSuggestions.entries()) {
@@ -114,13 +115,13 @@ function renderSlashCommandMenu() {
       if (isBusyAllowedSlashCommand(spec)) {
         const badge = document.createElement('span');
         badge.className = 'slash-command-item-badge';
-        badge.textContent = 'Live';
+        badge.textContent = tr('common.live');
         commandRow.appendChild(badge);
       }
 
       const description = document.createElement('div');
       description.className = 'slash-command-item-description';
-      description.textContent = spec.description;
+      description.textContent = spec.description();
 
       button.append(commandRow, description);
       fragment.appendChild(button);
@@ -220,11 +221,11 @@ export function send() {
 
   if (state.activeGroupId) {
     if (text.startsWith('/') && state.pendingImages.length === 0) {
-      addSystem('Slash commands are not supported in group chat.');
+      addSystem(tr('group.slashUnsupported'));
       return;
     }
     if (state.pendingImages.length > 0) {
-      addSystem('Group chat does not support image attachments yet.');
+      addSystem(tr('group.imagesUnsupported'));
       return;
     }
     const targetMode = state.groupTargetMode || 'all';
@@ -234,7 +235,7 @@ export function send() {
         ? state.groupSelectedTargets.filter((target) => activeMembers.has(target))
         : [];
     if (targetMode === 'selected' && targets.length === 0) {
-      addSystem('Select at least one group member before sending.');
+      addSystem(tr('group.selectMember'));
       return;
     }
     state.ws.send(
@@ -265,9 +266,7 @@ export function send() {
 
     const commandText = normalizeSlashCommandText(text);
     if (state.busy && !canSendWhileBusy(commandText)) {
-      addSystem(
-        'Agent \u8fd0\u884c\u4e2d\u65f6\uff0c\u53ea\u5141\u8bb8 /stop\u3001/tool \u548c /reasoning\u3002',
-      );
+      addSystem(tr('slash.busyLimited'));
       return;
     }
     sendCmd(commandText);
@@ -334,7 +333,7 @@ export function stopAgent() {
 export function sendCmd(cmd) {
   const normalizedCmd = normalizeSlashCommandText(cmd.trim());
   if (state.activeGroupId) {
-    addSystem('Slash commands are not supported in group chat.');
+    addSystem(tr('group.slashUnsupported'));
     return;
   }
   if ((!canSendWhileBusy(normalizedCmd) && state.busy) || !state.ws || state.ws.readyState !== 1) {

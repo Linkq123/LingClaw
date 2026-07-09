@@ -7,14 +7,33 @@ import { renderSessionDrawer } from './renderers/sessions.js';
 import { closeToolDrawer } from './renderers/tools.js';
 import { resetTodosUiState } from './renderers/todos.js';
 import { finishAssistantStream, finishReasoningStream } from './handlers/stream.js';
+import { tr } from './i18n.js';
+
+type TranslationVars = Record<string, string | number | boolean | null | undefined>;
+type ConnectionStatus = 'connecting' | 'connected' | 'disconnected';
+
+let currentConnStatus: {
+  status: ConnectionStatus;
+  key: string;
+  vars?: TranslationVars;
+} = {
+  status: 'disconnected',
+  key: 'common.offline',
+};
 
 // Connection indicator has three visual states: connecting (amber, pulsing),
 // connected (green), disconnected/failed (red). We used to flip straight from
 // connected → disconnected on socket close which hid the in-flight retry from
 // the user; the intermediate state makes the retry loop legible.
-function setConnStatus(status: 'connecting' | 'connected' | 'disconnected', label: string): void {
+function setConnStatus(status: ConnectionStatus, key: string, vars?: TranslationVars): void {
+  currentConnStatus = { status, key, vars };
+  refreshConnectionStatus();
+}
+
+export function refreshConnectionStatus(): void {
+  const { status, key, vars } = currentConnStatus;
   if (dom.connDot) dom.connDot.className = `conn-dot ${status}`;
-  if (dom.connLabel) dom.connLabel.textContent = label;
+  if (dom.connLabel) dom.connLabel.textContent = tr(key, vars);
 }
 
 function sessionWebSocketUrl(): string {
@@ -51,14 +70,14 @@ export function cancelReconnect(): void {
 }
 
 export function connect(onMessage) {
-  setConnStatus('connecting', 'Connecting…');
+  setConnStatus('connecting', 'common.connecting');
   state.ws = new WebSocket(sessionWebSocketUrl());
 
   state.ws.onopen = () => {
     state.reconnectDelay = 1000;
     state.reconnectAttempts = 0;
-    setConnStatus('connected', 'Online');
-    addSystem('Connected.');
+    setConnStatus('connected', 'common.online');
+    addSystem(tr('common.connected'));
   };
 
   state.ws.onclose = () => {
@@ -67,10 +86,14 @@ export function connect(onMessage) {
       const delaySecs = Math.ceil(state.reconnectDelay / 1000);
       setConnStatus(
         'connecting',
-        `Reconnecting in ${delaySecs}s (#${state.reconnectAttempts + 1})`,
+        'socket.reconnecting',
+        {
+          seconds: delaySecs,
+          attempt: state.reconnectAttempts + 1,
+        },
       );
       if (state.reconnectAttempts === 0) {
-        addSystem('Disconnected. Reconnecting...');
+        addSystem(tr('socket.disconnectedReconnecting'));
       }
       reconnectTimer = setTimeout(() => {
         reconnectTimer = null;
@@ -81,8 +104,8 @@ export function connect(onMessage) {
     } else {
       state.sessionSwitchInFlight = false;
       renderSessionDrawer();
-      setConnStatus('disconnected', 'Offline');
-      addSystem('Connection lost. Please refresh the page.', 'error');
+      setConnStatus('disconnected', 'common.offline');
+      addSystem(tr('socket.lostRefresh'), 'error');
     }
   };
 

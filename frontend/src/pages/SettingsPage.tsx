@@ -29,6 +29,7 @@ import {
   serializeProviderForms,
 } from './settingsModels.js';
 import type { ModelFormEntry, ProviderFormData } from './settingsModels.js';
+import { subscribeLanguageChange, tr } from '../i18n.js';
 
 // ── Module-level bridge (imperative open/close from main.ts) ──────────────────
 
@@ -104,44 +105,64 @@ interface TabMeta {
   saveMode: TabSaveMode;
 }
 
-const SETTINGS_TABS: ReadonlyArray<TabMeta> = [
+const SETTINGS_TAB_DEFS: ReadonlyArray<{
+  id: TabId;
+  labelKey: string;
+  descriptionKey: string;
+  saveMode: TabSaveMode;
+}> = [
   {
     id: 'tab-general',
-    label: 'General',
-    description: 'Server, timeouts, context limits, and feature switches.',
+    labelKey: 'settings.tab.general',
+    descriptionKey: 'settings.tab.generalDesc',
     saveMode: 'config',
   },
   {
     id: 'tab-skills',
-    label: 'Skills',
-    description: 'Session-scoped system skill availability.',
+    labelKey: 'settings.tab.skills',
+    descriptionKey: 'settings.tab.skillsDesc',
     saveMode: 'skills',
   },
   {
     id: 'tab-agents',
-    label: 'Agents',
-    description: 'Default model routing for the main agent and sub-agents.',
+    labelKey: 'settings.tab.agents',
+    descriptionKey: 'settings.tab.agentsDesc',
     saveMode: 'config',
   },
   {
     id: 'tab-models',
-    label: 'Models',
-    description: 'Provider endpoints, API keys, model capabilities, and test actions.',
+    labelKey: 'settings.tab.models',
+    descriptionKey: 'settings.tab.modelsDesc',
     saveMode: 'config',
   },
   {
     id: 'tab-mcp',
-    label: 'MCP',
-    description: 'MCP server commands, environment, and connectivity checks.',
+    labelKey: 'settings.tab.mcp',
+    descriptionKey: 'settings.tab.mcpDesc',
     saveMode: 'config',
   },
   {
     id: 'tab-s3',
-    label: 'S3',
-    description: 'S3-compatible file storage settings.',
+    labelKey: 'settings.tab.s3',
+    descriptionKey: 'settings.tab.s3Desc',
     saveMode: 'config',
   },
 ];
+
+function settingsTabs(): ReadonlyArray<TabMeta> {
+  return SETTINGS_TAB_DEFS.map((tab) => ({
+    id: tab.id,
+    label: tr(tab.labelKey),
+    description: tr(tab.descriptionKey),
+    saveMode: tab.saveMode,
+  }));
+}
+
+function useLanguageVersion(): number {
+  const [version, setVersion] = useState(0);
+  useEffect(() => subscribeLanguageChange(() => setVersion((current) => current + 1)), []);
+  return version;
+}
 
 function normalizeConfigForSave(config: AppConfig): AppConfig {
   const finalConfig: AppConfig = {
@@ -210,9 +231,9 @@ function TriSelect({ value, onChange }: { value: TriBool; onChange: (v: TriBool)
       value={triStateToString(value)}
       onChange={(e) => onChange(stringToTriBool(e.target.value))}
     >
-      <option value="">Default</option>
-      <option value="true">Enabled</option>
-      <option value="false">Disabled</option>
+      <option value="">{tr('common.default')}</option>
+      <option value="true">{tr('common.enabled')}</option>
+      <option value="false">{tr('common.disabled')}</option>
     </select>
   );
 }
@@ -226,11 +247,12 @@ const ModelSelect = React.memo(function ModelSelect({
   options: string[];
   onChange: (v: string) => void;
 }) {
+  useLanguageVersion();
   const v = value || '';
   const includesValue = v && options.includes(v);
   return (
     <select value={v} onChange={(e) => onChange(e.target.value)}>
-      <option value="">-- none --</option>
+      <option value="">-- {tr('common.none')} --</option>
       {options.map((opt) => (
         <option key={opt} value={opt}>
           {opt}
@@ -278,7 +300,7 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
   return (
     <>
       <div className="settings-group">
-        <div className="settings-group-title">Server</div>
+        <div className="settings-group-title">{tr('settings.server')}</div>
         <SettingsRow label="Port">
           <input
             type="number"
@@ -289,7 +311,7 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
         </SettingsRow>
       </div>
       <div className="settings-group">
-        <div className="settings-group-title">Timeouts (seconds)</div>
+        <div className="settings-group-title">{tr('settings.timeouts')}</div>
         <SettingsRow label="Exec Timeout">
           <input
             type="number"
@@ -324,7 +346,7 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
         </SettingsRow>
       </div>
       <div className="settings-group">
-        <div className="settings-group-title">Context</div>
+        <div className="settings-group-title">{tr('settings.context')}</div>
         <SettingsRow label="Max Context Tokens">
           <input
             type="number"
@@ -351,7 +373,7 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
         </SettingsRow>
       </div>
       <div className="settings-group">
-        <div className="settings-group-title">Features</div>
+        <div className="settings-group-title">{tr('settings.features')}</div>
         <SettingsRow label="Structured Memory">
           <TriSelect value={s.structuredMemory} onChange={(v) => set({ structuredMemory: v })} />
         </SettingsRow>
@@ -397,10 +419,7 @@ function AgentsTab({
 }) {
   const modelRaw = config.agents?.defaults?.model;
   // Stabilise the model reference so downstream memoization deps are stable.
-  const model = useMemo(
-    () => (modelRaw || {}) as Record<string, string | undefined>,
-    [modelRaw],
-  );
+  const model = useMemo(() => (modelRaw || {}) as Record<string, string | undefined>, [modelRaw]);
   const providersRaw = config.models?.providers;
   // Stabilise the providers reference so downstream memoization deps are stable.
   const providers = useMemo(() => providersRaw || {}, [providersRaw]);
@@ -483,14 +502,12 @@ function AgentsTab({
 
   return (
     <div className="settings-group">
-      <div className="settings-group-title">Agent Default Models</div>
+      <div className="settings-group-title">{tr('settings.agentDefaults')}</div>
       <p style={{ fontSize: 12, color: 'var(--dim)', marginBottom: 12 }}>
-        Models must reference a provider configured in the Models tab (format:{' '}
-        <code>provider/model-id</code>).
+        {tr('settings.agentDefaultsHelp')}
       </p>
       <p style={{ fontSize: 12, color: 'var(--dim)', marginBottom: 12 }}>
-        Sub-agent resolution order is <code>sub-agent-&lt;name&gt;</code> {'->'}{' '}
-        <code>sub-agent</code> {'->'} <code>primary</code>.
+        {tr('settings.subAgentOrder')}
       </p>
       {AGENT_ROLES.map(({ key, label }) => (
         <AgentRoleRow
@@ -511,7 +528,7 @@ function AgentsTab({
           gap: 10,
         }}
       >
-        <div style={{ fontSize: 12, fontWeight: 600 }}>Per-Sub-Agent Overrides</div>
+        <div style={{ fontSize: 12, fontWeight: 600 }}>{tr('settings.perSubAgentOverrides')}</div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
           <select
             value={selectedAgentName}
@@ -519,7 +536,7 @@ function AgentsTab({
             disabled={availableAgentsToAdd.length === 0}
           >
             {availableAgentsToAdd.length === 0 ? (
-              <option value="">No discovered sub-agents available</option>
+              <option value="">{tr('settings.noDiscoveredAgents')}</option>
             ) : (
               availableAgentsToAdd.map((agent) => (
                 <option key={agent.name} value={agent.name}>
@@ -534,24 +551,22 @@ function AgentsTab({
             onClick={addSubAgentOverride}
             disabled={!selectedAgentName || !defaultNewSubAgentModel}
           >
-            + Add Sub-Agent Override
+            {tr('settings.addSubAgentOverride')}
           </button>
         </div>
         {!defaultNewSubAgentModel && (
-          <div style={{ fontSize: 12, color: 'var(--dim)' }}>
-            Add at least one model in the Models tab before creating a sub-agent-specific override.
-          </div>
+          <div style={{ fontSize: 12, color: 'var(--dim)' }}>{tr('settings.addModelFirst')}</div>
         )}
         {subAgentOverrides.length === 0 ? (
           <div style={{ fontSize: 12, color: 'var(--dim)' }}>
-            No sub-agent-specific model overrides configured.
+            {tr('settings.noSubAgentOverrides')}
           </div>
         ) : (
           subAgentOverrides.map(({ key, agentName, value }) => {
             const discovered = discoveredAgentByName.get(agentName);
             const label = discovered?.source
               ? `${agentName} (${discovered.source})`
-              : `${agentName} (not currently discovered)`;
+              : `${agentName} (${tr('settings.notDiscovered')})`;
             return (
               <div
                 key={key}
@@ -574,10 +589,10 @@ function AgentsTab({
                   <div style={{ fontSize: 12, color: 'var(--dim)' }}>{label}</div>
                   <button
                     className="btn-danger-sm"
-                    title={`Remove override for ${agentName}`}
+                    title={tr('settings.removeOverride', { agent: agentName })}
                     onClick={() => removeSubAgentOverride(key)}
                   >
-                    Remove
+                    {tr('common.remove')}
                   </button>
                 </div>
                 <ModelSelect
@@ -758,6 +773,7 @@ function ProviderCardInner({
   onDelete: (rowKey: string) => void;
   onTest: (p: ProviderFormData, modelId: string) => void;
 }) {
+  useLanguageVersion();
   const addModel = () => {
     onChange({
       ...prov,
@@ -862,7 +878,7 @@ function ProviderCardInner({
           />
         ))}
         <button className="btn-secondary" style={{ marginTop: 6, fontSize: 11 }} onClick={addModel}>
-          + Add Model
+          {tr('settings.addModel')}
         </button>
       </div>
     </div>
@@ -1064,11 +1080,11 @@ function ModelsTab({
         />
       ))}
       <button className="btn-secondary" style={{ marginTop: 10 }} onClick={addProvider}>
-        + Add Provider
+        {tr('settings.addProvider')}
       </button>
       <details style={{ marginTop: 16 }}>
         <summary style={{ fontSize: 12, color: 'var(--dim)', cursor: 'pointer' }}>
-          Advanced: Raw JSON
+          {tr('settings.advancedRawJson')}
         </summary>
         <div className="json-editor-wrap" style={{ marginTop: 8 }}>
           <textarea
@@ -1083,7 +1099,7 @@ function ModelsTab({
           />
           {jsonError && <div className="json-editor-error">{jsonError}</div>}
           <button className="btn-secondary" style={{ marginTop: 6 }} onClick={applyJson}>
-            Apply JSON
+            {tr('settings.applyJson')}
           </button>
         </div>
       </details>
@@ -1225,6 +1241,7 @@ function McpServerCardInner({
   onDelete: (rowKey: string) => void;
   onTest: (s: McpFormEntry) => void;
 }) {
+  useLanguageVersion();
   const [newEnvKey, setNewEnvKey] = useState('');
   const [newEnvVal, setNewEnvVal] = useState('');
 
@@ -1948,20 +1965,17 @@ function McpTab({
         />
       ))}
       <button className="btn-secondary" style={{ marginTop: 10 }} onClick={addServer}>
-        + Add MCP Server
+        {tr('settings.addMcpServer')}
       </button>
       <div className="settings-card" style={{ marginTop: 16 }}>
         <div className="settings-card-title">
-          Session MCP Permissions
+          {tr('settings.sessionMcpPermissions')}
           <span style={{ color: 'var(--dim)', fontWeight: 400 }}> · {sessionId}</span>
         </div>
-        <div className="settings-card-description">
-          Configured servers are discovered globally. Tools are injected only after they are enabled
-          for this session.
-        </div>
+        <div className="settings-card-description">{tr('settings.mcpPermissionsDesc')}</div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', margin: '10px 0' }}>
           <button className="btn-secondary" type="button" onClick={() => void loadCatalog()}>
-            {catalogLoading ? 'Loading...' : 'Refresh Catalog'}
+            {catalogLoading ? tr('settings.loading') : tr('settings.refreshCatalog')}
           </button>
           <button
             className="btn-primary"
@@ -1969,9 +1983,13 @@ function McpTab({
             disabled={!policyDirty || policySaving}
             onClick={() => void saveMcpPolicy()}
           >
-            {policySaving ? 'Saving...' : 'Save MCP Permissions'}
+            {policySaving ? tr('settings.saving') : tr('settings.saveMcpPermissions')}
           </button>
-          {policyDirty && <span style={{ color: 'var(--warn)', fontSize: 12 }}>Unsaved</span>}
+          {policyDirty && (
+            <span style={{ color: 'var(--warn)', fontSize: 12 }}>
+              {tr('settings.unsavedShort')}
+            </span>
+          )}
         </div>
         <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12 }}>
           <input
@@ -1982,7 +2000,7 @@ function McpTab({
               markPolicyDirty();
             }}
           />
-          Require confirmation for mutating MCP tools
+          {tr('settings.confirmMutatingTools')}
         </label>
         <label
           style={{
@@ -2001,7 +2019,7 @@ function McpTab({
               markPolicyDirty();
             }}
           />
-          Expose this session workspace root to MCP servers
+          {tr('settings.exposeWorkspaceRoot')}
         </label>
         {(catalog?.servers || []).map((server) => (
           <div className="provider-card" key={server.id} style={{ marginTop: 10 }}>
@@ -2038,7 +2056,7 @@ function McpTab({
                     disabled={!server.configuredEnabled}
                     onChange={(e) => toggleServerPolicy(server, e.target.checked)}
                   />
-                  Enabled for session
+                  {tr('settings.enabledForSession')}
                 </label>
               </div>
             </div>
@@ -2085,17 +2103,14 @@ function McpTab({
       </div>
       {Boolean(sessionResources.length || sessionPrompts.length) && (
         <div className="settings-card" style={{ marginTop: 16 }}>
-          <div className="settings-card-title">Resources and Prompts</div>
-          <div className="settings-card-description">
-            Read-only preview actions fetch the selected MCP payload and insert it into the chat
-            input for manual use.
-          </div>
+          <div className="settings-card-title">{tr('settings.resourcesAndPrompts')}</div>
+          <div className="settings-card-description">{tr('settings.resourcesAndPromptsDesc')}</div>
           {sessionResources.map((resource) => (
             <div className="provider-card" key={`${resource.server}:${resource.uri}`}>
               <div className="provider-card-header">
                 <span className="provider-card-name">{resource.name || resource.uri}</span>
                 <button className="btn-secondary" onClick={() => void readResource(resource)}>
-                  Read
+                  {tr('settings.readResource')}
                 </button>
               </div>
               <div style={{ color: 'var(--dim)', fontSize: 12 }}>{resource.uri}</div>
@@ -2108,7 +2123,7 @@ function McpTab({
                 <div className="provider-card-header">
                   <span className="provider-card-name">{prompt.name}</span>
                   <button className="btn-secondary" onClick={() => void getPrompt(prompt)}>
-                    Get
+                    {tr('settings.getPrompt')}
                   </button>
                 </div>
                 {prompt.description && (
@@ -2132,7 +2147,7 @@ function McpTab({
                 {prompt.arguments !== undefined && (
                   <details style={{ marginTop: 6 }}>
                     <summary style={{ color: 'var(--dim)', cursor: 'pointer', fontSize: 12 }}>
-                      Arguments schema
+                      {tr('settings.argumentsSchema')}
                     </summary>
                     <pre className="json-editor" style={{ marginTop: 6 }}>
                       {JSON.stringify(prompt.arguments, null, 2)}
@@ -2146,7 +2161,7 @@ function McpTab({
       )}
       <details style={{ marginTop: 16 }}>
         <summary style={{ fontSize: 12, color: 'var(--dim)', cursor: 'pointer' }}>
-          Advanced: Raw JSON
+          {tr('settings.advancedRawJson')}
         </summary>
         <div className="json-editor-wrap" style={{ marginTop: 8 }}>
           <textarea
@@ -2161,7 +2176,7 @@ function McpTab({
           />
           {jsonError && <div className="json-editor-error">{jsonError}</div>}
           <button className="btn-secondary" style={{ marginTop: 6 }} onClick={applyJson}>
-            Apply JSON
+            {tr('settings.applyJson')}
           </button>
         </div>
       </details>
@@ -2221,7 +2236,7 @@ function SkillsTab({
   const loadSkills = useCallback(
     async (signal?: AbortSignal) => {
       setLoading(true);
-      setStatus({ message: 'Loading skills...', type: 'loading' });
+      setStatus({ message: tr('settings.loadingSkills'), type: 'loading' });
       try {
         const response = await fetch(
           `/api/session-skills?session=${encodeURIComponent(targetSessionId)}`,
@@ -2237,10 +2252,13 @@ function SkillsTab({
         setSavedEnabledIds(nextEnabled);
         setKnownSkillIds(sortedSkillIds(nextSkills));
         setSessionLabel(data.session?.name || data.session?.id || targetSessionId);
-        setStatus({ message: 'Loaded', type: 'success' });
+        setStatus({ message: tr('settings.skillsLoaded'), type: 'success' });
       } catch (error: unknown) {
         if ((error as Error).name === 'AbortError') return;
-        setStatus({ message: `Load failed: ${(error as Error).message}`, type: 'error' });
+        setStatus({
+          message: tr('settings.skillsLoadFailed', { error: (error as Error).message }),
+          type: 'error',
+        });
       } finally {
         setLoading(false);
       }
@@ -2292,12 +2310,12 @@ function SkillsTab({
   const revertSkills = useCallback(() => {
     const saved = new Set(savedEnabledIds);
     setSkills((current) => current.map((skill) => ({ ...skill, enabled: saved.has(skill.id) })));
-    setStatus({ message: 'Reverted unsaved skill changes', type: 'idle' });
+    setStatus({ message: tr('settings.skillsReverted'), type: 'idle' });
   }, [savedEnabledIds]);
 
   const saveSkills = useCallback(async () => {
     setSaving(true);
-    setStatus({ message: 'Saving skills...', type: 'loading' });
+    setStatus({ message: tr('settings.skillsSaving'), type: 'loading' });
     try {
       const response = await fetch(
         `/api/session-skills?session=${encodeURIComponent(targetSessionId)}`,
@@ -2320,9 +2338,12 @@ function SkillsTab({
       setSavedEnabledIds(nextEnabled);
       setKnownSkillIds(sortedSkillIds(nextSkills));
       setSessionLabel(data.session?.name || data.session?.id || sessionLabel);
-      setStatus({ message: 'Skills saved', type: 'success' });
+      setStatus({ message: tr('settings.skillsSaved'), type: 'success' });
     } catch (error: unknown) {
-      setStatus({ message: `Save failed: ${(error as Error).message}`, type: 'error' });
+      setStatus({
+        message: tr('settings.skillsSaveFailed', { error: (error as Error).message }),
+        type: 'error',
+      });
     } finally {
       setSaving(false);
     }
@@ -2337,10 +2358,10 @@ function SkillsTab({
 
   return (
     <div className="settings-group skills-settings">
-      <div className="settings-group-title">System Skills</div>
+      <div className="settings-group-title">{tr('settings.systemSkills')}</div>
       <div className="skills-toolbar">
         <div className="skills-session-label">
-          Session: <code>{sessionLabel}</code>
+          {tr('settings.sessionLabel')} <code>{sessionLabel}</code>
         </div>
         <span className={statusClass}>{status.message}</span>
       </div>
@@ -2348,8 +2369,8 @@ function SkillsTab({
         <input
           type="search"
           value={filterText}
-          placeholder="Search system skills"
-          aria-label="Search system skills"
+          placeholder={tr('settings.searchSkills')}
+          aria-label={tr('settings.searchSkills')}
           onChange={(event) => setFilterText(event.target.value)}
         />
         <button
@@ -2357,35 +2378,33 @@ function SkillsTab({
           onClick={() => setAllEnabled(true)}
           disabled={loading || saving}
         >
-          Enable all
+          {tr('settings.enableAll')}
         </button>
         <button
           className="btn-secondary"
           onClick={() => setAllEnabled(false)}
           disabled={loading || saving}
         >
-          Disable all
+          {tr('settings.disableAll')}
         </button>
         <button
           className="btn-secondary"
           onClick={revertSkills}
           disabled={!dirty || loading || saving}
         >
-          Revert
+          {tr('settings.revert')}
         </button>
         <button className="btn-primary" onClick={saveSkills} disabled={!dirty || loading || saving}>
-          Save Skills
+          {tr('settings.saveSkills')}
         </button>
       </div>
       <div className="skills-summary">
-        {enabledCount} of {skills.length} system skills enabled. System skills are off by default
-        and are injected only after you enable and save them here. Global and session-local skills
-        are still discovered automatically.
+        {tr('settings.skillsSummary', { enabled: enabledCount, total: skills.length })}
       </div>
       <div className="skills-list">
         {visibleSkills.length === 0 ? (
           <div className="skills-empty">
-            {loading ? 'Loading skills...' : 'No matching system skills.'}
+            {loading ? tr('settings.loadingSkills') : tr('settings.noMatchingSkills')}
           </div>
         ) : (
           visibleSkills.map((skill) => (
@@ -2422,7 +2441,7 @@ function S3Tab({ config, onChange }: { config: AppConfig; onChange: (c: AppConfi
 
   return (
     <div className="settings-group">
-      <div className="settings-group-title">S3-Compatible File Storage</div>
+      <div className="settings-group-title">{tr('settings.s3Title')}</div>
       <SettingsRow label="Endpoint">
         <input
           type="text"
@@ -2519,7 +2538,7 @@ function CorruptConfigView({
       onStatus('Fix JSON syntax errors first', 'error');
       return;
     }
-    onStatus('Saving...');
+    onStatus(tr('settings.saving'));
     try {
       const resp = await fetch('/api/config', {
         method: 'PUT',
@@ -2528,7 +2547,7 @@ function CorruptConfigView({
       });
       const result = await resp.json();
       if (!resp.ok || result.error) {
-        onStatus(result.error || 'Save failed', 'error');
+        onStatus(result.error || tr('settings.saveFailed'), 'error');
         return;
       }
       onStatus('Saved! Reloading...', 'success');
@@ -2553,13 +2572,11 @@ function CorruptConfigView({
   return (
     <div className="settings-group">
       <div className="settings-group-title" style={{ color: 'var(--accent-error)' }}>
-        Config File Error
+        {tr('settings.configFileErrorTitle')}
       </div>
-      <p style={{ color: 'var(--dim)' }}>
-        The config file has a JSON syntax error. Fix it below and save, or edit the file manually.
-      </p>
+      <p style={{ color: 'var(--dim)' }}>{tr('settings.configFileErrorBody')}</p>
       <p style={{ fontSize: 12, color: 'var(--dim)' }}>
-        File: <code>{data.path}</code>
+        {tr('settings.file')} <code>{data.path}</code>
       </p>
       <div className="json-editor-wrap">
         <textarea
@@ -2576,7 +2593,7 @@ function CorruptConfigView({
         {errorMsg && <div className="json-editor-error">{errorMsg}</div>}
       </div>
       <button className="btn-primary" style={{ marginTop: 10 }} onClick={save}>
-        Save & Recover
+        {tr('settings.saveRecover')}
       </button>
     </div>
   );
@@ -2666,18 +2683,18 @@ function SettingsShell({
   const hasUnsavedChanges = configDirty || skillsDirty || mcpDirty;
   const dirtySections = [
     configDirty ? 'Config' : '',
-    skillsDirty ? 'Skills' : '',
+    skillsDirty ? tr('settings.tab.skills') : '',
     mcpDirty ? 'MCP' : '',
   ].filter(Boolean);
 
   return (
     <div className="page-panel settings-panel">
       <div className="settings-shell">
-        <aside className="settings-sidebar" aria-label="Settings sections">
+        <aside className="settings-sidebar" aria-label={tr('settings.sectionsAria')}>
           <div className="settings-sidebar-head">
             <div className="settings-eyebrow">LingClaw</div>
-            <h2>Settings</h2>
-            <p>Configure runtime, providers, agents, tools, and storage.</p>
+            <h2>{tr('settings.title')}</h2>
+            <p>{tr('settings.subtitle')}</p>
           </div>
           <div id="settings-tabs" className="page-tabs settings-nav" role="tablist">
             {tabs.map((tab) => (
@@ -2708,13 +2725,9 @@ function SettingsShell({
           <div className="settings-topbar">
             <div className="settings-title-block">
               <h2 ref={titleRef} tabIndex={-1}>
-                {corrupt ? 'Config File Error' : activeMeta.label}
+                {corrupt ? tr('settings.configError') : activeMeta.label}
               </h2>
-              <p>
-                {corrupt
-                  ? 'Repair the JSON config before editing other settings.'
-                  : activeMeta.description}
-              </p>
+              <p>{corrupt ? tr('settings.configErrorSubtitle') : activeMeta.description}</p>
             </div>
             <div className="settings-topbar-actions">
               <span className={statusClass} id="settings-status">
@@ -2722,8 +2735,8 @@ function SettingsShell({
               </span>
               <button
                 className="page-close"
-                title="Close"
-                aria-label="Close"
+                title={tr('common.close')}
+                aria-label={tr('common.close')}
                 onClick={onRequestClose}
               >
                 ×
@@ -2734,19 +2747,20 @@ function SettingsShell({
           {showDiscardConfirm && (
             <div className="settings-discard-dialog" role="alertdialog" aria-live="assertive">
               <div>
-                <strong>Discard unsaved changes?</strong>
+                <strong>{tr('settings.discardTitle')}</strong>
                 <span>
-                  {` ${dirtySections.join(', ')} ${
-                    dirtySections.length === 1 ? 'has' : 'have'
-                  } unsaved changes.`}
+                  {` ${tr('settings.discardBody', {
+                    sections: dirtySections.join(', '),
+                    verb: dirtySections.length === 1 ? 'has' : 'have',
+                  })}`}
                 </span>
               </div>
               <div className="settings-discard-actions">
                 <button className="btn-secondary" type="button" onClick={onCancelDiscard}>
-                  Keep Editing
+                  {tr('settings.keepEditing')}
                 </button>
                 <button className="btn-primary btn-danger" type="button" onClick={onDiscardChanges}>
-                  Discard Changes
+                  {tr('settings.discardChanges')}
                 </button>
               </div>
             </div>
@@ -2759,10 +2773,10 @@ function SettingsShell({
           <div className="settings-footer">
             <div className="settings-footer-note">
               {hasUnsavedChanges
-                ? 'You have unsaved changes.'
+                ? tr('settings.unsaved')
                 : activeMeta.saveMode === 'skills'
-                  ? 'Skills save independently for the current session.'
-                  : 'No unsaved config changes.'}
+                  ? tr('settings.skillsIndependent')
+                  : tr('settings.noUnsaved')}
             </div>
             {canSaveConfig && (
               <button
@@ -2771,7 +2785,7 @@ function SettingsShell({
                 onClick={onSaveConfig}
                 disabled={!configDirty || status.type === 'loading'}
               >
-                Save
+                {tr('settings.save')}
               </button>
             )}
           </div>
@@ -2784,6 +2798,7 @@ function SettingsShell({
 // ── Main SettingsPage component ───────────────────────────────────────────────
 
 export function SettingsPage() {
+  useLanguageVersion();
   const [visible, setVisible] = useState(false);
   const [config, setConfig] = useState<AppConfig>({});
   const [savedConfig, setSavedConfig] = useState<AppConfig>({});
@@ -2909,7 +2924,7 @@ export function SettingsPage() {
     if (!visible) return;
     const controller = new AbortController();
     (async () => {
-      setStatus({ message: 'Loading...', type: 'loading' });
+      setStatus({ message: tr('settings.loading'), type: 'loading' });
       try {
         const resp = await fetch('/api/config', { signal: controller.signal });
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -2920,7 +2935,7 @@ export function SettingsPage() {
           setConfig({});
           setSavedConfig({});
           setConfigBaseline(serializeConfigForDirty({}));
-          setStatus({ message: 'Config file has syntax errors', type: 'error' });
+          setStatus({ message: tr('settings.syntaxErrors'), type: 'error' });
           return;
         }
         const nextConfig = data.config || {};
@@ -2929,10 +2944,13 @@ export function SettingsPage() {
         setSavedConfig(nextConfig);
         setConfigBaseline(serializeConfigForDirty(nextConfig));
         if (!hasUnsavedChangesRef.current) setShowDiscardConfirm(false);
-        setStatus({ message: `Loaded from ${data.path}`, type: 'success' });
+        setStatus({ message: tr('settings.loadedFrom', { path: data.path }), type: 'success' });
       } catch (e: unknown) {
         if ((e as Error).name === 'AbortError') return;
-        setStatus({ message: `Load failed: ${(e as Error).message}`, type: 'error' });
+        setStatus({
+          message: tr('settings.loadFailed', { error: (e as Error).message }),
+          type: 'error',
+        });
       }
     })();
     return () => controller.abort();
@@ -2987,7 +3005,7 @@ export function SettingsPage() {
       return;
     }
 
-    setStatus({ message: 'Saving...', type: 'loading' });
+    setStatus({ message: tr('settings.saving'), type: 'loading' });
     try {
       const resp = await fetch('/api/config', {
         method: 'PUT',
@@ -2996,19 +3014,21 @@ export function SettingsPage() {
       });
       const data = await resp.json();
       if (!resp.ok || data.error) {
-        setStatus({ message: data.error || 'Save failed', type: 'error' });
+        setStatus({ message: data.error || tr('settings.saveFailed'), type: 'error' });
         return;
       }
       setStatus({
-        message:
-          'Saved successfully! Most changes apply immediately. Restart LingClaw only for port changes.',
+        message: tr('settings.saved'),
         type: 'success',
       });
       setConfig(finalConfig);
       setSavedConfig(finalConfig);
       setConfigBaseline(serializeConfigForDirty(finalConfig));
     } catch (e: unknown) {
-      setStatus({ message: `Save failed: ${(e as Error).message}`, type: 'error' });
+      setStatus({
+        message: tr('settings.saveFailedWithError', { error: (e as Error).message }),
+        type: 'error',
+      });
     }
   };
 
@@ -3027,7 +3047,7 @@ export function SettingsPage() {
   return (
     <SettingsShell
       activeTab={activeTab}
-      tabs={SETTINGS_TABS}
+      tabs={settingsTabs()}
       status={status}
       configDirty={configDirty}
       skillsDirty={skillsDirty}

@@ -2,6 +2,7 @@ import { invalidateChatScrollCache, scrollDown } from '../scroll.js';
 import { dom, state } from '../state.js';
 import type { AutoTraceEvent } from '../types.js';
 import { escHtml, hideWelcome } from '../utils.js';
+import { tr } from '../i18n.js';
 
 function flag(value: boolean): string {
   return value ? 'yes' : 'no';
@@ -96,7 +97,9 @@ function renderAutoDebugPanel(): void {
 
 export function updateAutoDebugToggleButton(): void {
   if (!dom.toggleAutoDebugBtn) return;
-  dom.toggleAutoDebugBtn.textContent = `Auto Debug: ${state.autoDebugEnabled ? 'On' : 'Off'}`;
+  dom.toggleAutoDebugBtn.textContent = `${tr('common.autoDebug')}: ${
+    state.autoDebugEnabled ? tr('common.on') : tr('common.off')
+  }`;
   dom.toggleAutoDebugBtn.classList.toggle('is-active', state.autoDebugEnabled);
 }
 
@@ -130,7 +133,9 @@ export function clearCompressionOutcomeForNewRound(nextCycle: number | null | un
   }
 }
 
-export function applyCompressionOutcome(compression: NonNullable<AutoTraceEvent['compression']>): void {
+export function applyCompressionOutcome(
+  compression: NonNullable<AutoTraceEvent['compression']>,
+): void {
   state.latestCompression = compression;
   if (state.latestAutoTrace) {
     state.latestAutoTrace = {
@@ -148,7 +153,7 @@ export function applyAutoTrace(trace: AutoTraceEvent): void {
   const compression =
     previousCycle != null && trace.cycle > previousCycle
       ? trace.compression
-      : trace.compression ?? state.latestCompression ?? undefined;
+      : (trace.compression ?? state.latestCompression ?? undefined);
   if (previousCycle != null && trace.cycle > previousCycle && !trace.compression) {
     clearCompressionOutcome();
   }

@@ -7,6 +7,7 @@ import {
   initTodosPanel,
   resetTodosUiState,
 } from '../src/renderers/todos.js';
+import { setLanguage } from '../src/i18n.js';
 
 function flushPromises(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
@@ -23,6 +24,7 @@ function jsonResponse(payload: unknown, status = 200): Response {
 
 describe('todos panel', () => {
   beforeEach(() => {
+    setLanguage('en');
     document.body.innerHTML = `
       <section id="todos-host"></section>
       <div id="chat"></div>
@@ -68,7 +70,7 @@ describe('todos panel', () => {
       updated_at: 1710000000,
     });
 
-    expect(dom.todosPanel?.textContent).toContain('Updated by user');
+    expect(dom.todosPanel?.textContent).toContain('Updated by You');
     expect(dom.todosPanel?.querySelector<HTMLInputElement>('.todo-row-input')?.value).toBe(
       'Inspect runtime loop',
     );
@@ -110,7 +112,9 @@ describe('todos panel', () => {
     });
 
     expect(dom.todosPanel?.querySelector<HTMLInputElement>('.todo-row-input')?.disabled).toBe(true);
-    expect(dom.todosPanel?.querySelector<HTMLSelectElement>('.todo-row-status')?.disabled).toBe(true);
+    expect(dom.todosPanel?.querySelector<HTMLSelectElement>('.todo-row-status')?.disabled).toBe(
+      true,
+    );
     const addButton = dom.todosPanel?.querySelector<HTMLButtonElement>('.todos-add-btn');
     expect(addButton?.disabled).toBe(true);
 
@@ -153,6 +157,8 @@ describe('todos panel', () => {
     });
 
     const statusSelect = dom.todosPanel?.querySelectorAll<HTMLSelectElement>('.todo-row-status')[0];
+    expect(dom.todosPanel?.textContent).toContain('Updated by Assistant');
+
     statusSelect!.value = 'completed';
     statusSelect!.dispatchEvent(new Event('change', { bubbles: true }));
     await flushPromises();
@@ -227,7 +233,9 @@ describe('todos panel', () => {
       status: 'pending',
     });
     expect(state.todos.revision).toBe(6);
-    const inputs = Array.from(dom.todosPanel?.querySelectorAll<HTMLInputElement>('.todo-row-input') || []);
+    const inputs = Array.from(
+      dom.todosPanel?.querySelectorAll<HTMLInputElement>('.todo-row-input') || [],
+    );
     expect(inputs.map((input) => input.value)).toContain('New todo');
   });
 
