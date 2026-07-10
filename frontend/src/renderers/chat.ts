@@ -1,5 +1,5 @@
 import { dom, state } from '../state.js';
-import { DEFAULT_BRAND_AVATAR, DEFAULT_WELCOME_LOGO } from '../constants.js';
+import { DEFAULT_BRAND_AVATAR } from '../constants.js';
 import { formatTime, hideWelcome } from '../utils.js';
 import { scrollDown, queueUnreadContent, invalidateChatScrollCache } from '../scroll.js';
 import { pinReactStatusToBottom } from './react-status.js';
@@ -208,13 +208,21 @@ export function showWelcome() {
   w.className = 'welcome';
   w.id = 'welcome';
 
-  // welcome-logo
   const logoDiv = document.createElement('div');
-  logoDiv.className = 'welcome-logo';
+  logoDiv.className = 'welcome-brand-mark';
   const logoImg = document.createElement('img');
-  logoImg.src = DEFAULT_WELCOME_LOGO;
-  logoImg.alt = 'LingClaw';
+  logoImg.src = DEFAULT_BRAND_AVATAR;
+  logoImg.alt = '';
   logoDiv.appendChild(logoImg);
+
+  const eyebrow = document.createElement('div');
+  eyebrow.className = 'welcome-eyebrow';
+  eyebrow.innerHTML =
+    '<svg class="icon" aria-hidden="true"><use href="#icon-sparkles"></use></svg><span>LINGCLAW</span>';
+
+  const title = document.createElement('h1');
+  title.className = 'welcome-title';
+  title.textContent = tr('welcome.title');
 
   // version badge (dynamic — uses textContent, no innerHTML)
   const versionBadgeClass = ['app-version-badge', 'welcome-version'].join(' ');
@@ -227,34 +235,41 @@ export function showWelcome() {
     versionBadge.hidden = true;
   }
 
-  // welcome-hint
-  const hint = document.createElement('div');
+  const hint = document.createElement('p');
   hint.className = 'welcome-hint';
-  hint.appendChild(document.createTextNode(tr('welcome.ready')));
-  hint.appendChild(document.createElement('br'));
-  hint.appendChild(document.createTextNode(tr('welcome.hintPrefix')));
+  const ready = document.createElement('span');
+  ready.textContent = tr('welcome.ready');
+  const secondary = document.createElement('span');
+  secondary.className = 'welcome-hint-secondary';
+  secondary.appendChild(document.createTextNode(tr('welcome.hintPrefix')));
   const slash = document.createElement('strong');
   slash.textContent = '/';
-  hint.appendChild(slash);
-  hint.appendChild(document.createTextNode(tr('welcome.hintSuffix')));
+  secondary.appendChild(slash);
+  secondary.appendChild(document.createTextNode(tr('welcome.hintSuffix')));
+  hint.append(ready, secondary);
 
   // welcome-shortcuts
   const shortcuts = document.createElement('div');
   shortcuts.className = 'welcome-shortcuts';
-  const shortcutDefs: Array<[string, string]> = [
-    ['/clear', tr('common.newConversation')],
-    ['/status', tr('common.status')],
-    ['/help', tr('common.help')],
+  const shortcutDefs: Array<[string, string, string]> = [
+    ['/clear', tr('common.newConversation'), 'message'],
+    ['/status', tr('common.status'), 'activity'],
+    ['/help', tr('common.help'), 'help'],
   ];
-  for (const [cmd, label] of shortcutDefs) {
+  for (const [cmd, label, icon] of shortcutDefs) {
     const btn = document.createElement('button');
     btn.dataset.action = 'cmd';
     btn.dataset.cmd = cmd;
-    btn.textContent = label;
+    btn.innerHTML = `<svg class="icon" aria-hidden="true"><use href="#icon-${icon}"></use></svg>`;
+    const text = document.createElement('span');
+    text.textContent = label;
+    btn.appendChild(text);
     shortcuts.appendChild(btn);
   }
 
   w.appendChild(logoDiv);
+  w.appendChild(eyebrow);
+  w.appendChild(title);
   w.appendChild(versionBadge);
   w.appendChild(hint);
   w.appendChild(shortcuts);
@@ -275,7 +290,8 @@ export function setBusy(b) {
   } else {
     dom.input.placeholder = 'Message LingClaw... (/ for commands)';
   }
-  dom.sendIcon.innerHTML = '↑';
+  dom.sendIcon.innerHTML =
+    '<svg class="icon" aria-hidden="true"><use href="#icon-send"></use></svg>';
   dom.sendBtn.title = '';
   dom.sendBtn.setAttribute('aria-label', 'Send message');
 }

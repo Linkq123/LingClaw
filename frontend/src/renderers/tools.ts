@@ -4,9 +4,60 @@ import { scrollDown, syncToolDrawerBounds } from '../scroll.js';
 import { wrapInTimeline, animatePanelIn, animateCollapsibleSection } from './timeline.js';
 import { pinReactStatusToBottom } from './react-status.js';
 import { tr } from '../i18n.js';
+import { trapDialogFocus } from '../pages/dialogFocus.js';
 
 const TOOL_LIVE_OUTPUT_MAX_CHARS = 60000;
 const TOOL_LIVE_OUTPUT_TRUNCATED_PREFIX = '[live output truncated]\n';
+let lastToolDrawerFocus: HTMLElement | null = null;
+let toolDrawerFocusRaf = 0;
+let toolDrawerModal = false;
+
+function isToolDrawerModalViewport(): boolean {
+  if (typeof window.matchMedia === 'function') {
+    return window.matchMedia('(max-width: 1279px)').matches;
+  }
+  return window.innerWidth < 1280;
+}
+
+function cancelToolDrawerFocus(): void {
+  if (!toolDrawerFocusRaf) return;
+  cancelAnimationFrame(toolDrawerFocusRaf);
+  toolDrawerFocusRaf = 0;
+}
+
+function setToolDrawerBackgroundInert(modal: boolean): void {
+  document.body.classList.toggle('tool-drawer-modal-open', modal);
+  const mobileNavigationViewport =
+    typeof window.matchMedia === 'function'
+      ? window.matchMedia('(max-width: 768px)').matches
+      : window.innerWidth <= 768;
+  const mobileNavigationOpen = mobileNavigationViewport && state.mobileNavigationOpen;
+  if (dom.sessionDrawer) {
+    dom.sessionDrawer.inert = modal || (mobileNavigationViewport && !mobileNavigationOpen);
+  }
+  const conversation = document.querySelector<HTMLElement>('.conversation-column');
+  if (conversation) conversation.inert = modal || mobileNavigationOpen;
+}
+
+export function syncToolDrawerResponsiveState(): void {
+  const drawer = dom.toolDrawer;
+  if (!drawer) return;
+  const open = drawer.classList.contains('open');
+  const modal = open && isToolDrawerModalViewport();
+  const becameModal = modal && !toolDrawerModal;
+  toolDrawerModal = modal;
+  if (modal) drawer.setAttribute('aria-modal', 'true');
+  else drawer.removeAttribute('aria-modal');
+  setToolDrawerBackgroundInert(modal);
+  if (becameModal && !drawer.contains(document.activeElement)) {
+    drawer.querySelector<HTMLButtonElement>('.tool-drawer-close')?.focus();
+  }
+}
+
+export function trapToolDrawerFocus(event: KeyboardEvent): boolean {
+  if (!toolDrawerModal || !dom.toolDrawer?.classList.contains('open')) return false;
+  return trapDialogFocus(event, dom.toolDrawer);
+}
 
 export function mergeToolLiveOutput(current, stream, chunk, maxChars = TOOL_LIVE_OUTPUT_MAX_CHARS) {
   const prefix = stream === 'stderr' ? '\n[stderr]\n' : '';
@@ -66,7 +117,7 @@ export function addToolCall(name, args, id) {
   panel.dataset.toolStatus = tr('tool.running');
 
   panel.innerHTML = `
-    <div class="tool-header" data-action="open-tool-drawer">
+    <div class="tool-header" data-action="open-tool-drawer" role="button" tabindex="0" aria-haspopup="dialog">
       <span class="tool-icon">⚡</span>
       <span class="tool-name">${escHtml(name)}</span>
       <span class="tool-args-preview">${escHtml(truncateStr(args, 80))}</span>
@@ -150,7 +201,7 @@ export function addToolResult(name, result, id, durationMs = null) {
     ? tr('tool.resultReturnedWithDuration', { duration: durationLabel })
     : tr('tool.resultReturned');
   el.innerHTML = `
-    <div class="tool-header" data-action="open-tool-drawer">
+    <div class="tool-header" data-action="open-tool-drawer" role="button" tabindex="0" aria-haspopup="dialog">
       <span class="tool-icon">📋</span>
       <span class="tool-name">${escHtml(name)} result</span>
       <span class="tool-status">${escHtml(el.dataset.toolStatus)}</span>
@@ -188,8 +239,11 @@ export function syncToolDrawer(panel) {
   if (dom.toolDrawerResultSection) dom.toolDrawerResultSection.hidden = !hasDetail;
 }
 
-export function openToolDrawer(panel) {
+export function openToolDrawer(panel, trigger: HTMLElement | null = null) {
   if (!panel || !dom.toolDrawer || !dom.toolDrawerBackdrop) return;
+  cancelToolDrawerFocus();
+  lastToolDrawerFocus =
+    trigger || (document.activeElement instanceof HTMLElement ? document.activeElement : null);
   syncToolDrawerBounds();
   if (state.activeToolPanel && state.activeToolPanel !== panel) {
     state.activeToolPanel.classList.remove('tool-panel-active');
@@ -200,20 +254,38 @@ export function openToolDrawer(panel) {
   dom.toolDrawer.classList.add('open');
   dom.toolDrawerBackdrop.classList.add('open');
   dom.toolDrawer.setAttribute('aria-hidden', 'false');
+  dom.toolDrawer.setAttribute('role', 'dialog');
+  syncToolDrawerResponsiveState();
+  if (trigger) {
+    toolDrawerFocusRaf = requestAnimationFrame(() => {
+      toolDrawerFocusRaf = 0;
+      if (!dom.toolDrawer?.classList.contains('open')) return;
+      dom.toolDrawer.querySelector<HTMLButtonElement>('.tool-drawer-close')?.focus();
+    });
+  }
 }
 
 export function openToolDrawerFromHeader(header) {
-  openToolDrawer(header.closest('.tool-panel'));
+  openToolDrawer(header.closest('.tool-panel'), header);
 }
 
 export function closeToolDrawer() {
+  cancelToolDrawerFocus();
   if (!dom.toolDrawer || !dom.toolDrawerBackdrop) return;
+  const previousFocus = lastToolDrawerFocus;
+  const shouldRestoreFocus = dom.toolDrawer.contains(document.activeElement);
+  lastToolDrawerFocus = null;
   dom.toolDrawer.classList.remove('open');
   dom.toolDrawerBackdrop.classList.remove('open');
   dom.toolDrawer.setAttribute('aria-hidden', 'true');
+  syncToolDrawerResponsiveState();
   if (state.activeToolPanel) {
     state.activeToolPanel.classList.remove('tool-panel-active');
     state.activeToolPanel = null;
+  }
+  if (shouldRestoreFocus) {
+    if (previousFocus?.isConnected) previousFocus.focus();
+    else dom.input?.focus();
   }
 }
 

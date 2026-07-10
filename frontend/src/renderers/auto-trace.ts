@@ -97,10 +97,16 @@ function renderAutoDebugPanel(): void {
 
 export function updateAutoDebugToggleButton(): void {
   if (!dom.toggleAutoDebugBtn) return;
-  dom.toggleAutoDebugBtn.textContent = `${tr('common.autoDebug')}: ${
-    state.autoDebugEnabled ? tr('common.on') : tr('common.off')
-  }`;
+  const label = dom.toggleAutoDebugBtn.querySelector('.control-label');
+  if (label) {
+    label.textContent = tr('common.autoDebug');
+  } else {
+    dom.toggleAutoDebugBtn.textContent = `${tr('common.autoDebug')}: ${
+      state.autoDebugEnabled ? tr('common.on') : tr('common.off')
+    }`;
+  }
   dom.toggleAutoDebugBtn.classList.toggle('is-active', state.autoDebugEnabled);
+  dom.toggleAutoDebugBtn.setAttribute('aria-pressed', String(state.autoDebugEnabled));
 }
 
 export function clearAutoTracePanel(): void {

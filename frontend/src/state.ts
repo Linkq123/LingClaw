@@ -139,6 +139,8 @@ export interface AppState {
   markdownRenderQueue: HTMLElement[];
   markdownQueueHandle: number;
   sessionDrawerExpanded: boolean;
+  mobileNavigationOpen: boolean;
+  activeShellPopover: 'view-controls' | 'commands' | null;
   activeSubagentPanels: Map<string, HTMLElement>;
   activeOrchestrations: Map<
     string,
@@ -212,6 +214,8 @@ export const state: AppState = {
   deferredHistory: [],
   activeToolPanel: null,
   sessionDrawerExpanded: true,
+  mobileNavigationOpen: false,
+  activeShellPopover: null,
   showTodos: false,
   showTools: true,
   showReasoning: true,

@@ -7,162 +7,127 @@
     <link rel="icon" type="image/png" href="/branding/logo-mark.png" />
   </head>
   <body>
-    <!-- Skip link — lets keyboard users jump past the header straight to the
-     composer. Visible only on focus. -->
+    <svg class="icon-sprite" aria-hidden="true">
+      <symbol id="icon-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16" /></symbol>
+      <symbol id="icon-chevron-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6" /></symbol>
+      <symbol id="icon-chevron-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6" /></symbol>
+      <symbol id="icon-chevron-down" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6" /></symbol>
+      <symbol id="icon-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></symbol>
+      <symbol id="icon-settings" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="3" />
+        <path
+          d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"
+        />
+      </symbol>
+      <symbol id="icon-chart" viewBox="0 0 24 24">
+        <path d="M4 20V10M10 20V4M16 20v-7M22 20H2" />
+      </symbol>
+      <symbol id="icon-theme" viewBox="0 0 24 24">
+        <path
+          d="M12 3a9 9 0 1 0 9 9c0-1-.8-1.6-1.8-1.4-3.1.7-5.8-2-5.1-5.1C14.3 4.5 13.6 3 12 3Z"
+        />
+      </symbol>
+      <symbol id="icon-language" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18" />
+      </symbol>
+      <symbol id="icon-layout" viewBox="0 0 24 24">
+        <rect x="3" y="4" width="18" height="16" rx="2" />
+        <path d="M9 4v16M9 10h12" />
+      </symbol>
+      <symbol id="icon-more" viewBox="0 0 24 24">
+        <circle cx="5" cy="12" r="1" />
+        <circle cx="12" cy="12" r="1" />
+        <circle cx="19" cy="12" r="1" />
+      </symbol>
+      <symbol id="icon-todos" viewBox="0 0 24 24">
+        <path d="m4 6 2 2 4-4M12 6h8M4 12l2 2 4-4M12 12h8M4 18l2 2 4-4M12 18h8" />
+      </symbol>
+      <symbol id="icon-tools" viewBox="0 0 24 24">
+        <path
+          d="m14.7 6.3 3-3a4.2 4.2 0 0 1-5.6 5.6L5 16a2.1 2.1 0 1 0 3 3l7.1-7.1a4.2 4.2 0 0 1 5.6-5.6l-3 3"
+        />
+      </symbol>
+      <symbol id="icon-reasoning" viewBox="0 0 24 24">
+        <path
+          d="M9.5 4.5A3.5 3.5 0 0 0 6 8c0 .5.1.9.3 1.3A4 4 0 0 0 8 17h1.5M14.5 4.5A3.5 3.5 0 0 1 18 8c0 .5-.1.9-.3 1.3A4 4 0 0 1 16 17h-1.5M9.5 4.5V20M14.5 4.5V20M9.5 9h5M9.5 15h5"
+        />
+      </symbol>
+      <symbol id="icon-debug" viewBox="0 0 24 24">
+        <path d="M8 2h8M9 2v3M15 2v3M4 13h4M16 13h4M5 7l3 2M19 7l-3 2M5 19l3-2M19 19l-3-2" />
+        <rect x="8" y="5" width="8" height="15" rx="4" />
+      </symbol>
+      <symbol id="icon-activity" viewBox="0 0 24 24">
+        <path d="M3 12h4l2.5-7 5 14 2.5-7h4" />
+      </symbol>
+      <symbol id="icon-trash" viewBox="0 0 24 24">
+        <path d="M3 6h18M8 6V4h8v2M19 6l-1 15H6L5 6M10 10v7M14 10v7" />
+      </symbol>
+      <symbol id="icon-help" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M9.7 9a2.5 2.5 0 1 1 3.7 2.2c-.9.5-1.4 1-1.4 2.3M12 17h.01" />
+      </symbol>
+      <symbol id="icon-keyboard" viewBox="0 0 24 24">
+        <rect x="3" y="6" width="18" height="12" rx="2" />
+        <path d="M7 10h.01M11 10h.01M15 10h.01M18 10h.01M7 14h10" />
+      </symbol>
+      <symbol id="icon-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18" /></symbol>
+      <symbol id="icon-paperclip" viewBox="0 0 24 24">
+        <path
+          d="m20.5 11.5-8.8 8.8a5 5 0 0 1-7.1-7.1l9.2-9.2a3.5 3.5 0 0 1 5 5l-9.2 9.2a2 2 0 1 1-2.8-2.8l8.5-8.5"
+        />
+      </symbol>
+      <symbol id="icon-send" viewBox="0 0 24 24">
+        <path d="m22 2-7 20-4-9-9-4Z" />
+        <path d="M22 2 11 13" />
+      </symbol>
+      <symbol id="icon-stop" viewBox="0 0 24 24">
+        <rect x="6" y="6" width="12" height="12" rx="2" />
+      </symbol>
+      <symbol id="icon-message" viewBox="0 0 24 24">
+        <path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4Z" />
+      </symbol>
+      <symbol id="icon-sparkles" viewBox="0 0 24 24">
+        <path
+          d="m12 3 1.2 3.8L17 8l-3.8 1.2L12 13l-1.2-3.8L7 8l3.8-1.2ZM19 14l.8 2.2L22 17l-2.2.8L19 20l-.8-2.2L16 17l2.2-.8ZM5 14l.6 1.4L7 16l-1.4.6L5 18l-.6-1.4L3 16l1.4-.6Z"
+        />
+      </symbol>
+      <symbol id="icon-refresh" viewBox="0 0 24 24">
+        <path d="M20 7v5h-5M4 17v-5h5" />
+        <path d="M6.1 9A7 7 0 0 1 18.5 6.5L20 12M4 12l1.5 5.5A7 7 0 0 0 17.9 15" />
+      </symbol>
+      <symbol id="icon-edit" viewBox="0 0 24 24">
+        <path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z" />
+      </symbol>
+    </svg>
+
     <a class="skip-link" href="#input" data-i18n="header.skipToInput">Skip to message input</a>
 
-    <!-- Main -->
-    <div class="main">
-      <header>
-        <div class="conn-badge" id="conn-badge">
-          <span class="conn-dot disconnected" id="conn-dot"></span>
-          <span class="conn-label" id="conn-label">Offline</span>
-        </div>
-        <div class="brand-block">
-          <img class="brand-logo" src="/branding/logo-mark.png" alt="" width="28" height="28" />
-          <span class="session-name" id="session-name">LingClaw</span>
-          <span class="session-id" id="session-id"></span>
-          <button
-            id="theme-toggle-btn"
-            class="theme-toggle-btn header-theme-toggle"
-            data-action="toggle-theme"
-            data-i18n-aria-label="theme.toggle"
-            data-i18n-title="theme.toggle"
-            aria-label="Toggle theme"
-            title="Toggle theme"
-          >
-            ◐ Auto
-          </button>
-          <button
-            id="language-toggle-btn"
-            class="language-toggle-btn"
-            data-action="toggle-language"
-            data-i18n="common.language"
-            data-i18n-aria-label="common.languageTitle"
-            data-i18n-title="common.languageTitle"
-            aria-label="Switch language"
-            title="Switch language"
-          >
-            中文
-          </button>
-          <span class="app-version-badge header-version" id="app-version-header" hidden></span>
-        </div>
-        <div class="actions">
-          <span class="usage-badge" id="usage-badge"></span>
-          <button
-            id="nav-settings-btn"
-            data-action="nav-settings"
-            data-i18n="common.settings"
-            data-i18n-aria-label="common.settings"
-            aria-label="Settings"
-            class="mobile-hide"
-          >
-            Settings
-          </button>
-          <button
-            id="nav-usage-btn"
-            data-action="nav-usage"
-            data-i18n="common.usage"
-            data-i18n-aria-label="common.usage"
-            aria-label="Usage"
-            class="mobile-hide"
-          >
-            Usage
-          </button>
-          <button
-            id="toggle-todos-btn"
-            data-action="toggle-todos"
-            data-i18n-aria-label="header.toggleTodos"
-            aria-label="Toggle todos visibility"
-          >
-            Todos: Off
-          </button>
-          <button
-            id="toggle-tools-btn"
-            data-action="toggle-tools"
-            data-i18n-aria-label="header.toggleTools"
-            aria-label="Toggle tools visibility"
-          >
-            Tools: On
-          </button>
-          <button
-            id="toggle-reasoning-btn"
-            data-action="toggle-reasoning"
-            data-i18n-aria-label="header.toggleReasoning"
-            aria-label="Toggle reasoning visibility"
-          >
-            Reasoning: On
-          </button>
-          <button
-            id="toggle-auto-debug-btn"
-            data-action="toggle-auto-debug"
-            data-i18n-aria-label="header.toggleAutoDebug"
-            class="mobile-hide"
-          >
-            Auto Debug: Off
-          </button>
-          <button
-            class="mobile-hide"
-            data-action="cmd"
-            data-cmd="/status"
-            data-i18n="common.status"
-            data-i18n-aria-label="header.showStatus"
-            aria-label="Show status"
-          >
-            Status
-          </button>
-          <button
-            class="mobile-hide"
-            data-action="cmd"
-            data-cmd="/clear"
-            data-i18n="common.clear"
-            data-i18n-aria-label="header.clearChat"
-            aria-label="Clear chat"
-          >
-            Clear
-          </button>
-          <button
-            class="mobile-hide"
-            data-action="cmd"
-            data-cmd="/help"
-            data-i18n="common.help"
-            data-i18n-aria-label="header.showHelp"
-            aria-label="Show help"
-          >
-            Help
-          </button>
-          <button
-            class="mobile-menu-toggle"
-            id="mobile-menu-toggle"
-            data-action="toggle-mobile-menu"
-            data-i18n-aria-label="common.moreActions"
-            aria-label="More actions"
-            aria-expanded="false"
-            aria-controls="mobile-menu"
-          >
-            ⋯
-          </button>
-          <div class="mobile-menu" id="mobile-menu" role="menu">
-            <button data-action="toggle-theme" data-i18n="theme.toggle">Toggle theme</button>
-            <button data-action="toggle-language" data-i18n="common.language">中文</button>
-            <button data-action="show-shortcuts" data-i18n="header.shortcuts">Shortcuts</button>
-            <button data-action="nav-settings" data-i18n="common.settings">Settings</button>
-            <button data-action="nav-usage" data-i18n="common.usage">Usage</button>
-            <button data-action="toggle-auto-debug" data-i18n="common.autoDebug">Auto Debug</button>
-            <button data-action="cmd-close-menu" data-cmd="/status" data-i18n="common.status">Status</button>
-            <button data-action="cmd-close-menu" data-cmd="/clear" data-i18n="common.clear">Clear</button>
-            <button data-action="cmd-close-menu" data-cmd="/help" data-i18n="common.help">Help</button>
-          </div>
-        </div>
-      </header>
+    <div class="main" id="app-workspace">
       <div class="app-shell">
+        <button
+          class="mobile-navigation-backdrop"
+          id="mobile-navigation-backdrop"
+          data-action="close-mobile-navigation"
+          data-i18n-aria-label="workspace.closeNavigation"
+          aria-label="Close navigation"
+          hidden
+        ></button>
+
         <aside
           class="session-drawer"
           id="session-drawer"
           data-i18n-aria-label="session.drawerLabel"
           aria-label="Sessions"
         >
-          <div class="session-drawer-header">
+          <div class="sidebar-brand-row">
+            <div class="sidebar-brand" aria-label="LingClaw">
+              <span class="sidebar-brand-mark"><img src="/branding/logo-mark.png" alt="" /></span>
+              <span class="sidebar-brand-copy">
+                <strong>LingClaw</strong>
+                <span data-i18n="workspace.subtitle">Agent Workspace</span>
+              </span>
+            </div>
             <button
               id="session-drawer-toggle-btn"
               class="session-drawer-toggle-btn"
@@ -170,38 +135,279 @@
               aria-label="Collapse sessions drawer"
               aria-expanded="true"
             >
-              &lt;
-            </button>
-            <h2 class="session-drawer-heading" data-i18n="session.drawerLabel">Sessions</h2>
-            <button
-              id="session-drawer-new-btn"
-              class="session-drawer-new-btn"
-              data-i18n="session.newSession"
-              data-i18n-aria-label="session.newSessionShort"
-              aria-label="New session"
-            >
-              New Session
+              <svg class="icon" aria-hidden="true"><use href="#icon-chevron-left"></use></svg>
             </button>
           </div>
+
+          <button
+            id="session-drawer-new-btn"
+            class="session-drawer-new-btn"
+            data-i18n-aria-label="session.newSessionShort"
+            aria-label="New session"
+          >
+            <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>
+            <span class="sidebar-new-label" data-i18n="session.newSession">New Session</span>
+          </button>
+
+          <div class="session-drawer-heading-row">
+            <h2 class="session-drawer-heading" data-i18n="session.drawerLabel">Sessions</h2>
+            <span class="sidebar-live-dot" aria-hidden="true"></span>
+          </div>
           <div id="session-drawer-list" class="session-drawer-list" aria-live="polite"></div>
+
+          <footer class="sidebar-footer">
+            <div class="sidebar-utility-grid">
+              <button
+                id="nav-settings-btn"
+                class="sidebar-utility"
+                data-action="nav-settings"
+                data-i18n-aria-label="common.settings"
+                aria-label="Settings"
+              >
+                <svg class="icon" aria-hidden="true"><use href="#icon-settings"></use></svg>
+                <span data-i18n="common.settings">Settings</span>
+              </button>
+              <button
+                id="nav-usage-btn"
+                class="sidebar-utility"
+                data-action="nav-usage"
+                data-i18n-aria-label="common.usage"
+                aria-label="Usage"
+              >
+                <svg class="icon" aria-hidden="true"><use href="#icon-chart"></use></svg>
+                <span data-i18n="common.usage">Usage</span>
+              </button>
+              <button
+                id="theme-toggle-btn"
+                class="sidebar-utility theme-toggle-btn"
+                data-action="toggle-theme"
+                data-i18n-aria-label="theme.toggle"
+                aria-label="Toggle theme"
+              >
+                <svg class="icon" aria-hidden="true"><use href="#icon-theme"></use></svg>
+                <span id="theme-toggle-label">Auto</span>
+              </button>
+              <button
+                id="language-toggle-btn"
+                class="sidebar-utility language-toggle-btn"
+                data-action="toggle-language"
+                data-i18n-aria-label="common.languageTitle"
+                aria-label="Switch language"
+              >
+                <svg class="icon" aria-hidden="true"><use href="#icon-language"></use></svg>
+                <span data-i18n="common.language">中文</span>
+              </button>
+            </div>
+            <div class="sidebar-meta">
+              <span data-i18n="workspace.localFirst">Local-first workspace</span>
+              <span class="app-version-badge header-version" id="app-version-header" hidden></span>
+            </div>
+          </footer>
         </aside>
+
         <div class="conversation-column">
+          <header class="workspace-header">
+            <button
+              class="mobile-navigation-toggle"
+              id="mobile-navigation-toggle"
+              data-action="toggle-mobile-navigation"
+              data-i18n-aria-label="workspace.openNavigation"
+              aria-label="Open navigation"
+              aria-expanded="false"
+              aria-controls="session-drawer"
+            >
+              <svg class="icon" aria-hidden="true"><use href="#icon-menu"></use></svg>
+            </button>
+
+            <div class="workspace-session-block">
+              <div class="workspace-session-title-row">
+                <span class="session-name" id="session-name">LingClaw</span>
+                <span class="app-mode-chip" data-i18n="workspace.agentMode">Agent</span>
+              </div>
+              <span class="session-id" id="session-id"></span>
+            </div>
+
+            <div class="workspace-status-cluster">
+              <div class="conn-badge" id="conn-badge">
+                <span class="conn-dot disconnected" id="conn-dot"></span>
+                <span class="conn-label" id="conn-label">Offline</span>
+              </div>
+              <span class="usage-badge" id="usage-badge"></span>
+            </div>
+
+            <div class="actions workspace-actions">
+              <div class="shell-menu-wrap">
+                <button
+                  class="workspace-action-btn"
+                  id="view-controls-toggle"
+                  data-action="toggle-view-controls"
+                  data-i18n-aria-label="workspace.viewControls"
+                  aria-label="View controls"
+                  aria-expanded="false"
+                  aria-controls="view-controls-menu"
+                >
+                  <svg class="icon" aria-hidden="true"><use href="#icon-layout"></use></svg>
+                  <span class="workspace-action-label" data-i18n="workspace.viewControls"
+                    >View</span
+                  >
+                  <span class="workspace-action-count" id="view-controls-count">2</span>
+                </button>
+                <div class="shell-menu view-controls-menu" id="view-controls-menu" hidden>
+                  <div class="shell-menu-heading">
+                    <strong data-i18n="workspace.viewControls">View controls</strong>
+                    <span data-i18n="workspace.viewControlsHint"
+                      >Choose what appears in the timeline</span
+                    >
+                  </div>
+                  <button
+                    id="toggle-todos-btn"
+                    class="shell-toggle-item"
+                    data-action="toggle-todos"
+                    aria-pressed="false"
+                  >
+                    <span class="shell-menu-icon"
+                      ><svg class="icon" aria-hidden="true"><use href="#icon-todos"></use></svg
+                    ></span>
+                    <span class="shell-menu-item-copy"
+                      ><strong class="control-label" data-i18n="todos.title">Todos</strong
+                      ><span data-i18n="workspace.todosHint">Session task list</span></span
+                    >
+                    <span class="shell-switch" aria-hidden="true"><span></span></span>
+                  </button>
+                  <button
+                    id="toggle-tools-btn"
+                    class="shell-toggle-item"
+                    data-action="toggle-tools"
+                    aria-pressed="true"
+                  >
+                    <span class="shell-menu-icon"
+                      ><svg class="icon" aria-hidden="true"><use href="#icon-tools"></use></svg
+                    ></span>
+                    <span class="shell-menu-item-copy"
+                      ><strong class="control-label" data-i18n="common.tools">Tools</strong
+                      ><span data-i18n="workspace.toolsHint">Tool calls and results</span></span
+                    >
+                    <span class="shell-switch" aria-hidden="true"><span></span></span>
+                  </button>
+                  <button
+                    id="toggle-reasoning-btn"
+                    class="shell-toggle-item"
+                    data-action="toggle-reasoning"
+                    aria-pressed="true"
+                  >
+                    <span class="shell-menu-icon"
+                      ><svg class="icon" aria-hidden="true"><use href="#icon-reasoning"></use></svg
+                    ></span>
+                    <span class="shell-menu-item-copy"
+                      ><strong class="control-label" data-i18n="common.reasoning">Reasoning</strong
+                      ><span data-i18n="workspace.reasoningHint">Reasoning trace</span></span
+                    >
+                    <span class="shell-switch" aria-hidden="true"><span></span></span>
+                  </button>
+                  <button
+                    id="toggle-auto-debug-btn"
+                    class="shell-toggle-item"
+                    data-action="toggle-auto-debug"
+                    aria-pressed="false"
+                  >
+                    <span class="shell-menu-icon"
+                      ><svg class="icon" aria-hidden="true"><use href="#icon-debug"></use></svg
+                    ></span>
+                    <span class="shell-menu-item-copy"
+                      ><strong class="control-label" data-i18n="common.autoDebug">Auto Debug</strong
+                      ><span data-i18n="workspace.debugHint">Automatic routing trace</span></span
+                    >
+                    <span class="shell-switch" aria-hidden="true"><span></span></span>
+                  </button>
+                </div>
+              </div>
+
+              <div class="shell-menu-wrap">
+                <button
+                  class="workspace-action-btn workspace-action-icon"
+                  id="mobile-menu-toggle"
+                  data-action="toggle-mobile-menu"
+                  data-i18n-aria-label="common.moreActions"
+                  aria-label="More actions"
+                  aria-expanded="false"
+                  aria-controls="mobile-menu"
+                >
+                  <svg class="icon" aria-hidden="true"><use href="#icon-more"></use></svg>
+                </button>
+                <div class="shell-menu command-menu" id="mobile-menu" hidden>
+                  <div class="shell-menu-heading">
+                    <strong data-i18n="workspace.quickActions">Quick actions</strong>
+                    <span data-i18n="workspace.quickActionsHint"
+                      >Run common workspace commands</span
+                    >
+                  </div>
+                  <button data-action="cmd-close-menu" data-cmd="/status">
+                    <span class="shell-menu-icon"
+                      ><svg class="icon" aria-hidden="true"><use href="#icon-activity"></use></svg
+                    ></span>
+                    <span data-i18n="common.status">Status</span>
+                    <kbd>/status</kbd>
+                  </button>
+                  <button data-action="cmd-close-menu" data-cmd="/clear">
+                    <span class="shell-menu-icon"
+                      ><svg class="icon" aria-hidden="true"><use href="#icon-trash"></use></svg
+                    ></span>
+                    <span data-i18n="common.clear">Clear</span>
+                    <kbd>/clear</kbd>
+                  </button>
+                  <button data-action="cmd-close-menu" data-cmd="/help">
+                    <span class="shell-menu-icon"
+                      ><svg class="icon" aria-hidden="true"><use href="#icon-help"></use></svg
+                    ></span>
+                    <span data-i18n="common.help">Help</span>
+                    <kbd>/help</kbd>
+                  </button>
+                  <button data-action="show-shortcuts">
+                    <span class="shell-menu-icon"
+                      ><svg class="icon" aria-hidden="true"><use href="#icon-keyboard"></use></svg
+                    ></span>
+                    <span data-i18n="header.shortcuts">Shortcuts</span>
+                    <kbd>Ctrl K</kbd>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </header>
+
           <section id="todos-host" class="todos-host" aria-live="polite"></section>
           <div id="chat" role="log" aria-live="polite">
             <div class="welcome" id="welcome">
-              <div class="welcome-logo"><img src="/branding/logo-wordmark.png" alt="LingClaw" /></div>
-              <div class="app-version-badge welcome-version" id="app-version-welcome" hidden></div>
-              <div class="welcome-hint">
-                <span data-i18n="welcome.ready">Your private AI assistant is ready</span><br />
-                <span data-i18n="welcome.hintPrefix">Type a message to start, or use </span><strong>/</strong><span data-i18n="welcome.hintSuffix"> commands</span>
+              <div class="welcome-brand-mark"><img src="/branding/logo-mark.png" alt="" /></div>
+              <div class="welcome-eyebrow">
+                <svg class="icon" aria-hidden="true"><use href="#icon-sparkles"></use></svg
+                ><span>LINGCLAW</span>
               </div>
+              <h1 class="welcome-title" data-i18n="welcome.title">Your agent workspace</h1>
+              <div class="app-version-badge welcome-version" id="app-version-welcome" hidden></div>
+              <p class="welcome-hint">
+                <span data-i18n="welcome.ready">Your private AI assistant is ready</span>
+                <span class="welcome-hint-secondary"
+                  ><span data-i18n="welcome.hintPrefix">Type a message to start, or use </span
+                  ><strong>/</strong><span data-i18n="welcome.hintSuffix"> commands</span></span
+                >
+              </p>
               <div class="welcome-shortcuts">
-                <button data-action="cmd" data-cmd="/clear" data-i18n="common.newConversation">New Conversation</button>
-                <button data-action="cmd" data-cmd="/status" data-i18n="common.status">Status</button>
-                <button data-action="cmd" data-cmd="/help" data-i18n="common.help">Help</button>
+                <button data-action="cmd" data-cmd="/clear">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-message"></use></svg
+                  ><span data-i18n="common.newConversation">New Conversation</span>
+                </button>
+                <button data-action="cmd" data-cmd="/status">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-activity"></use></svg
+                  ><span data-i18n="common.status">Status</span>
+                </button>
+                <button data-action="cmd" data-cmd="/help">
+                  <svg class="icon" aria-hidden="true"><use href="#icon-help"></use></svg
+                  ><span data-i18n="common.help">Help</span>
+                </button>
               </div>
             </div>
           </div>
+
           <button
             id="jump-to-latest"
             type="button"
@@ -212,6 +418,7 @@
             <span class="jump-to-latest-label" data-i18n="composer.jumpBottom">Back to bottom</span>
             <span class="jump-to-latest-badge" id="jump-to-latest-badge" hidden></span>
           </button>
+
           <div id="input-area">
             <div id="group-target-bar" class="group-target-bar" hidden></div>
             <div id="image-preview-bar" class="image-preview-bar" style="display: none"></div>
@@ -232,12 +439,15 @@
                   aria-label="More options"
                   title="More options"
                 >
-                  +
+                  <svg class="icon" aria-hidden="true"><use href="#icon-plus"></use></svg>
                 </button>
                 <div id="attach-popup" class="attach-popup" style="display: none">
                   <div id="attach-menu" class="attach-menu">
                     <button class="attach-menu-item" id="attach-local-btn" type="button" hidden>
-                      <span class="attach-menu-icon">+</span>
+                      <span class="attach-menu-icon"
+                        ><svg class="icon" aria-hidden="true">
+                          <use href="#icon-paperclip"></use></svg
+                      ></span>
                       <span data-i18n="composer.addImage">Add image</span>
                     </button>
                     <button
@@ -252,11 +462,18 @@
                     </button>
                   </div>
                   <div id="attach-upload-status" class="attach-upload-status" style="display: none">
-                    <span class="upload-spinner"></span> <span data-i18n="composer.uploading">Uploading...</span>
+                    <span class="upload-spinner"></span>
+                    <span data-i18n="composer.uploading">Uploading...</span>
                   </div>
                 </div>
               </div>
-              <input type="file" id="image-file-input" accept="image/jpeg,image/png" multiple hidden />
+              <input
+                type="file"
+                id="image-file-input"
+                accept="image/jpeg,image/png"
+                multiple
+                hidden
+              />
               <textarea
                 id="input"
                 data-i18n-placeholder="composer.placeholder"
@@ -277,12 +494,53 @@
                 title="Stop"
                 style="display: none"
               >
-                <span id="stop-icon">■</span>
+                <span id="stop-icon"
+                  ><svg class="icon" aria-hidden="true"><use href="#icon-stop"></use></svg
+                ></span>
               </button>
-              <button id="send" data-i18n-aria-label="composer.send" aria-label="Send message"><span id="send-icon">↑</span></button>
+              <button id="send" data-i18n-aria-label="composer.send" aria-label="Send message">
+                <span id="send-icon"
+                  ><svg class="icon" aria-hidden="true"><use href="#icon-send"></use></svg
+                ></span>
+              </button>
             </div>
           </div>
         </div>
+
+        <aside
+          class="tool-drawer"
+          id="tool-drawer"
+          aria-hidden="true"
+          aria-labelledby="tool-drawer-title"
+        >
+          <div class="tool-drawer-header">
+            <div class="tool-drawer-title-wrap">
+              <span class="tool-drawer-kicker" data-i18n="tool.drawerKicker">Tool</span>
+              <h3 class="tool-drawer-title" id="tool-drawer-title" data-i18n="tool.details">
+                Tool details
+              </h3>
+            </div>
+            <button
+              class="tool-drawer-close"
+              data-action="close-tool-drawer"
+              data-i18n-aria-label="tool.closeDrawer"
+              aria-label="Close tool drawer"
+            >
+              <svg class="icon" aria-hidden="true"><use href="#icon-close"></use></svg>
+            </button>
+          </div>
+          <div class="tool-drawer-meta" id="tool-drawer-meta"></div>
+          <div class="tool-drawer-content">
+            <section class="tool-drawer-section">
+              <div class="tool-drawer-section-title" data-i18n="common.arguments">Arguments</div>
+              <pre class="tool-drawer-code" id="tool-drawer-args"></pre>
+            </section>
+            <section class="tool-drawer-section" id="tool-drawer-result-section" hidden>
+              <div class="tool-drawer-section-title" data-i18n="common.result">Result</div>
+              <pre class="tool-drawer-code" id="tool-drawer-result"></pre>
+            </section>
+          </div>
+        </aside>
       </div>
     </div>
 
@@ -291,39 +549,8 @@
       id="tool-drawer-backdrop"
       data-action="close-tool-drawer"
     ></div>
-
-    <!-- Settings Page — React root -->
     <div class="page-overlay" id="settings-page" hidden></div>
-
-    <!-- Usage Page — React root -->
     <div class="page-overlay" id="usage-page" hidden></div>
-    <aside class="tool-drawer" id="tool-drawer" aria-hidden="true">
-      <div class="tool-drawer-header">
-        <div class="tool-drawer-title-wrap">
-          <span class="tool-drawer-kicker" data-i18n="tool.drawerKicker">Tool</span>
-          <h3 class="tool-drawer-title" id="tool-drawer-title" data-i18n="tool.details">Tool details</h3>
-        </div>
-        <button
-          class="tool-drawer-close"
-          data-action="close-tool-drawer"
-          data-i18n-aria-label="tool.closeDrawer"
-          aria-label="Close tool drawer"
-        >
-          ×
-        </button>
-      </div>
-      <div class="tool-drawer-meta" id="tool-drawer-meta"></div>
-      <div class="tool-drawer-content">
-        <section class="tool-drawer-section">
-          <div class="tool-drawer-section-title" data-i18n="common.arguments">Arguments</div>
-          <pre class="tool-drawer-code" id="tool-drawer-args"></pre>
-        </section>
-        <section class="tool-drawer-section" id="tool-drawer-result-section" hidden>
-          <div class="tool-drawer-section-title" data-i18n="common.result">Result</div>
-          <pre class="tool-drawer-code" id="tool-drawer-result"></pre>
-        </section>
-      </div>
-    </aside>
 
     <script type="module" src="/src/main.ts"></script>
   </body>

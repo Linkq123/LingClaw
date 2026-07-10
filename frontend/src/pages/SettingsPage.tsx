@@ -30,6 +30,7 @@ import {
 } from './settingsModels.js';
 import type { ModelFormEntry, ProviderFormData } from './settingsModels.js';
 import { subscribeLanguageChange, tr } from '../i18n.js';
+import { trapDialogFocus } from './dialogFocus.js';
 
 // ── Module-level bridge (imperative open/close from main.ts) ──────────────────
 
@@ -104,6 +105,15 @@ interface TabMeta {
   description: string;
   saveMode: TabSaveMode;
 }
+
+const SETTINGS_TAB_ICONS: Record<TabId, string> = {
+  'tab-general': 'settings',
+  'tab-skills': 'sparkles',
+  'tab-agents': 'activity',
+  'tab-models': 'reasoning',
+  'tab-mcp': 'tools',
+  'tab-s3': 'paperclip',
+};
 
 const SETTINGS_TAB_DEFS: ReadonlyArray<{
   id: TabId;
@@ -301,7 +311,7 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
     <>
       <div className="settings-group">
         <div className="settings-group-title">{tr('settings.server')}</div>
-        <SettingsRow label="Port">
+        <SettingsRow label={tr('settings.field.port')}>
           <input
             type="number"
             value={s.port ?? ''}
@@ -312,7 +322,7 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
       </div>
       <div className="settings-group">
         <div className="settings-group-title">{tr('settings.timeouts')}</div>
-        <SettingsRow label="Exec Timeout">
+        <SettingsRow label={tr('settings.field.execTimeout')}>
           <input
             type="number"
             value={s.execTimeout ?? ''}
@@ -320,7 +330,7 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
             onChange={(e) => set({ execTimeout: numInputToValue(e.target.value) })}
           />
         </SettingsRow>
-        <SettingsRow label="Tool Timeout">
+        <SettingsRow label={tr('settings.field.toolTimeout')}>
           <input
             type="number"
             value={s.toolTimeout ?? ''}
@@ -328,7 +338,7 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
             onChange={(e) => set({ toolTimeout: numInputToValue(e.target.value) })}
           />
         </SettingsRow>
-        <SettingsRow label="Sub-Agent Timeout">
+        <SettingsRow label={tr('settings.field.subagentTimeout')}>
           <input
             type="number"
             value={s.subAgentTimeout ?? ''}
@@ -336,7 +346,7 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
             onChange={(e) => set({ subAgentTimeout: numInputToValue(e.target.value) })}
           />
         </SettingsRow>
-        <SettingsRow label="Max LLM Retries">
+        <SettingsRow label={tr('settings.field.maxLlmRetries')}>
           <input
             type="number"
             value={s.maxLlmRetries ?? ''}
@@ -347,7 +357,7 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
       </div>
       <div className="settings-group">
         <div className="settings-group-title">{tr('settings.context')}</div>
-        <SettingsRow label="Max Context Tokens">
+        <SettingsRow label={tr('settings.field.maxContextTokens')}>
           <input
             type="number"
             value={s.maxContextTokens ?? ''}
@@ -355,7 +365,7 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
             onChange={(e) => set({ maxContextTokens: numInputToValue(e.target.value) })}
           />
         </SettingsRow>
-        <SettingsRow label="Max Output Bytes">
+        <SettingsRow label={tr('settings.field.maxOutputBytes')}>
           <input
             type="number"
             value={s.maxOutputBytes ?? ''}
@@ -363,7 +373,7 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
             onChange={(e) => set({ maxOutputBytes: numInputToValue(e.target.value) })}
           />
         </SettingsRow>
-        <SettingsRow label="Max File Bytes">
+        <SettingsRow label={tr('settings.field.maxFileBytes')}>
           <input
             type="number"
             value={s.maxFileBytes ?? ''}
@@ -374,28 +384,28 @@ function GeneralTab({ config, onChange }: { config: AppConfig; onChange: (c: App
       </div>
       <div className="settings-group">
         <div className="settings-group-title">{tr('settings.features')}</div>
-        <SettingsRow label="Structured Memory">
+        <SettingsRow label={tr('settings.field.structuredMemory')}>
           <TriSelect value={s.structuredMemory} onChange={(v) => set({ structuredMemory: v })} />
         </SettingsRow>
-        <SettingsRow label="Daily Reflection">
+        <SettingsRow label={tr('settings.field.dailyReflection')}>
           <TriSelect value={s.dailyReflection} onChange={(v) => set({ dailyReflection: v })} />
         </SettingsRow>
-        <SettingsRow label="State Digest">
+        <SettingsRow label={tr('settings.field.stateDigest')}>
           <TriSelect value={s.enableStateDigest} onChange={(v) => set({ enableStateDigest: v })} />
         </SettingsRow>
-        <SettingsRow label="Task Plan">
+        <SettingsRow label={tr('settings.field.taskPlan')}>
           <TriSelect value={s.enableTaskPlan} onChange={(v) => set({ enableTaskPlan: v })} />
         </SettingsRow>
-        <SettingsRow label="Enable S3">
+        <SettingsRow label={tr('settings.field.enableS3')}>
           <TriSelect value={s.enableS3} onChange={(v) => set({ enableS3: v })} />
         </SettingsRow>
-        <SettingsRow label="OpenAI Stream Usage">
+        <SettingsRow label={tr('settings.field.openaiStreamUsage')}>
           <TriSelect
             value={s.openaiStreamIncludeUsage}
             onChange={(v) => set({ openaiStreamIncludeUsage: v })}
           />
         </SettingsRow>
-        <SettingsRow label="Anthropic Prompt Caching">
+        <SettingsRow label={tr('settings.field.anthropicPromptCaching')}>
           <TriSelect
             value={s.anthropicPromptCaching}
             onChange={(v) => set({ anthropicPromptCaching: v })}
@@ -666,7 +676,7 @@ function ModelEntryRow({
           />{' '}
           Reasoning
         </label>
-        <button className="btn-danger-sm" title="Remove model" onClick={onDelete}>
+        <button className="btn-danger-sm" title={tr('settings.removeModel')} onClick={onDelete}>
           ✕
         </button>
       </div>
@@ -721,7 +731,7 @@ function ModelEntryRow({
           Thinking Format
           <input
             type="text"
-            aria-label="Thinking Format"
+            aria-label={tr('settings.thinkingFormat')}
             value={modelThinkingFormat(model)}
             placeholder="openai"
             title="Examples: openai, qwen, doubao, deepseek-v4, ollama, gpt-oss"
@@ -832,7 +842,7 @@ function ProviderCardInner({
           </button>
           <button
             className="btn-danger-sm"
-            title="Delete provider"
+            title={tr('settings.deleteProvider')}
             onClick={() => onDelete(prov._key)}
           >
             ✕
@@ -840,7 +850,7 @@ function ProviderCardInner({
         </div>
       </div>
       <div className="provider-form" style={{ display: 'grid', gap: 8, marginTop: 8 }}>
-        <SettingsRow label="API Type">
+        <SettingsRow label={tr('settings.field.apiType')}>
           <select value={prov.api} onChange={(e) => onChange({ ...prov, api: e.target.value })}>
             <option value="openai-completions">OpenAI Completions</option>
             <option value="openai-responses">OpenAI Responses</option>
@@ -849,7 +859,7 @@ function ProviderCardInner({
             <option value="gemini">Gemini</option>
           </select>
         </SettingsRow>
-        <SettingsRow label="Base URL">
+        <SettingsRow label={tr('settings.field.baseUrl')}>
           <input
             type="text"
             value={prov.baseUrl}
@@ -857,7 +867,7 @@ function ProviderCardInner({
             onChange={(e) => onChange({ ...prov, baseUrl: e.target.value })}
           />
         </SettingsRow>
-        <SettingsRow label="API Key">
+        <SettingsRow label={tr('settings.field.apiKey')}>
           <input
             type="password"
             value={prov.apiKey}
@@ -1293,7 +1303,7 @@ function McpServerCardInner({
           </button>
           <button
             className="btn-danger-sm"
-            title="Delete server"
+            title={tr('settings.deleteServer')}
             onClick={() => onDelete(server._key)}
           >
             ✕
@@ -1301,7 +1311,7 @@ function McpServerCardInner({
         </div>
       </div>
       <div className="provider-form" style={{ display: 'grid', gap: 8, marginTop: 8 }}>
-        <SettingsRow label="Transport">
+        <SettingsRow label={tr('settings.field.transport')}>
           <select
             value={server.transport || 'stdio'}
             onChange={(e) =>
@@ -1312,7 +1322,7 @@ function McpServerCardInner({
             <option value="streamable-http">streamable-http</option>
           </select>
         </SettingsRow>
-        <SettingsRow label="URL">
+        <SettingsRow label={tr('settings.field.url')}>
           <input
             type="text"
             value={server.url || ''}
@@ -1321,7 +1331,7 @@ function McpServerCardInner({
             onChange={(e) => onChange({ ...server, url: e.target.value })}
           />
         </SettingsRow>
-        <SettingsRow label="Command">
+        <SettingsRow label={tr('settings.field.command')}>
           <input
             type="text"
             value={server.command || ''}
@@ -1330,7 +1340,7 @@ function McpServerCardInner({
             onChange={(e) => onChange({ ...server, command: e.target.value })}
           />
         </SettingsRow>
-        <SettingsRow label="Args (one per line)">
+        <SettingsRow label={tr('settings.field.argsPerLine')}>
           <textarea
             value={server._argsText}
             rows={3}
@@ -1339,7 +1349,7 @@ function McpServerCardInner({
             onChange={(e) => onChange({ ...server, _argsText: e.target.value })}
           />
         </SettingsRow>
-        <SettingsRow label="CWD">
+        <SettingsRow label={tr('settings.field.cwd')}>
           <input
             type="text"
             value={server.cwd || ''}
@@ -1347,7 +1357,7 @@ function McpServerCardInner({
             onChange={(e) => onChange({ ...server, cwd: e.target.value })}
           />
         </SettingsRow>
-        <SettingsRow label="Timeout (s)">
+        <SettingsRow label={tr('settings.field.timeoutSeconds')}>
           <input
             type="number"
             value={server.timeoutSecs ?? ''}
@@ -1386,7 +1396,7 @@ function McpServerCardInner({
                 onChange({ ...server, env: { ...(server.env || {}), [k]: e.target.value } })
               }
             />
-            <button className="btn-danger-sm" title="Remove" onClick={() => removeEnvVar(k)}>
+            <button className="btn-danger-sm" title={tr('common.remove')} onClick={() => removeEnvVar(k)}>
               ✕
             </button>
           </div>
@@ -2442,7 +2452,7 @@ function S3Tab({ config, onChange }: { config: AppConfig; onChange: (c: AppConfi
   return (
     <div className="settings-group">
       <div className="settings-group-title">{tr('settings.s3Title')}</div>
-      <SettingsRow label="Endpoint">
+      <SettingsRow label={tr('settings.field.endpoint')}>
         <input
           type="text"
           value={s3.endpoint || ''}
@@ -2450,7 +2460,7 @@ function S3Tab({ config, onChange }: { config: AppConfig; onChange: (c: AppConfi
           onChange={(e) => set({ endpoint: e.target.value || undefined })}
         />
       </SettingsRow>
-      <SettingsRow label="Region">
+      <SettingsRow label={tr('settings.field.region')}>
         <input
           type="text"
           value={s3.region || ''}
@@ -2458,28 +2468,28 @@ function S3Tab({ config, onChange }: { config: AppConfig; onChange: (c: AppConfi
           onChange={(e) => set({ region: e.target.value || undefined })}
         />
       </SettingsRow>
-      <SettingsRow label="Bucket">
+      <SettingsRow label={tr('settings.field.bucket')}>
         <input
           type="text"
           value={s3.bucket || ''}
           onChange={(e) => set({ bucket: e.target.value || undefined })}
         />
       </SettingsRow>
-      <SettingsRow label="Access Key">
+      <SettingsRow label={tr('settings.field.accessKey')}>
         <input
           type="text"
           value={s3.accessKey || ''}
           onChange={(e) => set({ accessKey: e.target.value || undefined })}
         />
       </SettingsRow>
-      <SettingsRow label="Secret Key">
+      <SettingsRow label={tr('settings.field.secretKey')}>
         <input
           type="password"
           value={s3.secretKey || ''}
           onChange={(e) => set({ secretKey: e.target.value || undefined })}
         />
       </SettingsRow>
-      <SettingsRow label="Prefix">
+      <SettingsRow label={tr('settings.field.prefix')}>
         <input
           type="text"
           value={s3.prefix || ''}
@@ -2487,7 +2497,7 @@ function S3Tab({ config, onChange }: { config: AppConfig; onChange: (c: AppConfi
           onChange={(e) => set({ prefix: e.target.value || undefined })}
         />
       </SettingsRow>
-      <SettingsRow label="URL Expiry (s)">
+      <SettingsRow label={tr('settings.field.urlExpirySeconds')}>
         <input
           type="number"
           value={s3.urlExpirySecs ?? ''}
@@ -2495,7 +2505,7 @@ function S3Tab({ config, onChange }: { config: AppConfig; onChange: (c: AppConfi
           onChange={(e) => set({ urlExpirySecs: numInputToValue(e.target.value) })}
         />
       </SettingsRow>
-      <SettingsRow label="Lifecycle (days)">
+      <SettingsRow label={tr('settings.field.lifecycleDays')}>
         <input
           type="number"
           value={s3.lifecycleDays ?? ''}
@@ -2688,7 +2698,13 @@ function SettingsShell({
   ].filter(Boolean);
 
   return (
-    <div className="page-panel settings-panel">
+    <div
+      className="page-panel settings-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="settings-dialog-title"
+      tabIndex={-1}
+    >
       <div className="settings-shell">
         <aside className="settings-sidebar" aria-label={tr('settings.sectionsAria')}>
           <div className="settings-sidebar-head">
@@ -2714,6 +2730,11 @@ function SettingsShell({
                 onClick={() => changeTab(tab.id)}
                 onKeyDown={(event) => handleTabKeyDown(event, tab.id)}
               >
+                <span className="settings-nav-icon" aria-hidden="true">
+                  <svg className="icon">
+                    <use href={`#icon-${SETTINGS_TAB_ICONS[tab.id]}`} />
+                  </svg>
+                </span>
                 <span className="settings-nav-label">{tab.label}</span>
                 <span className="settings-nav-description">{tab.description}</span>
               </button>
@@ -2724,7 +2745,7 @@ function SettingsShell({
         <section className="settings-main">
           <div className="settings-topbar">
             <div className="settings-title-block">
-              <h2 ref={titleRef} tabIndex={-1}>
+              <h2 id="settings-dialog-title" ref={titleRef} tabIndex={-1}>
                 {corrupt ? tr('settings.configError') : activeMeta.label}
               </h2>
               <p>{corrupt ? tr('settings.configErrorSubtitle') : activeMeta.description}</p>
@@ -2739,7 +2760,9 @@ function SettingsShell({
                 aria-label={tr('common.close')}
                 onClick={onRequestClose}
               >
-                ×
+                <svg className="icon" aria-hidden="true">
+                  <use href="#icon-close" />
+                </svg>
               </button>
             </div>
           </div>
@@ -2818,6 +2841,7 @@ export function SettingsPage() {
   const visibleRef = useRef(false);
   const settingsSessionIdRef = useRef('main');
   const hasUnsavedChangesRef = useRef(false);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
 
   const configDirty = useMemo(
     () => serializeConfigForDirty(config) !== configBaseline,
@@ -2896,6 +2920,19 @@ export function SettingsPage() {
 
   useEffect(() => {
     if (!visible) return;
+    previousFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    document.body.classList.add('page-dialog-open');
+    return () => {
+      document.body.classList.remove('page-dialog-open');
+      const previous = previousFocusRef.current;
+      previousFocusRef.current = null;
+      if (previous?.isConnected) previous.focus();
+    };
+  }, [visible]);
+
+  useEffect(() => {
+    if (!visible) return;
     setVisitedTabs((current) => {
       if (current.has(activeTab)) return current;
       return new Set(current).add(activeTab);
@@ -2905,6 +2942,13 @@ export function SettingsPage() {
   useEffect(() => {
     if (!visible) return;
     const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.key === 'Tab' &&
+        trapDialogFocus(event, document.querySelector<HTMLElement>('.settings-panel'))
+      ) {
+        event.stopPropagation();
+        return;
+      }
       if (event.key !== 'Escape') return;
       event.preventDefault();
       event.stopPropagation();

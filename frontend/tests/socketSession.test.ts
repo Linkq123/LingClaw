@@ -318,7 +318,7 @@ describe('socket session binding', () => {
     renameGroupButton?.click();
     deleteGroupButton?.click();
 
-    expect(createGroupButton?.textContent).toBe('+');
+    expect(createGroupButton?.querySelector('use')?.getAttribute('href')).toBe('#icon-plus');
     expect(onCreateGroup).toHaveBeenCalled();
     expect(onSwitchGroup).toHaveBeenCalledWith('review-group');
     expect(onRenameGroup).toHaveBeenCalledWith('review-group');

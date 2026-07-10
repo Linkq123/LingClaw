@@ -21,6 +21,8 @@ describe('i18n', () => {
 
     expect(language()).toBe('zh-CN');
     expect(tr('common.settings')).toBe('设置');
+    expect(tr('welcome.title')).toBe('你的智能代理工作台');
+    expect(tr('workspace.viewControls')).toBe('视图控制');
     expect(document.documentElement.lang).toBe('zh-CN');
     expect(localStorage.getItem('lingclaw.language')).toBe('zh-CN');
   });

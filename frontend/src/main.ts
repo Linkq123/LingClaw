@@ -7,6 +7,7 @@ import './css/chat.css';
 import './css/panels.css';
 import './css/pages.css';
 import './css/responsive.css';
+import './css/workspace.css';
 
 import { initTheme, cycleTheme, disposeTheme } from './theme.js';
 import { initI18n, tr, toggleLanguage, subscribeLanguageChange, translateDom } from './i18n.js';
@@ -62,6 +63,8 @@ import {
   openToolDrawerFromHeader,
   closeToolDrawer,
   syncToolDrawer,
+  syncToolDrawerResponsiveState,
+  trapToolDrawerFocus,
   toggleTool,
 } from './renderers/tools.js';
 import { preloadMarkdownEngine, scheduleMarkdownRender } from './markdown.js';
@@ -85,7 +88,17 @@ import {
   renderImagePreviews,
 } from './images.js';
 import { sendCmd, initInputListeners } from './input.js';
-import { toggleMobileMenu, closeMobileMenu, initMobileListeners } from './mobile.js';
+import {
+  toggleMobileMenu,
+  closeMobileMenu,
+  toggleViewControlsMenu,
+  closeShellPopovers,
+  toggleMobileNavigation,
+  closeMobileNavigation,
+  isMobileViewport,
+  syncResponsiveNavigation,
+  initMobileListeners,
+} from './mobile.js';
 import { applyToolsVisibility } from './viewState.js';
 import {
   createSubagentPanel,
@@ -209,19 +222,36 @@ initTodosPanel();
 // ── View toggles ──
 
 function updateViewToggleButtons() {
+  const syncButton = (button: HTMLButtonElement | null, label: string, enabled: boolean) => {
+    if (!button) return;
+    const labelEl = button.querySelector('.control-label');
+    if (labelEl) {
+      labelEl.textContent = label;
+    } else {
+      button.textContent = `${label}: ${enabled ? tr('common.on') : tr('common.off')}`;
+    }
+    button.classList.toggle('is-active', enabled);
+    button.setAttribute('aria-pressed', String(enabled));
+  };
+
   if (dom.toggleTodosBtn) {
-    dom.toggleTodosBtn.textContent = `${tr('todos.title')}: ${state.showTodos ? tr('common.on') : tr('common.off')}`;
-    dom.toggleTodosBtn.classList.toggle('is-active', state.showTodos);
+    syncButton(dom.toggleTodosBtn, tr('todos.title'), state.showTodos);
   }
   if (dom.toggleToolsBtn) {
-    dom.toggleToolsBtn.textContent = `${tr('common.tools')}: ${state.showTools ? tr('common.on') : tr('common.off')}`;
-    dom.toggleToolsBtn.classList.toggle('is-active', state.showTools);
+    syncButton(dom.toggleToolsBtn, tr('common.tools'), state.showTools);
   }
   if (dom.toggleReasoningBtn) {
-    dom.toggleReasoningBtn.textContent = `${tr('common.reasoning')}: ${state.showReasoning ? tr('common.on') : tr('common.off')}`;
-    dom.toggleReasoningBtn.classList.toggle('is-active', state.showReasoning);
+    syncButton(dom.toggleReasoningBtn, tr('common.reasoning'), state.showReasoning);
   }
   updateAutoDebugToggleButton();
+  const activeCount = [
+    state.showTodos,
+    state.showTools,
+    state.showReasoning,
+    state.autoDebugEnabled,
+  ].filter(Boolean).length;
+  const count = document.getElementById('view-controls-count');
+  if (count) count.textContent = String(activeCount);
 }
 
 function refreshLocalizedUi() {
@@ -297,10 +327,15 @@ function updateUsageBadge() {
     dom.usageBadge.removeAttribute('title');
     return;
   }
-  dom.usageBadge.textContent = `📊 ${tr('usage.inOut', {
+  if (!dom.usageBadge.querySelector('.usage-badge-label')) {
+    dom.usageBadge.innerHTML =
+      '<svg class="icon" aria-hidden="true"><use href="#icon-chart"></use></svg><span class="usage-badge-label"></span>';
+  }
+  const label = dom.usageBadge.querySelector('.usage-badge-label');
+  if (label) label.textContent = tr('usage.inOut', {
     input: formatTokenCount(inp),
     output: formatTokenCount(out),
-  })}`;
+  });
   dom.usageBadge.title = tr('header.usageBadgeTitle', {
     dailyInput: formatTokenCount(inp),
     dailyOutput: formatTokenCount(out),
@@ -756,6 +791,7 @@ function switchToSession(sessionId: string) {
   state.pendingDeleteSessionId =
     state.activeSessionId && state.activeSessionId !== 'main' ? state.activeSessionId : '';
   state.activeSessionId = nextSessionId;
+  closeMobileNavigation({ restoreFocus: true });
   persistActiveSessionId(nextSessionId);
   state.sessionSwitchInFlight = true;
   renderSessionDrawer();
@@ -770,6 +806,7 @@ function switchToGroup(groupId: string) {
   }
   enterGroupControlSession();
   state.activeGroupId = nextGroupId;
+  closeMobileNavigation({ restoreFocus: true });
   persistActiveGroupId(nextGroupId);
   state.activeGroupMembers = [];
   clearGroupRunState();
@@ -1992,10 +2029,14 @@ const actionHandlers = {
   'toggle-auto-debug': () => toggleAutoDebug(),
   'nav-settings': () => {
     closeMobileMenu();
+    closeShellPopovers();
+    closeMobileNavigation({ restoreFocus: true });
     openSettingsPage(state.activeSessionId || 'main');
   },
   'nav-usage': () => {
     closeMobileMenu();
+    closeShellPopovers();
+    closeMobileNavigation({ restoreFocus: true });
     openUsagePage(state.activeSessionId);
   },
   'close-page': (el) => {
@@ -2012,9 +2053,12 @@ const actionHandlers = {
   'cmd-close-menu': (el) => {
     const cmd = el.dataset.cmd;
     if (cmd) sendCmd(cmd);
-    closeMobileMenu();
+    closeShellPopovers();
   },
   'toggle-mobile-menu': () => toggleMobileMenu(),
+  'toggle-view-controls': () => toggleViewControlsMenu(),
+  'toggle-mobile-navigation': (el) => toggleMobileNavigation(el),
+  'close-mobile-navigation': () => closeMobileNavigation({ restoreFocus: true }),
   'toggle-theme': () => cycleTheme(),
   'toggle-language': () => {
     toggleLanguage();
@@ -2073,9 +2117,13 @@ function handleDocumentClick(e: MouseEvent) {
 }
 
 function handleDocumentKeydown(e: KeyboardEvent) {
+  if (e.key === 'Tab' && trapToolDrawerFocus(e)) {
+    return;
+  }
   if (e.key === 'Escape') {
     closeToolDrawer();
-    closeMobileMenu();
+    closeShellPopovers({ restoreFocus: true });
+    closeMobileNavigation({ restoreFocus: true });
     closeSubagentModal();
     closeOrchestrateTaskModal();
     closeSettingsPage();
@@ -2259,7 +2307,9 @@ function closeShortcutsOverlay(): void {
 }
 
 function handleWindowResizeMenu() {
-  if (window.innerWidth > 768) closeMobileMenu();
+  if (window.innerWidth > 768) closeShellPopovers();
+  syncResponsiveNavigation();
+  syncToolDrawerResponsiveState();
 }
 
 function handleJumpToLatestClick() {
@@ -2267,10 +2317,15 @@ function handleJumpToLatestClick() {
 }
 
 function handleSessionDrawerToggleClick() {
-  toggleSessionDrawerExpanded();
+  if (isMobileViewport()) {
+    closeMobileNavigation({ restoreFocus: true });
+  } else {
+    toggleSessionDrawerExpanded();
+  }
 }
 
 function handleSessionDrawerNewClick() {
+  closeMobileNavigation({ restoreFocus: true });
   void createSession();
 }
 

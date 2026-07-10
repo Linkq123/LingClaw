@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import type { UsageData } from '../types/config.js';
 import { subscribeLanguageChange, tr } from '../i18n.js';
+import { trapDialogFocus } from './dialogFocus.js';
 
 // ── Module-level bridge ───────────────────────────────────────────────────────
 
@@ -536,6 +537,7 @@ export function UsagePage() {
   const [usageSessionId, setUsageSessionId] = useState('');
   const [dailyRange, setDailyRange] = useState(7);
   const [providerRange, setProviderRange] = useState(7);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
     _open = () => {
@@ -558,6 +560,38 @@ export function UsagePage() {
   useEffect(() => {
     const el = document.getElementById('usage-page');
     if (el) el.hidden = !visible;
+  }, [visible]);
+
+  useEffect(() => {
+    if (!visible) return;
+    previousFocusRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    document.body.classList.add('page-dialog-open');
+    const focusTimer = window.setTimeout(() => {
+      document.querySelector<HTMLButtonElement>('.usage-panel .page-close')?.focus();
+    }, 0);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.key === 'Tab' &&
+        trapDialogFocus(event, document.querySelector<HTMLElement>('.usage-panel'))
+      ) {
+        event.stopPropagation();
+        return;
+      }
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      setVisible(false);
+    };
+    window.addEventListener('keydown', onKeyDown, true);
+    return () => {
+      window.clearTimeout(focusTimer);
+      window.removeEventListener('keydown', onKeyDown, true);
+      document.body.classList.remove('page-dialog-open');
+      const previous = previousFocusRef.current;
+      previousFocusRef.current = null;
+      if (previous?.isConnected) previous.focus();
+    };
   }, [visible]);
 
   // Shared loader: used by both the visibility effect and the manual refresh
@@ -603,12 +637,21 @@ export function UsagePage() {
 
   // Render inside #usage-page overlay (panel content only)
   return (
-    <div className="page-panel page-panel-wide usage-panel">
+    <div
+      className="page-panel page-panel-wide usage-panel"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="usage-dialog-title"
+      tabIndex={-1}
+    >
       <div className="page-header">
-        <h2>{tr('usage.title')}</h2>
+        <h2 id="usage-dialog-title">{tr('usage.title')}</h2>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <button className="btn-secondary" onClick={refreshUsage} disabled={loading}>
-            {loading ? tr('usage.loading') : tr('usage.refresh')}
+            <svg className={`icon${loading ? ' is-spinning' : ''}`} aria-hidden="true">
+              <use href="#icon-refresh" />
+            </svg>
+            <span>{loading ? tr('usage.loading') : tr('usage.refresh')}</span>
           </button>
           <button
             className="page-close"
@@ -616,15 +659,40 @@ export function UsagePage() {
             aria-label={tr('common.close')}
             onClick={() => setVisible(false)}
           >
-            ×
+            <svg className="icon" aria-hidden="true">
+              <use href="#icon-close" />
+            </svg>
           </button>
         </div>
       </div>
 
       <div className="page-body usage-page-body" id="usage-body">
-        {error && <p style={{ color: 'var(--accent-error)' }}>{error}</p>}
+        {error && (
+          <div className="usage-error-state" role="alert">
+            <span className="usage-state-icon">
+              <svg className="icon" aria-hidden="true">
+                <use href="#icon-activity" />
+              </svg>
+            </span>
+            <strong>{tr('usage.loadErrorTitle')}</strong>
+            <p>{error}</p>
+            <button className="btn-secondary" onClick={refreshUsage} disabled={loading}>
+              <svg className={`icon${loading ? ' is-spinning' : ''}`} aria-hidden="true">
+                <use href="#icon-refresh" />
+              </svg>
+              <span>{tr('usage.retry')}</span>
+            </button>
+          </div>
+        )}
         {!usageData && !error && loading && (
-          <p style={{ color: 'var(--dim)' }}>{tr('usage.loading')}</p>
+          <div className="usage-loading-state" role="status">
+            <span className="usage-state-icon">
+              <svg className="icon is-spinning" aria-hidden="true">
+                <use href="#icon-refresh" />
+              </svg>
+            </span>
+            <strong>{tr('usage.loading')}</strong>
+          </div>
         )}
         {usageData && (
           <>

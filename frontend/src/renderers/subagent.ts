@@ -978,5 +978,5 @@ export function copySubagentSummary(button) {
 export function openSubagentToolDrawer(button) {
   if (!button) return;
   pulseFocus(button);
-  openToolDrawer(button);
+  openToolDrawer(button, button);
 }

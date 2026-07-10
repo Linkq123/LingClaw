@@ -26,6 +26,35 @@ type RenderableGroup = SessionGroupSummary & {
 
 let callbacks: SessionDrawerCallbacks | null = null;
 
+function iconMarkup(name: string): string {
+  return `<svg class="icon" aria-hidden="true"><use href="#icon-${name}"></use></svg>`;
+}
+
+function isMobileDrawerViewport(): boolean {
+  if (typeof window === 'undefined') return false;
+  if (typeof window.matchMedia === 'function')
+    return window.matchMedia('(max-width: 768px)').matches;
+  return window.innerWidth <= 768;
+}
+
+export function syncSessionDrawerToggleChrome(): void {
+  if (!dom.sessionDrawerToggleBtn) return;
+  if (isMobileDrawerViewport()) {
+    dom.sessionDrawerToggleBtn.innerHTML = iconMarkup('close');
+    dom.sessionDrawerToggleBtn.setAttribute('aria-label', tr('workspace.closeNavigation'));
+    dom.sessionDrawerToggleBtn.setAttribute('aria-expanded', String(state.mobileNavigationOpen));
+    return;
+  }
+  dom.sessionDrawerToggleBtn.innerHTML = iconMarkup(
+    state.sessionDrawerExpanded ? 'chevron-left' : 'chevron-right',
+  );
+  dom.sessionDrawerToggleBtn.setAttribute(
+    'aria-label',
+    state.sessionDrawerExpanded ? tr('session.collapseDrawer') : tr('session.expandDrawer'),
+  );
+  dom.sessionDrawerToggleBtn.setAttribute('aria-expanded', String(state.sessionDrawerExpanded));
+}
+
 function loadDrawerPreference(): boolean {
   try {
     const value = globalThis.localStorage?.getItem(SESSION_DRAWER_STORAGE_KEY);
@@ -197,7 +226,7 @@ function createSessionRow(session: RenderableSession): HTMLElement {
       tr('session.rename', { name: session.name || session.id }),
     );
     renameButton.title = tr('session.rename', { name: session.name || session.id });
-    renameButton.textContent = '✎';
+    renameButton.innerHTML = iconMarkup('edit');
     renameButton.addEventListener('click', () => {
       callbacks?.onRename?.(session.id);
     });
@@ -213,7 +242,7 @@ function createSessionRow(session: RenderableSession): HTMLElement {
       tr('session.delete', { name: session.name || session.id }),
     );
     deleteButton.title = tr('session.delete', { name: session.name || session.id });
-    deleteButton.textContent = '×';
+    deleteButton.innerHTML = iconMarkup('trash');
     deleteButton.addEventListener('click', () => {
       callbacks?.onDelete(session.id);
     });
@@ -239,7 +268,7 @@ function createSectionHeader(label: string, count: number, action?: () => void):
     const button = document.createElement('button');
     button.type = 'button';
     button.className = 'session-drawer-section-action';
-    button.textContent = '+';
+    button.innerHTML = iconMarkup('plus');
     button.title =
       label === tr('session.sectionGroups')
         ? tr('session.newGroup')
@@ -314,7 +343,7 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
       tr('session.renameGroup', { name: group.name || group.id }),
     );
     renameButton.title = tr('session.renameGroup', { name: group.name || group.id });
-    renameButton.textContent = '✎';
+    renameButton.innerHTML = iconMarkup('edit');
     renameButton.addEventListener('click', () => callbacks?.onRenameGroup?.(group.id));
     actions.push(renameButton);
   }
@@ -328,7 +357,7 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
       tr('session.deleteGroup', { name: group.name || group.id }),
     );
     deleteButton.title = tr('session.deleteGroup', { name: group.name || group.id });
-    deleteButton.textContent = '×';
+    deleteButton.innerHTML = iconMarkup('trash');
     deleteButton.addEventListener('click', () => callbacks?.onDeleteGroup?.(group.id));
     actions.push(deleteButton);
   }
@@ -349,19 +378,12 @@ function applyDrawerChrome(): void {
   dom.sessionDrawer.classList.toggle('is-collapsed', !state.sessionDrawerExpanded);
   dom.sessionDrawer.dataset.expanded = String(state.sessionDrawerExpanded);
 
-  if (dom.sessionDrawerToggleBtn) {
-    dom.sessionDrawerToggleBtn.textContent = state.sessionDrawerExpanded ? '<' : '>';
-    dom.sessionDrawerToggleBtn.setAttribute(
-      'aria-label',
-      state.sessionDrawerExpanded ? tr('session.collapseDrawer') : tr('session.expandDrawer'),
-    );
-    dom.sessionDrawerToggleBtn.setAttribute('aria-expanded', String(state.sessionDrawerExpanded));
-  }
+  syncSessionDrawerToggleChrome();
 
   if (dom.sessionDrawerNewBtn) {
-    dom.sessionDrawerNewBtn.textContent = state.sessionDrawerExpanded
-      ? tr('session.newSession')
-      : '+';
+    dom.sessionDrawerNewBtn.innerHTML = `${iconMarkup('plus')}<span class="sidebar-new-label">${tr(
+      'session.newSession',
+    )}</span>`;
     dom.sessionDrawerNewBtn.disabled = state.sessionSwitchInFlight;
     dom.sessionDrawerNewBtn.setAttribute('aria-label', tr('session.newSessionShort'));
     dom.sessionDrawerNewBtn.title = tr('session.newSessionShort');
@@ -392,12 +414,6 @@ export function renderSessionDrawer(): void {
     state.activeSessionId,
     state.pendingDeleteSessionId,
   );
-
-  if (!state.sessionDrawerExpanded) {
-    dom.sessionDrawerList.hidden = true;
-    dom.sessionDrawerList.replaceChildren();
-    return;
-  }
 
   dom.sessionDrawerList.hidden = false;
   const sessions = renderableSessions();

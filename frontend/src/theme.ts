@@ -91,8 +91,12 @@ function updateThemeButton(): void {
     light: tr('theme.light'),
     dark: tr('theme.dark'),
   };
-  const icons: Record<ThemeChoice, string> = { auto: '◐', light: '☀', dark: '☾' };
-  btn.textContent = `${icons[currentChoice]} ${labels[currentChoice]}`;
+  const label = btn.querySelector('#theme-toggle-label');
+  if (label) {
+    label.textContent = labels[currentChoice];
+  } else {
+    btn.textContent = labels[currentChoice];
+  }
   const nextChoice: ThemeChoice =
     currentChoice === 'auto' ? 'light' : currentChoice === 'light' ? 'dark' : 'auto';
   btn.setAttribute(

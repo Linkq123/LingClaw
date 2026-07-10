@@ -8,7 +8,7 @@ import { escHtml, fallbackCopy, scheduleBackgroundTask, isAsciiDigit } from './u
 import { scrollDown, invalidateChatScrollCache } from './scroll.js';
 
 type MarkdownDeps = {
-  hljs: typeof import('highlight.js').default;
+  hljs: typeof import('./highlighter.js').default;
   marked: typeof import('marked').marked;
   DOMPurify: typeof import('dompurify').default;
   katex: typeof import('katex').default;
@@ -25,7 +25,7 @@ function defaultExport<T>(module: T): T extends { default: infer D } ? D : T {
 async function loadMarkdownDeps(): Promise<MarkdownDeps> {
   if (markdownDepsPromise) return markdownDepsPromise;
   markdownDepsPromise = Promise.all([
-    import('highlight.js'),
+    import('./highlighter.js'),
     import('marked'),
     import('marked-highlight'),
     import('dompurify'),

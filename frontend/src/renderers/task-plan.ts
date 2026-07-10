@@ -65,7 +65,7 @@ function updatePanel(panel: HTMLElement, event: TaskPlanEvent): void {
   panel.dataset.toolStatus = event.plan.status || 'active';
   panel.className = `tool-panel tool-panel-ready task-plan-panel task-plan-${event.plan.status || 'active'}`;
   panel.innerHTML = `
-    <div class="tool-header task-plan-header" data-action="open-tool-drawer">
+    <div class="tool-header task-plan-header" data-action="open-tool-drawer" role="button" tabindex="0" aria-haspopup="dialog">
       <span class="tool-icon task-plan-icon">▣</span>
       <span class="tool-name">Task Plan</span>
       <span class="tool-args-preview">${escHtml(event.plan.goal)}</span>
