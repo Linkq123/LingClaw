@@ -31,7 +31,9 @@ function disablePlaceholderInteractivity(root: HTMLElement) {
   });
 
   root
-    .querySelectorAll('button, [href], input, select, textarea, [tabindex], [contenteditable="true"]')
+    .querySelectorAll(
+      'button, [href], input, select, textarea, [tabindex], [contenteditable="true"]',
+    )
     .forEach((node) => {
       if (node instanceof HTMLElement) {
         node.setAttribute('tabindex', '-1');
@@ -67,8 +69,7 @@ function createModalHostPlaceholder(
   placeholder.classList.remove(config.hostClass);
   placeholder.classList.remove('subagent-modal-anchor');
   placeholder.classList.add(config.placeholderClass);
-  placeholder.style.minHeight =
-    heightPx || `${Math.max(host.getBoundingClientRect().height, 1)}px`;
+  placeholder.style.minHeight = heightPx || `${Math.max(host.getBoundingClientRect().height, 1)}px`;
   stripDuplicateIds(placeholder);
   trimPlaceholderContent(placeholder);
   disablePlaceholderInteractivity(placeholder);
@@ -108,7 +109,10 @@ export function moveModalHostToBody(host: ModalHostElement | null, config: Modal
   document.body.appendChild(host);
 }
 
-export function restoreModalHost(host: ModalHostElement | null, config: Pick<ModalHostConfig, 'hostClass'>) {
+export function restoreModalHost(
+  host: ModalHostElement | null,
+  config: Pick<ModalHostConfig, 'hostClass'>,
+) {
   if (!host || !host.classList.contains(config.hostClass)) return;
 
   const parent = host._modalHostParent;

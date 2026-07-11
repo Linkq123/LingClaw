@@ -65,12 +65,12 @@ describe('orchestrate task modal hosting', () => {
   it('uses the shared workflow and task status icons', () => {
     mountOrchestration();
 
-    expect(
-      dom.chat?.querySelector('.orchestrate-icon use')?.getAttribute('href'),
-    ).toBe('#icon-workflow');
-    expect(
-      dom.chat?.querySelector('.orchestrate-task-icon use')?.getAttribute('href'),
-    ).toBe('#icon-more');
+    expect(dom.chat?.querySelector('.orchestrate-icon use')?.getAttribute('href')).toBe(
+      '#icon-workflow',
+    );
+    expect(dom.chat?.querySelector('.orchestrate-task-icon use')?.getAttribute('href')).toBe(
+      '#icon-more',
+    );
     expect(
       dom.chat?.querySelector('.orchestrate-header > .chevron use')?.getAttribute('href'),
     ).toBe('#icon-chevron-right');
@@ -83,9 +83,9 @@ describe('orchestrate task modal hosting', () => {
       'completed',
     );
 
-    expect(
-      dom.chat?.querySelector('.orchestrate-task-icon use')?.getAttribute('href'),
-    ).toBe('#icon-check');
+    expect(dom.chat?.querySelector('.orchestrate-task-icon use')?.getAttribute('href')).toBe(
+      '#icon-check',
+    );
   });
 
   it('preserves streamed task output when a synthetic plan expands into multiple tasks', () => {
@@ -142,7 +142,9 @@ describe('orchestrate task modal hosting', () => {
     expect(rows).toHaveLength(2);
     expect(firstRow?.dataset.taskId).toBe('task-a');
     expect(secondRow?.dataset.taskId).toBe('task-b');
-    expect(firstPanel?.querySelector('[data-subagent-tool-trail] .subagent-tool-pill')).not.toBeNull();
+    expect(
+      firstPanel?.querySelector('[data-subagent-tool-trail] .subagent-tool-pill'),
+    ).not.toBeNull();
     expect(
       firstPanel
         ?.querySelector('[data-subagent-tool-trail] .subagent-tool-pill')
@@ -321,7 +323,9 @@ describe('orchestrate task modal hosting', () => {
 
     const row = dom.chat?.querySelector('[data-task-id="task-a"]') as HTMLElement | null;
     const visiblePanel = row?.querySelector('.subagent-panel') as HTMLElement | null;
-    const registeredPanel = state.activeSubagentPanels.get('orch-1:task-a') as HTMLElement | undefined;
+    const registeredPanel = state.activeSubagentPanels.get('orch-1:task-a') as
+      | HTMLElement
+      | undefined;
 
     expect(registeredPanel).toBe(visiblePanel);
     expect(
@@ -378,7 +382,9 @@ describe('orchestrate task modal hosting', () => {
 
     const row = dom.chat?.querySelector('[data-task-id="task-a"]') as HTMLElement | null;
     const visiblePanel = row?.querySelector('.subagent-panel') as HTMLElement | null;
-    const registeredPanel = state.activeSubagentPanels.get('orch-1:task-a') as HTMLElement | undefined;
+    const registeredPanel = state.activeSubagentPanels.get('orch-1:task-a') as
+      | HTMLElement
+      | undefined;
 
     expect(registeredPanel).toBe(visiblePanel);
     expect(
@@ -521,8 +527,12 @@ describe('orchestrate task modal hosting', () => {
     );
 
     const rows = dom.chat?.querySelectorAll('.orchestrate-task') || [];
-    const firstPanel = (rows[0] as HTMLElement | undefined)?.querySelector('.subagent-panel') as HTMLElement | null;
-    const secondPanel = (rows[1] as HTMLElement | undefined)?.querySelector('.subagent-panel') as HTMLElement | null;
+    const firstPanel = (rows[0] as HTMLElement | undefined)?.querySelector(
+      '.subagent-panel',
+    ) as HTMLElement | null;
+    const secondPanel = (rows[1] as HTMLElement | undefined)?.querySelector(
+      '.subagent-panel',
+    ) as HTMLElement | null;
 
     expect(firstPanel?.querySelector('[data-subagent-tool-trail] .subagent-tool-pill')).toBeNull();
     expect(
@@ -540,7 +550,9 @@ describe('orchestrate task modal hosting', () => {
     const summary = row?.querySelector('.orchestrate-task-summary') as HTMLElement | null;
     const sharedPanel = row?.querySelector('.subagent-panel') as HTMLElement | null;
     const sharedHost = sharedPanel?.parentElement as HTMLElement | null;
-    const scrollIntoViewSpy = Element.prototype.scrollIntoView as unknown as ReturnType<typeof vi.fn>;
+    const scrollIntoViewSpy = Element.prototype.scrollIntoView as unknown as ReturnType<
+      typeof vi.fn
+    >;
 
     expect(orchestratePanel?.querySelector('[data-action="orchestrate-toggle-all"]')).toBeNull();
     expect(orchestratePanel?.querySelector('[data-action="orchestrate-focus-active"]')).toBeNull();
@@ -556,7 +568,8 @@ describe('orchestrate task modal hosting', () => {
     expect(sharedHost?.parentElement).toBe(document.body);
     expect(document.querySelector('.subagent-modal-placeholder')).not.toBeNull();
     expect(
-      (document.querySelector('.subagent-modal-placeholder') as HTMLElement | null)?.style.minHeight,
+      (document.querySelector('.subagent-modal-placeholder') as HTMLElement | null)?.style
+        .minHeight,
     ).not.toBe('');
     expect(document.querySelector('.subagent-modal-placeholder .subagent-panel')).not.toBeNull();
     expect(sharedPanel?.classList.contains('subagent-modal-open')).toBe(true);
@@ -661,7 +674,9 @@ describe('orchestrate task modal hosting', () => {
     const sharedPanel = row?.querySelector('.subagent-panel') as HTMLElement | null;
 
     openOrchestrateTaskModal(trigger);
-    const initialPlaceholder = dom.chat?.querySelector('.subagent-modal-placeholder') as HTMLElement | null;
+    const initialPlaceholder = dom.chat?.querySelector(
+      '.subagent-modal-placeholder',
+    ) as HTMLElement | null;
     const initialPlaceholderHeight = initialPlaceholder?.style.minHeight;
 
     markOrchestrateTask(
@@ -692,7 +707,8 @@ describe('orchestrate task modal hosting', () => {
     expect(placeholderPanel?.classList.contains('subagent-active')).toBe(false);
     expect(placeholderPanel?.classList.contains('subagent-done')).toBe(true);
     expect(
-      (dom.chat?.querySelector('.subagent-modal-placeholder') as HTMLElement | null)?.style.minHeight,
+      (dom.chat?.querySelector('.subagent-modal-placeholder') as HTMLElement | null)?.style
+        .minHeight,
     ).toBe(initialPlaceholderHeight);
   });
 });

@@ -30,6 +30,7 @@
   --accent-error: #d94b5f;
   --accent-success: #16875e;
   --accent-warn: #c77b17;
+  --welcome-muted: #6c7184;
   --brand-gradient: #6554d9;
   --brand-gradient-soft: color-mix(in srgb, var(--accent2) 9%, transparent);
   --workspace-sidebar-width: 288px;
@@ -75,6 +76,7 @@
   --accent-error: #ff7a8b;
   --accent-success: #4ed49d;
   --accent-warn: #f4b95c;
+  --welcome-muted: #9da4b8;
   --brand-gradient: #6554d9;
   --brand-gradient-soft: color-mix(in srgb, var(--accent2) 12%, transparent);
 }
@@ -233,7 +235,7 @@ button {
 .session-drawer-new-btn,
 .sidebar-utility,
 .mobile-navigation-toggle,
-.workspace-action-btn {
+.workspace-header .workspace-action-btn {
   border: 1px solid var(--border);
   background: var(--surface);
   color: var(--dim);
@@ -259,7 +261,7 @@ button {
 .session-drawer-toggle-btn:hover,
 .sidebar-utility:hover,
 .mobile-navigation-toggle:hover,
-.workspace-action-btn:hover {
+.workspace-header .workspace-action-btn:hover {
   color: var(--text);
   background: var(--panel-hover);
   border-color: color-mix(in srgb, var(--accent2) 32%, var(--border));
@@ -598,8 +600,7 @@ button {
   height: 13px;
 }
 
-.workspace-header .actions button,
-.workspace-action-btn {
+.workspace-header .workspace-action-btn {
   min-height: 38px;
   padding: 0 11px;
   display: inline-flex;
@@ -611,7 +612,7 @@ button {
   font-weight: 700;
 }
 
-.workspace-action-btn[aria-expanded='true'] {
+.workspace-header .workspace-action-btn[aria-expanded='true'] {
   color: var(--text);
   background: color-mix(in srgb, var(--accent2) 8%, var(--surface));
   border-color: color-mix(in srgb, var(--accent2) 30%, var(--border));
@@ -692,7 +693,7 @@ button {
   font-size: 10px;
 }
 
-.shell-menu button {
+.workspace-header .shell-menu button {
   width: 100%;
   min-height: 44px;
   padding: 7px 9px;
@@ -708,7 +709,7 @@ button {
   font-size: 12px;
 }
 
-.shell-menu button:hover {
+.workspace-header .shell-menu button:hover {
   background: var(--panel-hover);
 }
 
@@ -1028,7 +1029,7 @@ button {
 .welcome-hint {
   max-width: 420px;
   display: block;
-  color: var(--dim);
+  color: var(--welcome-muted);
   font-size: 13px;
   line-height: 1.55;
 }
@@ -1229,6 +1230,13 @@ button {
       calc(100vw - var(--workspace-sidebar-width) - var(--workspace-inspector-width) - 56px)
     );
     --assistant-output-width: var(--chat-output-width);
+  }
+
+  .app-shell:has(.session-drawer.is-collapsed):has(.tool-drawer.open) {
+    --chat-output-width: min(
+      var(--workspace-content-width),
+      calc(100vw - var(--workspace-sidebar-collapsed) - var(--workspace-inspector-width) - 56px)
+    );
   }
 }
 
@@ -1764,9 +1772,20 @@ button {
 
   .workspace-header .session-id,
   .app-mode-chip,
-  .conn-label,
   .workspace-status-cluster .usage-badge {
     display: none;
+  }
+
+  .conn-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
   }
 
   .workspace-status-cluster {
@@ -1780,6 +1799,16 @@ button {
     min-height: 30px;
     padding: 0;
     justify-content: center;
+  }
+
+  .conn-dot.connecting {
+    border-radius: 0;
+    clip-path: polygon(50% 0, 100% 50%, 50% 100%, 0 50%);
+  }
+
+  .conn-dot.disconnected {
+    border-radius: 0;
+    clip-path: polygon(50% 0, 100% 100%, 0 100%);
   }
 
   .workspace-actions {
@@ -2027,10 +2056,6 @@ button {
 
   .workspace-header .session-name {
     max-width: 25vw;
-  }
-
-  .workspace-status-cluster {
-    display: none;
   }
 
   .welcome {

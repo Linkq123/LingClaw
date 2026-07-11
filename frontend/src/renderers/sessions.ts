@@ -1,6 +1,6 @@
 import { dom, state } from '../state.js';
 import type { SessionGroupSummary, SessionSummary } from '../types.js';
-import { normalizePendingDeleteSessionId, shouldSwitchToSelectedSession } from '../utils.js';
+import { normalizePendingDeleteSessionId } from '../utils.js';
 import { tr } from '../i18n.js';
 import { iconMarkup } from '../icons.js';
 
@@ -26,6 +26,28 @@ type RenderableGroup = SessionGroupSummary & {
 };
 
 let callbacks: SessionDrawerCallbacks | null = null;
+
+function hasValidId(id: string): boolean {
+  return id.trim().length > 0;
+}
+
+function isCurrentSessionId(id: string): boolean {
+  return hasValidId(id) && !state.activeGroupId && id === state.activeSessionId;
+}
+
+function isCurrentGroupId(id: string): boolean {
+  return hasValidId(id) && hasValidId(state.activeGroupId) && id === state.activeGroupId;
+}
+
+function dedupeValidIds<T extends { id: string }>(items: T[]): T[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    if (!hasValidId(item.id)) return true;
+    if (seen.has(item.id)) return false;
+    seen.add(item.id);
+    return true;
+  });
+}
 
 function isMobileDrawerViewport(): boolean {
   if (typeof window === 'undefined') return false;
@@ -76,15 +98,20 @@ function persistDrawerPreference(): void {
 }
 
 function renderableSessions(): RenderableSession[] {
-  const items: RenderableSession[] = state.sessions.map((session) => ({
-    ...session,
-    pending: state.sessionSwitchInFlight && session.id === state.activeSessionId,
-  }));
-  if (state.activeSessionId && !items.some((session) => session.id === state.activeSessionId)) {
+  const items: RenderableSession[] = dedupeValidIds(
+    state.sessions.map((session) => ({
+      ...session,
+      pending: state.sessionSwitchInFlight && isCurrentSessionId(session.id),
+    })),
+  );
+  if (
+    hasValidId(state.activeSessionId) &&
+    !items.some((session) => session.id === state.activeSessionId)
+  ) {
     items.unshift({
       id: state.activeSessionId,
       name: state.activeSessionId,
-      pending: state.sessionSwitchInFlight,
+      pending: state.sessionSwitchInFlight && !state.activeGroupId,
     });
   }
   items.sort((a, b) => {
@@ -96,10 +123,19 @@ function renderableSessions(): RenderableSession[] {
 }
 
 function renderableGroups(): RenderableGroup[] {
-  const items: RenderableGroup[] = state.sessionGroups.map((group) => ({
-    ...group,
-    pending: state.sessionSwitchInFlight && group.id === state.activeGroupId,
-  }));
+  const items: RenderableGroup[] = dedupeValidIds(
+    state.sessionGroups.map((group) => ({
+      ...group,
+      pending: state.sessionSwitchInFlight && isCurrentGroupId(group.id),
+    })),
+  );
+  if (hasValidId(state.activeGroupId) && !items.some((group) => group.id === state.activeGroupId)) {
+    items.unshift({
+      id: state.activeGroupId,
+      name: state.activeGroupId,
+      pending: state.sessionSwitchInFlight,
+    });
+  }
   items.sort((a, b) => (b.updated_at ?? 0) - (a.updated_at ?? 0) || a.id.localeCompare(b.id));
   return items;
 }
@@ -111,7 +147,10 @@ function currentBadgeLabel(session: RenderableSession): string {
   if (session.corrupt) {
     return tr('common.corrupt');
   }
-  if (!state.activeGroupId && session.id === state.activeSessionId) {
+  if (!hasValidId(session.id)) {
+    return tr('common.unavailable');
+  }
+  if (isCurrentSessionId(session.id)) {
     return tr('common.current');
   }
   return '';
@@ -120,15 +159,18 @@ function currentBadgeLabel(session: RenderableSession): string {
 function currentGroupBadgeLabel(group: RenderableGroup): string {
   if (group.pending) return tr('common.switching');
   if (group.corrupt) return tr('common.corrupt');
-  if (group.id === state.activeGroupId) return tr('common.current');
+  if (!hasValidId(group.id)) return tr('common.unavailable');
+  if (isCurrentGroupId(group.id)) return tr('common.current');
   if ((group.running ?? 0) > 0) return tr('session.groupRunning', { count: group.running ?? 0 });
   return '';
 }
 
 function isSessionDeleteable(session: RenderableSession): boolean {
   return (
+    !state.activeGroupId &&
     !state.sessionSwitchInFlight &&
     !session.pending &&
+    hasValidId(session.id) &&
     session.id !== 'main' &&
     session.id !== state.activeSessionId
   );
@@ -138,6 +180,7 @@ function isSessionRenameable(session: RenderableSession): boolean {
   return (
     !state.sessionSwitchInFlight &&
     !session.pending &&
+    hasValidId(session.id) &&
     session.corrupt !== true &&
     callbacks?.onRename != null
   );
@@ -147,7 +190,9 @@ function createSessionRow(session: RenderableSession): HTMLElement {
   const row = document.createElement('div');
   row.className = 'session-drawer-row';
   row.dataset.sessionId = session.id;
-  if (session.id === state.activeSessionId) {
+  const hasValidSessionId = hasValidId(session.id);
+  const isCurrentSession = isCurrentSessionId(session.id);
+  if (isCurrentSession) {
     row.classList.add('is-active');
   }
   if (session.corrupt) {
@@ -156,7 +201,7 @@ function createSessionRow(session: RenderableSession): HTMLElement {
   if (session.pending) {
     row.classList.add('is-pending');
   }
-  if (state.sessionSwitchInFlight) {
+  if (state.sessionSwitchInFlight || !hasValidSessionId) {
     row.classList.add('is-disabled');
   }
 
@@ -167,15 +212,17 @@ function createSessionRow(session: RenderableSession): HTMLElement {
   mainButton.disabled =
     state.sessionSwitchInFlight ||
     session.pending === true ||
-    (!state.activeGroupId &&
-      !shouldSwitchToSelectedSession(state.sessions, state.activeSessionId, session.id));
+    session.corrupt === true ||
+    !hasValidSessionId;
   mainButton.setAttribute(
     'aria-label',
-    session.corrupt
+    session.corrupt || !hasValidSessionId
       ? tr('session.unavailable', { name: session.name || session.id })
-      : tr('session.switchTo', { name: session.name || session.id }),
+      : isCurrentSession
+        ? tr('session.current', { name: session.name || session.id })
+        : tr('session.switchTo', { name: session.name || session.id }),
   );
-  if (session.id === state.activeSessionId) {
+  if (isCurrentSession) {
     mainButton.setAttribute('aria-current', 'true');
   }
   mainButton.addEventListener('click', () => {
@@ -281,19 +328,31 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
   const row = document.createElement('div');
   row.className = 'session-drawer-row session-drawer-row-group';
   row.dataset.groupId = group.id;
-  if (group.id === state.activeGroupId) row.classList.add('is-active');
+  const hasValidGroupId = hasValidId(group.id);
+  const isCurrentGroup = isCurrentGroupId(group.id);
+  if (isCurrentGroup) row.classList.add('is-active');
   if (group.corrupt) row.classList.add('is-corrupt');
   if (group.pending) row.classList.add('is-pending');
-  if (state.sessionSwitchInFlight) row.classList.add('is-disabled');
+  if (state.sessionSwitchInFlight || !hasValidGroupId) row.classList.add('is-disabled');
 
   const mainButton = document.createElement('button');
   mainButton.type = 'button';
   mainButton.className = 'session-drawer-row-main';
   mainButton.dataset.sessionAction = 'switch-group';
   mainButton.disabled =
-    state.sessionSwitchInFlight || group.pending === true || group.corrupt === true;
-  mainButton.setAttribute('aria-label', tr('session.openGroup', { name: group.name || group.id }));
-  if (group.id === state.activeGroupId) mainButton.setAttribute('aria-current', 'true');
+    state.sessionSwitchInFlight ||
+    group.pending === true ||
+    group.corrupt === true ||
+    !hasValidGroupId;
+  mainButton.setAttribute(
+    'aria-label',
+    group.corrupt || !hasValidGroupId
+      ? tr('session.unavailableGroup', { name: group.name || group.id })
+      : isCurrentGroup
+        ? tr('session.currentGroup', { name: group.name || group.id })
+        : tr('session.openGroup', { name: group.name || group.id }),
+  );
+  if (isCurrentGroup) mainButton.setAttribute('aria-current', 'true');
   mainButton.addEventListener('click', () => {
     if (!mainButton.disabled) callbacks?.onSwitchGroup?.(group.id);
   });
@@ -329,6 +388,7 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
     !state.sessionSwitchInFlight &&
     !group.pending &&
     !group.corrupt &&
+    hasValidGroupId &&
     callbacks?.onRenameGroup
   ) {
     const renameButton = document.createElement('button');
@@ -344,7 +404,12 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
     renameButton.addEventListener('click', () => callbacks?.onRenameGroup?.(group.id));
     actions.push(renameButton);
   }
-  if (!state.sessionSwitchInFlight && !group.pending && callbacks?.onDeleteGroup) {
+  if (
+    !state.sessionSwitchInFlight &&
+    !group.pending &&
+    hasValidGroupId &&
+    callbacks?.onDeleteGroup
+  ) {
     const deleteButton = document.createElement('button');
     deleteButton.type = 'button';
     deleteButton.className = 'session-drawer-row-action session-drawer-row-delete';

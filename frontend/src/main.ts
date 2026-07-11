@@ -96,6 +96,8 @@ import {
   closeShellPopovers,
   toggleMobileNavigation,
   closeMobileNavigation,
+  createMobileNavigationSelectionHandler,
+  createCommandMenuActionHandler,
   isMobileViewport,
   syncResponsiveNavigation,
   initMobileListeners,
@@ -204,6 +206,14 @@ if (state.activeGroupId) {
   state.groupReturnSessionId = groupSessionState.groupReturnSessionId;
   state.activeSessionId = groupSessionState.activeSessionId;
 }
+const switchToSession = createMobileNavigationSelectionHandler(
+  (sessionId) => !state.activeGroupId && sessionId === state.activeSessionId,
+  performSwitchToSession,
+);
+const switchToGroup = createMobileNavigationSelectionHandler(
+  (groupId) => groupId === state.activeGroupId,
+  performSwitchToGroup,
+);
 initSessionDrawer({
   onCreate: createSession,
   onCreateGroup: createGroup,
@@ -333,10 +343,11 @@ function updateUsageBadge() {
       '<svg class="icon" aria-hidden="true"><use href="#icon-chart"></use></svg><span class="usage-badge-label"></span>';
   }
   const label = dom.usageBadge.querySelector('.usage-badge-label');
-  if (label) label.textContent = tr('usage.inOut', {
-    input: formatTokenCount(inp),
-    output: formatTokenCount(out),
-  });
+  if (label)
+    label.textContent = tr('usage.inOut', {
+      input: formatTokenCount(inp),
+      output: formatTokenCount(out),
+    });
   dom.usageBadge.title = tr('header.usageBadgeTitle', {
     dailyInput: formatTokenCount(inp),
     dailyOutput: formatTokenCount(out),
@@ -774,16 +785,8 @@ function upsertSessionSummary(session: SessionSummary) {
   state.sessions = normalizeSessionListPayload({ sessions: state.sessions });
 }
 
-function switchToSession(sessionId: string) {
-  const nextSessionId = String(sessionId || '').trim();
-  if (
-    !nextSessionId ||
-    (!state.activeGroupId && nextSessionId === state.activeSessionId) ||
-    state.sessionSwitchInFlight
-  ) {
-    renderSessionDrawer();
-    return;
-  }
+function performSwitchToSession(nextSessionId: string) {
+  if (state.sessionSwitchInFlight) return;
   state.activeGroupId = '';
   state.groupReturnSessionId = '';
   persistActiveGroupId('');
@@ -792,22 +795,16 @@ function switchToSession(sessionId: string) {
   state.pendingDeleteSessionId =
     state.activeSessionId && state.activeSessionId !== 'main' ? state.activeSessionId : '';
   state.activeSessionId = nextSessionId;
-  closeMobileNavigation({ restoreFocus: true });
   persistActiveSessionId(nextSessionId);
   state.sessionSwitchInFlight = true;
   renderSessionDrawer();
   reconnectToActiveSession(handleMessage);
 }
 
-function switchToGroup(groupId: string) {
-  const nextGroupId = String(groupId || '').trim();
-  if (!nextGroupId || nextGroupId === state.activeGroupId || state.sessionSwitchInFlight) {
-    renderSessionDrawer();
-    return;
-  }
+function performSwitchToGroup(nextGroupId: string) {
+  if (state.sessionSwitchInFlight) return;
   enterGroupControlSession();
   state.activeGroupId = nextGroupId;
-  closeMobileNavigation({ restoreFocus: true });
   persistActiveGroupId(nextGroupId);
   state.activeGroupMembers = [];
   clearGroupRunState();
@@ -889,7 +886,7 @@ async function createGroup() {
 
 function deleteSession(sessionId: string) {
   const targetSessionId = String(sessionId || '').trim();
-  if (!targetSessionId || state.sessionSwitchInFlight) return;
+  if (!targetSessionId || state.activeGroupId || state.sessionSwitchInFlight) return;
   if (targetSessionId === 'main' || targetSessionId === state.activeSessionId) return;
   if (!targetSessionId) return;
   const confirmed = window.confirm(tr('session.confirmDelete', { id: targetSessionId }));
@@ -2023,6 +2020,8 @@ function handleMessage(data) {
 
 // ── Event delegation for data-action buttons ──
 
+const handleCommandMenuAction = createCommandMenuActionHandler(sendCmd);
+
 const actionHandlers = {
   'toggle-tools': () => toggleToolsVisibility(),
   'toggle-todos': () => toggleTodosVisibility(),
@@ -2051,11 +2050,7 @@ const actionHandlers = {
     const cmd = el.dataset.cmd;
     if (cmd) sendCmd(cmd);
   },
-  'cmd-close-menu': (el) => {
-    const cmd = el.dataset.cmd;
-    if (cmd) sendCmd(cmd);
-    closeShellPopovers();
-  },
+  'cmd-close-menu': handleCommandMenuAction,
   'toggle-mobile-menu': () => toggleMobileMenu(),
   'toggle-view-controls': () => toggleViewControlsMenu(),
   'toggle-mobile-navigation': (el) => toggleMobileNavigation(el),

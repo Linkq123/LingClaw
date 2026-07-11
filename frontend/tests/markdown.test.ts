@@ -214,24 +214,21 @@ describe('findProgressiveSplitPoint', () => {
 
   it('does not soft-split after a reference-style link definition colon', () => {
     const text =
-      'a'.repeat(90) +
-      '\n[spec]: https://example.com/very/long/path/that/should/remain-attached';
+      'a'.repeat(90) + '\n[spec]: https://example.com/very/long/path/that/should/remain-attached';
 
     expect(findProgressiveSplitPoint(text)).toBe(-1);
   });
 
   it('does not soft-split after a blockquote reference-style link definition colon', () => {
     const text =
-      'a'.repeat(90) +
-      '\n> [spec]: https://example.com/very/long/path/that/should/remain-attached';
+      'a'.repeat(90) + '\n> [spec]: https://example.com/very/long/path/that/should/remain-attached';
 
     expect(findProgressiveSplitPoint(text)).toBe(-1);
   });
 
   it('does not soft-split after common abbreviations', () => {
     const text =
-      'a'.repeat(90) +
-      ' e.g. 这里其实还在同一句里，后面还有足够长的正文内容来验证缩写误判。';
+      'a'.repeat(90) + ' e.g. 这里其实还在同一句里，后面还有足够长的正文内容来验证缩写误判。';
 
     const abbreviationDotIndex = text.indexOf('e.g.') + 'e.g.'.length - 1;
 
@@ -259,8 +256,7 @@ describe('findProgressiveSplitPoint', () => {
 
   it('does not split at the newline before a lazy list continuation', () => {
     const prefix = 'Intro paragraph that is already long enough to create a safe boundary.\n\n';
-    const text =
-      prefix + '- foo\nbar baz qux quux corge grault garply waldo fred plugh xyzzy thud';
+    const text = prefix + '- foo\nbar baz qux quux corge grault garply waldo fred plugh xyzzy thud';
 
     expect(findProgressiveSplitPoint(text)).toBe(prefix.length);
   });

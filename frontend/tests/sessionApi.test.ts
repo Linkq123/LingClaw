@@ -208,9 +208,8 @@ describe('session API', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const { createSessionGroup, deleteSessionGroup, updateSessionGroup } = await import(
-      '../src/sessionApi.js'
-    );
+    const { createSessionGroup, deleteSessionGroup, updateSessionGroup } =
+      await import('../src/sessionApi.js');
 
     await expect(createSessionGroup('Group A', ['worker-a', 'worker-b'])).resolves.toEqual({
       id: 'group-a',
@@ -292,9 +291,8 @@ describe('session API', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const { promoteSessionGroupAdmin, removeSessionGroupMember } = await import(
-      '../src/sessionApi.js'
-    );
+    const { promoteSessionGroupAdmin, removeSessionGroupMember } =
+      await import('../src/sessionApi.js');
 
     await expect(promoteSessionGroupAdmin('group-a', 'worker-a')).resolves.toMatchObject({
       id: 'group-a',

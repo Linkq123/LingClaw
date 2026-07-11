@@ -21,11 +21,12 @@ describe('slashCommands', () => {
 
     expect(menuState?.exactMatch).toBe(true);
     expect(menuState?.suggestions[0]?.command).toBe('/skills');
-    expect(menuState?.suggestions.slice(1, 4).map((spec) => spec.command).sort()).toEqual([
-      '/skills-global',
-      '/skills-session',
-      '/skills-system',
-    ]);
+    expect(
+      menuState?.suggestions
+        .slice(1, 4)
+        .map((spec) => spec.command)
+        .sort(),
+    ).toEqual(['/skills-global', '/skills-session', '/skills-system']);
   });
 
   it('does not treat mixed-case input as an exact match', () => {

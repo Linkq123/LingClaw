@@ -155,8 +155,6 @@ describe('buildHistoryReasoningPanel', () => {
     expect(header?.querySelector('.reasoning-icon use')?.getAttribute('href')).toBe(
       '#icon-reasoning',
     );
-    expect(header?.querySelector('.chevron use')?.getAttribute('href')).toBe(
-      '#icon-chevron-right',
-    );
+    expect(header?.querySelector('.chevron use')?.getAttribute('href')).toBe('#icon-chevron-right');
   });
 });

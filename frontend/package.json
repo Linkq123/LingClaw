@@ -11,8 +11,8 @@
     "test": "vitest run",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "fmt": "prettier --write \"src/**/*.{ts,tsx}\" \"tests/**/*.ts\"",
-    "fmt:check": "prettier --check \"src/**/*.{ts,tsx}\" \"tests/**/*.ts\""
+    "fmt": "prettier --write .prettierrc eslint.config.js package.json tsconfig.json vite.config.ts index.html \"src/**/*.{ts,tsx,css}\" \"tests/**/*.ts\"",
+    "fmt:check": "prettier --check .prettierrc eslint.config.js package.json tsconfig.json vite.config.ts index.html \"src/**/*.{ts,tsx,css}\" \"tests/**/*.ts\""
   },
   "dependencies": {
     "dompurify": "^3.1.6",

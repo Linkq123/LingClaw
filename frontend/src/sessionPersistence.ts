@@ -42,9 +42,7 @@ export function mainSessionStateForGroupControl(
   return {
     activeSessionId: 'main',
     groupReturnSessionId:
-      previousSessionId && !isMainSession
-        ? previousSessionId
-        : existingReturnSessionId,
+      previousSessionId && !isMainSession ? previousSessionId : existingReturnSessionId,
   };
 }
 

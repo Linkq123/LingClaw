@@ -280,8 +280,7 @@ export function setBusy(b) {
   } else {
     dom.input.placeholder = 'Message LingClaw... (/ for commands)';
   }
-  dom.sendIcon.innerHTML =
-    iconMarkup('send');
+  dom.sendIcon.innerHTML = iconMarkup('send');
   dom.sendBtn.title = '';
   dom.sendBtn.setAttribute('aria-label', 'Send message');
 }

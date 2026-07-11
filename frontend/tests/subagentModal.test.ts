@@ -70,13 +70,17 @@ describe('subagent modal hosting', () => {
     expect(panel).not.toBeNull();
     const wrapper = panel?.closest('.timeline-node') as HTMLElement | null;
     const header = panel?.querySelector('.subagent-header') as HTMLElement | null;
-    const scrollIntoViewSpy = Element.prototype.scrollIntoView as unknown as ReturnType<typeof vi.fn>;
+    const scrollIntoViewSpy = Element.prototype.scrollIntoView as unknown as ReturnType<
+      typeof vi.fn
+    >;
 
     expect(wrapper?.parentElement).toBe(dom.chat);
 
     openSubagentModal(header);
 
-    const placeholder = dom.chat?.querySelector('.subagent-modal-placeholder') as HTMLElement | null;
+    const placeholder = dom.chat?.querySelector(
+      '.subagent-modal-placeholder',
+    ) as HTMLElement | null;
 
     expect(wrapper?.classList.contains('subagent-modal-host')).toBe(true);
     expect(wrapper?.parentElement).toBe(document.body);
@@ -189,7 +193,9 @@ describe('subagent modal hosting', () => {
     const header = panel?.querySelector('.subagent-header') as HTMLElement | null;
 
     openSubagentModal(header);
-    const initialPlaceholder = dom.chat?.querySelector('.subagent-modal-placeholder') as HTMLElement | null;
+    const initialPlaceholder = dom.chat?.querySelector(
+      '.subagent-modal-placeholder',
+    ) as HTMLElement | null;
     const initialPlaceholderHeight = initialPlaceholder?.style.minHeight;
     finishSubagentPanel(
       { task_id: 'task-3c', agent: 'explore' },
@@ -205,7 +211,8 @@ describe('subagent modal hosting', () => {
     expect(placeholderPanel?.classList.contains('subagent-active')).toBe(false);
     expect(placeholderPanel?.classList.contains('subagent-done')).toBe(true);
     expect(
-      (dom.chat?.querySelector('.subagent-modal-placeholder') as HTMLElement | null)?.style.minHeight,
+      (dom.chat?.querySelector('.subagent-modal-placeholder') as HTMLElement | null)?.style
+        .minHeight,
     ).toBe(initialPlaceholderHeight);
   });
 
@@ -225,20 +232,18 @@ describe('subagent modal hosting', () => {
     createSubagentPanel('explore', 'Inspect the logs and summarize the failure.', 'task-4b');
 
     const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
-    const actionButtons = Array.from(
-      panel?.querySelectorAll('.panel-action-btn') || [],
-    ).map((button) => (button as HTMLButtonElement).textContent?.trim());
-    const sectionTitles = Array.from(
-      panel?.querySelectorAll('.subagent-section-title') || [],
-    ).map((title) => (title as HTMLElement).textContent?.trim());
+    const actionButtons = Array.from(panel?.querySelectorAll('.panel-action-btn') || []).map(
+      (button) => (button as HTMLButtonElement).textContent?.trim(),
+    );
+    const sectionTitles = Array.from(panel?.querySelectorAll('.subagent-section-title') || []).map(
+      (title) => (title as HTMLElement).textContent?.trim(),
+    );
 
     expect(panel?.querySelector('.subagent-status')?.textContent).toBe('Running');
     expect(panel?.querySelector('.subagent-icon use')?.getAttribute('href')).toBe(
       '#icon-user-node',
     );
-    expect(panel?.querySelector('.chevron use')?.getAttribute('href')).toBe(
-      '#icon-chevron-right',
-    );
+    expect(panel?.querySelector('.chevron use')?.getAttribute('href')).toBe('#icon-chevron-right');
     expect(panel?.querySelector('.subagent-modal-close use')?.getAttribute('href')).toBe(
       '#icon-close',
     );
@@ -342,16 +347,18 @@ describe('subagent modal hosting', () => {
     );
 
     const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
-    const reasoningBody = panel?.querySelector('[data-subagent-reasoning-body]') as HTMLElement | null;
+    const reasoningBody = panel?.querySelector(
+      '[data-subagent-reasoning-body]',
+    ) as HTMLElement | null;
     const toolBadges = panel?.querySelectorAll('.subagent-tool-pill') || [];
     const summary = panel?.querySelector('.subagent-summary') as HTMLElement | null;
 
     expect(reasoningBody?.textContent).toContain('Check the log file');
     expect(panel?.querySelectorAll('.subagent-tool-row') || []).toHaveLength(0);
     expect(toolBadges).toHaveLength(1);
-    expect((toolBadges[0].querySelector('.subagent-tool-pill-name') as HTMLElement | null)?.textContent).toBe(
-      'read_file',
-    );
+    expect(
+      (toolBadges[0].querySelector('.subagent-tool-pill-name') as HTMLElement | null)?.textContent,
+    ).toBe('read_file');
     expect((toolBadges[0] as HTMLButtonElement).dataset.toolResult).toContain(
       'startup config missing',
     );
@@ -383,7 +390,9 @@ describe('subagent modal hosting', () => {
     );
 
     const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
-    const badges = Array.from(panel?.querySelectorAll('.subagent-tool-pill') || []) as HTMLButtonElement[];
+    const badges = Array.from(
+      panel?.querySelectorAll('.subagent-tool-pill') || [],
+    ) as HTMLButtonElement[];
 
     expect(badges).toHaveLength(2);
     expect(badges[0].classList.contains('is-done')).toBe(true);

@@ -103,7 +103,9 @@
         <path d="m8 12 2.6 2.6L16.5 9" />
       </symbol>
       <symbol id="icon-alert-triangle" viewBox="0 0 24 24">
-        <path d="M10.3 4.1 2.7 17.5A2 2 0 0 0 4.4 20h15.2a2 2 0 0 0 1.7-2.5L13.7 4.1a2 2 0 0 0-3.4 0Z" />
+        <path
+          d="M10.3 4.1 2.7 17.5A2 2 0 0 0 4.4 20h15.2a2 2 0 0 0 1.7-2.5L13.7 4.1a2 2 0 0 0-3.4 0Z"
+        />
         <path d="M12 9v4M12 16.5h.01" />
       </symbol>
       <symbol id="icon-clipboard" viewBox="0 0 24 24">
@@ -275,7 +277,13 @@
             </div>
 
             <div class="workspace-status-cluster">
-              <div class="conn-badge" id="conn-badge">
+              <div
+                class="conn-badge"
+                id="conn-badge"
+                role="status"
+                aria-live="polite"
+                aria-atomic="true"
+              >
                 <span class="conn-dot disconnected" id="conn-dot"></span>
                 <span class="conn-label" id="conn-label">Offline</span>
               </div>

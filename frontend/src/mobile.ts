@@ -128,6 +128,29 @@ export function closeMobileNavigation({ restoreFocus = false } = {}): void {
   if (restoreFocus && previousTrigger?.isConnected) previousTrigger.focus();
 }
 
+export function createMobileNavigationSelectionHandler(
+  isCurrent: (selectionId: string) => boolean,
+  navigate: (selectionId: string) => void,
+): (selectionId: string) => void {
+  return (selectionId) => {
+    const normalizedSelectionId = String(selectionId || '').trim();
+    if (!normalizedSelectionId) return;
+    closeMobileNavigation({ restoreFocus: true });
+    if (isCurrent(normalizedSelectionId)) return;
+    navigate(normalizedSelectionId);
+  };
+}
+
+export function createCommandMenuActionHandler(
+  executeCommand: (command: string) => void,
+): (element: Element) => void {
+  return (element) => {
+    const command = element instanceof HTMLElement ? element.dataset.cmd : undefined;
+    if (command) executeCommand(command);
+    closeShellPopovers({ restoreFocus: true });
+  };
+}
+
 export function toggleMobileNavigation(trigger?: HTMLElement | null): void {
   if (state.mobileNavigationOpen) {
     closeMobileNavigation({ restoreFocus: true });

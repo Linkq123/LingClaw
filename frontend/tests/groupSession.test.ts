@@ -40,9 +40,7 @@ describe('group sessions', () => {
       groupReturnSessionId: 'worker-a',
     });
     expect('pendingDeleteSessionId' in groupSessionState).toBe(false);
-    expect(sessionIdAfterLeavingGroup(groupSessionState.groupReturnSessionId, '')).toBe(
-      'worker-a',
-    );
+    expect(sessionIdAfterLeavingGroup(groupSessionState.groupReturnSessionId, '')).toBe('worker-a');
 
     persistActiveGroupId('');
 
@@ -106,8 +104,13 @@ describe('group sessions', () => {
       onSwitchGroup,
     });
 
-    const groupRow = stateModule.dom.sessionDrawerList?.querySelector('[data-group-id="review-group"]');
-    groupRow?.querySelector<HTMLButtonElement>('[data-session-action="switch-group"]')?.click();
+    const groupRow = stateModule.dom.sessionDrawerList?.querySelector(
+      '[data-group-id="review-group"]',
+    );
+    const groupSwitchButton = groupRow?.querySelector<HTMLButtonElement>(
+      '[data-session-action="switch-group"]',
+    );
+    groupSwitchButton?.click();
     groupRow?.querySelector<HTMLButtonElement>('[data-session-action="rename"]')?.click();
     groupRow?.querySelector<HTMLButtonElement>('[data-session-action="delete"]')?.click();
     stateModule.dom.sessionDrawerList
@@ -120,6 +123,121 @@ describe('group sessions', () => {
     expect(onRenameGroup).toHaveBeenCalledWith('review-group');
     expect(onDeleteGroup).toHaveBeenCalledWith('review-group');
     expect(onCreateGroup).toHaveBeenCalled();
+  });
+
+  it('uses a localized neutral label for the current group', async () => {
+    const stateModule = await import('../src/state.js');
+    const { setLanguage } = await import('../src/i18n.js');
+    const sessionsRenderer = await import('../src/renderers/sessions.js');
+    setLanguage('en');
+    stateModule.initDomRefs();
+    stateModule.state.sessions = [{ id: 'main', name: 'Main' }];
+    stateModule.state.activeGroupId = 'review-group';
+    stateModule.state.sessionGroups = [
+      {
+        id: 'review-group',
+        name: 'Review Group',
+        members: 2,
+        messages: 3,
+        running: 0,
+        updated_at: 10,
+      },
+    ];
+    sessionsRenderer.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete: vi.fn(),
+      onSwitch: vi.fn(),
+      onSwitchGroup: vi.fn(),
+    });
+
+    const currentGroupButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '[data-session-action="switch-group"]',
+    );
+    expect(currentGroupButton?.getAttribute('aria-current')).toBe('true');
+    expect(currentGroupButton?.getAttribute('aria-label')).toBe('Current group: Review Group');
+    const activeRows = stateModule.dom.sessionDrawerList?.querySelectorAll(
+      '.session-drawer-row.is-active',
+    );
+    expect(activeRows).toHaveLength(1);
+    expect(activeRows?.[0]?.getAttribute('data-group-id')).toBe('review-group');
+
+    setLanguage('zh-CN');
+    sessionsRenderer.renderSessionDrawer();
+    expect(
+      stateModule.dom.sessionDrawerList
+        ?.querySelector<HTMLButtonElement>('[data-session-action="switch-group"]')
+        ?.getAttribute('aria-label'),
+    ).toBe('当前群聊：Review Group');
+  });
+
+  it('renders duplicate valid group ids only once', async () => {
+    const stateModule = await import('../src/state.js');
+    const sessionsRenderer = await import('../src/renderers/sessions.js');
+    stateModule.initDomRefs();
+    stateModule.state.activeGroupId = 'review-group';
+    stateModule.state.sessionGroups = [
+      { id: 'review-group', name: 'Review Group', updated_at: 20 },
+      { id: 'review-group', name: 'Stale Duplicate', updated_at: 10 },
+    ];
+
+    sessionsRenderer.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete: vi.fn(),
+      onSwitch: vi.fn(),
+      onSwitchGroup: vi.fn(),
+    });
+
+    expect(
+      stateModule.dom.sessionDrawerList?.querySelectorAll('[data-group-id="review-group"]'),
+    ).toHaveLength(1);
+    expect(
+      stateModule.dom.sessionDrawerList?.querySelectorAll('[aria-current="true"]'),
+    ).toHaveLength(1);
+  });
+
+  it('keeps invalid group ids disabled', async () => {
+    const stateModule = await import('../src/state.js');
+    const sessionsRenderer = await import('../src/renderers/sessions.js');
+    stateModule.initDomRefs();
+    stateModule.state.sessionGroups = [
+      {
+        id: '',
+        name: 'Invalid Group',
+        members: 0,
+        messages: 0,
+        running: 0,
+        updated_at: 0,
+      },
+    ];
+    const onSwitchGroup = vi.fn();
+    const onRenameGroup = vi.fn();
+    const onDeleteGroup = vi.fn();
+    sessionsRenderer.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete: vi.fn(),
+      onSwitch: vi.fn(),
+      onSwitchGroup,
+      onRenameGroup,
+      onDeleteGroup,
+    });
+
+    const invalidGroupButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '[data-session-action="switch-group"]',
+    );
+    const invalidGroupRow = invalidGroupButton?.closest('.session-drawer-row');
+    expect(invalidGroupButton?.disabled).toBe(true);
+    expect(invalidGroupButton?.getAttribute('aria-label')).toBe('Unavailable group Invalid Group');
+    expect(invalidGroupButton?.hasAttribute('aria-current')).toBe(false);
+    expect(invalidGroupRow?.classList.contains('is-active')).toBe(false);
+    expect(invalidGroupRow?.classList.contains('is-disabled')).toBe(true);
+    expect(invalidGroupRow?.querySelector('.session-drawer-row-badge')?.textContent).toBe(
+      'Unavailable',
+    );
+    expect(
+      stateModule.dom.sessionDrawerList?.querySelector('.session-drawer-row-actions'),
+    ).toBeNull();
+    invalidGroupButton?.click();
+    expect(onSwitchGroup).not.toHaveBeenCalled();
   });
 
   it('sends group messages with selected and mentions target modes', async () => {

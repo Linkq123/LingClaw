@@ -21,7 +21,6 @@ export function matchesOverlayDismissTarget(
   controlSelector: string,
 ): boolean {
   return (
-    target instanceof Element &&
-    (target === overlay || target.closest(controlSelector) !== null)
+    target instanceof Element && (target === overlay || target.closest(controlSelector) !== null)
   );
 }

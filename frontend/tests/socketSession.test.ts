@@ -55,11 +55,13 @@ describe('socket session binding', () => {
   }
 
   beforeEach(async () => {
+    localStorage.clear();
     vi.resetModules();
     stateModule = await import('../src/state.js');
     sessionsRendererModule = await import('../src/renderers/sessions.js');
     utilsModule = await import('../src/utils.js');
-    localStorage.clear();
+    const { setLanguage } = await import('../src/i18n.js');
+    setLanguage('en');
     mountSessionDrawerDom();
     stateModule.state.activeSessionId = '';
     stateModule.state.activeGroupId = '';
@@ -231,6 +233,93 @@ describe('socket session binding', () => {
     expect(onDelete).toHaveBeenCalledWith('project-alpha');
   });
 
+  it('hides session delete actions while a group chat is active', async () => {
+    const onDelete = vi.fn();
+    stateModule.state.sessions = [
+      { id: 'main', name: 'Main' },
+      { id: 'project-alpha', name: 'Project Alpha' },
+    ];
+    stateModule.state.activeSessionId = 'main';
+    stateModule.state.activeGroupId = 'review-group';
+    stateModule.state.sessionGroups = [{ id: 'review-group', name: 'Review Group' }];
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete,
+      onSwitch: vi.fn(),
+      onSwitchGroup: vi.fn(),
+    });
+
+    expect(
+      stateModule.dom.sessionDrawerList?.querySelector(
+        '[data-session-id="project-alpha"] [data-session-action="delete"]',
+      ),
+    ).toBeNull();
+    expect(onDelete).not.toHaveBeenCalled();
+  });
+
+  it('keeps the current session row clickable so mobile navigation can close', async () => {
+    const onSwitch = vi.fn();
+    stateModule.state.sessions = [
+      { id: 'main', name: 'Main' },
+      { id: 'research-notes', name: 'Research Notes' },
+    ];
+    stateModule.state.activeSessionId = 'research-notes';
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete: vi.fn(),
+      onSwitch,
+    });
+
+    const currentButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '[data-session-id="research-notes"] [data-session-action="switch"]',
+    );
+
+    expect(currentButton?.disabled).toBe(false);
+    expect(currentButton?.getAttribute('aria-current')).toBe('true');
+    expect(currentButton?.getAttribute('aria-label')).toBe('Current session: Research Notes');
+    currentButton?.click();
+    expect(onSwitch).toHaveBeenCalledWith('research-notes');
+  });
+
+  it('keeps invalid session ids disabled', async () => {
+    const onSwitch = vi.fn();
+    const onRename = vi.fn();
+    stateModule.state.sessions = [
+      { id: '', name: 'Invalid Session' },
+      { id: '   ', name: 'Whitespace Session' },
+    ];
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete: vi.fn(),
+      onRename,
+      onSwitch,
+    });
+
+    const invalidButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '[data-session-id=""] [data-session-action="switch"]',
+    );
+    const invalidRow = invalidButton?.closest('.session-drawer-row');
+    expect(invalidButton?.disabled).toBe(true);
+    expect(invalidButton?.getAttribute('aria-label')).toBe('Unavailable session Invalid Session');
+    expect(invalidButton?.hasAttribute('aria-current')).toBe(false);
+    expect(invalidRow?.classList.contains('is-active')).toBe(false);
+    expect(invalidRow?.classList.contains('is-disabled')).toBe(true);
+    expect(invalidRow?.querySelector('.session-drawer-row-badge')?.textContent).toBe('Unavailable');
+    expect(
+      stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+        '[data-session-id="   "] [data-session-action="switch"]',
+      )?.disabled,
+    ).toBe(true);
+    expect(
+      stateModule.dom.sessionDrawerList?.querySelector('.session-drawer-row-actions'),
+    ).toBeNull();
+    invalidButton?.click();
+    expect(onSwitch).not.toHaveBeenCalled();
+  });
+
   it('keeps main as the first rendered session regardless of recency order', async () => {
     stateModule.state.sessions = [
       { id: 'project-alpha', name: 'Project Alpha', updated_at: 20 },
@@ -248,6 +337,27 @@ describe('socket session binding', () => {
     const rows = stateModule.dom.sessionDrawerList?.querySelectorAll('.session-drawer-row');
 
     expect(rows?.[0]?.getAttribute('data-session-id')).toBe('main');
+  });
+
+  it('renders duplicate valid session ids only once', async () => {
+    stateModule.state.sessions = [
+      { id: 'research-notes', name: 'Research Notes', updated_at: 20 },
+      { id: 'research-notes', name: 'Stale Duplicate', updated_at: 10 },
+    ];
+    stateModule.state.activeSessionId = 'research-notes';
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete: vi.fn(),
+      onSwitch: vi.fn(),
+    });
+
+    expect(
+      stateModule.dom.sessionDrawerList?.querySelectorAll('[data-session-id="research-notes"]'),
+    ).toHaveLength(1);
+    expect(
+      stateModule.dom.sessionDrawerList?.querySelectorAll('[aria-current="true"]'),
+    ).toHaveLength(1);
   });
 
   it('renders a rename action for healthy sessions', async () => {
@@ -442,6 +552,35 @@ describe('socket session binding', () => {
     expect(targetSwitchButton?.disabled).toBe(true);
   });
 
+  it('marks only the target group as switching when entering group chat', async () => {
+    stateModule.state.sessions = [{ id: 'main', name: 'Main' }];
+    stateModule.state.activeSessionId = 'main';
+    stateModule.state.activeGroupId = 'review-group';
+    stateModule.state.sessionGroups = [{ id: 'review-group', name: 'Review Group' }];
+    stateModule.state.sessionSwitchInFlight = true;
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete: vi.fn(),
+      onSwitch: vi.fn(),
+      onSwitchGroup: vi.fn(),
+    });
+
+    const pendingRows = stateModule.dom.sessionDrawerList?.querySelectorAll(
+      '.session-drawer-row.is-pending',
+    );
+    const mainRow = stateModule.dom.sessionDrawerList?.querySelector('[data-session-id="main"]');
+    const groupRow = stateModule.dom.sessionDrawerList?.querySelector(
+      '[data-group-id="review-group"]',
+    );
+
+    expect(pendingRows).toHaveLength(1);
+    expect(mainRow?.classList.contains('is-pending')).toBe(false);
+    expect(mainRow?.querySelector('.session-drawer-row-badge')).toBeNull();
+    expect(groupRow?.classList.contains('is-pending')).toBe(true);
+    expect(groupRow?.querySelector('.session-drawer-row-badge')?.textContent).toBe('Switching');
+  });
+
   it('keeps the active session visible when the drawer list has not caught up yet', async () => {
     stateModule.state.sessions = [{ id: 'main', name: 'Main' }];
     stateModule.state.activeSessionId = 'research-notes';
@@ -463,7 +602,36 @@ describe('socket session binding', () => {
 
     expect(activeRow).not.toBeNull();
     expect(activeBadge?.textContent).toBe('Current');
-    expect(activeSwitchButton?.disabled).toBe(true);
+    expect(activeSwitchButton?.disabled).toBe(false);
+    expect(activeSwitchButton?.getAttribute('aria-current')).toBe('true');
+    expect(activeSwitchButton?.getAttribute('aria-label')).toBe('Current session: research-notes');
+  });
+
+  it('keeps a restored active group visible while the group list is loading', async () => {
+    stateModule.state.sessions = [{ id: 'main', name: 'Main' }];
+    stateModule.state.activeSessionId = 'main';
+    stateModule.state.activeGroupId = 'review-group';
+    stateModule.state.sessionGroups = [];
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete: vi.fn(),
+      onSwitch: vi.fn(),
+      onSwitchGroup: vi.fn(),
+    });
+
+    const activeGroupRow = stateModule.dom.sessionDrawerList?.querySelector(
+      '[data-group-id="review-group"]',
+    );
+    const activeGroupButton = activeGroupRow?.querySelector<HTMLButtonElement>(
+      '[data-session-action="switch-group"]',
+    );
+
+    expect(activeGroupRow).not.toBeNull();
+    expect(activeGroupRow?.classList.contains('is-active')).toBe(true);
+    expect(activeGroupRow?.querySelector('.session-drawer-row-badge')?.textContent).toBe('Current');
+    expect(activeGroupButton?.getAttribute('aria-current')).toBe('true');
+    expect(activeGroupButton?.getAttribute('aria-label')).toBe('Current group: review-group');
   });
 
   it('drops the session switch lock when reconnect finally fails', async () => {

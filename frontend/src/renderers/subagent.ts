@@ -177,8 +177,7 @@ function findPendingEmptyIdToolBadge(panel, toolName = ''): HTMLButtonElement | 
   if (!panel) return null;
 
   const badges = getToolBadges(panel);
-  const matchesToolName = (badge) =>
-    !toolName || (badge.dataset.toolName || '') === toolName;
+  const matchesToolName = (badge) => !toolName || (badge.dataset.toolName || '') === toolName;
 
   return (
     badges.find(
@@ -194,7 +193,11 @@ function findPendingEmptyIdToolBadge(panel, toolName = ''): HTMLButtonElement | 
   );
 }
 
-function findToolBadge(panel, toolId, { allowPendingEmptyId = false, toolName = '' } = {}): HTMLButtonElement | null {
+function findToolBadge(
+  panel,
+  toolId,
+  { allowPendingEmptyId = false, toolName = '' } = {},
+): HTMLButtonElement | null {
   if (!panel) return null;
   if (hasStableToolId(toolId)) {
     return getToolBadges(panel).find((badge) => badge.dataset.toolId === toolId) || null;
@@ -260,7 +263,11 @@ function ensureToolBadge(panel, toolId, toolName) {
   return badge;
 }
 
-function syncToolOverview(panel, fallbackTotal: number | null = null, counts: ToolCounts | null = null) {
+function syncToolOverview(
+  panel,
+  fallbackTotal: number | null = null,
+  counts: ToolCounts | null = null,
+) {
   if (!panel) return;
 
   const badges = counts ? null : getToolBadges(panel);
@@ -268,8 +275,7 @@ function syncToolOverview(panel, fallbackTotal: number | null = null, counts: To
   const settled = counts
     ? counts.settled
     : badges.filter(
-        (badge) =>
-          badge.classList.contains('is-done') || badge.classList.contains('is-failed'),
+        (badge) => badge.classList.contains('is-done') || badge.classList.contains('is-failed'),
       ).length;
   const failed = counts
     ? counts.failed
@@ -434,7 +440,12 @@ function resolvePanel(ref: SubagentPanelRef) {
   if (ref && ref.task_id && state.activeSubagentPanels.has(ref.task_id)) {
     return state.activeSubagentPanels.get(ref.task_id);
   }
-  if (ref && ref.allowAgentFallback !== false && ref.agent && state.activeSubagentPanels.has(ref.agent)) {
+  if (
+    ref &&
+    ref.allowAgentFallback !== false &&
+    ref.agent &&
+    state.activeSubagentPanels.has(ref.agent)
+  ) {
     return state.activeSubagentPanels.get(ref.agent);
   }
   return null;
@@ -785,7 +796,10 @@ export function finishSubagentReasoning(ref: SubagentPanelRef) {
   meta.title = rawText.trim() || LABELS.completed;
 }
 
-export function restoreSubagentHistorySnapshot(ref: SubagentPanelRef, snapshot: SubagentHistorySnapshot) {
+export function restoreSubagentHistorySnapshot(
+  ref: SubagentPanelRef,
+  snapshot: SubagentHistorySnapshot,
+) {
   const panel = resolvePanel(ref);
   if (!panel || !snapshot) return;
 
@@ -875,11 +889,7 @@ export function updateSubagentToolResult(
     showResult,
   );
   badge.dataset.toolLiveOutput = '';
-  updateToolBadgeState(
-    badge,
-    stateLabel,
-    isError ? 'is-failed' : 'is-done',
-  );
+  updateToolBadgeState(badge, stateLabel, isError ? 'is-failed' : 'is-done');
 
   if (state.activeToolPanel === badge) {
     syncToolDrawer(badge);

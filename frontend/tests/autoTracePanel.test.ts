@@ -123,7 +123,9 @@ describe('auto trace debug panel', () => {
     setAutoDebugEnabled(true);
 
     const panel = document.querySelector('[data-auto-trace-panel="true"]');
-    expect(panel?.textContent).toContain('compression=compressed saved_tokens=1024 saved_percent=18');
+    expect(panel?.textContent).toContain(
+      'compression=compressed saved_tokens=1024 saved_percent=18',
+    );
   });
 
   it('keeps the latest compression outcome through start-of-round trace clearing', () => {
@@ -137,7 +139,9 @@ describe('auto trace debug panel', () => {
     setAutoDebugEnabled(true);
 
     const panel = document.querySelector('[data-auto-trace-panel="true"]');
-    expect(panel?.textContent).toContain('compression=compressed saved_tokens=1024 saved_percent=18');
+    expect(panel?.textContent).toContain(
+      'compression=compressed saved_tokens=1024 saved_percent=18',
+    );
   });
 
   it('renders the latest compression outcome alongside the trace', () => {
@@ -150,7 +154,9 @@ describe('auto trace debug panel', () => {
     setAutoDebugEnabled(true);
 
     const panel = document.querySelector('[data-auto-trace-panel="true"]');
-    expect(panel?.textContent).toContain('compression=compressed saved_tokens=1024 saved_percent=18');
+    expect(panel?.textContent).toContain(
+      'compression=compressed saved_tokens=1024 saved_percent=18',
+    );
   });
 
   it('keeps the latest compression outcome when a trace arrives later', () => {
@@ -255,7 +261,9 @@ describe('auto trace debug panel', () => {
 
     const panel = document.querySelector('[data-auto-trace-panel="true"]');
     expect(state.latestCompression?.outcome).toBe('compressed');
-    expect(panel?.textContent).toContain('compression=compressed saved_tokens=1024 saved_percent=18');
+    expect(panel?.textContent).toContain(
+      'compression=compressed saved_tokens=1024 saved_percent=18',
+    );
   });
 
   it('ignores sub-agent traces for the top-level debug panel', () => {

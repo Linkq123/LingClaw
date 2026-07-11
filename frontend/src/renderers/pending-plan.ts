@@ -14,12 +14,10 @@ export function clearPendingPlanAction(): void {
 
 export function restorePendingPlanAction(): void {
   if (!state.pendingPlanExecutionId) return;
-  document
-    .querySelectorAll<HTMLButtonElement>('.plan-execute-btn')
-    .forEach((button) => {
-      button.disabled = false;
-      button.textContent = '开始执行';
-    });
+  document.querySelectorAll<HTMLButtonElement>('.plan-execute-btn').forEach((button) => {
+    button.disabled = false;
+    button.textContent = '开始执行';
+  });
   state.pendingPlanExecutionId = '';
 }
 
@@ -42,9 +40,7 @@ function latestAssistantContent(): Element | null {
 function assistantContentForPlan(messageIndex: number | null): Element | null {
   if (!dom.chat) return null;
   if (typeof messageIndex === 'number') {
-    const row = dom.chat.querySelector(
-      `.msg-row.assistant[data-message-index="${messageIndex}"]`,
-    );
+    const row = dom.chat.querySelector(`.msg-row.assistant[data-message-index="${messageIndex}"]`);
     const content = row?.querySelector('.msg-content');
     if (content) return content;
   }

@@ -302,7 +302,11 @@ function buildDagLayout(layersContainer: HTMLElement, tasks, orchestrateId: stri
   return { taskRows, taskPanels, taskLayer, layerCount };
 }
 
-function syncSharedTaskPanel(entry, data, status: Exclude<TaskStatus, 'pending' | 'running'> | 'running') {
+function syncSharedTaskPanel(
+  entry,
+  data,
+  status: Exclude<TaskStatus, 'pending' | 'running'> | 'running',
+) {
   const panel = entry?.taskPanels.get(data?.id);
   if (!panel) return;
   const shouldCollapseImmediately = !panel.classList.contains('subagent-modal-open');
@@ -387,10 +391,16 @@ export function openOrchestrateTaskModal(trigger: HTMLElement | null) {
   openSubagentPanelModal(panel);
 }
 
-function syncReusedTaskMetadata(existingRow: HTMLElement, existingPanel: HTMLElement, nextRow: HTMLElement, task) {
+function syncReusedTaskMetadata(
+  existingRow: HTMLElement,
+  existingPanel: HTMLElement,
+  nextRow: HTMLElement,
+  task,
+) {
   const displayPrompt = stripDelegatedPromptRuntimeContext(task.prompt_preview || '');
 
-  existingRow.dataset.orchestrateId = nextRow.dataset.orchestrateId || existingRow.dataset.orchestrateId || '';
+  existingRow.dataset.orchestrateId =
+    nextRow.dataset.orchestrateId || existingRow.dataset.orchestrateId || '';
   existingRow.dataset.taskId = nextRow.dataset.taskId || existingRow.dataset.taskId || '';
   if (displayPrompt) {
     existingRow.dataset.promptPreview = displayPrompt;
@@ -407,7 +417,10 @@ function syncReusedTaskMetadata(existingRow: HTMLElement, existingPanel: HTMLEle
   );
   updateSubagentPrompt(
     {
-      task_id: compositeTaskId(existingRow.dataset.orchestrateId || '', existingRow.dataset.taskId || ''),
+      task_id: compositeTaskId(
+        existingRow.dataset.orchestrateId || '',
+        existingRow.dataset.taskId || '',
+      ),
       agent: existingPanel.dataset.agent || task.agent || '',
     },
     displayPrompt,
@@ -429,7 +442,13 @@ function reuseSyntheticTaskRows(existing, layout, nextTasks) {
   }
 }
 
-function applySyntheticLayoutMerge(existing, layers: HTMLElement, nextLayers: HTMLElement, layout, layerCount: number) {
+function applySyntheticLayoutMerge(
+  existing,
+  layers: HTMLElement,
+  nextLayers: HTMLElement,
+  layout,
+  layerCount: number,
+) {
   layers.replaceChildren(...Array.from(nextLayers.children));
   existing.taskRows = layout.taskRows;
   existing.taskPanels = layout.taskPanels;

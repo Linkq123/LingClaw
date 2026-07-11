@@ -87,7 +87,7 @@ lingclaw --version
 
 如果你使用的是手动 `cargo install --path .` 路径，并且修改了 `frontend/`，在复制 `static/` 之前先执行 `cd frontend && npm ci && npm run build`，把最新前端产物重新生成到 `static/`。如果改用 `lingclaw install -d /path/to/source`，命令会在检测到 `frontend/package.json` 且 `npm` 可用时自动构建前端；若 `npm` 不可用但仓库里已有可用的 `static/`，则回退为安装现有静态产物。`lingclaw update` 在源码目录内升级时也会沿用同一套前端准备与安装逻辑。
 
-前端体验相关改动建议同时执行 `cd frontend && npm test`、`npx eslint .`、`npx prettier --check "src/**/*.{ts,tsx}" "tests/**/*.ts"` 和 `npm run build`；Markdown 或流式渲染调整需要特别确认普通文本不会在完成时整段重绘，表格等跨段格式则能在最终阶段按需修正。
+前端体验相关改动建议在 `frontend/` 下同时执行 `npm run typecheck`、`npm test`、`npm run lint`、`npm run fmt:check` 和 `npm run build`；格式检查覆盖 Prettier 配置、HTML、CSS、TypeScript/TSX 与测试文件。Markdown 或流式渲染调整需要特别确认普通文本不会在完成时整段重绘，表格等跨段格式则能在最终阶段按需修正。
 
 服务启动后访问 http://127.0.0.1:18989 。
 

@@ -84,14 +84,10 @@ export function connect(onMessage) {
     resetSessionScopedUiState();
     if (state.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
       const delaySecs = Math.ceil(state.reconnectDelay / 1000);
-      setConnStatus(
-        'connecting',
-        'socket.reconnecting',
-        {
-          seconds: delaySecs,
-          attempt: state.reconnectAttempts + 1,
-        },
-      );
+      setConnStatus('connecting', 'socket.reconnecting', {
+        seconds: delaySecs,
+        attempt: state.reconnectAttempts + 1,
+      });
       if (state.reconnectAttempts === 0) {
         addSystem(tr('socket.disconnectedReconnecting'));
       }

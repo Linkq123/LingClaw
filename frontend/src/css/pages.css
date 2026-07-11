@@ -404,7 +404,11 @@
   padding: 16px;
   border: 1px solid var(--border);
   border-radius: 8px;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 92%, white), var(--surface));
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--surface) 92%, white),
+    var(--surface)
+  );
   box-shadow: 0 10px 26px rgba(44, 46, 62, 0.04);
 }
 .settings-group-title {
@@ -539,7 +543,11 @@
   border-radius: 8px;
   padding: 16px;
   margin-bottom: 12px;
-  background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 94%, white), var(--surface));
+  background: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--surface) 94%, white),
+    var(--surface)
+  );
   box-shadow: 0 10px 26px rgba(44, 46, 62, 0.04);
 }
 .provider-card-header {
