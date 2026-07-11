@@ -5,6 +5,7 @@ import { wrapInTimeline, animatePanelIn, animateCollapsibleSection } from './tim
 import { pinReactStatusToBottom } from './react-status.js';
 import { tr } from '../i18n.js';
 import { trapDialogFocus } from '../pages/dialogFocus.js';
+import { iconMarkup } from '../icons.js';
 
 const TOOL_LIVE_OUTPUT_MAX_CHARS = 60000;
 const TOOL_LIVE_OUTPUT_TRUNCATED_PREFIX = '[live output truncated]\n';
@@ -118,7 +119,7 @@ export function addToolCall(name, args, id) {
 
   panel.innerHTML = `
     <div class="tool-header" data-action="open-tool-drawer" role="button" tabindex="0" aria-haspopup="dialog">
-      <span class="tool-icon">⚡</span>
+      <span class="tool-icon">${iconMarkup('bolt')}</span>
       <span class="tool-name">${escHtml(name)}</span>
       <span class="tool-args-preview">${escHtml(truncateStr(args, 80))}</span>
       <span class="tool-status">${escHtml(tr('tool.running'))}</span>
@@ -202,7 +203,7 @@ export function addToolResult(name, result, id, durationMs = null) {
     : tr('tool.resultReturned');
   el.innerHTML = `
     <div class="tool-header" data-action="open-tool-drawer" role="button" tabindex="0" aria-haspopup="dialog">
-      <span class="tool-icon">📋</span>
+      <span class="tool-icon">${iconMarkup('clipboard')}</span>
       <span class="tool-name">${escHtml(name)} result</span>
       <span class="tool-status">${escHtml(el.dataset.toolStatus)}</span>
     </div>

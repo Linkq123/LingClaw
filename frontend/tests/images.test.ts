@@ -3,11 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ensureUploadTokenInternal,
   openAttachPopup,
+  renderImagePreviews,
   syncPlanModeToggle,
   togglePlanMode,
   updateAttachButton,
 } from '../src/images.js';
 import { dom, initDomRefs, state } from '../src/state.js';
+import { setLanguage, translateDom } from '../src/i18n.js';
 
 function jsonResponse(payload: unknown): Response {
   return new Response(JSON.stringify(payload), {
@@ -26,6 +28,7 @@ function deferredResponse() {
 
 describe('ensureUploadTokenInternal', () => {
   beforeEach(() => {
+    setLanguage('en');
     document.body.innerHTML = `
       <div class="attach-wrapper">
         <button id="attach-btn"></button>
@@ -79,6 +82,7 @@ describe('ensureUploadTokenInternal', () => {
 
 describe('attachment menu', () => {
   beforeEach(() => {
+    setLanguage('en');
     document.body.innerHTML = `
       <div class="attach-wrapper">
         <button id="attach-btn"></button>
@@ -132,5 +136,20 @@ describe('attachment menu', () => {
     expect(state.planModeEnabled).toBe(true);
     expect(dom.planModeToggle?.getAttribute('aria-checked')).toBe('true');
     expect(dom.planModeToggle?.classList.contains('is-on')).toBe(true);
+  });
+
+  it('uses the shared close icon for pending image removal', () => {
+    state.pendingImages = [{ url: 'https://example.com/image.png' }];
+
+    renderImagePreviews();
+
+    const removeButton = dom.imagePreviewBar?.querySelector<HTMLButtonElement>('.remove-btn');
+    expect(removeButton?.querySelector('use')?.getAttribute('href')).toBe('#icon-close');
+    expect(removeButton?.getAttribute('aria-label')).toBe('Remove image');
+
+    setLanguage('zh-CN');
+    translateDom();
+
+    expect(removeButton?.getAttribute('aria-label')).toBe('移除图片');
   });
 });

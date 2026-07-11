@@ -1,6 +1,8 @@
 import { dom, state } from '../state.js';
 import type { TodoItem, TodoStatus, TodosStateEvent, TodosUpdateResponse } from '../types.js';
 import { tr } from '../i18n.js';
+import { createIcon } from '../icons.js';
+import type { IconName } from '../icons.js';
 
 const MAX_TODO_ITEMS = 12;
 const MAX_TODO_CONTENT_CHARS = 200;
@@ -250,7 +252,7 @@ function addTodo(): void {
 }
 
 function createIconButton(
-  label: string,
+  icon: IconName,
   title: string,
   onClick: () => void,
   disabled: boolean,
@@ -258,7 +260,7 @@ function createIconButton(
   const button = document.createElement('button');
   button.type = 'button';
   button.className = 'todo-row-btn';
-  button.textContent = label;
+  button.appendChild(createIcon(icon));
   button.title = title;
   button.setAttribute('aria-label', title);
   button.disabled = disabled;
@@ -316,18 +318,23 @@ function renderTodoRow(
   const actions = document.createElement('div');
   actions.className = 'todo-row-actions';
   actions.appendChild(
-    createIconButton('↑', tr('todos.moveUp'), () => moveTodo(item.id, -1), disabled || index === 0),
+    createIconButton(
+      'arrow-up',
+      tr('todos.moveUp'),
+      () => moveTodo(item.id, -1),
+      disabled || index === 0,
+    ),
   );
   actions.appendChild(
     createIconButton(
-      '↓',
+      'arrow-down',
       tr('todos.moveDown'),
       () => moveTodo(item.id, 1),
       disabled || index === total - 1,
     ),
   );
   actions.appendChild(
-    createIconButton('×', tr('todos.delete'), () => removeTodo(item.id), disabled),
+    createIconButton('trash', tr('todos.delete'), () => removeTodo(item.id), disabled),
   );
 
   row.appendChild(statusSelect);

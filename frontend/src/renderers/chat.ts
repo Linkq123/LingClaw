@@ -4,6 +4,8 @@ import { formatTime, hideWelcome } from '../utils.js';
 import { scrollDown, queueUnreadContent, invalidateChatScrollCache } from '../scroll.js';
 import { pinReactStatusToBottom } from './react-status.js';
 import { tr } from '../i18n.js';
+import { createIcon, iconMarkup } from '../icons.js';
+import type { IconName } from '../icons.js';
 
 function setVersionBadge(el, version) {
   if (!el) return;
@@ -42,7 +44,8 @@ function setAssistantAvatar(node) {
   img.style.cssText = 'width:100%;height:100%;border-radius:50%;object-fit:cover';
   img.onerror = () => {
     node.replaceChildren();
-    node.textContent = '🦀';
+    node.textContent = 'LC';
+    node.classList.add('is-text-fallback');
   };
   node.appendChild(img);
 }
@@ -129,14 +132,14 @@ function buildDismissButton(): HTMLButtonElement {
   btn.type = 'button';
   btn.dataset.action = 'dismiss-system-card';
   btn.setAttribute('aria-label', tr('common.dismiss'));
-  btn.textContent = '×';
+  btn.appendChild(createIcon('close'));
   return btn;
 }
 
-function buildIconSpan(icon: string): HTMLSpanElement {
+function buildIconSpan(icon: IconName): HTMLSpanElement {
   const span = document.createElement('span');
   span.className = 'system-icon';
-  span.textContent = icon;
+  span.appendChild(createIcon(icon));
   return span;
 }
 
@@ -155,12 +158,12 @@ export function addSystem(t, kind = 'info', options: { dismissible?: boolean } =
   card.className = 'system-card';
   if (dismissible) card.classList.add('is-dismissible');
   if (kind === 'success') card.classList.add('success-card');
-  const icon = kind === 'success' ? '✅' : 'ℹ️';
+  const icon: IconName = kind === 'success' ? 'check-circle' : 'info';
   const isBlock = t.includes('\n') || t.length > 80;
   if (isBlock) {
     const header = document.createElement('div');
     header.className = 'system-header';
-    header.appendChild(buildIconSpan('📋'));
+    header.appendChild(buildIconSpan('clipboard'));
     const label = document.createElement('span');
     label.textContent = tr('common.system');
     header.appendChild(label);
@@ -191,7 +194,7 @@ export function addError(t, options: { dismissible?: boolean } = {}) {
   const card = document.createElement('div');
   card.className = 'system-card system-inline error-card';
   if (dismissible) card.classList.add('is-dismissible');
-  card.appendChild(buildIconSpan('⚠️'));
+  card.appendChild(buildIconSpan('alert-triangle'));
   card.appendChild(buildInlineText(t));
   if (dismissible) card.appendChild(buildDismissButton());
   row.appendChild(card);
@@ -215,11 +218,6 @@ export function showWelcome() {
   logoImg.alt = '';
   logoDiv.appendChild(logoImg);
 
-  const eyebrow = document.createElement('div');
-  eyebrow.className = 'welcome-eyebrow';
-  eyebrow.innerHTML =
-    '<svg class="icon" aria-hidden="true"><use href="#icon-sparkles"></use></svg><span>LINGCLAW</span>';
-
   const title = document.createElement('h1');
   title.className = 'welcome-title';
   title.textContent = tr('welcome.title');
@@ -239,19 +237,12 @@ export function showWelcome() {
   hint.className = 'welcome-hint';
   const ready = document.createElement('span');
   ready.textContent = tr('welcome.ready');
-  const secondary = document.createElement('span');
-  secondary.className = 'welcome-hint-secondary';
-  secondary.appendChild(document.createTextNode(tr('welcome.hintPrefix')));
-  const slash = document.createElement('strong');
-  slash.textContent = '/';
-  secondary.appendChild(slash);
-  secondary.appendChild(document.createTextNode(tr('welcome.hintSuffix')));
-  hint.append(ready, secondary);
+  hint.append(ready);
 
   // welcome-shortcuts
   const shortcuts = document.createElement('div');
   shortcuts.className = 'welcome-shortcuts';
-  const shortcutDefs: Array<[string, string, string]> = [
+  const shortcutDefs: Array<[string, string, IconName]> = [
     ['/clear', tr('common.newConversation'), 'message'],
     ['/status', tr('common.status'), 'activity'],
     ['/help', tr('common.help'), 'help'],
@@ -260,7 +251,7 @@ export function showWelcome() {
     const btn = document.createElement('button');
     btn.dataset.action = 'cmd';
     btn.dataset.cmd = cmd;
-    btn.innerHTML = `<svg class="icon" aria-hidden="true"><use href="#icon-${icon}"></use></svg>`;
+    btn.appendChild(createIcon(icon));
     const text = document.createElement('span');
     text.textContent = label;
     btn.appendChild(text);
@@ -268,7 +259,6 @@ export function showWelcome() {
   }
 
   w.appendChild(logoDiv);
-  w.appendChild(eyebrow);
   w.appendChild(title);
   w.appendChild(versionBadge);
   w.appendChild(hint);
@@ -291,7 +281,7 @@ export function setBusy(b) {
     dom.input.placeholder = 'Message LingClaw... (/ for commands)';
   }
   dom.sendIcon.innerHTML =
-    '<svg class="icon" aria-hidden="true"><use href="#icon-send"></use></svg>';
+    iconMarkup('send');
   dom.sendBtn.title = '';
   dom.sendBtn.setAttribute('aria-label', 'Send message');
 }

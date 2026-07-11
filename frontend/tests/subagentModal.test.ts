@@ -233,7 +233,15 @@ describe('subagent modal hosting', () => {
     ).map((title) => (title as HTMLElement).textContent?.trim());
 
     expect(panel?.querySelector('.subagent-status')?.textContent).toBe('Running');
-    expect(panel?.querySelector('.subagent-icon')?.textContent).toBe('✦');
+    expect(panel?.querySelector('.subagent-icon use')?.getAttribute('href')).toBe(
+      '#icon-user-node',
+    );
+    expect(panel?.querySelector('.chevron use')?.getAttribute('href')).toBe(
+      '#icon-chevron-right',
+    );
+    expect(panel?.querySelector('.subagent-modal-close use')?.getAttribute('href')).toBe(
+      '#icon-close',
+    );
     expect(actionButtons).toEqual(['Copy summary']);
     expect(sectionTitles).toEqual(['Task prompt', 'Tool chain']);
   });

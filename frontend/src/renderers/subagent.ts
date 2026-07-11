@@ -19,6 +19,7 @@ import {
   restoreModalHost,
   syncModalHostPlaceholder,
 } from './modalHost.js';
+import { iconMarkup } from '../icons.js';
 
 type SubagentPanelRef = {
   task_id?: string;
@@ -552,14 +553,14 @@ function buildSubagentPanel(agentName, prompt, taskId) {
   header.setAttribute('tabindex', '0');
   header.setAttribute('aria-expanded', 'false');
   header.innerHTML = `
-    <span class="subagent-icon">&#10022;</span>
+    <span class="subagent-icon">${iconMarkup('user-node')}</span>
     <span class="subagent-head-copy">
       <span class="subagent-kicker">${LABELS.subagent}</span>
       <span class="subagent-label">${escHtml(agentName)}</span>
     </span>
     <span class="subagent-status">${LABELS.running}</span>
-    <span class="chevron">&#9656;</span>
-    <button type="button" class="subagent-modal-close" data-action="close-subagent-modal" aria-label="Close sub-agent details" tabindex="-1">&times;</button>
+    <span class="chevron">${iconMarkup('chevron-right')}</span>
+    <button type="button" class="subagent-modal-close" data-action="close-subagent-modal" aria-label="Close sub-agent details" tabindex="-1">${iconMarkup('close')}</button>
   `;
 
   const body = document.createElement('div');

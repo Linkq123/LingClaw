@@ -86,6 +86,7 @@ Frontend source lives in `frontend/` and builds into `static/`, which the Rust s
 - `frontend/src/slashCommands.ts` — slash command catalog, normalization helpers, and autocomplete matching
 - `frontend/src/socket.ts` — connection lifecycle and reconnect behavior
 - `frontend/src/state.ts` — central UI state and DOM refs
+- `frontend/src/icons.ts` — typed names and helpers for the local inline SVG sprite
 - `frontend/src/mobile.ts` — workspace popovers, transient mobile navigation, and responsive shell state
 - `frontend/src/css/workspace.css` — final design tokens and modern workspace/responsive overrides
 - `frontend/src/renderers/` — chat, todos, tools, reasoning, subagent, orchestration, task-plan, and auto-trace panels
@@ -114,6 +115,7 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 - `session_control.dispatch` is for controlling other sessions and must reject `main` as a target, including trimmed/normalized variants, so the main run never waits on a queued run behind itself.
 - OpenAI family currently has two protocol kinds: `openai-completions` (`/v1/chat/completions`) and `openai-responses` (`/v1/responses`). Both conversation paths use native upstream streaming; Responses requests set `stream: true` and map Responses SSE events into LingClaw's existing live events.
 - The frontend session switcher lives in a collapsible desktop sidebar. At `<=768px` it becomes a transient overlay drawer that defaults closed and must not change the persisted desktop expansion preference. Todos, Tools, Reasoning, and Auto Debug live in the view-controls popover.
+- Frontend action and status icons must use the inline SVG sprite in `frontend/index.html` through typed helpers from `frontend/src/icons.ts`; keep SVGs decorative with accessible labels on their controls, and do not introduce Emoji or Unicode glyphs as UI icons.
 - Slash command autocomplete is frontend-local UI on top of the existing `/...` command transport: incomplete prefixes can be completed via keyboard or mouse before dispatch.
 - Automatic context compression runs as a `BeforeAnalyze` hook in `src/hooks.rs`.
 - Browser `plan_mode: true` starts `AgentRunMode::PlanOnly`: the agent may call the LLM and use only read-only tools (`think`, `read_file`, `list_dir`, `search_files`, `http_fetch`, plus read-only MCP tools enabled by the session policy). It must produce an assistant plan message, store `pending_plan`, and emit `plan_ready`; clicking “开始执行” sends `execute_plan_id`, clears the pending plan, appends a short `Proceed with the approved plan.` user message, and starts normal execute mode.

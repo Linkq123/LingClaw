@@ -14,3 +14,14 @@ export function closeOverlayById(
       return false;
   }
 }
+
+export function matchesOverlayDismissTarget(
+  target: EventTarget | null,
+  overlay: Element,
+  controlSelector: string,
+): boolean {
+  return (
+    target instanceof Element &&
+    (target === overlay || target.closest(controlSelector) !== null)
+  );
+}

@@ -152,5 +152,11 @@ describe('buildHistoryReasoningPanel', () => {
     const header = panel.querySelector('.reasoning-header');
     expect(header).not.toBeNull();
     expect((header as HTMLElement).dataset.action).toBe('toggle-tool');
+    expect(header?.querySelector('.reasoning-icon use')?.getAttribute('href')).toBe(
+      '#icon-reasoning',
+    );
+    expect(header?.querySelector('.chevron use')?.getAttribute('href')).toBe(
+      '#icon-chevron-right',
+    );
   });
 });

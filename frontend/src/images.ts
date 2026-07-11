@@ -1,6 +1,7 @@
 import { dom, state } from './state.js';
 import { addSystem } from './renderers/chat.js';
 import { tr } from './i18n.js';
+import { createIcon } from './icons.js';
 
 // Guard: prevent double-registration on Vite HMR re-execution of main.ts.
 let _listenerInit = false;
@@ -254,8 +255,11 @@ export function renderImagePreviews() {
       imgEl.style.display = 'none';
     };
     const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
     removeBtn.className = 'remove-btn';
-    removeBtn.textContent = '\u00d7';
+    removeBtn.setAttribute('data-i18n-aria-label', 'composer.removeImage');
+    removeBtn.setAttribute('aria-label', tr('composer.removeImage'));
+    removeBtn.appendChild(createIcon('close'));
     removeBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       removeImage(idx);

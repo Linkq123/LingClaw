@@ -2,6 +2,7 @@ import { dom, state } from '../state.js';
 import type { SessionGroupSummary, SessionSummary } from '../types.js';
 import { normalizePendingDeleteSessionId, shouldSwitchToSelectedSession } from '../utils.js';
 import { tr } from '../i18n.js';
+import { iconMarkup } from '../icons.js';
 
 export const SESSION_DRAWER_STORAGE_KEY = 'lingclaw.sessionDrawerExpanded';
 
@@ -25,10 +26,6 @@ type RenderableGroup = SessionGroupSummary & {
 };
 
 let callbacks: SessionDrawerCallbacks | null = null;
-
-function iconMarkup(name: string): string {
-  return `<svg class="icon" aria-hidden="true"><use href="#icon-${name}"></use></svg>`;
-}
 
 function isMobileDrawerViewport(): boolean {
   if (typeof window === 'undefined') return false;

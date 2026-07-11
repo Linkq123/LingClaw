@@ -21,7 +21,9 @@ describe('i18n', () => {
 
     expect(language()).toBe('zh-CN');
     expect(tr('common.settings')).toBe('设置');
-    expect(tr('welcome.title')).toBe('你的智能代理工作台');
+    expect(tr('welcome.title')).toBe('工作区已就绪');
+    expect(tr('welcome.ready')).toBe('输入消息，或使用 / 命令开始。');
+    expect(tr('workspace.subtitle')).toBe('本地工作区');
     expect(tr('workspace.viewControls')).toBe('视图控制');
     expect(document.documentElement.lang).toBe('zh-CN');
     expect(localStorage.getItem('lingclaw.language')).toBe('zh-CN');

@@ -77,6 +77,9 @@ describe('task plan timeline panel', () => {
     expect(panel?.classList.contains('tool-panel')).toBe(true);
     expect(panel?.textContent).toContain('Fix MCP timeout handling');
     expect(panel?.textContent).not.toContain('cargo test mcp');
+    expect(panel?.querySelector('.task-plan-icon use')?.getAttribute('href')).toBe(
+      '#icon-task-plan',
+    );
     expect((panel as HTMLElement | null)?.dataset.toolResult).toContain('cargo test mcp');
     expect(panel?.querySelector('.task-plan-body')).toBeNull();
   });

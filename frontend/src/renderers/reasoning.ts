@@ -4,6 +4,7 @@
  * (which is handled incrementally in handlers/stream.ts via flushReasoningText).
  */
 import { removeTimelinePanel } from './timeline.js';
+import { iconMarkup } from '../icons.js';
 
 export function summarizeReasoningText(thinking: string) {
   const summaryText = String(thinking ?? '')
@@ -57,10 +58,10 @@ export function buildHistoryReasoningPanel(thinking: string): HTMLElement {
   header.className = 'reasoning-header';
   header.dataset.action = 'toggle-tool';
   header.innerHTML = `
-    <span class="reasoning-icon">\ud83d\udcad</span>
+    <span class="reasoning-icon">${iconMarkup('reasoning')}</span>
     <span class="reasoning-label">Reasoning</span>
     <span class="reasoning-status"></span>
-    <span class="chevron">\u25b8</span>
+    <span class="chevron">${iconMarkup('chevron-right')}</span>
   `;
 
   const statusEl = header.querySelector('.reasoning-status') as Element | null;

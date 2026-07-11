@@ -31,6 +31,8 @@ import {
 import type { ModelFormEntry, ProviderFormData } from './settingsModels.js';
 import { subscribeLanguageChange, tr } from '../i18n.js';
 import { trapDialogFocus } from './dialogFocus.js';
+import { iconHref } from '../icons.js';
+import type { IconName } from '../icons.js';
 
 // ── Module-level bridge (imperative open/close from main.ts) ──────────────────
 
@@ -106,13 +108,13 @@ interface TabMeta {
   saveMode: TabSaveMode;
 }
 
-const SETTINGS_TAB_ICONS: Record<TabId, string> = {
+const SETTINGS_TAB_ICONS: Record<TabId, IconName> = {
   'tab-general': 'settings',
-  'tab-skills': 'sparkles',
-  'tab-agents': 'activity',
+  'tab-skills': 'package',
+  'tab-agents': 'users',
   'tab-models': 'reasoning',
-  'tab-mcp': 'tools',
-  'tab-s3': 'paperclip',
+  'tab-mcp': 'workflow',
+  'tab-s3': 'database',
 };
 
 const SETTINGS_TAB_DEFS: ReadonlyArray<{
@@ -600,9 +602,12 @@ function AgentsTab({
                   <button
                     className="btn-danger-sm"
                     title={tr('settings.removeOverride', { agent: agentName })}
+                    aria-label={tr('settings.removeOverride', { agent: agentName })}
                     onClick={() => removeSubAgentOverride(key)}
                   >
-                    {tr('common.remove')}
+                    <svg className="icon" aria-hidden="true" focusable="false">
+                      <use href={iconHref('trash')} />
+                    </svg>
                   </button>
                 </div>
                 <ModelSelect
@@ -676,8 +681,15 @@ function ModelEntryRow({
           />{' '}
           Reasoning
         </label>
-        <button className="btn-danger-sm" title={tr('settings.removeModel')} onClick={onDelete}>
-          ✕
+        <button
+          className="btn-danger-sm"
+          title={tr('settings.removeModel')}
+          aria-label={tr('settings.removeModel')}
+          onClick={onDelete}
+        >
+          <svg className="icon" aria-hidden="true" focusable="false">
+            <use href={iconHref('trash')} />
+          </svg>
         </button>
       </div>
       <div
@@ -843,9 +855,12 @@ function ProviderCardInner({
           <button
             className="btn-danger-sm"
             title={tr('settings.deleteProvider')}
+            aria-label={tr('settings.deleteProvider')}
             onClick={() => onDelete(prov._key)}
           >
-            ✕
+            <svg className="icon" aria-hidden="true" focusable="false">
+              <use href={iconHref('trash')} />
+            </svg>
           </button>
         </div>
       </div>
@@ -1053,13 +1068,13 @@ function ModelsTab({
           }),
         });
         const data = await resp.json();
-        if (data.ok) applyResult('ok', '✓ Connected');
+        if (data.ok) applyResult('ok', 'Connected');
         else {
-          applyResult('fail', '✗ Failed');
+          applyResult('fail', 'Failed');
           onStatus(data.error || 'Connection failed', 'error');
         }
       } catch (e: unknown) {
-        applyResult('fail', '✗ Error');
+        applyResult('fail', 'Error');
         onStatus((e as Error).message, 'error');
       }
       scheduleProviderReset(prov._key);
@@ -1304,9 +1319,12 @@ function McpServerCardInner({
           <button
             className="btn-danger-sm"
             title={tr('settings.deleteServer')}
+            aria-label={tr('settings.deleteServer')}
             onClick={() => onDelete(server._key)}
           >
-            ✕
+            <svg className="icon" aria-hidden="true" focusable="false">
+              <use href={iconHref('trash')} />
+            </svg>
           </button>
         </div>
       </div>
@@ -1396,8 +1414,15 @@ function McpServerCardInner({
                 onChange({ ...server, env: { ...(server.env || {}), [k]: e.target.value } })
               }
             />
-            <button className="btn-danger-sm" title={tr('common.remove')} onClick={() => removeEnvVar(k)}>
-              ✕
+            <button
+              className="btn-danger-sm"
+              title={tr('common.remove')}
+              aria-label={tr('common.remove')}
+              onClick={() => removeEnvVar(k)}
+            >
+              <svg className="icon" aria-hidden="true" focusable="false">
+                <use href={iconHref('trash')} />
+              </svg>
             </button>
           </div>
         ))}
@@ -1714,13 +1739,13 @@ function McpTab({
           }),
         });
         const data = await resp.json();
-        if (data.ok) applyState('ok', `✓ ${data.tools} tools`);
+        if (data.ok) applyState('ok', `${data.tools} tools`);
         else {
-          applyState('fail', '✗ Failed');
+          applyState('fail', 'Failed');
           if (data.error) onStatus(data.error, 'error');
         }
       } catch (e: unknown) {
-        applyState('fail', '✗ Error');
+        applyState('fail', 'Error');
         onStatus((e as Error).message, 'error');
       }
       scheduleMcpReset(sv._key);
@@ -2732,7 +2757,7 @@ function SettingsShell({
               >
                 <span className="settings-nav-icon" aria-hidden="true">
                   <svg className="icon">
-                    <use href={`#icon-${SETTINGS_TAB_ICONS[tab.id]}`} />
+                    <use href={iconHref(SETTINGS_TAB_ICONS[tab.id])} />
                   </svg>
                 </span>
                 <span className="settings-nav-label">{tab.label}</span>

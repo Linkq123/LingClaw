@@ -22,6 +22,8 @@ import {
   openSubagentPanelModal,
   updateSubagentPrompt,
 } from './subagent.js';
+import { iconMarkup } from '../icons.js';
+import type { IconName } from '../icons.js';
 
 type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
 
@@ -164,19 +166,19 @@ function statusText(status: TaskStatus) {
   }
 }
 
-function statusIcon(status: TaskStatus) {
+function statusIcon(status: TaskStatus): IconName {
   switch (status) {
     case 'running':
-      return '\u25cf';
+      return 'circle-dot';
     case 'completed':
-      return '\u2713';
+      return 'check';
     case 'failed':
-      return '\u2715';
+      return 'close';
     case 'skipped':
-      return '\u21b7';
+      return 'skip';
     case 'pending':
     default:
-      return '\u2026';
+      return 'more';
   }
 }
 
@@ -261,7 +263,7 @@ function buildDagLayout(layersContainer: HTMLElement, tasks, orchestrateId: stri
           aria-expanded="false"
           aria-haspopup="dialog"
         >
-          <span class="orchestrate-task-icon">${statusIcon('pending')}</span>
+          <span class="orchestrate-task-icon">${iconMarkup(statusIcon('pending'))}</span>
           <span class="orchestrate-task-main">
             <span class="orchestrate-task-title">
               <span class="orchestrate-task-id">${escHtml(task.id)}</span>
@@ -272,7 +274,7 @@ function buildDagLayout(layersContainer: HTMLElement, tasks, orchestrateId: stri
             )}</span>
           </span>
           <span class="orchestrate-task-status">${statusText('pending')}</span>
-          <span class="chevron">\u25b8</span>
+          <span class="chevron">${iconMarkup('chevron-right')}</span>
         </div>
       `;
 
@@ -493,12 +495,12 @@ export function createOrchestratePanel(data) {
   header.className = 'orchestrate-header';
   header.dataset.action = 'toggle-tool';
   header.innerHTML = `
-    <span class="orchestrate-icon">\u2699</span>
+    <span class="orchestrate-icon">${iconMarkup('workflow')}</span>
     <span class="orchestrate-label">Orchestrate / ${data.task_count || 0} tasks / ${
       data.layer_count || 0
     } layers</span>
     <span class="orchestrate-status">Running</span>
-    <span class="chevron">\u25b8</span>
+    <span class="chevron">${iconMarkup('chevron-right')}</span>
   `;
 
   const body = document.createElement('div');
@@ -596,7 +598,7 @@ export function markOrchestrateTask(data, status: Exclude<TaskStatus, 'pending'>
   setTaskStatusTone(row, status);
 
   const iconEl = row.querySelector('.orchestrate-task-icon') as HTMLElement | null;
-  if (iconEl) iconEl.textContent = statusIcon(status);
+  if (iconEl) iconEl.innerHTML = iconMarkup(statusIcon(status));
 
   const statusEl = row.querySelector('.orchestrate-task-status') as HTMLElement | null;
   if (statusEl) {

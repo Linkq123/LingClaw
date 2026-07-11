@@ -4,6 +4,7 @@ import type { TaskPlanEvent, TaskPlanPayload } from '../types.js';
 import { escHtml, hideWelcome } from '../utils.js';
 import { animatePanelIn, wrapInTimeline } from './timeline.js';
 import { closeToolDrawer } from './tools.js';
+import { iconMarkup } from '../icons.js';
 
 let activeTaskPlanPanel: HTMLElement | null = null;
 let activeTaskPlanKey = '';
@@ -66,7 +67,7 @@ function updatePanel(panel: HTMLElement, event: TaskPlanEvent): void {
   panel.className = `tool-panel tool-panel-ready task-plan-panel task-plan-${event.plan.status || 'active'}`;
   panel.innerHTML = `
     <div class="tool-header task-plan-header" data-action="open-tool-drawer" role="button" tabindex="0" aria-haspopup="dialog">
-      <span class="tool-icon task-plan-icon">▣</span>
+      <span class="tool-icon task-plan-icon">${iconMarkup('task-plan')}</span>
       <span class="tool-name">Task Plan</span>
       <span class="tool-args-preview">${escHtml(event.plan.goal)}</span>
       <span class="tool-status">${escHtml(event.plan.status || 'active')}</span>

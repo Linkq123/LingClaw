@@ -578,7 +578,7 @@ describe('SettingsPage test button timers', () => {
       await flushMicrotasks();
     });
 
-    expect(findPrimaryTestButton().textContent).toBe('✓ Connected');
+    expect(findPrimaryTestButton().textContent).toBe('Connected');
 
     await act(async () => {
       vi.advanceTimersByTime(2000);
@@ -590,14 +590,14 @@ describe('SettingsPage test button timers', () => {
       await flushMicrotasks();
     });
 
-    expect(findPrimaryTestButton().textContent).toBe('✓ Connected');
+    expect(findPrimaryTestButton().textContent).toBe('Connected');
 
     await act(async () => {
       vi.advanceTimersByTime(2500);
       await flushMicrotasks();
     });
 
-    expect(findPrimaryTestButton().textContent).toBe('✓ Connected');
+    expect(findPrimaryTestButton().textContent).toBe('Connected');
 
     await act(async () => {
       vi.advanceTimersByTime(1500);
@@ -663,7 +663,7 @@ describe('SettingsPage test button timers', () => {
       await flushMicrotasks();
     });
 
-    expect(findPrimaryTestButton().textContent).toBe('✓ 3 tools');
+    expect(findPrimaryTestButton().textContent).toBe('3 tools');
     expect(testBody).toMatchObject({
       server: 'demo',
       transport: 'stdio',
@@ -684,14 +684,14 @@ describe('SettingsPage test button timers', () => {
       await flushMicrotasks();
     });
 
-    expect(findPrimaryTestButton().textContent).toBe('✓ 3 tools');
+    expect(findPrimaryTestButton().textContent).toBe('3 tools');
 
     await act(async () => {
       vi.advanceTimersByTime(2500);
       await flushMicrotasks();
     });
 
-    expect(findPrimaryTestButton().textContent).toBe('✓ 3 tools');
+    expect(findPrimaryTestButton().textContent).toBe('3 tools');
 
     await act(async () => {
       vi.advanceTimersByTime(1500);

@@ -195,6 +195,7 @@ describe('todos panel', () => {
     const moveDownButton = Array.from(
       dom.todosPanel?.querySelectorAll<HTMLButtonElement>('.todo-row-btn') || [],
     ).find((button) => button.title === 'Move down');
+    expect(moveDownButton?.querySelector('use')?.getAttribute('href')).toBe('#icon-arrow-down');
     moveDownButton!.click();
     await flushPromises();
 
@@ -210,6 +211,7 @@ describe('todos panel', () => {
     const deleteButtons = Array.from(
       dom.todosPanel?.querySelectorAll<HTMLButtonElement>('.todo-row-btn') || [],
     ).filter((button) => button.title === 'Delete todo');
+    expect(deleteButtons[0]?.querySelector('use')?.getAttribute('href')).toBe('#icon-trash');
     deleteButtons[0].click();
     await flushPromises();
 

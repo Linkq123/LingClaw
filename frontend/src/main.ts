@@ -13,6 +13,7 @@ import { initTheme, cycleTheme, disposeTheme } from './theme.js';
 import { initI18n, tr, toggleLanguage, subscribeLanguageChange, translateDom } from './i18n.js';
 import { dom, initDomRefs, state } from './state.js';
 import { HISTORY_LOAD_CHUNK_SIZE, HISTORY_RENDER_LIMIT } from './constants.js';
+import { createIcon, iconMarkup } from './icons.js';
 import { findHistoryRenderStart, splitHistoryLoadChunk } from './historyWindow.js';
 import {
   formatTokenCount,
@@ -131,7 +132,7 @@ import {
   closeUsagePage,
   prefetchPageChunks,
 } from './pages/lazy.js';
-import { closeOverlayById } from './pages/overlay.js';
+import { closeOverlayById, matchesOverlayDismissTarget } from './pages/overlay.js';
 import {
   buildHistoryReasoningPanel,
   finalizeOrDiscardLiveReasoningPanel,
@@ -644,7 +645,7 @@ function renderGroupMemberDrawer() {
   const closeButton = document.createElement('button');
   closeButton.type = 'button';
   closeButton.className = 'group-member-drawer-close';
-  closeButton.textContent = '×';
+  closeButton.appendChild(createIcon('close'));
   closeButton.setAttribute('aria-label', tr('group.closeMembers'));
   closeButton.addEventListener('click', () => {
     state.groupMembersDrawerOpen = false;
@@ -1811,10 +1812,10 @@ function handleMessage(data) {
       header.className = 'reasoning-header';
       header.dataset.action = 'toggle-tool';
       header.innerHTML = `
-          <span class="reasoning-icon">\ud83d\udcad</span>
+          <span class="reasoning-icon">${iconMarkup('reasoning')}</span>
           <span class="reasoning-label">Reasoning</span>
           <span class="reasoning-status">\u63a8\u7406\u4e2d</span>
-          <span class="chevron open">\u25b8</span>
+          <span class="chevron open">${iconMarkup('chevron-right')}</span>
       `;
       const body = document.createElement('div');
       body.className = 'reasoning-body show';
@@ -2209,7 +2210,7 @@ function ensureShortcutsOverlay(): HTMLElement {
     <div class="shortcuts-panel">
       <div class="shortcuts-header">
         <h2>Keyboard shortcuts</h2>
-        <button type="button" class="shortcuts-close" aria-label="Close">×</button>
+        <button type="button" class="shortcuts-close" aria-label="Close">${iconMarkup('close')}</button>
       </div>
       <dl class="shortcuts-list">
         <dt><kbd>Enter</kbd></dt><dd>Send message</dd>
@@ -2224,9 +2225,7 @@ function ensureShortcutsOverlay(): HTMLElement {
     </div>
   `;
   el.addEventListener('click', (ev) => {
-    const t = ev.target;
-    if (!(t instanceof Element)) return;
-    if (t === el || t.classList.contains('shortcuts-close')) {
+    if (matchesOverlayDismissTarget(ev.target, el, '.shortcuts-close')) {
       closeShortcutsOverlay();
     }
   });

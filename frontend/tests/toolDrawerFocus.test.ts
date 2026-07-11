@@ -36,6 +36,7 @@ describe('tool drawer focus', () => {
     const header = panel.querySelector<HTMLElement>('.tool-header');
     expect(header?.getAttribute('role')).toBe('button');
     expect(header?.tabIndex).toBe(0);
+    expect(header?.querySelector('.tool-icon use')?.getAttribute('href')).toBe('#icon-bolt');
 
     header?.focus();
     toolsModule.openToolDrawerFromHeader(header);

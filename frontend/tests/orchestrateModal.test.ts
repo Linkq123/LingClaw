@@ -62,6 +62,32 @@ describe('orchestrate task modal hosting', () => {
     });
   }
 
+  it('uses the shared workflow and task status icons', () => {
+    mountOrchestration();
+
+    expect(
+      dom.chat?.querySelector('.orchestrate-icon use')?.getAttribute('href'),
+    ).toBe('#icon-workflow');
+    expect(
+      dom.chat?.querySelector('.orchestrate-task-icon use')?.getAttribute('href'),
+    ).toBe('#icon-more');
+    expect(
+      dom.chat?.querySelector('.orchestrate-header > .chevron use')?.getAttribute('href'),
+    ).toBe('#icon-chevron-right');
+    expect(
+      dom.chat?.querySelector('.orchestrate-task-summary > .chevron use')?.getAttribute('href'),
+    ).toBe('#icon-chevron-right');
+
+    markOrchestrateTask(
+      { orchestrate_id: 'orch-1', id: 'task-a', result_preview: 'Done' },
+      'completed',
+    );
+
+    expect(
+      dom.chat?.querySelector('.orchestrate-task-icon use')?.getAttribute('href'),
+    ).toBe('#icon-check');
+  });
+
   it('preserves streamed task output when a synthetic plan expands into multiple tasks', () => {
     createOrchestratePanel({
       orchestrate_id: 'orch-1',
