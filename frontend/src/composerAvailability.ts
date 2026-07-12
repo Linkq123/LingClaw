@@ -1,4 +1,5 @@
 import { tr } from './i18n.js';
+import { mentionedGroupTargets } from './groupMentions.js';
 import { dom, state } from './state.js';
 import type { AppConfig, ConfigApiResponse } from './types/config.js';
 
@@ -164,28 +165,11 @@ export function isComposerModelReady(): boolean {
   return state.composerModelAvailability === 'ready';
 }
 
-function mentionedGroupTargets(value: string): string[] {
-  const memberSet = new Set(state.activeGroupMembers);
-  const mentioned = new Set<string>();
-  for (const token of value.split(/\s+/)) {
-    const allToken = token.replace(/^[^A-Za-z0-9@]+|[^A-Za-z0-9@]+$/g, '');
-    if (allToken.toLowerCase() === '@all') return [...state.activeGroupMembers];
-    const normalized = token.replace(/^[^A-Za-z0-9@._-]+|[^A-Za-z0-9@._-]+$/g, '');
-    const raw = normalized.startsWith('@') ? normalized.slice(1) : '';
-    if (memberSet.has(raw)) mentioned.add(raw);
-    else {
-      const withoutSentenceDots = raw.replace(/\.+$/, '');
-      if (memberSet.has(withoutSentenceDots)) mentioned.add(withoutSentenceDots);
-    }
-  }
-  return state.activeGroupMembers.filter((member) => mentioned.has(member));
-}
-
 function currentGroupTargets(value: string): string[] {
   return state.groupTargetMode === 'selected'
     ? state.groupSelectedTargets.filter((target) => state.activeGroupMembers.includes(target))
     : state.groupTargetMode === 'mentions'
-      ? mentionedGroupTargets(value)
+      ? mentionedGroupTargets(value, state.activeGroupMembers)
       : state.activeGroupMembers;
 }
 

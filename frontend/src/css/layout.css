@@ -755,6 +755,59 @@ header .actions button.is-active {
   color: var(--dim);
   font-size: 12px;
 }
+
+.mention-menu-item {
+  min-height: 52px;
+  flex-direction: row;
+  align-items: center;
+  gap: 10px;
+}
+
+.mention-menu-avatar {
+  width: 30px;
+  height: 30px;
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  border: 1px solid color-mix(in srgb, var(--accent2) 20%, var(--border));
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--accent2) 10%, var(--surface));
+  color: color-mix(in srgb, var(--accent2) 82%, var(--text));
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.mention-menu-copy {
+  min-width: 0;
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mention-menu-name,
+.mention-menu-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mention-menu-name {
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 700;
+}
+
+.mention-menu-meta {
+  color: var(--dim);
+  font: 10.5px/1.35 var(--font-mono);
+}
+
+@media (max-width: 768px) {
+  .mention-menu-item {
+    min-height: 56px;
+  }
+}
 /* Image preview bar */
 .image-preview-bar {
   display: flex;

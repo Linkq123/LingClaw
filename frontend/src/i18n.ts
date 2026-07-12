@@ -146,6 +146,10 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'group.memberMeta': '{id} · {role} · {status}',
     'group.mention': 'Mention {name}',
     'group.mentionAll': 'Mention all members',
+    'group.mentionEveryone': 'Everyone',
+    'group.mentionSuggestions': 'Mention a group member',
+    'group.mentionNoMatches': 'No matching group members',
+    'group.memberError': '{name} · {error}',
     'group.promote': 'Promote {name}',
     'group.remove': 'Remove {name}',
     'group.confirmRemove': 'Remove {name} from this group?',
@@ -280,6 +284,7 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'socket.lostRefresh': 'Connection lost. Please refresh the page.',
 
     'slash.noMatches': 'No matching commands',
+    'slash.suggestions': 'Command suggestions',
     'slash.busyLimited':
       'While the agent is running, only /stop, /tool, and /reasoning are allowed.',
     'slash.new': 'Compress conversation to memory and clear the current context.',
@@ -634,6 +639,10 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'group.memberMeta': '{id} · {role} · {status}',
     'group.mention': '提及 {name}',
     'group.mentionAll': '提及所有成员',
+    'group.mentionEveryone': '所有成员',
+    'group.mentionSuggestions': '选择要提及的群成员',
+    'group.mentionNoMatches': '没有匹配的群成员',
+    'group.memberError': '{name} · {error}',
     'group.promote': '升级 {name}',
     'group.remove': '移除 {name}',
     'group.confirmRemove': '将 {name} 移出这个群聊？',
@@ -763,6 +772,7 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'socket.lostRefresh': '连接丢失，请刷新页面。',
 
     'slash.noMatches': '没有匹配的命令',
+    'slash.suggestions': '命令建议',
     'slash.busyLimited': '代理运行中时，只允许 /stop、/tool 和 /reasoning。',
     'slash.new': '将对话压缩到记忆并清空当前上下文。',
     'slash.status': '显示当前会话状态。',

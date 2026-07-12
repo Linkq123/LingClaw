@@ -415,4 +415,24 @@ describe('workspace shell', () => {
       /\.msg\.user \{[\s\S]*?width: fit-content;[\s\S]*?max-width: 100%;[\s\S]*?word-break: normal;/,
     );
   });
+
+  it('keeps execution stacks visible and uses a single scroll container for long details', () => {
+    expect(workspaceCss).toMatch(/\.execution-stack \{[\s\S]*?flex: 0 0 auto;/);
+    expect(workspaceCss).toMatch(
+      /\.execution-stack-body \{[\s\S]*?max-height: min\(62dvh, 680px\);[\s\S]*?overflow-y: auto;/,
+    );
+    expect(workspaceCss).toMatch(/\.execution-stack-body \{[\s\S]*?overscroll-behavior-y: auto;/);
+    expect(workspaceCss).toMatch(
+      /\.execution-step \.reasoning-body\.show \{[\s\S]*?max-height: none;[\s\S]*?overflow: visible;/,
+    );
+    expect(workspaceCss).toMatch(
+      /\.execution-stack\.is-complete:not\(\.is-expanded\) \{[\s\S]*?border-color:[\s\S]*?background:/,
+    );
+  });
+
+  it('exposes composer suggestions through an accessible combobox contract', () => {
+    expect(indexHtml).toMatch(
+      /<textarea[\s\S]*?id="input"[\s\S]*?role="combobox"[\s\S]*?aria-autocomplete="list"[\s\S]*?aria-controls="slash-command-menu"[\s\S]*?aria-expanded="false"[\s\S]*?aria-haspopup="listbox"/,
+    );
+  });
 });

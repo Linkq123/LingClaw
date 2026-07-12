@@ -82,7 +82,8 @@ The runtime uses an explicit ReAct-style state machine:
 Frontend source lives in `frontend/` and builds into `static/`, which the Rust server serves directly.
 
 - `frontend/src/main.ts` — browser entrypoint and WebSocket event switchboard
-- `frontend/src/input.ts` — message composer, slash-command menu behavior, image paste/drop, and send/stop flows
+- `frontend/src/input.ts` — message composer, slash-command and Group mention menus, image paste/drop, and send/stop flows
+- `frontend/src/groupMentions.ts` — shared `@session-id` parsing, caret-aware replacement, candidate filtering, and safe post-Markdown mention decoration
 - `frontend/src/slashCommands.ts` — slash command catalog, normalization helpers, and autocomplete matching
 - `frontend/src/socket.ts` — connection lifecycle and reconnect behavior
 - `frontend/src/state.ts` — central UI state and DOM refs
@@ -92,6 +93,7 @@ Frontend source lives in `frontend/` and builds into `static/`, which the Rust s
 - `frontend/src/css/workspace.css` — final design tokens and modern workspace/responsive overrides
 - `frontend/src/renderers/` — chat, todos, tools, reasoning, subagent, orchestration, task-plan, and auto-trace panels
 - `frontend/src/renderers/execution-stack.ts` — groups one top-level Agent run's reasoning, tools, task plan, sub-agents, and orchestration into a single accessible live/complete activity stack; renderers must mount top-level process panels through this layer rather than creating independent timeline cards
+- `frontend/src/renderers/group-chat.ts` — renders Group speaker metadata separately from Markdown message content and maps protocol mentions to display names without changing persisted content
 - `frontend/src/renderers/todos.ts` — session-level todos panel and `/api/todos` persistence flow
 - `frontend/src/handlers/stream.ts` — streamed assistant/reasoning text handling
 - `frontend/src/pages/SettingsPage.tsx` and `frontend/src/pages/UsagePage.tsx` — React islands
@@ -123,7 +125,9 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 - The frontend session switcher lives in a collapsible desktop sidebar. At `<=768px` it becomes a transient overlay drawer that defaults closed and must not change the persisted desktop expansion preference. Todos, Tools, Reasoning, and Auto Debug live in the view-controls popover.
 - Frontend action and status icons must use the inline SVG sprite in `frontend/index.html` through typed helpers from `frontend/src/icons.ts`; keep SVGs decorative with accessible labels on their controls, and do not introduce Emoji or Unicode glyphs as UI icons.
 - Top-level process UI uses one execution stack per Agent run. It may span multiple ReAct cycles, auto-collapses only when the user has not manually toggled it, filters Tool/Reasoning steps through the existing view state, and must not fabricate duration for history records that do not provide one.
+- Execution stacks are direct children of the scrollable flex chat column and must remain non-shrinking; long expanded details use the stack body as the single bounded scroll container rather than nesting scroll areas inside Reasoning/Sub-agent/Orchestration bodies.
 - Slash command autocomplete is frontend-local UI on top of the existing `/...` command transport: incomplete prefixes can be completed via keyboard or mouse before dispatch.
+- Group mention autocomplete may display localized Session names, but selection must write the exact `@session-id` token into the composer; speaker names and mentions are decorated as text/semantic DOM outside the raw Markdown pipeline.
 - Automatic context compression runs as a `BeforeAnalyze` hook in `src/hooks.rs`.
 - Browser `plan_mode: true` starts `AgentRunMode::PlanOnly`: the agent may call the LLM and use only read-only tools (`think`, `read_file`, `list_dir`, `search_files`, `http_fetch`, plus read-only MCP tools enabled by the session policy). It must produce an assistant plan message, store `pending_plan`, and emit `plan_ready`; clicking “开始执行” sends `execute_plan_id`, clears the pending plan, appends a short `Proceed with the approved plan.` user message, and starts normal execute mode.
 - Group dispatch can request `run_mode=plan_only`; each target session still uses its own PlanOnly tool boundary and pending-plan behavior.

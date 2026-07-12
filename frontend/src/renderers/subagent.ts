@@ -11,7 +11,11 @@ import {
 } from '../utils.js';
 import { scrollDown } from '../scroll.js';
 import { animatePanelIn, animateCollapsibleSection } from './timeline.js';
-import { mountExecutionPanel, refreshExecutionStackForPanel } from './execution-stack.js';
+import {
+  mountExecutionPanel,
+  refreshExecutionStackForPanel,
+  resumeExecutionStackAutoCollapse,
+} from './execution-stack.js';
 import { pinReactStatusToBottom } from './react-status.js';
 import { closeToolDrawer, openToolDrawer, syncToolDrawer, mergeToolLiveOutput } from './tools.js';
 import {
@@ -607,6 +611,7 @@ function syncOwningOrchestrateRowExpansion(panel, expanded) {
 export function closeSubagentModal() {
   const panel = document.querySelector('.subagent-panel.subagent-modal-open');
   let shouldRestoreFocus = false;
+  let collapsedStackHeader: HTMLButtonElement | null = null;
   if (panel) {
     if (state.activeToolPanel && panel.contains(state.activeToolPanel)) {
       closeToolDrawer();
@@ -627,6 +632,7 @@ export function closeSubagentModal() {
     const host = resolveSubagentModalHost(panel);
     restoreModalHost(host, { hostClass: 'subagent-modal-host' });
     syncOwningOrchestrateRowExpansion(panel, false);
+    collapsedStackHeader = resumeExecutionStackAutoCollapse(panel);
   }
   const backdrop = document.getElementById('subagent-modal-backdrop');
   if (backdrop) backdrop.hidden = true;
@@ -634,7 +640,8 @@ export function closeSubagentModal() {
   const previousFocus = lastSubagentModalFocus;
   lastSubagentModalFocus = null;
   if (shouldRestoreFocus) {
-    if (previousFocus?.isConnected) previousFocus.focus();
+    if (collapsedStackHeader) collapsedStackHeader.focus();
+    else if (previousFocus?.isConnected) previousFocus.focus();
     else document.querySelector<HTMLButtonElement>('.execution-stack-header')?.focus();
   }
 }

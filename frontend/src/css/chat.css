@@ -68,6 +68,132 @@
   text-align: right;
 }
 
+/* ── Group conversation messages ── */
+.msg-row.group-message.assistant {
+  width: min(86%, 860px);
+  min-width: 0;
+}
+
+.msg-row.group-message.assistant .msg-content {
+  flex: 0 1 auto;
+  width: auto;
+  max-width: 100%;
+}
+
+.group-message-speaker {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 20px;
+  margin: 0 5px 4px;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.msg-row.group-message.user .group-message-speaker {
+  justify-content: flex-end;
+}
+
+.group-message-speaker-name {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.group-message-speaker-role {
+  padding-left: 7px;
+  border-left: 1px solid var(--border);
+}
+
+.msg-row.group-message.assistant .msg.group-message-body {
+  width: fit-content;
+  min-width: min(240px, 100%);
+  max-width: 100%;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--border) 86%, transparent);
+  border-radius: 14px 14px 14px 4px;
+  background: color-mix(in srgb, var(--surface) 92%, var(--bg));
+}
+
+.msg-row.group-message--main.assistant .msg.group-message-body {
+  border-color: color-mix(in srgb, var(--accent2) 20%, var(--border));
+}
+
+.msg-row.group-message--system.assistant .msg.group-message-body {
+  color: var(--dim);
+  background: color-mix(in srgb, var(--surface2) 78%, var(--surface));
+}
+
+.msg-avatar.group-message-avatar {
+  border: 1px solid color-mix(in srgb, var(--accent2) 18%, var(--border));
+  background: color-mix(in srgb, var(--accent2) 11%, var(--surface));
+  color: color-mix(in srgb, var(--accent2) 78%, var(--text));
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.msg-avatar.group-message-avatar[data-avatar-tone='1'] {
+  border-color: color-mix(in srgb, var(--accent-success) 22%, var(--border));
+  background: color-mix(in srgb, var(--accent-success) 10%, var(--surface));
+  color: color-mix(in srgb, var(--accent-success) 74%, var(--text));
+}
+
+.msg-avatar.group-message-avatar[data-avatar-tone='2'] {
+  border-color: color-mix(in srgb, var(--accent-warn) 24%, var(--border));
+  background: color-mix(in srgb, var(--accent-warn) 10%, var(--surface));
+  color: color-mix(in srgb, var(--accent-warn) 72%, var(--text));
+}
+
+.msg-avatar.group-message-avatar[data-avatar-tone='3'] {
+  border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
+  background: color-mix(in srgb, var(--accent) 9%, var(--surface));
+  color: color-mix(in srgb, var(--accent) 76%, var(--text));
+}
+
+.group-mention {
+  display: inline;
+  padding: 1px 5px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--accent2) 11%, transparent);
+  color: color-mix(in srgb, var(--accent2) 82%, var(--text));
+  font-weight: 650;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.msg.user.group-message-body :is(p, ul, ol, blockquote, pre) {
+  margin: 0 0 8px;
+}
+
+.msg.user.group-message-body {
+  white-space: normal;
+}
+
+.msg.user.group-message-body > :last-child {
+  margin-bottom: 0;
+}
+
+.msg.user.group-message-body :is(ul, ol) {
+  padding-left: 1.25em;
+}
+
+.msg.user.group-message-body pre {
+  max-width: 100%;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+@media (max-width: 768px) {
+  .msg-row.group-message.assistant {
+    width: calc(100% - 8px);
+  }
+
+  .msg-row.group-message.assistant .msg.group-message-body {
+    min-width: min(180px, 100%);
+  }
+}
+
 .plan-execute-action {
   display: flex;
   justify-content: flex-start;

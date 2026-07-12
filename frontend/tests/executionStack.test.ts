@@ -7,6 +7,7 @@ import {
   removeExecutionPanel,
   refreshExecutionStacks,
   resetExecutionStackState,
+  resumeExecutionStackAutoCollapse,
   restoreExecutionStackState,
   syncAllExecutionStackVisibility,
   toggleExecutionStack,
@@ -64,6 +65,8 @@ describe('execution stack', () => {
     expect(stack.querySelector('.execution-stack-header')?.getAttribute('aria-expanded')).toBe(
       'false',
     );
+    expect(stack.hidden).toBe(false);
+    expect((stack.querySelector('.execution-stack-body') as HTMLElement).hidden).toBe(true);
   });
 
   it('preserves a manual collapse when execution completes', () => {
@@ -77,6 +80,22 @@ describe('execution stack', () => {
 
     expect(stack.dataset.executionUserToggled).toBe('true');
     expect(stack.classList.contains('is-expanded')).toBe(false);
+  });
+
+  it('returns focus to the summary before an automatic collapse hides a step control', () => {
+    vi.useFakeTimers();
+    const panel = document.createElement('div');
+    const detailButton = document.createElement('button');
+    panel.appendChild(detailButton);
+    mountExecutionPanel(panel, 'tool');
+    const stack = state.activeExecutionStack as HTMLElement;
+    detailButton.focus();
+
+    completeExecutionStack({ durationMs: 100 });
+    vi.advanceTimersByTime(600);
+
+    expect(stack.classList.contains('is-expanded')).toBe(false);
+    expect(document.activeElement).toBe(stack.querySelector('.execution-stack-header'));
   });
 
   it('removes an empty stack with its final step', () => {
@@ -138,6 +157,15 @@ describe('execution stack', () => {
     expect(stack.querySelector('.execution-stack-header')?.getAttribute('aria-expanded')).toBe(
       'true',
     );
+
+    state.activeToolPanel = null;
+    const collapsedHeader = resumeExecutionStackAutoCollapse(panel);
+
+    expect(stack.classList.contains('is-expanded')).toBe(false);
+    expect(collapsedHeader).toBe(stack.querySelector('.execution-stack-header'));
+    expect(stack.querySelector('.execution-stack-header')?.getAttribute('aria-expanded')).toBe(
+      'false',
+    );
   });
 
   it('synchronizes aria-expanded when a linked section is collapsed programmatically', () => {
@@ -156,12 +184,16 @@ describe('execution stack', () => {
 
   it('starts a new stack after the previous execution completes', () => {
     mountExecutionPanel(document.createElement('div'), 'reasoning');
+    const firstStack = state.activeExecutionStack as HTMLElement;
     completeExecutionStack({ immediate: true, durationMs: null });
     mountExecutionPanel(document.createElement('div'), 'tool');
 
     expect(document.querySelectorAll('.execution-stack')).toHaveLength(2);
     expect(document.querySelectorAll('.execution-stack.is-complete')).toHaveLength(1);
     expect(document.querySelectorAll('.execution-stack.is-running')).toHaveLength(1);
+    expect(firstStack.isConnected).toBe(true);
+    expect(firstStack.hidden).toBe(false);
+    expect(state.activeExecutionStack).not.toBe(firstStack);
   });
 
   it('restores a running stack after history pagination temporarily detaches it', () => {

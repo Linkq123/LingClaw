@@ -1,5 +1,6 @@
 import { iconMarkup } from '../icons.js';
 import { tr } from '../i18n.js';
+import { invalidateChatScrollCache } from '../scroll.js';
 import { dom, state } from '../state.js';
 import { formatToolDuration } from '../utils.js';
 
@@ -92,13 +93,28 @@ function stackHasOpenDetail(stack: HTMLElement): boolean {
   return Boolean(stack.querySelector('.subagent-modal-placeholder'));
 }
 
+function executionStackForPanel(panel: Element | null): HTMLElement | null {
+  const directStack = panel?.closest<HTMLElement>('.execution-stack');
+  const modalStep = panel?.closest<HTMLElement & { _modalHostPlaceholder?: HTMLElement | null }>(
+    '.execution-step',
+  );
+  return (
+    directStack ||
+    modalStep?._modalHostPlaceholder?.closest<HTMLElement>('.execution-stack') ||
+    null
+  );
+}
+
 function setStackExpanded(stack: HTMLElement, expanded: boolean): void {
   const header = stack.querySelector<HTMLButtonElement>('.execution-stack-header');
   const body = getBody(stack);
+  const restoreHeaderFocus = !expanded && Boolean(body?.contains(document.activeElement));
   stack.classList.toggle('is-expanded', expanded);
   header?.setAttribute('aria-expanded', String(expanded));
   if (body) body.hidden = !expanded;
   stack.querySelector('.execution-stack-chevron')?.classList.toggle('open', expanded);
+  if (restoreHeaderFocus) header?.focus();
+  invalidateChatScrollCache();
 }
 
 function createExecutionStack(before: Element | null = null): HTMLElement {
@@ -125,6 +141,7 @@ function createExecutionStack(before: Element | null = null): HTMLElement {
   if (before?.parentElement === dom.chat) dom.chat.insertBefore(stack, before);
   else dom.chat.appendChild(stack);
   state.activeExecutionStack = stack;
+  invalidateChatScrollCache();
   syncStackSummary(stack);
   return stack;
 }
@@ -171,25 +188,37 @@ export function removeExecutionPanel(panel: Element | null): void {
   if (getSteps(stack).length === 0) {
     if (state.activeExecutionStack === stack) state.activeExecutionStack = null;
     stack.remove();
+    invalidateChatScrollCache();
     return;
   }
   syncExecutionStackVisibility(stack);
 }
 
 export function refreshExecutionStackForPanel(panel: Element | null): void {
-  const directStack = panel?.closest<HTMLElement>('.execution-stack');
-  const modalStep = panel?.closest<HTMLElement & { _modalHostPlaceholder?: HTMLElement | null }>(
-    '.execution-step',
-  );
-  const stack =
-    directStack || modalStep?._modalHostPlaceholder?.closest<HTMLElement>('.execution-stack');
+  const stack = executionStackForPanel(panel);
   if (stack) syncStackSummary(stack);
+}
+
+export function resumeExecutionStackAutoCollapse(panel: Element | null): HTMLButtonElement | null {
+  const stack = executionStackForPanel(panel);
+  if (
+    !stack ||
+    stack.dataset.executionStatus !== 'complete' ||
+    stack.dataset.executionUserToggled === 'true' ||
+    collapseTimers.has(stack) ||
+    stackHasOpenDetail(stack)
+  ) {
+    return null;
+  }
+  setStackExpanded(stack, false);
+  return stack.querySelector<HTMLButtonElement>('.execution-stack-header');
 }
 
 export function syncExecutionStackVisibility(stack: HTMLElement): void {
   for (const step of getSteps(stack)) {
     step.hidden = !stepIsVisible(step);
   }
+  invalidateChatScrollCache();
   syncStackSummary(stack);
 }
 

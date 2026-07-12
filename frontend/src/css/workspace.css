@@ -2144,6 +2144,7 @@ button {
 /* Aggregated execution stack --------------------------------------------- */
 
 .execution-stack {
+  flex: 0 0 auto;
   width: 100%;
   max-width: var(--workspace-content-width);
   margin: 1px auto;
@@ -2160,6 +2161,11 @@ button {
 .execution-stack.is-expanded {
   border-color: var(--border);
   background: color-mix(in srgb, var(--surface) 96%, transparent);
+}
+
+.execution-stack.is-complete:not(.is-expanded) {
+  border-color: color-mix(in srgb, var(--border) 72%, transparent);
+  background: color-mix(in srgb, var(--surface) 54%, transparent);
 }
 
 .execution-stack-header {
@@ -2244,6 +2250,10 @@ button {
 
 .execution-stack-body {
   padding: 0 10px 6px;
+  max-height: min(62dvh, 680px);
+  overflow-y: auto;
+  overscroll-behavior-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .execution-stack-body[hidden],
@@ -2338,7 +2348,13 @@ button {
 .execution-step .reasoning-body.show {
   padding: 9px 11px;
   border: 0;
-  max-height: 320px;
+  max-height: none;
+  overflow: visible;
+}
+
+.execution-step :is(.subagent-body.show, .orchestrate-body.show) {
+  max-height: none;
+  overflow: visible;
 }
 
 .execution-step .subagent-head-copy {
@@ -2444,8 +2460,6 @@ button {
 
   .execution-stack-body {
     max-height: 52dvh;
-    overflow-y: auto;
-    overscroll-behavior: contain;
   }
 
   .execution-step .tool-args-preview,

@@ -57,6 +57,12 @@ import {
   loadAppVersion,
 } from './renderers/chat.js';
 import {
+  groupMemberName,
+  refreshGroupMessages,
+  renderGroupMessage,
+} from './renderers/group-chat.js';
+import { insertGroupMention as replaceGroupMentionQuery } from './groupMentions.js';
+import {
   pinReactStatusToBottom,
   clearReactStatus,
   showReactStatus,
@@ -99,7 +105,7 @@ import {
   syncRestoredSessionCapabilities,
   updateS3ConfigIdentity,
 } from './images.js';
-import { sendCmd, initInputListeners } from './input.js';
+import { sendCmd, initInputListeners, refreshInputMenus } from './input.js';
 import {
   toggleMobileMenu,
   closeMobileMenu,
@@ -316,6 +322,8 @@ function refreshLocalizedUi() {
   renderSessionDrawer();
   renderGroupTargetControls();
   renderGroupMemberDrawer();
+  refreshGroupMessages();
+  refreshInputMenus();
   renderTodosPanel();
   renderReactStatus();
   refreshExecutionStacks();
@@ -498,27 +506,6 @@ function normalizeGroupMemberDetails(
   return out;
 }
 
-function groupMemberName(sessionId: string): string {
-  const id = String(sessionId || '').trim();
-  if (!id) return 'session';
-  const detail = state.activeGroupMemberDetails.find((member) => member.id === id);
-  if (detail?.name) return detail.name;
-  const summary = state.sessions.find((session) => session.id === id);
-  return summary?.name || id;
-}
-
-function renderProtocolMentions(text: string): string {
-  return String(text || '').replace(
-    /(^|[\s([{<"'`])@([A-Za-z0-9_.-]*[A-Za-z0-9_-])(?=$|[\s)\]}>.,;:!?'"`])/g,
-    (match, prefix, rawId) => {
-      const id = String(rawId || '');
-      if (id.toLowerCase() === 'all') return `${prefix}@${tr('common.all')}`;
-      if (!state.activeGroupMembers.includes(id)) return match;
-      return `${prefix}@${groupMemberName(id)}`;
-    },
-  );
-}
-
 function resetGroupTargetControls() {
   state.activeGroupMembers = [];
   state.activeGroupMemberDetails = [];
@@ -574,6 +561,8 @@ function setActiveGroupMembers(
   }
   renderGroupTargetControls();
   renderGroupMemberDrawer();
+  refreshGroupMessages();
+  refreshInputMenus();
 }
 
 function selectGroupTargetMode(mode: 'all' | 'selected' | 'mentions') {
@@ -600,20 +589,23 @@ function toggleSelectedGroupTarget(memberId: string) {
   syncToolDrawerBounds();
 }
 
-function insertGroupMention(sessionId: string) {
+function insertGroupMentionAtSelection(sessionId: string) {
   if (!dom.input) return;
-  const token = sessionId === 'all' ? '@all' : `@${sessionId}`;
   const value = dom.input.value;
   const start = dom.input.selectionStart ?? value.length;
   const end = dom.input.selectionEnd ?? value.length;
   const before = value.slice(0, start);
   const after = value.slice(end);
   const prefix = before && !/\s$/.test(before) ? ' ' : '';
-  const suffix = after && !/^\s/.test(after) ? ' ' : '';
-  dom.input.value = `${before}${prefix}${token}${suffix}${after}`;
-  const cursor = before.length + prefix.length + token.length + suffix.length;
+  const insertionStart = before.length + prefix.length;
+  const replacement = replaceGroupMentionQuery(
+    `${before}${prefix}${after}`,
+    { start: insertionStart, end: insertionStart, query: '' },
+    sessionId,
+  );
+  dom.input.value = replacement.value;
   dom.input.focus();
-  dom.input.setSelectionRange(cursor, cursor);
+  dom.input.setSelectionRange(replacement.cursor, replacement.cursor);
   dom.input.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
@@ -746,7 +738,7 @@ function renderGroupMemberDrawer() {
       mentionButton.className = 'group-member-action';
       mentionButton.textContent = '@';
       mentionButton.title = tr('group.mention', { name: detail.name || detail.id });
-      mentionButton.addEventListener('click', () => insertGroupMention(detail.id));
+      mentionButton.addEventListener('click', () => insertGroupMentionAtSelection(detail.id));
       actions.appendChild(mentionButton);
 
       if (detail.role === 'member') {
@@ -772,7 +764,7 @@ function renderGroupMemberDrawer() {
       mentionAllButton.className = 'group-member-action';
       mentionAllButton.textContent = '@all';
       mentionAllButton.title = tr('group.mentionAll');
-      mentionAllButton.addEventListener('click', () => insertGroupMention('all'));
+      mentionAllButton.addEventListener('click', () => insertGroupMentionAtSelection('all'));
       actions.appendChild(mentionAllButton);
     }
 
@@ -1604,32 +1596,6 @@ function loadEarlierMessages() {
   });
 }
 
-function groupMessageText(message): string {
-  const role = String(message?.role || 'system');
-  const sessionId = message?.session_id ? String(message.session_id) : '';
-  const prefix =
-    role === 'session'
-      ? `[${groupMemberName(sessionId)}] `
-      : role === 'main'
-        ? `[${tr('common.main')}] `
-        : role === 'user'
-          ? `[${tr('common.you')}] `
-          : role === 'system'
-            ? `[${tr('common.system')}] `
-            : '';
-  return `${prefix}${renderProtocolMentions(String(message?.content || ''))}`;
-}
-
-function renderGroupMessage(message): void {
-  const role = String(message?.role || 'system');
-  const bubbleRole = role === 'user' ? 'user' : role === 'system' ? 'system' : 'assistant';
-  const el = addMsg(bubbleRole, groupMessageText(message), message?.timestamp);
-  if (bubbleRole === 'assistant') {
-    el._rawText = groupMessageText(message);
-    scheduleMarkdownRender(el);
-  }
-}
-
 function isNoReplyGroupResult(value: unknown): boolean {
   let normalized = String(value ?? '').trim();
   if (!normalized) return true;
@@ -1682,7 +1648,9 @@ function renderGroupHistory(data): void {
     const resultExcerpt = String(run?.result_excerpt ?? '');
     applyGroupRunStatus(runId, status, run?.updated_at, sessionId);
     if (status === 'failed' && run?.error) {
-      addError(`[${groupMemberName(sessionId)}] ${run.error}`);
+      addError(
+        tr('group.memberError', { name: groupMemberName(sessionId), error: String(run.error) }),
+      );
     } else if (
       status === 'completed' &&
       runId &&
@@ -1768,7 +1736,12 @@ function handleGroupMemberEvent(data): void {
   const event = data?.event || {};
   const sessionId = String(data?.session_id || '');
   if (event.type === 'error') {
-    addError(`[${groupMemberName(sessionId)}] ${event.content || 'error'}`);
+    addError(
+      tr('group.memberError', {
+        name: groupMemberName(sessionId),
+        error: String(event.content || 'error'),
+      }),
+    );
   }
 }
 
@@ -1865,7 +1838,12 @@ function handleMessage(data) {
         data.session_id,
       );
       if (applied && data.error) {
-        addError(`[${groupMemberName(String(data.session_id || ''))}] ${data.error}`);
+        addError(
+          tr('group.memberError', {
+            name: groupMemberName(String(data.session_id || '')),
+            error: String(data.error),
+          }),
+        );
       }
       break;
     }

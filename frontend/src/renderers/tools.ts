@@ -2,7 +2,11 @@ import { dom, state } from '../state.js';
 import { escHtml, truncateStr, formatToolDuration, hideWelcome } from '../utils.js';
 import { scrollDown, syncToolDrawerBounds } from '../scroll.js';
 import { animatePanelIn, animateCollapsibleSection } from './timeline.js';
-import { mountExecutionPanel, refreshExecutionStackForPanel } from './execution-stack.js';
+import {
+  mountExecutionPanel,
+  refreshExecutionStackForPanel,
+  resumeExecutionStackAutoCollapse,
+} from './execution-stack.js';
 import { pinReactStatusToBottom } from './react-status.js';
 import { tr } from '../i18n.js';
 import { trapDialogFocus } from '../pages/dialogFocus.js';
@@ -290,12 +294,15 @@ export function closeToolDrawer() {
   dom.toolDrawerBackdrop.classList.remove('open');
   dom.toolDrawer.setAttribute('aria-hidden', 'true');
   syncToolDrawerResponsiveState();
-  if (state.activeToolPanel) {
-    state.activeToolPanel.classList.remove('tool-panel-active');
+  const activePanel = state.activeToolPanel;
+  if (activePanel) {
+    activePanel.classList.remove('tool-panel-active');
     state.activeToolPanel = null;
   }
+  const collapsedStackHeader = resumeExecutionStackAutoCollapse(activePanel);
   if (shouldRestoreFocus) {
-    if (previousFocus?.isConnected) previousFocus.focus();
+    if (collapsedStackHeader) collapsedStackHeader.focus();
+    else if (previousFocus?.isConnected) previousFocus.focus();
     else dom.input?.focus();
   }
 }

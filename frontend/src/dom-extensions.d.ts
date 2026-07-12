@@ -10,6 +10,7 @@ declare global {
     _markdownRenderedRaw?: string;
     _liveTail?: HTMLElement | null;
     _markdownShouldFollow?: boolean;
+    _afterMarkdownRender?: (() => void) | null;
     _focusFlashTimer?: number;
     _resetLabelTimer?: number;
   }

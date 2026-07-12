@@ -814,6 +814,7 @@ function getMarkdownRaw(el) {
 export async function renderMarkdown(el) {
   const raw = getMarkdownRaw(el);
   if (el._markdownRenderedRaw === raw) {
+    el._afterMarkdownRender?.();
     invalidateChatScrollCache();
     return;
   }
@@ -833,5 +834,6 @@ export async function renderMarkdown(el) {
   decorateCodeBlocks(el);
   scheduleCodeHighlight(el.querySelectorAll('pre code'));
   el._markdownRenderedRaw = raw;
+  el._afterMarkdownRender?.();
   invalidateChatScrollCache();
 }

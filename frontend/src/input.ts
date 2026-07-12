@@ -12,6 +12,13 @@ import {
   type SlashCommandSpec,
 } from './slashCommands.js';
 import { tr } from './i18n.js';
+import {
+  filterGroupMentionMembers,
+  findGroupMentionQuery,
+  insertGroupMention,
+  type GroupMentionMember,
+  type GroupMentionQuery,
+} from './groupMentions.js';
 import { renderSessionDrawer } from './renderers/sessions.js';
 import {
   areGroupMessageTargetsModelReady,
@@ -25,18 +32,27 @@ import {
 let _listenerInit = false;
 let slashMenuSuggestions: SlashCommandSpec[] = [];
 let slashMenuActiveIndex = 0;
+let mentionMenuSuggestions: GroupMentionMember[] = [];
+let mentionMenuActiveIndex = 0;
+let activeMentionQuery: GroupMentionQuery | null = null;
 
 function closeSlashCommandMenu() {
   const menu = dom.slashCommandMenu;
-  if (!menu || menu.hidden) {
-    slashMenuSuggestions = [];
-    slashMenuActiveIndex = 0;
-    return;
-  }
-  menu.hidden = true;
-  menu.replaceChildren();
   slashMenuSuggestions = [];
   slashMenuActiveIndex = 0;
+  mentionMenuSuggestions = [];
+  mentionMenuActiveIndex = 0;
+  activeMentionQuery = null;
+  if (dom.input) {
+    dom.input.removeAttribute('aria-activedescendant');
+    dom.input.setAttribute('aria-expanded', 'false');
+  }
+  if (!menu || menu.hidden) return;
+  menu.hidden = true;
+  menu.replaceChildren();
+  menu.classList.remove('mention-menu');
+  menu.setAttribute('role', 'listbox');
+  menu.setAttribute('aria-label', tr('slash.suggestions'));
   syncToolDrawerBounds();
 }
 
@@ -66,7 +82,152 @@ function syncSlashCommandMenuSelection(menu: HTMLElement) {
     item.classList.toggle('is-active', isActive);
     item.setAttribute('aria-selected', isActive ? 'true' : 'false');
   });
+  const activeItem = items[slashMenuActiveIndex];
+  if (activeItem) dom.input?.setAttribute('aria-activedescendant', activeItem.id);
+  else dom.input?.removeAttribute('aria-activedescendant');
   scrollActiveSlashCommandIntoView(menu);
+}
+
+function groupMentionRoleLabel(role?: string): string {
+  if (role === 'admin') return tr('common.admin');
+  if (role === 'owner') return tr('common.main');
+  if (role === 'all') return tr('group.mentionEveryone');
+  return tr('common.member');
+}
+
+function currentMentionMembers(): GroupMentionMember[] {
+  const details = new Map(
+    state.activeGroupMemberDetails.map((member) => [member.id, member] as const),
+  );
+  return state.activeGroupMembers.map((id) => {
+    const detail = details.get(id);
+    return {
+      id,
+      name: detail?.name || id,
+      role: detail?.role || 'member',
+    };
+  });
+}
+
+function syncGroupMentionMenuSelection(menu: HTMLElement): void {
+  const items = menu.querySelectorAll<HTMLElement>('.mention-menu-item');
+  items.forEach((item, index) => {
+    const active = index === mentionMenuActiveIndex;
+    item.classList.toggle('is-active', active);
+    item.setAttribute('aria-selected', active ? 'true' : 'false');
+  });
+  const activeItem = items[mentionMenuActiveIndex];
+  if (activeItem) {
+    dom.input?.setAttribute('aria-activedescendant', activeItem.id);
+    if (typeof activeItem.scrollIntoView === 'function') {
+      activeItem.scrollIntoView({ block: 'nearest' });
+    }
+  } else {
+    dom.input?.removeAttribute('aria-activedescendant');
+  }
+}
+
+function applyGroupMentionSuggestion(candidate: GroupMentionMember): void {
+  if (!dom.input || !activeMentionQuery) return;
+  const currentQuery = findGroupMentionQuery(
+    dom.input.value,
+    dom.input.selectionStart ?? dom.input.value.length,
+  );
+  if (!currentQuery) {
+    closeSlashCommandMenu();
+    return;
+  }
+  const replacement = insertGroupMention(dom.input.value, currentQuery, candidate.id);
+  dom.input.value = replacement.value;
+  dom.input.focus();
+  dom.input.setSelectionRange(replacement.cursor, replacement.cursor);
+  dom.input.style.height = 'auto';
+  dom.input.style.height = Math.min(dom.input.scrollHeight, 120) + 'px';
+  closeSlashCommandMenu();
+  syncComposerAvailability();
+  syncToolDrawerBounds();
+}
+
+function renderGroupMentionMenu(): boolean {
+  const menu = dom.slashCommandMenu;
+  const input = dom.input;
+  if (!menu || !input || !state.activeGroupId) return false;
+
+  const query = findGroupMentionQuery(input.value, input.selectionStart ?? input.value.length);
+  if (!query) return false;
+  activeMentionQuery = query;
+  const previousId = mentionMenuSuggestions[mentionMenuActiveIndex]?.id;
+  mentionMenuSuggestions = filterGroupMentionMembers(
+    query.query,
+    state.activeGroupMembers,
+    currentMentionMembers(),
+    tr('common.all'),
+  );
+  const previousIndex = previousId
+    ? mentionMenuSuggestions.findIndex((candidate) => candidate.id === previousId)
+    : -1;
+  mentionMenuActiveIndex =
+    previousIndex >= 0
+      ? previousIndex
+      : Math.min(mentionMenuActiveIndex, Math.max(0, mentionMenuSuggestions.length - 1));
+
+  const fragment = document.createDocumentFragment();
+  if (mentionMenuSuggestions.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'slash-command-empty mention-menu-empty';
+    empty.textContent = tr('group.mentionNoMatches');
+    fragment.appendChild(empty);
+  } else {
+    mentionMenuSuggestions.forEach((candidate, index) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.id = `group-mention-option-${index}`;
+      button.className = 'slash-command-item mention-menu-item';
+      button.dataset.mentionId = candidate.id;
+      button.setAttribute('role', 'option');
+      button.addEventListener('mouseenter', () => {
+        mentionMenuActiveIndex = index;
+        syncGroupMentionMenuSelection(menu);
+      });
+      button.addEventListener('mousedown', (event) => event.preventDefault());
+      button.addEventListener('click', () => applyGroupMentionSuggestion(candidate));
+
+      const avatar = document.createElement('span');
+      avatar.className = 'mention-menu-avatar';
+      avatar.textContent = candidate.id === 'all' ? '@' : Array.from(candidate.name)[0] || '?';
+      const copy = document.createElement('span');
+      copy.className = 'mention-menu-copy';
+      const name = document.createElement('span');
+      name.className = 'mention-menu-name';
+      name.textContent = candidate.name;
+      const meta = document.createElement('span');
+      meta.className = 'mention-menu-meta';
+      meta.textContent = `@${candidate.id} · ${groupMentionRoleLabel(candidate.role)}`;
+      copy.append(name, meta);
+      button.append(avatar, copy);
+      fragment.appendChild(button);
+    });
+  }
+
+  slashMenuSuggestions = [];
+  menu.classList.add('mention-menu');
+  menu.setAttribute('role', 'listbox');
+  menu.setAttribute('aria-label', tr('group.mentionSuggestions'));
+  menu.hidden = false;
+  menu.replaceChildren(fragment);
+  input.setAttribute('aria-controls', menu.id);
+  input.setAttribute('aria-expanded', 'true');
+  syncGroupMentionMenuSelection(menu);
+  syncToolDrawerBounds();
+  return true;
+}
+
+function renderComposerSuggestionMenu(): void {
+  if (renderGroupMentionMenu()) return;
+  mentionMenuSuggestions = [];
+  mentionMenuActiveIndex = 0;
+  activeMentionQuery = null;
+  renderSlashCommandMenu();
 }
 
 function renderSlashCommandMenu() {
@@ -104,7 +265,9 @@ function renderSlashCommandMenu() {
     for (const [index, spec] of slashMenuSuggestions.entries()) {
       const button = document.createElement('button');
       button.type = 'button';
+      button.id = `slash-command-option-${index}`;
       button.className = 'slash-command-item';
+      button.setAttribute('role', 'option');
       button.dataset.slashCommand = spec.command;
       button.dataset.slashIndex = String(index);
       button.addEventListener('mouseenter', () => {
@@ -137,8 +300,13 @@ function renderSlashCommandMenu() {
     }
   }
 
+  menu.classList.remove('mention-menu');
+  menu.setAttribute('role', 'listbox');
+  menu.setAttribute('aria-label', tr('slash.suggestions'));
   menu.hidden = false;
   menu.replaceChildren(fragment);
+  dom.input.setAttribute('aria-controls', menu.id);
+  dom.input.setAttribute('aria-expanded', 'true');
   syncSlashCommandMenuSelection(menu);
   syncToolDrawerBounds();
 }
@@ -171,6 +339,41 @@ function applyPendingSlashCommandSuggestion(text: string): boolean {
 
   applySlashCommandSuggestion(suggestion);
   return true;
+}
+
+function handleGroupMentionKeydown(e: KeyboardEvent): boolean {
+  const menu = dom.slashCommandMenu;
+  if (
+    e.isComposing ||
+    !menu ||
+    menu.hidden ||
+    !menu.classList.contains('mention-menu') ||
+    !activeMentionQuery
+  ) {
+    return false;
+  }
+
+  if (e.key === 'Escape') {
+    e.preventDefault();
+    closeSlashCommandMenu();
+    return true;
+  }
+  if (mentionMenuSuggestions.length === 0) return false;
+  if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    const direction = e.key === 'ArrowDown' ? 1 : -1;
+    mentionMenuActiveIndex =
+      (mentionMenuActiveIndex + direction + mentionMenuSuggestions.length) %
+      mentionMenuSuggestions.length;
+    syncGroupMentionMenuSelection(menu);
+    return true;
+  }
+  if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
+    e.preventDefault();
+    applyGroupMentionSuggestion(mentionMenuSuggestions[mentionMenuActiveIndex]);
+    return true;
+  }
+  return false;
 }
 
 function handleSlashCommandKeydown(e: KeyboardEvent): boolean {
@@ -378,6 +581,8 @@ export function initInputListeners() {
   if (_listenerInit) return;
   _listenerInit = true;
   dom.input.addEventListener('keydown', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
+    if (handleGroupMentionKeydown(e)) return;
     if (handleSlashCommandKeydown(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -425,12 +630,24 @@ export function initInputListeners() {
   dom.input.addEventListener('input', () => {
     dom.input.style.height = 'auto';
     dom.input.style.height = Math.min(dom.input.scrollHeight, 120) + 'px';
-    renderSlashCommandMenu();
+    renderComposerSuggestionMenu();
     syncComposerAvailability();
     syncToolDrawerBounds();
   });
   dom.input.addEventListener('focus', () => {
-    renderSlashCommandMenu();
+    renderComposerSuggestionMenu();
+  });
+  dom.input.addEventListener('compositionend', () => {
+    renderComposerSuggestionMenu();
+    syncComposerAvailability();
+  });
+  dom.input.addEventListener('click', () => {
+    renderComposerSuggestionMenu();
+  });
+  dom.input.addEventListener('keyup', (event) => {
+    if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+      renderComposerSuggestionMenu();
+    }
   });
   dom.input.addEventListener('blur', () => {
     window.setTimeout(() => {
@@ -472,6 +689,14 @@ export function initInputListeners() {
   //    the chat container. `dragenter` uses a counter because `dragleave`
   //    fires when the pointer crosses any child boundary. ──
   initDropzone();
+}
+
+export function refreshInputMenus(): void {
+  if (!dom.input || document.activeElement !== dom.input) {
+    closeSlashCommandMenu();
+    return;
+  }
+  renderComposerSuggestionMenu();
 }
 
 let dragCounter = 0;
