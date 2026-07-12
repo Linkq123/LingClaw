@@ -409,7 +409,7 @@ describe('workspace shell', () => {
 
   it('keeps short user messages content-sized instead of collapsing percentage widths', () => {
     expect(workspaceCss).toMatch(
-      /\.msg-row\.user \.msg-content \{[\s\S]*?width: fit-content;[\s\S]*?max-width: min\(72%, 720px\);/,
+      /\.msg-row\.user \{[\s\S]*?align-self: flex-end;[\s\S]*?width: fit-content;[\s\S]*?max-width: min\(72%, 720px\);[\s\S]*?margin-left: auto;/,
     );
     expect(workspaceCss).toMatch(
       /\.msg\.user \{[\s\S]*?width: fit-content;[\s\S]*?max-width: 100%;[\s\S]*?word-break: normal;/,
