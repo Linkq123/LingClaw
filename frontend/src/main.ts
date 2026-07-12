@@ -87,6 +87,8 @@ import {
   dropUnavailablePendingUploads,
   initImageListeners,
   renderImagePreviews,
+  syncRestoredSessionCapabilities,
+  updateS3ConfigIdentity,
 } from './images.js';
 import { sendCmd, initInputListeners } from './input.js';
 import {
@@ -135,6 +137,29 @@ import {
   prefetchPageChunks,
 } from './pages/lazy.js';
 import { closeOverlayById, matchesOverlayDismissTarget } from './pages/overlay.js';
+import {
+  CONFIG_SAVED_EVENT,
+  acceptComposerHttpModelPayloadRevision,
+  acceptComposerSocketModelPayloadRevision,
+  beginComposerSessionTransition,
+  captureComposerSessionTransitionFallbackCapabilities,
+  captureComposerSessionTransitionTargetCapabilitiesBaseline,
+  completeComposerSessionTransition,
+  composerSessionPayloadMatchesTransition,
+  getComposerConnectionGeneration,
+  groupModelRosterMatches,
+  handleComposerConfigSaved,
+  refreshComposerAvailability,
+  resetComposerGroupModelConfiguration,
+  restoreComposerSessionTransition,
+  sessionIdsMatchExactly,
+  setComposerExplicitPrimaryModelConfigured,
+  setComposerSessionModelConfigured,
+  setGroupModelConfiguredMembers,
+  syncComposerAvailability,
+  updateComposerSessionTransitionFallbackCapabilities,
+  updateComposerSessionTransitionFallback,
+} from './composerAvailability.js';
 import {
   buildHistoryReasoningPanel,
   finalizeOrDiscardLiveReasoningPanel,
@@ -267,6 +292,7 @@ function updateViewToggleButtons() {
 
 function refreshLocalizedUi() {
   translateDom();
+  syncComposerAvailability();
   refreshConnectionStatus();
   updateViewToggleButtons();
   updateUsageBadge();
@@ -477,6 +503,7 @@ function resetGroupTargetControls() {
   state.groupMembersDrawerOpen = false;
   state.groupTargetMode = 'all';
   state.groupSelectedTargets = [];
+  resetComposerGroupModelConfiguration();
   renderGroupTargetControls();
   renderGroupMemberDrawer();
 }
@@ -532,6 +559,7 @@ function selectGroupTargetMode(mode: 'all' | 'selected' | 'mentions') {
     state.groupSelectedTargets = [...state.activeGroupMembers];
   }
   renderGroupTargetControls();
+  syncComposerAvailability();
   syncToolDrawerBounds();
 }
 
@@ -545,6 +573,7 @@ function toggleSelectedGroupTarget(memberId: string) {
   const memberSet = new Set(state.activeGroupMembers);
   state.groupSelectedTargets = Array.from(selected).filter((target) => memberSet.has(target));
   renderGroupTargetControls();
+  syncComposerAvailability();
   syncToolDrawerBounds();
 }
 
@@ -785,8 +814,19 @@ function upsertSessionSummary(session: SessionSummary) {
   state.sessions = normalizeSessionListPayload({ sessions: state.sessions });
 }
 
+function sessionIdentityActionBlocked(): boolean {
+  return (
+    state.sessionSwitchInFlight ||
+    state.sessionIdentityMutationInFlight ||
+    state.composerSessionTransitionPending ||
+    state.composerSessionIdentityPending ||
+    state.imageUploadInFlight
+  );
+}
+
 function performSwitchToSession(nextSessionId: string) {
-  if (state.sessionSwitchInFlight) return;
+  if (sessionIdentityActionBlocked()) return;
+  beginComposerSessionTransition(false, nextSessionId);
   state.activeGroupId = '';
   state.groupReturnSessionId = '';
   persistActiveGroupId('');
@@ -802,7 +842,9 @@ function performSwitchToSession(nextSessionId: string) {
 }
 
 function performSwitchToGroup(nextGroupId: string) {
-  if (state.sessionSwitchInFlight) return;
+  if (sessionIdentityActionBlocked()) return;
+  beginComposerSessionTransition();
+  resetComposerGroupModelConfiguration();
   enterGroupControlSession();
   state.activeGroupId = nextGroupId;
   persistActiveGroupId(nextGroupId);
@@ -819,8 +861,12 @@ function performSwitchToGroup(nextGroupId: string) {
 let sessionCreateInFlight = false;
 
 async function createSession() {
-  if (sessionCreateInFlight || state.sessionSwitchInFlight) return;
+  if (sessionCreateInFlight || sessionIdentityActionBlocked()) return;
   sessionCreateInFlight = true;
+  state.sessionIdentityMutationInFlight = true;
+  renderSessionDrawer();
+  syncComposerAvailability();
+  updateAttachButton();
   try {
     const created = await requestCreateSession();
     upsertSessionSummary(created);
@@ -831,9 +877,10 @@ async function createSession() {
     persistActiveGroupId('');
     clearGroupRunState();
     resetGroupTargetControls();
+    beginComposerSessionTransition(false, created.id);
+    state.sessionSwitchInFlight = true;
     state.activeSessionId = created.id;
     persistActiveSessionId(created.id);
-    state.sessionSwitchInFlight = true;
     renderSessionDrawer();
     reconnectToActiveSession(handleMessage);
   } catch (error) {
@@ -843,11 +890,15 @@ async function createSession() {
     renderSessionDrawer();
   } finally {
     sessionCreateInFlight = false;
+    state.sessionIdentityMutationInFlight = false;
+    renderSessionDrawer();
+    syncComposerAvailability();
+    updateAttachButton();
   }
 }
 
 async function createGroup() {
-  if (sessionCreateInFlight || state.sessionSwitchInFlight) return;
+  if (sessionCreateInFlight || sessionIdentityActionBlocked()) return;
   const rawName = window.prompt(tr('session.promptGroupName'), tr('session.defaultGroupName'));
   const name = rawName?.trim();
   if (!name) return;
@@ -861,15 +912,21 @@ async function createGroup() {
     .map((item) => item.trim())
     .filter(Boolean);
   sessionCreateInFlight = true;
+  state.sessionIdentityMutationInFlight = true;
+  renderSessionDrawer();
+  syncComposerAvailability();
+  updateAttachButton();
   try {
     const created = await requestCreateSessionGroup(name, members);
     upsertGroupSummary(created);
     enterGroupControlSession();
+    beginComposerSessionTransition();
+    state.sessionSwitchInFlight = true;
+    resetComposerGroupModelConfiguration();
     state.activeGroupId = created.id;
     persistActiveGroupId(created.id);
     clearGroupRunState();
     setActiveGroupMembers(members);
-    state.sessionSwitchInFlight = true;
     renderSessionDrawer();
     reconnectToActiveSession(handleMessage);
   } catch (error) {
@@ -881,12 +938,16 @@ async function createGroup() {
     renderSessionDrawer();
   } finally {
     sessionCreateInFlight = false;
+    state.sessionIdentityMutationInFlight = false;
+    renderSessionDrawer();
+    syncComposerAvailability();
+    updateAttachButton();
   }
 }
 
 function deleteSession(sessionId: string) {
   const targetSessionId = String(sessionId || '').trim();
-  if (!targetSessionId || state.activeGroupId || state.sessionSwitchInFlight) return;
+  if (!targetSessionId || state.activeGroupId || sessionIdentityActionBlocked()) return;
   if (targetSessionId === 'main' || targetSessionId === state.activeSessionId) return;
   if (!targetSessionId) return;
   const confirmed = window.confirm(tr('session.confirmDelete', { id: targetSessionId }));
@@ -898,7 +959,7 @@ function deleteSession(sessionId: string) {
 
 async function renameSession(sessionId: string) {
   const targetSessionId = String(sessionId || '').trim();
-  if (!targetSessionId || state.sessionSwitchInFlight) return;
+  if (!targetSessionId || sessionIdentityActionBlocked()) return;
   const current = state.sessions.find((session) => session.id === targetSessionId);
   if (current?.corrupt) return;
   const raw = window.prompt(tr('session.promptName'), current?.name || targetSessionId);
@@ -943,7 +1004,7 @@ async function renameSession(sessionId: string) {
 
 async function renameGroup(groupId: string) {
   const targetGroupId = String(groupId || '').trim();
-  if (!targetGroupId || state.sessionSwitchInFlight) return;
+  if (!targetGroupId || sessionIdentityActionBlocked()) return;
   const current = state.sessionGroups.find((group) => group.id === targetGroupId);
   if (current?.corrupt) return;
   const rawName = window.prompt(tr('session.promptGroupName'), current?.name || targetGroupId);
@@ -986,14 +1047,22 @@ async function renameGroup(groupId: string) {
 
 async function deleteGroup(groupId: string) {
   const targetGroupId = String(groupId || '').trim();
-  if (!targetGroupId || state.sessionSwitchInFlight) return;
+  if (!targetGroupId || sessionIdentityActionBlocked()) return;
   const confirmed = window.confirm(tr('session.confirmDeleteGroup', { id: targetGroupId }));
   if (!confirmed) return;
+  const changesActiveIdentity = state.activeGroupId === targetGroupId;
+  if (changesActiveIdentity) {
+    state.sessionIdentityMutationInFlight = true;
+    renderSessionDrawer();
+    syncComposerAvailability();
+    updateAttachButton();
+  }
   try {
     await requestDeleteSessionGroup(targetGroupId);
     state.sessionGroups = state.sessionGroups.filter((group) => group.id !== targetGroupId);
     if (state.activeGroupId === targetGroupId) {
       leaveActiveGroupForSession();
+      beginComposerSessionTransition(false, state.activeSessionId);
       state.sessionSwitchInFlight = true;
       reconnectToActiveSession(handleMessage);
     }
@@ -1004,6 +1073,13 @@ async function deleteGroup(groupId: string) {
         error: error instanceof Error ? error.message : String(error),
       }),
     );
+  } finally {
+    if (changesActiveIdentity) {
+      state.sessionIdentityMutationInFlight = false;
+      renderSessionDrawer();
+      syncComposerAvailability();
+      updateAttachButton();
+    }
   }
 }
 
@@ -1013,12 +1089,208 @@ function applyGroupDetail(detail: {
   members?: unknown;
   member_details?: unknown;
   pending_votes?: unknown;
+  model_override_members?: unknown;
+  model_configured_members?: unknown;
+  model_member_ids?: unknown;
+  explicitPrimaryModelConfigured?: unknown;
+  configRevision?: unknown;
+  capabilities?: { s3?: boolean; s3_config_id?: string | null };
 }) {
   if (!detail?.id || detail.id !== state.activeGroupId) return;
   if (detail.name) {
     dom.sessionNameEl.textContent = detail.name;
   }
   setActiveGroupMembers(detail.members, detail.member_details, detail.pending_votes);
+  applyGroupModelConfigurationAfterRosterUpdate(detail, false);
+}
+
+function applyGroupModelConfiguration(
+  detail: {
+    members?: unknown;
+    model_override_members?: unknown;
+    model_configured_members?: unknown;
+    model_member_ids?: unknown;
+    explicitPrimaryModelConfigured?: unknown;
+    configRevision?: unknown;
+    capabilities?: { s3?: boolean; s3_config_id?: string | null };
+  },
+  connectionPayload: boolean,
+  forceS3TokenRefresh = false,
+): boolean {
+  const modelMemberIds = Array.isArray(detail.model_member_ids)
+    ? detail.model_member_ids
+    : detail.members;
+  const revisionAccepted = connectionPayload
+    ? acceptComposerSocketModelPayloadRevision(detail.configRevision)
+    : acceptComposerHttpModelPayloadRevision(detail.configRevision);
+  if (!revisionAccepted) return false;
+  applyS3Capabilities(detail, forceS3TokenRefresh);
+  if (Array.isArray(modelMemberIds) && !groupModelRosterMatches(modelMemberIds)) {
+    if (connectionPayload && state.composerGroupModelRevision !== state.composerConfigRevision) {
+      void refreshActiveGroupModelConfiguration();
+    }
+    return false;
+  }
+  if (typeof detail.explicitPrimaryModelConfigured === 'boolean') {
+    setComposerExplicitPrimaryModelConfigured(
+      detail.explicitPrimaryModelConfigured,
+      detail.configRevision,
+    );
+  }
+  const configuredMembers = Array.isArray(detail.model_configured_members)
+    ? detail.model_configured_members
+    : state.composerExplicitPrimaryModelConfigured
+      ? state.activeGroupMembers
+      : detail.model_override_members;
+  return setGroupModelConfiguredMembers(configuredMembers, detail.configRevision);
+}
+
+let activeGroupModelRefreshInFlight = false;
+let activeGroupModelRefreshPending = false;
+
+function applyGroupModelConfigurationAfterRosterUpdate(
+  detail: Parameters<typeof applyGroupModelConfiguration>[0],
+  connectionPayload: boolean,
+  forceS3TokenRefresh = false,
+): boolean {
+  const refreshWasInFlight = activeGroupModelRefreshInFlight;
+  const refreshWasPending = activeGroupModelRefreshPending;
+  const applied = applyGroupModelConfiguration(detail, connectionPayload, forceS3TokenRefresh);
+  const refreshStarted = !refreshWasInFlight && activeGroupModelRefreshInFlight;
+  const refreshQueued = !refreshWasPending && activeGroupModelRefreshPending;
+  if (
+    !applied &&
+    state.composerGroupModelRevision !== state.composerConfigRevision &&
+    !refreshStarted &&
+    !refreshQueued &&
+    !activeGroupModelRefreshPending
+  ) {
+    void refreshActiveGroupModelConfiguration();
+  }
+  return applied;
+}
+
+async function refreshActiveGroupModelConfiguration(): Promise<void> {
+  const groupId = state.activeGroupId;
+  if (!groupId) return;
+  if (activeGroupModelRefreshInFlight) {
+    activeGroupModelRefreshPending = true;
+    return;
+  }
+  const connectionGeneration = getComposerConnectionGeneration();
+  activeGroupModelRefreshInFlight = true;
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const detail = await requestGetSessionGroup(groupId);
+      if (state.activeGroupId !== groupId) return;
+      if (getComposerConnectionGeneration() !== connectionGeneration) {
+        activeGroupModelRefreshPending = true;
+        return;
+      }
+      if (applyGroupModelConfiguration(detail, false)) return;
+    }
+  } catch {
+    // A later reliable model event or reconnect can retry this bounded refresh.
+  } finally {
+    activeGroupModelRefreshInFlight = false;
+    if (activeGroupModelRefreshPending) {
+      activeGroupModelRefreshPending = false;
+      void refreshActiveGroupModelConfiguration();
+    }
+  }
+}
+
+function applyS3Capabilities(data, forceTokenRefresh = false): void {
+  const identityChanged = updateS3ConfigIdentity(data.capabilities?.s3_config_id, true);
+  if (data.capabilities && typeof data.capabilities.s3 === 'boolean') {
+    const previousS3Capable = state.s3Capable;
+    state.s3Capable = data.capabilities.s3;
+    if (state.s3Capable) {
+      if (forceTokenRefresh || identityChanged || !previousS3Capable || !state.uploadToken) {
+        void ensureUploadTokenInternal(forceTokenRefresh || identityChanged).catch(() => {});
+      }
+    } else {
+      state.uploadToken = '';
+      state.uploadTokenPromise = null;
+      dropUnavailablePendingUploads(previousS3Capable);
+    }
+    updateAttachButton();
+  }
+}
+
+function applySessionCapabilities(data): void {
+  if (data.capabilities && typeof data.capabilities.image === 'boolean') {
+    state.imageCapable = data.capabilities.image;
+    updateAttachButton();
+  }
+  applyS3Capabilities(data, true);
+}
+
+function restoreComposerSessionTransitionWithCapabilities(): void {
+  const restored = restoreComposerSessionTransition();
+  syncRestoredSessionCapabilities(restored);
+  if (restored) renderSessionDrawer();
+}
+
+function sessionModelPayloadTargetsActiveSession(data, authoritativeFullPayload = false): boolean {
+  const payloadSessionId = String(data.id || '').trim();
+  if (!payloadSessionId) return false;
+  if (!state.composerSessionTransitionPending) {
+    if (authoritativeFullPayload && state.composerSessionIdentityPending) return true;
+    return sessionIdsMatchExactly(payloadSessionId, state.activeSessionId || 'main');
+  }
+  const updatedFallback = updateComposerSessionTransitionFallback(
+    data.id,
+    data.modelOverridePresent === true,
+    data.modelOverrideConfigured === true,
+    typeof data.effectiveModelConfigured === 'boolean' ? data.effectiveModelConfigured : undefined,
+    typeof data.explicitPrimaryModelConfigured === 'boolean'
+      ? data.explicitPrimaryModelConfigured
+      : undefined,
+    data.configRevision,
+  );
+  if (updatedFallback) {
+    const targetCapabilitiesApplied = updateComposerSessionTransitionFallbackCapabilities(
+      typeof data.capabilities?.image === 'boolean' ? data.capabilities.image : undefined,
+      typeof data.capabilities?.s3 === 'boolean' ? data.capabilities.s3 : undefined,
+      typeof data.capabilities?.s3_config_id === 'string'
+        ? data.capabilities.s3_config_id
+        : data.capabilities?.s3_config_id === null
+          ? ''
+          : undefined,
+    );
+    if (!targetCapabilitiesApplied) {
+      applySessionCapabilities(data);
+      captureComposerSessionTransitionFallbackCapabilities();
+    }
+    return false;
+  }
+  if (!composerSessionPayloadMatchesTransition(data.id)) return false;
+  return true;
+}
+
+function applySessionModelFields(data, completeTransition = true): boolean {
+  if (!acceptComposerSocketModelPayloadRevision(data.configRevision)) return false;
+  if (typeof data.explicitPrimaryModelConfigured === 'boolean') {
+    setComposerExplicitPrimaryModelConfigured(
+      data.explicitPrimaryModelConfigured,
+      data.configRevision,
+    );
+  }
+  setComposerSessionModelConfigured(
+    data.modelOverridePresent === true,
+    data.modelOverrideConfigured === true,
+    typeof data.effectiveModelConfigured === 'boolean' ? data.effectiveModelConfigured : undefined,
+    data.configRevision,
+    completeTransition,
+  );
+  captureComposerSessionTransitionTargetCapabilitiesBaseline();
+  applySessionCapabilities(data);
+  return true;
+}
+
+function applySessionModelConfiguration(data): boolean {
+  return sessionModelPayloadTargetsActiveSession(data) && applySessionModelFields(data, false);
 }
 
 async function promoteGroupMember(sessionId: string) {
@@ -1477,6 +1749,7 @@ function isActiveGroupConnectionError(content: string): boolean {
 
 function recoverFromInvalidActiveGroup(): void {
   leaveActiveGroupForSession();
+  beginComposerSessionTransition(false, state.activeSessionId);
   state.sessionSwitchInFlight = true;
   reconnectToActiveSession(handleMessage);
 }
@@ -1491,10 +1764,11 @@ function handleMessage(data) {
       break;
 
     case 'group':
-      clearCompressionOutcome();
       {
         const nextGroupId = String(data.id || '').trim();
         if (!nextGroupId) break;
+        state.composerSessionIdentityPending = false;
+        clearCompressionOutcome();
         const groupChanged = state.activeGroupId !== '' && state.activeGroupId !== nextGroupId;
         state.activeGroupId = nextGroupId;
         if (groupChanged) {
@@ -1503,7 +1777,10 @@ function handleMessage(data) {
       }
       persistActiveGroupId(state.activeGroupId || '');
       setActiveGroupMembers(data.members, data.member_details, data.pending_votes);
+      applyGroupModelConfigurationAfterRosterUpdate(data, true, true);
       state.sessionSwitchInFlight = false;
+      syncComposerAvailability();
+      updateAttachButton();
       dom.sessionNameEl.textContent = data.name || tr('group.nameFallback');
       dom.sessionIdEl.textContent = state.activeGroupId.slice(0, 12);
       renderSessionDrawer();
@@ -1512,9 +1789,15 @@ function handleMessage(data) {
 
     case 'group_history':
       if (Array.isArray(data.members)) {
-        setActiveGroupMembers(data.members, data.member_details, data.pending_votes);
+        applyGroupModelConfiguration(data, true);
       }
       renderGroupHistory(data);
+      break;
+
+    case 'group_model_configuration':
+      if (String(data.id || '').trim() === state.activeGroupId) {
+        applyGroupModelConfiguration(data, true);
+      }
       break;
 
     case 'group_message':
@@ -1565,7 +1848,15 @@ function handleMessage(data) {
       }
       renderSessionDrawer();
       break;
+    case 'session_model_configuration':
+      applySessionModelConfiguration(data);
+      break;
+
     case 'session':
+      if (!sessionModelPayloadTargetsActiveSession(data, true)) break;
+      state.composerSessionIdentityPending = false;
+      applySessionModelFields(data, false);
+      completeComposerSessionTransition();
       clearCompressionOutcome();
       state.activeGroupId = '';
       state.groupReturnSessionId = '';
@@ -1575,25 +1866,11 @@ function handleMessage(data) {
       state.activeSessionId = data.id;
       persistActiveSessionId(state.activeSessionId || 'main');
       state.sessionSwitchInFlight = false;
+      syncComposerAvailability();
+      updateAttachButton();
       dom.sessionNameEl.textContent = data.name || tr('common.main');
       dom.sessionIdEl.textContent = data.id.slice(0, 12);
       renderSessionDrawer();
-      if (data.capabilities && typeof data.capabilities.image === 'boolean') {
-        state.imageCapable = data.capabilities.image;
-        updateAttachButton();
-      }
-      if (data.capabilities && typeof data.capabilities.s3 === 'boolean') {
-        const previousS3Capable = state.s3Capable;
-        state.s3Capable = data.capabilities.s3;
-        if (state.s3Capable) {
-          void ensureUploadTokenInternal(true).catch(() => {});
-        } else {
-          state.uploadToken = '';
-          state.uploadTokenPromise = null;
-          dropUnavailablePendingUploads(previousS3Capable);
-        }
-        updateAttachButton();
-      }
       if (data.usage) {
         state.dailyInputTokens = data.usage.daily_input ?? 0;
         state.dailyOutputTokens = data.usage.daily_output ?? 0;
@@ -1991,6 +2268,7 @@ function handleMessage(data) {
     case 'success':
       clearReactStatus();
       addSystem(data.content, 'success', { dismissible: data.dismissible === true });
+      restoreComposerSessionTransitionWithCapabilities();
       setBusy(false);
       break;
 
@@ -1998,6 +2276,7 @@ function handleMessage(data) {
       clearReactStatus();
       addSystem(data.content, 'info', { dismissible: data.dismissible === true });
       restorePendingPlanAction();
+      restoreComposerSessionTransitionWithCapabilities();
       setBusy(false);
       break;
 
@@ -2010,6 +2289,7 @@ function handleMessage(data) {
       state.reasoningPanel = null;
       resetRoundTimers();
       restorePendingPlanAction();
+      restoreComposerSessionTransitionWithCapabilities();
       setBusy(false);
       if (isActiveGroupConnectionError(String(data.content || ''))) {
         recoverFromInvalidActiveGroup();
@@ -2072,6 +2352,7 @@ const actionHandlers = {
   },
   'load-earlier': () => loadEarlierMessages(),
   'execute-plan': (el) => executePendingPlan(el),
+  'retry-composer-config': () => void refreshComposerAvailability(),
   'open-tool-drawer': (el) => openToolDrawerFromHeader(el),
   'toggle-tool': (el) => toggleTool(el),
   'subagent-copy-summary': (el) => copySubagentSummary(el),
@@ -2356,6 +2637,7 @@ function installChatResizeObserver(): void {
 }
 
 document.addEventListener('click', handleDocumentClick);
+window.addEventListener(CONFIG_SAVED_EVENT, handleComposerConfigSaved);
 const unsubscribeLanguageChange = subscribeLanguageChange(refreshLocalizedUi);
 
 // ── Init ──
@@ -2371,6 +2653,7 @@ updateJumpToLatestVisibility();
 initImageListeners();
 initInputListeners();
 initMobileListeners();
+void refreshComposerAvailability();
 
 document.addEventListener('keydown', handleDocumentKeydown);
 dom.chat.addEventListener('scroll', handleChatScroll, { passive: true });
@@ -2410,6 +2693,7 @@ if (import.meta.hot) {
     unsubscribeLanguageChange();
     cancelReconnect();
     document.removeEventListener('click', handleDocumentClick);
+    window.removeEventListener(CONFIG_SAVED_EVENT, handleComposerConfigSaved);
     document.removeEventListener('keydown', handleDocumentKeydown);
     dom.chat.removeEventListener('scroll', handleChatScroll);
     window.removeEventListener('resize', syncToolDrawerBounds);

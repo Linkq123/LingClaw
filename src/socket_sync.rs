@@ -1,6 +1,11 @@
 use serde_json::json;
 
-use crate::{AppState, SessionSummary, WsTx, session_store::*, ws_send};
+use crate::{AppState, Config, SessionSummary, WsTx, session_store::*, ws_send};
+
+pub(crate) struct ModelConfigurationPayloads {
+    session_payloads: Vec<(String, serde_json::Value)>,
+    group_payloads: Vec<(String, serde_json::Value)>,
+}
 
 fn default_history_payload() -> serde_json::Value {
     json!({"type":"history","messages":[]})
@@ -15,12 +20,24 @@ fn default_todos_state_payload() -> serde_json::Value {
 }
 
 pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, session_id: &str) {
-    let config = state.config();
-    let (name, history, view_state, todos_state, supports_image, usage) = {
+    let model_status_guard = crate::CONFIG_FILE_LOCK.read().await;
+    let (config, config_revision) = state.config_snapshot_with_revision();
+    let (
+        name,
+        history,
+        view_state,
+        todos_state,
+        supports_image,
+        model_override_present,
+        model_override_configured,
+        effective_model_configured,
+        usage,
+    ) = {
         let sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get(session_id) {
-            let model = session.effective_model(&config.model);
-            let supports_image = config.model_supports_image(model);
+            let (model, model_override_configured, effective_model_configured) =
+                session.model_configuration(&config);
+            let supports_image = config.model_supports_image(&model);
             let usage = build_session_usage_payload(session);
             (
                 session.name.clone(),
@@ -28,6 +45,9 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
                 build_view_state_payload(session),
                 crate::todos::build_todos_state_event(&session.todos),
                 supports_image,
+                session.model_override.is_some(),
+                model_override_configured,
+                effective_model_configured,
                 usage,
             )
         } else {
@@ -37,17 +57,20 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
                 default_view_state_payload(),
                 default_todos_state_payload(),
                 false,
+                false,
+                false,
+                config.explicit_primary_model_configured,
                 json!({}),
             )
         }
     };
 
     let s3_available = config.s3.is_some();
-    ws_send(
-        tx,
-        &json!({"type":"session","id":session_id,"name":name,"capabilities":{"image":supports_image,"s3":s3_available},"usage":usage}),
-    )
-    .await;
+    let s3_config_id = config.s3.as_ref().map(crate::image_uploads::s3_config_id);
+    let session_payload = json!({"type":"session","id":session_id,"name":name,"explicitPrimaryModelConfigured":config.explicit_primary_model_configured,"modelOverridePresent":model_override_present,"modelOverrideConfigured":model_override_configured,"effectiveModelConfigured":effective_model_configured,"configRevision":config_revision,"capabilities":{"image":supports_image,"s3":s3_available,"s3_config_id":s3_config_id},"usage":usage});
+    drop(model_status_guard);
+
+    ws_send(tx, &session_payload).await;
     ws_send(tx, &view_state).await;
     ws_send(tx, &todos_state).await;
     ws_send(tx, &history).await;
@@ -58,14 +81,126 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
 pub(crate) fn build_session_info_payload(
     session_id: &str,
     name: &str,
-    state: &AppState,
+    config: &Config,
     effective_model: &str,
+    model_override_present: bool,
+    model_override_configured: bool,
+    effective_model_configured: bool,
+    config_revision: u64,
     usage: serde_json::Value,
 ) -> serde_json::Value {
-    let config = state.config();
     let supports_image = config.model_supports_image(effective_model);
     let s3_available = config.s3.is_some();
-    json!({"type":"session","id":session_id,"name":name,"capabilities":{"image":supports_image,"s3":s3_available},"usage":usage})
+    let s3_config_id = config.s3.as_ref().map(crate::image_uploads::s3_config_id);
+    json!({"type":"session","id":session_id,"name":name,"explicitPrimaryModelConfigured":config.explicit_primary_model_configured,"modelOverridePresent":model_override_present,"modelOverrideConfigured":model_override_configured,"effectiveModelConfigured":effective_model_configured,"configRevision":config_revision,"capabilities":{"image":supports_image,"s3":s3_available,"s3_config_id":s3_config_id},"usage":usage})
+}
+
+fn build_session_model_configuration_payload(
+    session_id: &str,
+    config: &Config,
+    effective_model: &str,
+    model_override_present: bool,
+    model_override_configured: bool,
+    effective_model_configured: bool,
+    config_revision: u64,
+) -> serde_json::Value {
+    json!({
+        "type": "session_model_configuration",
+        "id": session_id,
+        "explicitPrimaryModelConfigured": config.explicit_primary_model_configured,
+        "modelOverridePresent": model_override_present,
+        "modelOverrideConfigured": model_override_configured,
+        "effectiveModelConfigured": effective_model_configured,
+        "configRevision": config_revision,
+        "capabilities": {
+            "image": config.model_supports_image(effective_model),
+            "s3": config.s3.is_some(),
+            "s3_config_id": config.s3.as_ref().map(crate::image_uploads::s3_config_id),
+        },
+    })
+}
+
+pub(crate) async fn collect_model_configuration_payloads(
+    state: &AppState,
+    config: &Config,
+    config_revision: u64,
+) -> ModelConfigurationPayloads {
+    let session_ids = {
+        let clients = state.session_clients.lock().await;
+        clients.keys().cloned().collect::<Vec<_>>()
+    };
+    let session_payloads = {
+        let sessions = state.sessions.lock().await;
+        session_ids
+            .into_iter()
+            .map(|session_id| {
+                let (
+                    model,
+                    model_override_present,
+                    model_override_configured,
+                    effective_model_configured,
+                ) = sessions
+                    .get(&session_id)
+                    .map(|session| {
+                        let (model, model_override_configured, effective_model_configured) =
+                            session.model_configuration(config);
+                        (
+                            model,
+                            session.model_override.is_some(),
+                            model_override_configured,
+                            effective_model_configured,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            config.model.clone(),
+                            false,
+                            false,
+                            config.explicit_primary_model_configured,
+                        )
+                    });
+                let payload = build_session_model_configuration_payload(
+                    &session_id,
+                    config,
+                    &model,
+                    model_override_present,
+                    model_override_configured,
+                    effective_model_configured,
+                    config_revision,
+                );
+                (session_id, payload)
+            })
+            .collect()
+    };
+    let group_payloads = crate::session_control::collect_group_model_configuration_payloads(
+        state,
+        config,
+        config_revision,
+    )
+    .await;
+    ModelConfigurationPayloads {
+        session_payloads,
+        group_payloads,
+    }
+}
+
+pub(crate) async fn send_model_configuration_payloads(
+    state: &AppState,
+    payloads: ModelConfigurationPayloads,
+) {
+    let ModelConfigurationPayloads {
+        session_payloads,
+        group_payloads,
+    } = payloads;
+    let session_sends = session_payloads
+        .into_iter()
+        .map(|(session_id, payload)| async move {
+            crate::send_session_client_event(state, &session_id, payload).await;
+        });
+    tokio::join!(
+        futures::future::join_all(session_sends),
+        crate::session_control::send_group_model_configuration_payloads(state, group_payloads),
+    );
 }
 
 /// Build the usage sub-object for a session event.

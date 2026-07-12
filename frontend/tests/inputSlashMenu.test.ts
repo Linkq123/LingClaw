@@ -29,6 +29,12 @@ describe('input slash command menu', () => {
         <button id="stop"></button>
       </div>
     `;
+    const { state } = await import('../src/state.js');
+    state.composerModelAvailability = 'ready';
+    state.composerSessionIdentityPending = false;
+    state.sessionSwitchInFlight = false;
+    state.sessionIdentityMutationInFlight = false;
+    state.imageUploadInFlight = false;
   });
 
   it('renders suggestions for slash-prefixed input and inserts the highlighted command with Tab', async () => {
@@ -134,6 +140,120 @@ describe('input slash command menu', () => {
 
     expect(sendMock).toHaveBeenCalledWith('/help');
     expect(input.value).toBe('');
+  });
+
+  it('blocks normal messages while a slash Session switch is awaiting confirmation', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = {
+      readyState: 1,
+      send: sendMock,
+    } as unknown as WebSocket;
+    stateModule.state.pendingImages = [];
+    stateModule.state.busy = false;
+
+    const { send } = await import('../src/input.js');
+    stateModule.dom.input!.value = '/switch unconfigured-session';
+    send();
+
+    expect(sendMock).toHaveBeenCalledWith('/switch unconfigured-session');
+    expect(stateModule.state.composerSessionTransitionPending).toBe(true);
+    expect(stateModule.state.composerModelAvailability).toBe('checking');
+
+    stateModule.dom.input!.value = 'must wait for the Session payload';
+    send();
+    expect(sendMock).toHaveBeenCalledTimes(1);
+
+    stateModule.dom.input!.value = '/switch second-session';
+    send();
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(stateModule.state.composerSessionTransitionTarget).toBe('unconfigured-session');
+  });
+
+  it('does not lock the composer for a switch command without a target', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = {
+      readyState: 1,
+      send: sendMock,
+    } as unknown as WebSocket;
+    stateModule.state.pendingImages = [];
+    stateModule.state.busy = false;
+
+    const { send } = await import('../src/input.js');
+    stateModule.dom.input!.value = '/switch';
+    send();
+
+    expect(sendMock).toHaveBeenCalledWith('/switch');
+    expect(stateModule.state.composerSessionTransitionPending).toBe(false);
+    expect(stateModule.state.composerModelAvailability).toBe('ready');
+  });
+
+  it('blocks a targeted switch until the initial Session identity is confirmed', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = {
+      readyState: 1,
+      send: sendMock,
+    } as unknown as WebSocket;
+    stateModule.state.pendingImages = [];
+    stateModule.state.busy = false;
+    stateModule.state.composerSessionIdentityPending = true;
+    stateModule.state.composerModelAvailability = 'checking';
+
+    const { send } = await import('../src/input.js');
+    stateModule.dom.input!.value = '/switch target-session';
+    send();
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(stateModule.state.composerSessionTransitionPending).toBe(false);
+
+    stateModule.dom.input!.value = '/switch';
+    send();
+    expect(sendMock).toHaveBeenCalledWith('/switch');
+  });
+
+  it('blocks a targeted switch while an image upload is still in flight', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = {
+      readyState: 1,
+      send: sendMock,
+    } as unknown as WebSocket;
+    stateModule.state.pendingImages = [];
+    stateModule.state.busy = false;
+    stateModule.state.imageUploadInFlight = true;
+
+    const { send } = await import('../src/input.js');
+    stateModule.dom.input!.value = '/switch target-session';
+    send();
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(stateModule.state.composerSessionTransitionPending).toBe(false);
+  });
+
+  it('does not send an ordinary message before its image upload finishes', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = {
+      readyState: 1,
+      send: sendMock,
+    } as unknown as WebSocket;
+    stateModule.state.pendingImages = [];
+    stateModule.state.busy = false;
+    stateModule.state.imageUploadInFlight = true;
+
+    const { send } = await import('../src/input.js');
+    stateModule.dom.input!.value = 'describe the uploaded image';
+    send();
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(stateModule.dom.input!.value).toBe('describe the uploaded image');
   });
 
   it('normalizes mixed-case slash commands on Enter instead of sending them unchanged', async () => {
@@ -328,5 +448,69 @@ describe('input slash command menu', () => {
 
     expect(input.value).toBe('/status');
     expect(menu.hidden).toBe(true);
+  });
+
+  it('does not dispatch composer input while the Agent model is unconfigured', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = { readyState: 1, send: sendMock } as unknown as WebSocket;
+    stateModule.state.composerModelAvailability = 'agent-model-unconfigured';
+    stateModule.dom.input!.value = 'should not be sent';
+
+    const { send } = await import('../src/input.js');
+    send();
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(stateModule.dom.input?.value).toBe('should not be sent');
+  });
+
+  it('still dispatches slash commands while the Agent model is unconfigured', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = { readyState: 1, send: sendMock } as unknown as WebSocket;
+    stateModule.state.composerModelAvailability = 'agent-model-unconfigured';
+    stateModule.state.pendingImages = [];
+    stateModule.dom.input!.value = '/help';
+
+    const { send } = await import('../src/input.js');
+    send();
+
+    expect(sendMock).toHaveBeenCalledWith('/help');
+    expect(stateModule.dom.input?.value).toBe('');
+  });
+
+  it('does not dispatch /new while the Agent model is unconfigured', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = { readyState: 1, send: sendMock } as unknown as WebSocket;
+    stateModule.state.composerModelAvailability = 'agent-model-unconfigured';
+    stateModule.state.pendingImages = [];
+    stateModule.dom.input!.value = '/new';
+
+    const { send } = await import('../src/input.js');
+    send();
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(stateModule.dom.input?.value).toBe('/new');
+  });
+
+  it('allows clicking Send for model-independent slash commands', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = { readyState: 1, send: sendMock } as unknown as WebSocket;
+    stateModule.state.composerModelAvailability = 'agent-model-unconfigured';
+
+    const { initInputListeners } = await import('../src/input.js');
+    initInputListeners();
+    stateModule.dom.input!.value = '/status';
+    stateModule.dom.input!.dispatchEvent(new Event('input', { bubbles: true }));
+
+    expect(stateModule.dom.sendBtn?.disabled).toBe(false);
+    stateModule.dom.sendBtn?.click();
+    expect(sendMock).toHaveBeenCalledWith('/status');
   });
 });

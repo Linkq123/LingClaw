@@ -27,6 +27,16 @@ type RenderableGroup = SessionGroupSummary & {
 
 let callbacks: SessionDrawerCallbacks | null = null;
 
+function identityNavigationBlocked(): boolean {
+  return (
+    state.sessionSwitchInFlight ||
+    state.sessionIdentityMutationInFlight ||
+    state.composerSessionTransitionPending ||
+    state.composerSessionIdentityPending ||
+    state.imageUploadInFlight
+  );
+}
+
 function hasValidId(id: string): boolean {
   return id.trim().length > 0;
 }
@@ -168,7 +178,7 @@ function currentGroupBadgeLabel(group: RenderableGroup): string {
 function isSessionDeleteable(session: RenderableSession): boolean {
   return (
     !state.activeGroupId &&
-    !state.sessionSwitchInFlight &&
+    !identityNavigationBlocked() &&
     !session.pending &&
     hasValidId(session.id) &&
     session.id !== 'main' &&
@@ -178,7 +188,7 @@ function isSessionDeleteable(session: RenderableSession): boolean {
 
 function isSessionRenameable(session: RenderableSession): boolean {
   return (
-    !state.sessionSwitchInFlight &&
+    !identityNavigationBlocked() &&
     !session.pending &&
     hasValidId(session.id) &&
     session.corrupt !== true &&
@@ -201,7 +211,7 @@ function createSessionRow(session: RenderableSession): HTMLElement {
   if (session.pending) {
     row.classList.add('is-pending');
   }
-  if (state.sessionSwitchInFlight || !hasValidSessionId) {
+  if (identityNavigationBlocked() || !hasValidSessionId) {
     row.classList.add('is-disabled');
   }
 
@@ -210,7 +220,7 @@ function createSessionRow(session: RenderableSession): HTMLElement {
   mainButton.className = 'session-drawer-row-main';
   mainButton.dataset.sessionAction = 'switch';
   mainButton.disabled =
-    state.sessionSwitchInFlight ||
+    identityNavigationBlocked() ||
     session.pending === true ||
     session.corrupt === true ||
     !hasValidSessionId;
@@ -318,7 +328,10 @@ function createSectionHeader(label: string, count: number, action?: () => void):
         ? tr('session.newGroup')
         : tr('session.newSessionShort');
     button.setAttribute('aria-label', button.title);
-    button.addEventListener('click', action);
+    button.disabled = identityNavigationBlocked();
+    button.addEventListener('click', () => {
+      if (!button.disabled) action();
+    });
     header.appendChild(button);
   }
   return header;
@@ -333,14 +346,14 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
   if (isCurrentGroup) row.classList.add('is-active');
   if (group.corrupt) row.classList.add('is-corrupt');
   if (group.pending) row.classList.add('is-pending');
-  if (state.sessionSwitchInFlight || !hasValidGroupId) row.classList.add('is-disabled');
+  if (identityNavigationBlocked() || !hasValidGroupId) row.classList.add('is-disabled');
 
   const mainButton = document.createElement('button');
   mainButton.type = 'button';
   mainButton.className = 'session-drawer-row-main';
   mainButton.dataset.sessionAction = 'switch-group';
   mainButton.disabled =
-    state.sessionSwitchInFlight ||
+    identityNavigationBlocked() ||
     group.pending === true ||
     group.corrupt === true ||
     !hasValidGroupId;
@@ -385,7 +398,7 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
 
   const actions: HTMLElement[] = [];
   if (
-    !state.sessionSwitchInFlight &&
+    !identityNavigationBlocked() &&
     !group.pending &&
     !group.corrupt &&
     hasValidGroupId &&
@@ -405,7 +418,7 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
     actions.push(renameButton);
   }
   if (
-    !state.sessionSwitchInFlight &&
+    !identityNavigationBlocked() &&
     !group.pending &&
     hasValidGroupId &&
     callbacks?.onDeleteGroup
@@ -446,7 +459,7 @@ function applyDrawerChrome(): void {
     dom.sessionDrawerNewBtn.innerHTML = `${iconMarkup('plus')}<span class="sidebar-new-label">${tr(
       'session.newSession',
     )}</span>`;
-    dom.sessionDrawerNewBtn.disabled = state.sessionSwitchInFlight;
+    dom.sessionDrawerNewBtn.disabled = identityNavigationBlocked();
     dom.sessionDrawerNewBtn.setAttribute('aria-label', tr('session.newSessionShort'));
     dom.sessionDrawerNewBtn.title = tr('session.newSessionShort');
   }

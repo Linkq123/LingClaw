@@ -6,6 +6,7 @@ import { pinReactStatusToBottom } from './react-status.js';
 import { tr } from '../i18n.js';
 import { createIcon, iconMarkup } from '../icons.js';
 import type { IconName } from '../icons.js';
+import { syncComposerAvailability } from '../composerAvailability.js';
 
 function setVersionBadge(el, version) {
   if (!el) return;
@@ -274,13 +275,7 @@ export function setBusy(b) {
   state.busy = b;
   dom.stopBtn.style.display = b ? 'flex' : 'none';
   dom.stopBtn.disabled = !b;
-  dom.sendBtn.disabled = false;
-  if (b) {
-    dom.input.placeholder = 'Message LingClaw... (运行中可发送干预，点击红色按钮停止)';
-  } else {
-    dom.input.placeholder = 'Message LingClaw... (/ for commands)';
-  }
+  syncComposerAvailability();
   dom.sendIcon.innerHTML = iconMarkup('send');
-  dom.sendBtn.title = '';
-  dom.sendBtn.setAttribute('aria-label', 'Send message');
+  dom.sendBtn.setAttribute('aria-label', tr('composer.send'));
 }

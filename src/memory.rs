@@ -1893,6 +1893,10 @@ struct MemoryUpdateRequest {
     session_id: String,
     workspace: PathBuf,
     model: String,
+    /// Immutable runtime configuration captured by the Agent run that
+    /// produced this memory update. Model/provider resolution must use this
+    /// snapshot rather than the queue's subsequently hot-reloaded config.
+    config: Arc<Config>,
     /// Only user messages + final assistant response (no tool noise).
     conversation_excerpt: Vec<crate::ChatMessage>,
 }
@@ -1926,7 +1930,6 @@ impl MemoryUpdateQueue {
         let cancel = CancellationToken::new();
         tokio::spawn(memory_updater_loop(
             rx,
-            config.clone(),
             status.clone(),
             cancel.clone(),
             sessions,
@@ -1969,6 +1972,7 @@ impl MemoryUpdateQueue {
         session_id: String,
         workspace: PathBuf,
         model: String,
+        config: Arc<Config>,
         conversation_excerpt: Vec<crate::ChatMessage>,
     ) {
         if self.cancel.is_cancelled() {
@@ -1978,6 +1982,7 @@ impl MemoryUpdateQueue {
             session_id,
             workspace,
             model: model.clone(),
+            config,
             conversation_excerpt,
         };
         if self.tx.try_send(req).is_err() {
@@ -1999,7 +2004,6 @@ const DEBOUNCE_DURATION: Duration = Duration::from_secs(3);
 /// Background loop that processes memory update requests with debounce.
 async fn memory_updater_loop(
     mut rx: mpsc::Receiver<MemoryUpdateRequest>,
-    config: Arc<Mutex<Arc<Config>>>,
     status: SharedMemoryQueueStatus,
     cancel: CancellationToken,
     sessions: Arc<AsyncMutex<HashMap<String, Session>>>,
@@ -2042,13 +2046,7 @@ async fn memory_updater_loop(
                 snapshot.last_started_at = started_at;
             });
 
-            let config_snapshot = match config.lock() {
-                Ok(guard) => guard.clone(),
-                Err(poisoned) => {
-                    eprintln!("Warning: memory queue config lock poisoned; recovering");
-                    poisoned.into_inner().clone()
-                }
-            };
+            let config_snapshot = Arc::clone(&final_req.config);
             let memory_timeout = config_snapshot.tool_timeout.max(Duration::from_secs(30));
             let http = Client::builder()
                 .timeout(memory_timeout)

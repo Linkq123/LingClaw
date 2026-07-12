@@ -138,6 +138,10 @@ fn reflection_runtime_matches(generation: u64) -> bool {
         && REFLECTION_RUNTIME_GENERATION.load(std::sync::atomic::Ordering::Acquire) == generation
 }
 
+fn reflection_run_snapshot_is_enabled(config: &Config) -> bool {
+    config.daily_reflection && reflection_runtime_enabled()
+}
+
 fn register_active_reflection(cancel: CancellationToken) -> u64 {
     let task_id = NEXT_REFLECTION_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     match ACTIVE_REFLECTION_CANCELS.lock() {
@@ -266,6 +270,8 @@ impl AgentRunMode {
 
 struct AgentRunCtx<'a> {
     state: &'a Arc<AppState>,
+    config: Arc<Config>,
+    model: String,
     current_session_id: &'a str,
     cancel: &'a CancellationToken,
     live_tx: &'a LiveTx,
@@ -736,10 +742,10 @@ async fn prepare_analyze_snapshot(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> Option<AnalyzeSnapshot> {
-    let config = ctx.state.config();
+    let config = ctx.config.clone();
     let mut sessions = ctx.state.sessions.lock().await;
     let session = sessions.get_mut(ctx.current_session_id)?;
-    let base_model = session.effective_model(&config.model).to_string();
+    let base_model = ctx.model.clone();
     let enabled_system_skills = session.enabled_system_skills.clone();
 
     // Extract latest user message for query-aware memory retrieval and complexity sensing.
@@ -960,7 +966,7 @@ async fn fit_messages_to_request_budget(
     think_level: &str,
     extra_tools: &[serde_json::Value],
 ) -> Option<(usize, usize)> {
-    let config = ctx.state.config();
+    let config = ctx.config.clone();
     let provider = config.resolve_model(model).provider;
     let request_budget =
         crate::context::context_input_budget_for_runtime(&config, model, think_level);
@@ -1085,7 +1091,7 @@ async fn build_cycle_tools(
     phase_state: &AgentPhaseState,
     resolved: &providers::ResolvedModel,
 ) -> Vec<serde_json::Value> {
-    let config = ctx.state.config();
+    let config = ctx.config.clone();
     if phase_state.run_mode.is_plan_only() {
         build_plan_only_tools(&config, resolved.provider, &phase_state.cycle_workspace)
     } else {
@@ -1572,6 +1578,13 @@ async fn execute_tool_with_live_output(
 /// Returns the outcome as a standard ToolOutcome so it integrates with the
 /// existing record_tool_result flow. Sub-agent token usage is accumulated into
 /// the parent session counters so global/daily stats remain accurate.
+fn delegated_config_for_run(config: &Config, run_model: &str) -> Config {
+    let mut delegated = config.clone();
+    delegated.model = run_model.to_string();
+    delegated.explicit_primary_model_configured = true;
+    delegated
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_task_tool(
     args_str: &str,
@@ -2030,7 +2043,7 @@ async fn execute_tool_call(
     phase_state: &mut AgentPhaseState,
     tc: &ToolCall,
 ) -> Result<(tools::ToolOutcome, Option<String>), AgentPhaseControl> {
-    let config = ctx.state.config();
+    let config = ctx.config.clone();
     if phase_state.run_mode.is_plan_only()
         && !is_plan_only_allowed_tool(&tc.function.name, &config, &phase_state.cycle_workspace)
     {
@@ -2140,6 +2153,7 @@ async fn execute_tool_call(
         // Sub-agent task: no outer timeout — the sub-agent enforces its own
         // deadline via config.sub_agent_timeout inside run_subagent().
         let task_cancel = ctx.run_cancel.child_token();
+        let delegated_config = delegated_config_for_run(&config, &ctx.model);
         run_tool_with_feedback(
             ctx.live_tx,
             ctx.run_cancel,
@@ -2148,7 +2162,7 @@ async fn execute_tool_call(
             None,
             execute_task_tool(
                 &effective_args,
-                &config,
+                &delegated_config,
                 &ctx.state.http,
                 &phase_state.cycle_workspace,
                 ctx.live_tx,
@@ -2163,6 +2177,7 @@ async fn execute_tool_call(
         // Multi-agent orchestration: no outer timeout — individual sub-agents
         // enforce their own deadlines via config.sub_agent_timeout.
         let orch_cancel = ctx.run_cancel.child_token();
+        let delegated_config = delegated_config_for_run(&config, &ctx.model);
         run_tool_with_feedback(
             ctx.live_tx,
             ctx.run_cancel,
@@ -2171,7 +2186,7 @@ async fn execute_tool_call(
             None,
             execute_orchestrate_tool(
                 &effective_args,
-                &config,
+                &delegated_config,
                 &ctx.state.http,
                 &phase_state.cycle_workspace,
                 ctx.live_tx,
@@ -2262,7 +2277,7 @@ async fn record_tool_result(
     effective_args: Option<&str>,
 ) -> AgentPhaseControl {
     // ── AfterToolExec hook (skipped when tool was rejected) ──────────────
-    let config = ctx.state.config();
+    let config = ctx.config.clone();
     if let Some(eff_args) = effective_args {
         let after_input = ToolHookInput {
             tool_name: tc.function.name.clone(),
@@ -2395,7 +2410,7 @@ async fn update_working_state(
     phase_state: &mut AgentPhaseState,
     summaries: &[agent::ObservationSummary],
 ) {
-    let config = ctx.state.config();
+    let config = ctx.config.clone();
     let session_data = {
         let sessions = ctx.state.sessions.lock().await;
         sessions
@@ -2403,7 +2418,7 @@ async fn update_working_state(
             .map(|session| WorkingStateSessionData {
                 latest_query: latest_user_query_from_messages(&session.messages),
                 workspace: session.workspace.clone(),
-                fallback_model: session.effective_model(&config.model).to_string(),
+                fallback_model: ctx.model.clone(),
             })
     };
 
@@ -2724,7 +2739,7 @@ async fn run_analyze_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
-    let config = ctx.state.config();
+    let config = ctx.config.clone();
     if phase_state.round >= AGENT_HARD_CAP_ROUNDS {
         let (system_event, mut done_event) = build_agent_hard_cap_events(
             AGENT_HARD_CAP_ROUNDS,
@@ -3065,7 +3080,7 @@ async fn run_act_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
-    let config = ctx.state.config();
+    let config = ctx.config.clone();
     phase_state.collected_results.clear();
     let tool_calls = std::mem::take(&mut phase_state.pending_tool_calls);
 
@@ -3286,7 +3301,7 @@ async fn run_observe_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
-    let config = ctx.state.config();
+    let config = ctx.config.clone();
     let summaries = agent::summarize_observations(&phase_state.collected_results);
     let state_before_observe = phase_state.working_state.clone();
     for summary in &summaries {
@@ -3449,7 +3464,7 @@ async fn run_finish_phase(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
 ) -> AgentPhaseControl {
-    let config = ctx.state.config();
+    let config = ctx.config.clone();
     let plan_ready_event = if phase_state.run_mode.is_plan_only() {
         register_pending_plan(ctx, phase_state).await
     } else {
@@ -3496,13 +3511,13 @@ async fn run_finish_phase(
         && config.structured_memory
         && let (Some(queue), Some(session)) = (memory_queue.as_ref(), &snapshot)
     {
-        let fallback_model = session.effective_model(&config.model);
-        let model = config.memory_model_or(fallback_model).to_string();
+        let model = config.memory_model_or(&ctx.model).to_string();
         let excerpt = crate::memory::prefilter_for_memory(&session.messages);
         queue.enqueue(
             session.id.clone(),
             session.workspace.clone(),
             model,
+            config.clone(),
             excerpt,
         );
     }
@@ -3514,7 +3529,7 @@ async fn run_finish_phase(
     // CAS has a side-effect; if it fires but the session is gone, nobody
     // would roll back the cooldown slot.
     if !phase_state.run_mode.is_plan_only()
-        && reflection_runtime_enabled()
+        && reflection_run_snapshot_is_enabled(&config)
         && let Some(ref session) = snapshot
         && let Some((previous_epoch, claimed_epoch)) = try_claim_reflection(
             phase_state.react_ctx.cycles,
@@ -3525,12 +3540,12 @@ async fn run_finish_phase(
         if !reflection_runtime_matches(reflection_generation) {
             rollback_reflection_claim(previous_epoch, claimed_epoch);
         } else {
-            let config = ctx.state.config();
+            let config = ctx.config.clone();
             let http = ctx.state.http.clone();
             let sessions = ctx.state.sessions.clone();
             let session_id = session.id.clone();
             let workspace = session.workspace.clone();
-            let fallback_model = session.effective_model(&config.model).to_string();
+            let fallback_model = ctx.model.clone();
             let model = config.reflection_model_or(&fallback_model).to_string();
             let messages = crate::memory::prefilter_for_memory(&session.messages);
             let cycles = phase_state.react_ctx.cycles;
@@ -3665,6 +3680,7 @@ pub(crate) async fn run_agent_session(
     stop_requested: &Arc<AtomicBool>,
     run_mode: AgentRunMode,
     reservation: Option<AgentRunReservation>,
+    model_snapshot: Option<crate::SessionModelSnapshot>,
 ) -> AgentRunOutcome {
     let show_react = {
         let sessions = state.sessions.lock().await;
@@ -3705,11 +3721,38 @@ pub(crate) async fn run_agent_session(
             }
         },
     };
+    let model_snapshot = match model_snapshot {
+        Some(snapshot) if snapshot.explicit => Some(snapshot),
+        Some(_) => None,
+        None => crate::session_model_snapshot(state, current_session_id)
+            .await
+            .filter(|snapshot| snapshot.explicit),
+    };
+    let Some(model_snapshot) = model_snapshot else {
+        release_agent_run_reservation(state, current_session_id, &reservation).await;
+        let _ = live_send(
+            live_tx,
+            json!({
+                "type":"error",
+                "content":"Configure an explicit model before starting an Agent run.",
+                "dismissible":true,
+            }),
+        )
+        .await;
+        return AgentRunOutcome {
+            rerun_agent: false,
+            shutting_down: false,
+            run_stopped: false,
+            run_failed: true,
+        };
+    };
     let run_cancel = reservation.run_cancel;
     let deferred_interventions = reservation.deferred_interventions;
 
     let ctx = AgentRunCtx {
         state,
+        config: model_snapshot.config,
+        model: model_snapshot.model,
         current_session_id,
         cancel,
         live_tx,

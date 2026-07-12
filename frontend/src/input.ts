@@ -12,6 +12,14 @@ import {
   type SlashCommandSpec,
 } from './slashCommands.js';
 import { tr } from './i18n.js';
+import { renderSessionDrawer } from './renderers/sessions.js';
+import {
+  areGroupMessageTargetsModelReady,
+  beginComposerSessionTransition,
+  canBypassComposerModelGate,
+  isComposerModelReady,
+  syncComposerAvailability,
+} from './composerAvailability.js';
 
 // Guard: prevent double-registration on Vite HMR re-execution of main.ts.
 let _listenerInit = false;
@@ -40,6 +48,7 @@ function applySlashCommandSuggestion(spec: SlashCommandSpec) {
   dom.input.style.height = 'auto';
   dom.input.style.height = Math.min(dom.input.scrollHeight, 120) + 'px';
   closeSlashCommandMenu();
+  syncComposerAvailability();
   syncToolDrawerBounds();
 }
 
@@ -215,11 +224,13 @@ function handleSlashCommandKeydown(e: KeyboardEvent): boolean {
 
 export function send() {
   if (!state.ws || state.ws.readyState !== 1) return;
+  if (state.sessionSwitchInFlight || state.sessionIdentityMutationInFlight) return;
 
   const text = dom.input.value.trim();
   if (!text && state.pendingImages.length === 0) return;
 
   if (state.activeGroupId) {
+    if (state.imageUploadInFlight) return;
     if (text.startsWith('/') && state.pendingImages.length === 0) {
       addSystem(tr('group.slashUnsupported'));
       return;
@@ -238,6 +249,7 @@ export function send() {
       addSystem(tr('group.selectMember'));
       return;
     }
+    if (!areGroupMessageTargetsModelReady(text)) return;
     state.ws.send(
       JSON.stringify({
         type: 'group_message',
@@ -255,6 +267,7 @@ export function send() {
     dom.input.value = '';
     dom.input.style.height = 'auto';
     closeSlashCommandMenu();
+    syncComposerAvailability();
     syncToolDrawerBounds();
     return;
   }
@@ -269,14 +282,32 @@ export function send() {
       addSystem(tr('slash.busyLimited'));
       return;
     }
+    const commandName = commandText.split(/\s+/, 1)[0].toLowerCase();
+    const targetSessionId =
+      commandName === '/switch' ? commandText.trim().split(/\s+/, 2)[1] || '' : '';
+    if (targetSessionId && (state.composerSessionIdentityPending || state.imageUploadInFlight)) {
+      return;
+    }
+    const modelGateBypassed = canBypassComposerModelGate(commandText);
+    if (state.imageUploadInFlight && !modelGateBypassed) return;
+    if (!isComposerModelReady() && !modelGateBypassed) return;
+    if (commandName === '/switch') {
+      if (targetSessionId) {
+        beginComposerSessionTransition(true, targetSessionId);
+        renderSessionDrawer();
+      }
+    }
     sendCmd(commandText);
     pushInputHistory(commandText);
     dom.input.value = '';
     dom.input.style.height = 'auto';
     closeSlashCommandMenu();
+    syncComposerAvailability();
     syncToolDrawerBounds();
     return;
   }
+
+  if (state.imageUploadInFlight || !isComposerModelReady()) return;
 
   const hasImages = state.pendingImages.length > 0;
   const effectiveImages = state.busy ? [] : state.pendingImages.slice();
@@ -388,12 +419,14 @@ export function initInputListeners() {
       }
       dom.input.style.height = 'auto';
       dom.input.style.height = Math.min(dom.input.scrollHeight, 120) + 'px';
+      syncComposerAvailability();
     }
   });
   dom.input.addEventListener('input', () => {
     dom.input.style.height = 'auto';
     dom.input.style.height = Math.min(dom.input.scrollHeight, 120) + 'px';
     renderSlashCommandMenu();
+    syncComposerAvailability();
     syncToolDrawerBounds();
   });
   dom.input.addEventListener('focus', () => {

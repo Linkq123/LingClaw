@@ -184,6 +184,11 @@ export interface AppConfig {
 export interface ConfigApiResponse {
   config?: AppConfig;
   path?: string;
+  environmentModelConfigured?: boolean;
+  explicitPrimaryModelConfigured?: boolean;
+  configuredModelsAvailable?: boolean;
+  configRevision?: number;
+  configFileEtag?: string;
   parse_error?: string;
   raw?: string;
   error?: string;

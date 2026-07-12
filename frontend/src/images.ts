@@ -2,6 +2,8 @@ import { dom, state } from './state.js';
 import { addSystem } from './renderers/chat.js';
 import { tr } from './i18n.js';
 import { createIcon } from './icons.js';
+import { syncComposerAvailability } from './composerAvailability.js';
+import { renderSessionDrawer } from './renderers/sessions.js';
 
 // Guard: prevent double-registration on Vite HMR re-execution of main.ts.
 let _listenerInit = false;
@@ -31,6 +33,7 @@ export async function ensureUploadTokenInternal(forceRefresh: boolean): Promise<
           throw new Error('upload token missing');
         }
         if (requestSeq === state.uploadTokenRequestSeq) {
+          updateS3ConfigIdentity(data.s3_config_id, true);
           state.uploadToken = data.upload_token;
         }
         return data.upload_token;
@@ -46,9 +49,30 @@ export async function ensureUploadTokenInternal(forceRefresh: boolean): Promise<
 
 // ── Image Attachment ──
 
+function attachmentChangesBlocked(): boolean {
+  return Boolean(
+    state.sessionSwitchInFlight ||
+    state.sessionIdentityMutationInFlight ||
+    state.composerSessionTransitionPending ||
+    state.composerSessionIdentityPending ||
+    state.imageUploadInFlight,
+  );
+}
+
 export function updateAttachButton() {
+  const sessionTransitionBlocked = Boolean(
+    state.sessionSwitchInFlight ||
+    state.sessionIdentityMutationInFlight ||
+    state.composerSessionTransitionPending ||
+    state.composerSessionIdentityPending,
+  );
+  const changesBlocked = attachmentChangesBlocked();
   if (dom.attachBtn) dom.attachBtn.style.display = '';
-  if (dom.attachLocalBtn) dom.attachLocalBtn.hidden = !(state.imageCapable && state.s3Capable);
+  if (dom.attachBtn) dom.attachBtn.disabled = changesBlocked;
+  if (dom.attachLocalBtn) {
+    dom.attachLocalBtn.hidden = changesBlocked || !(state.imageCapable && state.s3Capable);
+  }
+  if (sessionTransitionBlocked) closeAttachPopup();
   syncPlanModeToggle();
   if (!state.imageCapable && state.pendingImages.length > 0) {
     state.pendingImages = [];
@@ -71,10 +95,10 @@ function isUploadedPendingImage(image) {
   return !!(image && (image.object_key || image.attachment_token));
 }
 
-export function dropUnavailablePendingUploads(notify = false) {
-  if (state.pendingImages.length === 0) return;
+export function dropUnavailablePendingUploads(notify = false): boolean {
+  if (state.pendingImages.length === 0) return false;
   const keptImages = state.pendingImages.filter((image) => !isUploadedPendingImage(image));
-  if (keptImages.length === state.pendingImages.length) return;
+  if (keptImages.length === state.pendingImages.length) return false;
   state.pendingImages = keptImages;
   renderImagePreviews();
   closeAttachPopup();
@@ -82,6 +106,32 @@ export function dropUnavailablePendingUploads(notify = false) {
   if (notify) {
     addSystem(tr('composer.uploadUnavailable'));
   }
+  return true;
+}
+
+export function updateS3ConfigIdentity(value: unknown, notify = false): boolean {
+  if (value !== null && typeof value !== 'string') return false;
+  const nextId = typeof value === 'string' ? value : '';
+  const changed = state.s3ConfigId.length > 0 && state.s3ConfigId !== nextId;
+  state.s3ConfigId = nextId;
+  if (changed) {
+    const dropped = dropUnavailablePendingUploads(false);
+    if (dropped && notify) addSystem(tr('composer.uploadConfigChanged'));
+  }
+  return changed;
+}
+
+export function syncRestoredSessionCapabilities(restored: boolean): void {
+  if (!restored) return;
+  if (state.s3Capable) {
+    void ensureUploadTokenInternal(true).catch(() => {});
+  } else {
+    state.uploadToken = '';
+    state.uploadTokenPromise = null;
+    dropUnavailablePendingUploads(false);
+  }
+  renderImagePreviews();
+  updateAttachButton();
 }
 
 export function closeAttachPopup() {
@@ -93,6 +143,10 @@ export function closeAttachPopup() {
 
 export function openAttachPopup() {
   if (!dom.attachPopup) return;
+  if (attachmentChangesBlocked()) {
+    closeAttachPopup();
+    return;
+  }
   updateAttachButton();
   if (dom.attachMenu) dom.attachMenu.style.display = 'flex';
   if (dom.attachUrlInput) dom.attachUrlInput.style.display = 'none';
@@ -110,6 +164,7 @@ export function toggleAttachPopup() {
 }
 
 export function addImageUrl(url) {
+  if (attachmentChangesBlocked()) return;
   if (!url || !url.trim()) return;
   const trimmed = url.trim();
   let parsed;
@@ -151,83 +206,162 @@ export function addImageUrl(url) {
 }
 
 export async function uploadLocalImages(files) {
-  if (!files || files.length === 0) return;
-  if (dom.attachUploadStatus) {
-    if (dom.attachMenu) dom.attachMenu.style.display = 'none';
-    if (dom.attachUrlInput) dom.attachUrlInput.style.display = 'none';
-    dom.attachUploadStatus.style.display = 'flex';
+  if (!files || files.length === 0) {
+    return;
   }
-  let token;
-  try {
-    token = await ensureUploadToken();
-  } catch (e) {
-    addSystem(tr('composer.uploadFailed', { error: e.message }));
-    closeAttachPopup();
+  if (attachmentChangesBlocked() || !state.imageCapable || !state.s3Capable) {
     if (dom.imageFileInput) dom.imageFileInput.value = '';
     return;
   }
-  const formData = new FormData();
-  for (const file of files) {
-    formData.append('file', file);
-  }
+  const uploadContext = {
+    sessionId: state.activeSessionId,
+    groupId: state.activeGroupId,
+    socket: state.ws,
+    s3ConfigId: state.s3ConfigId,
+  };
+  const uploadContextIsCurrent = () =>
+    state.activeSessionId === uploadContext.sessionId &&
+    state.activeGroupId === uploadContext.groupId &&
+    state.ws === uploadContext.socket &&
+    state.s3ConfigId === uploadContext.s3ConfigId &&
+    (!uploadContext.socket || uploadContext.socket.readyState === 1) &&
+    !state.sessionSwitchInFlight &&
+    !state.sessionIdentityMutationInFlight &&
+    !state.composerSessionTransitionPending &&
+    !state.composerSessionIdentityPending &&
+    state.imageCapable &&
+    state.s3Capable;
+  const reportChangedUploadContext = () => {
+    addSystem(tr('composer.uploadContextChanged'));
+  };
+  state.imageUploadInFlight = true;
+  syncComposerAvailability();
+  updateAttachButton();
+  renderSessionDrawer();
   try {
-    let resp = await fetch('/api/upload-images', {
-      method: 'POST',
-      headers: { 'X-LingClaw-Upload-Token': token },
-      body: formData,
-    });
-    if (resp.status === 403) {
-      token = await ensureUploadTokenInternal(true);
-      resp = await fetch('/api/upload-images', {
+    if (dom.attachUploadStatus) {
+      if (dom.attachMenu) dom.attachMenu.style.display = 'none';
+      if (dom.attachUrlInput) dom.attachUrlInput.style.display = 'none';
+      dom.attachUploadStatus.style.display = 'flex';
+    }
+    let token;
+    try {
+      token = await ensureUploadToken();
+    } catch (e) {
+      if (uploadContextIsCurrent()) {
+        addSystem(tr('composer.uploadFailed', { error: e.message }));
+      } else {
+        reportChangedUploadContext();
+      }
+      return;
+    }
+    if (!uploadContext.s3ConfigId && state.s3ConfigId) {
+      uploadContext.s3ConfigId = state.s3ConfigId;
+    }
+    if (!uploadContextIsCurrent()) {
+      reportChangedUploadContext();
+      return;
+    }
+    const formData = new FormData();
+    for (const file of files) {
+      formData.append('file', file);
+    }
+    try {
+      let resp = await fetch('/api/upload-images', {
         method: 'POST',
         headers: { 'X-LingClaw-Upload-Token': token },
         body: formData,
       });
-    }
-    if (!resp.ok) {
+      if (!uploadContextIsCurrent()) {
+        reportChangedUploadContext();
+        return;
+      }
       if (resp.status === 403) {
-        state.uploadToken = '';
-      }
-      const errText = await resp.text().catch(() => resp.statusText);
-      addSystem(tr('composer.uploadFailed', { error: errText }));
-      closeAttachPopup();
-      if (dom.imageFileInput) dom.imageFileInput.value = '';
-      return;
-    }
-    const data = await resp.json();
-    if (data.images && data.images.length > 0) {
-      for (const image of data.images) {
-        state.pendingImages.push({
-          url: image.url,
-          object_key: image.object_key,
-          attachment_token: image.attachment_token,
+        token = await ensureUploadTokenInternal(true);
+        if (!uploadContextIsCurrent()) {
+          reportChangedUploadContext();
+          return;
+        }
+        resp = await fetch('/api/upload-images', {
+          method: 'POST',
+          headers: { 'X-LingClaw-Upload-Token': token },
+          body: formData,
         });
+        if (!uploadContextIsCurrent()) {
+          reportChangedUploadContext();
+          return;
+        }
       }
-      renderImagePreviews();
-    } else if (data.urls && data.urls.length > 0) {
-      for (const url of data.urls) {
-        state.pendingImages.push({ url });
+      if (!resp.ok) {
+        if (resp.status === 403) {
+          state.uploadToken = '';
+        }
+        const errText = await resp.text().catch(() => resp.statusText);
+        addSystem(tr('composer.uploadFailed', { error: errText }));
+        closeAttachPopup();
+        if (dom.imageFileInput) dom.imageFileInput.value = '';
+        return;
       }
-      renderImagePreviews();
+      const data = await resp.json();
+      const responseS3ConfigId = typeof data.s3_config_id === 'string' ? data.s3_config_id : '';
+      if (!uploadContextIsCurrent()) {
+        reportChangedUploadContext();
+        return;
+      }
+      if (!responseS3ConfigId || responseS3ConfigId !== uploadContext.s3ConfigId) {
+        await ensureUploadTokenInternal(true).catch(() => {});
+        reportChangedUploadContext();
+        return;
+      }
+      if (data.images && data.images.length > 0) {
+        if (data.images.some((image) => image.s3_config_id !== responseS3ConfigId)) {
+          reportChangedUploadContext();
+          return;
+        }
+        for (const image of data.images) {
+          state.pendingImages.push({
+            url: image.url,
+            object_key: image.object_key,
+            attachment_token: image.attachment_token,
+            s3_config_id: image.s3_config_id,
+          });
+        }
+        renderImagePreviews();
+      } else if (data.urls && data.urls.length > 0) {
+        for (const url of data.urls) {
+          state.pendingImages.push({ url });
+        }
+        renderImagePreviews();
+      }
+      if (data.errors && data.errors.length > 0) {
+        for (const err of data.errors) {
+          addSystem(tr('composer.uploadError', { error: err }));
+        }
+      }
+      if (!data.urls || data.urls.length === 0) {
+        if (!data.errors || data.errors.length === 0) {
+          addSystem(tr('composer.noImagesUploaded'));
+        }
+      }
+    } catch (e) {
+      if (uploadContextIsCurrent()) {
+        addSystem(tr('composer.uploadFailed', { error: e.message }));
+      } else {
+        reportChangedUploadContext();
+      }
     }
-    if (data.errors && data.errors.length > 0) {
-      for (const err of data.errors) {
-        addSystem(tr('composer.uploadError', { error: err }));
-      }
-    }
-    if (!data.urls || data.urls.length === 0) {
-      if (!data.errors || data.errors.length === 0) {
-        addSystem(tr('composer.noImagesUploaded'));
-      }
-    }
-  } catch (e) {
-    addSystem(tr('composer.uploadFailed', { error: e.message }));
+  } finally {
+    closeAttachPopup();
+    if (dom.imageFileInput) dom.imageFileInput.value = '';
+    state.imageUploadInFlight = false;
+    syncComposerAvailability();
+    updateAttachButton();
+    renderSessionDrawer();
   }
-  closeAttachPopup();
-  if (dom.imageFileInput) dom.imageFileInput.value = '';
 }
 
 export function removeImage(index) {
+  if (attachmentChangesBlocked()) return;
   state.pendingImages.splice(index, 1);
   renderImagePreviews();
 }
@@ -237,6 +371,7 @@ export function renderImagePreviews() {
   dom.imagePreviewBar.innerHTML = '';
   if (state.pendingImages.length === 0) {
     dom.imagePreviewBar.style.display = 'none';
+    syncComposerAvailability();
     return;
   }
   dom.imagePreviewBar.style.display = 'flex';
@@ -259,6 +394,7 @@ export function renderImagePreviews() {
     removeBtn.className = 'remove-btn';
     removeBtn.setAttribute('data-i18n-aria-label', 'composer.removeImage');
     removeBtn.setAttribute('aria-label', tr('composer.removeImage'));
+    removeBtn.disabled = attachmentChangesBlocked();
     removeBtn.appendChild(createIcon('close'));
     removeBtn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -268,6 +404,7 @@ export function renderImagePreviews() {
     item.appendChild(removeBtn);
     dom.imagePreviewBar.appendChild(item);
   });
+  syncComposerAvailability();
 }
 
 export function initImageListeners() {

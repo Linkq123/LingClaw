@@ -8,7 +8,6 @@ use std::{
 use crate::providers;
 
 pub(crate) const DEFAULT_PORT: u16 = 18989;
-
 // ── Config ──────────────────────────────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -129,6 +128,13 @@ impl Provider {
 
 #[derive(Clone)]
 pub(crate) struct Config {
+    /// True only when the primary Agent model came from validated JSON config or
+    /// a valid LINGCLAW_MODEL value. The built-in fallback never sets this.
+    pub(crate) explicit_primary_model_configured: bool,
+    /// Whether the raw JSON declared at least one provider before runtime
+    /// environment expansion and sanitization. This keeps an unavailable
+    /// catalog from silently degrading Session overrides into legacy models.
+    pub(crate) provider_catalog_declared: bool,
     pub(crate) api_key: String,
     pub(crate) api_base: String,
     pub(crate) model: String,
@@ -195,6 +201,39 @@ pub(crate) fn format_sub_agent_timeout(timeout: Duration) -> String {
 fn trimmed_nonempty(value: Option<String>) -> Option<String> {
     let value = value?.trim().to_string();
     if value.is_empty() { None } else { Some(value) }
+}
+
+fn selected_primary_model(
+    json_primary: Option<String>,
+    environment_primary: Option<String>,
+) -> (String, bool) {
+    let json_primary = trimmed_nonempty(json_primary);
+    let environment_primary = trimmed_nonempty(environment_primary);
+    let explicit = json_primary.is_some() || environment_primary.is_some();
+    (
+        json_primary
+            .or(environment_primary)
+            .unwrap_or_else(|| "gpt-4o-mini".to_string()),
+        explicit,
+    )
+}
+
+fn validated_explicit_primary_model(
+    model: &str,
+    source_is_explicit: bool,
+    providers: &HashMap<String, JsonProviderConfig>,
+    require_catalog_match_for_plain: bool,
+) -> Result<bool, String> {
+    if !source_is_explicit {
+        return Ok(false);
+    }
+    validate_agent_model_ref_with_policy(
+        "primary",
+        model,
+        providers,
+        require_catalog_match_for_plain,
+    )?;
+    Ok(true)
 }
 
 const SUB_AGENT_MODEL_FIELD_PREFIX: &str = "sub-agent-";
@@ -523,7 +562,8 @@ fn validate_mcp_server_cwd(name: &str, cwd: &str, workspace: &Path) -> Result<()
 
 impl Config {
     pub(crate) fn load() -> Self {
-        let json_cfg = sanitize_loaded_json_config(load_config_file());
+        let (json_cfg, provider_catalog_declared) =
+            sanitize_loaded_json_config_with_status(load_config_file());
         let settings = json_cfg.settings.unwrap_or_default();
         let settings_has_provider = settings.provider.is_some();
         let settings_has_api_key = settings.api_key.is_some();
@@ -565,7 +605,10 @@ impl Config {
             .agents
             .and_then(|a| a.defaults)
             .and_then(|d| d.model);
-        let default_from_json = model_config.as_ref().and_then(|m| m.primary.clone());
+        let json_primary_model = model_config.as_ref().and_then(|m| m.primary.clone());
+        let primary_model_from_json = trimmed_nonempty(json_primary_model.clone()).is_some();
+        let (model, primary_model_is_explicit) =
+            selected_primary_model(json_primary_model, std::env::var("LINGCLAW_MODEL").ok());
         let fast_model = model_config
             .as_ref()
             .and_then(|m| m.fast.clone())
@@ -606,10 +649,6 @@ impl Config {
             .as_ref()
             .and_then(|m| m.context.clone())
             .or_else(|| std::env::var("LINGCLAW_CONTEXT_MODEL").ok());
-
-        let model = default_from_json
-            .or_else(|| std::env::var("LINGCLAW_MODEL").ok())
-            .unwrap_or_else(|| "gpt-4o-mini".to_string());
 
         // API base: legacy settings.apiBase → env OPENAI_API_BASE → default
         let settings_api_base = settings.api_base.clone();
@@ -660,6 +699,8 @@ impl Config {
         };
 
         let mut config = Self {
+            explicit_primary_model_configured: primary_model_is_explicit,
+            provider_catalog_declared,
             api_key,
             api_base,
             model,
@@ -765,6 +806,18 @@ impl Config {
             !settings_has_api_base,
             !settings_has_api_key,
         );
+        match validated_explicit_primary_model(
+            &config.model,
+            config.explicit_primary_model_configured,
+            &config.providers,
+            primary_model_from_json,
+        ) {
+            Ok(configured) => config.explicit_primary_model_configured = configured,
+            Err(error) => {
+                eprintln!("WARNING: Ignoring invalid explicit primary model: {error}");
+                config.explicit_primary_model_configured = false;
+            }
+        }
         config
     }
 
@@ -1043,7 +1096,52 @@ impl Config {
         self.resolve_model(model_ref).provider.label().to_string()
     }
 
-    /// List all available models: from config file providers + the default env model.
+    pub(crate) fn explicit_primary_model_ref(&self) -> Option<String> {
+        if !self.explicit_primary_model_configured {
+            return None;
+        }
+        if let Ok(canonical) = self.canonical_model_ref(&self.model) {
+            return Some(canonical);
+        }
+
+        let primary = self.model.trim();
+        if primary.is_empty() || primary.contains('/') {
+            return None;
+        }
+        let catalog_matches = self
+            .providers
+            .values()
+            .filter(|provider| provider.models.iter().any(|model| model.id == primary))
+            .count();
+        // Config::load deliberately keeps a legacy LINGCLAW_MODEL plain id
+        // valid when JSON providers exist. Preserve only the no-catalog-match
+        // case here; ambiguous catalog ids must still use a provider prefix.
+        (catalog_matches == 0).then(|| primary.to_string())
+    }
+
+    pub(crate) fn selectable_model_ref(&self, model_ref: &str) -> Result<String, String> {
+        let trimmed = model_ref.trim();
+        if self.provider_catalog_declared && self.providers.is_empty() {
+            if let Some(primary) = self.explicit_primary_model_ref()
+                && self.canonical_model_ref(trimmed).ok().as_deref() == Some(primary.as_str())
+            {
+                return Ok(primary);
+            }
+            return Err(
+                "Configured model providers are unavailable. Restore their runtime configuration before selecting a Session model."
+                    .to_string(),
+            );
+        }
+        match self.canonical_model_ref(model_ref) {
+            Ok(canonical) => Ok(canonical),
+            Err(_) if self.explicit_primary_model_ref().as_deref() == Some(model_ref.trim()) => {
+                Ok(model_ref.trim().to_string())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// List selectable catalog entries plus an explicitly configured primary model.
     pub(crate) fn available_models(&self) -> Vec<String> {
         let mut models: Vec<String> = Vec::new();
         for (prov_name, pc) in &self.providers {
@@ -1051,12 +1149,10 @@ impl Config {
                 models.push(format!("{prov_name}/{}", m.id));
             }
         }
-        if models.is_empty() {
-            models.push(self.model.clone());
-        } else if let Ok(canonical) = self.canonical_model_ref(&self.model)
-            && !models.iter().any(|m| m == &canonical)
+        if let Some(primary) = self.explicit_primary_model_ref()
+            && !models.iter().any(|m| m == &primary)
         {
-            models.push(canonical);
+            models.push(primary);
         }
         models
     }
@@ -1123,6 +1219,9 @@ impl Config {
         }
 
         if let Some((prov_name, model_id)) = trimmed.split_once('/') {
+            if model_id.trim().is_empty() {
+                return Err("Model id cannot be empty.".into());
+            }
             if self.providers.is_empty() {
                 let provider = prov_name.to_ascii_lowercase();
                 if provider == "openai"
@@ -1142,7 +1241,7 @@ impl Config {
                     "Unknown provider '{prov_name}'. Use /model to list available models."
                 ));
             };
-            if pc.models.iter().any(|m| m.id == model_id) {
+            if pc.models.is_empty() || pc.models.iter().any(|m| m.id == model_id) {
                 return Ok(format!("{prov_name}/{model_id}"));
             }
             return Err(format!(
@@ -1207,11 +1306,20 @@ impl Config {
     }
 }
 
-fn sanitize_loaded_json_config_with_lookup<F>(json_cfg: JsonConfig, lookup: &mut F) -> JsonConfig
+fn sanitize_loaded_json_config_with_lookup_and_status<F>(
+    json_cfg: JsonConfig,
+    lookup: &mut F,
+) -> (JsonConfig, bool)
 where
     F: FnMut(&str) -> Option<String>,
 {
     let mut json_cfg = json_cfg;
+
+    let had_declared_providers = json_cfg
+        .models
+        .as_ref()
+        .and_then(|models| models.providers.as_ref())
+        .is_some_and(|providers| !providers.is_empty());
 
     let mut providers = json_cfg
         .models
@@ -1305,7 +1413,9 @@ where
             let Some(value) = model_ref.as_deref() else {
                 continue;
             };
-            if let Err(error) = validate_agent_model_ref(field, value, &providers) {
+            if let Err(error) =
+                validate_loaded_agent_model_ref(field, value, &providers, had_declared_providers)
+            {
                 eprintln!("WARNING: Ignoring invalid config file entry: {error}");
                 *model_ref = None;
             }
@@ -1319,7 +1429,12 @@ where
                     return false;
                 }
             };
-            if let Err(error) = validate_agent_model_ref(field, model_ref, &providers) {
+            if let Err(error) = validate_loaded_agent_model_ref(
+                field,
+                model_ref,
+                &providers,
+                had_declared_providers,
+            ) {
                 eprintln!("WARNING: Ignoring invalid config file entry: {error}");
                 return false;
             }
@@ -1327,11 +1442,26 @@ where
         });
     }
 
-    json_cfg
+    (json_cfg, had_declared_providers)
 }
 
+#[cfg(test)]
+fn sanitize_loaded_json_config_with_lookup<F>(json_cfg: JsonConfig, lookup: &mut F) -> JsonConfig
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    sanitize_loaded_json_config_with_lookup_and_status(json_cfg, lookup).0
+}
+
+#[cfg(test)]
 fn sanitize_loaded_json_config(json_cfg: JsonConfig) -> JsonConfig {
     sanitize_loaded_json_config_with_lookup(json_cfg, &mut |env_name| std::env::var(env_name).ok())
+}
+
+fn sanitize_loaded_json_config_with_status(json_cfg: JsonConfig) -> (JsonConfig, bool) {
+    sanitize_loaded_json_config_with_lookup_and_status(json_cfg, &mut |env_name| {
+        std::env::var(env_name).ok()
+    })
 }
 
 // ── Config File (lingclaw.json) ──────────────────────────────────────────────
@@ -1554,9 +1684,61 @@ fn validate_agent_model_ref(
     model_ref: &str,
     providers: &HashMap<String, JsonProviderConfig>,
 ) -> Result<(), String> {
+    validate_agent_model_ref_with_policy(field, model_ref, providers, true)
+}
+
+fn validate_loaded_agent_model_ref(
+    field: &str,
+    model_ref: &str,
+    providers: &HashMap<String, JsonProviderConfig>,
+    had_declared_providers: bool,
+) -> Result<(), String> {
+    if had_declared_providers && providers.is_empty() {
+        return Err(format!(
+            "Invalid agents.defaults.model.{field}: model '{model_ref}' cannot be resolved because every declared provider was unavailable after runtime configuration."
+        ));
+    }
+    validate_agent_model_ref(field, model_ref, providers)
+}
+
+fn validate_agent_model_ref_with_policy(
+    field: &str,
+    model_ref: &str,
+    providers: &HashMap<String, JsonProviderConfig>,
+    require_catalog_match_for_plain: bool,
+) -> Result<(), String> {
+    let model_ref = model_ref.trim();
+    if model_ref.is_empty() {
+        return Err(format!(
+            "Invalid agents.defaults.model.{field}: model id cannot be empty."
+        ));
+    }
     let has_configured_providers = !providers.is_empty();
     let Some((provider_name, model_id)) = model_ref.split_once('/') else {
-        return Ok(());
+        if !has_configured_providers || !require_catalog_match_for_plain {
+            return Ok(());
+        }
+
+        let mut matching_providers = providers
+            .iter()
+            .filter(|(_, provider)| provider.models.iter().any(|model| model.id == model_ref))
+            .map(|(provider_name, _)| provider_name.as_str())
+            .collect::<Vec<_>>();
+        matching_providers.sort_unstable();
+        return match matching_providers.as_slice() {
+            [] => Err(format!(
+                "Invalid agents.defaults.model.{field}: unknown model '{model_ref}'. Add it in models.providers first."
+            )),
+            [_] => Ok(()),
+            _ => Err(format!(
+                "Invalid agents.defaults.model.{field}: model '{model_ref}' is ambiguous. Use an explicit provider/model reference (one of: {}).",
+                matching_providers
+                    .iter()
+                    .map(|provider_name| format!("{provider_name}/{model_ref}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        };
     };
     if model_id.trim().is_empty() {
         return Err(format!(

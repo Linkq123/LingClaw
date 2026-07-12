@@ -155,6 +155,54 @@ fn attachment_object_key_tokens_round_trip() {
 }
 
 #[test]
+fn s3_config_identity_is_stable_and_changes_with_storage_settings() {
+    let cfg = S3Config {
+        endpoint: "https://minio.example.test/storage".into(),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    };
+
+    assert_eq!(s3_config_id(&cfg), s3_config_id(&cfg.clone()));
+
+    let mut changed_endpoint = cfg.clone();
+    changed_endpoint.endpoint = "https://replacement.example.test/storage".into();
+    assert_ne!(s3_config_id(&cfg), s3_config_id(&changed_endpoint));
+
+    let mut changed_secret = cfg.clone();
+    changed_secret.secret_key = "replacement-secret-key".into();
+    assert_ne!(s3_config_id(&cfg), s3_config_id(&changed_secret));
+}
+
+#[test]
+fn attachment_tokens_are_bound_to_the_full_s3_configuration() {
+    let cfg = S3Config {
+        endpoint: "https://minio.example.test/storage".into(),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    };
+    let object_key = "images/2026/demo.png";
+    let token = sign_attachment_object_key(&cfg, object_key);
+    let mut changed_cfg = cfg.clone();
+    changed_cfg.endpoint = "https://replacement.example.test/storage".into();
+
+    assert!(!verify_attachment_object_key(
+        &changed_cfg,
+        object_key,
+        &token
+    ));
+}
+
+#[test]
 fn resolve_image_url_presigns_uploaded_s3_objects() {
     let cfg = S3Config {
         endpoint: "https://minio.example.test/storage".into(),

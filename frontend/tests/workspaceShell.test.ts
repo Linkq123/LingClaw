@@ -168,6 +168,11 @@ describe('workspace shell', () => {
     stateModule.initDomRefs();
     stateModule.state.mobileNavigationOpen = false;
     stateModule.state.activeShellPopover = null;
+    stateModule.state.sessionSwitchInFlight = false;
+    stateModule.state.sessionIdentityMutationInFlight = false;
+    stateModule.state.composerSessionTransitionPending = false;
+    stateModule.state.composerSessionIdentityPending = false;
+    stateModule.state.imageUploadInFlight = false;
   });
 
   it('opens mobile navigation without changing the persisted desktop drawer state', () => {

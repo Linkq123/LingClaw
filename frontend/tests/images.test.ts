@@ -1,13 +1,21 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  addImageUrl,
   ensureUploadTokenInternal,
   openAttachPopup,
+  removeImage,
   renderImagePreviews,
   syncPlanModeToggle,
   togglePlanMode,
   updateAttachButton,
+  updateS3ConfigIdentity,
+  uploadLocalImages,
 } from '../src/images.js';
+import {
+  beginComposerSessionTransition,
+  restoreComposerSessionTransition,
+} from '../src/composerAvailability.js';
 import { dom, initDomRefs, state } from '../src/state.js';
 import { setLanguage, translateDom } from '../src/i18n.js';
 
@@ -48,8 +56,14 @@ describe('ensureUploadTokenInternal', () => {
     state.uploadTokenRequestSeq = 0;
     state.imageCapable = false;
     state.s3Capable = false;
+    state.s3ConfigId = '';
     state.planModeEnabled = false;
     state.pendingImages = [];
+    state.imageUploadInFlight = false;
+    state.sessionSwitchInFlight = false;
+    state.sessionIdentityMutationInFlight = false;
+    state.composerSessionIdentityPending = false;
+    state.composerSessionTransitionPending = false;
   });
 
   afterEach(() => {
@@ -61,7 +75,9 @@ describe('ensureUploadTokenInternal', () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockReturnValueOnce(first.promise)
-      .mockResolvedValueOnce(jsonResponse({ upload_token: 'fresh-token' }));
+      .mockResolvedValueOnce(
+        jsonResponse({ upload_token: 'fresh-token', s3_config_id: 'fresh-s3' }),
+      );
     vi.stubGlobal('fetch', fetchMock);
 
     const firstRequest = ensureUploadTokenInternal(false);
@@ -71,11 +87,13 @@ describe('ensureUploadTokenInternal', () => {
 
     await expect(refreshedRequest).resolves.toBe('fresh-token');
     expect(state.uploadToken).toBe('fresh-token');
+    expect(state.s3ConfigId).toBe('fresh-s3');
 
-    first.resolve(jsonResponse({ upload_token: 'stale-token' }));
+    first.resolve(jsonResponse({ upload_token: 'stale-token', s3_config_id: 'stale-s3' }));
 
     await expect(firstRequest).resolves.toBe('stale-token');
     expect(state.uploadToken).toBe('fresh-token');
+    expect(state.s3ConfigId).toBe('fresh-s3');
     expect(state.uploadTokenPromise).toBeNull();
   });
 });
@@ -99,8 +117,14 @@ describe('attachment menu', () => {
     initDomRefs();
     state.imageCapable = false;
     state.s3Capable = false;
+    state.s3ConfigId = '';
     state.planModeEnabled = false;
     state.pendingImages = [];
+    state.imageUploadInFlight = false;
+    state.sessionSwitchInFlight = false;
+    state.sessionIdentityMutationInFlight = false;
+    state.composerSessionIdentityPending = false;
+    state.composerSessionTransitionPending = false;
   });
 
   it('keeps the plus menu visible and only shows image upload when uploads are available', () => {
@@ -114,6 +138,7 @@ describe('attachment menu', () => {
     expect(dom.attachLocalBtn?.hidden).toBe(true);
 
     state.s3Capable = true;
+    state.s3ConfigId = 's3-a';
     updateAttachButton();
     expect(dom.attachLocalBtn?.hidden).toBe(false);
   });
@@ -151,5 +176,264 @@ describe('attachment menu', () => {
     translateDom();
 
     expect(removeButton?.getAttribute('aria-label')).toBe('移除图片');
+  });
+
+  it('preserves the source draft by blocking attachment changes during a Session switch', () => {
+    state.imageCapable = true;
+    state.pendingImages = [{ url: 'https://example.com/source.png' }];
+    beginComposerSessionTransition(true, 'missing-session');
+    updateAttachButton();
+
+    expect(dom.attachBtn?.disabled).toBe(true);
+    addImageUrl('https://example.com/new.png');
+    removeImage(0);
+    expect(state.pendingImages).toEqual([{ url: 'https://example.com/source.png' }]);
+
+    restoreComposerSessionTransition();
+    expect(state.pendingImages).toEqual([{ url: 'https://example.com/source.png' }]);
+  });
+});
+
+describe('local image upload lifecycle', () => {
+  beforeEach(() => {
+    setLanguage('en');
+    document.body.innerHTML = `
+      <div id="chat"></div>
+      <div class="attach-wrapper">
+        <button id="attach-btn"></button>
+        <div id="attach-popup" style="display: none">
+          <div id="attach-menu">
+            <button id="attach-local-btn"></button>
+          </div>
+          <div id="attach-upload-status" style="display: none"></div>
+        </div>
+        <input id="image-file-input" type="file" />
+      </div>
+      <div id="image-preview-bar"></div>
+      <textarea id="input">describe the image</textarea>
+      <button id="send"></button>
+      <p id="composer-availability-status">
+        <span id="composer-availability-message"></span>
+        <button id="composer-availability-retry"></button>
+      </p>
+    `;
+    initDomRefs();
+    state.ws = null;
+    state.activeSessionId = 'main';
+    state.activeGroupId = '';
+    state.sessionSwitchInFlight = false;
+    state.sessionIdentityMutationInFlight = false;
+    state.composerSessionIdentityPending = false;
+    state.composerSessionTransitionPending = false;
+    state.composerModelAvailability = 'ready';
+    state.imageCapable = true;
+    state.s3Capable = true;
+    state.s3ConfigId = 's3-a';
+    state.pendingImages = [];
+    state.imageUploadInFlight = false;
+    state.uploadToken = 'upload-token';
+    state.uploadTokenPromise = null;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('keeps ordinary sending disabled until a successful upload is applied', async () => {
+    const upload = deferredResponse();
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockReturnValue(upload.promise));
+
+    const pending = uploadLocalImages([new File(['image'], 'image.png', { type: 'image/png' })]);
+
+    expect(state.imageUploadInFlight).toBe(true);
+    expect(dom.sendBtn?.disabled).toBe(true);
+    expect(dom.input?.placeholder).toContain('image upload');
+
+    upload.resolve(
+      jsonResponse({
+        s3_config_id: 's3-a',
+        images: [
+          {
+            url: 'https://images.example/uploaded.png',
+            object_key: 'uploads/uploaded.png',
+            attachment_token: 'attachment-token',
+            s3_config_id: 's3-a',
+          },
+        ],
+        urls: ['https://images.example/uploaded.png'],
+      }),
+    );
+    await pending;
+
+    expect(state.imageUploadInFlight).toBe(false);
+    expect(state.pendingImages).toEqual([
+      {
+        url: 'https://images.example/uploaded.png',
+        object_key: 'uploads/uploaded.png',
+        attachment_token: 'attachment-token',
+        s3_config_id: 's3-a',
+      },
+    ]);
+    expect(dom.sendBtn?.disabled).toBe(false);
+  });
+
+  it('clears a rejected file selection so the same file can be selected again', async () => {
+    const input = dom.imageFileInput!;
+    Object.defineProperty(input, 'value', {
+      configurable: true,
+      writable: true,
+      value: 'C:\\fakepath\\image.png',
+    });
+    state.sessionSwitchInFlight = true;
+
+    await uploadLocalImages([new File(['image'], 'image.png', { type: 'image/png' })]);
+
+    expect(input.value).toBe('');
+    expect(state.imageUploadInFlight).toBe(false);
+  });
+
+  it('restores composer availability when an upload request fails', async () => {
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockRejectedValue(new Error('network down')));
+
+    await uploadLocalImages([new File(['image'], 'image.png', { type: 'image/png' })]);
+
+    expect(state.imageUploadInFlight).toBe(false);
+    expect(state.pendingImages).toEqual([]);
+    expect(dom.sendBtn?.disabled).toBe(false);
+    expect(dom.chat?.textContent).toContain('network down');
+  });
+
+  it('discards a completed upload after the active capability is revoked', async () => {
+    const upload = deferredResponse();
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockReturnValue(upload.promise));
+    const pending = uploadLocalImages([new File(['image'], 'image.png', { type: 'image/png' })]);
+
+    state.s3Capable = false;
+    upload.resolve(
+      jsonResponse({
+        s3_config_id: 's3-a',
+        images: [
+          {
+            url: 'https://images.example/stale.png',
+            object_key: 'uploads/stale.png',
+            attachment_token: 'attachment-token',
+            s3_config_id: 's3-a',
+          },
+        ],
+        urls: ['https://images.example/stale.png'],
+      }),
+    );
+    await pending;
+
+    expect(state.pendingImages).toEqual([]);
+    expect(dom.chat?.textContent).toContain('upload was discarded');
+  });
+
+  it('discards a completed upload after its source socket disconnects', async () => {
+    const upload = deferredResponse();
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockReturnValue(upload.promise));
+    const sourceSocket = { readyState: 1 } as WebSocket;
+    state.ws = sourceSocket;
+    const pending = uploadLocalImages([new File(['image'], 'image.png', { type: 'image/png' })]);
+
+    Object.assign(sourceSocket, { readyState: 3 });
+    state.activeSessionId = 'main-fallback';
+    upload.resolve(
+      jsonResponse({
+        s3_config_id: 's3-a',
+        images: [
+          {
+            url: 'https://images.example/stale.png',
+            object_key: 'uploads/stale.png',
+            attachment_token: 'attachment-token',
+            s3_config_id: 's3-a',
+          },
+        ],
+        urls: ['https://images.example/stale.png'],
+      }),
+    );
+    await pending;
+
+    expect(state.pendingImages).toEqual([]);
+    expect(dom.chat?.textContent).toContain('upload was discarded');
+  });
+
+  it('drops only trusted pending uploads when the S3 configuration changes', () => {
+    state.pendingImages = [
+      { url: 'https://example.com/remote.png' },
+      {
+        url: 'https://images.example/uploaded.png',
+        object_key: 'uploads/uploaded.png',
+        attachment_token: 'attachment-token',
+        s3_config_id: 's3-a',
+      },
+    ];
+    renderImagePreviews();
+
+    expect(updateS3ConfigIdentity('s3-b', true)).toBe(true);
+
+    expect(state.pendingImages).toEqual([{ url: 'https://example.com/remote.png' }]);
+    expect(dom.chat?.textContent).toContain('storage settings changed');
+  });
+
+  it('discards an in-flight upload when the S3 configuration changes', async () => {
+    const upload = deferredResponse();
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockReturnValue(upload.promise));
+    const pending = uploadLocalImages([new File(['image'], 'image.png', { type: 'image/png' })]);
+
+    updateS3ConfigIdentity('s3-b');
+    upload.resolve(
+      jsonResponse({
+        s3_config_id: 's3-a',
+        images: [
+          {
+            url: 'https://images.example/stale.png',
+            object_key: 'uploads/stale.png',
+            attachment_token: 'attachment-token',
+            s3_config_id: 's3-a',
+          },
+        ],
+        urls: ['https://images.example/stale.png'],
+      }),
+    );
+    await pending;
+
+    expect(state.pendingImages).toEqual([]);
+    expect(dom.chat?.textContent).toContain('upload was discarded');
+  });
+
+  it('refreshes the client configuration before unlocking after an upload identity mismatch', async () => {
+    const upload = deferredResponse();
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockReturnValueOnce(upload.promise)
+      .mockResolvedValueOnce(
+        jsonResponse({ upload_token: 'replacement-token', s3_config_id: 's3-b' }),
+      );
+    vi.stubGlobal('fetch', fetchMock);
+    const pending = uploadLocalImages([new File(['image'], 'image.png', { type: 'image/png' })]);
+
+    upload.resolve(
+      jsonResponse({
+        s3_config_id: 's3-b',
+        images: [
+          {
+            url: 'https://images.example/new-storage.png',
+            object_key: 'uploads/new-storage.png',
+            attachment_token: 'replacement-token',
+            s3_config_id: 's3-b',
+          },
+        ],
+        urls: ['https://images.example/new-storage.png'],
+      }),
+    );
+    await pending;
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(state.s3ConfigId).toBe('s3-b');
+    expect(state.uploadToken).toBe('replacement-token');
+    expect(state.pendingImages).toEqual([]);
+    expect(state.imageUploadInFlight).toBe(false);
+    expect(dom.chat?.textContent).toContain('upload was discarded');
   });
 });

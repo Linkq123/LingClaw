@@ -13,6 +13,7 @@ use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -118,6 +119,19 @@ pub(crate) fn session_ids_match(a: &str, b: &str) -> bool {
 const INBOUND_BUFFER_CAPACITY: usize = 128;
 static CONFIG_FILE_LOCK: std::sync::LazyLock<tokio::sync::RwLock<()>> =
     std::sync::LazyLock::new(|| tokio::sync::RwLock::new(()));
+/// Process-local, monotonically increasing runtime config revision. The value is
+/// paired with `AppState.config` while holding the same mutex so payload builders
+/// can never combine a Config snapshot with a revision from another update.
+static CONFIG_REVISION: std::sync::LazyLock<AtomicU64> = std::sync::LazyLock::new(|| {
+    let epoch_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    AtomicU64::new(epoch_millis.max(1))
+});
+#[cfg(test)]
+static CONFIG_REVISION_BUMPS_BY_STATE: std::sync::LazyLock<std::sync::Mutex<HashMap<usize, u64>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 // ── Data Models ──────────────────────────────────────────────────────────────
 
@@ -128,6 +142,9 @@ struct ImageAttachment {
     /// presigned URLs can be generated for history replay and provider calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     s3_object_key: Option<String>,
+    /// Opaque identity of the S3 configuration that accepted this upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    s3_config_id: Option<String>,
     /// Persisted path to a cached base64 file inside the session workspace.
     /// This keeps historical Ollama images available across restarts without
     /// bloating the session JSON itself.
@@ -462,9 +479,71 @@ impl Session {
     fn effective_model<'a>(&'a self, default: &'a str) -> &'a str {
         self.model_override.as_deref().unwrap_or(default)
     }
+
+    fn validated_model_override(&self, config: &Config) -> Option<String> {
+        self.model_override
+            .as_deref()
+            .and_then(|model| config.selectable_model_ref(model).ok())
+    }
+
+    fn has_explicit_model_override(&self, config: &Config) -> bool {
+        self.validated_model_override(config).is_some()
+    }
+
+    fn model_configuration(&self, config: &Config) -> (String, bool, bool) {
+        if self.model_override.is_some() {
+            match self.validated_model_override(config) {
+                Some(model) => (model, true, true),
+                None => (
+                    self.model_override.clone().unwrap_or_default(),
+                    false,
+                    false,
+                ),
+            }
+        } else {
+            (
+                config.model.clone(),
+                false,
+                config.explicit_primary_model_configured,
+            )
+        }
+    }
+
+    fn effective_model_configured(&self, config: &Config) -> bool {
+        self.model_configuration(config).2
+    }
 }
 
 const UPLOAD_TOKEN_HEADER: &str = "x-lingclaw-upload-token";
+
+#[derive(Clone)]
+pub(crate) struct SessionModelSnapshot {
+    pub(crate) config: Arc<Config>,
+    pub(crate) model: String,
+    pub(crate) explicit: bool,
+}
+
+async fn session_model_snapshot(
+    state: &AppState,
+    session_id: &str,
+) -> Option<SessionModelSnapshot> {
+    let _model_status_guard = CONFIG_FILE_LOCK.read().await;
+    let config = state.config();
+    let sessions = state.sessions.lock().await;
+    let session = sessions.get(session_id)?;
+    let (model, _, explicit) = session.model_configuration(&config);
+    Some(SessionModelSnapshot {
+        model,
+        explicit,
+        config,
+    })
+}
+
+async fn session_has_explicit_model(state: &AppState, session_id: &str) -> bool {
+    session_model_snapshot(state, session_id)
+        .await
+        .is_some_and(|snapshot| snapshot.explicit)
+}
 
 struct AppState {
     config: std::sync::Mutex<Arc<Config>>,
@@ -490,38 +569,92 @@ struct AppState {
 }
 
 impl AppState {
+    fn next_config_revision(&self) -> u64 {
+        let revision = CONFIG_REVISION.fetch_add(1, Ordering::AcqRel) + 1;
+        #[cfg(test)]
+        {
+            let state_key = self as *const Self as usize;
+            let mut counts = CONFIG_REVISION_BUMPS_BY_STATE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *counts.entry(state_key).or_default() += 1;
+        }
+        revision
+    }
+
+    #[cfg(test)]
+    fn config_revision_bump_count_for_test(&self) -> u64 {
+        let state_key = self as *const Self as usize;
+        CONFIG_REVISION_BUMPS_BY_STATE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&state_key)
+            .copied()
+            .unwrap_or_default()
+    }
+
     /// Return a snapshot of the current runtime config.
     fn config(&self) -> Arc<Config> {
+        self.config_snapshot_with_revision().0
+    }
+
+    /// Return one atomic runtime config/revision pair.
+    fn config_snapshot_with_revision(&self) -> (Arc<Config>, u64) {
         match self.config.lock() {
-            Ok(guard) => guard.clone(),
+            Ok(guard) => (guard.clone(), CONFIG_REVISION.load(Ordering::Acquire)),
             Err(poisoned) => {
                 eprintln!("Warning: config lock poisoned; recovering with inner value");
-                poisoned.into_inner().clone()
+                (
+                    poisoned.into_inner().clone(),
+                    CONFIG_REVISION.load(Ordering::Acquire),
+                )
+            }
+        }
+    }
+
+    /// Advance the model-configuration revision without replacing the global
+    /// Config, for example after a persisted Session `/model` override changes.
+    fn bump_config_revision(&self) -> (Arc<Config>, u64) {
+        match self.config.lock() {
+            Ok(guard) => {
+                let revision = self.next_config_revision();
+                (guard.clone(), revision)
+            }
+            Err(poisoned) => {
+                eprintln!("Warning: config lock poisoned during revision bump; recovering");
+                let guard = poisoned.into_inner();
+                let revision = self.next_config_revision();
+                (guard.clone(), revision)
             }
         }
     }
 
     /// Hot-swap the runtime config (called after saving to disk).
-    fn replace_config(&self, new: Config) {
+    fn replace_config(&self, new: Config) -> (Arc<Config>, u64) {
+        let new = Arc::new(new);
         match self.config.lock() {
             Ok(mut guard) => {
-                *guard = Arc::new(new);
+                *guard = new.clone();
+                let revision = self.next_config_revision();
+                (new, revision)
             }
             Err(poisoned) => {
                 eprintln!("Warning: config lock poisoned during replace; recovering");
                 let mut guard = poisoned.into_inner();
-                *guard = Arc::new(new);
+                *guard = new.clone();
+                let revision = self.next_config_revision();
+                (new, revision)
             }
         }
     }
 
-    fn apply_runtime_config(&self, new: Config) {
+    fn apply_runtime_config(&self, new: Config) -> (Arc<Config>, u64) {
         self.sync_memory_queue(&new);
         runtime_loop::refresh_reflection_runtime(new.daily_reflection);
         if !new.daily_reflection {
             runtime_loop::cancel_active_reflections();
         }
-        self.replace_config(new);
+        self.replace_config(new)
     }
 
     fn memory_queue(&self) -> Option<MemoryUpdateQueue> {
@@ -2599,6 +2732,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
     let mut rerun_agent = false;
     let mut agent_run_mode = runtime_loop::AgentRunMode::Execute;
     let mut agent_run_reservation = None;
+    let mut agent_model_snapshot = None;
     loop {
         if !rerun_agent {
             let text = tokio::select! {
@@ -2627,9 +2761,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
                 IdleSocketInputAction::StartAgent {
                     run_mode,
                     reservation,
+                    model_snapshot,
                 } => {
                     agent_run_mode = run_mode;
                     agent_run_reservation = Some(reservation);
+                    agent_model_snapshot = Some(model_snapshot);
                 }
                 IdleSocketInputAction::SwitchSession { session_id, result } => {
                     match switch_socket_session(
@@ -2688,6 +2824,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
             &stop_requested,
             agent_run_mode,
             agent_run_reservation.take(),
+            agent_model_snapshot.take(),
         )
         .await;
         run_active.store(false, Ordering::Relaxed);
@@ -2816,17 +2953,10 @@ async fn handle_group_socket(
         let _ = writer.await;
         return;
     };
-    let member_names = session_control::group_member_name_map(&state, &group).await;
-    ws_send(
-        &tx,
-        &session_group::group_info_payload(&group, &member_names),
-    )
-    .await;
-    ws_send(
-        &tx,
-        &session_group::group_history_payload(&group, &member_names),
-    )
-    .await;
+    let group_info = session_control::group_info_json(&state, &group).await;
+    ws_send(&tx, &group_info).await;
+    let group_history = session_control::group_history_json(&state, &group).await;
+    ws_send(&tx, &group_history).await;
     for run in group
         .runs
         .iter()
@@ -3195,6 +3325,7 @@ async fn api_put_session(
     let name = validate_session_display_name(&request.name)
         .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
 
+    let model_status_guard = CONFIG_FILE_LOCK.read().await;
     let persist_gate = session_persist_gate(&session_id);
     let _persist_guard = persist_gate.lock().await;
 
@@ -3210,14 +3341,19 @@ async fn api_put_session(
         session.name = name.clone();
         session.updated_at = now_epoch();
 
-        let config = state.config();
-        let model = session.effective_model(&config.model).to_string();
+        let (config, config_revision) = state.config_snapshot_with_revision();
+        let (model, model_override_configured, effective_model_configured) =
+            session.model_configuration(&config);
         let usage = socket_sync::build_session_usage_payload(session);
         let session_event = socket_sync::build_session_info_payload(
             &session_id,
             &session.name,
-            &state,
+            &config,
             &model,
+            session.model_override.is_some(),
+            model_override_configured,
+            effective_model_configured,
+            config_revision,
             usage,
         );
         let payload = json!({
@@ -3239,6 +3375,7 @@ async fn api_put_session(
         ));
     }
 
+    drop(model_status_guard);
     send_session_client_event(&state, &session_id, session_event).await;
     broadcast_session_list_payload(&state).await;
 
@@ -4088,8 +4225,10 @@ async fn api_client_config(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_local_request_headers(&headers)?;
+    let config = state.config();
     Ok(Json(json!({
         "upload_token": state.upload_token,
+        "s3_config_id": config.s3.as_ref().map(image_uploads::s3_config_id),
     })))
 }
 
@@ -4123,6 +4262,7 @@ async fn api_upload_images(
             Json(json!({"error": "S3 not configured"})),
         )
     })?;
+    let s3_config_id = image_uploads::s3_config_id(s3_cfg);
 
     let mut uploaded_images: Vec<serde_json::Value> = Vec::new();
     let mut urls: Vec<String> = Vec::new();
@@ -4210,6 +4350,7 @@ async fn api_upload_images(
                     "url": url.clone(),
                     "object_key": object_key,
                     "attachment_token": attachment_token,
+                    "s3_config_id": s3_config_id.clone(),
                 }));
                 urls.push(url);
             }
@@ -4218,15 +4359,34 @@ async fn api_upload_images(
     }
 
     Ok(Json(
-        json!({ "images": uploaded_images, "urls": urls, "errors": errors }),
+        json!({ "images": uploaded_images, "urls": urls, "errors": errors, "s3_config_id": s3_config_id }),
     ))
 }
 
 // ── Config & Usage API ───────────────────────────────────────────────────────
 
+fn has_explicit_model_environment(value: Option<&str>) -> bool {
+    value.is_some_and(|model| !model.trim().is_empty())
+}
+
+fn environment_model_configured() -> bool {
+    let model = std::env::var("LINGCLAW_MODEL").ok();
+    has_explicit_model_environment(model.as_deref())
+}
+
+fn configured_models_available(config: &Config) -> bool {
+    config.providers.values().any(|provider| {
+        provider
+            .models
+            .iter()
+            .any(|model| !model.id.trim().is_empty())
+    })
+}
+
 /// GET /api/config — read the raw JSON config file.
 async fn api_get_config(
     headers: HeaderMap,
+    State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_local_request_headers(&headers)?;
     let workspace = session_workspace_path(MAIN_SESSION_ID);
@@ -4247,16 +4407,26 @@ async fn api_get_config(
             Json(json!({"error": "Cannot determine config path"})),
         )
     })?;
-    let content = read_config_file_snapshot(&path).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("Cannot read config: {e}")})),
-        )
-    })?;
+    let (config, config_revision, content) = read_runtime_config_file_snapshot(&state, &path)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Cannot read config: {e}")})),
+            )
+        })?;
+    let explicit_primary_model_configured = config.explicit_primary_model_configured;
+    let configured_models_available = configured_models_available(&config);
+    let config_file_etag = config_file_etag(&content);
     match serde_json::from_str::<serde_json::Value>(&content) {
         Ok(value) => Ok(Json(json!({
             "config": value,
             "path": path.display().to_string(),
+            "environmentModelConfigured": environment_model_configured(),
+            "explicitPrimaryModelConfigured": explicit_primary_model_configured,
+            "configuredModelsAvailable": configured_models_available,
+            "configRevision": config_revision,
+            "configFileEtag": config_file_etag,
             "discoveredAgents": discovered_agents.clone(),
         }))),
         Err(e) => {
@@ -4266,6 +4436,11 @@ async fn api_get_config(
                 "config": null,
                 "raw": content,
                 "path": path.display().to_string(),
+                "environmentModelConfigured": environment_model_configured(),
+                "explicitPrimaryModelConfigured": explicit_primary_model_configured,
+                "configuredModelsAvailable": configured_models_available,
+                "configRevision": config_revision,
+                "configFileEtag": config_file_etag,
                 "parse_error": msg,
                 "line": line,
                 "column": column,
@@ -4282,6 +4457,22 @@ async fn api_put_config(
     Json(body): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     validate_local_request_headers(&headers)?;
+    let base_config_file_etag = match body.get("baseConfigFileEtag") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(value))
+            if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) =>
+        {
+            Some(value.to_ascii_lowercase())
+        }
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "baseConfigFileEtag must be a 64-character SHA-256 hex string"
+                })),
+            ));
+        }
+    };
     let config_value = body
         .get("config")
         .ok_or_else(|| {
@@ -4339,6 +4530,29 @@ async fn api_put_config(
 
     let _save_guard = CONFIG_FILE_LOCK.write().await;
 
+    if let Some(base_etag) = base_config_file_etag {
+        let current_content = read_config_file_snapshot_unlocked(&path).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("Cannot read config: {error}")})),
+            )
+        })?;
+        let current_etag = config_file_etag(&current_content);
+        if base_etag != current_etag {
+            let (_, current_revision) = state.config_snapshot_with_revision();
+            let current_config = serde_json::from_str::<serde_json::Value>(&current_content).ok();
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "Configuration changed after it was loaded. Reload the latest configuration before saving.",
+                    "config": current_config,
+                    "configRevision": current_revision,
+                    "configFileEtag": current_etag,
+                })),
+            ));
+        }
+    }
+
     // Write to temp file then replace original without discarding the old file
     // if the final swap fails on Windows.
     let tmp_path = path.with_extension("tmp");
@@ -4359,45 +4573,33 @@ async fn api_put_config(
     // Hot-reload: re-read the saved config into the runtime so that
     // model/MCP changes take effect without a restart.
     let new_config = Config::load();
-    state.apply_runtime_config(new_config);
+    let (applied_config, config_revision) = state.apply_runtime_config(new_config);
 
-    // Release the config file lock before potentially slow MCP I/O.
+    // Collect an immutable same-revision snapshot for every connected Session
+    // and Group while the write lock still protects this applied Config.
+    let model_configuration_payloads =
+        socket_sync::collect_model_configuration_payloads(&state, &applied_config, config_revision)
+            .await;
+
+    // Release the config file lock before any potentially backpressured socket
+    // send or slow MCP I/O.
     drop(_save_guard);
 
-    // Push a refreshed `session` event so that capability flags (e.g. image
-    // support) are reflected in the frontend immediately — without requiring
-    // a page reload.
-    // Acquire each lock separately so we never hold `sessions` while waiting
-    // on `session_clients` (consistent with send_existing_session_payloads).
-    let session_payload = {
-        let sessions = state.sessions.lock().await;
-        let config = state.config();
-        let (name, model, usage) = sessions
-            .get(MAIN_SESSION_ID)
-            .map(|s| {
-                let m = s.effective_model(&config.model).to_string();
-                let u = socket_sync::build_session_usage_payload(s);
-                (s.name.clone(), m, u)
-            })
-            .unwrap_or_else(|| ("Main".to_string(), config.model.clone(), json!({})));
-        socket_sync::build_session_info_payload(MAIN_SESSION_ID, &name, &state, &model, usage)
-    };
-    let tx_opt = state
-        .session_clients
-        .lock()
-        .await
-        .get(MAIN_SESSION_ID)
-        .map(|b| b.tx.clone());
-    if let Some(tx) = tx_opt {
-        ws_send(&tx, &session_payload).await;
-    }
+    socket_sync::send_model_configuration_payloads(&state, model_configuration_payloads).await;
 
     // Invalidate cached MCP runtime state so the next explicit catalog/agent
     // round sees config changes without probing session-disabled servers during
     // Settings Save.
     tools::mcp::invalidate_runtime_state_without_remote_shutdown().await;
 
-    Ok(Json(json!({"ok": true})))
+    Ok(Json(json!({
+        "ok": true,
+        "environmentModelConfigured": environment_model_configured(),
+        "explicitPrimaryModelConfigured": applied_config.explicit_primary_model_configured,
+        "configuredModelsAvailable": configured_models_available(&applied_config),
+        "configRevision": config_revision,
+        "configFileEtag": config_file_etag(&pretty),
+    })))
 }
 
 /// POST /api/config/test-model — test a model provider connection.
@@ -4737,13 +4939,32 @@ async fn api_usage(
     })))
 }
 
-async fn read_config_file_snapshot(path: &Path) -> std::io::Result<String> {
-    let _read_guard = CONFIG_FILE_LOCK.read().await;
+fn read_config_file_snapshot_unlocked(path: &Path) -> std::io::Result<String> {
     match std::fs::read_to_string(path) {
         Ok(content) => Ok(content),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok("{}".to_string()),
         Err(err) => Err(err),
     }
+}
+
+fn config_file_etag(content: &str) -> String {
+    format!("{:x}", Sha256::digest(content.as_bytes()))
+}
+
+#[cfg(test)]
+async fn read_config_file_snapshot(path: &Path) -> std::io::Result<String> {
+    let _read_guard = CONFIG_FILE_LOCK.read().await;
+    read_config_file_snapshot_unlocked(path)
+}
+
+async fn read_runtime_config_file_snapshot(
+    state: &AppState,
+    path: &Path,
+) -> std::io::Result<(Arc<Config>, u64, String)> {
+    let _read_guard = CONFIG_FILE_LOCK.read().await;
+    let (config, config_revision) = state.config_snapshot_with_revision();
+    let content = read_config_file_snapshot_unlocked(path)?;
+    Ok((config, config_revision, content))
 }
 
 fn parse_serde_error_position(msg: &str) -> (Option<u64>, Option<u64>) {

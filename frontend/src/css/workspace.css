@@ -1096,6 +1096,28 @@ button {
     0 0 0 3px color-mix(in srgb, var(--accent2) 11%, transparent);
 }
 
+.composer-availability-status {
+  margin: 0 10px;
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.composer-availability-retry {
+  margin-left: 6px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  color: var(--accent2);
+  font: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.composer-availability-status[hidden] {
+  display: none;
+}
+
 .attach-btn,
 #send,
 #stop {
@@ -1419,6 +1441,13 @@ button {
   padding: 10px 20px;
   border-top-color: var(--border);
   background: color-mix(in srgb, var(--surface) 96%, transparent);
+}
+
+.settings-footer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
 }
 
 .btn-primary,

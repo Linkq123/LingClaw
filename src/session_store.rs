@@ -795,12 +795,19 @@ pub(crate) fn build_history_payload_with_s3(
                             images
                                 .iter()
                                 .map(|image| {
-                                    let url = crate::image_uploads::resolve_image_url(
-                                        &image.url,
-                                        image.s3_object_key.as_deref(),
+                                    let url = if crate::image_uploads::stored_s3_config_matches(
+                                        image.s3_config_id.as_deref(),
                                         s3_cfg,
-                                    )
-                                    .unwrap_or_else(|_| image.url.clone());
+                                    ) {
+                                        crate::image_uploads::resolve_image_url(
+                                            &image.url,
+                                            image.s3_object_key.as_deref(),
+                                            s3_cfg,
+                                        )
+                                        .unwrap_or_else(|_| image.url.clone())
+                                    } else {
+                                        image.url.clone()
+                                    };
                                     json!({"url": url})
                                 })
                                 .collect::<Vec<_>>()

@@ -14,6 +14,12 @@ import type {
   SessionSkillsApiResponse,
 } from '../types/config.js';
 import {
+  CONFIG_SAVED_EVENT,
+  acceptComposerConfigRevision,
+  getComposerConnectionGeneration,
+  refreshComposerAvailability,
+} from '../composerAvailability.js';
+import {
   validateProviderName,
   validateMcpCwdValue,
   validateModelsConfigDraftShape,
@@ -56,6 +62,34 @@ export function closeSettingsPage(): void {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 type TriBool = boolean | undefined;
+
+async function fetchLatestConfigResponse(init: RequestInit = {}): Promise<ConfigApiResponse> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const connectionGeneration = getComposerConnectionGeneration();
+    const response = await fetch('/api/config', { ...init, cache: 'no-store' });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data: ConfigApiResponse = await response.json();
+    if (connectionGeneration !== getComposerConnectionGeneration()) continue;
+    if (acceptComposerConfigRevision(data.configRevision)) return data;
+  }
+  throw new Error(tr('settings.configChangedWhileLoading'));
+}
+
+function dispatchConfigSaved(config: AppConfig, data: ConfigApiResponse): void {
+  window.dispatchEvent(
+    new CustomEvent(CONFIG_SAVED_EVENT, {
+      detail: {
+        config,
+        explicitPrimaryModelConfigured: data.explicitPrimaryModelConfigured === true,
+        configuredModelsAvailable:
+          typeof data.configuredModelsAvailable === 'boolean'
+            ? data.configuredModelsAvailable
+            : undefined,
+        configRevision: data.configRevision,
+      },
+    }),
+  );
+}
 
 function triStateToString(v: TriBool): string {
   if (v === true) return 'true';
@@ -2546,18 +2580,32 @@ function S3Tab({ config, onChange }: { config: AppConfig; onChange: (c: AppConfi
 
 function CorruptConfigView({
   data,
+  conflict,
   onStatus,
+  onConflict,
+  onReload,
   onReloaded,
 }: {
   data: ConfigApiResponse;
+  conflict: boolean;
   onStatus: (msg: string, type?: string) => void;
+  onConflict: () => void;
+  onReload: () => void;
   onReloaded: (data: ConfigApiResponse) => void;
 }) {
   const [rawText, setRawText] = useState(data.raw || '');
   const [hasError, setHasError] = useState(true);
   const [errorMsg, setErrorMsg] = useState(data.parse_error || '');
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setRawText(data.raw || '');
+    setHasError(true);
+    setErrorMsg(data.parse_error || '');
+  }, [data]);
 
   const save = async () => {
+    if (saving || conflict) return;
     if (!rawText.trim()) {
       onStatus('Config is empty', 'error');
       return;
@@ -2574,25 +2622,36 @@ function CorruptConfigView({
       return;
     }
     onStatus(tr('settings.saving'));
+    setSaving(true);
     try {
+      const connectionGeneration = getComposerConnectionGeneration();
       const resp = await fetch('/api/config', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config: parsed }),
+        body: JSON.stringify({
+          config: parsed,
+          ...(typeof data.configFileEtag === 'string'
+            ? { baseConfigFileEtag: data.configFileEtag }
+            : {}),
+        }),
       });
-      const result = await resp.json();
+      const result: ConfigApiResponse = await resp.json();
+      if (connectionGeneration !== getComposerConnectionGeneration()) {
+        onConflict();
+        return;
+      }
+      if (resp.status === 409) {
+        onConflict();
+        return;
+      }
       if (!resp.ok || result.error) {
         onStatus(result.error || tr('settings.saveFailed'), 'error');
         return;
       }
       onStatus('Saved! Reloading...', 'success');
       setTimeout(() => {
-        fetch('/api/config')
-          .then((r2) => {
-            if (!r2.ok) throw new Error(`HTTP ${r2.status}`);
-            return r2.json();
-          })
-          .then((reloaded: ConfigApiResponse) => onReloaded(reloaded))
+        fetchLatestConfigResponse()
+          .then((reloaded) => onReloaded(reloaded))
           .catch(() => {
             // Reload failed (network error or non-2xx response); config was
             // saved but the UI may be stale.
@@ -2601,6 +2660,8 @@ function CorruptConfigView({
       }, 600);
     } catch (e: unknown) {
       onStatus(`Save failed: ${(e as Error).message}`, 'error');
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -2627,9 +2688,16 @@ function CorruptConfigView({
         />
         {errorMsg && <div className="json-editor-error">{errorMsg}</div>}
       </div>
-      <button className="btn-primary" style={{ marginTop: 10 }} onClick={save}>
-        {tr('settings.saveRecover')}
-      </button>
+      <div className="settings-footer-actions" style={{ marginTop: 10 }}>
+        {conflict && (
+          <button className="btn-secondary" type="button" onClick={onReload} disabled={saving}>
+            {tr('settings.reloadLatest')}
+          </button>
+        )}
+        <button className="btn-primary" type="button" onClick={save} disabled={saving || conflict}>
+          {tr('settings.saveRecover')}
+        </button>
+      </div>
     </div>
   );
 }
@@ -2641,12 +2709,14 @@ function SettingsShell({
   tabs,
   status,
   configDirty,
+  configConflict,
   skillsDirty,
   mcpDirty,
   corrupt,
   showDiscardConfirm,
   onTabChange,
   onSaveConfig,
+  onReloadConfig,
   onRequestClose,
   onCancelDiscard,
   onDiscardChanges,
@@ -2656,12 +2726,14 @@ function SettingsShell({
   tabs: ReadonlyArray<TabMeta>;
   status: { message: string; type: StatusType };
   configDirty: boolean;
+  configConflict: boolean;
   skillsDirty: boolean;
   mcpDirty: boolean;
   corrupt: boolean;
   showDiscardConfirm: boolean;
   onTabChange: (tab: TabId) => void;
   onSaveConfig: () => void;
+  onReloadConfig: () => void;
   onRequestClose: () => void;
   onCancelDiscard: () => void;
   onDiscardChanges: () => void;
@@ -2827,14 +2899,26 @@ function SettingsShell({
                   : tr('settings.noUnsaved')}
             </div>
             {canSaveConfig && (
-              <button
-                className="btn-primary"
-                id="settings-save-btn"
-                onClick={onSaveConfig}
-                disabled={!configDirty || status.type === 'loading'}
-              >
-                {tr('settings.save')}
-              </button>
+              <div className="settings-footer-actions">
+                {configConflict && (
+                  <button
+                    className="btn-secondary"
+                    type="button"
+                    onClick={onReloadConfig}
+                    disabled={status.type === 'loading'}
+                  >
+                    {tr('settings.reloadLatest')}
+                  </button>
+                )}
+                <button
+                  className="btn-primary"
+                  id="settings-save-btn"
+                  onClick={onSaveConfig}
+                  disabled={!configDirty || configConflict || status.type === 'loading'}
+                >
+                  {tr('settings.save')}
+                </button>
+              </div>
             )}
           </div>
         </section>
@@ -2851,6 +2935,8 @@ export function SettingsPage() {
   const [config, setConfig] = useState<AppConfig>({});
   const [savedConfig, setSavedConfig] = useState<AppConfig>({});
   const [configBaseline, setConfigBaseline] = useState(() => serializeConfigForDirty({}));
+  const [loadedConfigFileEtag, setLoadedConfigFileEtag] = useState<string>();
+  const [configConflict, setConfigConflict] = useState(false);
   const [activeTab, setActiveTab] = useState<TabId>('tab-general');
   const [visitedTabs, setVisitedTabs] = useState<ReadonlySet<TabId>>(
     () => new Set(['tab-general']),
@@ -2866,6 +2952,8 @@ export function SettingsPage() {
   const visibleRef = useRef(false);
   const settingsSessionIdRef = useRef('main');
   const hasUnsavedChangesRef = useRef(false);
+  const configRef = useRef<AppConfig>({});
+  const saveInFlightRef = useRef(false);
   const previousFocusRef = useRef<HTMLElement | null>(null);
 
   const configDirty = useMemo(
@@ -2878,6 +2966,7 @@ export function SettingsPage() {
     setShowDiscardConfirm(false);
     setConfig(savedConfig);
     setConfigBaseline(serializeConfigForDirty(savedConfig));
+    setConfigConflict(false);
     setVisible(false);
     setSkillsDirty(false);
     setMcpDirty(false);
@@ -2906,6 +2995,10 @@ export function SettingsPage() {
   useEffect(() => {
     hasUnsavedChangesRef.current = hasUnsavedChanges;
   }, [hasUnsavedChanges]);
+
+  useEffect(() => {
+    configRef.current = config;
+  }, [config]);
 
   // Register bridge functions
   useEffect(() => {
@@ -2988,32 +3081,59 @@ export function SettingsPage() {
     if (!hasUnsavedChanges) setShowDiscardConfirm(false);
   }, [hasUnsavedChanges]);
 
+  const applyLoadedConfigResponse = useCallback((data: ConfigApiResponse): boolean => {
+    setDiscoveredAgents(data.discoveredAgents || []);
+    setLoadedConfigFileEtag(
+      typeof data.configFileEtag === 'string' ? data.configFileEtag : undefined,
+    );
+    setConfigConflict(false);
+    if (data.parse_error) {
+      setCorruptData(data);
+      setConfig({});
+      setSavedConfig({});
+      setConfigBaseline(serializeConfigForDirty({}));
+      setStatus({ message: tr('settings.syntaxErrors'), type: 'error' });
+      return false;
+    }
+    const nextConfig = data.config || {};
+    setCorruptData(null);
+    setConfig(nextConfig);
+    setSavedConfig(nextConfig);
+    setConfigBaseline(serializeConfigForDirty(nextConfig));
+    if (!hasUnsavedChangesRef.current) setShowDiscardConfirm(false);
+    setStatus({ message: tr('settings.loadedFrom', { path: data.path }), type: 'success' });
+    dispatchConfigSaved(nextConfig, data);
+    return true;
+  }, []);
+
+  const reloadLatestConfig = useCallback(async () => {
+    setStatus({ message: tr('settings.loading'), type: 'loading' });
+    try {
+      const latest = await fetchLatestConfigResponse();
+      applyLoadedConfigResponse(latest);
+    } catch (error: unknown) {
+      setStatus({
+        message: tr('settings.loadFailed', { error: (error as Error).message }),
+        type: 'error',
+      });
+    }
+  }, [applyLoadedConfigResponse]);
+
   // Load config when opened
   useEffect(() => {
     if (!visible) return;
     const controller = new AbortController();
+    const configSnapshotAtRequest = serializeConfigForDirty(configRef.current);
     (async () => {
       setStatus({ message: tr('settings.loading'), type: 'loading' });
       try {
-        const resp = await fetch('/api/config', { signal: controller.signal });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const data: ConfigApiResponse = await resp.json();
-        setDiscoveredAgents(data.discoveredAgents || []);
-        if (data.parse_error) {
-          setCorruptData(data);
-          setConfig({});
-          setSavedConfig({});
-          setConfigBaseline(serializeConfigForDirty({}));
-          setStatus({ message: tr('settings.syntaxErrors'), type: 'error' });
+        const data = await fetchLatestConfigResponse({ signal: controller.signal });
+        if (serializeConfigForDirty(configRef.current) !== configSnapshotAtRequest) {
+          setConfigConflict(true);
+          setStatus({ message: tr('settings.configConflict'), type: 'error' });
           return;
         }
-        const nextConfig = data.config || {};
-        setCorruptData(null);
-        setConfig(nextConfig);
-        setSavedConfig(nextConfig);
-        setConfigBaseline(serializeConfigForDirty(nextConfig));
-        if (!hasUnsavedChangesRef.current) setShowDiscardConfirm(false);
-        setStatus({ message: tr('settings.loadedFrom', { path: data.path }), type: 'success' });
+        applyLoadedConfigResponse(data);
       } catch (e: unknown) {
         if ((e as Error).name === 'AbortError') return;
         setStatus({
@@ -3023,7 +3143,7 @@ export function SettingsPage() {
       }
     })();
     return () => controller.abort();
-  }, [visible]);
+  }, [applyLoadedConfigResponse, visible]);
 
   const handleStatus = useCallback((message: string, type = 'idle') => {
     setStatus({ message, type: type as StatusType });
@@ -3036,8 +3156,12 @@ export function SettingsPage() {
 
     for (const [key, val] of Object.entries(model)) {
       if (!val) continue;
-      if ((val as string).includes('/')) {
-        const [provName, ...rest] = (val as string).split('/');
+      const modelRef = String(val).trim();
+      if (!modelRef) {
+        throw new Error(`Agent model "${key}": model id cannot be empty.`);
+      }
+      if (modelRef.includes('/')) {
+        const [provName, ...rest] = modelRef.split('/');
         const modelId = rest.join('/');
         if (!modelId || !modelId.trim()) {
           throw new Error(`Agent model "${key}": model id cannot be empty after provider prefix.`);
@@ -3060,11 +3184,32 @@ export function SettingsPage() {
             );
           }
         }
+      } else if (hasConfiguredProviders) {
+        const matchingProviders = Object.entries(providers)
+          .filter(([, provider]) =>
+            (provider.models || []).some((candidate) => candidate.id === modelRef),
+          )
+          .map(([providerName]) => providerName)
+          .sort();
+        if (matchingProviders.length === 0) {
+          throw new Error(
+            `Agent model "${key}" references unknown model "${modelRef}". Add it in Models first.`,
+          );
+        }
+        if (matchingProviders.length > 1) {
+          throw new Error(
+            `Agent model "${key}" is ambiguous. Use one of: ${matchingProviders
+              .map((providerName) => `${providerName}/${modelRef}`)
+              .join(', ')}.`,
+          );
+        }
       }
     }
   };
 
   const saveConfig = async () => {
+    if (saveInFlightRef.current || configConflict) return;
+    const requestConfigSnapshot = serializeConfigForDirty(config);
     const finalConfig = normalizeConfigForSave(config);
 
     try {
@@ -3075,29 +3220,76 @@ export function SettingsPage() {
     }
 
     setStatus({ message: tr('settings.saving'), type: 'loading' });
+    saveInFlightRef.current = true;
     try {
+      const connectionGeneration = getComposerConnectionGeneration();
       const resp = await fetch('/api/config', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config: finalConfig }),
+        body: JSON.stringify({
+          config: finalConfig,
+          ...(loadedConfigFileEtag ? { baseConfigFileEtag: loadedConfigFileEtag } : {}),
+        }),
       });
-      const data = await resp.json();
+      const data: ConfigApiResponse = await resp.json();
+      if (connectionGeneration !== getComposerConnectionGeneration()) {
+        setConfigConflict(true);
+        setStatus({ message: tr('settings.configConflict'), type: 'error' });
+        return;
+      }
+      if (resp.status === 409) {
+        setConfigConflict(true);
+        setStatus({ message: tr('settings.configConflict'), type: 'error' });
+        return;
+      }
       if (!resp.ok || data.error) {
         setStatus({ message: data.error || tr('settings.saveFailed'), type: 'error' });
         return;
+      }
+      const composerRevisionAccepted = acceptComposerConfigRevision(data.configRevision);
+      let latestComposerResponse: ConfigApiResponse | undefined;
+      if (!composerRevisionAccepted) {
+        const latest = await fetchLatestConfigResponse();
+        const sameSavedFile =
+          typeof data.configFileEtag === 'string' && data.configFileEtag === latest.configFileEtag;
+        if (!sameSavedFile) {
+          if (serializeConfigForDirty(configRef.current) === requestConfigSnapshot) {
+            applyLoadedConfigResponse(latest);
+          } else {
+            setConfigConflict(true);
+            setStatus({ message: tr('settings.configConflict'), type: 'error' });
+          }
+          return;
+        }
+        latestComposerResponse = latest;
       }
       setStatus({
         message: tr('settings.saved'),
         type: 'success',
       });
-      setConfig(finalConfig);
+      setConfig((current) =>
+        serializeConfigForDirty(current) === requestConfigSnapshot ? finalConfig : current,
+      );
       setSavedConfig(finalConfig);
       setConfigBaseline(serializeConfigForDirty(finalConfig));
+      setLoadedConfigFileEtag(
+        typeof data.configFileEtag === 'string' ? data.configFileEtag : undefined,
+      );
+      setConfigConflict(false);
+      if (composerRevisionAccepted) {
+        dispatchConfigSaved(finalConfig, data);
+      } else if (latestComposerResponse?.config && !latestComposerResponse.parse_error) {
+        dispatchConfigSaved(latestComposerResponse.config, latestComposerResponse);
+      } else {
+        void refreshComposerAvailability();
+      }
     } catch (e: unknown) {
       setStatus({
         message: tr('settings.saveFailedWithError', { error: (e as Error).message }),
         type: 'error',
       });
+    } finally {
+      saveInFlightRef.current = false;
     }
   };
 
@@ -3119,12 +3311,14 @@ export function SettingsPage() {
       tabs={settingsTabs()}
       status={status}
       configDirty={configDirty}
+      configConflict={configConflict}
       skillsDirty={skillsDirty}
       mcpDirty={mcpDirty}
       corrupt={!!corruptData}
       showDiscardConfirm={showDiscardConfirm}
       onTabChange={selectTab}
       onSaveConfig={saveConfig}
+      onReloadConfig={() => void reloadLatestConfig()}
       onRequestClose={requestClose}
       onCancelDiscard={() => setShowDiscardConfirm(false)}
       onDiscardChanges={closeWithoutPrompt}
@@ -3133,18 +3327,15 @@ export function SettingsPage() {
         <>
           <CorruptConfigView
             data={corruptData}
+            conflict={configConflict}
             onStatus={handleStatus}
+            onConflict={() => {
+              setConfigConflict(true);
+              setStatus({ message: tr('settings.configConflict'), type: 'error' });
+            }}
+            onReload={() => void reloadLatestConfig()}
             onReloaded={(d) => {
-              if (!d.parse_error) {
-                const nextConfig = d.config || {};
-                setCorruptData(null);
-                setConfig(nextConfig);
-                setSavedConfig(nextConfig);
-                setConfigBaseline(serializeConfigForDirty(nextConfig));
-                setStatus({ message: 'Loaded', type: 'success' });
-              } else {
-                setCorruptData(d);
-              }
+              applyLoadedConfigResponse(d);
             }}
           />
         </>

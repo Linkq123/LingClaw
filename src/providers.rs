@@ -1509,13 +1509,42 @@ fn materialize_image_urls(
 ) -> Result<Vec<ChatMessage>, String> {
     let mut hydrated = messages.to_vec();
     for msg in &mut hydrated {
-        if let Some(images) = msg.images.as_mut() {
-            for image in images {
+        if let Some(images) = msg.images.take() {
+            let mut available_images = Vec::with_capacity(images.len());
+            let mut removed_stale_upload = false;
+            for mut image in images {
+                if image.s3_object_key.is_some()
+                    && !image_uploads::stored_s3_config_matches(
+                        image.s3_config_id.as_deref(),
+                        s3_cfg,
+                    )
+                {
+                    // This is already-persisted history, not a newly supplied
+                    // attachment. Never reinterpret its object key under a new
+                    // S3 configuration, but do not make the Session unusable
+                    // for every later text-only turn either.
+                    removed_stale_upload = true;
+                    continue;
+                }
                 image.url = image_uploads::resolve_image_url(
                     &image.url,
                     image.s3_object_key.as_deref(),
                     s3_cfg,
                 )?;
+                available_images.push(image);
+            }
+            if !available_images.is_empty() {
+                msg.images = Some(available_images);
+            } else if removed_stale_upload
+                && msg
+                    .content
+                    .as_deref()
+                    .is_none_or(|content| content.trim().is_empty())
+            {
+                msg.content = Some(
+                    "[A previously attached image is unavailable because storage settings changed.]"
+                        .to_string(),
+                );
             }
         }
     }
@@ -1527,6 +1556,7 @@ fn is_trusted_uploaded_image(
     s3_cfg: Option<&crate::config::S3Config>,
 ) -> bool {
     s3_cfg.is_some()
+        && image_uploads::stored_s3_config_matches(image.s3_config_id.as_deref(), s3_cfg)
         && image
             .s3_object_key
             .as_deref()

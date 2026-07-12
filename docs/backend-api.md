@@ -290,6 +290,10 @@ Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group �
     "id": "a1b2c3",
     "name": "Review Group",
     "members": ["worker-a", "worker-b"],
+    "explicitPrimaryModelConfigured": false,
+    "model_override_members": ["worker-a"],
+    "model_configured_members": ["worker-a"],
+    "configRevision": 1720684800124,
     "admins": ["worker-b"],
     "pending_votes": [],
     "member_details": [
@@ -395,13 +399,14 @@ Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group �
 
 ## 4.4 GET /api/client-config
 
-返回前端运行所需的轻量配置。目前主要用于图片上传 token。
+返回前端运行所需的轻量配置。目前主要用于图片上传 token 和当前 S3 配置身份。
 
 ### 响应
 
 ```json
 {
-  "upload_token": "..."
+  "upload_token": "...",
+  "s3_config_id": "..."
 }
 ```
 
@@ -409,6 +414,8 @@ Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group �
 
 - 仅本地请求可访问
 - `upload_token` 由前端拿到后用于 `POST /api/upload-images`
+- `s3_config_id` 是不包含明文凭据的当前 S3 配置身份；未配置 S3 时为 `null`
+- 客户端必须把 token 与同一次有效配置身份一起使用；强制刷新产生的新响应应覆盖旧的并发响应
 
 ## 4.5 GET /api/config
 
@@ -426,6 +433,11 @@ Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group �
     "s3": {}
   },
   "path": "C:\\Users\\admin\\.lingclaw\\.lingclaw.json",
+  "environmentModelConfigured": false,
+  "explicitPrimaryModelConfigured": false,
+  "configuredModelsAvailable": false,
+  "configRevision": 1720684800123,
+  "configFileEtag": "4d2f0a9f4c8a0e7b4f51b6d61ce1c56b9f80fbfe13a4b3662bce289b55b6905f",
   "discoveredAgents": [
     {
       "name": "reviewer",
@@ -443,6 +455,11 @@ Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group �
   "config": null,
   "raw": "{ ...损坏的原始 JSON... }",
   "path": "C:\\Users\\admin\\.lingclaw\\.lingclaw.json",
+  "environmentModelConfigured": false,
+  "explicitPrimaryModelConfigured": false,
+  "configuredModelsAvailable": false,
+  "configRevision": 1720684800123,
+  "configFileEtag": "0ab1e83a02170e78445c84fa95708d8a7c3553e56911c95d531f0d21ab4d8408",
   "parse_error": "expected `:` at line 12 column 9",
   "line": 12,
   "column": 9,
@@ -455,6 +472,11 @@ Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group �
 - `config`：解析成功时返回对象，失败时为 `null`
 - `raw`：仅在解析失败时返回原始文本
 - `path`：配置文件绝对路径
+- `environmentModelConfigured`：是否通过非空 `LINGCLAW_MODEL` 显式配置了运行时主模型；不包含内置默认模型回退
+- `explicitPrimaryModelConfigured`：服务端对当前运行时配置完成清洗和引用校验后，是否存在显式全局主模型；前端必须使用该字段判断可运行性，不能直接信任原始 JSON 中的 `primary`
+- `configuredModelsAvailable`：运行时完成环境变量展开和 provider 清洗后，provider 目录中是否仍存在至少一个模型；不包含 legacy `LINGCLAW_MODEL` 主模型或空目录动态 provider。前端用它区分“模型未配置”和“Agent 模型未配置”，不能从原始 `config` 推断
+- `configRevision`：JavaScript 安全整数范围内的模型配置修订号。相对于当前 LingClaw 进程通过 `PUT /api/config` 执行的更新，配置文件内容、运行时模型状态和该修订号在同一把锁下取样，因此不会混合一次进程内更新前后的状态。手工编辑或其他进程写入不经过这把锁：后续 `GET` 可能先看到新的磁盘 `raw`/`configFileEtag`，但当前进程不会自动热加载该配置；需通过 Settings 重新保存或重启 LingClaw 才会应用到运行时
+- `configFileEtag`：原始配置文件内容的 SHA-256。Settings 保存整份配置时应把它作为 `baseConfigFileEtag` 回传，用于检测其他页面、进程或手工编辑造成的并发修改；它与会被 Session `/model` 推进的 `configRevision` 相互独立
 - `parse_error`：`serde_json` 错误文本
 - `line` / `column`：尽力提取出的语法错误位置
 - `discoveredAgents`：当前 workspace 发现到的子代理
@@ -480,7 +502,7 @@ Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group �
 
 ### 请求体
 
-顶层必须包含 `config` 字段：
+顶层必须包含 `config` 字段。Settings 等“先读后整份保存”的客户端还应携带上次 GET 返回的可选 `baseConfigFileEtag`：
 
 ```json
 {
@@ -560,7 +582,8 @@ Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group �
       "urlExpirySecs": 604800,
       "lifecycleDays": 14
     }
-  }
+  },
+  "baseConfigFileEtag": "4d2f0a9f4c8a0e7b4f51b6d61ce1c56b9f80fbfe13a4b3662bce289b55b6905f"
 }
 ```
 
@@ -568,7 +591,27 @@ Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group �
 
 ```json
 {
-  "ok": true
+  "ok": true,
+  "environmentModelConfigured": false,
+  "explicitPrimaryModelConfigured": true,
+  "configuredModelsAvailable": true,
+  "configRevision": 1720684800124,
+  "configFileEtag": "bc72e9017a83d5f7d26bc216e8ef26e73ace9dbe0d987f748de58fe532a3119d"
+}
+```
+
+三个模型状态字段的语义与 `GET /api/config` 相同，供保存配置后的前端即时刷新模型可用状态。保存完成后，服务端也会向所有已连接 Session/Group 推送具有相同 `configRevision` 的更新状态。
+
+`configRevision` 是进程内严格递增、以 Unix epoch 毫秒为初始种子的模型配置状态序号：每次成功应用 `PUT /api/config`，以及每次成功持久化 Session `/model` override 都会推进它。时间种子使它通常也能跨重启递增，但协议只保证单个服务端进程内的严格单调性。前端应持续保留已接受的最大序号并忽略更小的异步状态包；普通 WebSocket 重连不应无条件清零该比较状态。若新连接收到的首个带版本 Session/Group 模型状态小于当前基线，客户端可将其视为后端进程重启并建立新基线；HTTP 响应不能消费这次连接握手。
+
+若 `baseConfigFileEtag` 与写锁内重新读取到的文件内容不一致，服务端返回 `409 Conflict`，不会写文件或热重载。响应包含当前 `config`（若仍可解析）、`configRevision` 与 `configFileEtag`；客户端应保留本地编辑并明确让用户重新加载，而不是自动覆盖任一版本。只执行 Session `/model` 不会改变文件 ETag，因此不会产生无关的 Settings 保存冲突。
+
+```json
+{
+  "error": "Configuration changed after it was loaded. Reload the latest configuration before saving.",
+  "config": {},
+  "configRevision": 1720684800125,
+  "configFileEtag": "bc72e9017a83d5f7d26bc216e8ef26e73ace9dbe0d987f748de58fe532a3119d"
 }
 ```
 
@@ -648,9 +691,13 @@ Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group �
 约束：
 
 - 如果写成 `provider/model-id` 形式，则 provider 必须存在于 `models.providers`
-- 如果该 provider 已定义 `models` 列表，则 `model-id` 必须存在
+- 如果该 provider 已定义非空 `models` 列表，则 `model-id` 必须存在；空列表继续允许显式 `provider/model-id` 兼容动态模型目录
+- 当 `models.providers` 非空且 JSON 配置使用纯 model ID 时，该 ID 必须在所有 provider 的非空模型目录中唯一命中；未知或歧义 ID 会使 `PUT /api/config` 返回 `400`
+- 通过环境变量 `LINGCLAW_MODEL` 提供的 legacy 纯 model ID 保留宽松兼容，不要求进入 JSON provider 目录；这项例外不适用于 Settings 写入的 `agents.defaults.model.*`
+- 若 JSON 原本声明了 provider，但运行时环境变量展开/校验后所有 provider 都不可用，服务端会保留“目录曾声明”的状态：已有 Session override 与新的 `/model` 选择均不得退化为 builtin 前缀或纯 ID legacy 路由；仅单独显式配置且与当前值完全一致的 `LINGCLAW_MODEL` 仍可使用
 - 当 `models.providers` 为空时，允许使用内置 provider 前缀：
   - `openai`
+  - `openai-responses`
   - `anthropic`
   - `ollama`
   - `gemini`
@@ -1260,13 +1307,15 @@ Streamable HTTP 运行时会在 initialize 后维护 GET SSE 通知流，并记�
     {
       "url": "https://...presigned...",
       "object_key": "lingclaw/images/2026-05-02/....png",
-      "attachment_token": "..."
+      "attachment_token": "...",
+      "s3_config_id": "..."
     }
   ],
   "urls": [
     "https://...presigned..."
   ],
-  "errors": []
+  "errors": [],
+  "s3_config_id": "..."
 }
 ```
 
@@ -1275,6 +1324,7 @@ Streamable HTTP 运行时会在 initialize 后维护 GET SSE 通知流，并记�
 - `images`: 推荐前端保存，包含可信上传元信息
 - `urls`: 仅 URL 列表，便于兼容旧逻辑
 - `errors`: 局部失败列表；即使某些文件失败，其他文件仍可成功
+- 顶层和每个 `images[]` 中的 `s3_config_id` 必须一致，并与上传开始时的当前配置身份相同；不一致的响应不可加入待发送附件
 
 ### 典型错误
 
@@ -1320,7 +1370,8 @@ Streamable HTTP 运行时会在 initialize 后维护 GET SSE 通知流，并记�
     "Unsupported image content (declared type: image/webp)",
     "Image too large (12345678 bytes, max 10485760)",
     "S3 upload timed out"
-  ]
+  ],
+  "s3_config_id": "..."
 }
 ```
 
@@ -1374,7 +1425,7 @@ ws://127.0.0.1:18989/ws?group=a1b2c3&session=main
 
 - 普通 session socket 省略 `session` 时默认绑定 `main`；group socket 必须显式传 `session=main` 作为前端 group 控制 UI 的连接要求
 - 指定的 session 不存在时，服务端会按该 id 创建新 session（前提是 id 合法）
-- 非法 session id 会回退到 `main`，并额外推送一条 `error` 事件说明原因
+- 非法 session id，以及已持久化但损坏或当前无法加载的 session，都会回退到 `main`，并额外推送一条 `error` 事件说明原因
 - `group` 存在时进入 group chat，不会自动创建 group；未知/非法 group 或未携带 `session=main` 的 group socket 会返回 `error` 并关闭。`session=main` 是 UI 防误用约束，不是浏览器/本地进程之间的安全授权边界
 
 建立连接后，服务端通常会按以下顺序推送初始化事件：
@@ -1432,6 +1483,7 @@ Group socket 初始化顺序通常为：
 
 - 空闲时可执行命令
 - 忙碌时仅允许一小部分运行期控制命令，尤其是 `/stop`
+- `/new` 可能调用上下文压缩模型，因此与普通消息、图片和 `execute_plan_id` 一样，服务端要求全局显式主模型或当前 Session `/model` override；无模型命令仍可正常使用
 - Slash 命令只适用于普通 session socket；连接到 `/ws?group=<id>&session=main` 时，`/...` 文本会被拒绝，不会作为 group 消息派发
 
 ### 5.2.3 图片消息 JSON
@@ -1446,7 +1498,8 @@ Group socket 初始化顺序通常为：
     {
       "url": "https://...",
       "object_key": "lingclaw/images/2026-05-02/....png",
-      "attachment_token": "..."
+      "attachment_token": "...",
+      "s3_config_id": "..."
     }
   ]
 }
@@ -1458,14 +1511,15 @@ Group socket 初始化顺序通常为：
 {
   "url": "https://...",
   "object_key": "optional",
-  "attachment_token": "optional"
+  "attachment_token": "optional",
+  "s3_config_id": "optional"
 }
 ```
 
 说明：
 
-- `object_key + attachment_token` 成对使用
-- 若两者都存在，服务端会把该图当作受信任的已上传对象
+- `object_key + attachment_token + s3_config_id` 三者成组使用；缺少任一字段都会被拒绝
+- 若三者都存在且签名及配置身份仍匹配，服务端会把该图当作受信任的已上传对象
 - 若只传 `url`，服务端会按普通远程图片 URL 校验
 - 最多 `10` 张图
 - `plan_mode` 语义同普通消息 JSON；开启时只生成计划，关闭或省略时直接执行
@@ -1609,9 +1663,15 @@ Group socket 初始化顺序通常为：
   "type": "session",
   "id": "main",
   "name": "Main",
+  "explicitPrimaryModelConfigured": false,
+  "modelOverridePresent": true,
+  "modelOverrideConfigured": false,
+  "effectiveModelConfigured": false,
+  "configRevision": 1720684800124,
   "capabilities": {
     "image": true,
-    "s3": true
+    "s3": true,
+    "s3_config_id": "..."
   },
   "usage": {
     "daily_input": 100,
@@ -1626,6 +1686,35 @@ Group socket 初始化顺序通常为：
 
 - `capabilities.image`: 当前有效模型是否支持图片输入
 - `capabilities.s3`: 当前服务端是否可用 S3 上传能力
+- `capabilities.s3_config_id`: 当前 S3 配置身份；S3 不可用时为 `null`。身份变化时客户端必须丢弃尚未发送的本地上传附件，远程 URL 附件不受影响
+- `modelOverridePresent`: 当前 Session 是否持久化了 `/model` override。它只表示值存在，不表示该值仍能在当前 Config 中解析
+- `modelOverrideConfigured`: 当前 Session 的持久化 `/model` override 是否仍能在当前运行时 Config 中成功规范化；删除对应 provider/model 后会变为 `false`，不包含全局配置或内置默认回退
+- `explicitPrimaryModelConfigured`: 当前服务端运行时是否具有经过校验的显式全局主模型；配置保存后会向所有 Session 连接刷新该值
+- `effectiveModelConfigured`: 当前 Session 最终是否允许启动 Agent run。若 Session 存在持久化 override，则只取决于该 override 是否仍有效；失效 override 不会静默回退到全局模型。前端发送门禁必须优先使用此字段
+- `configRevision`: 生成上述模型状态字段时使用的配置修订号；同一个 payload 内的模型状态字段来自同一个不可变 Config 快照
+
+### `session_model_configuration`
+
+配置保存或任一 Session 成功执行 `/model` 后，服务端向每个已连接 Session 发送最小模型状态事件：
+
+```json
+{
+  "type": "session_model_configuration",
+  "id": "main",
+  "explicitPrimaryModelConfigured": true,
+  "modelOverridePresent": false,
+  "modelOverrideConfigured": false,
+  "effectiveModelConfigured": true,
+  "configRevision": 1720684800125,
+  "capabilities": {
+    "image": true,
+    "s3": true,
+    "s3_config_id": "..."
+  }
+}
+```
+
+该事件只更新模型门禁和随模型/配置变化的能力，不携带或覆盖 Session `name`、Usage、历史、Todos 等独立状态。首次连接和真正的 Session 切换仍使用完整 `session` 事件。
 
 ### `view_state`
 
@@ -1887,6 +1976,14 @@ Group socket 初始化顺序通常为：
   "id": "a1b2c3",
   "name": "Review Group",
   "members": ["worker-a", "worker-b"],
+  "explicitPrimaryModelConfigured": false,
+  "model_override_members": ["worker-a"],
+  "model_configured_members": ["worker-a"],
+  "configRevision": 1720684800124,
+  "capabilities": {
+    "s3": true,
+    "s3_config_id": "..."
+  },
   "admins": ["worker-b"],
   "pending_votes": [],
   "member_details": [
@@ -1904,6 +2001,10 @@ Group socket 初始化顺序通常为：
   "type": "group_history",
   "group_id": "a1b2c3",
   "members": ["worker-a", "worker-b"],
+  "explicitPrimaryModelConfigured": false,
+  "model_override_members": ["worker-a"],
+  "model_configured_members": ["worker-a"],
+  "configRevision": 1720684800124,
   "admins": ["worker-b"],
   "pending_votes": [],
   "member_details": [
@@ -1915,6 +2016,32 @@ Group socket 初始化顺序通常为：
   "runs": []
 }
 ```
+
+配置保存或任一 Session 成功执行 `/model` 后，Group 连接收到只含模型状态的专用事件：
+
+```json
+{
+  "type": "group_model_configuration",
+  "id": "a1b2c3",
+  "model_member_ids": ["worker-a", "worker-b"],
+  "explicitPrimaryModelConfigured": true,
+  "model_override_members": ["worker-a"],
+  "model_configured_members": ["worker-a", "worker-b"],
+  "configRevision": 1720684800125,
+  "capabilities": {
+    "s3": true,
+    "s3_config_id": "..."
+  }
+}
+```
+
+`group_model_configuration` 不携带或覆盖 Group `name`、成员、管理员、投票、消息或运行历史。`model_member_ids` 是生成模型状态时使用的成员集合，仅用于前端确认该快照仍对应当前 roster；不一致时前端必须先让旧模型状态失效，再只刷新当前 roster 的模型配置，不能用该字段回滚成员列表。`capabilities.s3` 与 `capabilities.s3_config_id` 是同一 Config 修订下的全局上传状态，使停留在 Group 页面中的客户端也能立即丢弃旧存储身份的待发送附件；Group payload 不推断多成员共同的图片模型能力。
+
+`model_override_members` 只列出持久化 Session `/model` override 在当前 Config 中仍然有效的成员，保留用于诊断和兼容。`model_configured_members` 列出最终允许启动 Agent run 的成员：无 override 的成员可使用经过校验的全局模型；存在 override 的成员必须保证 override 仍有效，失效 override 不会回退到全局模型。前端 Group 门禁必须直接使用 `model_configured_members`，服务端也会按相同语义拒绝包含未配置目标的 dispatch。
+
+`explicitPrimaryModelConfigured` 与 Session payload 中同名字段语义相同。`configRevision` 与 Session payload 使用同一修订序列；同一个 Group payload 内的全局和成员模型状态都基于该修订号对应的 Config 快照。成员执行 `/model` 后，所有已连接 Session 和 Group 都会收到相同新序号的状态 payload，避免全局序列推进后未关联页面永久保留旧序号。配置保存广播同样会在一个不可变 Config 快照下生成全部 Session/Group 模型字段，并与 `/model` 广播及其他配置保存串行，避免混合新旧状态。
+
+每个 Agent run 会在取得 reservation 后、写入目标消息前获取经过校验的 Config/Session 模型快照，并在整个 run 内复用该快照；task/orchestrate 未配置专用子代理模型时继承该快照中的 Session 模型。因此普通消息、busy intervention rerun、直接 `session_control.dispatch`、成员回复触发的后续 `@session-id` 派发，以及排队期间发生的配置热重载都不能落入内置默认模型；`/new` 压缩也在实际命令入口使用同样的快照规则。自动 mention 后续派发若缺少有效模型，会生成可见的 failed group run，而不是只写服务端日志。
 
 ```json
 {
@@ -2442,15 +2569,19 @@ reasoning 流结束。
 {
   "url": "https://...",
   "object_key": "lingclaw/images/...",
-  "attachment_token": "..."
+  "attachment_token": "...",
+  "s3_config_id": "..."
 }
 ```
 
 这样服务端会：
 
-- 校验 `attachment_token`
+- 校验 `attachment_token`，且签名绑定完整 S3 配置身份
+- 确认 `s3_config_id` 仍等于服务端当前配置身份
 - 重新生成可信 URL
 - 避免客户端伪造任意 S3 object key
+
+新接收的上传会把 `s3_config_id` 与 object key 一起持久化。配置轮换后，旧附件不会使用新 endpoint/bucket 重新签名；历史回放保留旧 fallback URL，模型上下文会剥离已失效的旧本地上传图片，避免它永久阻断该 Session 的后续纯文本对话。升级前保存、尚无该字段的历史附件继续按旧兼容路径处理。
 
 ### 6.2 普通远程图片
 
@@ -2473,6 +2604,7 @@ WebSocket 下若图片不合法，通常以 `system` 事件返回错误，例如
 - `Invalid uploaded image token. Please re-attach the image.`
 - `Incomplete uploaded image metadata. Please re-attach the image.`
 - `S3 uploads are no longer configured. Please re-attach the image.`
+- `S3 upload configuration changed. Please re-attach the image.`
 
 ## 7. 建议的前端接入顺序
 
@@ -2486,7 +2618,8 @@ WebSocket 下若图片不合法，通常以 `system` 事件返回错误，例如
 6. 如需本地上传图片：
    - 先调用 `GET /api/client-config`
    - 再调用 `POST /api/upload-images`
-   - 最后把 `url + object_key + attachment_token` 带回 WebSocket 消息
+   - 校验响应顶层及逐图 `s3_config_id` 与当前身份一致
+   - 最后把 `url + object_key + attachment_token + s3_config_id` 带回 WebSocket 消息
 
 ## 8. 已知实现特征
 

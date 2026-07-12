@@ -44,6 +44,8 @@ fn test_config_with_mcp() -> Config {
         },
     );
     Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "env-key".to_string(),
         api_base: "https://api.openai.com/v1".to_string(),
         model: "gpt-4o-mini".to_string(),

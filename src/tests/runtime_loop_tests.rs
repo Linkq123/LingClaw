@@ -9,6 +9,8 @@ use crate::config::{JsonMcpServerConfig, JsonModelEntry, JsonProviderConfig, S3C
 
 fn test_config() -> Config {
     Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -39,6 +41,26 @@ fn test_config() -> Config {
         enable_state_digest: true,
         enable_task_plan: true,
     }
+}
+
+#[test]
+fn delegated_config_uses_the_validated_session_model_as_primary_fallback() {
+    let config = test_config();
+    let delegated = delegated_config_for_run(&config, "openai/session-model");
+
+    assert_eq!(delegated.model, "openai/session-model");
+    assert_eq!(
+        crate::subagents::executor::resolve_subagent_model(&delegated, "reviewer"),
+        "openai/session-model"
+    );
+
+    let mut configured = config;
+    configured.sub_agent_model = Some("openai/sub-agent-model".to_string());
+    let delegated = delegated_config_for_run(&configured, "openai/session-model");
+    assert_eq!(
+        crate::subagents::executor::resolve_subagent_model(&delegated, "reviewer"),
+        "openai/sub-agent-model"
+    );
 }
 
 fn test_app_state() -> AppState {
@@ -285,6 +307,139 @@ async fn handle_idle_socket_input_accepts_plan_mode_payload_without_images() {
 }
 
 #[tokio::test]
+async fn handle_idle_socket_input_rejects_agent_start_without_an_explicit_model() {
+    let mut config = test_config();
+    config.explicit_primary_model_configured = false;
+    let state = Arc::new(test_app_state());
+    state.replace_config(config);
+    let session_id = MAIN_SESSION_ID.to_string();
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+    }
+
+    let action = handle_idle_socket_input(
+        "do not use the fallback".into(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(event["type"], "error");
+    assert!(
+        event["content"]
+            .as_str()
+            .unwrap()
+            .contains("explicit model")
+    );
+    let sessions = state.sessions.lock().await;
+    assert_eq!(sessions[&session_id].messages.len(), 1);
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_keeps_unknown_slash_commands_model_free() {
+    let mut config = test_config();
+    config.explicit_primary_model_configured = false;
+    let state = Arc::new(test_app_state());
+    state.replace_config(config);
+    let session_id = MAIN_SESSION_ID.to_string();
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+    }
+
+    let action = handle_idle_socket_input(
+        "/bogus".into(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(event["type"], "system");
+    assert_eq!(event["content"], "Unknown command. Type /help.");
+    assert!(state.active_runs.lock().await.is_empty());
+    let sessions = state.sessions.lock().await;
+    assert_eq!(sessions[&session_id].messages.len(), 1);
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_rechecks_the_model_after_reserving_the_run() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+    }
+    let active_runs_guard = state.active_runs.lock().await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let task_state = Arc::clone(&state);
+    let task_session_id = session_id.clone();
+    let task = tokio::spawn(async move {
+        let mut current_session_id = task_session_id.clone();
+        handle_idle_socket_input(
+            "wait for the final model snapshot".into(),
+            &mut current_session_id,
+            &Arc::new(Mutex::new(task_session_id)),
+            1,
+            &task_state,
+            &tx,
+            &live_tx,
+            &CancellationToken::new(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    let mut disabled = test_config();
+    disabled.explicit_primary_model_configured = false;
+    state.replace_config(disabled);
+    drop(active_runs_guard);
+
+    let action = task.await.expect("input task should complete");
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(event["type"], "error");
+    assert!(
+        event["content"]
+            .as_str()
+            .unwrap()
+            .contains("explicit model")
+    );
+    assert_eq!(state.sessions.lock().await[&session_id].messages.len(), 1);
+    assert!(!state.active_runs.lock().await.contains_key(&session_id));
+}
+
+#[tokio::test]
 async fn handle_idle_socket_input_releases_reservation_when_session_is_missing() {
     let state = Arc::new(test_app_state());
     let session_id = MAIN_SESSION_ID.to_string();
@@ -482,6 +637,71 @@ async fn handle_idle_socket_input_executes_matching_pending_plan() {
     let _ = std::fs::remove_file(
         crate::session_store::sessions_dir().join(format!("{session_id}.json")),
     );
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_keeps_a_pending_plan_when_the_final_model_is_disabled() {
+    let state = Arc::new(test_app_state());
+    let session_id = "pending-plan-final-model".to_string();
+    let mut session = test_session(&session_id, "Pending Plan", None);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_final_model".into(),
+        original_user_message_index: 0,
+        assistant_plan_message_index: 0,
+        created_at: 10,
+    });
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+    let active_runs_guard = state.active_runs.lock().await;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let task_state = Arc::clone(&state);
+    let task_session_id = session_id.clone();
+    let task = tokio::spawn(async move {
+        let mut current_session_id = task_session_id.clone();
+        handle_idle_socket_input(
+            r#"{"execute_plan_id":"plan_final_model"}"#.into(),
+            &mut current_session_id,
+            &Arc::new(Mutex::new(task_session_id)),
+            1,
+            &task_state,
+            &tx,
+            &live_tx,
+            &CancellationToken::new(),
+            &Arc::new(AtomicBool::new(false)),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    let mut disabled = test_config();
+    disabled.explicit_primary_model_configured = false;
+    state.replace_config(disabled);
+    drop(active_runs_guard);
+
+    let action = task.await.expect("plan task should complete");
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(event["type"], "error");
+    assert!(
+        event["content"]
+            .as_str()
+            .unwrap()
+            .contains("explicit model")
+    );
+    let sessions = state.sessions.lock().await;
+    assert_eq!(
+        sessions[&session_id]
+            .pending_plan
+            .as_ref()
+            .map(|plan| plan.id.as_str()),
+        Some("plan_final_model")
+    );
+    assert_eq!(sessions[&session_id].messages.len(), 1);
+    drop(sessions);
+    assert!(!state.active_runs.lock().await.contains_key(&session_id));
 }
 
 #[tokio::test]
@@ -705,6 +925,192 @@ async fn handle_idle_socket_input_broadcasts_session_list_when_session_set_chang
 
     let other_parsed = recv_json_with_timeout(&mut other_rx).await;
     assert_eq!(other_parsed["type"].as_str(), Some("session_list"));
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_broadcasts_model_revision_to_every_session_once() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!("model-broadcast-current-{}", now_epoch());
+    let other_session_id = format!("model-broadcast-other-{}", now_epoch());
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (other_tx, mut other_rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(
+            session_id.clone(),
+            test_session(&session_id, "Current", None),
+        );
+        sessions.insert(
+            other_session_id.clone(),
+            test_session(&other_session_id, "Other", None),
+        );
+    }
+    {
+        let mut clients = state.session_clients.lock().await;
+        clients.insert(
+            session_id.clone(),
+            SessionClientBinding {
+                connection_id: 1,
+                tx: tx.clone(),
+                replay_ready: true,
+                pending_events: VecDeque::new(),
+                live_send_in_progress: false,
+            },
+        );
+        clients.insert(
+            other_session_id.clone(),
+            SessionClientBinding {
+                connection_id: 2,
+                tx: other_tx,
+                replay_ready: true,
+                pending_events: VecDeque::new(),
+                live_send_in_progress: false,
+            },
+        );
+    }
+    let (_, revision_before) = state.config_snapshot_with_revision();
+
+    let action = handle_idle_socket_input(
+        "/model openai/gpt-4o-mini".into(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    let current_events = [
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+        recv_json_with_timeout(&mut rx).await,
+    ];
+    assert_eq!(
+        current_events[0]["type"].as_str(),
+        Some("session_model_configuration"),
+        "the committed global model revision must be delivered before origin-only refresh output"
+    );
+    assert!(
+        current_events
+            .iter()
+            .any(|payload| payload["type"].as_str() == Some("system"))
+    );
+    let current_status = current_events
+        .iter()
+        .find(|payload| payload["type"].as_str() == Some("session_model_configuration"))
+        .expect("current Session should receive one model status payload");
+    let other_status = recv_json_with_timeout(&mut other_rx).await;
+    let revision = current_status["configRevision"]
+        .as_u64()
+        .expect("current status should carry a revision");
+    assert!(revision > revision_before);
+    assert_eq!(current_status["id"].as_str(), Some(session_id.as_str()));
+    assert_eq!(current_status["modelOverridePresent"], true);
+    assert_eq!(current_status["modelOverrideConfigured"], true);
+    assert_eq!(
+        other_status["type"].as_str(),
+        Some("session_model_configuration")
+    );
+    assert_eq!(other_status["id"].as_str(), Some(other_session_id.as_str()));
+    assert_eq!(other_status["modelOverridePresent"], false);
+    assert_eq!(other_status["configRevision"], revision);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+            .await
+            .is_err(),
+        "the current Session must not receive a duplicate direct status payload"
+    );
+
+    let _ = tokio::fs::remove_file(
+        crate::session_store::sessions_dir().join(format!("{session_id}.json")),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn model_configuration_send_does_not_let_one_backpressured_session_block_others() {
+    let state = Arc::new(test_app_state());
+    let blocked_session_id = "blocked-model-status-client".to_string();
+    let ready_session_id = "ready-model-status-client".to_string();
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(
+            blocked_session_id.clone(),
+            test_session(&blocked_session_id, "Blocked", None),
+        );
+        sessions.insert(
+            ready_session_id.clone(),
+            test_session(&ready_session_id, "Ready", None),
+        );
+    }
+
+    let (blocked_tx, _blocked_rx) = tokio::sync::mpsc::channel::<String>(1);
+    blocked_tx
+        .send("occupied".to_string())
+        .await
+        .expect("blocked channel should accept its sentinel");
+    let (ready_tx, mut ready_rx) = tokio::sync::mpsc::channel::<String>(2);
+    {
+        let mut clients = state.session_clients.lock().await;
+        clients.insert(
+            blocked_session_id,
+            SessionClientBinding {
+                connection_id: 1,
+                tx: blocked_tx,
+                replay_ready: true,
+                pending_events: VecDeque::new(),
+                live_send_in_progress: false,
+            },
+        );
+        clients.insert(
+            ready_session_id.clone(),
+            SessionClientBinding {
+                connection_id: 2,
+                tx: ready_tx,
+                replay_ready: true,
+                pending_events: VecDeque::new(),
+                live_send_in_progress: false,
+            },
+        );
+    }
+    let model_status_guard = CONFIG_FILE_LOCK.read().await;
+    let (config, config_revision) = state.config_snapshot_with_revision();
+    let payloads =
+        crate::socket_sync::collect_model_configuration_payloads(&state, &config, config_revision)
+            .await;
+    drop(model_status_guard);
+
+    let send_task = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move {
+            crate::socket_sync::send_model_configuration_payloads(&state, payloads).await;
+        }
+    });
+
+    let ready_status = recv_json_with_timeout(&mut ready_rx).await;
+    assert_eq!(
+        ready_status["type"].as_str(),
+        Some("session_model_configuration")
+    );
+    assert_eq!(ready_status["id"].as_str(), Some(ready_session_id.as_str()));
+    assert_eq!(ready_status["configRevision"], config_revision);
+    assert!(
+        !send_task.is_finished(),
+        "the sentinel-filled client should keep its own send pending"
+    );
+    send_task.abort();
+    let _ = send_task.await;
 }
 
 #[cfg(windows)]
@@ -1637,6 +2043,7 @@ async fn run_agent_session_emits_user_stop_done_for_shared_stop_request() {
         &stop_requested,
         AgentRunMode::Execute,
         None,
+        None,
     )
     .await;
 
@@ -1647,6 +2054,47 @@ async fn run_agent_session_emits_user_stop_done_for_shared_stop_request() {
     assert_eq!(done_event["type"].as_str(), Some("done"));
     assert_eq!(done_event["phase"].as_str(), Some("stopped"));
     assert_eq!(done_event["reason"].as_str(), Some("user_stop"));
+}
+
+#[tokio::test]
+async fn run_agent_session_rechecks_model_configuration_at_the_run_boundary() {
+    let mut config = test_config();
+    config.explicit_primary_model_configured = false;
+    let state = Arc::new(test_app_state());
+    state.replace_config(config);
+    let session_id = MAIN_SESSION_ID.to_string();
+    let cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let (live_tx, mut live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let (_inbound_tx, mut inbound_rx) = tokio::sync::mpsc::channel::<String>(4);
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), test_session(&session_id, "Main", None));
+    }
+
+    let outcome = run_agent_session(
+        &state,
+        &session_id,
+        1,
+        &cancel,
+        &live_tx,
+        &mut inbound_rx,
+        &stop_requested,
+        AgentRunMode::Execute,
+        None,
+        None,
+    )
+    .await;
+
+    assert!(outcome.run_failed);
+    assert!(!outcome.rerun_agent);
+    let event = live_rx
+        .recv()
+        .await
+        .expect("model gate error should be emitted");
+    assert_eq!(event["type"], "error");
+    assert!(!state.active_runs.lock().await.contains_key(&session_id));
 }
 
 #[tokio::test]
@@ -1674,6 +2122,7 @@ async fn run_agent_session_prioritizes_stop_request_over_cancel() {
         &mut inbound_rx,
         &stop_requested,
         AgentRunMode::Execute,
+        None,
         None,
     )
     .await;
@@ -1766,6 +2215,7 @@ async fn run_agent_session_stop_preserves_interventions_after_trimming_incomplet
         &stop_requested,
         AgentRunMode::Execute,
         None,
+        None,
     )
     .await;
 
@@ -1823,6 +2273,8 @@ async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
 
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -2083,6 +2535,8 @@ async fn run_analyze_phase_emits_start_then_auto_trace_for_auto_rounds() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -2160,6 +2614,8 @@ async fn run_analyze_phase_emits_post_hook_think_in_auto_trace() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -2230,6 +2686,8 @@ async fn run_analyze_phase_skips_auto_trace_for_manual_think_levels() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -2288,6 +2746,8 @@ async fn run_analyze_phase_skips_auto_trace_for_unsupported_models() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -2358,6 +2818,8 @@ async fn prepare_analyze_snapshot_preserves_messages_for_before_analyze_compress
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -2412,6 +2874,8 @@ async fn prepare_analyze_snapshot_includes_task_plan_in_execute_mode() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -2471,6 +2935,8 @@ async fn prepare_analyze_snapshot_skips_task_plan_when_config_disabled() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -2627,6 +3093,8 @@ async fn execute_tool_call_rejects_session_control_in_plan_only_mode() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: MAIN_SESSION_ID,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -2781,6 +3249,8 @@ async fn prepare_analyze_snapshot_keeps_plan_only_prompt_read_only() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -2833,6 +3303,8 @@ async fn execute_tool_call_rejects_mutating_tools_in_plan_only_mode() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -2919,6 +3391,8 @@ async fn run_finish_phase_plan_only_registers_plan_without_memory_enqueue() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -3017,6 +3491,8 @@ async fn run_finish_phase_plan_only_empty_response_does_not_register_old_plan() 
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -3108,6 +3584,8 @@ async fn run_analyze_phase_emits_context_compress_skipped_for_low_savings() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -3312,6 +3790,8 @@ async fn run_analyze_phase_emits_context_pruned_after_before_analyze_compression
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -3385,6 +3865,8 @@ async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections(
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -3519,6 +4001,8 @@ async fn prepare_analyze_snapshot_preserves_todos_when_optional_sections_overflo
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -3636,6 +4120,8 @@ async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -3765,6 +4251,8 @@ async fn update_working_state_keeps_results_attached_to_their_original_query() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -3880,6 +4368,8 @@ async fn update_working_state_reuses_same_cycle_task_memory_selection() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -4032,6 +4522,8 @@ async fn update_working_state_refreshes_task_memory_after_state_changes() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -4132,6 +4624,8 @@ async fn prepare_analyze_snapshot_injects_fresh_task_state_each_time() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -4291,6 +4785,8 @@ async fn prepare_analyze_snapshot_injects_retrieved_task_memory() {
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -4401,6 +4897,8 @@ async fn prepare_analyze_snapshot_injects_agent_recommendations_and_delegation_g
         mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -4549,6 +5047,8 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
 
     let ctx = AgentRunCtx {
         state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
         current_session_id: &session_id,
         cancel: &cancel,
         live_tx: &live_tx,
@@ -4676,6 +5176,7 @@ fn test_image_attachment() -> ImageAttachment {
     ImageAttachment {
         url: "https://example.test/image.png".to_string(),
         s3_object_key: None,
+        s3_config_id: None,
         cache_path: None,
         data: None,
     }
@@ -5051,6 +5552,8 @@ fn update_llm_response_usage_uses_request_estimate_when_provider_usage_missing()
 
         let ctx = AgentRunCtx {
             state: &state,
+            config: state.config(),
+            model: state.config().model.clone(),
             current_session_id: "usage-session",
             cancel: &cancel,
             live_tx: &live_tx,
@@ -5223,6 +5726,8 @@ fn update_llm_response_usage_uses_configured_provider_name() {
 
         let ctx = AgentRunCtx {
             state: &state,
+            config: state.config(),
+            model: state.config().model.clone(),
             current_session_id: "usage-session",
             cancel: &cancel,
             live_tx: &live_tx,
@@ -5277,11 +5782,13 @@ fn resolve_input_image_url_prefers_verified_s3_object_url() {
     let s3_cfg = test_s3_config();
     let object_key = "images/2026/demo.png";
     let token = crate::image_uploads::sign_attachment_object_key(&s3_cfg, object_key);
+    let config_id = crate::image_uploads::s3_config_id(&s3_cfg);
 
     let (url, trusted_object_key) = socket_input::resolve_input_image_url(
         "https://example.com/decoy.png",
         Some(object_key),
         Some(&token),
+        Some(&config_id),
         Some(&s3_cfg),
     )
     .expect("verified uploads should resolve to a trusted S3 URL");
@@ -5297,6 +5804,7 @@ fn resolve_input_image_url_rejects_incomplete_uploaded_metadata() {
         "https://example.com/photo.png",
         Some("images/2026/demo.png"),
         None,
+        None,
         Some(&test_s3_config()),
     )
     .expect_err("partial upload metadata should be rejected");
@@ -5304,6 +5812,30 @@ fn resolve_input_image_url_rejects_incomplete_uploaded_metadata() {
     assert_eq!(
         err,
         "Incomplete uploaded image metadata. Please re-attach the image."
+    );
+}
+
+#[test]
+fn resolve_input_image_url_rejects_upload_from_previous_s3_configuration() {
+    let original_cfg = test_s3_config();
+    let object_key = "images/2026/demo.png";
+    let token = crate::image_uploads::sign_attachment_object_key(&original_cfg, object_key);
+    let original_config_id = crate::image_uploads::s3_config_id(&original_cfg);
+    let mut current_cfg = original_cfg.clone();
+    current_cfg.endpoint = "https://replacement.example.test/storage".to_string();
+
+    let err = socket_input::resolve_input_image_url(
+        "https://example.com/decoy.png",
+        Some(object_key),
+        Some(&token),
+        Some(&original_config_id),
+        Some(&current_cfg),
+    )
+    .expect_err("uploads must stay bound to the S3 configuration that accepted them");
+
+    assert_eq!(
+        err,
+        "S3 upload configuration changed. Please re-attach the image."
     );
 }
 
@@ -5364,6 +5896,28 @@ fn reflection_runtime_generation_invalidates_stale_tasks_after_disable() {
     let new_generation = reflection_runtime_generation();
     assert!(reflection_runtime_enabled());
     assert!(reflection_runtime_matches(new_generation));
+}
+
+#[test]
+fn reflection_run_policy_uses_the_originating_enabled_setting() {
+    let _guard = reflection_test_guard().blocking_lock();
+
+    refresh_reflection_runtime(false);
+    let disabled_config = test_config();
+    refresh_reflection_runtime(true);
+    assert!(
+        !reflection_run_snapshot_is_enabled(&disabled_config),
+        "enabling reflection must not make an older disabled run reflect"
+    );
+
+    let mut enabled_config = test_config();
+    enabled_config.daily_reflection = true;
+    assert!(reflection_run_snapshot_is_enabled(&enabled_config));
+    refresh_reflection_runtime(false);
+    assert!(
+        !reflection_run_snapshot_is_enabled(&enabled_config),
+        "disabling reflection must invalidate an already-running snapshot"
+    );
 }
 
 #[tokio::test]

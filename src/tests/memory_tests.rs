@@ -26,6 +26,8 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 
 fn queue_test_config() -> Config {
     Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "test-key".to_string(),
         api_base: "https://api.openai.com/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -400,6 +402,41 @@ async fn test_memory_queue_replace_config_updates_runtime_snapshot() {
         .clone();
     assert_eq!(snapshot.tool_timeout, Duration::from_secs(90));
     assert_eq!(snapshot.api_key, "new-key");
+}
+
+#[tokio::test]
+async fn test_memory_request_keeps_trigger_config_after_queue_reload() {
+    let mut trigger_config = queue_test_config();
+    trigger_config.api_base = "https://trigger.example/v1".to_string();
+    trigger_config.api_key = "trigger-key".to_string();
+    let trigger_config = Arc::new(trigger_config);
+    let request = MemoryUpdateRequest {
+        session_id: "memory-config-snapshot".to_string(),
+        workspace: PathBuf::from("memory-config-snapshot"),
+        model: "openai/trigger-model".to_string(),
+        config: Arc::clone(&trigger_config),
+        conversation_excerpt: Vec::new(),
+    };
+    let queue = MemoryUpdateQueue::spawn(
+        (*trigger_config).clone(),
+        Arc::new(AsyncMutex::new(HashMap::new())),
+    );
+
+    let mut reloaded_config = queue_test_config();
+    reloaded_config.api_base = "https://reloaded.example/v1".to_string();
+    reloaded_config.api_key = "reloaded-key".to_string();
+    queue.replace_config(reloaded_config);
+
+    assert!(Arc::ptr_eq(&request.config, &trigger_config));
+    assert_eq!(request.config.api_base, "https://trigger.example/v1");
+    assert_eq!(request.config.api_key, "trigger-key");
+    let live_config = queue
+        .config
+        .lock()
+        .expect("queue config lock should be available")
+        .clone();
+    assert_eq!(live_config.api_base, "https://reloaded.example/v1");
+    assert_ne!(request.config.api_base, live_config.api_base);
 }
 
 #[tokio::test]

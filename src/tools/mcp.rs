@@ -1773,6 +1773,8 @@ pub(crate) async fn test_mcp_server(
     let mut mcp_servers = HashMap::new();
     mcp_servers.insert(server_name.to_string(), mcp_cfg.clone());
     let temp_config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: String::new(),
         api_base: String::new(),
         model: String::new(),

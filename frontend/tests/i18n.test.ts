@@ -25,6 +25,7 @@ describe('i18n', () => {
     expect(tr('welcome.ready')).toBe('输入消息，或使用 / 命令开始。');
     expect(tr('workspace.subtitle')).toBe('本地工作区');
     expect(tr('workspace.viewControls')).toBe('视图控制');
+    expect(tr('settings.configChangedWhileLoading')).toBe('加载期间配置发生变化，请重试。');
     expect(document.documentElement.lang).toBe('zh-CN');
     expect(localStorage.getItem('lingclaw.language')).toBe('zh-CN');
   });

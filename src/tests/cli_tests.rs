@@ -43,6 +43,8 @@ fn test_config_with_broken_mcp() -> Config {
     );
 
     Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "env-key".to_string(),
         api_base: "https://api.openai.com/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -381,6 +383,19 @@ fn wizard_suggested_fast_model_falls_back_to_primary_model() {
         .expect("primary model should be used when no family fast model is configured");
 
     assert_eq!(fast_model, "openai-2/gpt-4.1");
+}
+
+#[test]
+fn wizard_model_block_omits_models_when_setup_is_skipped() {
+    let mut providers = serde_json::Map::new();
+    providers.insert(
+        "openai".to_string(),
+        json!({ "api": "openai-completions", "models": [] }),
+    );
+    let model_block = wizard_model_block(&providers, None);
+
+    assert!(model_block.is_empty());
+    assert!(!model_block.contains_key("primary"));
 }
 
 #[test]

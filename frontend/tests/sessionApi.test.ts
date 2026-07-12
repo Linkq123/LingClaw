@@ -55,6 +55,11 @@ describe('session API', () => {
           id: 'reviewers',
           name: 'Reviewers',
           members: ['worker-a', ' worker-b ', ''],
+          explicitPrimaryModelConfigured: false,
+          configRevision: 123456,
+          model_override_members: [' worker-a ', ''],
+          model_configured_members: [' worker-a ', ' worker-b ', ''],
+          capabilities: { s3: true, s3_config_id: 's3-config-a' },
           admins: ['worker-b'],
           pending_votes: [
             {
@@ -93,6 +98,11 @@ describe('session API', () => {
       id: 'reviewers',
       name: 'Reviewers',
       members: ['worker-a', 'worker-b'],
+      explicitPrimaryModelConfigured: false,
+      configRevision: 123456,
+      model_override_members: ['worker-a'],
+      model_configured_members: ['worker-a', 'worker-b'],
+      capabilities: { s3: true, s3_config_id: 's3-config-a' },
       admins: ['worker-b'],
       pending_votes: [
         {

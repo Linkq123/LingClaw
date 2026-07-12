@@ -523,11 +523,12 @@
               />
               <textarea
                 id="input"
-                data-i18n-placeholder="composer.placeholder"
+                data-i18n-placeholder="composer.checkingModel"
                 data-i18n-aria-label="composer.aria"
-                placeholder="Message LingClaw... (/ for commands)"
+                placeholder="Checking model configuration..."
                 rows="1"
                 aria-label="Message input"
+                aria-describedby="composer-availability-status"
                 enterkeyhint="send"
                 autocomplete="off"
                 autocapitalize="sentences"
@@ -545,12 +546,36 @@
                   ><svg class="icon" aria-hidden="true"><use href="#icon-stop"></use></svg
                 ></span>
               </button>
-              <button id="send" data-i18n-aria-label="composer.send" aria-label="Send message">
+              <button
+                id="send"
+                data-i18n-aria-label="composer.send"
+                aria-label="Send message"
+                aria-describedby="composer-availability-status"
+                disabled
+              >
                 <span id="send-icon"
                   ><svg class="icon" aria-hidden="true"><use href="#icon-send"></use></svg
                 ></span>
               </button>
             </div>
+            <p
+              id="composer-availability-status"
+              class="composer-availability-status"
+              role="status"
+              aria-live="polite"
+            >
+              <span id="composer-availability-message">Checking model configuration...</span>
+              <button
+                id="composer-availability-retry"
+                class="composer-availability-retry"
+                type="button"
+                data-action="retry-composer-config"
+                data-i18n="composer.retryConfig"
+                hidden
+              >
+                Retry
+              </button>
+            </p>
           </div>
         </div>
 

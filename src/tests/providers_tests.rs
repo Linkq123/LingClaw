@@ -2576,6 +2576,7 @@ async fn build_gemini_body_inlines_images_and_function_declarations() {
             images: Some(vec![ImageAttachment {
                 url: "memory://image.png".into(),
                 s3_object_key: None,
+                s3_config_id: None,
                 cache_path: None,
                 data: Some(
                     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
@@ -3035,6 +3036,7 @@ async fn build_gemini_body_rejects_invalid_cached_image_data() {
         images: Some(vec![ImageAttachment {
             url: "memory://bad-image".into(),
             s3_object_key: None,
+            s3_config_id: None,
             cache_path: None,
             data: Some("not-base64".into()),
         }]),
@@ -4595,12 +4597,14 @@ fn convert_messages_to_openai_user_with_images() {
             ImageAttachment {
                 url: "https://example.com/a.png".into(),
                 s3_object_key: None,
+                s3_config_id: None,
                 cache_path: None,
                 data: None,
             },
             ImageAttachment {
                 url: "https://example.com/b.jpg".into(),
                 s3_object_key: None,
+                s3_config_id: None,
                 cache_path: None,
                 data: None,
             },
@@ -4634,6 +4638,7 @@ fn convert_messages_to_openai_strips_images_when_tool_messages_present() {
             images: Some(vec![ImageAttachment {
                 url: "https://example.com/a.png".into(),
                 s3_object_key: None,
+                s3_config_id: None,
                 cache_path: None,
                 data: None,
             }]),
@@ -4694,6 +4699,7 @@ fn convert_messages_to_anthropic_user_with_images() {
         images: Some(vec![ImageAttachment {
             url: "https://example.com/photo.png".into(),
             s3_object_key: None,
+            s3_config_id: None,
             cache_path: None,
             data: None,
         }]),
@@ -4725,12 +4731,14 @@ fn convert_messages_to_ollama_user_with_images() {
             ImageAttachment {
                 url: "https://example.com/x.png".into(),
                 s3_object_key: None,
+                s3_config_id: None,
                 cache_path: Some("C:/tmp/x.b64".into()),
                 data: Some("aW1hZ2VfZGF0YV94".into()),
             },
             ImageAttachment {
                 url: "https://example.com/y.jpg".into(),
                 s3_object_key: None,
+                s3_config_id: None,
                 cache_path: Some("C:/tmp/y.b64".into()),
                 data: Some("aW1hZ2VfZGF0YV95".into()),
             },
@@ -4770,6 +4778,7 @@ fn convert_messages_to_ollama_user_with_images_missing_b64() {
         images: Some(vec![ImageAttachment {
             url: "https://example.com/x.png".into(),
             s3_object_key: None,
+            s3_config_id: None,
             cache_path: None,
             data: None,
         }]),
@@ -4801,6 +4810,7 @@ async fn fetch_images_base64_reads_persisted_cache_without_refetch() {
         images: Some(vec![ImageAttachment {
             url: "https://example.com/cached.png".into(),
             s3_object_key: None,
+            s3_config_id: None,
             cache_path: Some(cache_path),
             data: None,
         }]),
@@ -4832,6 +4842,7 @@ async fn fetch_images_base64_skips_uncached_historical_fetch_failures() {
         images: Some(vec![ImageAttachment {
             url: "http://127.0.0.1/stale.png".into(),
             s3_object_key: None,
+            s3_config_id: None,
             cache_path: None,
             data: None,
         }]),
@@ -4874,6 +4885,7 @@ async fn fetch_images_base64_trusted_uploaded_urls_bypass_ssrf_on_cache_miss() {
         images: Some(vec![ImageAttachment {
             url: "https://expired.example.test/old.png".into(),
             s3_object_key: Some("images/2026/demo.png".into()),
+            s3_config_id: None,
             cache_path: None,
             data: None,
         }]),
@@ -4942,6 +4954,7 @@ fn materialize_image_urls_refreshes_uploaded_s3_urls() {
         images: Some(vec![ImageAttachment {
             url: "https://expired.example.test/old.png".into(),
             s3_object_key: Some("images/2026/demo.png".into()),
+            s3_config_id: None,
             cache_path: None,
             data: None,
         }]),
@@ -4958,6 +4971,112 @@ fn materialize_image_urls_refreshes_uploaded_s3_urls() {
 
     assert!(url.starts_with("https://minio.example.test/storage/bucket/images/2026/demo.png?"));
     assert!(url.contains("X-Amz-Signature="));
+}
+
+#[test]
+fn materialize_image_urls_drops_stale_s3_history_without_blocking_text() {
+    let original_cfg = S3Config {
+        endpoint: "https://minio.example.test/storage".into(),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    };
+    let original_config_id = crate::image_uploads::s3_config_id(&original_cfg);
+    let mut current_cfg = original_cfg.clone();
+    current_cfg.endpoint = "https://replacement.example.test/storage".into();
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some("continue with the text conversation".into()),
+        images: Some(vec![
+            ImageAttachment {
+                url: "https://expired.example.test/old.png".into(),
+                s3_object_key: Some("images/2026/demo.png".into()),
+                s3_config_id: Some(original_config_id),
+                cache_path: None,
+                data: None,
+            },
+            ImageAttachment {
+                url: "https://example.com/remote.png".into(),
+                s3_object_key: None,
+                s3_config_id: None,
+                cache_path: None,
+                data: None,
+            },
+        ]),
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let hydrated = materialize_image_urls(&messages, Some(&current_cfg))
+        .expect("stale historical uploads must not block later text turns");
+
+    assert_eq!(
+        hydrated[0].content.as_deref(),
+        Some("continue with the text conversation")
+    );
+    let images = hydrated[0]
+        .images
+        .as_ref()
+        .expect("remote image should remain");
+    assert_eq!(images.len(), 1);
+    assert_eq!(images[0].url, "https://example.com/remote.png");
+    assert!(images[0].s3_object_key.is_none());
+}
+
+#[test]
+fn materialize_image_urls_replaces_stale_image_only_history_with_text() {
+    let original_cfg = S3Config {
+        endpoint: "https://minio.example.test/storage".into(),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    };
+    let mut current_cfg = original_cfg.clone();
+    current_cfg.endpoint = "https://replacement.example.test/storage".into();
+    let messages = vec![ChatMessage {
+        role: "user".into(),
+        content: Some(String::new()),
+        images: Some(vec![ImageAttachment {
+            url: "https://expired.example.test/old.png".into(),
+            s3_object_key: Some("images/2026/demo.png".into()),
+            s3_config_id: Some(crate::image_uploads::s3_config_id(&original_cfg)),
+            cache_path: None,
+            data: None,
+        }]),
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    }];
+
+    let hydrated = materialize_image_urls(&messages, Some(&current_cfg))
+        .expect("stale image-only history should degrade to a valid text turn");
+
+    assert!(hydrated[0].images.is_none());
+    assert!(
+        hydrated[0]
+            .content
+            .as_deref()
+            .is_some_and(|content| !content.trim().is_empty())
+    );
+    let (_, anthropic) = convert_messages_to_anthropic(&hydrated);
+    assert!(
+        anthropic[0]["content"]
+            .as_str()
+            .is_some_and(|content| !content.trim().is_empty())
+    );
 }
 
 #[test]

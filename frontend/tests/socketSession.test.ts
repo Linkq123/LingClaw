@@ -69,6 +69,10 @@ describe('socket session binding', () => {
     stateModule.state.reconnectDelay = 1000;
     stateModule.state.reconnectAttempts = 0;
     stateModule.state.sessionSwitchInFlight = false;
+    stateModule.state.sessionIdentityMutationInFlight = false;
+    stateModule.state.composerSessionTransitionPending = false;
+    stateModule.state.composerSessionIdentityPending = false;
+    stateModule.state.imageUploadInFlight = false;
     stateModule.state.sessionDrawerExpanded = true;
     stateModule.state.sessions = [];
     stateModule.state.sessionGroups = [];
@@ -84,6 +88,25 @@ describe('socket session binding', () => {
     connect(() => {});
 
     expect(mockWebSocket).toHaveBeenCalledWith('ws://localhost:3000/ws');
+  });
+
+  it('starts a model revision handshake when the socket opens', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockReturnValue(new Promise(() => {})));
+    const { acceptComposerConfigRevision, acceptComposerSocketModelPayloadRevision } =
+      await import('../src/composerAvailability.js');
+    const { connect } = await import('../src/socket.js');
+    stateModule.state.composerConfigRevision = 50;
+    stateModule.state.composerSessionModelRevision = 50;
+
+    connect(() => {});
+    const socket = mockWebSocket.mock.instances[0] as unknown as { onopen?: () => void };
+    socket.onopen?.();
+
+    // An HTTP response cannot consume the connection-scoped handshake.
+    expect(acceptComposerConfigRevision(49)).toBe(false);
+    expect(acceptComposerSocketModelPayloadRevision(5)).toBe(true);
+    expect(stateModule.state.composerConfigRevision).toBe(5);
+    expect(stateModule.state.composerSessionModelRevision).toBeNull();
   });
 
   it('retranslates the current connection state without resetting it to offline', async () => {
@@ -525,6 +548,85 @@ describe('socket session binding', () => {
     expect(pendingSwitchButton?.disabled).toBe(true);
   });
 
+  it('disables Session and Group navigation controls while an image upload is active', async () => {
+    const onCreate = vi.fn();
+    const onCreateGroup = vi.fn();
+    const onSwitch = vi.fn();
+    const onSwitchGroup = vi.fn();
+    stateModule.state.sessions = [
+      { id: 'main', name: 'Main' },
+      { id: 'research-notes', name: 'Research Notes' },
+    ];
+    stateModule.state.sessionGroups = [{ id: 'review-group', name: 'Review Group' }];
+    stateModule.state.activeSessionId = 'main';
+    stateModule.state.imageUploadInFlight = true;
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate,
+      onCreateGroup,
+      onDelete: vi.fn(),
+      onSwitch,
+      onSwitchGroup,
+    });
+
+    const sessionButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '[data-session-id="research-notes"] [data-session-action="switch"]',
+    );
+    const groupButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '[data-group-id="review-group"] [data-session-action="switch-group"]',
+    );
+    const createGroupButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '.session-drawer-section-action',
+    );
+
+    expect(stateModule.dom.sessionDrawerNewBtn?.disabled).toBe(true);
+    expect(sessionButton?.disabled).toBe(true);
+    expect(groupButton?.disabled).toBe(true);
+    expect(createGroupButton?.disabled).toBe(true);
+    stateModule.dom.sessionDrawerNewBtn?.click();
+    sessionButton?.click();
+    groupButton?.click();
+    createGroupButton?.click();
+    expect(onCreate).not.toHaveBeenCalled();
+    expect(onCreateGroup).not.toHaveBeenCalled();
+    expect(onSwitch).not.toHaveBeenCalled();
+    expect(onSwitchGroup).not.toHaveBeenCalled();
+  });
+
+  it('disables identity navigation while a slash Session switch is awaiting confirmation', async () => {
+    const onCreateGroup = vi.fn();
+    const onSwitch = vi.fn();
+    stateModule.state.sessions = [
+      { id: 'main', name: 'Main' },
+      { id: 'research-notes', name: 'Research Notes' },
+    ];
+    stateModule.state.sessionGroups = [{ id: 'review-group', name: 'Review Group' }];
+    stateModule.state.activeSessionId = 'main';
+    stateModule.state.composerSessionTransitionPending = true;
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onCreateGroup,
+      onDelete: vi.fn(),
+      onSwitch,
+      onSwitchGroup: vi.fn(),
+    });
+
+    const sessionButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '[data-session-id="research-notes"] [data-session-action="switch"]',
+    );
+    const createGroupButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '.session-drawer-section-action',
+    );
+    expect(stateModule.dom.sessionDrawerNewBtn?.disabled).toBe(true);
+    expect(sessionButton?.disabled).toBe(true);
+    expect(createGroupButton?.disabled).toBe(true);
+    sessionButton?.click();
+    createGroupButton?.click();
+    expect(onSwitch).not.toHaveBeenCalled();
+    expect(onCreateGroup).not.toHaveBeenCalled();
+  });
+
   it('marks an existing target session as switching while the session reconnect is in flight', async () => {
     stateModule.state.sessions = [
       { id: 'main', name: 'Main' },
@@ -635,10 +737,12 @@ describe('socket session binding', () => {
   });
 
   it('drops the session switch lock when reconnect finally fails', async () => {
+    const composerModule = await import('../src/composerAvailability.js');
     const { connect } = await import('../src/socket.js');
     const sockets: Array<{ onclose?: () => void; close: ReturnType<typeof vi.fn> }> = [];
 
     stateModule.state.sessionSwitchInFlight = true;
+    composerModule.beginComposerSessionTransition(false, 'unreachable-session');
     mockWebSocket.mockImplementation(() => {
       const socket = {
         close: vi.fn(),
@@ -661,6 +765,43 @@ describe('socket session binding', () => {
     sockets[0].onclose?.();
 
     expect(stateModule.state.sessionSwitchInFlight).toBe(false);
+    expect(stateModule.state.composerSessionTransitionPending).toBe(false);
+  });
+
+  it('restores a pending slash switch before reconnecting the source Session', async () => {
+    const composerModule = await import('../src/composerAvailability.js');
+    const { connect } = await import('../src/socket.js');
+    const sockets: Array<{ onclose?: () => void }> = [];
+    mockWebSocket.mockImplementation(() => {
+      const socket = {
+        close: vi.fn(),
+        onopen: undefined,
+        onclose: undefined,
+        onerror: undefined,
+        onmessage: undefined,
+        send: vi.fn(),
+        readyState: 1,
+      };
+      sockets.push(socket);
+      return socket as unknown as WebSocket;
+    });
+    stateModule.state.activeSessionId = 'main';
+    composerModule.applyComposerConfig({}, true, 30);
+    composerModule.setComposerExplicitPrimaryModelConfigured(true, 30);
+    composerModule.setComposerSessionModelConfigured(false, false, true, 30);
+    composerModule.beginComposerSessionTransition(true, 'target-session');
+    expect(
+      composerModule.updateComposerSessionTransitionFallback('main', true, false, false, true, 30),
+    ).toBe(true);
+
+    connect(() => {});
+    stateModule.state.reconnectAttempts = 3;
+    sockets[0].onclose?.();
+
+    expect(stateModule.state.composerSessionTransitionPending).toBe(false);
+    expect(stateModule.state.composerSessionModelRevision).toBe(30);
+    expect(stateModule.state.composerSessionModelOverridePresent).toBe(true);
+    expect(stateModule.state.composerModelAvailability).toBe('session-model-unconfigured');
   });
 
   it('keeps sessionSwitchInFlight true during reconnect cleanup until the new session payload arrives', async () => {
@@ -671,6 +812,36 @@ describe('socket session binding', () => {
     reconnectToActiveSession(() => {});
 
     expect(stateModule.state.sessionSwitchInFlight).toBe(true);
+  });
+
+  it('detaches the previous socket message handler during reconnect', async () => {
+    const sockets: Array<{
+      close: ReturnType<typeof vi.fn>;
+      onmessage?: ((event: { data: string }) => void) | null;
+    }> = [];
+    mockWebSocket.mockImplementation(() => {
+      const socket = {
+        close: vi.fn(),
+        onopen: undefined,
+        onclose: undefined,
+        onerror: undefined,
+        onmessage: undefined,
+        send: vi.fn(),
+        readyState: 1,
+      };
+      sockets.push(socket);
+      return socket as unknown as WebSocket;
+    });
+    const onMessage = vi.fn();
+    const { connect, reconnectToActiveSession } = await import('../src/socket.js');
+
+    connect(onMessage);
+    const staleHandler = sockets[0].onmessage;
+    reconnectToActiveSession(onMessage);
+
+    expect(sockets[0].onmessage).toBeNull();
+    staleHandler?.({ data: JSON.stringify({ type: 'session', id: 'old' }) });
+    expect(onMessage).not.toHaveBeenCalled();
   });
 
   it('does not clear the pending delete target before the delete request returns', async () => {

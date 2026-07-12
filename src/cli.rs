@@ -2550,15 +2550,6 @@ impl WizardProviderKind {
         }
     }
 
-    fn fallback_model_id(self) -> &'static str {
-        match self {
-            Self::OpenAI => "gpt-4o-mini",
-            Self::Anthropic => "claude-opus-4-7",
-            Self::Ollama => "qwen3",
-            Self::Gemini => "gemini-2.5-flash",
-        }
-    }
-
     fn preferred_fast_model_id(self) -> Option<&'static str> {
         match self {
             Self::OpenAI => Some("gpt-4o-mini"),
@@ -2726,6 +2717,23 @@ fn wizard_suggested_fast_model(
     Some(primary_model.to_string())
 }
 
+fn wizard_model_block(
+    providers: &serde_json::Map<String, serde_json::Value>,
+    primary_model: Option<String>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let fast_model = wizard_suggested_fast_model(providers, primary_model.as_deref());
+    let mut model_block = serde_json::Map::new();
+    if let Some(primary) = primary_model {
+        model_block.insert("primary".to_string(), json!(primary));
+    }
+    if let Some(ref fast) = fast_model {
+        model_block.insert("fast".to_string(), json!(fast));
+        model_block.insert("sub-agent".to_string(), json!(fast));
+        model_block.insert("memory".to_string(), json!(fast));
+    }
+    model_block
+}
+
 pub(crate) fn run_setup_wizard(force: bool) -> bool {
     let config_path = match config_file_path() {
         Some(p) => p,
@@ -2786,7 +2794,6 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     println!();
     let mut providers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
     let mut default_model: Option<String> = None;
-    let mut fallback_default_model: Option<String> = None;
 
     loop {
         let provider_choice = if providers.is_empty() {
@@ -2819,10 +2826,6 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
             base_url
         };
         let api_key = prompt_secret(kind.api_key_prompt());
-        if fallback_default_model.is_none() {
-            fallback_default_model =
-                Some(format!("{}/{}", provider_name, kind.fallback_model_id()));
-        }
         providers.insert(
             provider_name.clone(),
             wizard_build_provider_entry(kind, base_url, api_key),
@@ -2931,33 +2934,8 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     prompt_line("   Press Enter to continue...");
     println!();
 
-    let primary_model = default_model.clone().or(fallback_default_model.clone());
-    let fast_model: Option<String> =
-        wizard_suggested_fast_model(&providers, primary_model.as_deref());
-    // Sub-agent model defaults to the same as fast model (cheaper for delegated tasks).
-    let sub_agent_model: Option<String> = fast_model.clone();
-    // Structured memory extraction also defaults to the lighter model when available.
-    let memory_model: Option<String> = fast_model.clone();
-
     // Build config JSON
-    let mut model_block = serde_json::Map::new();
-    model_block.insert(
-        "primary".to_string(),
-        json!(
-            primary_model
-                .clone()
-                .unwrap_or_else(|| "gpt-4o-mini".to_string())
-        ),
-    );
-    if let Some(ref fast) = fast_model {
-        model_block.insert("fast".to_string(), json!(fast));
-    }
-    if let Some(ref sub_agent) = sub_agent_model {
-        model_block.insert("sub-agent".to_string(), json!(sub_agent));
-    }
-    if let Some(ref memory) = memory_model {
-        model_block.insert("memory".to_string(), json!(memory));
-    }
+    let model_block = wizard_model_block(&providers, default_model);
 
     let settings = json!({
         "port": DEFAULT_PORT,
@@ -3015,13 +2993,13 @@ pub(crate) fn run_setup_wizard(force: bool) -> bool {
     }
 
     println!("   ✅ Configuration saved to {}", config_path.display());
-    if fast_model.is_some() {
+    if config.pointer("/agents/defaults/model/fast").is_some() {
         println!("   💡 Fast model configured for simple first-cycle queries.");
     }
-    if sub_agent_model.is_some() {
+    if config.pointer("/agents/defaults/model/sub-agent").is_some() {
         println!("   💡 Sub-agent model configured for delegated task execution.");
     }
-    if memory_model.is_some() {
+    if config.pointer("/agents/defaults/model/memory").is_some() {
         println!("   💡 Memory model configured for structured memory extraction.");
     }
     if config.get("s3").is_some() {

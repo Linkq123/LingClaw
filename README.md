@@ -16,18 +16,18 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 
 - **10 标准工具**：`think`、`todos`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`；另有动态工具：`task`（子代理委托，发现代理时注册）、`orchestrate`（多代理 DAG 编排，发现代理时注册）、`session_control`（仅 `main` 正常执行模式注册，用于跨 session/group 调度）
 - **MCP client（实验性）**：支持通过 `mcpServers` 配置接入 stdio 与 Streamable HTTP MCP server，发现 tools/resources/prompts，并以当前 session 的 Settings → MCP 权限为准手动启用 tools；配置 server 不再等于自动注入模型工具。运行时会处理分页、`ping` / 可选 `roots/list`、Streamable HTTP GET/SSE 通知、`notifications/*/list_changed` 缓存失效、工具超时取消、空闲回收和启动失败冷却；resources/prompts 只做只读浏览，需用户手动插入对话
-- **多会话与群聊**：默认会话仍为 `main`，但现在支持创建、切换、重命名、列出和删除其他持久化 session；新增 session 时后端会自动生成 6 位英数字 id，用户只需在需要时重命名；`main` 的 `session_control` 可创建/删除 session、查询单 session profile/能力/运行反馈，并可删除 group、升级群管理员、移除群成员。Groups 分区可创建持久化 session group，群聊消息写入 group 历史，被点名/广播的成员 session 会收到“群聊摘要 + main 指令”用户消息，并按自身模型、MCP、Skills、TaskPlan 设置异步并发执行；群聊 UI 使用 session 名称展示成员，协议仍以 `@session-id` 为准
+- **多会话与群聊**：默认会话仍为 `main`，但现在支持创建、切换、重命名、列出和删除其他持久化 session；新增 session 时后端会自动生成 6 位英数字 id，用户只需在需要时重命名；`main` 的 `session_control` 可创建/删除 session、查询单 session profile/能力/运行反馈，并可删除 group、升级群管理员、移除群成员。Groups 分区可创建持久化 session group，群聊消息写入 group 历史，被点名/广播的成员 session 会收到“群聊摘要 + main 指令”用户消息，并按自身模型、MCP、Skills、TaskPlan 设置异步并发执行；只有具有显式全局主模型或持久化 Session `/model` override 的目标成员才会启动，前后端都会阻止成员落入内置默认模型；群聊 UI 使用 session 名称展示成员，协议仍以 `@session-id` 为准
 - **会话级 Todos**：新增结构化 `todos` 工具，维护每个 session 唯一的一份当前任务清单；采用“整表替换 + revision 乐观并发”协议，支持用户与主代理协同编辑、重连恢复、冲突检测，以及专用 todo 面板展示
 - **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、frontend-coder、backend-coder、general-coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
 - **运行期 Task Plan**：默认关闭；在 Settings → General → Features 开启 `Task Plan` 后，每轮 Analyze 前用规则生成临时 `TaskPlan`，结合用户请求、`WorkingState`、任务记忆、最近工具结果、可用工具和子代理，向模型软注入目标、步骤、工具/代理建议、验证建议与验收标准；它是运行期软指导，不会自动执行验证命令，也不会写入会话消息历史。聊天页“计划模式”对应 `plan_mode` 计划模式：先产出可批准的计划，再由用户点击“开始执行”
 - **文档化斜杠命令**：`/new`、`/model`、`/switch`、`/sessions`、`/delete`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/reflection`、`/help`
 - **多 Provider 模型路由**：OpenAI（Chat Completions / Responses）+ Anthropic + Ollama + Gemini，支持 `provider/model` 和纯 model ID
 - **OpenAI 双协议**：OpenAI family 现在支持保留原有 `openai-completions`（`/v1/chat/completions`）并新增 `openai-responses`（`/v1/responses`）；两者共享同一套模型解析与工具权限体系。对话路径下两者都使用原生上游流式调用，`openai-responses` 会设置 `stream: true` 并把 Responses SSE 事件映射为 LingClaw 现有前端事件流
-- **会话模型覆盖**：运行时通过 `/model` 切换当前活动 session 使用的模型
+- **会话模型覆盖**：运行时通过 `/model` 切换当前活动 session 使用的模型；持久化 override 必须在当前配置中仍然有效，浏览器和服务端执行边界都会阻止未显式配置模型的 Agent run。Session 一旦存在失效 override 就不会静默回退到全局模型；Group 也按每个成员最终有效模型状态执行门禁。运行会固定复用启动时经过校验的配置/模型快照，task/orchestrate 未单独指定子代理模型时也继承该 Session 模型，避免热重载或委托执行落入内置默认模型；模型状态变化会同步到已连接的 Session/Group，状态/帮助等无模型命令仍可使用
 - **会话持久化**：默认 `main` 与其他 session 都会各自保存工作区、消息历史、视图状态和当前 todos 快照
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
-- **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、克制专业的响应式工作台（本地 SVG 图标体系、紧凑空白状态、可折叠左侧会话导航、视图/命令弹层、桌面停靠式工具检查器与手机底部面板）、稳定的 Markdown 分段渲染（表格、代码块、任务列表、引用、数学公式等常见格式）、版本号 badge（侧栏 + 欢迎页，从 `/api/health` 获取）、主回复右下角显示本轮输入/输出 token 和首 token 耗时、输入框上下键历史导航（最多 10 条）、输入 `/` 时的斜杠命令自动补全菜单（支持键盘上下选择、Tab/Enter 补全和鼠标点击）；左侧 session drawer 支持折叠/展开、切换、重命名和删除非当前 session，手机端默认关闭并以遮罩抽屉打开；todo 面板默认隐藏，可通过视图控制菜单显示，支持增删改、状态切换和上下移动，但不修改 session 数据以外的视图状态；Settings 页面（React 岛屿）支持在线编辑配置、Provider 连接测试、MCP Server 连接测试、当前 session 的系统 Skills 开关、MCP server/tool 权限、OAuth 连接状态以及 resources/prompts 浏览插入，并可在 Models 标签页直接编辑 `compat.thinkingFormat`；视图控制菜单提供 Tools、Reasoning、Todos 和默认关闭的 `Auto Debug` 开关；Usage 页面（React 岛屿）显示 Token 用量统计、按 Model Role 拆分的明细卡片与 Canvas 图表；前端支持浅色/深色主题和中文/英文切换，偏好保存在浏览器本地
-- **图片附件**：聊天页通过 `+` 菜单在上传能力可用时提供本地 JPEG/PNG 图片上传；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；Gemini/Ollama 会由 LingClaw 本地预取为 base64/inlineData 并持久化缓存到会话工作区，因此可配合私网、localhost 或仅局域网可达的网关使用；WebSocket 协议仍可接收受信任上传元信息或远程图片 URL；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
+- **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、克制专业的响应式工作台（本地 SVG 图标体系、紧凑空白状态、可折叠左侧会话导航、视图/命令弹层、桌面停靠式工具检查器与手机底部面板）、稳定的 Markdown 分段渲染（表格、代码块、任务列表、引用、数学公式等常见格式）、版本号 badge（侧栏 + 欢迎页，从 `/api/health` 获取）、主回复右下角显示本轮输入/输出 token 和首 token 耗时、输入框上下键历史导航（最多 10 条）、输入 `/` 时的斜杠命令自动补全菜单（支持键盘上下选择、Tab/Enter 补全和鼠标点击）；首次使用时需要在 Settings 添加模型并为主 Agent 指定 `primary` 模型、显式设置有效的 `LINGCLAW_MODEL`，或通过 `/model` 为当前 Session 选择已配置模型，否则普通聊天和 `/new` 保持禁用并按当前语言提示缺失配置；提示分类使用服务端清洗后的运行时模型目录，`/switch` 等待目标 Session 状态时也会暂时锁定普通发送；设置向导选择 Skip 或未添加任何模型时不会写入默认 primary；无需模型的状态、帮助及设置类 slash 命令仍可使用；左侧 session drawer 支持折叠/展开、切换、重命名和删除非当前 session，手机端默认关闭并以遮罩抽屉打开；todo 面板默认隐藏，可通过视图控制菜单显示，支持增删改、状态切换和上下移动，但不修改 session 数据以外的视图状态；Settings 页面（React 岛屿）支持在线编辑配置、Provider 连接测试、MCP Server 连接测试、当前 session 的系统 Skills 开关、MCP server/tool 权限、OAuth 连接状态以及 resources/prompts 浏览插入，并可在 Models 标签页直接编辑 `compat.thinkingFormat`；视图控制菜单提供 Tools、Reasoning、Todos 和默认关闭的 `Auto Debug` 开关；Usage 页面（React 岛屿）显示 Token 用量统计、按 Model Role 拆分的明细卡片与 Canvas 图表；前端支持浅色/深色主题和中文/英文切换，偏好保存在浏览器本地
+- **图片附件**：聊天页通过 `+` 菜单在上传能力可用时提供本地 JPEG/PNG 图片上传；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；Gemini/Ollama 会由 LingClaw 本地预取为 base64/inlineData 并持久化缓存到会话工作区，因此可配合私网、localhost 或仅局域网可达的网关使用；WebSocket 协议仍可接收受信任上传元信息或远程图片 URL；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；上传结果和附件签名会绑定当前 S3 配置身份，上传期间普通发送、Plan 执行和 Session/Group 导航会暂时锁定，若当前会话、连接、图片/S3 能力或存储配置在响应前变化，旧上传结果会被丢弃；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
 - **Structured Memory（可选）**：启用 `structuredMemory` 后，Finish 阶段会异步抽取稳定偏好、项目上下文和长期事实，写入 workspace 下的 `structured_memory.json`，并记录 `structured_memory.audit.jsonl` 诊断轨迹；`/memory`、`/memory stats`、`/memory debug` 可查看状态与最近审计信息
@@ -95,7 +95,7 @@ lingclaw --version
 
 ```bash
 # OpenAI
-OPENAI_API_KEY=sk-xxx lingclaw
+OPENAI_API_KEY=sk-xxx LINGCLAW_MODEL=gpt-4o-mini lingclaw
 
 # Anthropic
 ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
@@ -250,7 +250,7 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 - `structuredMemory` 默认为 `false`；启用后会在 Finish 阶段后台更新结构化记忆，并在后续 system prompt 中注入摘要；若配置了 `agents.defaults.model.memory` 或 `LINGCLAW_MEMORY_MODEL`，后台抽取优先使用该模型，否则回退到当前会话有效模型
 - `dailyReflection` 默认为 `false`；启用后会在满足轮次和冷却条件时，于 Finish 后台生成 post-execution reflection，并追加到 `memory/YYYY-MM-DD.md`；若配置了 `agents.defaults.model.reflection` 或 `LINGCLAW_REFLECTION_MODEL`，reflection 优先使用该模型，否则回退到 memory 模型，再回退到当前会话有效模型
 - `enableTaskPlan` 默认为 `false`；可在 Settings → General → Features 的 `Task Plan` 开关启用。启用后运行期会生成规则 `TaskPlan`，注入 `## Task Plan` 动态上下文并发送 `task_plan` live event；关闭时不生成、不注入、不发送，不影响 `plan_mode` 计划模式本身
-- 顶层 `s3` 为可选项；配置后聊天页会额外启用本地 JPEG/PNG 上传，上传对象以 object key 持久化，历史回放和 provider 请求都会即时重新现签 URL
+- 顶层 `s3` 为可选项；配置后聊天页会额外启用本地 JPEG/PNG 上传，上传对象以 object key 和不含明文凭据的配置身份持久化；仅当身份仍匹配时，历史回放和 provider 请求才会按当前配置重新现签 URL，配置轮换不会把旧 object key 误解释到新存储位置
 - AWS S3 若使用官方 endpoint，建议使用与 `region` 对应的区域 host；设置向导留空 endpoint 时会自动默认到该区域地址
 - OpenAI/Anthropic 直接使用现签 URL，因此 `s3.endpoint` 必须能被远端 provider 访问；Gemini/Ollama 路径会在本地预取并转成 base64/inlineData，可用于私网、localhost 或 VPN-only 网关
 - 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容，但 Setup Wizard 不再生成它们；新配置应省略这些字段
@@ -319,7 +319,7 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 | `OPENAI_API_BASE` | `https://api.openai.com/v1` | 备用 API Base |
 | `OLLAMA_API_BASE` | `http://127.0.0.1:11434` | Ollama API Base |
 | `GEMINI_API_BASE` | `https://generativelanguage.googleapis.com/v1beta` | Gemini API Base |
-| `LINGCLAW_MODEL` | `gpt-4o-mini` | 默认模型 |
+| `LINGCLAW_MODEL` | 未设置 | 显式主模型；未设置时内部兼容回退值不会被视为已配置，也不会允许启动 Agent 调用 |
 | `LINGCLAW_PORT` | `18989` | HTTP 端口 |
 | `LINGCLAW_EXEC_TIMEOUT` | `30` | Shell 命令超时（秒） |
 | `LINGCLAW_TOOL_TIMEOUT` | `30` | 非 shell 的 Act 阶段工具超时（秒），不适用于子代理 |
@@ -497,7 +497,7 @@ tools:
 
 1. **`agents.defaults.model.sub-agent-<name>`** — 指定子代理的专属模型（例如 `sub-agent-reviewer`）
 2. **`agents.defaults.model.sub-agent`** — 全局子代理模型配置（JSON 配置或 `LINGCLAW_SUB_AGENT_MODEL` 环境变量）
-3. **`agents.defaults.model.primary`** — 主模型（兜底）
+3. **当前父 Session 的有效模型** — 若该 Session 有有效 `/model` override 则继承 override，否则使用 `agents.defaults.model.primary`
 
 `AGENT.md` 中即使存在遗留的 `model` 字段，当前版本也会忽略，不参与运行时模型选择。
 

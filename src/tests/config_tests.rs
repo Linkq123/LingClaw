@@ -2,6 +2,132 @@ use super::*;
 use serde_json::json;
 use std::{collections::HashMap, time::Duration};
 
+#[test]
+fn primary_model_selection_ignores_blank_json_before_environment() {
+    let (model, explicit) = selected_primary_model(
+        Some("   ".to_string()),
+        Some(" openai/gpt-4.1 ".to_string()),
+    );
+
+    assert_eq!(model, "openai/gpt-4.1");
+    assert!(explicit);
+    assert_eq!(
+        selected_primary_model(None, None),
+        ("gpt-4o-mini".to_string(), false)
+    );
+}
+
+#[test]
+fn explicit_primary_model_validation_rejects_unknown_catalog_references() {
+    let providers = HashMap::from([(
+        "custom".to_string(),
+        JsonProviderConfig {
+            base_url: "https://gateway.example/v1".to_string(),
+            api_key: "key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "good".to_string(),
+                name: None,
+                reasoning: None,
+                input: None,
+                cost: None,
+                context_window: None,
+                max_tokens: None,
+                compat: None,
+            }],
+        },
+    )]);
+
+    assert_eq!(
+        validated_explicit_primary_model("custom/good", true, &providers, true),
+        Ok(true)
+    );
+    assert_eq!(
+        validated_explicit_primary_model("good", true, &providers, true),
+        Ok(true)
+    );
+    assert_eq!(
+        validated_explicit_primary_model("gpt-4o-mini", false, &providers, true),
+        Ok(false)
+    );
+    assert_eq!(
+        validated_explicit_primary_model("legacy-env-model", true, &providers, false),
+        Ok(true),
+        "an explicit legacy environment model remains valid outside the JSON catalog"
+    );
+    let error = validated_explicit_primary_model("custom/missing", true, &providers, true)
+        .expect_err("an unknown provider model must not enable Agent runs");
+    assert!(error.contains("unknown model 'missing'"));
+    let error = validated_explicit_primary_model("missing", true, &providers, true)
+        .expect_err("an unknown plain JSON model must not enable Agent runs");
+    assert!(error.contains("unknown model 'missing'"));
+}
+
+#[test]
+fn explicit_primary_model_validation_rejects_an_ambiguous_plain_json_model() {
+    let model = JsonModelEntry {
+        id: "shared".to_string(),
+        name: None,
+        reasoning: None,
+        input: None,
+        cost: None,
+        context_window: None,
+        max_tokens: None,
+        compat: None,
+    };
+    let provider = |base_url: &str| JsonProviderConfig {
+        base_url: base_url.to_string(),
+        api_key: "key".to_string(),
+        api: "openai-completions".to_string(),
+        models: vec![model.clone()],
+    };
+    let providers = HashMap::from([
+        ("first".to_string(), provider("https://first.example/v1")),
+        ("second".to_string(), provider("https://second.example/v1")),
+    ]);
+
+    let error = validated_explicit_primary_model("shared", true, &providers, true)
+        .expect_err("an ambiguous plain JSON model must not enable Agent runs");
+    assert!(error.contains("ambiguous"));
+    assert!(error.contains("first/shared"));
+    assert!(error.contains("second/shared"));
+}
+
+#[test]
+fn declared_but_unavailable_provider_catalog_blocks_legacy_session_models() {
+    let mut config = runtime_alignment_config(
+        Provider::OpenAI,
+        Provider::OpenAI.default_api_base(),
+        "key",
+        "gpt-4o-mini",
+        HashMap::new(),
+    );
+    config.provider_catalog_declared = true;
+    config.explicit_primary_model_configured = false;
+
+    let plain_error = config
+        .selectable_model_ref("plain-override")
+        .expect_err("a plain Session override must not bypass an unavailable declared catalog");
+    assert!(plain_error.contains("providers are unavailable"));
+    let builtin_error = config
+        .selectable_model_ref("openai/gpt-x")
+        .expect_err("a builtin-prefixed override must not bypass an unavailable declared catalog");
+    assert!(builtin_error.contains("providers are unavailable"));
+
+    config.model = "openai/explicit-env-model".to_string();
+    config.explicit_primary_model_configured = true;
+    assert_eq!(
+        config.selectable_model_ref("openai/explicit-env-model"),
+        Ok("openai/explicit-env-model".to_string()),
+        "the separately configured LINGCLAW_MODEL primary remains selectable"
+    );
+    assert_eq!(
+        config.selectable_model_ref("OpenAI/explicit-env-model"),
+        Ok("openai/explicit-env-model".to_string()),
+        "builtin provider spelling is canonicalized before comparing the explicit environment primary"
+    );
+}
+
 fn runtime_alignment_config(
     provider: Provider,
     api_base: &str,
@@ -10,6 +136,8 @@ fn runtime_alignment_config(
     providers: HashMap<String, JsonProviderConfig>,
 ) -> Config {
     Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: api_key.to_string(),
         api_base: api_base.to_string(),
         model: model.to_string(),
@@ -536,6 +664,58 @@ fn validate_json_agent_model_refs_rejects_unknown_model_for_configured_provider(
 }
 
 #[test]
+fn sanitize_loaded_json_config_drops_an_unknown_plain_primary_model() {
+    let providers = HashMap::from([(
+        "openai-work".to_string(),
+        JsonProviderConfig {
+            base_url: "https://gateway.example/v1".to_string(),
+            api_key: "key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "gpt-4o-mini".to_string(),
+                name: None,
+                reasoning: None,
+                input: None,
+                cost: None,
+                context_window: None,
+                max_tokens: None,
+                compat: None,
+            }],
+        },
+    )]);
+    let sanitized = sanitize_loaded_json_config(JsonConfig {
+        settings: None,
+        models: Some(JsonModelsConfig {
+            providers: Some(providers),
+        }),
+        agents: Some(JsonAgentsConfig {
+            defaults: Some(JsonAgentDefaults {
+                model: Some(JsonDefaultModel {
+                    primary: Some("typo-model".to_string()),
+                    fast: None,
+                    sub_agent: None,
+                    memory: None,
+                    reflection: None,
+                    context: None,
+                    extra: HashMap::new(),
+                }),
+            }),
+        }),
+        mcp_servers: None,
+        s3: None,
+    });
+
+    assert_eq!(
+        sanitized
+            .agents
+            .and_then(|agents| agents.defaults)
+            .and_then(|defaults| defaults.model)
+            .and_then(|model| model.primary),
+        None
+    );
+}
+
+#[test]
 fn validate_json_agent_model_refs_checks_dynamic_sub_agent_overrides() {
     let mut providers = HashMap::new();
     providers.insert(
@@ -892,7 +1072,7 @@ fn sanitize_loaded_json_config_resolves_provider_env_placeholders() {
         "LINGCLAW_TEST_PROVIDER_API_KEY".to_string(),
         "env-provider-key".to_string(),
     );
-    let sanitized = sanitize_loaded_json_config_with_lookup(
+    let (sanitized, provider_catalog_declared) = sanitize_loaded_json_config_with_lookup_and_status(
         JsonConfig {
             settings: None,
             models: Some(JsonModelsConfig {
@@ -905,6 +1085,8 @@ fn sanitize_loaded_json_config_resolves_provider_env_placeholders() {
         &mut |env_name| env.get(env_name).cloned(),
     );
 
+    assert!(provider_catalog_declared);
+
     let provider = sanitized
         .models
         .as_ref()
@@ -916,7 +1098,7 @@ fn sanitize_loaded_json_config_resolves_provider_env_placeholders() {
 }
 
 #[test]
-fn sanitize_loaded_json_config_drops_provider_when_base_url_env_is_unset() {
+fn sanitize_loaded_json_config_drops_provider_and_plain_primary_when_base_url_env_is_unset() {
     let mut providers = HashMap::new();
     providers.insert(
         "openai-work".to_string(),
@@ -939,7 +1121,19 @@ fn sanitize_loaded_json_config_drops_provider_when_base_url_env_is_unset() {
             models: Some(JsonModelsConfig {
                 providers: Some(providers),
             }),
-            agents: None,
+            agents: Some(JsonAgentsConfig {
+                defaults: Some(JsonAgentDefaults {
+                    model: Some(JsonDefaultModel {
+                        primary: Some("dynamic-model".to_string()),
+                        fast: None,
+                        sub_agent: None,
+                        memory: None,
+                        reflection: None,
+                        context: None,
+                        extra: HashMap::new(),
+                    }),
+                }),
+            }),
             mcp_servers: None,
             s3: None,
         },
@@ -953,6 +1147,85 @@ fn sanitize_loaded_json_config_drops_provider_when_base_url_env_is_unset() {
             .and_then(|models| models.providers.as_ref())
             .is_none(),
         "providers with unresolved baseUrl placeholders should be dropped at runtime"
+    );
+    assert_eq!(
+        sanitized
+            .agents
+            .and_then(|agents| agents.defaults)
+            .and_then(|defaults| defaults.model)
+            .and_then(|model| model.primary),
+        None,
+        "a plain JSON primary must not fall back to the legacy provider after its declared provider is dropped"
+    );
+}
+
+#[test]
+fn sanitize_loaded_json_config_drops_builtin_prefixed_primary_with_unavailable_declared_provider() {
+    let providers = HashMap::from([(
+        "openai".to_string(),
+        JsonProviderConfig {
+            base_url: "${LINGCLAW_TEST_PROVIDER_BASE_URL}".to_string(),
+            api_key: "${LINGCLAW_TEST_PROVIDER_API_KEY}".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "gpt-x".to_string(),
+                name: None,
+                reasoning: None,
+                input: None,
+                cost: None,
+                context_window: None,
+                max_tokens: None,
+                compat: None,
+            }],
+        },
+    )]);
+    let env = HashMap::from([(
+        "LINGCLAW_TEST_PROVIDER_API_KEY".to_string(),
+        "env-provider-key".to_string(),
+    )]);
+
+    let (sanitized, provider_catalog_declared) = sanitize_loaded_json_config_with_lookup_and_status(
+        JsonConfig {
+            settings: None,
+            models: Some(JsonModelsConfig {
+                providers: Some(providers),
+            }),
+            agents: Some(JsonAgentsConfig {
+                defaults: Some(JsonAgentDefaults {
+                    model: Some(JsonDefaultModel {
+                        primary: Some("openai/gpt-x".to_string()),
+                        fast: None,
+                        sub_agent: None,
+                        memory: None,
+                        reflection: None,
+                        context: None,
+                        extra: HashMap::new(),
+                    }),
+                }),
+            }),
+            mcp_servers: None,
+            s3: None,
+        },
+        &mut |env_name| env.get(env_name).cloned(),
+    );
+
+    assert!(provider_catalog_declared);
+
+    assert!(
+        sanitized
+            .models
+            .as_ref()
+            .and_then(|models| models.providers.as_ref())
+            .is_none()
+    );
+    assert_eq!(
+        sanitized
+            .agents
+            .and_then(|agents| agents.defaults)
+            .and_then(|defaults| defaults.model)
+            .and_then(|model| model.primary),
+        None,
+        "a JSON builtin-prefixed primary must not silently fall back to the builtin provider after its declared provider is dropped"
     );
 }
 

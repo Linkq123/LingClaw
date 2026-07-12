@@ -12,6 +12,8 @@ use crate::config;
 
 fn test_config() -> Config {
     Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "test-key".to_string(),
         api_base: "https://test.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),

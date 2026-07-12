@@ -4,10 +4,22 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 
 import { SettingsPage, closeSettingsPage, openSettingsPage } from '../src/pages/SettingsPage.js';
+import {
+  CONFIG_SAVED_EVENT,
+  acceptComposerSocketModelPayloadRevision,
+  beginComposerRevisionHandshake,
+} from '../src/composerAvailability.js';
+import { state } from '../src/state.js';
 
-function jsonResponse(payload: unknown): Response {
+beforeEach(() => {
+  state.composerConfigRevision = null;
+  state.composerSessionModelRevision = null;
+  state.composerGroupModelRevision = null;
+});
+
+function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
-    status: 200,
+    status,
     headers: { 'Content-Type': 'application/json' },
   });
 }
@@ -193,6 +205,7 @@ describe('SettingsPage shell layout and dirty state', () => {
           jsonResponse({
             path: '/tmp/config.json',
             config: { settings: { port: 18989 } },
+            configFileEtag: 'a'.repeat(64),
           }),
         );
       }
@@ -240,8 +253,422 @@ describe('SettingsPage shell layout and dirty state', () => {
       await flushMicrotasks();
     });
 
-    expect(savedBody).toEqual({ config: { settings: { port: 19000 } } });
+    expect(savedBody).toEqual({
+      config: { settings: { port: 19000 } },
+      baseConfigFileEtag: 'a'.repeat(64),
+    });
     expect(save.disabled).toBe(true);
+  });
+
+  it('preserves edits made while a config save is in flight', async () => {
+    const pendingSave = deferred<Response>();
+    let savedBody: unknown;
+    let getCount = 0;
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config' && init?.method === 'PUT') {
+        savedBody = JSON.parse(String(init.body || '{}'));
+        return pendingSave.promise;
+      }
+      if (url === '/api/config') {
+        getCount += 1;
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: { settings: { port: getCount === 1 ? 18989 : 19000 } },
+            configRevision: getCount === 1 ? 10 : 12,
+            configFileEtag: (getCount === 1 ? 'a' : 'b').repeat(64),
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+    const save = document.getElementById('settings-save-btn');
+    if (!(save instanceof HTMLButtonElement)) throw new Error('Save button not found');
+
+    await act(async () => {
+      setInputValue(findInputByPlaceholder('18989'), '19000');
+      await flushMicrotasks();
+      save.click();
+      await flushMicrotasks();
+    });
+    await act(async () => {
+      setInputValue(findInputByPlaceholder('18989'), '19001');
+      await flushMicrotasks();
+    });
+    await act(async () => {
+      // A concurrent /model update advances only the model-status revision;
+      // the successful file save must still keep the newer local edit.
+      state.composerConfigRevision = 12;
+      pendingSave.resolve(
+        jsonResponse({
+          ok: true,
+          configRevision: 11,
+          configFileEtag: 'b'.repeat(64),
+        }),
+      );
+      await pendingSave.promise;
+      await flushMicrotasks();
+    });
+
+    expect(savedBody).toMatchObject({ baseConfigFileEtag: 'a'.repeat(64) });
+    expect(getCount).toBe(2);
+    expect(findInputByPlaceholder('18989').value).toBe('19001');
+    expect(save.disabled).toBe(false);
+    expect(document.body.textContent).toContain('You have unsaved changes.');
+  });
+
+  it('does not overwrite config edits made while the initial load is in flight', async () => {
+    const initialLoad = deferred<Response>();
+    let getCount = 0;
+    const fetchMock = vi.fn<typeof fetch>((input) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url !== '/api/config') throw new Error(`Unexpected fetch URL: ${url}`);
+      getCount += 1;
+      if (getCount === 1) return initialLoad.promise;
+      return Promise.resolve(
+        jsonResponse({
+          path: '/tmp/config.json',
+          config: { settings: { port: 19191 } },
+          configRevision: 21,
+          configFileEtag: 'b'.repeat(64),
+        }),
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      setInputValue(findInputByPlaceholder('18989'), '19000');
+      await flushMicrotasks();
+    });
+    await act(async () => {
+      initialLoad.resolve(
+        jsonResponse({
+          path: '/tmp/config.json',
+          config: { settings: { port: 18989 } },
+          configRevision: 20,
+          configFileEtag: 'a'.repeat(64),
+        }),
+      );
+      await initialLoad.promise;
+      await flushMicrotasks();
+    });
+
+    const save = document.getElementById('settings-save-btn');
+    if (!(save instanceof HTMLButtonElement)) throw new Error('Save button not found');
+    expect(findInputByPlaceholder('18989').value).toBe('19000');
+    expect(save.disabled).toBe(true);
+    expect(document.body.textContent).toContain('Configuration changed elsewhere.');
+
+    await act(async () => {
+      findButtonByText('Reload latest').click();
+      await flushMicrotasks();
+    });
+
+    expect(getCount).toBe(2);
+    expect(findInputByPlaceholder('18989').value).toBe('19191');
+    expect(save.disabled).toBe(true);
+  });
+
+  it('keeps local edits on a config conflict and reloads only on request', async () => {
+    let getCount = 0;
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config' && init?.method === 'PUT') {
+        return Promise.resolve(
+          jsonResponse(
+            {
+              error: 'Configuration changed',
+              configRevision: 21,
+              configFileEtag: 'b'.repeat(64),
+            },
+            409,
+          ),
+        );
+      }
+      if (url === '/api/config') {
+        getCount += 1;
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: { settings: { port: getCount === 1 ? 18989 : 19191 } },
+            configRevision: getCount === 1 ? 20 : 21,
+            configFileEtag: (getCount === 1 ? 'a' : 'b').repeat(64),
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+    const save = document.getElementById('settings-save-btn');
+    if (!(save instanceof HTMLButtonElement)) throw new Error('Save button not found');
+
+    await act(async () => {
+      setInputValue(findInputByPlaceholder('18989'), '19000');
+      await flushMicrotasks();
+      save.click();
+      await flushMicrotasks();
+    });
+
+    expect(findInputByPlaceholder('18989').value).toBe('19000');
+    expect(save.disabled).toBe(true);
+    expect(document.body.textContent).toContain('Configuration changed elsewhere.');
+
+    await act(async () => {
+      findButtonByText('Reload latest').click();
+      await flushMicrotasks();
+    });
+
+    expect(getCount).toBe(2);
+    expect(findInputByPlaceholder('18989').value).toBe('19191');
+    expect(save.disabled).toBe(true);
+  });
+
+  it('lets the corrupt-config editor reload its ETag after a save conflict', async () => {
+    let getCount = 0;
+    const putBodies: Array<{ baseConfigFileEtag?: string }> = [];
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config' && init?.method === 'PUT') {
+        putBodies.push(JSON.parse(String(init.body || '{}')));
+        if (putBodies.length === 1) {
+          return Promise.resolve(
+            jsonResponse(
+              {
+                error: 'Configuration changed',
+                configRevision: 21,
+                configFileEtag: 'b'.repeat(64),
+              },
+              409,
+            ),
+          );
+        }
+        return Promise.resolve(jsonResponse({ error: 'Stop after request inspection' }, 400));
+      }
+      if (url === '/api/config') {
+        getCount += 1;
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            parse_error: 'Unexpected end of JSON input',
+            raw: getCount === 1 ? '{"broken":' : '{"newer":',
+            configRevision: getCount === 1 ? 20 : 21,
+            configFileEtag: (getCount === 1 ? 'a' : 'b').repeat(64),
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+    const editor = document.querySelector('.json-editor');
+    if (!(editor instanceof HTMLTextAreaElement)) throw new Error('JSON editor not found');
+
+    await act(async () => {
+      setTextareaValue(editor, '{"settings":{"port":19000}}');
+      findButtonByText('Save & Recover').click();
+      await flushMicrotasks();
+    });
+
+    expect(putBodies[0]?.baseConfigFileEtag).toBe('a'.repeat(64));
+    expect(editor.value).toBe('{"settings":{"port":19000}}');
+    expect(document.body.textContent).toContain('Configuration changed elsewhere.');
+    expect(findButtonByText('Save & Recover').disabled).toBe(true);
+
+    await act(async () => {
+      findButtonByText('Reload latest').click();
+      await flushMicrotasks();
+    });
+
+    expect(getCount).toBe(2);
+    const reloadedEditor = document.querySelector('.json-editor');
+    if (!(reloadedEditor instanceof HTMLTextAreaElement)) {
+      throw new Error('Reloaded JSON editor not found');
+    }
+    expect(reloadedEditor.value).toBe('{"newer":');
+
+    await act(async () => {
+      setTextareaValue(reloadedEditor, '{"settings":{"port":19191}}');
+      findButtonByText('Save & Recover').click();
+      await flushMicrotasks();
+    });
+
+    expect(putBodies[1]?.baseConfigFileEtag).toBe('b'.repeat(64));
+  });
+
+  it('reloads the newest config instead of applying a stale save response', async () => {
+    let getCount = 0;
+    const configEvents: Array<{
+      config?: { settings?: { port?: number } };
+      configRevision?: number;
+    }> = [];
+    const onConfig = (event: Event) => {
+      configEvents.push(
+        (
+          event as CustomEvent<{
+            config?: { settings?: { port?: number } };
+            configRevision?: number;
+          }>
+        ).detail,
+      );
+    };
+    window.addEventListener(CONFIG_SAVED_EVENT, onConfig);
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config' && init?.method === 'PUT') {
+        return Promise.resolve(jsonResponse({ ok: true, configRevision: 19 }));
+      }
+      if (url === '/api/config') {
+        getCount += 1;
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: { settings: { port: getCount === 1 ? 18989 : 19191 } },
+            configRevision: 20,
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      ({ root } = await renderSettingsPage());
+      await openAndLoad();
+      const save = document.getElementById('settings-save-btn');
+      if (!(save instanceof HTMLButtonElement)) throw new Error('Save button not found');
+
+      await act(async () => {
+        setInputValue(findInputByPlaceholder('18989'), '19000');
+        await flushMicrotasks();
+      });
+      await act(async () => {
+        save.click();
+        await flushMicrotasks();
+      });
+      await vi.waitFor(() => expect(getCount).toBe(2));
+
+      expect(findInputByPlaceholder('18989').value).toBe('19191');
+      expect(save.disabled).toBe(true);
+      expect(state.composerConfigRevision).toBe(20);
+      expect(configEvents.at(-1)).toMatchObject({
+        config: { settings: { port: 19191 } },
+        configRevision: 20,
+      });
+    } finally {
+      window.removeEventListener(CONFIG_SAVED_EVENT, onConfig);
+    }
+  });
+
+  it('retries an older Settings GET and emits the accepted save revision', async () => {
+    state.composerConfigRevision = 30;
+    let getCount = 0;
+    const configEvents: Array<{ configRevision?: number }> = [];
+    const onConfig = (event: Event) => {
+      configEvents.push((event as CustomEvent<{ configRevision?: number }>).detail);
+    };
+    window.addEventListener(CONFIG_SAVED_EVENT, onConfig);
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config' && init?.method === 'PUT') {
+        return Promise.resolve(
+          jsonResponse({
+            ok: true,
+            configRevision: 31,
+            explicitPrimaryModelConfigured: true,
+          }),
+        );
+      }
+      if (url === '/api/config') {
+        getCount += 1;
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: { settings: { port: getCount === 1 ? 18000 : 19001 } },
+            configRevision: getCount === 1 ? 29 : 30,
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    try {
+      ({ root } = await renderSettingsPage());
+      await openAndLoad();
+      expect(getCount).toBe(2);
+      expect(findInputByPlaceholder('18989').value).toBe('19001');
+
+      const save = document.getElementById('settings-save-btn');
+      if (!(save instanceof HTMLButtonElement)) throw new Error('Save button not found');
+      await act(async () => {
+        setInputValue(findInputByPlaceholder('18989'), '19002');
+        await flushMicrotasks();
+      });
+      await act(async () => {
+        save.click();
+        await flushMicrotasks();
+      });
+
+      expect(configEvents.at(-1)?.configRevision).toBe(31);
+      expect(state.composerConfigRevision).toBe(31);
+    } finally {
+      window.removeEventListener(CONFIG_SAVED_EVENT, onConfig);
+    }
+  });
+
+  it('discards a Settings GET response from the previous socket generation', async () => {
+    state.composerConfigRevision = 100;
+    const oldResponse = deferred<Response>();
+    let getCount = 0;
+    const fetchMock = vi.fn<typeof fetch>((input) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url !== '/api/config') throw new Error(`Unexpected fetch URL: ${url}`);
+      getCount += 1;
+      if (getCount === 1) return oldResponse.promise;
+      return Promise.resolve(
+        jsonResponse({
+          path: '/tmp/config.json',
+          config: { settings: { port: 19005 } },
+          configRevision: 5,
+          configFileEtag: 'b'.repeat(64),
+        }),
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+    await act(async () => {
+      beginComposerRevisionHandshake();
+      expect(acceptComposerSocketModelPayloadRevision(5)).toBe(true);
+      oldResponse.resolve(
+        jsonResponse({
+          path: '/tmp/old-config.json',
+          config: { settings: { port: 19100 } },
+          configRevision: 100,
+          configFileEtag: 'a'.repeat(64),
+        }),
+      );
+      await vi.waitFor(() => expect(getCount).toBeGreaterThanOrEqual(4));
+      await flushMicrotasks();
+    });
+
+    expect(findInputByPlaceholder('18989').value).toBe('19005');
+    expect(state.composerConfigRevision).toBe(5);
+    expect(findInputByPlaceholder('18989').value).not.toBe('19100');
   });
 
   it('saves the Task Plan feature switch as enableTaskPlan', async () => {

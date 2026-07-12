@@ -938,6 +938,8 @@ fn test_app_state() -> AppState {
 
 fn test_config() -> crate::Config {
     crate::Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "test-key".to_string(),
         api_base: "https://api.openai.com/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -966,6 +968,158 @@ fn test_config() -> crate::Config {
         enable_task_plan: false,
         s3: None,
     }
+}
+
+#[test]
+fn group_targets_require_a_global_model_or_session_overrides() {
+    let mut sessions = HashMap::new();
+    let mut configured = test_session_with_workspace(
+        "configured-worker",
+        "Configured",
+        unique_temp_workspace("configured-worker"),
+    );
+    configured.model_override = Some("openai/gpt-4o-mini".to_string());
+    sessions.insert(configured.id.clone(), configured);
+    let unconfigured = test_session_with_workspace(
+        "unconfigured-worker",
+        "Unconfigured",
+        unique_temp_workspace("unconfigured-worker"),
+    );
+    sessions.insert(unconfigured.id.clone(), unconfigured);
+    let targets = vec![
+        "configured-worker".to_string(),
+        "unconfigured-worker".to_string(),
+    ];
+    let global_config = test_config();
+    let mut session_only_config = test_config();
+    session_only_config.explicit_primary_model_configured = false;
+
+    assert!(
+        target_sessions_missing_explicit_models(&global_config, &sessions, &targets).is_empty()
+    );
+    assert_eq!(
+        target_sessions_missing_explicit_models(&session_only_config, &sessions, &targets),
+        vec!["unconfigured-worker".to_string()]
+    );
+
+    let mut invalid = test_session_with_workspace(
+        "invalid-worker",
+        "Invalid",
+        unique_temp_workspace("invalid-worker"),
+    );
+    invalid.model_override = Some("removed-provider/model".to_string());
+    sessions.insert(invalid.id.clone(), invalid);
+    assert_eq!(
+        target_sessions_missing_explicit_models(
+            &global_config,
+            &sessions,
+            &["invalid-worker".to_string()],
+        ),
+        vec!["invalid-worker".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn group_payload_exposes_validated_global_and_member_model_state() {
+    let state = test_app_state();
+    let mut member = test_session_with_workspace(
+        "configured-worker",
+        "Configured",
+        unique_temp_workspace("configured-worker-payload"),
+    );
+    member.model_override = Some("openai/gpt-4o-mini".to_string());
+    let default_member = test_session_with_workspace(
+        "default-worker",
+        "Default",
+        unique_temp_workspace("default-worker-payload"),
+    );
+    let mut invalid_member = test_session_with_workspace(
+        "invalid-worker",
+        "Invalid",
+        unique_temp_workspace("invalid-worker-payload"),
+    );
+    invalid_member.model_override = Some("removed-provider/model".to_string());
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(member.id.clone(), member);
+        sessions.insert(default_member.id.clone(), default_member);
+        sessions.insert(invalid_member.id.clone(), invalid_member);
+    }
+    let group = SessionGroup::new(
+        "model-state-group",
+        "Model State",
+        vec![
+            "configured-worker".to_string(),
+            "default-worker".to_string(),
+            "invalid-worker".to_string(),
+        ],
+    );
+
+    let payload = group_info_json(&state, &group).await;
+
+    assert_eq!(payload["explicitPrimaryModelConfigured"], true);
+    assert_eq!(
+        payload["model_override_members"],
+        json!(["configured-worker"])
+    );
+    assert_eq!(
+        payload["model_configured_members"],
+        json!(["configured-worker", "default-worker"])
+    );
+    assert!(
+        payload["configRevision"]
+            .as_u64()
+            .is_some_and(|value| value > 0)
+    );
+}
+
+#[tokio::test]
+async fn group_model_configuration_payload_does_not_duplicate_mutable_group_state() {
+    let state = test_app_state();
+    let mut config = (*state.config()).clone();
+    config.s3 = Some(crate::config::S3Config {
+        endpoint: "https://minio.example.test/storage".into(),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    });
+    let expected_s3_config_id = crate::image_uploads::s3_config_id(config.s3.as_ref().unwrap());
+    state.replace_config(config);
+    let member = test_session_with_workspace(
+        "model-worker",
+        "Model Worker",
+        unique_temp_workspace("model-worker-payload"),
+    );
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(member.id.clone(), member);
+    }
+    let group = SessionGroup::new(
+        "model-event-group",
+        "Model Event",
+        vec!["model-worker".to_string()],
+    );
+    let (config, config_revision) = state.config_snapshot_with_revision();
+
+    let payload =
+        group_model_configuration_payload_with_config(&state, &group, &config, config_revision)
+            .await;
+
+    assert_eq!(payload["type"], "group_model_configuration");
+    assert_eq!(payload["id"], "model-event-group");
+    assert_eq!(payload["model_member_ids"], json!(["model-worker"]));
+    assert_eq!(payload["capabilities"]["s3"], true);
+    assert_eq!(
+        payload["capabilities"]["s3_config_id"],
+        expected_s3_config_id
+    );
+    assert!(payload.get("name").is_none());
+    assert!(payload.get("members").is_none());
+    assert!(payload.get("pending_votes").is_none());
 }
 
 #[tokio::test]
@@ -1289,6 +1443,78 @@ async fn active_group_run_statuses_preserves_queued_runs() {
     assert_eq!(statuses.get("worker-a").map(String::as_str), Some("queued"));
     clear_group_run_control("queued-run");
     group_cleanup.cleanup_now();
+}
+
+#[tokio::test]
+async fn final_group_model_gate_records_a_visible_failed_run() {
+    let _guard = control_registry_test_guard();
+    clear_group_run_controls_for_test();
+    let state = Arc::new(test_app_state());
+    let mut config = test_config();
+    config.explicit_primary_model_configured = false;
+    state.replace_config(config);
+    let session_id = "worker-without-model".to_string();
+    state.sessions.lock().await.insert(
+        session_id.clone(),
+        test_session_with_workspace(
+            &session_id,
+            "Worker Without Model",
+            unique_temp_workspace("worker-without-model"),
+        ),
+    );
+    let group_id = format!(
+        "model-gate-visible-{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut group_cleanup = CreatedGroupCleanup::track(group_id.clone());
+    let run_id = "model-gate-visible-run".to_string();
+    let mut group = SessionGroup::new(&group_id, "Model Gate", vec![session_id.clone()]);
+    group.runs.push(GroupRun {
+        id: run_id.clone(),
+        group_id: group_id.clone(),
+        session_id: session_id.clone(),
+        status: "queued".to_string(),
+        prompt: "follow up".to_string(),
+        result_excerpt: None,
+        error: None,
+        created_at: 1,
+        updated_at: 1,
+        completed_at: None,
+    });
+    session_group::save_group_to_disk_locked(&group)
+        .await
+        .expect("group should save");
+    let control = test_direct_control();
+    register_group_run_control(&run_id, &group_id, &session_id, &control);
+    let run = StartedRun {
+        run_id: run_id.clone(),
+        group_id: Some(group_id.clone()),
+        optional_reply: false,
+        mention_depth: 1,
+        session_id: session_id.clone(),
+        control,
+    };
+
+    run_target_run(
+        state.clone(),
+        run,
+        "automatic mention follow-up".to_string(),
+        AgentRunMode::Execute,
+        4_000,
+    )
+    .await;
+
+    let loaded = session_group::load_group_from_disk(&group_id).expect("group should load");
+    assert_eq!(loaded.runs[0].status, "failed");
+    assert!(
+        loaded.runs[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("Explicit model configuration"))
+    );
+    assert!(state.sessions.lock().await[&session_id].messages.is_empty());
+    group_cleanup.cleanup_now();
+    clear_group_run_controls_for_test();
 }
 
 #[tokio::test]

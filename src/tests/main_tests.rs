@@ -17,6 +17,141 @@ use std::{
     sync::atomic::AtomicU64,
 };
 
+#[test]
+fn explicit_model_environment_requires_a_nonempty_value() {
+    assert!(!has_explicit_model_environment(None));
+    assert!(!has_explicit_model_environment(Some("")));
+    assert!(!has_explicit_model_environment(Some("   ")));
+    assert!(has_explicit_model_environment(Some("gpt-4o-mini")));
+}
+
+#[test]
+fn configured_models_available_uses_the_runtime_provider_catalog() {
+    let mut config = test_config();
+    assert!(!configured_models_available(&config));
+    config.providers.insert(
+        "custom".to_string(),
+        JsonProviderConfig {
+            base_url: "https://gateway.example/v1".to_string(),
+            api_key: "key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "good".to_string(),
+                name: None,
+                reasoning: None,
+                input: None,
+                cost: None,
+                context_window: None,
+                max_tokens: None,
+                compat: None,
+            }],
+        },
+    );
+
+    assert!(configured_models_available(&config));
+}
+
+#[test]
+fn explicit_session_model_override_requires_a_nonempty_value() {
+    let config = test_config();
+    let mut session = test_session("model-override", "Model Override", None);
+    assert!(!session.has_explicit_model_override(&config));
+    session.model_override = Some("   ".to_string());
+    assert!(!session.has_explicit_model_override(&config));
+    session.model_override = Some("openai/gpt-4o-mini".to_string());
+    assert!(session.has_explicit_model_override(&config));
+    session.model_override = Some("removed-provider/model".to_string());
+    assert!(!session.has_explicit_model_override(&config));
+}
+
+#[test]
+fn unavailable_declared_provider_catalog_invalidates_legacy_session_overrides() {
+    let mut config = test_config();
+    config.providers.clear();
+    config.provider_catalog_declared = true;
+    config.explicit_primary_model_configured = false;
+    let mut session = test_session("unavailable-catalog", "Unavailable Catalog", None);
+
+    session.model_override = Some("openai/gpt-x".to_string());
+    assert!(!session.has_explicit_model_override(&config));
+    assert!(!session.effective_model_configured(&config));
+
+    session.model_override = Some("plain-override".to_string());
+    assert!(!session.has_explicit_model_override(&config));
+    assert!(!session.effective_model_configured(&config));
+}
+
+#[tokio::test]
+async fn invalid_session_override_blocks_the_global_model_fallback() {
+    let state = test_app_state();
+    let session_id = "invalid-model-override";
+    let mut session = test_session(session_id, "Invalid Override", None);
+    session.model_override = Some("removed-provider/model".to_string());
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.to_string(), session);
+
+    let snapshot = session_model_snapshot(&state, session_id)
+        .await
+        .expect("session should exist");
+
+    assert!(!snapshot.explicit);
+    assert_eq!(snapshot.model, "removed-provider/model");
+
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(session_id)
+        .expect("session should remain loaded");
+    let (model, override_configured, effective_configured) =
+        session.model_configuration(&snapshot.config);
+    let (_, config_revision) = state.config_snapshot_with_revision();
+    let payload = socket_sync::build_session_info_payload(
+        session_id,
+        &session.name,
+        &snapshot.config,
+        &model,
+        true,
+        override_configured,
+        effective_configured,
+        config_revision,
+        json!({}),
+    );
+    assert_eq!(payload["explicitPrimaryModelConfigured"], true);
+    assert_eq!(payload["modelOverridePresent"], true);
+    assert_eq!(payload["modelOverrideConfigured"], false);
+    assert_eq!(payload["effectiveModelConfigured"], false);
+    assert_eq!(payload["configRevision"], config_revision);
+}
+
+#[test]
+fn session_payload_exposes_the_validated_global_model_state() {
+    let state = test_app_state();
+    let mut config = test_config();
+    config.explicit_primary_model_configured = false;
+    state.replace_config(config);
+    let (config, config_revision) = state.config_snapshot_with_revision();
+
+    let payload = socket_sync::build_session_info_payload(
+        MAIN_SESSION_ID,
+        "Main",
+        &config,
+        "gpt-4o-mini",
+        false,
+        false,
+        false,
+        config_revision,
+        json!({}),
+    );
+
+    assert_eq!(payload["explicitPrimaryModelConfigured"], false);
+    assert_eq!(payload["modelOverridePresent"], false);
+    assert_eq!(payload["modelOverrideConfigured"], false);
+    assert_eq!(payload["effectiveModelConfigured"], false);
+    assert_eq!(payload["configRevision"], config_revision);
+}
+
 /// RAII guard that cleans up a saved session's JSON file and workspace directory on drop.
 /// This ensures cleanup runs even if the test panics.
 struct SavedSessionGuard {
@@ -35,6 +170,8 @@ impl Drop for SavedSessionGuard {
 
 fn test_config() -> Config {
     Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -367,12 +504,14 @@ fn compression_source_text_includes_image_markers() {
         ImageAttachment {
             url: "https://example.com/a.png".to_string(),
             s3_object_key: None,
+            s3_config_id: None,
             cache_path: None,
             data: None,
         },
         ImageAttachment {
             url: "https://example.com/b.png".to_string(),
             s3_object_key: None,
+            s3_config_id: None,
             cache_path: None,
             data: None,
         },
@@ -1507,6 +1646,8 @@ fn resolve_model_uses_config_for_plain_model_id() {
     );
 
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -1963,6 +2104,7 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
             images: Some(vec![ImageAttachment {
                 url: "https://example.com/photo.png".into(),
                 s3_object_key: None,
+                s3_config_id: None,
                 cache_path: Some("C:/internal/cache/file.b64".into()),
                 data: Some("aW1hZ2U=".into()),
             }]),
@@ -2012,7 +2154,7 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
 
 #[test]
 fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
-    let session = Session {
+    let mut session = Session {
         id: "test".into(),
         name: "Test".into(),
         messages: vec![ChatMessage {
@@ -2021,6 +2163,7 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
             images: Some(vec![ImageAttachment {
                 url: "https://expired.example.test/photo.png".into(),
                 s3_object_key: Some("lingclaw/images/2026/demo.png".into()),
+                s3_config_id: None,
                 cache_path: None,
                 data: None,
             }]),
@@ -2067,6 +2210,8 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
         url_expiry_secs: 3600,
         lifecycle_days: 14,
     };
+    session.messages[0].images.as_mut().unwrap()[0].s3_config_id =
+        Some(crate::image_uploads::s3_config_id(&s3_cfg));
 
     let payload = crate::session_store::build_history_payload_with_s3(&session, Some(&s3_cfg));
     let url = payload["messages"][0]["images"][0]["url"]
@@ -2077,6 +2222,15 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
         url.starts_with("https://minio.example.test/storage/bucket/lingclaw/images/2026/demo.png?")
     );
     assert!(url.contains("X-Amz-Signature="));
+
+    let mut replacement_cfg = s3_cfg.clone();
+    replacement_cfg.endpoint = "https://replacement.example.test/storage".into();
+    let payload =
+        crate::session_store::build_history_payload_with_s3(&session, Some(&replacement_cfg));
+    assert_eq!(
+        payload["messages"][0]["images"][0]["url"],
+        "https://expired.example.test/photo.png"
+    );
 }
 
 #[test]
@@ -3034,6 +3188,8 @@ fn resolve_model_uses_ollama_provider_config_for_plain_model_id() {
     );
 
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: String::new(),
         api_base: "https://api.openai.com/v1".to_string(),
         model: "llama3.2".to_string(),
@@ -3116,6 +3272,8 @@ fn cli_default_model_marker_uses_canonical_model_ref() {
     );
 
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "key-a".to_string(),
         api_base: "https://api-a.example/v1".to_string(),
         model: "shared-model".to_string(),
@@ -3204,6 +3362,8 @@ fn resolve_model_prefers_current_provider_for_duplicate_plain_ids() {
     );
 
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "shared-model".to_string(),
@@ -3284,6 +3444,8 @@ fn resolve_model_prefers_exact_runtime_match_for_same_provider_type() {
     );
 
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "key-b".to_string(),
         api_base: "https://api-b.example/v1".to_string(),
         model: "shared-model".to_string(),
@@ -3364,6 +3526,8 @@ fn resolve_model_prefers_exact_runtime_match_for_same_anthropic_provider_type() 
     );
 
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "ant-key-b".to_string(),
         api_base: "https://anthropic-b.example".to_string(),
         model: "shared-model".to_string(),
@@ -3444,6 +3608,8 @@ fn resolve_model_prefers_exact_runtime_match_for_same_ollama_provider_type() {
     );
 
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "ollama-key-b".to_string(),
         api_base: "http://127.0.0.1:11435".to_string(),
         model: "qwen3".to_string(),
@@ -3508,6 +3674,8 @@ fn canonical_model_ref_expands_unique_plain_id() {
     );
 
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -3587,6 +3755,8 @@ fn canonical_model_ref_rejects_ambiguous_plain_id() {
     );
 
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "key-a".to_string(),
         api_base: "https://api-a.example/v1".to_string(),
         model: "shared-model".to_string(),
@@ -3668,6 +3838,8 @@ fn available_models_omits_ambiguous_plain_default_alias() {
     );
 
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "key-a".to_string(),
         api_base: "https://api-a.example/v1".to_string(),
         model: "shared-model".to_string(),
@@ -3729,6 +3901,8 @@ fn canonical_model_ref_rejects_unknown_plain_id_when_providers_exist() {
     );
 
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -3790,6 +3964,8 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
     );
 
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -3829,8 +4005,67 @@ fn canonical_model_ref_preserves_explicit_provider_model() {
 }
 
 #[test]
+fn canonical_model_ref_allows_explicit_model_for_dynamic_provider_catalog() {
+    let mut config = test_config();
+    config.providers.insert(
+        "custom".to_string(),
+        JsonProviderConfig {
+            base_url: "https://models.example/v1".to_string(),
+            api_key: "custom-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: Vec::new(),
+        },
+    );
+
+    let canonical = config
+        .canonical_model_ref("custom/dynamic-model")
+        .expect("an empty provider catalog should allow an explicit dynamic model id");
+    assert_eq!(canonical, "custom/dynamic-model");
+
+    let mut session = test_session("dynamic-model-session", "Dynamic Model", None);
+    session.model_override = Some("custom/dynamic-model".to_string());
+    assert_eq!(
+        session.validated_model_override(&config).as_deref(),
+        Some("custom/dynamic-model")
+    );
+    assert!(session.effective_model_configured(&config));
+}
+
+#[test]
+fn available_models_omits_implicit_fallback_for_an_empty_dynamic_catalog() {
+    let mut config = test_config();
+    config.explicit_primary_model_configured = false;
+    config.providers.insert(
+        "custom".to_string(),
+        JsonProviderConfig {
+            base_url: "https://models.example/v1".to_string(),
+            api_key: "custom-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: Vec::new(),
+        },
+    );
+
+    assert!(config.available_models().is_empty());
+
+    config.explicit_primary_model_configured = true;
+    config.model = "custom/dynamic-primary".to_string();
+    assert_eq!(
+        config.available_models(),
+        vec!["custom/dynamic-primary".to_string()]
+    );
+
+    config.model = "legacy-env-model".to_string();
+    assert_eq!(
+        config.available_models(),
+        vec!["legacy-env-model".to_string()]
+    );
+}
+
+#[test]
 fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "env-key".to_string(),
         api_base: "https://api.openai.com/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -3870,8 +4105,21 @@ fn canonical_model_ref_allows_explicit_provider_without_provider_config() {
 }
 
 #[test]
+fn canonical_model_ref_rejects_empty_model_id_without_provider_config() {
+    let config = test_config();
+
+    let error = config
+        .canonical_model_ref("openai/")
+        .expect_err("an explicit provider still requires a model id");
+
+    assert!(error.contains("Model id cannot be empty"));
+}
+
+#[test]
 fn resolve_model_strips_provider_prefix_without_provider_config() {
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "env-key".to_string(),
         api_base: "https://api.openai.com/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -3913,6 +4161,8 @@ fn resolve_model_strips_provider_prefix_without_provider_config() {
 #[test]
 fn resolve_model_accepts_ollama_prefix_without_provider_config() {
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: String::new(),
         api_base: "https://api.openai.com/v1".to_string(),
         model: "llama3.2".to_string(),
@@ -3974,6 +4224,8 @@ fn build_session_status_reports_resolved_target() {
     );
 
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -5238,8 +5490,20 @@ fn generate_shutdown_token_returns_64_hex_chars() {
 }
 
 #[tokio::test]
-async fn api_client_config_returns_upload_token() {
-    let state = Arc::new(test_app_state());
+async fn api_client_config_returns_upload_token_and_s3_identity() {
+    let mut config = test_config();
+    config.s3 = Some(crate::config::S3Config {
+        endpoint: "https://minio.example.test/storage".into(),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    });
+    let expected_s3_config_id = crate::image_uploads::s3_config_id(config.s3.as_ref().unwrap());
+    let state = Arc::new(test_app_state_with_config(config));
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
 
@@ -5248,6 +5512,7 @@ async fn api_client_config_returns_upload_token() {
         .expect("local request should be accepted");
 
     assert_eq!(payload["upload_token"], state.upload_token);
+    assert_eq!(payload["s3_config_id"], expected_s3_config_id);
 }
 
 #[tokio::test]
@@ -7065,6 +7330,105 @@ async fn api_put_config_rejects_unknown_agent_model_id_for_configured_provider()
 }
 
 #[tokio::test]
+async fn api_put_config_rejects_unknown_plain_agent_model_id() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let state = Arc::new(test_app_state());
+    let result = api_put_config(
+        headers,
+        State(state),
+        Json(json!({
+            "config": {
+                "models": {
+                    "providers": {
+                        "openai-work": {
+                            "api": "openai-completions",
+                            "baseUrl": "https://gateway.example/v1",
+                            "apiKey": "key",
+                            "models": [
+                                {
+                                    "id": "gpt-4o-mini"
+                                }
+                            ]
+                        }
+                    }
+                },
+                "agents": {
+                    "defaults": {
+                        "model": {
+                            "primary": "typo-model"
+                        }
+                    }
+                }
+            }
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("unknown plain model ids should fail");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("unknown model 'typo-model'"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_a_stale_file_etag_before_writing() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let state = Arc::new(test_app_state());
+    let (_, current_revision) = state.config_snapshot_with_revision();
+    let result = api_put_config(
+        headers,
+        State(state),
+        Json(json!({
+            "baseConfigFileEtag": "0000000000000000000000000000000000000000000000000000000000000000",
+            "config": {}
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("a stale full-config write must be rejected");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["configRevision"], current_revision);
+    assert_eq!(body["configFileEtag"].as_str().map(str::len), Some(64));
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("Reload the latest configuration"))
+    );
+}
+
+#[tokio::test]
+async fn api_put_config_rejects_an_invalid_base_file_etag() {
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+
+    let state = Arc::new(test_app_state());
+    let result = api_put_config(
+        headers,
+        State(state),
+        Json(json!({
+            "baseConfigFileEtag": "not-an-etag",
+            "config": {}
+        })),
+    )
+    .await;
+
+    let (status, Json(body)) = result.expect_err("invalid file etags must be rejected");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("baseConfigFileEtag"))
+    );
+}
+
+#[tokio::test]
 async fn api_put_config_rejects_empty_mcp_command() {
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
@@ -7261,6 +7625,46 @@ async fn read_config_file_snapshot_waits_for_active_writer() {
 
     let content = task.await.expect("reader task should join");
     assert_eq!(content, "{\"ok\":true}");
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn runtime_config_file_snapshot_keeps_config_revision_and_file_atomic() {
+    let base = std::env::temp_dir().join(format!("lingclaw-config-atomic-{}", now_epoch()));
+    std::fs::create_dir_all(&base).expect("temp dir should be created");
+    let path = base.join("config.json");
+    std::fs::write(&path, r#"{"model":"old"}"#).expect("old config should be written");
+    let state = Arc::new(test_app_state());
+
+    let write_guard = CONFIG_FILE_LOCK.write().await;
+    let task = tokio::spawn({
+        let state = state.clone();
+        let path = path.clone();
+        async move {
+            read_runtime_config_file_snapshot(&state, &path)
+                .await
+                .expect("atomic config read should succeed")
+        }
+    });
+    for _ in 0..3 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !task.is_finished(),
+        "reader must wait before taking any snapshot"
+    );
+
+    let mut next = test_config();
+    next.model = "new-model".to_string();
+    let (_, expected_revision) = state.replace_config(next);
+    std::fs::write(&path, r#"{"model":"new-model"}"#).expect("new config should be written");
+    drop(write_guard);
+
+    let (config, revision, content) = task.await.expect("reader task should join");
+    assert_eq!(config.model, "new-model");
+    assert_eq!(revision, expected_revision);
+    assert_eq!(content, r#"{"model":"new-model"}"#);
 
     let _ = std::fs::remove_dir_all(&base);
 }
@@ -7707,6 +8111,149 @@ fn handle_command_persists_tool_and_reasoning_visibility_changes() {
 }
 
 #[test]
+fn model_list_omits_implicit_fallback_and_includes_a_dynamic_session_override() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("dynamic-model-list-{}", now_epoch());
+    let mut config = test_config();
+    config.explicit_primary_model_configured = false;
+    config.providers.insert(
+        "custom".to_string(),
+        JsonProviderConfig {
+            base_url: "https://models.example/v1".to_string(),
+            api_key: "custom-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: Vec::new(),
+        },
+    );
+    let state = test_app_state_with_config(config);
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(
+            session_id.clone(),
+            test_session(&session_id, "Dynamic Model List", None),
+        );
+    }
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+
+    let unconfigured = rt
+        .block_on(handle_command(
+            "/model",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+    assert!(unconfigured.response.contains("(none configured)"));
+    assert!(!unconfigured.response.contains("gpt-4o-mini"));
+
+    rt.block_on(state.sessions.lock())
+        .get_mut(&session_id)
+        .expect("dynamic model Session should remain loaded")
+        .model_override = Some("custom/dynamic-model".to_string());
+    let configured = rt
+        .block_on(handle_command(
+            "/model",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+    assert!(
+        configured
+            .response
+            .contains("custom/dynamic-model (current)")
+    );
+}
+
+#[test]
+fn model_list_keeps_a_valid_legacy_environment_model_with_an_empty_dynamic_catalog() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("legacy-env-model-list-{}", now_epoch());
+    let mut config = test_config();
+    config.explicit_primary_model_configured = true;
+    config.model = "legacy-env-model".to_string();
+    config.providers.insert(
+        "custom".to_string(),
+        JsonProviderConfig {
+            base_url: "https://models.example/v1".to_string(),
+            api_key: "custom-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: Vec::new(),
+        },
+    );
+    let state = test_app_state_with_config(config);
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        let mut session = test_session(&session_id, "Legacy Environment Model", None);
+        session.model_override = Some("removed-provider/removed-model".to_string());
+        sessions.insert(session_id.clone(), session);
+    }
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+
+    let result = rt
+        .block_on(handle_command(
+            "/model",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+
+    assert!(result.response.contains("legacy-env-model"));
+    assert!(!result.response.contains("legacy-env-model (current)"));
+    assert!(!result.response.contains("(none configured)"));
+
+    let switched = rt
+        .block_on(handle_command(
+            "/model legacy-env-model",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("listed legacy model should be selectable");
+    assert_eq!(switched.response_type, "system");
+    assert!(
+        switched
+            .response
+            .contains("Model switched to: legacy-env-model")
+    );
+    let sessions = rt.block_on(state.sessions.lock());
+    let session = sessions
+        .get(&session_id)
+        .expect("legacy model Session should remain loaded");
+    assert_eq!(session.model_override.as_deref(), Some("legacy-env-model"));
+    assert!(session.effective_model_configured(&state.config()));
+    drop(sessions);
+
+    let listed_after_switch = rt
+        .block_on(handle_command(
+            "/model",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("switched legacy model should remain listable");
+    assert!(
+        listed_after_switch
+            .response
+            .contains("legacy-env-model (current)")
+    );
+    let _ = std::fs::remove_file(sessions_dir().join(format!("{session_id}.json")));
+}
+
+#[test]
 fn handle_command_persists_model_think_and_react_changes() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let session_id = format!("persist-command-{}", now_epoch());
@@ -7725,6 +8272,7 @@ fn handle_command_persists_model_think_and_react_changes() {
 
     let (tx, _rx) = mpsc::channel(4);
     let cancel = CancellationToken::new();
+    let (_, revision_before_model) = state.config_snapshot_with_revision();
 
     let model_result = rt
         .block_on(handle_command(
@@ -7738,6 +8286,23 @@ fn handle_command_persists_model_think_and_react_changes() {
         .expect("command should return a result");
     assert_eq!(model_result.response_type, "system");
     assert!(model_result.sessions_changed);
+    let (_, revision_after_first_model) = state.config_snapshot_with_revision();
+    assert!(revision_after_first_model > revision_before_model);
+
+    let second_model_result = rt
+        .block_on(handle_command(
+            "/model anthropic/claude-sonnet-4-6",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("second model command should return a result");
+    assert_eq!(second_model_result.response_type, "system");
+    assert!(second_model_result.sessions_changed);
+    let (_, revision_after_second_model) = state.config_snapshot_with_revision();
+    assert!(revision_after_second_model > revision_after_first_model);
 
     let think_result = rt
         .block_on(handle_command(
@@ -7768,7 +8333,7 @@ fn handle_command_persists_model_think_and_react_changes() {
     let persisted = load_session_from_disk(&session_id).expect("session should load from disk");
     assert_eq!(
         persisted.model_override.as_deref(),
-        Some("openai/gpt-4o-mini")
+        Some("anthropic/claude-sonnet-4-6")
     );
     assert_eq!(persisted.think_level, "high");
     assert!(!persisted.show_react);
@@ -7782,6 +8347,51 @@ fn handle_command_persists_model_think_and_react_changes() {
         .map(PathBuf::from)
         .expect("session dir should exist");
     let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn handle_model_save_failure_does_not_publish_a_provisional_override() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("failed-model-candidate-{}", now_epoch());
+    let state = test_app_state();
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(
+            session_id.clone(),
+            test_session(&session_id, "Candidate Failure", None),
+        );
+    }
+    let tmp_path = sessions_dir().join(format!("{session_id}.json.tmp"));
+    std::fs::create_dir_all(&tmp_path).expect("tmp path directory should force write failure");
+    let revision_bumps_before = state.config_revision_bump_count_for_test();
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+
+    let result = rt
+        .block_on(handle_command(
+            "/model openai/gpt-4o-mini",
+            &session_id,
+            1,
+            &state,
+            &tx,
+            &cancel,
+        ))
+        .expect("command should return a result");
+
+    assert_eq!(result.response_type, "error");
+    assert!(!result.sessions_changed);
+    assert!(result.model_configuration_payloads.is_none());
+    assert_eq!(
+        state.config_revision_bump_count_for_test(),
+        revision_bumps_before
+    );
+    assert_eq!(
+        rt.block_on(state.sessions.lock())[&session_id].model_override,
+        None
+    );
+
+    let _ = std::fs::remove_dir_all(tmp_path);
+    let _ = std::fs::remove_file(sessions_dir().join(format!("{session_id}.json")));
 }
 
 #[test]
@@ -7931,6 +8541,33 @@ fn handle_command_persists_new_on_empty_context() {
         .map(PathBuf::from)
         .expect("session dir should exist");
     let _ = std::fs::remove_dir_all(session_dir);
+}
+
+#[test]
+fn handle_command_new_rejects_an_implicit_fallback_model() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let session_id = format!("new-without-explicit-model-{}", now_epoch());
+    let state = test_app_state();
+    let mut config = test_config();
+    config.explicit_primary_model_configured = false;
+    state.replace_config(config);
+    {
+        let mut sessions = rt.block_on(state.sessions.lock());
+        sessions.insert(
+            session_id.clone(),
+            test_session(&session_id, "No Explicit Model", None),
+        );
+    }
+    let (tx, _rx) = mpsc::channel(4);
+    let cancel = CancellationToken::new();
+
+    let result = rt
+        .block_on(handle_command("/new", &session_id, 1, &state, &tx, &cancel))
+        .expect("command should return a result");
+
+    assert_eq!(result.response_type, "error");
+    assert!(result.response.contains("explicit model"));
+    assert!(!result.sessions_changed);
 }
 
 #[test]
@@ -13013,6 +13650,8 @@ fn context_input_budget_reserves_headroom() {
     );
 
     let config = Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "env-key".to_string(),
         api_base: "https://fallback.example/v1".to_string(),
         model: "gpt-4o-mini".to_string(),

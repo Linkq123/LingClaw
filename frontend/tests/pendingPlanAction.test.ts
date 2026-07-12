@@ -38,6 +38,12 @@ describe('pending plan action', () => {
     state.pendingPlanId = '';
     state.pendingPlanMessageIndex = null;
     state.pendingPlanExecutionId = '';
+    state.composerModelAvailability = 'ready';
+    state.imageUploadInFlight = false;
+    state.sessionSwitchInFlight = false;
+    state.sessionIdentityMutationInFlight = false;
+    state.composerSessionTransitionPending = false;
+    state.composerSessionIdentityPending = false;
     state.ws = {
       readyState: WebSocket.OPEN,
       send: vi.fn(),
@@ -131,6 +137,42 @@ describe('pending plan action', () => {
     expect(state.busy).toBe(true);
     expect(state.pendingPlanExecutionId).toBe('plan_123');
     expect(document.querySelector('.msg-row.user .msg')).toBeNull();
+  });
+
+  it('disables and blocks plan execution when the Agent model is unconfigured', () => {
+    state.composerModelAvailability = 'agent-model-unconfigured';
+    renderPendingPlanAction({
+      plan_id: 'plan_123',
+      message_index: 2,
+      created_at: 1710000000,
+    });
+
+    const button = document.querySelector<HTMLButtonElement>('.plan-execute-btn');
+    expect(button?.disabled).toBe(true);
+
+    executePendingPlan(button);
+
+    expect(state.ws?.send).not.toHaveBeenCalled();
+    expect(state.busy).toBe(false);
+    expect(state.pendingPlanExecutionId).toBe('');
+  });
+
+  it('disables and blocks plan execution while an attachment upload is pending', () => {
+    state.imageUploadInFlight = true;
+    renderPendingPlanAction({
+      plan_id: 'plan_123',
+      message_index: 2,
+      created_at: 1710000000,
+    });
+
+    const button = document.querySelector<HTMLButtonElement>('.plan-execute-btn');
+    expect(button?.disabled).toBe(true);
+
+    executePendingPlan(button);
+
+    expect(state.ws?.send).not.toHaveBeenCalled();
+    expect(state.busy).toBe(false);
+    expect(state.pendingPlanExecutionId).toBe('');
   });
 
   it('adds the execution transcript only after backend start confirms execution', () => {

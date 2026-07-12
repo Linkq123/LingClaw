@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 describe('group sessions', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.resetModules();
     localStorage.clear();
     document.body.innerHTML = `
@@ -11,6 +11,13 @@ describe('group sessions', () => {
         <div id="session-drawer-list"></div>
       </aside>
     `;
+    const { state } = await import('../src/state.js');
+    state.composerModelAvailability = 'ready';
+    state.sessionSwitchInFlight = false;
+    state.sessionIdentityMutationInFlight = false;
+    state.composerSessionTransitionPending = false;
+    state.composerSessionIdentityPending = false;
+    state.imageUploadInFlight = false;
   });
 
   it('persists and clears the active group id', async () => {
@@ -257,6 +264,7 @@ describe('group sessions', () => {
     stateModule.state.ws = { readyState: 1, send: sendMock } as unknown as WebSocket;
     stateModule.state.activeGroupId = 'review-group';
     stateModule.state.activeGroupMembers = ['worker-a', 'worker-b'];
+    stateModule.state.groupModelConfiguredMembers = new Set(['worker-a', 'worker-b']);
     stateModule.state.groupTargetMode = 'selected';
     stateModule.state.groupSelectedTargets = ['worker-b', 'missing-worker'];
     stateModule.state.pendingImages = [];
@@ -323,5 +331,41 @@ describe('group sessions', () => {
     expect(stateModule.dom.chat?.textContent).toContain(
       'Slash commands are not supported in group chat.',
     );
+  });
+
+  it('only sends group messages when every selected target has an effective model', async () => {
+    document.body.innerHTML = `
+      <div id="input-area">
+        <div id="group-target-bar"></div>
+        <div id="slash-command-menu" hidden></div>
+        <textarea id="input"></textarea>
+        <button id="stop"></button>
+        <button id="send"></button>
+        <span id="send-icon"></span>
+      </div>
+    `;
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = { readyState: 1, send: sendMock } as unknown as WebSocket;
+    stateModule.state.composerModelAvailability = 'agent-model-unconfigured';
+    stateModule.state.activeGroupId = 'review-group';
+    stateModule.state.activeGroupMembers = ['worker-a', 'worker-b'];
+    stateModule.state.groupTargetMode = 'selected';
+    stateModule.state.groupSelectedTargets = ['worker-a'];
+    stateModule.state.groupModelConfiguredMembers = new Set(['worker-a']);
+    stateModule.state.pendingImages = [];
+
+    const { send } = await import('../src/input.js');
+    stateModule.dom.input!.value = 'run configured target';
+    send();
+    expect(sendMock).toHaveBeenCalledTimes(1);
+
+    stateModule.state.busy = false;
+    stateModule.state.groupSelectedTargets = ['worker-b'];
+    stateModule.dom.input!.value = 'do not use fallback';
+    send();
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(stateModule.dom.input?.value).toBe('do not use fallback');
   });
 });

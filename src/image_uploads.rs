@@ -30,6 +30,35 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
+/// Opaque identity for the S3 fields that determine object placement,
+/// signing, and URL materialization. The secret is used as the HMAC key and
+/// is never included in the returned value.
+pub(crate) fn s3_config_id(cfg: &S3Config) -> String {
+    let mut payload = b"lingclaw-s3-config-v1".to_vec();
+    for value in [
+        cfg.endpoint.as_bytes(),
+        cfg.region.as_bytes(),
+        cfg.bucket.as_bytes(),
+        cfg.access_key.as_bytes(),
+        cfg.prefix.as_bytes(),
+    ] {
+        payload.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        payload.extend_from_slice(value);
+    }
+    payload.extend_from_slice(&cfg.url_expiry_secs.to_be_bytes());
+    payload.extend_from_slice(&cfg.lifecycle_days.to_be_bytes());
+    hex_encode(&hmac_sha256(cfg.secret_key.as_bytes(), &payload))
+}
+
+pub(crate) fn stored_s3_config_matches(stored_id: Option<&str>, cfg: Option<&S3Config>) -> bool {
+    match stored_id {
+        // Legacy persisted images predate config identities. Preserve their
+        // existing behavior while all newly accepted uploads are bound.
+        None => true,
+        Some(stored_id) => cfg.is_some_and(|cfg| s3_config_id(cfg) == stored_id),
+    }
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -50,7 +79,12 @@ fn hex_decode(input: &str) -> Option<Vec<u8>> {
 }
 
 fn attachment_signing_payload(cfg: &S3Config, object_key: &str) -> String {
-    format!("lingclaw-upload:{}:{}", cfg.bucket, object_key)
+    format!(
+        "lingclaw-upload:{}:{}:{}",
+        s3_config_id(cfg),
+        cfg.bucket,
+        object_key
+    )
 }
 
 pub(crate) fn sign_attachment_object_key(cfg: &S3Config, object_key: &str) -> String {

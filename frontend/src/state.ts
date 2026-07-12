@@ -10,6 +10,7 @@ import type {
   SessionGroupSummary,
   TodosStateEvent,
 } from './types.js';
+import type { ComposerModelAvailability } from './composerAvailability.js';
 
 // ── DOM refs ──
 
@@ -17,6 +18,8 @@ export interface DomRefs {
   chat: HTMLElement | null;
   input: HTMLTextAreaElement | null;
   inputArea: HTMLElement | null;
+  composerAvailabilityStatus: HTMLElement | null;
+  composerAvailabilityRetry: HTMLButtonElement | null;
   jumpToLatestBtn: HTMLButtonElement | null;
   jumpToLatestBadge: HTMLElement | null;
   stopBtn: HTMLButtonElement | null;
@@ -70,6 +73,17 @@ export interface AppState {
   ws: WebSocket | null;
   currentMsg: HTMLElement | null;
   busy: boolean;
+  composerModelAvailability: ComposerModelAvailability;
+  composerExplicitPrimaryModelConfigured: boolean;
+  composerSessionModelOverridePresent: boolean;
+  composerEffectiveModelConfigured: boolean | null;
+  composerSessionTransitionPending: boolean;
+  composerSessionTransitionTarget: string;
+  composerSessionIdentityPending: boolean;
+  composerConfigRevision: number | null;
+  composerSessionModelRevision: number | null;
+  composerGroupModelRevision: number | null;
+  groupModelConfiguredMembers: Set<string>;
   activeSessionId: string;
   activeGroupId: string;
   activeGroupMembers: string[];
@@ -86,6 +100,7 @@ export interface AppState {
   sessions: SessionSummary[];
   sessionGroups: SessionGroupSummary[];
   sessionSwitchInFlight: boolean;
+  sessionIdentityMutationInFlight: boolean;
   todos: TodosStateEvent;
   todoDrafts: Map<string, string>;
   todoSaving: boolean;
@@ -125,6 +140,7 @@ export interface AppState {
   currentAppVersion: string;
   imageCapable: boolean;
   s3Capable: boolean;
+  s3ConfigId: string;
   planModeEnabled: boolean;
   pendingPlanId: string;
   pendingPlanMessageIndex: number | null;
@@ -133,6 +149,7 @@ export interface AppState {
   uploadTokenPromise: Promise<string> | null;
   uploadTokenRequestSeq: number;
   pendingImages: ImageAttachment[];
+  imageUploadInFlight: boolean;
   inputHistory: string[];
   inputHistoryIndex: number;
   inputHistoryDraft: string;
@@ -167,6 +184,17 @@ export const state: AppState = {
   ws: null,
   currentMsg: null,
   busy: false,
+  composerModelAvailability: 'checking',
+  composerExplicitPrimaryModelConfigured: false,
+  composerSessionModelOverridePresent: false,
+  composerEffectiveModelConfigured: null,
+  composerSessionTransitionPending: false,
+  composerSessionTransitionTarget: '',
+  composerSessionIdentityPending: true,
+  composerConfigRevision: null,
+  composerSessionModelRevision: null,
+  composerGroupModelRevision: null,
+  groupModelConfiguredMembers: new Set(),
   activeSessionId: '',
   activeGroupId: '',
   activeGroupMembers: [],
@@ -183,6 +211,7 @@ export const state: AppState = {
   sessions: [],
   sessionGroups: [],
   sessionSwitchInFlight: false,
+  sessionIdentityMutationInFlight: false,
   todos: {
     type: 'todos_state',
     revision: 0,
@@ -231,6 +260,7 @@ export const state: AppState = {
   currentAppVersion: '',
   imageCapable: false,
   s3Capable: false,
+  s3ConfigId: '',
   planModeEnabled: false,
   pendingPlanId: '',
   pendingPlanMessageIndex: null,
@@ -239,6 +269,7 @@ export const state: AppState = {
   uploadTokenPromise: null,
   uploadTokenRequestSeq: 0,
   pendingImages: [],
+  imageUploadInFlight: false,
   inputHistory: [],
   inputHistoryIndex: -1,
   inputHistoryDraft: '',
@@ -261,6 +292,10 @@ export function initDomRefs() {
   dom.chat = document.getElementById('chat');
   dom.input = document.getElementById('input') as HTMLTextAreaElement | null;
   dom.inputArea = document.getElementById('input-area');
+  dom.composerAvailabilityStatus = document.getElementById('composer-availability-status');
+  dom.composerAvailabilityRetry = document.getElementById(
+    'composer-availability-retry',
+  ) as HTMLButtonElement | null;
   dom.jumpToLatestBtn = document.getElementById('jump-to-latest') as HTMLButtonElement | null;
   dom.jumpToLatestBadge = document.getElementById('jump-to-latest-badge');
   dom.stopBtn = document.getElementById('stop') as HTMLButtonElement | null;

@@ -8,6 +8,13 @@ import { closeToolDrawer } from './renderers/tools.js';
 import { resetTodosUiState } from './renderers/todos.js';
 import { finishAssistantStream, finishReasoningStream } from './handlers/stream.js';
 import { tr } from './i18n.js';
+import { syncRestoredSessionCapabilities, updateAttachButton } from './images.js';
+import {
+  beginComposerRevisionHandshake,
+  completeComposerSessionTransition,
+  restoreComposerSessionTransition,
+  syncComposerAvailability,
+} from './composerAvailability.js';
 
 type TranslationVars = Record<string, string | number | boolean | null | undefined>;
 type ConnectionStatus = 'connecting' | 'connected' | 'disconnected';
@@ -71,16 +78,22 @@ export function cancelReconnect(): void {
 
 export function connect(onMessage) {
   setConnStatus('connecting', 'common.connecting');
-  state.ws = new WebSocket(sessionWebSocketUrl());
+  const socket = new WebSocket(sessionWebSocketUrl());
+  state.ws = socket;
 
-  state.ws.onopen = () => {
+  socket.onopen = () => {
+    if (state.ws !== socket) return;
+    beginComposerRevisionHandshake();
+    renderSessionDrawer();
     state.reconnectDelay = 1000;
     state.reconnectAttempts = 0;
     setConnStatus('connected', 'common.online');
     addSystem(tr('common.connected'));
   };
 
-  state.ws.onclose = () => {
+  socket.onclose = () => {
+    if (state.ws !== socket) return;
+    syncRestoredSessionCapabilities(restoreComposerSessionTransition());
     resetSessionScopedUiState();
     if (state.reconnectAttempts < MAX_RECONNECT_ATTEMPTS) {
       const delaySecs = Math.ceil(state.reconnectDelay / 1000);
@@ -98,16 +111,23 @@ export function connect(onMessage) {
       state.reconnectDelay = Math.min(state.reconnectDelay * 2, 30000);
       state.reconnectAttempts++;
     } else {
+      completeComposerSessionTransition();
       state.sessionSwitchInFlight = false;
+      state.composerSessionIdentityPending = false;
+      syncComposerAvailability();
+      updateAttachButton();
       renderSessionDrawer();
       setConnStatus('disconnected', 'common.offline');
       addSystem(tr('socket.lostRefresh'), 'error');
     }
   };
 
-  state.ws.onerror = () => state.ws.close();
+  socket.onerror = () => {
+    if (state.ws === socket) socket.close();
+  };
 
-  state.ws.onmessage = (e) => {
+  socket.onmessage = (e) => {
+    if (state.ws !== socket) return;
     let data;
     try {
       data = JSON.parse(e.data);
@@ -128,6 +148,7 @@ export function reconnectToActiveSession(onMessage): void {
     state.ws = null;
     ws.onclose = null;
     ws.onerror = null;
+    ws.onmessage = null;
     ws.close();
   }
   resetSessionScopedUiState();

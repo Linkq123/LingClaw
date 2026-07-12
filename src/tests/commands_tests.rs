@@ -27,6 +27,8 @@ fn unique_session_id(prefix: &str) -> String {
 
 fn test_config() -> crate::Config {
     crate::Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "env-key".to_string(),
         api_base: "https://api.openai.com/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -69,6 +71,8 @@ async fn think_command_waits_for_session_persist_gate_before_mutating_session() 
     let session_id = unique_session_id("think-persist-gate");
     let state = Arc::new(AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://fallback.example/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -287,6 +291,8 @@ async fn status_command_reports_runtime_request_estimate() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://fallback.example/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -433,6 +439,8 @@ async fn status_command_uses_runtime_auto_policy_for_idle_auto_sessions() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "openai/gpt-4o-reasoner".to_string(),
@@ -578,6 +586,8 @@ async fn status_command_reports_compression_recorded_before_start_event() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "openai/gpt-4o-reasoner".to_string(),
@@ -731,6 +741,8 @@ async fn status_command_reports_prune_only_state() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "openai/gpt-4o-reasoner".to_string(),
@@ -879,6 +891,8 @@ async fn status_command_reports_replayed_compression_outcome_after_reconnect() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "openai/gpt-4o-reasoner".to_string(),
@@ -1033,6 +1047,8 @@ async fn status_command_reports_latest_compression_outcome() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "openai/gpt-4o-reasoner".to_string(),
@@ -1186,6 +1202,8 @@ async fn status_command_prefers_live_round_effective_think() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "openai/gpt-4o-reasoner".to_string(),
@@ -1342,6 +1360,8 @@ async fn status_command_prefers_live_round_effective_think_for_manual_sessions()
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "openai/gpt-4o-reasoner".to_string(),
@@ -1499,6 +1519,8 @@ async fn status_command_prefers_live_round_effective_think_over_base_model_suppo
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "openai/gpt-4o-mini".to_string(),
@@ -1676,6 +1698,8 @@ async fn status_command_reports_latest_auto_trace_summary() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "openai/gpt-4o-reasoner".to_string(),
@@ -1876,6 +1900,8 @@ async fn status_command_reports_live_runtime_provider_for_cross_provider_fast_mo
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "openai/gpt-4o-mini".to_string(),
@@ -2032,6 +2058,8 @@ async fn system_prompt_command_returns_current_prompt_and_token_estimate() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -2516,6 +2544,8 @@ async fn delete_command_allows_targeting_corrupt_persisted_session() {
 async fn switch_command_creates_or_switches_session() {
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -2590,6 +2620,8 @@ async fn memory_command_stats_reports_unavailable_without_runtime_queue() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -2712,6 +2744,8 @@ async fn memory_command_rejects_unknown_subcommand() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "env-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -2855,6 +2889,8 @@ async fn reflection_command_disabled_shows_hint() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -2993,6 +3029,8 @@ async fn reflection_command_reads_runtime_daily_reflection_updates() {
     );
 
     let base_config = crate::Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: "test-key".to_string(),
         api_base: "https://api.openai.com/v1".to_string(),
         model: "gpt-4o-mini".to_string(),
@@ -3176,6 +3214,8 @@ async fn reflection_command_disabled_allows_read_today() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -3315,6 +3355,8 @@ async fn reflection_command_enabled_shows_status() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -3466,6 +3508,8 @@ async fn reflection_command_today_shows_content() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -3623,6 +3667,8 @@ async fn reflection_command_today_filters_out_new_summaries() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -3783,6 +3829,8 @@ async fn reflection_command_today_preserves_horizontal_rules_in_body() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -3946,6 +3994,8 @@ async fn reflection_command_list_shows_only_files_with_reflections() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),
@@ -4086,6 +4136,8 @@ async fn reflection_command_invalid_arg_shows_usage() {
 
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(crate::Config {
+            explicit_primary_model_configured: true,
+            provider_catalog_declared: false,
             api_key: "test-key".to_string(),
             api_base: "https://api.openai.com/v1".to_string(),
             model: "gpt-4o-mini".to_string(),

@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    AppState, ChatMessage, MAIN_SESSION_ID, Session, now_epoch,
+    AppState, ChatMessage, Config, MAIN_SESSION_ID, Session, now_epoch,
     prompts::{self, SkillSource},
     runtime_loop::{self, AgentRunMode},
     session_group::{self, GroupMessage, GroupRun, SessionGroup},
@@ -281,6 +281,38 @@ async fn prepare_dispatch_targets(
         ));
     }
     resolve_existing_target_session_ids(state, targets).await
+}
+
+async fn ensure_explicit_target_models(state: &AppState, targets: &[String]) -> Result<(), String> {
+    let model_status_guard = crate::CONFIG_FILE_LOCK.read().await;
+    let config = state.config();
+    let sessions = state.sessions.lock().await;
+    let missing = target_sessions_missing_explicit_models(&config, &sessions, targets);
+    drop(sessions);
+    drop(model_status_guard);
+    if !missing.is_empty() {
+        return Err(format!(
+            "Explicit model configuration is required for target session(s): {}.",
+            missing.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn target_sessions_missing_explicit_models(
+    config: &Config,
+    sessions: &HashMap<String, Session>,
+    targets: &[String],
+) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|target| {
+            sessions
+                .get(*target)
+                .is_none_or(|session| !session.effective_model_configured(config))
+        })
+        .cloned()
+        .collect()
 }
 
 fn prune_direct_runs_locked(runs: &mut HashMap<String, DirectRunEntry>) {
@@ -1753,6 +1785,9 @@ async fn dispatch_group_mentions_from_session_result(
             return;
         }
     };
+    // Let each target reach run_target_run's final model gate. A missing or
+    // invalid model is then recorded and broadcast as a visible failed run
+    // instead of silently dropping the automatic mention follow-up here.
     let message = group_mention_followup_prompt(source_session_id, content);
     if let Err(error) = dispatch_to_sessions(
         state,
@@ -1864,31 +1899,222 @@ pub(crate) async fn group_member_name_map(
     names
 }
 
+#[derive(Default)]
+struct GroupModelConfiguration {
+    override_members: Vec<String>,
+    configured_members: Vec<String>,
+}
+
+fn record_group_member_model_configuration(
+    model_configuration: &mut GroupModelConfiguration,
+    member: &str,
+    session: &Session,
+    config: &Config,
+) {
+    if session.has_explicit_model_override(config) {
+        model_configuration
+            .override_members
+            .push(member.to_string());
+    }
+    if session.effective_model_configured(config) {
+        model_configuration
+            .configured_members
+            .push(member.to_string());
+    }
+}
+
+async fn group_model_configuration(
+    state: &AppState,
+    group: &SessionGroup,
+    config: &Config,
+) -> GroupModelConfiguration {
+    let (mut model_configuration, unresolved) = {
+        let sessions = state.sessions.lock().await;
+        let mut model_configuration = GroupModelConfiguration::default();
+        let mut unresolved = Vec::new();
+        for member in &group.members {
+            match sessions.get(member) {
+                Some(session) => {
+                    record_group_member_model_configuration(
+                        &mut model_configuration,
+                        member,
+                        session,
+                        config,
+                    );
+                }
+                None => unresolved.push(member.clone()),
+            }
+        }
+        (model_configuration, unresolved)
+    };
+    for member in unresolved {
+        if let Some(session) = session_store::load_session_from_disk(&member) {
+            record_group_member_model_configuration(
+                &mut model_configuration,
+                &member,
+                &session,
+                config,
+            );
+        }
+    }
+    model_configuration
+}
+
+fn attach_group_model_configuration(
+    payload: &mut Value,
+    model_configuration: &GroupModelConfiguration,
+    config: &Config,
+    config_revision: u64,
+) {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "model_override_members".to_string(),
+            json!(&model_configuration.override_members),
+        );
+        object.insert(
+            "model_configured_members".to_string(),
+            json!(&model_configuration.configured_members),
+        );
+        object.insert(
+            "explicitPrimaryModelConfigured".to_string(),
+            json!(config.explicit_primary_model_configured),
+        );
+        object.insert("configRevision".to_string(), json!(config_revision));
+        object.insert(
+            "capabilities".to_string(),
+            json!({
+                "s3": config.s3.is_some(),
+                "s3_config_id": config.s3.as_ref().map(crate::image_uploads::s3_config_id),
+            }),
+        );
+    }
+}
+
+async fn group_model_configuration_payload_with_config(
+    state: &AppState,
+    group: &SessionGroup,
+    config: &Config,
+    config_revision: u64,
+) -> Value {
+    let model_configuration = group_model_configuration(state, group, config).await;
+    let mut payload = json!({
+        "type": "group_model_configuration",
+        "id": group.id,
+        "model_member_ids": &group.members,
+    });
+    attach_group_model_configuration(&mut payload, &model_configuration, config, config_revision);
+    payload
+}
+
+async fn group_json_with_config(
+    state: &AppState,
+    group: &SessionGroup,
+    config: &Config,
+    config_revision: u64,
+) -> Value {
+    let names = group_member_name_map(state, group).await;
+    let model_configuration = group_model_configuration(state, group, config).await;
+    let mut payload = session_group::group_to_json(group, &names);
+    attach_group_model_configuration(&mut payload, &model_configuration, config, config_revision);
+    payload
+}
+
 /// Build the full group JSON (for HTTP responses) with member names resolved once.
 pub(crate) async fn group_json(state: &AppState, group: &SessionGroup) -> Value {
+    let model_status_guard = crate::CONFIG_FILE_LOCK.read().await;
+    let (config, config_revision) = state.config_snapshot_with_revision();
+    let payload = group_json_with_config(state, group, &config, config_revision).await;
+    drop(model_status_guard);
+    payload
+}
+
+async fn group_info_json_with_config(
+    state: &AppState,
+    group: &SessionGroup,
+    config: &Config,
+    config_revision: u64,
+) -> Value {
     let names = group_member_name_map(state, group).await;
-    session_group::group_to_json(group, &names)
+    let model_configuration = group_model_configuration(state, group, config).await;
+    let mut payload = session_group::group_info_payload(group, &names);
+    attach_group_model_configuration(&mut payload, &model_configuration, config, config_revision);
+    payload
+}
+
+pub(crate) async fn group_info_json(state: &AppState, group: &SessionGroup) -> Value {
+    let model_status_guard = crate::CONFIG_FILE_LOCK.read().await;
+    let (config, config_revision) = state.config_snapshot_with_revision();
+    let payload = group_info_json_with_config(state, group, &config, config_revision).await;
+    drop(model_status_guard);
+    payload
+}
+
+async fn group_history_json_with_config(
+    state: &AppState,
+    group: &SessionGroup,
+    config: &Config,
+    config_revision: u64,
+) -> Value {
+    let names = group_member_name_map(state, group).await;
+    let model_configuration = group_model_configuration(state, group, config).await;
+    let mut payload = session_group::group_history_payload(group, &names);
+    attach_group_model_configuration(&mut payload, &model_configuration, config, config_revision);
+    payload
+}
+
+pub(crate) async fn group_history_json(state: &AppState, group: &SessionGroup) -> Value {
+    let model_status_guard = crate::CONFIG_FILE_LOCK.read().await;
+    let (config, config_revision) = state.config_snapshot_with_revision();
+    let payload = group_history_json_with_config(state, group, &config, config_revision).await;
+    drop(model_status_guard);
+    payload
 }
 
 /// Broadcast a reliable `group` info payload with member names resolved once.
 pub(crate) async fn send_group_info(state: &AppState, group: &SessionGroup) {
-    let names = group_member_name_map(state, group).await;
-    crate::send_group_client_event(
-        state,
-        &group.id,
-        GroupClientEvent::reliable(session_group::group_info_payload(group, &names)),
-    )
-    .await;
+    let payload = group_info_json(state, group).await;
+    crate::send_group_client_event(state, &group.id, GroupClientEvent::reliable(payload)).await;
 }
 
 /// Broadcast a reliable `group_history` payload with member names resolved once.
 pub(crate) async fn send_group_history(state: &AppState, group_id: &str, group: &SessionGroup) {
-    let names = group_member_name_map(state, group).await;
     crate::send_group_client_event(
         state,
         group_id,
-        GroupClientEvent::reliable(session_group::group_history_payload(group, &names)),
+        GroupClientEvent::reliable(group_history_json(state, group).await),
     )
+    .await;
+}
+
+pub(crate) async fn collect_group_model_configuration_payloads(
+    state: &AppState,
+    config: &Config,
+    config_revision: u64,
+) -> Vec<(String, Value)> {
+    let group_ids = {
+        let clients = state.group_clients.lock().await;
+        clients.keys().cloned().collect::<Vec<_>>()
+    };
+    let mut payloads = Vec::with_capacity(group_ids.len());
+    for group_id in group_ids {
+        let Some(group) = session_group::load_group_from_disk(&group_id) else {
+            continue;
+        };
+        let payload =
+            group_model_configuration_payload_with_config(state, &group, config, config_revision)
+                .await;
+        payloads.push((group_id, payload));
+    }
+    payloads
+}
+
+pub(crate) async fn send_group_model_configuration_payloads(
+    state: &AppState,
+    payloads: Vec<(String, Value)>,
+) {
+    futures::future::join_all(payloads.into_iter().map(|(group_id, payload)| async move {
+        crate::send_group_client_event(state, &group_id, GroupClientEvent::reliable(payload)).await;
+    }))
     .await;
 }
 
@@ -1974,6 +2200,14 @@ async fn mark_started_run_stopped(state: &AppState, run: &StartedRun) {
         clear_group_run_control(&run.run_id);
     } else {
         update_direct_run_status(&run.run_id, DirectRunStatus::Stopped);
+    }
+}
+
+async fn mark_started_run_failed(state: &AppState, run: &StartedRun, error: String) {
+    if let Some(group_id) = run.group_id.as_deref() {
+        mark_group_run_failed(state, group_id, &run.run_id, error).await;
+    } else {
+        update_direct_run_status(&run.run_id, DirectRunStatus::Failed);
     }
 }
 
@@ -2080,6 +2314,21 @@ async fn run_target_run(
         }
     };
 
+    let model_snapshot = match crate::session_model_snapshot(&state, &run.session_id).await {
+        Some(snapshot) if snapshot.explicit => snapshot,
+        _ => {
+            runtime_loop::release_agent_run_reservation(&state, &run.session_id, &reservation)
+                .await;
+            mark_started_run_failed(
+                state.as_ref(),
+                &run,
+                "Explicit model configuration is required for the target session.".to_string(),
+            )
+            .await;
+            return;
+        }
+    };
+
     if let Some(group_id) = run.group_id.as_deref() {
         match update_run_status(&state, group_id, &run.run_id, "running", None, None).await {
             Ok(Some(_)) => {}
@@ -2175,6 +2424,7 @@ async fn run_target_run(
         &stop_requested,
         run_mode,
         Some(reservation),
+        Some(model_snapshot),
     )
     .await;
     drop(live_tx);
@@ -2511,7 +2761,9 @@ pub(crate) async fn handle_group_socket_message(
         } else {
             SESSION_CONTROL_MEMBERS_MAX_ITEMS
         };
-        Some(prepare_dispatch_targets(state, Some(group_id), targets, max_targets).await?)
+        let targets = prepare_dispatch_targets(state, Some(group_id), targets, max_targets).await?;
+        ensure_explicit_target_models(state, &targets).await?;
+        Some(targets)
     } else {
         match payload.target_mode.as_str() {
             "selected" | "mentions" | "all" | "" => {}
@@ -4146,6 +4398,7 @@ async fn dispatch_from_tool(state: &Arc<AppState>, args: &Value) -> Result<Strin
     };
     let targets =
         prepare_dispatch_targets(state, group_id.as_deref(), raw_targets, max_targets).await?;
+    ensure_explicit_target_models(state, &targets).await?;
     let run_mode = parse_run_mode(
         args.get("run_mode")
             .and_then(Value::as_str)

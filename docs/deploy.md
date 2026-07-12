@@ -429,7 +429,7 @@ volumes:
 | `primary` | 主 Agent 默认模型 | `LINGCLAW_MODEL` |
 | `fast` | 简单首轮查询优先使用的轻量模型；若当前上下文含图片，则仅在该模型支持图片输入时启用 | `LINGCLAW_FAST_MODEL` |
 | `sub-agent` | 子代理执行模型 | `LINGCLAW_SUB_AGENT_MODEL` |
-| `sub-agent-<name>` | 指定子代理的专属模型；未配置时回退到 `sub-agent` 再回退到 `primary` | - |
+| `sub-agent-<name>` | 指定子代理的专属模型；未配置时回退到 `sub-agent`，再继承当前父 Session 的有效模型（无 Session override 时为 `primary`） | - |
 | `memory` | structured memory 后台抽取模型 | `LINGCLAW_MEMORY_MODEL` |
 | `reflection` | daily reflection 后台模型 | `LINGCLAW_REFLECTION_MODEL` |
 | `context` | 自动上下文压缩优先模型 | `LINGCLAW_CONTEXT_MODEL` |

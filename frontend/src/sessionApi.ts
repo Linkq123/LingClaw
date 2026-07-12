@@ -107,6 +107,28 @@ function normalizeGroupDetail(group: unknown): SessionGroupDetail {
   if (!id) {
     throw new Error('Group response did not include an id.');
   }
+  const modelConfiguredMembers = Array.isArray(raw.model_configured_members)
+    ? normalizeStringArray(raw.model_configured_members)
+    : undefined;
+  const configRevision =
+    raw.configRevision === null || raw.configRevision === undefined
+      ? Number.NaN
+      : Number(raw.configRevision);
+  const rawCapabilities =
+    raw.capabilities && typeof raw.capabilities === 'object' && !Array.isArray(raw.capabilities)
+      ? (raw.capabilities as Record<string, unknown>)
+      : null;
+  const s3Capability = typeof rawCapabilities?.s3 === 'boolean' ? rawCapabilities.s3 : undefined;
+  const rawS3ConfigId = rawCapabilities?.s3_config_id;
+  const s3ConfigId: string | null | undefined =
+    typeof rawS3ConfigId === 'string' ? rawS3ConfigId : rawS3ConfigId === null ? null : undefined;
+  const capabilities =
+    s3Capability !== undefined || s3ConfigId !== undefined
+      ? {
+          ...(s3Capability !== undefined ? { s3: s3Capability } : {}),
+          ...(s3ConfigId !== undefined ? { s3_config_id: s3ConfigId } : {}),
+        }
+      : undefined;
   return {
     id,
     name: String(raw.name ?? id),
@@ -114,6 +136,16 @@ function normalizeGroupDetail(group: unknown): SessionGroupDetail {
     admins: normalizeStringArray(raw.admins),
     pending_votes: normalizeGroupVotes(raw.pending_votes),
     member_details: normalizeGroupMemberDetails(raw.member_details),
+    model_override_members: normalizeStringArray(raw.model_override_members),
+    ...(modelConfiguredMembers !== undefined
+      ? { model_configured_members: modelConfiguredMembers }
+      : {}),
+    explicitPrimaryModelConfigured:
+      typeof raw.explicitPrimaryModelConfigured === 'boolean'
+        ? raw.explicitPrimaryModelConfigured
+        : undefined,
+    ...(Number.isSafeInteger(configRevision) && configRevision >= 0 ? { configRevision } : {}),
+    ...(capabilities ? { capabilities } : {}),
     messages: Array.isArray(raw.messages) ? raw.messages : [],
     runs: Array.isArray(raw.runs) ? raw.runs : [],
     created_at: typeof raw.created_at === 'number' ? raw.created_at : Number(raw.created_at ?? 0),

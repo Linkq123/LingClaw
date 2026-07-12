@@ -158,6 +158,21 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'group.selectMember': 'Select at least one group member before sending.',
 
     'composer.placeholder': 'Message LingClaw... (/ for commands)',
+    'composer.placeholderBusy': 'Message LingClaw... (send guidance while running, or use Stop)',
+    'composer.checkingModel': 'Checking model configuration...',
+    'composer.modelsUnconfigured': 'Configure a model in Settings before sending a message.',
+    'composer.agentModelUnconfigured':
+      'Assign a primary Agent model in Settings before sending a message.',
+    'composer.sessionModelUnconfigured':
+      'The current Session model is no longer available. Choose another model with /model.',
+    'composer.configUnavailable': 'Model configuration is unavailable. Check Settings and retry.',
+    'composer.uploadInProgress':
+      'Wait for the image upload to finish before sending or changing sessions.',
+    'composer.sessionChangeInProgress': 'Session change in progress...',
+    'composer.uploadContextChanged':
+      'The image upload was discarded because the active Session or its capabilities changed.',
+    'composer.retryConfig': 'Retry',
+    'composer.groupTargetsUnconfigured': 'Configure models for: {targets}.',
     'composer.aria': 'Message input',
     'composer.moreOptions': 'More options',
     'composer.addImage': 'Add image',
@@ -179,6 +194,8 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'composer.noImagesUploaded': 'No images uploaded.',
     'composer.uploadUnavailable':
       'Local uploaded images were cleared because image uploads are unavailable. Please re-attach them after uploads are restored.',
+    'composer.uploadConfigChanged':
+      'Local uploaded images were cleared because storage settings changed. Please re-attach them.',
 
     'welcome.title': 'Workspace ready',
     'welcome.ready': 'Type a message or use / commands to begin.',
@@ -296,10 +313,14 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'settings.loaded': 'Loaded',
     'settings.loadedFrom': 'Loaded from {path}',
     'settings.loadFailed': 'Load failed: {error}',
+    'settings.configChangedWhileLoading': 'Configuration changed while loading. Please retry.',
     'settings.syntaxErrors': 'Config file has syntax errors',
     'settings.saving': 'Saving...',
     'settings.saveFailed': 'Save failed',
     'settings.saveFailedWithError': 'Save failed: {error}',
+    'settings.configConflict':
+      'Configuration changed elsewhere. Reload the latest version before saving.',
+    'settings.reloadLatest': 'Reload latest',
     'settings.saved':
       'Saved successfully! Most changes apply immediately. Restart LingClaw only for port changes.',
     'settings.tab.general': 'General',
@@ -323,7 +344,7 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'settings.agentDefaultsHelp':
       'Models must reference a provider configured in the Models tab (format: provider/model-id).',
     'settings.subAgentOrder':
-      'Sub-agent resolution order is sub-agent-<name> -> sub-agent -> primary.',
+      'Sub-agent resolution order is sub-agent-<name> -> sub-agent -> current parent Session model.',
     'settings.perSubAgentOverrides': 'Per-Sub-Agent Overrides',
     'settings.noDiscoveredAgents': 'No discovered sub-agents available',
     'settings.addSubAgentOverride': '+ Add Sub-Agent Override',
@@ -555,6 +576,18 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'group.selectMember': '发送前至少选择一个群成员。',
 
     'composer.placeholder': '给 LingClaw 发消息...（/ 打开命令）',
+    'composer.placeholderBusy': '给 LingClaw 发消息...（运行中可发送干预，或点击停止）',
+    'composer.checkingModel': '正在检查模型配置...',
+    'composer.modelsUnconfigured': '模型未配置，请先前往设置添加模型。',
+    'composer.agentModelUnconfigured': 'Agent 模型未配置，请先在设置中指定主模型。',
+    'composer.sessionModelUnconfigured':
+      '当前 Session 的模型已不可用，请使用 /model 选择其他模型。',
+    'composer.configUnavailable': '模型配置暂时不可用，请检查设置后重试。',
+    'composer.uploadInProgress': '请等待图片上传完成后再发送消息或切换会话。',
+    'composer.sessionChangeInProgress': '会话切换中...',
+    'composer.uploadContextChanged': '当前 Session 或其能力已变化，本次图片上传已丢弃。',
+    'composer.retryConfig': '重试',
+    'composer.groupTargetsUnconfigured': '以下成员未配置模型：{targets}。',
     'composer.aria': '消息输入框',
     'composer.moreOptions': '更多选项',
     'composer.addImage': '添加图片',
@@ -575,6 +608,7 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'composer.uploadError': '上传错误：{error}',
     'composer.noImagesUploaded': '没有图片被上传。',
     'composer.uploadUnavailable': '本地上传图片已清除，因为图片上传当前不可用。恢复后请重新附加。',
+    'composer.uploadConfigChanged': '存储设置已更改，本地上传图片已清除。请重新附加。',
 
     'welcome.title': '工作区已就绪',
     'welcome.ready': '输入消息，或使用 / 命令开始。',
@@ -691,10 +725,13 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'settings.loaded': '已加载',
     'settings.loadedFrom': '已从 {path} 加载',
     'settings.loadFailed': '加载失败：{error}',
+    'settings.configChangedWhileLoading': '加载期间配置发生变化，请重试。',
     'settings.syntaxErrors': '配置文件存在语法错误',
     'settings.saving': '保存中...',
     'settings.saveFailed': '保存失败',
     'settings.saveFailedWithError': '保存失败：{error}',
+    'settings.configConflict': '配置已在其他页面或进程中更新。请重新加载最新版本后再保存。',
+    'settings.reloadLatest': '重新加载最新配置',
     'settings.saved': '保存成功！大多数更改会立即生效；只有端口变更需要重启 LingClaw。',
     'settings.tab.general': '通用',
     'settings.tab.generalDesc': '服务、超时、上下文限制和功能开关。',
@@ -714,7 +751,8 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'settings.features': '功能',
     'settings.agentDefaults': '代理默认模型',
     'settings.agentDefaultsHelp': '模型必须引用模型页中配置的服务商（格式：provider/model-id）。',
-    'settings.subAgentOrder': '子代理解析顺序：sub-agent-<name> -> sub-agent -> primary。',
+    'settings.subAgentOrder':
+      '子代理解析顺序：sub-agent-<name> -> sub-agent -> 当前父 Session 的有效模型。',
     'settings.perSubAgentOverrides': '子代理专用覆盖',
     'settings.noDiscoveredAgents': '没有可用的已发现子代理',
     'settings.addSubAgentOverride': '+ 添加子代理覆盖',

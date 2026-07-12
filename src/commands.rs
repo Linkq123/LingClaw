@@ -33,6 +33,7 @@ pub(crate) struct CommandResult {
     pub(crate) refresh_history: bool,
     pub(crate) dismissible: bool,
     pub(crate) switch_to_session: Option<String>,
+    pub(crate) model_configuration_payloads: Option<crate::socket_sync::ModelConfigurationPayloads>,
 }
 
 pub(crate) fn command_result(
@@ -48,6 +49,7 @@ pub(crate) fn command_result(
         refresh_history: false,
         dismissible: true,
         switch_to_session: None,
+        model_configuration_payloads: None,
     }
 }
 
@@ -119,6 +121,39 @@ where
     }
 
     Ok(())
+}
+
+/// Persist a candidate model override before exposing it to live readers. The
+/// caller holds `CONFIG_FILE_LOCK` for writing, so committing the in-memory
+/// override and advancing the revision is atomic with respect to all guarded
+/// model-status snapshot builders.
+async fn persist_session_model_override(
+    state: &AppState,
+    current_session_id: &str,
+    canonical: &str,
+) -> Result<(std::sync::Arc<crate::Config>, u64), String> {
+    let persist_gate = session_persist_gate(current_session_id);
+    let _persist_guard = persist_gate.lock().await;
+    let candidate = {
+        let sessions = state.sessions.lock().await;
+        let mut candidate = sessions
+            .get(current_session_id)
+            .cloned()
+            .ok_or_else(|| "Session not found".to_string())?;
+        candidate.model_override = Some(canonical.to_string());
+        candidate.updated_at = now_epoch();
+        candidate
+    };
+
+    save_session_to_disk_locked(&candidate).await?;
+
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions
+        .get_mut(current_session_id)
+        .ok_or_else(|| "Session not found".to_string())?;
+    session.model_override = candidate.model_override;
+    session.updated_at = session.updated_at.max(candidate.updated_at);
+    Ok(state.bump_config_revision())
 }
 
 fn parse_toggle_value(arg: &str, command_name: &str) -> Result<bool, String> {
@@ -609,18 +644,26 @@ async fn handle_new_command(
     tx: &WsTx,
     cancel: &CancellationToken,
 ) -> Option<CommandResult> {
-    let config = state.config();
-    let (compress_messages, workspace, model_str) = {
+    let Some(model_snapshot) = crate::session_model_snapshot(state, current_session_id).await
+    else {
+        return Some(command_result("Session not found", "system", false));
+    };
+    if !model_snapshot.explicit {
+        return Some(command_result(
+            "Configure an explicit model before using /new.",
+            "error",
+            false,
+        ));
+    }
+    let config = model_snapshot.config;
+    let model_str = model_snapshot.model;
+    let (compress_messages, workspace) = {
         let sessions = state.sessions.lock().await;
         let session = match sessions.get(current_session_id) {
             Some(s) => s,
             None => return Some(command_result("Session not found", "system", false)),
         };
-        (
-            session.messages.clone(),
-            session.workspace.clone(),
-            session.effective_model(&config.model).to_string(),
-        )
+        (session.messages.clone(), session.workspace.clone())
     };
 
     let memory_dir = workspace.join("memory");
@@ -841,27 +884,53 @@ async fn handle_model_command(
     current_session_id: &str,
     state: &AppState,
 ) -> CommandResult {
+    // Keep validation, candidate persistence, live commit, revision advance,
+    // and payload collection in one write-locked transaction. Network sends
+    // happen later, after this guard has been released.
+    let _config_guard = crate::CONFIG_FILE_LOCK.write().await;
     let config = state.config();
     if arg.is_empty() {
         let sessions = state.sessions.lock().await;
-        let model = sessions
+        let (model, session_override_configured, effective_model_configured) = sessions
             .get(current_session_id)
-            .map(|s| s.effective_model(&config.model))
-            .unwrap_or(&config.model)
-            .to_string();
-        let current = config.canonical_model_ref(&model).unwrap_or(model.clone());
-        let available = config.available_models();
-        let list = available
-            .iter()
-            .map(|m| {
-                if m == &current {
-                    format!("  * {m} (current)")
-                } else {
-                    format!("    {m}")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
+            .map(|session| session.model_configuration(&config))
+            .unwrap_or_else(|| {
+                (
+                    config.model.clone(),
+                    false,
+                    config.explicit_primary_model_configured,
+                )
+            });
+        let current = if effective_model_configured {
+            if session_override_configured {
+                config.selectable_model_ref(&model).ok()
+            } else {
+                config.explicit_primary_model_ref()
+            }
+        } else {
+            None
+        };
+        let mut available = config.available_models();
+        if let Some(current) = current.as_ref()
+            && !available.iter().any(|model| model == current)
+        {
+            available.push(current.clone());
+        }
+        let list = if available.is_empty() {
+            "  (none configured)".to_string()
+        } else {
+            available
+                .iter()
+                .map(|model| {
+                    if current.as_ref() == Some(model) {
+                        format!("  * {model} (current)")
+                    } else {
+                        format!("    {model}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
         return command_result(
             format!("Available models:\n{list}\n\nUse /model <name> to switch."),
             "system",
@@ -869,25 +938,23 @@ async fn handle_model_command(
         );
     }
 
-    let canonical = match config.canonical_model_ref(arg) {
+    let canonical = match config.selectable_model_ref(arg) {
         Ok(value) => value,
         Err(err) => return command_result(err, "error", false),
     };
-    match persist_session_update(
-        state,
-        current_session_id,
-        |session| (session.model_override.clone(), session.updated_at),
-        |session| {
-            session.model_override = Some(canonical.clone());
-        },
-        |session, (model_override, updated_at)| {
-            session.model_override = model_override;
-            session.updated_at = updated_at;
-        },
-    )
-    .await
-    {
-        Ok(()) => command_result(format!("Model switched to: {canonical}"), "system", true),
+    match persist_session_model_override(state, current_session_id, &canonical).await {
+        Ok((config, config_revision)) => {
+            let payloads = crate::socket_sync::collect_model_configuration_payloads(
+                state,
+                &config,
+                config_revision,
+            )
+            .await;
+            let mut result =
+                command_result(format!("Model switched to: {canonical}"), "system", true);
+            result.model_configuration_payloads = Some(payloads);
+            result
+        }
         Err(err) if err == "Session not found" => command_result(err, "system", false),
         Err(err) => command_result(
             format!("Failed to persist model switch: {err}"),

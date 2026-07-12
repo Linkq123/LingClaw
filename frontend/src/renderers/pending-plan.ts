@@ -2,8 +2,20 @@ import { dom, state } from '../state.js';
 import type { PlanReadyPayload } from '../types.js';
 import { invalidateChatScrollCache } from '../scroll.js';
 import { addMsg, setBusy } from './chat.js';
+import { isComposerModelReady } from '../composerAvailability.js';
 
 const APPROVED_PLAN_EXECUTION_PREFIX = 'Proceed with the approved plan.';
+
+function canExecutePendingPlan(): boolean {
+  return (
+    isComposerModelReady() &&
+    !state.imageUploadInFlight &&
+    !state.sessionSwitchInFlight &&
+    !state.sessionIdentityMutationInFlight &&
+    !state.composerSessionTransitionPending &&
+    !state.composerSessionIdentityPending
+  );
+}
 
 export function clearPendingPlanAction(): void {
   state.pendingPlanId = '';
@@ -15,7 +27,7 @@ export function clearPendingPlanAction(): void {
 export function restorePendingPlanAction(): void {
   if (!state.pendingPlanExecutionId) return;
   document.querySelectorAll<HTMLButtonElement>('.plan-execute-btn').forEach((button) => {
-    button.disabled = false;
+    button.disabled = !canExecutePendingPlan();
     button.textContent = '开始执行';
   });
   state.pendingPlanExecutionId = '';
@@ -70,6 +82,8 @@ export function renderPendingPlanAction(plan: PlanReadyPayload | null | undefine
   button.dataset.action = 'execute-plan';
   button.dataset.planId = plan.plan_id;
   button.textContent = '开始执行';
+  button.disabled = !canExecutePendingPlan();
+  if (button.disabled) button.setAttribute('aria-describedby', 'composer-availability-status');
   action.appendChild(button);
   const time = content.querySelector('.msg-time');
   if (time) {
@@ -82,7 +96,14 @@ export function renderPendingPlanAction(plan: PlanReadyPayload | null | undefine
 
 export function executePendingPlan(button: HTMLButtonElement | null | undefined): void {
   const planId = button?.dataset?.planId || state.pendingPlanId;
-  if (!planId || state.busy || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  if (
+    !planId ||
+    !canExecutePendingPlan() ||
+    state.busy ||
+    !state.ws ||
+    state.ws.readyState !== WebSocket.OPEN
+  )
+    return;
   if (button) {
     button.disabled = true;
     button.textContent = '执行中';

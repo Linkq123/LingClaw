@@ -4,6 +4,7 @@ export interface ImageAttachment {
   url: string;
   object_key?: string;
   attachment_token?: string;
+  s3_config_id?: string;
 }
 
 export interface HistoryMessage {
@@ -87,6 +88,12 @@ export interface SessionGroupDetail {
   admins?: string[];
   pending_votes?: GroupVote[];
   member_details?: GroupMemberDetail[];
+  model_override_members?: string[];
+  model_configured_members?: string[];
+  model_member_ids?: string[];
+  explicitPrimaryModelConfigured?: boolean;
+  configRevision?: number;
+  capabilities?: { s3?: boolean; s3_config_id?: string | null };
   messages?: unknown[];
   runs?: unknown[];
   created_at?: number;
@@ -123,7 +130,12 @@ export interface SessionEvent {
   type: 'session';
   id: string;
   name?: string;
-  capabilities?: { image?: boolean; s3?: boolean };
+  capabilities?: { image?: boolean; s3?: boolean; s3_config_id?: string | null };
+  explicitPrimaryModelConfigured?: boolean;
+  modelOverridePresent?: boolean;
+  modelOverrideConfigured?: boolean;
+  effectiveModelConfigured?: boolean;
+  configRevision?: number;
   usage?: {
     daily_input?: number;
     daily_output?: number;

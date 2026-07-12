@@ -914,6 +914,8 @@ struct CapturedHttpRequest {
 
 fn base_config() -> Config {
     Config {
+        explicit_primary_model_configured: true,
+        provider_catalog_declared: false,
         api_key: String::new(),
         api_base: "https://api.openai.com/v1".to_string(),
         model: "openai/gpt-4o".to_string(),
