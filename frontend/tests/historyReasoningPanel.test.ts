@@ -57,18 +57,18 @@ describe('buildHistoryReasoningPanel', () => {
     expect(statusEl?.title).toBe(exact);
   });
 
-  it('falls back statusEl.title to 完成 when thinking trims to empty', () => {
+  it('falls back to the localized completed label when thinking trims to empty', () => {
     const panel = buildHistoryReasoningPanel('   \n  ');
     const statusEl = panel.querySelector<HTMLElement>('.reasoning-status');
-    expect(statusEl?.title).toBe('\u5b8c\u6210');
-    expect(statusEl?.textContent).toBe('\u5b8c\u6210');
+    expect(statusEl?.title).toBe('Completed');
+    expect(statusEl?.textContent).toBe('Completed');
   });
 
   it('marks whitespace-only reasoning as empty summary content', () => {
     const summary = summarizeReasoningText('   \n  ');
     expect(summary.hasContent).toBe(false);
-    expect(summary.previewText).toBe('\u5b8c\u6210');
-    expect(summary.titleText).toBe('\u5b8c\u6210');
+    expect(summary.previewText).toBe('Completed');
+    expect(summary.titleText).toBe('Completed');
   });
 
   it('drops live reasoning panels that only contain whitespace', () => {

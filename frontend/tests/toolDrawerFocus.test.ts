@@ -34,7 +34,7 @@ describe('tool drawer focus', () => {
   it('creates a keyboard trigger and restores focus after closing', async () => {
     const panel = toolsModule.addToolCall('read_file', '{}', 'tool-1') as HTMLElement;
     const header = panel.querySelector<HTMLElement>('.tool-header');
-    expect(header?.getAttribute('role')).toBe('button');
+    expect(header?.tagName).toBe('BUTTON');
     expect(header?.tabIndex).toBe(0);
     expect(header?.querySelector('.tool-icon use')?.getAttribute('href')).toBe('#icon-bolt');
 
@@ -74,6 +74,20 @@ describe('tool drawer focus', () => {
     toolsModule.syncToolDrawerResponsiveState();
     expect(stateModule.dom.toolDrawer?.hasAttribute('aria-modal')).toBe(false);
     expect(stateModule.dom.sessionDrawer?.inert).toBe(false);
+    toolsModule.closeToolDrawer();
+  });
+
+  it('uses modal focus behavior on desktop when opened from a sub-agent dialog', () => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1400 });
+    document.body.classList.add('subagent-modal-visible');
+    const panel = toolsModule.addToolCall('read_file', '{}', 'tool-subagent') as HTMLElement;
+
+    toolsModule.openToolDrawerFromHeader(panel.querySelector('.tool-header'));
+
+    expect(stateModule.dom.toolDrawer?.getAttribute('aria-modal')).toBe('true');
+    const tabEvent = new KeyboardEvent('keydown', { key: 'Tab', cancelable: true });
+    expect(toolsModule.trapToolDrawerFocus(tabEvent)).toBe(true);
+    document.body.classList.remove('subagent-modal-visible');
     toolsModule.closeToolDrawer();
   });
 

@@ -1,4 +1,5 @@
 import type { AppState } from './state.js';
+import { syncAllExecutionStackVisibility } from './renderers/execution-stack.js';
 
 export function applyToolsVisibility(
   showTools: boolean,
@@ -19,4 +20,9 @@ export function applyToolsVisibility(
     deps.closeOrchestrateTaskModal();
     deps.state.activeToolPanel = null;
   }
+
+  // Modal hosts are restored from placeholders by the close handlers above;
+  // apply filtering after that restoration so the real execution step, not
+  // only its temporary clone, receives the hidden state.
+  syncAllExecutionStackVisibility();
 }

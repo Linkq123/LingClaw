@@ -109,6 +109,7 @@ export interface AppState {
   todoFeedbackKind: 'conflict' | 'error' | '';
   todoPendingFocusId: string | null;
   reasoningPanel: HTMLElement | null;
+  activeExecutionStack: HTMLElement | null;
   reactStatusRow: HTMLElement | null;
   reactStatusPhase: ReactPhase;
   reactStatusCycle: number | null;
@@ -226,6 +227,7 @@ export const state: AppState = {
   todoFeedbackKind: '',
   todoPendingFocusId: null,
   reasoningPanel: null,
+  activeExecutionStack: null,
   reactStatusRow: null,
   reactStatusPhase: '',
   reactStatusCycle: null,

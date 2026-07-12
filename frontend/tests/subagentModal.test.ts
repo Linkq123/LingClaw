@@ -7,18 +7,26 @@ import {
   createSubagentPanel,
   finishSubagentPanel,
   openSubagentModal,
+  refreshSubagentPanelsLanguage,
   restoreSubagentHistorySnapshot,
+  startSubagentReasoning,
+  trapSubagentModalFocus,
   updateSubagentToolResult,
 } from '../src/renderers/subagent.js';
 import { dom, state } from '../src/state.js';
 import { applyToolsVisibility } from '../src/viewState.js';
+import { setLanguage } from '../src/i18n.js';
 
 let originalScrollIntoView: typeof Element.prototype.scrollIntoView | undefined;
 
 describe('subagent modal hosting', () => {
   beforeEach(() => {
-    document.body.innerHTML = '<div id="chat"></div>';
+    document.body.innerHTML = `
+      <aside id="session-drawer"></aside>
+      <div class="conversation-column"><div id="chat"></div></div>
+    `;
     dom.chat = document.getElementById('chat') as HTMLElement;
+    dom.sessionDrawer = document.getElementById('session-drawer');
     dom.toolDrawer = null;
     dom.toolDrawerBackdrop = null;
     dom.toolDrawerTitle = null;
@@ -31,6 +39,7 @@ describe('subagent modal hosting', () => {
     state.activeToolPanel = null;
     state.autoFollowChat = true;
     state.showTools = true;
+    setLanguage('en');
     originalScrollIntoView = Element.prototype.scrollIntoView;
     Object.defineProperty(Element.prototype, 'scrollIntoView', {
       configurable: true,
@@ -43,8 +52,10 @@ describe('subagent modal hosting', () => {
     state.activeSubagentPanels.clear();
     state.activeToolPanel = null;
     state.showTools = true;
+    setLanguage('en');
     document.body.innerHTML = '';
     dom.chat = null;
+    dom.sessionDrawer = null;
     dom.toolDrawer = null;
     dom.toolDrawerBackdrop = null;
     dom.toolDrawerTitle = null;
@@ -68,13 +79,14 @@ describe('subagent modal hosting', () => {
 
     const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
     expect(panel).not.toBeNull();
-    const wrapper = panel?.closest('.timeline-node') as HTMLElement | null;
+    const wrapper = panel?.closest('.execution-step') as HTMLElement | null;
+    const stackBody = wrapper?.parentElement;
     const header = panel?.querySelector('.subagent-header') as HTMLElement | null;
     const scrollIntoViewSpy = Element.prototype.scrollIntoView as unknown as ReturnType<
       typeof vi.fn
     >;
 
-    expect(wrapper?.parentElement).toBe(dom.chat);
+    expect(stackBody?.classList.contains('execution-stack-body')).toBe(true);
 
     openSubagentModal(header);
 
@@ -91,6 +103,12 @@ describe('subagent modal hosting', () => {
     expect(placeholder?.querySelector('.subagent-status')).toBeNull();
     expect(placeholder?.querySelector('.subagent-body')).toBeNull();
     expect(panel?.classList.contains('subagent-modal-open')).toBe(true);
+    expect(panel?.getAttribute('role')).toBe('dialog');
+    expect(panel?.getAttribute('aria-modal')).toBe('true');
+    expect(panel?.getAttribute('aria-label')).toBe('Sub-agent: explore');
+    expect(document.body.classList.contains('subagent-modal-visible')).toBe(true);
+    expect(dom.sessionDrawer?.inert).toBe(true);
+    expect(document.querySelector<HTMLElement>('.conversation-column')?.inert).toBe(true);
     expect(
       (panel?.querySelector('.subagent-body') as HTMLElement | null)?.hasAttribute('inert'),
     ).toBe(false);
@@ -101,16 +119,34 @@ describe('subagent modal hosting', () => {
     expect(panel?.querySelector('.subagent-modal-close')).toBe(document.activeElement);
     expect(scrollIntoViewSpy).not.toHaveBeenCalled();
 
+    const copyButton = panel?.querySelector<HTMLButtonElement>(
+      '[data-action="subagent-copy-summary"]',
+    );
+    copyButton?.focus();
+    const tabEvent = new KeyboardEvent('keydown', {
+      key: 'Tab',
+      bubbles: true,
+      cancelable: true,
+    });
+    expect(trapSubagentModalFocus(tabEvent)).toBe(true);
+    expect(document.activeElement).toBe(header);
+
     closeSubagentModal();
 
     expect(wrapper?.classList.contains('subagent-modal-host')).toBe(false);
-    expect(wrapper?.parentElement).toBe(dom.chat);
+    expect(wrapper?.parentElement).toBe(stackBody);
     expect(dom.chat?.querySelector('.subagent-modal-placeholder')).toBeNull();
     expect(panel?.classList.contains('subagent-modal-open')).toBe(false);
     expect(
       (panel?.querySelector('.subagent-body') as HTMLElement | null)?.hasAttribute('inert'),
     ).toBe(true);
     expect(document.getElementById('subagent-modal-backdrop')?.hidden).toBe(true);
+    expect(panel?.hasAttribute('role')).toBe(false);
+    expect(panel?.hasAttribute('aria-modal')).toBe(false);
+    expect(document.body.classList.contains('subagent-modal-visible')).toBe(false);
+    expect(dom.sessionDrawer?.inert).toBe(false);
+    expect(document.querySelector<HTMLElement>('.conversation-column')?.inert).toBe(false);
+    expect(document.activeElement).toBe(header);
   });
 
   it('keeps summary copy enabled for finished panels without tools', () => {
@@ -137,7 +173,8 @@ describe('subagent modal hosting', () => {
     createSubagentPanel('explore', 'Inspect the current service status.', 'task-3');
 
     const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement | null;
-    const wrapper = panel?.closest('.timeline-node') as HTMLElement | null;
+    const wrapper = panel?.closest('.execution-step') as HTMLElement | null;
+    const stackBody = wrapper?.parentElement;
     const header = panel?.querySelector('.subagent-header') as HTMLElement | null;
     const closeToolDrawer = vi.fn();
 
@@ -154,7 +191,8 @@ describe('subagent modal hosting', () => {
 
     expect(closeToolDrawer).toHaveBeenCalledTimes(1);
     expect(panel?.classList.contains('subagent-modal-open')).toBe(false);
-    expect(wrapper?.parentElement).toBe(dom.chat);
+    expect(wrapper?.parentElement).toBe(stackBody);
+    expect(wrapper?.hidden).toBe(true);
     expect(dom.chat?.classList.contains('hide-tools')).toBe(true);
     expect(document.getElementById('subagent-modal-backdrop')?.hidden).toBe(true);
   });
@@ -216,6 +254,20 @@ describe('subagent modal hosting', () => {
     ).toBe(initialPlaceholderHeight);
   });
 
+  it('updates the owning execution-stack failure state while the modal is open', () => {
+    createSubagentPanel('explore', 'Inspect the current service status.', 'task-open-failure');
+    const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement;
+    const stack = panel.closest('.execution-stack') as HTMLElement;
+    openSubagentModal(panel.querySelector('.subagent-header'));
+
+    finishSubagentPanel({ task_id: 'task-open-failure', agent: 'explore' }, false, {
+      error: 'service unavailable',
+    });
+
+    expect(stack.classList.contains('is-failed')).toBe(true);
+    expect(stack.querySelector('.execution-stack-title')?.textContent).toBe('Execution failed');
+  });
+
   it('strips delegated runtime context from the displayed prompt', () => {
     createSubagentPanel(
       'explore',
@@ -238,7 +290,11 @@ describe('subagent modal hosting', () => {
     const sectionTitles = Array.from(panel?.querySelectorAll('.subagent-section-title') || []).map(
       (title) => (title as HTMLElement).textContent?.trim(),
     );
+    const header = panel?.querySelector('.subagent-header');
+    const closeButton = panel?.querySelector('.subagent-modal-close');
 
+    expect(header).toBeInstanceOf(HTMLButtonElement);
+    expect(header?.contains(closeButton || null)).toBe(false);
     expect(panel?.querySelector('.subagent-status')?.textContent).toBe('Running');
     expect(panel?.querySelector('.subagent-icon use')?.getAttribute('href')).toBe(
       '#icon-user-node',
@@ -246,6 +302,9 @@ describe('subagent modal hosting', () => {
     expect(panel?.querySelector('.chevron use')?.getAttribute('href')).toBe('#icon-chevron-right');
     expect(panel?.querySelector('.subagent-modal-close use')?.getAttribute('href')).toBe(
       '#icon-close',
+    );
+    expect(closeButton?.getAttribute('data-i18n-aria-label')).toBe(
+      'execution.closeSubagentDetails',
     );
     expect(actionButtons).toEqual(['Copy summary']);
     expect(sectionTitles).toEqual(['Task prompt', 'Tool chain']);
@@ -364,6 +423,84 @@ describe('subagent modal hosting', () => {
     );
     expect(summary?.classList.contains('hidden')).toBe(false);
     expect(summary?.textContent).toContain('Found the root cause in the startup logs.');
+  });
+
+  it('preserves failed sub-agent details while refreshing localized status text', () => {
+    createSubagentPanel('reviewer', 'Inspect the failure.', 'task-language');
+    finishSubagentPanel({ task_id: 'task-language', agent: 'reviewer' }, false, {
+      cycles: 2,
+      tool_calls: 1,
+      duration_ms: 480,
+      error: 'request timed out',
+    });
+    const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement;
+
+    setLanguage('zh-CN');
+    refreshSubagentPanelsLanguage();
+
+    expect(panel.querySelector('.subagent-status')?.textContent).toBe(
+      '执行失败: request timed out',
+    );
+    expect(panel.querySelector('[data-subagent-chip="state"]')?.textContent).toBe('执行失败');
+    expect(panel.querySelector('[data-subagent-chip="cycle"]')?.textContent).toBe('第 2 轮');
+
+    setLanguage('en');
+    refreshSubagentPanelsLanguage();
+    expect(panel.querySelector('.subagent-status')?.textContent).toBe('Failed: request timed out');
+  });
+
+  it('refreshes tool, reasoning, and summary details inside an open sub-agent panel', () => {
+    createSubagentPanel('reviewer', 'Inspect the result.', 'task-detail-language');
+    addSubagentTool(
+      { task_id: 'task-detail-language', agent: 'reviewer' },
+      'read_file',
+      'tool-language',
+      '{}',
+    );
+    updateSubagentToolResult(
+      { task_id: 'task-detail-language', agent: 'reviewer' },
+      'tool-language',
+      18,
+      'ok',
+      false,
+      'read_file',
+    );
+    finishSubagentPanel({ task_id: 'task-detail-language', agent: 'reviewer' }, true, {
+      cycles: 2,
+      tool_calls: 1,
+      duration_ms: 480,
+      input_tokens: 120,
+      output_tokens: 64,
+      result_excerpt: 'Finished.',
+    });
+    const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement;
+
+    setLanguage('zh-CN');
+    refreshSubagentPanelsLanguage();
+
+    expect(panel.querySelector('.subagent-tool-pill-state')?.textContent).toBe('已完成 / 18ms');
+    expect(panel.querySelector('[data-subagent-tools-meta]')?.textContent).toBe(
+      '1 次调用 / 已完成 1 个',
+    );
+    expect(panel.querySelector('[data-subagent-chip="tools"]')?.textContent).toBe(
+      '已完成 1/1 个工具',
+    );
+    expect(panel.querySelector('.subagent-summary')?.textContent).toContain('轮次 2');
+    expect(panel.querySelector('.subagent-summary')?.textContent).toContain('输入 120');
+    expect(panel.querySelector('.subagent-summary-title')?.textContent).toBe('执行摘要');
+  });
+
+  it('refreshes the active sub-agent reasoning status without replacing its content', () => {
+    createSubagentPanel('reviewer', 'Inspect the result.', 'task-reasoning-language');
+    startSubagentReasoning({ task_id: 'task-reasoning-language', agent: 'reviewer' });
+    const panel = dom.chat?.querySelector('.subagent-panel') as HTMLElement;
+
+    setLanguage('zh-CN');
+    refreshSubagentPanelsLanguage();
+
+    expect(panel.querySelector('[data-subagent-reasoning-meta]')?.textContent).toBe(
+      '第 1 轮 / 思考中…',
+    );
   });
 
   it('matches empty tool ids to the earliest running badge', () => {

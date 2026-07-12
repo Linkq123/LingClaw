@@ -34,11 +34,19 @@ import {
   updateJumpToLatestVisibility,
 } from './scroll.js';
 import {
-  wrapInTimeline,
   animatePanelIn,
-  removeTimelinePanel,
   animateCollapsibleSection,
+  linkCollapsibleControl,
 } from './renderers/timeline.js';
+import {
+  completeExecutionStack,
+  mountExecutionPanel,
+  refreshExecutionStacks,
+  resetExecutionStackState,
+  restoreExecutionStackState,
+  syncAllExecutionStackVisibility,
+  toggleExecutionStack,
+} from './renderers/execution-stack.js';
 import {
   addMsg,
   addSystem,
@@ -67,6 +75,7 @@ import {
   syncToolDrawerResponsiveState,
   trapToolDrawerFocus,
   toggleTool,
+  refreshToolPanelsLanguage,
 } from './renderers/tools.js';
 import { preloadMarkdownEngine, scheduleMarkdownRender } from './markdown.js';
 import {
@@ -120,6 +129,8 @@ import {
   openSubagentModal,
   closeSubagentModal,
   openSubagentToolDrawer,
+  refreshSubagentPanelsLanguage,
+  trapSubagentModalFocus,
 } from './renderers/subagent.js';
 import {
   createOrchestratePanel,
@@ -128,6 +139,7 @@ import {
   finishOrchestratePanel,
   openOrchestrateTaskModal,
   closeOrchestrateTaskModal,
+  refreshOrchestratePanelsLanguage,
 } from './renderers/orchestrate.js';
 import {
   openSettingsPage,
@@ -177,6 +189,7 @@ import {
 import {
   applyTaskPlan,
   finishTaskPlanPanel,
+  refreshTaskPlanPanelsLanguage,
   supersedeTaskPlanPanel,
 } from './renderers/task-plan.js';
 import {
@@ -292,6 +305,10 @@ function updateViewToggleButtons() {
 
 function refreshLocalizedUi() {
   translateDom();
+  refreshToolPanelsLanguage();
+  refreshTaskPlanPanelsLanguage();
+  refreshSubagentPanelsLanguage();
+  refreshOrchestratePanelsLanguage();
   syncComposerAvailability();
   refreshConnectionStatus();
   updateViewToggleButtons();
@@ -301,6 +318,7 @@ function refreshLocalizedUi() {
   renderGroupMemberDrawer();
   renderTodosPanel();
   renderReactStatus();
+  refreshExecutionStacks();
   if (state.activeToolPanel) {
     syncToolDrawer(state.activeToolPanel);
   }
@@ -321,13 +339,18 @@ function applyViewState(viewState) {
 
   if (typeof viewState.show_reasoning === 'boolean') {
     state.showReasoning = viewState.show_reasoning;
+    dom.chat?.classList.toggle('hide-reasoning', !state.showReasoning);
     if (!state.showReasoning) {
       finishReasoningStream();
-      if (state.reasoningPanel) removeTimelinePanel(state.reasoningPanel);
+      if (state.reasoningPanel) {
+        state.reasoningPanel.classList.remove('reasoning-active');
+        finalizeOrDiscardLiveReasoningPanel(state.reasoningPanel);
+      }
       state.reasoningPanel = null;
     }
   }
 
+  syncAllExecutionStackVisibility();
   updateViewToggleButtons();
 }
 
@@ -1425,6 +1448,7 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
   const { followMarkdown = true } = options;
   switch (m.role) {
     case 'user': {
+      completeExecutionStack({ immediate: true, durationMs: null });
       const el = addMsg('user', m.content, m.timestamp);
       markHistoryMessageIndex(el, m.message_index);
       if (m.images && m.images.length > 0) renderUserImageThumbnails(el, m.images);
@@ -1433,12 +1457,13 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
     case 'assistant': {
       if (m.thinking && m.thinking.trim() && state.showReasoning) {
         const panel = buildHistoryReasoningPanel(m.thinking);
-        dom.chat.appendChild(wrapInTimeline(panel, 'reasoning'));
+        mountExecutionPanel(panel, 'reasoning');
         invalidateChatScrollCache();
       }
       // Thinking-only cycles (no text, tool call follows) have empty content.
       // Only create a bubble when there is actual message text.
       if (m.content) {
+        completeExecutionStack({ immediate: true, durationMs: null });
         const el = addMsg('assistant', m.content, m.timestamp);
         markHistoryMessageIndex(el, m.message_index);
         el._rawText = m.content;
@@ -1525,7 +1550,7 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
         });
         break;
       }
-      addToolResult('', m.result, m.id);
+      addToolResult('', m.result, m.id, m.duration_ms ?? null, m.is_error === true);
       break;
     }
   }
@@ -1545,6 +1570,7 @@ function loadEarlierMessages() {
   if (loadMoreRow) loadMoreRow.remove();
   const existing = [...dom.chat.children];
   dom.chat.replaceChildren();
+  const liveExecutionStack = resetExecutionStackState();
   invalidateChatScrollCache();
   dom.chat.classList.add('no-animate');
   state.bulkRenderingChat = true;
@@ -1566,7 +1592,9 @@ function loadEarlierMessages() {
     }
     state._historyOrchestrateIds = null;
   }
+  completeExecutionStack({ immediate: true, durationMs: null });
   for (const el of existing) dom.chat.appendChild(el);
+  restoreExecutionStackState(liveExecutionStack);
   invalidateChatScrollCache();
   requestAnimationFrame(() => {
     state.bulkRenderingChat = false;
@@ -1633,6 +1661,7 @@ function renderGroupHistory(data): void {
   renderImagePreviews();
   state.inputHistoryIndex = -1;
   dom.chat.replaceChildren();
+  resetExecutionStackState();
   invalidateChatScrollCache();
   state.deferredHistory = [];
   state.activeSubagentPanels.clear();
@@ -1902,6 +1931,7 @@ function handleMessage(data) {
       // replaceChildren() avoids the extra HTML parser invocation of
       // `innerHTML = ''` and is slightly friendlier to GC on large chats.
       dom.chat.replaceChildren();
+      resetExecutionStackState();
       invalidateChatScrollCache();
       state.deferredHistory = [];
       state.activeSubagentPanels.clear();
@@ -1937,6 +1967,7 @@ function handleMessage(data) {
           }
           state._historyOrchestrateIds = null;
         }
+        completeExecutionStack({ immediate: true, durationMs: null });
         requestAnimationFrame(() => {
           state.bulkRenderingChat = false;
           dom.chat.classList.remove('no-animate');
@@ -1961,6 +1992,7 @@ function handleMessage(data) {
       const isNewTurn = !state.busy || state.currentRoundStartedAt === 0;
       setBusy(true);
       if (isNewTurn) {
+        completeExecutionStack({ immediate: true });
         state.currentRoundStartedAt = performance.now();
         state.currentRoundFirstTokenAt = 0;
       }
@@ -2043,6 +2075,11 @@ function handleMessage(data) {
       }
       requestClearReactStatus();
       finishTaskPlanPanel();
+      completeExecutionStack({
+        durationMs: state.currentRoundStartedAt
+          ? Math.max(1, performance.now() - state.currentRoundStartedAt)
+          : null,
+      });
       state.reasoningPanel = null;
       if (data.daily_input_tokens != null) {
         state.dailyInputTokens = data.daily_input_tokens;
@@ -2082,26 +2119,24 @@ function handleMessage(data) {
       }
       const panel = document.createElement('div');
       panel.className = 'reasoning-panel reasoning-active';
-      const header = document.createElement('div');
+      const header = document.createElement('button');
+      header.type = 'button';
       header.className = 'reasoning-header';
       header.dataset.action = 'toggle-tool';
+      header.setAttribute('aria-expanded', 'true');
       header.innerHTML = `
           <span class="reasoning-icon">${iconMarkup('reasoning')}</span>
-          <span class="reasoning-label">Reasoning</span>
-          <span class="reasoning-status">\u63a8\u7406\u4e2d</span>
+          <span class="reasoning-label" data-i18n="common.reasoning">${tr('common.reasoning')}</span>
+          <span class="reasoning-status" data-i18n="execution.reasoningActive">${tr('execution.reasoningActive')}</span>
           <span class="chevron open">${iconMarkup('chevron-right')}</span>
       `;
       const body = document.createElement('div');
       body.className = 'reasoning-body show';
+      linkCollapsibleControl(header, body, 'reasoning-body');
       panel.appendChild(header);
       panel.appendChild(body);
       const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
-      const wrapper = wrapInTimeline(panel, 'reasoning');
-      if (currentRow) {
-        dom.chat.insertBefore(wrapper, currentRow);
-      } else {
-        dom.chat.appendChild(wrapper);
-      }
+      mountExecutionPanel(panel, 'reasoning', currentRow);
       invalidateChatScrollCache();
       pinReactStatusToBottom();
       animatePanelIn(panel);
@@ -2200,7 +2235,13 @@ function handleMessage(data) {
         state.reactStatusElapsedMs = data.duration_ms || state.reactStatusElapsedMs;
         renderReactStatus();
       }
-      addToolResult(data.name, data.result, data.id, data.duration_ms ?? null);
+      addToolResult(
+        data.name,
+        data.result,
+        data.id,
+        data.duration_ms ?? null,
+        data.is_error === true,
+      );
       break;
 
     case 'task_started':
@@ -2267,6 +2308,7 @@ function handleMessage(data) {
 
     case 'success':
       clearReactStatus();
+      completeExecutionStack();
       addSystem(data.content, 'success', { dismissible: data.dismissible === true });
       restoreComposerSessionTransitionWithCapabilities();
       setBusy(false);
@@ -2274,6 +2316,7 @@ function handleMessage(data) {
 
     case 'system':
       clearReactStatus();
+      completeExecutionStack();
       addSystem(data.content, 'info', { dismissible: data.dismissible === true });
       restorePendingPlanAction();
       restoreComposerSessionTransitionWithCapabilities();
@@ -2284,7 +2327,13 @@ function handleMessage(data) {
       clearCompressionOutcome();
       finishAssistantStream({ discardIfEmpty: true });
       finishReasoningStream();
+      if (state.reasoningPanel) {
+        state.reasoningPanel.classList.remove('reasoning-active');
+        finalizeOrDiscardLiveReasoningPanel(state.reasoningPanel);
+      }
+      finishTaskPlanPanel();
       clearReactStatus();
+      completeExecutionStack({ failed: true });
       addError(data.content, { dismissible: data.dismissible === true });
       state.reasoningPanel = null;
       resetRoundTimers();
@@ -2355,6 +2404,7 @@ const actionHandlers = {
   'retry-composer-config': () => void refreshComposerAvailability(),
   'open-tool-drawer': (el) => openToolDrawerFromHeader(el),
   'toggle-tool': (el) => toggleTool(el),
+  'toggle-execution-stack': (el) => toggleExecutionStack(el),
   'subagent-copy-summary': (el) => copySubagentSummary(el),
   'subagent-open-tool-drawer': (el) => openSubagentToolDrawer(el),
   'open-subagent-modal': (el) => {
@@ -2395,6 +2445,9 @@ function handleDocumentClick(e: MouseEvent) {
 
 function handleDocumentKeydown(e: KeyboardEvent) {
   if (e.key === 'Tab' && trapToolDrawerFocus(e)) {
+    return;
+  }
+  if (e.key === 'Tab' && trapSubagentModalFocus(e)) {
     return;
   }
   if (e.key === 'Escape') {

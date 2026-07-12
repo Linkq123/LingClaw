@@ -797,6 +797,9 @@
 .subagent-modal-backdrop[hidden] {
   display: none;
 }
+body.subagent-modal-visible {
+  overflow: hidden;
+}
 .panel-actions {
   display: flex;
   flex-wrap: wrap;
@@ -859,8 +862,12 @@
   border-color: color-mix(in srgb, var(--accent-error) 18%, var(--panel-border-soft));
 }
 .subagent-header {
+  width: 100%;
   padding: 10px 14px;
+  border: 0;
   background: transparent;
+  font: inherit;
+  text-align: left;
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -870,6 +877,7 @@
 }
 .subagent-panel.subagent-modal-open .subagent-header {
   flex-shrink: 0;
+  padding-right: 54px;
   border-bottom: 1px solid var(--panel-border-soft);
   background: var(--panel-surface-alt);
 }
@@ -929,6 +937,10 @@
 }
 .subagent-modal-close {
   display: none;
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  z-index: 1;
   width: 30px;
   height: 30px;
   border: 1px solid var(--panel-border-soft);
@@ -1494,12 +1506,17 @@
   overflow: hidden;
 }
 .orchestrate-task-summary {
+  width: 100%;
   display: flex;
   align-items: flex-start;
   gap: 10px;
   padding: 10px 12px;
   cursor: pointer;
+  border: 0;
   background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
   transition: background 0.15s;
 }
 .orchestrate-task-summary:hover {

@@ -1,7 +1,8 @@
 import { dom, state } from '../state.js';
 import { escHtml, truncateStr, formatToolDuration, hideWelcome } from '../utils.js';
 import { scrollDown, syncToolDrawerBounds } from '../scroll.js';
-import { wrapInTimeline, animatePanelIn, animateCollapsibleSection } from './timeline.js';
+import { animatePanelIn, animateCollapsibleSection } from './timeline.js';
+import { mountExecutionPanel, refreshExecutionStackForPanel } from './execution-stack.js';
 import { pinReactStatusToBottom } from './react-status.js';
 import { tr } from '../i18n.js';
 import { trapDialogFocus } from '../pages/dialogFocus.js';
@@ -28,23 +29,27 @@ function cancelToolDrawerFocus(): void {
 
 function setToolDrawerBackgroundInert(modal: boolean): void {
   document.body.classList.toggle('tool-drawer-modal-open', modal);
+  const subagentModalOpen = document.body.classList.contains('subagent-modal-visible');
   const mobileNavigationViewport =
     typeof window.matchMedia === 'function'
       ? window.matchMedia('(max-width: 768px)').matches
       : window.innerWidth <= 768;
   const mobileNavigationOpen = mobileNavigationViewport && state.mobileNavigationOpen;
   if (dom.sessionDrawer) {
-    dom.sessionDrawer.inert = modal || (mobileNavigationViewport && !mobileNavigationOpen);
+    dom.sessionDrawer.inert =
+      modal || subagentModalOpen || (mobileNavigationViewport && !mobileNavigationOpen);
   }
   const conversation = document.querySelector<HTMLElement>('.conversation-column');
-  if (conversation) conversation.inert = modal || mobileNavigationOpen;
+  if (conversation) conversation.inert = modal || subagentModalOpen || mobileNavigationOpen;
 }
 
 export function syncToolDrawerResponsiveState(): void {
   const drawer = dom.toolDrawer;
   if (!drawer) return;
   const open = drawer.classList.contains('open');
-  const modal = open && isToolDrawerModalViewport();
+  const modal =
+    open &&
+    (isToolDrawerModalViewport() || document.body.classList.contains('subagent-modal-visible'));
   const becameModal = modal && !toolDrawerModal;
   toolDrawerModal = modal;
   if (modal) drawer.setAttribute('aria-modal', 'true');
@@ -118,22 +123,15 @@ export function addToolCall(name, args, id) {
   panel.dataset.toolStatus = tr('tool.running');
 
   panel.innerHTML = `
-    <div class="tool-header" data-action="open-tool-drawer" role="button" tabindex="0" aria-haspopup="dialog">
+    <button type="button" class="tool-header" data-action="open-tool-drawer" aria-haspopup="dialog">
       <span class="tool-icon">${iconMarkup('bolt')}</span>
       <span class="tool-name">${escHtml(name)}</span>
       <span class="tool-args-preview">${escHtml(truncateStr(args, 80))}</span>
       <span class="tool-status">${escHtml(tr('tool.running'))}</span>
-    </div>
+    </button>
   `;
-  const wrapper = wrapInTimeline(panel, 'tool');
   const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
-  if (currentRow) {
-    // Tool calls are emitted after the assistant has finished streaming its text;
-    // insert the card AFTER the current assistant row, not before it.
-    currentRow.after(wrapper);
-  } else {
-    dom.chat.appendChild(wrapper);
-  }
+  mountExecutionPanel(panel, 'tool', currentRow);
   pinReactStatusToBottom();
   animatePanelIn(panel);
   hideWelcome();
@@ -145,6 +143,7 @@ export function updateToolProgress(id, elapsedMs) {
   const panel = findToolPanel(id);
   if (!panel || panel.dataset.toolHasResult === 'true') return;
   const seconds = Math.max(1, Math.floor((elapsedMs || 0) / 1000));
+  panel.dataset.toolElapsedSeconds = String(seconds);
   const statusText = tr('tool.runningWithSeconds', { seconds });
   panel.dataset.toolStatus = statusText;
   const statusEl = panel.querySelector('.tool-status');
@@ -154,6 +153,7 @@ export function updateToolProgress(id, elapsedMs) {
   if (state.activeToolPanel === panel) {
     syncToolDrawer(panel);
   }
+  refreshExecutionStackForPanel(panel);
 }
 
 export function appendToolOutput(id, stream, chunk) {
@@ -169,24 +169,32 @@ export function appendToolOutput(id, stream, chunk) {
   }
 }
 
-export function addToolResult(name, result, id, durationMs = null) {
+export function addToolResult(name, result, id, durationMs = null, isError = false) {
   const panel = findToolPanel(id);
   if (panel) {
     panel.dataset.toolResult = result;
     panel.dataset.toolLiveOutput = '';
     panel.dataset.toolHasResult = 'true';
+    panel.dataset.toolDurationMs = durationMs == null ? '' : String(durationMs);
+    panel.dataset.toolIsError = String(isError);
     const durationLabel = formatToolDuration(durationMs);
-    panel.dataset.toolStatus = durationLabel
-      ? tr('tool.resultReturnedWithDuration', { duration: durationLabel })
-      : tr('tool.resultReturned');
+    panel.dataset.toolStatus = isError
+      ? durationLabel
+        ? tr('tool.failedWithDuration', { duration: durationLabel })
+        : tr('tool.failed')
+      : durationLabel
+        ? tr('tool.resultReturnedWithDuration', { duration: durationLabel })
+        : tr('tool.resultReturned');
     const statusEl = panel.querySelector('.tool-status');
     if (statusEl) {
       statusEl.textContent = panel.dataset.toolStatus;
     }
     panel.classList.add('tool-panel-ready');
+    panel.classList.toggle('tool-panel-failed', isError);
     if (state.activeToolPanel === panel) {
       syncToolDrawer(panel);
     }
+    refreshExecutionStackForPanel(panel);
     return;
   }
   // Fallback: standalone result
@@ -197,25 +205,27 @@ export function addToolResult(name, result, id, durationMs = null) {
   el.dataset.toolArgs = '';
   el.dataset.toolResult = result;
   el.dataset.toolHasResult = 'true';
+  el.dataset.toolDurationMs = durationMs == null ? '' : String(durationMs);
+  el.dataset.toolIsError = String(isError);
   const durationLabel = formatToolDuration(durationMs);
-  el.dataset.toolStatus = durationLabel
-    ? tr('tool.resultReturnedWithDuration', { duration: durationLabel })
-    : tr('tool.resultReturned');
+  el.dataset.toolStatus = isError
+    ? durationLabel
+      ? tr('tool.failedWithDuration', { duration: durationLabel })
+      : tr('tool.failed')
+    : durationLabel
+      ? tr('tool.resultReturnedWithDuration', { duration: durationLabel })
+      : tr('tool.resultReturned');
   el.innerHTML = `
-    <div class="tool-header" data-action="open-tool-drawer" role="button" tabindex="0" aria-haspopup="dialog">
+    <button type="button" class="tool-header" data-action="open-tool-drawer" aria-haspopup="dialog">
       <span class="tool-icon">${iconMarkup('clipboard')}</span>
       <span class="tool-name">${escHtml(name)} result</span>
       <span class="tool-status">${escHtml(el.dataset.toolStatus)}</span>
-    </div>
+    </button>
   `;
   el.classList.add('tool-panel-ready');
-  const wrapper = wrapInTimeline(el, 'result');
+  el.classList.toggle('tool-panel-failed', isError);
   const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
-  if (currentRow) {
-    currentRow.after(wrapper);
-  } else {
-    dom.chat.appendChild(wrapper);
-  }
+  mountExecutionPanel(el, 'result', currentRow);
   pinReactStatusToBottom();
   animatePanelIn(el);
   scrollDown();
@@ -295,5 +305,32 @@ export function toggleTool(header) {
   const body = header.nextElementSibling;
   const nextOpen = !body.classList.contains('show');
   if (chevron) chevron.classList.toggle('open', nextOpen);
+  header.setAttribute?.('aria-expanded', String(nextOpen));
   animateCollapsibleSection(body, nextOpen);
+}
+
+export function refreshToolPanelsLanguage(): void {
+  document
+    .querySelectorAll<HTMLElement>('.tool-panel:not([data-task-plan-panel])')
+    .forEach((panel) => {
+      const hasResult = panel.dataset.toolHasResult === 'true';
+      const isError = panel.dataset.toolIsError === 'true';
+      const durationMs = panel.dataset.toolDurationMs ? Number(panel.dataset.toolDurationMs) : null;
+      const duration = formatToolDuration(durationMs);
+      const seconds = Number(panel.dataset.toolElapsedSeconds || 0);
+      const status = hasResult
+        ? isError
+          ? duration
+            ? tr('tool.failedWithDuration', { duration })
+            : tr('tool.failed')
+          : duration
+            ? tr('tool.resultReturnedWithDuration', { duration })
+            : tr('tool.resultReturned')
+        : seconds > 0
+          ? tr('tool.runningWithSeconds', { seconds })
+          : tr('tool.running');
+      panel.dataset.toolStatus = status;
+      const statusEl = panel.querySelector<HTMLElement>('.tool-status');
+      if (statusEl) statusEl.textContent = status;
+    });
 }

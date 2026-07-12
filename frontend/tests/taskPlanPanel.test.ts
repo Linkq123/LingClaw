@@ -3,11 +3,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   applyTaskPlan,
   finishTaskPlanPanel,
+  refreshTaskPlanPanelsLanguage,
   resetTaskPlanPanel,
   supersedeTaskPlanPanel,
 } from '../src/renderers/task-plan.js';
 import { dom, state } from '../src/state.js';
 import type { TaskPlanEvent } from '../src/types.js';
+import { setLanguage } from '../src/i18n.js';
 
 function sampleTaskPlan(overrides: Partial<TaskPlanEvent> = {}): TaskPlanEvent {
   return {
@@ -56,24 +58,26 @@ describe('task plan timeline panel', () => {
     state.autoFollowChat = false;
     state.bulkRenderingChat = false;
     state.activeToolPanel = null;
+    setLanguage('en');
     resetTaskPlanPanel();
   });
 
   afterEach(() => {
     resetTaskPlanPanel();
     state.activeToolPanel = null;
+    setLanguage('en');
     document.body.innerHTML = '';
     dom.chat = null;
     dom.toolDrawer = null;
     dom.toolDrawerBackdrop = null;
   });
 
-  it('creates a timeline panel for task_plan events', () => {
+  it('creates an execution-stack step for task_plan events', () => {
     applyTaskPlan(sampleTaskPlan());
 
     const panel = document.querySelector('[data-task-plan-panel="true"]');
     expect(panel).not.toBeNull();
-    expect(panel?.closest('.timeline-node--task-plan')).not.toBeNull();
+    expect(panel?.closest('.execution-step--task-plan')).not.toBeNull();
     expect(panel?.classList.contains('tool-panel')).toBe(true);
     expect(panel?.textContent).toContain('Fix MCP timeout handling');
     expect(panel?.textContent).not.toContain('cargo test mcp');
@@ -112,15 +116,36 @@ describe('task plan timeline panel', () => {
     expect(panel?.dataset.toolArgs).toContain('cycle 1');
   });
 
-  it('removes active task plans on done', () => {
+  it('keeps and completes active task plans on done', () => {
     applyTaskPlan(sampleTaskPlan());
     finishTaskPlanPanel();
 
-    expect(document.querySelector('[data-task-plan-panel="true"]')).toBeNull();
-    expect(document.querySelector('.timeline-node--task-plan')).toBeNull();
+    const panel = document.querySelector('[data-task-plan-panel="true"]') as HTMLElement;
+    expect(panel.dataset.taskPlanStatus).toBe('complete');
+    expect(panel.dataset.toolStatus).toBe('Completed');
   });
 
-  it('removes ready task plans on done', () => {
+  it('refreshes the task-plan label and status when language changes', () => {
+    applyTaskPlan(sampleTaskPlan());
+    const panel = document.querySelector('[data-task-plan-panel="true"]') as HTMLElement;
+
+    setLanguage('zh-CN');
+    refreshTaskPlanPanelsLanguage();
+
+    expect(panel.querySelector('.tool-name')?.textContent).toBe('任务计划');
+    expect(panel.querySelector('.tool-status')?.textContent).toBe('进行中');
+    expect(panel.dataset.toolStatus).toBe('进行中');
+    expect(panel.dataset.toolArgs).toBe('第 1 轮，第 0 周期，意图 change');
+    expect(panel.dataset.toolResult).toContain('目标: Fix MCP timeout handling');
+    expect(panel.dataset.toolResult).toContain('验证建议:');
+    expect(panel.dataset.toolResult).toContain('cargo test mcp');
+
+    finishTaskPlanPanel();
+    expect(panel.querySelector('.tool-status')?.textContent).toBe('已完成');
+    expect(panel.dataset.toolResult).toContain('状态: 已完成');
+  });
+
+  it('keeps and completes ready task plans on done', () => {
     applyTaskPlan(
       sampleTaskPlan({
         plan: {
@@ -131,11 +156,11 @@ describe('task plan timeline panel', () => {
     );
     finishTaskPlanPanel();
 
-    expect(document.querySelector('[data-task-plan-panel="true"]')).toBeNull();
-    expect(document.querySelector('.timeline-node--task-plan')).toBeNull();
+    const panel = document.querySelector('[data-task-plan-panel="true"]') as HTMLElement;
+    expect(panel.dataset.taskPlanStatus).toBe('complete');
   });
 
-  it('closes the tool drawer when the removed task plan is active', () => {
+  it('closes the tool drawer when the task plan is completed', () => {
     applyTaskPlan(sampleTaskPlan());
     const panel = document.querySelector('[data-task-plan-panel="true"]') as HTMLElement;
     panel.classList.add('tool-panel-active');
@@ -150,10 +175,13 @@ describe('task plan timeline panel', () => {
     expect(dom.toolDrawer?.classList.contains('open')).toBe(false);
     expect(dom.toolDrawerBackdrop?.classList.contains('open')).toBe(false);
     expect(dom.toolDrawer?.getAttribute('aria-hidden')).toBe('true');
-    expect(document.querySelector('[data-task-plan-panel="true"]')).toBeNull();
+    expect(
+      (document.querySelector('[data-task-plan-panel="true"]') as HTMLElement).dataset
+        .taskPlanStatus,
+    ).toBe('complete');
   });
 
-  it('marks the previous cycle stale before accepting the next plan', () => {
+  it('reuses the task-plan step for the next cycle', () => {
     applyTaskPlan(sampleTaskPlan({ round: 1, cycle: 0 }));
     supersedeTaskPlanPanel(1, 1);
     applyTaskPlan(sampleTaskPlan({ round: 1, cycle: 1 }));
@@ -161,13 +189,10 @@ describe('task plan timeline panel', () => {
     const panels = Array.from(
       document.querySelectorAll('[data-task-plan-panel="true"]'),
     ) as HTMLElement[];
-    expect(panels).toHaveLength(2);
-    expect(panels[0].dataset.taskPlanStatus).toBe('stale');
-    expect(panels[0].dataset.toolStatus).toBe('stale');
-    expect(panels[0].classList.contains('task-plan-stale')).toBe(true);
-    expect(panels[0].textContent).toContain('stale');
-    expect(panels[1].dataset.taskPlanCycle).toBe('1');
-    expect(panels[1].dataset.taskPlanStatus).toBe('active');
+    expect(panels).toHaveLength(1);
+    expect(panels[0].dataset.taskPlanCycle).toBe('1');
+    expect(panels[0].dataset.taskPlanStatus).toBe('active');
+    expect(panels[0].classList.contains('task-plan-stale')).toBe(false);
   });
 
   it('keeps the active panel when replaying the same round and cycle', () => {
@@ -199,7 +224,7 @@ describe('task plan timeline panel', () => {
     const panel = document.querySelector('[data-task-plan-panel="true"]') as HTMLElement;
     expect(panel.textContent).not.toContain('cargo test mcp');
     expect(panel.dataset.toolResult).toContain('cargo test mcp');
-    expect(panel.querySelector('button')).toBeNull();
+    expect(panel.querySelector('button[data-action="open-tool-drawer"]')).not.toBeNull();
     expect(panel.querySelector('[data-command]')).toBeNull();
   });
 });

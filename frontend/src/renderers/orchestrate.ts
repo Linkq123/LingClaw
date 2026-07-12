@@ -1,4 +1,4 @@
-import { dom, state } from '../state.js';
+import { state } from '../state.js';
 import {
   escHtml,
   formatToolDuration,
@@ -8,12 +8,12 @@ import {
   pulseFocus,
 } from '../utils.js';
 import { scrollDown } from '../scroll.js';
+import { animatePanelIn, animateCollapsibleSection, linkCollapsibleControl } from './timeline.js';
 import {
-  wrapInTimeline,
-  animatePanelIn,
-  animateCollapsibleSection,
-  removeTimelinePanel,
-} from './timeline.js';
+  mountExecutionPanel,
+  refreshExecutionStackForPanel,
+  removeExecutionPanel,
+} from './execution-stack.js';
 import { pinReactStatusToBottom } from './react-status.js';
 import {
   closeSubagentModal,
@@ -24,11 +24,24 @@ import {
 } from './subagent.js';
 import { iconMarkup } from '../icons.js';
 import type { IconName } from '../icons.js';
+import { tr } from '../i18n.js';
 
 type TaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
 
 function ensureRegistry() {
   return state.activeOrchestrations;
+}
+
+function orchestrationLabel(taskCount: number, layerCount: number): string {
+  return `${tr('execution.orchestration')} · ${tr('execution.orchestrationSummary', {
+    tasks: taskCount,
+    layers: layerCount,
+  })}`;
+}
+
+function layerLabel(layerIndex: number, parallel: boolean): string {
+  const label = tr('execution.layerLabel', { layer: layerIndex + 1 });
+  return parallel ? `${label} (${tr('execution.parallel')})` : label;
 }
 
 function escapeAttr(value: string) {
@@ -95,11 +108,17 @@ function syncProgressVisuals(entry) {
   ) as HTMLElement | null;
 
   if (progressLabel) {
-    const parts = [`${counts.completed}/${counts.total} completed`, `${completionPercent}%`];
-    if (counts.running) parts.push(`${counts.running} running`);
-    if (counts.failed) parts.push(`${counts.failed} failed`);
-    if (counts.skipped) parts.push(`${counts.skipped} skipped`);
-    if (counts.pending) parts.push(`${counts.pending} pending`);
+    const parts = [
+      tr('execution.progressCompleted', {
+        completed: counts.completed,
+        total: counts.total,
+      }),
+      `${completionPercent}%`,
+    ];
+    if (counts.running) parts.push(tr('execution.runningCount', { count: counts.running }));
+    if (counts.failed) parts.push(tr('execution.failedCount', { count: counts.failed }));
+    if (counts.skipped) parts.push(tr('execution.skippedCount', { count: counts.skipped }));
+    if (counts.pending) parts.push(tr('execution.pendingCount', { count: counts.pending }));
     progressLabel.textContent = parts.join(' / ');
   }
 
@@ -120,14 +139,7 @@ function syncProgressVisuals(entry) {
     segment.style.width = `${(value / total) * 100}%`;
     segment.hidden = value === 0;
 
-    const segmentLabel =
-      {
-        completed: 'Completed',
-        running: 'Running',
-        failed: 'Failed',
-        skipped: 'Skipped',
-        pending: 'Pending',
-      }[key] || key;
+    const segmentLabel = statusText(key as TaskStatus);
     segment.title = `${segmentLabel}: ${value}`;
   });
 
@@ -143,26 +155,29 @@ function updateHeaderProgress(entry) {
   if (!statusEl || !entry.panel.classList.contains('orchestrate-active')) return;
 
   const parts = [`${completed}/${total}`];
-  if (running) parts.push(`${running} running`);
-  if (failed) parts.push(`${failed} failed`);
-  if (skipped) parts.push(`${skipped} skipped`);
-  if (!running && pending && completed < total) parts.push(`${pending} pending`);
+  if (running) parts.push(tr('execution.runningCount', { count: running }));
+  if (failed) parts.push(tr('execution.failedCount', { count: failed }));
+  if (skipped) parts.push(tr('execution.skippedCount', { count: skipped }));
+  if (!running && pending && completed < total) {
+    parts.push(tr('execution.pendingCount', { count: pending }));
+  }
   statusEl.textContent = parts.join(' / ');
+  refreshExecutionStackForPanel(entry.panel);
 }
 
 function statusText(status: TaskStatus) {
   switch (status) {
     case 'running':
-      return 'Running';
+      return tr('execution.running');
     case 'completed':
-      return 'Completed';
+      return tr('execution.completed');
     case 'failed':
-      return 'Failed';
+      return tr('tool.failed');
     case 'skipped':
-      return 'Skipped';
+      return tr('execution.skipped');
     case 'pending':
     default:
-      return 'Pending';
+      return tr('execution.waiting');
   }
 }
 
@@ -189,7 +204,52 @@ function compositeTaskId(orchestrateId: string, taskId: string) {
 function setTaskPreview(row: HTMLElement, text: string) {
   const previewEl = row.querySelector('.orchestrate-task-preview') as HTMLElement | null;
   if (!previewEl) return;
-  previewEl.textContent = inlinePreview(text || 'Waiting to run');
+  previewEl.textContent = inlinePreview(text || tr('execution.waitingToRun'));
+}
+
+function taskPreviewFallback(kind: string): string {
+  switch (kind) {
+    case 'running':
+      return tr('execution.running');
+    case 'completed':
+      return tr('execution.taskCompleted');
+    case 'failed':
+      return tr('execution.taskFailed');
+    case 'skipped':
+      return tr('execution.taskSkipped');
+    case 'waiting':
+    default:
+      return tr('execution.waitingToRun');
+  }
+}
+
+function syncTaskRowPresentation(row: HTMLElement): void {
+  const status = (row.dataset.taskStatus || 'pending') as TaskStatus;
+  const statusParts = [statusText(status)];
+  if (row.dataset.statusDurationMs) {
+    const duration = formatToolDuration(Number(row.dataset.statusDurationMs));
+    if (duration) statusParts.push(duration);
+  }
+  if (row.dataset.statusInputTokens || row.dataset.statusOutputTokens) {
+    const tokens = [row.dataset.statusInputTokens, row.dataset.statusOutputTokens].filter(Boolean);
+    if (tokens.length) {
+      statusParts.push(
+        tr('execution.tokensMetric', {
+          count: tokens.map((token) => formatTokenCount(Number(token))).join('/'),
+        }),
+      );
+    }
+  }
+  if (status === 'skipped' && row.dataset.statusReason) {
+    statusParts.push(row.dataset.statusReason.slice(0, 60));
+  }
+  const statusEl = row.querySelector<HTMLElement>('.orchestrate-task-status');
+  if (statusEl) statusEl.textContent = statusParts.join(' / ');
+
+  setTaskPreview(
+    row,
+    row.dataset.previewText || taskPreviewFallback(row.dataset.previewKind || 'waiting'),
+  );
 }
 
 function setTaskStatusTone(row: HTMLElement, status: TaskStatus) {
@@ -239,9 +299,9 @@ function buildDagLayout(layersContainer: HTMLElement, tasks, orchestrateId: stri
 
     const header = document.createElement('div');
     header.className = 'orchestrate-layer-header';
-    header.textContent = `Layer ${layerIndex + 1}${
-      buckets[layerIndex].length > 1 ? ' (parallel)' : ''
-    }`;
+    header.dataset.layerIndex = String(layerIndex);
+    header.dataset.layerParallel = String(buckets[layerIndex].length > 1);
+    header.textContent = layerLabel(layerIndex, buckets[layerIndex].length > 1);
     layerEl.appendChild(header);
 
     const taskContainer = document.createElement('div');
@@ -253,13 +313,15 @@ function buildDagLayout(layersContainer: HTMLElement, tasks, orchestrateId: stri
       row.className = 'orchestrate-task orchestrate-task-pending';
       row.dataset.orchestrateId = orchestrateId;
       row.dataset.taskId = task.id;
+      row.dataset.taskStatus = 'pending';
+      row.dataset.previewKind = 'waiting';
+      row.dataset.previewText = displayPrompt;
       if (displayPrompt) row.dataset.promptPreview = displayPrompt;
       row.innerHTML = `
-        <div
+        <button
+          type="button"
           class="orchestrate-task-summary"
           data-action="open-orchestrate-task-modal"
-          role="button"
-          tabindex="0"
           aria-expanded="false"
           aria-haspopup="dialog"
         >
@@ -270,12 +332,12 @@ function buildDagLayout(layersContainer: HTMLElement, tasks, orchestrateId: stri
               <span class="orchestrate-task-agent">${escHtml(task.agent)}</span>
             </span>
             <span class="orchestrate-task-preview">${escHtml(
-              inlinePreview(displayPrompt || 'Waiting to run'),
+              inlinePreview(displayPrompt || tr('execution.waitingToRun')),
             )}</span>
           </span>
           <span class="orchestrate-task-status">${statusText('pending')}</span>
           <span class="chevron">${iconMarkup('chevron-right')}</span>
-        </div>
+        </button>
       `;
 
       const panel = createDetachedSubagentPanel(
@@ -364,9 +426,10 @@ function syncSharedTaskPanel(
         tool_calls: data.tool_calls,
         duration_ms: data.duration_ms,
         status_label: 'Skipped',
-        summary_title: 'Skip reason',
+        summary_title_key: 'execution.skipReason',
         summary_tone: 'muted',
-        summary_body: data.reason || 'Task skipped.',
+        summary_body: data.reason || '',
+        summary_body_key: data.reason ? undefined : 'execution.taskSkipped',
       },
       { immediate: shouldCollapseImmediately },
     );
@@ -388,7 +451,7 @@ export function openOrchestrateTaskModal(trigger: HTMLElement | null) {
   if (!panel) return;
 
   row.querySelector('.orchestrate-task-summary')?.setAttribute('aria-expanded', 'true');
-  openSubagentPanelModal(panel);
+  openSubagentPanelModal(panel, trigger);
 }
 
 function syncReusedTaskMetadata(
@@ -408,7 +471,9 @@ function syncReusedTaskMetadata(
     delete existingRow.dataset.promptPreview;
   }
 
-  setTaskPreview(existingRow, displayPrompt || 'Waiting to run');
+  existingRow.dataset.previewText = displayPrompt;
+  existingRow.dataset.previewKind = 'waiting';
+  setTaskPreview(existingRow, displayPrompt || tr('execution.waitingToRun'));
   existingPanel.dataset.orchestrateId = existingRow.dataset.orchestrateId || '';
   existingPanel.dataset.orchestrateTaskId = existingRow.dataset.taskId || '';
   state.activeSubagentPanels.set(
@@ -474,9 +539,12 @@ function mergeSyntheticOrchestratePanel(existing, data) {
 
   const nextLayers = document.createElement('div');
   const layout = buildDagLayout(nextLayers, nextTasks, data.orchestrate_id);
+  const nextTaskCount = data.task_count || nextTasks.length;
   const nextLayerCount = data.layer_count || layout.layerCount || existing.layerCount;
+  existing.panel.dataset.taskCount = String(nextTaskCount);
+  existing.panel.dataset.layerCount = String(nextLayerCount);
   if (label) {
-    label.textContent = `Orchestrate / ${data.task_count || nextTasks.length} tasks / ${nextLayerCount} layers`;
+    label.textContent = orchestrationLabel(nextTaskCount, nextLayerCount);
   }
 
   reuseSyntheticTaskRows(existing, layout, nextTasks);
@@ -501,29 +569,32 @@ export function createOrchestratePanel(data) {
       }
     }
 
-    removeTimelinePanel(existing.panel);
+    removeExecutionPanel(existing.panel);
     registry.delete(data.orchestrate_id);
   }
 
   const panel = document.createElement('div');
   panel.className = 'orchestrate-panel orchestrate-active';
   panel.dataset.orchestrateId = data.orchestrate_id;
+  panel.dataset.taskCount = String(data.task_count || 0);
+  panel.dataset.layerCount = String(data.layer_count || 0);
   if (data.synthetic === true) panel.dataset.synthetic = 'true';
 
-  const header = document.createElement('div');
+  const header = document.createElement('button');
+  header.type = 'button';
   header.className = 'orchestrate-header';
   header.dataset.action = 'toggle-tool';
+  header.setAttribute('aria-expanded', 'false');
   header.innerHTML = `
     <span class="orchestrate-icon">${iconMarkup('workflow')}</span>
-    <span class="orchestrate-label">Orchestrate / ${data.task_count || 0} tasks / ${
-      data.layer_count || 0
-    } layers</span>
-    <span class="orchestrate-status">Running</span>
+    <span class="orchestrate-label">${orchestrationLabel(data.task_count || 0, data.layer_count || 0)}</span>
+    <span class="orchestrate-status">${tr('execution.running')}</span>
     <span class="chevron">${iconMarkup('chevron-right')}</span>
   `;
 
   const body = document.createElement('div');
   body.className = 'orchestrate-body';
+  linkCollapsibleControl(header, body, 'orchestrate-body');
 
   const overview = document.createElement('div');
   overview.className = 'orchestrate-overview';
@@ -555,22 +626,19 @@ export function createOrchestratePanel(data) {
   panel.appendChild(body);
 
   const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+  panel.dataset.taskCount = String(tasks.length || data.task_count || 0);
   const layout = buildDagLayout(layers, tasks, data.orchestrate_id);
 
   if (!data.layer_count && layout.layerCount) {
+    panel.dataset.layerCount = String(layout.layerCount);
     const label = panel.querySelector('.orchestrate-label') as HTMLElement | null;
     if (label) {
-      label.textContent = `Orchestrate / ${tasks.length} tasks / ${layout.layerCount} layers`;
+      label.textContent = orchestrationLabel(tasks.length, layout.layerCount);
     }
   }
 
   const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
-  const wrapper = wrapInTimeline(panel, 'orchestrate');
-  if (currentRow) {
-    dom.chat.insertBefore(wrapper, currentRow);
-  } else {
-    dom.chat.appendChild(wrapper);
-  }
+  mountExecutionPanel(panel, 'orchestrate', currentRow);
 
   pinReactStatusToBottom();
   animatePanelIn(panel);
@@ -614,30 +682,15 @@ export function markOrchestrateTask(data, status: Exclude<TaskStatus, 'pending'>
     'orchestrate-task-skipped',
   );
   row.classList.add(`orchestrate-task-${status}`);
+  row.dataset.taskStatus = status;
+  row.dataset.statusDurationMs = data.duration_ms == null ? '' : String(data.duration_ms);
+  row.dataset.statusInputTokens = data.input_tokens == null ? '' : String(data.input_tokens);
+  row.dataset.statusOutputTokens = data.output_tokens == null ? '' : String(data.output_tokens);
+  row.dataset.statusReason = data.reason == null ? '' : String(data.reason);
   setTaskStatusTone(row, status);
 
   const iconEl = row.querySelector('.orchestrate-task-icon') as HTMLElement | null;
   if (iconEl) iconEl.innerHTML = iconMarkup(statusIcon(status));
-
-  const statusEl = row.querySelector('.orchestrate-task-status') as HTMLElement | null;
-  if (statusEl) {
-    const parts = [statusText(status)];
-    if (status === 'completed' || status === 'failed') {
-      if (data.duration_ms != null) {
-        const duration = formatToolDuration(data.duration_ms);
-        if (duration) parts.push(duration);
-      }
-      if (data.input_tokens != null || data.output_tokens != null) {
-        const tokens: string[] = [];
-        if (data.input_tokens != null) tokens.push(formatTokenCount(data.input_tokens));
-        if (data.output_tokens != null) tokens.push(formatTokenCount(data.output_tokens));
-        if (tokens.length) parts.push(`${tokens.join('/')} tok`);
-      }
-    } else if (status === 'skipped' && data.reason) {
-      parts.push(String(data.reason).slice(0, 60));
-    }
-    statusEl.textContent = parts.join(' / ');
-  }
 
   const displayPrompt = stripDelegatedPromptRuntimeContext(data.prompt || '');
   if (data.prompt) {
@@ -645,14 +698,17 @@ export function markOrchestrateTask(data, status: Exclude<TaskStatus, 'pending'>
   }
 
   if (status === 'running') {
-    setTaskPreview(row, displayPrompt || row.dataset.promptPreview || 'Running');
+    row.dataset.previewText = displayPrompt || row.dataset.promptPreview || '';
+    row.dataset.previewKind = 'running';
     row.removeAttribute('title');
     pulseFocus(row);
   } else if (status === 'completed') {
-    setTaskPreview(row, data.result_excerpt || data.result_preview || 'Task completed');
+    row.dataset.previewText = data.result_excerpt || data.result_preview || '';
+    row.dataset.previewKind = 'completed';
     row.removeAttribute('title');
   } else if (status === 'failed') {
-    setTaskPreview(row, data.error || 'Task failed');
+    row.dataset.previewText = data.error || '';
+    row.dataset.previewKind = 'failed';
     if (data.error) {
       row.title = String(data.error).slice(0, 200);
     } else {
@@ -660,12 +716,61 @@ export function markOrchestrateTask(data, status: Exclude<TaskStatus, 'pending'>
     }
     pulseFocus(row);
   } else if (status === 'skipped') {
-    setTaskPreview(row, data.reason || 'Task skipped');
+    row.dataset.previewText = data.reason || '';
+    row.dataset.previewKind = 'skipped';
     row.removeAttribute('title');
   }
 
+  syncTaskRowPresentation(row);
+
   syncSharedTaskPanel(entry, data, status);
   updateHeaderProgress(entry);
+}
+
+function renderOrchestrationSummary(panel: HTMLElement): void {
+  const summary = panel.querySelector('.orchestrate-summary') as HTMLElement | null;
+  if (!summary) return;
+
+  const completed = Number(panel.dataset.completedCount || 0);
+  const failed = Number(panel.dataset.failedCount || 0);
+  const skipped = Number(panel.dataset.skippedCount || 0);
+  const metrics = [tr('execution.completedCount', { count: completed })];
+  if (failed) metrics.push(tr('execution.failedCount', { count: failed }));
+  if (skipped) metrics.push(tr('execution.skippedCount', { count: skipped }));
+  if (panel.dataset.durationMs) {
+    const duration = formatToolDuration(Number(panel.dataset.durationMs));
+    if (duration) metrics.push(`${tr('execution.duration')} ${duration}`);
+  }
+  if (panel.dataset.inputTokens) {
+    metrics.push(
+      tr('execution.inputMetric', {
+        count: formatTokenCount(Number(panel.dataset.inputTokens)),
+      }),
+    );
+  }
+  if (panel.dataset.outputTokens) {
+    metrics.push(
+      tr('execution.outputMetric', {
+        count: formatTokenCount(Number(panel.dataset.outputTokens)),
+      }),
+    );
+  }
+
+  summary.innerHTML = `
+    <div class="orchestrate-summary-head">
+      <div class="orchestrate-summary-title">${escHtml(
+        panel.dataset.orchestrateAborted === 'true'
+          ? tr('execution.aborted')
+          : tr('execution.summary'),
+      )}</div>
+      <div class="orchestrate-summary-metrics">
+        ${metrics
+          .map((metric) => `<span class="orchestrate-summary-chip">${escHtml(metric)}</span>`)
+          .join('')}
+      </div>
+    </div>
+  `;
+  summary.classList.remove('hidden');
 }
 
 export function finishOrchestratePanel(data) {
@@ -675,6 +780,13 @@ export function finishOrchestratePanel(data) {
   const { panel } = entry;
   panel.classList.remove('orchestrate-active');
   panel.classList.add(data.aborted ? 'orchestrate-aborted' : 'orchestrate-done');
+  panel.dataset.completedCount = String(data.completed || 0);
+  panel.dataset.failedCount = String(data.failed || 0);
+  panel.dataset.skippedCount = String(data.skipped || 0);
+  panel.dataset.orchestrateAborted = String(data.aborted === true);
+  panel.dataset.durationMs = data.duration_ms == null ? '' : String(data.duration_ms);
+  panel.dataset.inputTokens = data.input_tokens == null ? '' : String(data.input_tokens);
+  panel.dataset.outputTokens = data.output_tokens == null ? '' : String(data.output_tokens);
 
   panel.querySelectorAll('.orchestrate-layer-active').forEach((el) => {
     el.classList.remove('orchestrate-layer-active');
@@ -682,43 +794,19 @@ export function finishOrchestratePanel(data) {
 
   const status = panel.querySelector('.orchestrate-status') as HTMLElement | null;
   if (status) {
-    const parts = [`${data.completed || 0} completed`];
-    if (data.failed) parts.push(`${data.failed} failed`);
-    if (data.skipped) parts.push(`${data.skipped} skipped`);
+    const parts = [tr('execution.completedCount', { count: data.completed || 0 })];
+    if (data.failed) parts.push(tr('execution.failedCount', { count: data.failed }));
+    if (data.skipped) parts.push(tr('execution.skippedCount', { count: data.skipped }));
     if (data.duration_ms != null) {
       const duration = formatToolDuration(data.duration_ms);
       if (duration) parts.push(duration);
     }
     status.textContent = data.aborted
-      ? `Aborted (${parts.join(' / ')})`
-      : `Completed (${parts.join(' / ')})`;
+      ? `${tr('execution.failed')} (${parts.join(' / ')})`
+      : `${tr('execution.completed')} (${parts.join(' / ')})`;
   }
 
-  const summary = panel.querySelector('.orchestrate-summary') as HTMLElement | null;
-  if (summary) {
-    const metrics = [
-      `${data.completed || 0} completed`,
-      data.failed ? `${data.failed} failed` : '',
-      data.skipped ? `${data.skipped} skipped` : '',
-      data.duration_ms != null ? `Duration ${formatToolDuration(data.duration_ms)}` : '',
-      data.input_tokens != null ? `In ${formatTokenCount(data.input_tokens)}` : '',
-      data.output_tokens != null ? `Out ${formatTokenCount(data.output_tokens)}` : '',
-    ].filter(Boolean);
-
-    summary.innerHTML = `
-      <div class="orchestrate-summary-head">
-        <div class="orchestrate-summary-title">${
-          data.aborted ? 'Execution aborted' : 'Execution summary'
-        }</div>
-        <div class="orchestrate-summary-metrics">
-          ${metrics
-            .map((metric) => `<span class="orchestrate-summary-chip">${escHtml(metric)}</span>`)
-            .join('')}
-        </div>
-      </div>
-    `;
-    summary.classList.remove('hidden');
-  }
+  renderOrchestrationSummary(panel);
 
   const body = panel.querySelector('.orchestrate-body') as HTMLElement | null;
   const chevron = panel.querySelector('.orchestrate-header .chevron') as HTMLElement | null;
@@ -728,5 +816,51 @@ export function finishOrchestratePanel(data) {
   chevron?.classList.remove('open');
 
   syncProgressVisuals(entry);
+  refreshExecutionStackForPanel(panel);
   entry.live = false;
+}
+
+export function refreshOrchestratePanelsLanguage(): void {
+  document.querySelectorAll<HTMLElement>('.orchestrate-panel').forEach((panel) => {
+    const label = panel.querySelector<HTMLElement>('.orchestrate-label');
+    const taskCount = Number(
+      panel.dataset.taskCount || panel.querySelectorAll('.orchestrate-task').length,
+    );
+    const layerCount = Number(
+      panel.dataset.layerCount || panel.querySelectorAll('.orchestrate-layer').length,
+    );
+    if (label) label.textContent = orchestrationLabel(taskCount, layerCount);
+
+    const entry = panel.dataset.orchestrateId
+      ? state.activeOrchestrations.get(panel.dataset.orchestrateId)
+      : null;
+    panel.querySelectorAll<HTMLElement>('.orchestrate-layer-header').forEach((header) => {
+      const layerIndex = Number(header.dataset.layerIndex || 0);
+      header.textContent = layerLabel(layerIndex, header.dataset.layerParallel === 'true');
+    });
+    getTaskRows(panel).forEach(syncTaskRowPresentation);
+    if (entry) syncProgressVisuals(entry);
+    if (panel.classList.contains('orchestrate-active') && entry) {
+      updateHeaderProgress(entry);
+      return;
+    }
+
+    const status = panel.querySelector<HTMLElement>('.orchestrate-status');
+    if (!status) return;
+    const completed = Number(panel.dataset.completedCount || 0);
+    const failed = Number(panel.dataset.failedCount || 0);
+    const skipped = Number(panel.dataset.skippedCount || 0);
+    const parts = [tr('execution.completedCount', { count: completed })];
+    if (failed) parts.push(tr('execution.failedCount', { count: failed }));
+    if (skipped) parts.push(tr('execution.skippedCount', { count: skipped }));
+    const duration = panel.dataset.durationMs
+      ? formatToolDuration(Number(panel.dataset.durationMs))
+      : '';
+    if (duration) parts.push(duration);
+    status.textContent =
+      panel.dataset.orchestrateAborted === 'true'
+        ? `${tr('execution.failed')} (${parts.join(' / ')})`
+        : `${tr('execution.completed')} (${parts.join(' / ')})`;
+    renderOrchestrationSummary(panel);
+  });
 }

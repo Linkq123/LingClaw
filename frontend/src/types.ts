@@ -17,6 +17,8 @@ export interface HistoryMessage {
   name?: string;
   arguments?: string;
   result?: string;
+  is_error?: boolean;
+  duration_ms?: number;
   thinking?: string;
   subagent_snapshot?: SubagentHistorySnapshot;
 }

@@ -1,10 +1,8 @@
 import type { HistoryMessage } from './types.js';
 
 export function findHistoryRenderStart(messages: HistoryMessage[], preferredStart: number): number {
-  let startIdx = Math.max(0, preferredStart);
-  if (startIdx === 0) {
-    return 0;
-  }
+  let startIdx = Math.min(messages.length, Math.max(0, preferredStart));
+  if (startIdx === 0 || startIdx === messages.length) return startIdx;
 
   const toolCallById = new Map<string, number>();
   for (let i = 0; i < messages.length; i++) {
@@ -17,6 +15,27 @@ export function findHistoryRenderStart(messages: HistoryMessage[], preferredStar
   let expanded = true;
   while (expanded) {
     expanded = false;
+
+    // Execution stacks are reconstructed from every process record between a
+    // user message and the final assistant response. Starting a history
+    // window in the middle of that range would split one Agent run into two
+    // stacks, so expand to the turn's user boundary. This stays inside the
+    // convergence loop because preserving a tool result below may reveal an
+    // even earlier turn boundary.
+    if (messages[startIdx]?.role !== 'user') {
+      let userBoundary = 0;
+      for (let i = startIdx - 1; i >= 0; i -= 1) {
+        if (messages[i].role === 'user') {
+          userBoundary = i;
+          break;
+        }
+      }
+      if (userBoundary < startIdx) {
+        startIdx = userBoundary;
+        expanded = true;
+      }
+    }
+
     for (let i = startIdx; i < messages.length; i++) {
       const message = messages[i];
       if (message.role !== 'tool_result' || !message.id) {

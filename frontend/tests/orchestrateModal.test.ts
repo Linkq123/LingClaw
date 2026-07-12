@@ -3,12 +3,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   closeOrchestrateTaskModal,
   createOrchestratePanel,
+  finishOrchestratePanel,
   markOrchestrateTask,
   openOrchestrateTaskModal,
+  refreshOrchestratePanelsLanguage,
 } from '../src/renderers/orchestrate.js';
-import { appendSubagentToolOutput } from '../src/renderers/subagent.js';
+import {
+  appendSubagentToolOutput,
+  refreshSubagentPanelsLanguage,
+} from '../src/renderers/subagent.js';
 import { dom, state } from '../src/state.js';
 import { applyToolsVisibility } from '../src/viewState.js';
+import { setLanguage } from '../src/i18n.js';
 
 let originalScrollIntoView: typeof Element.prototype.scrollIntoView | undefined;
 
@@ -21,6 +27,7 @@ describe('orchestrate task modal hosting', () => {
     state.activeToolPanel = null;
     state.autoFollowChat = true;
     state.showTools = true;
+    setLanguage('en');
     originalScrollIntoView = Element.prototype.scrollIntoView;
     Object.defineProperty(Element.prototype, 'scrollIntoView', {
       configurable: true,
@@ -33,6 +40,7 @@ describe('orchestrate task modal hosting', () => {
     state.activeOrchestrations.clear();
     state.activeToolPanel = null;
     state.showTools = true;
+    setLanguage('en');
     document.body.innerHTML = '';
     dom.chat = null;
     if (originalScrollIntoView) {
@@ -77,6 +85,7 @@ describe('orchestrate task modal hosting', () => {
     expect(
       dom.chat?.querySelector('.orchestrate-task-summary > .chevron use')?.getAttribute('href'),
     ).toBe('#icon-chevron-right');
+    expect(dom.chat?.querySelector('.orchestrate-task-summary')).toBeInstanceOf(HTMLButtonElement);
 
     markOrchestrateTask(
       { orchestrate_id: 'orch-1', id: 'task-a', result_preview: 'Done' },
@@ -495,6 +504,63 @@ describe('orchestrate task modal hosting', () => {
     expect(taskARow?.dataset.promptPreview).toBe('Fix the hidden footer in the expanded card.');
     expect(taskAPanel?.dataset.taskId).toBe('orch-1:task-a');
     expect(label?.textContent).toContain('2 layers');
+
+    setLanguage('zh-CN');
+    refreshSubagentPanelsLanguage();
+    refreshOrchestratePanelsLanguage();
+    expect(label?.textContent).toBe('编排 · 2 个任务 · 2 层');
+  });
+
+  it('refreshes task rows, progress, layers, and summary in an open orchestration', () => {
+    mountOrchestration();
+    markOrchestrateTask(
+      {
+        orchestrate_id: 'orch-1',
+        id: 'task-a',
+        duration_ms: 12,
+        input_tokens: 10,
+        output_tokens: 4,
+      },
+      'completed',
+    );
+    finishOrchestratePanel({
+      orchestrate_id: 'orch-1',
+      completed: 1,
+      failed: 0,
+      skipped: 0,
+      duration_ms: 25,
+      input_tokens: 10,
+      output_tokens: 4,
+      aborted: false,
+    });
+
+    setLanguage('zh-CN');
+    refreshOrchestratePanelsLanguage();
+
+    const panel = dom.chat?.querySelector('.orchestrate-panel') as HTMLElement;
+    expect(panel.querySelector('.orchestrate-layer-header')?.textContent).toBe('第 1 层');
+    expect(panel.querySelector('.orchestrate-task-status')?.textContent).toBe(
+      '已完成 / 12ms / 10/4 token',
+    );
+    expect(panel.querySelector('.orchestrate-task-preview')?.textContent).toBe('任务已完成');
+    expect(panel.querySelector('[data-orchestrate-progress-label]')?.textContent).toBe(
+      '已完成 1/1 / 100%',
+    );
+    expect(panel.querySelector('.orchestrate-summary-title')?.textContent).toBe('执行摘要');
+    expect(panel.querySelector('.orchestrate-summary')?.textContent).toContain('输入 10');
+  });
+
+  it('localizes the generated skip summary without replacing a backend reason', () => {
+    mountOrchestration();
+    markOrchestrateTask({ orchestrate_id: 'orch-1', id: 'task-a' }, 'skipped');
+
+    setLanguage('zh-CN');
+    refreshSubagentPanelsLanguage();
+    refreshOrchestratePanelsLanguage();
+
+    const taskPanel = dom.chat?.querySelector('.orchestrate-task .subagent-panel');
+    expect(taskPanel?.querySelector('.subagent-summary-title')?.textContent).toBe('跳过原因');
+    expect(taskPanel?.querySelector('.subagent-note')?.textContent).toBe('任务已跳过');
   });
 
   it('does not reuse another task panel when the same agent appears twice', () => {
@@ -586,6 +652,7 @@ describe('orchestrate task modal hosting', () => {
     expect(sharedPanel?.classList.contains('subagent-modal-open')).toBe(false);
     expect(document.getElementById('subagent-modal-backdrop')?.hidden).toBe(true);
     expect(summary?.getAttribute('aria-expanded')).toBe('false');
+    expect(document.activeElement).toBe(summary);
   });
 
   it('closes the task modal when tools are hidden', () => {
