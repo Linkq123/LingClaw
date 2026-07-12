@@ -70,4 +70,26 @@ describe('i18n', () => {
     setLanguage('zh-CN');
     expect(helpCommand.description()).toBe('显示命令帮助。');
   });
+
+  it('updates a dynamically recreated welcome state after switching languages', async () => {
+    document.body.innerHTML = '<main id="chat"></main>';
+    const { initDomRefs } = await import('../src/state.js');
+    const { showWelcome } = await import('../src/renderers/chat.js');
+    initDomRefs();
+    showWelcome();
+
+    expect(document.querySelector('.welcome-title')?.textContent).toBe('Workspace ready');
+
+    setLanguage('zh-CN');
+
+    expect(document.querySelector('.welcome-title')?.textContent).toBe('工作区已就绪');
+    expect(document.querySelector('.welcome-hint')?.textContent).toBe(
+      '输入消息，或使用 / 命令开始。',
+    );
+    expect(
+      Array.from(document.querySelectorAll('.welcome-shortcuts span')).map(
+        (element) => element.textContent,
+      ),
+    ).toEqual(['新对话', '状态', '帮助']);
+  });
 });

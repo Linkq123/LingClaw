@@ -221,6 +221,7 @@ export function showWelcome() {
 
   const title = document.createElement('h1');
   title.className = 'welcome-title';
+  title.dataset.i18n = 'welcome.title';
   title.textContent = tr('welcome.title');
 
   // version badge (dynamic — uses textContent, no innerHTML)
@@ -237,6 +238,7 @@ export function showWelcome() {
   const hint = document.createElement('p');
   hint.className = 'welcome-hint';
   const ready = document.createElement('span');
+  ready.dataset.i18n = 'welcome.ready';
   ready.textContent = tr('welcome.ready');
   hint.append(ready);
 
@@ -244,17 +246,18 @@ export function showWelcome() {
   const shortcuts = document.createElement('div');
   shortcuts.className = 'welcome-shortcuts';
   const shortcutDefs: Array<[string, string, IconName]> = [
-    ['/clear', tr('common.newConversation'), 'message'],
-    ['/status', tr('common.status'), 'activity'],
-    ['/help', tr('common.help'), 'help'],
+    ['/clear', 'common.newConversation', 'message'],
+    ['/status', 'common.status', 'activity'],
+    ['/help', 'common.help', 'help'],
   ];
-  for (const [cmd, label, icon] of shortcutDefs) {
+  for (const [cmd, labelKey, icon] of shortcutDefs) {
     const btn = document.createElement('button');
     btn.dataset.action = 'cmd';
     btn.dataset.cmd = cmd;
     btn.appendChild(createIcon(icon));
     const text = document.createElement('span');
-    text.textContent = label;
+    text.dataset.i18n = labelKey;
+    text.textContent = tr(labelKey);
     btn.appendChild(text);
     shortcuts.appendChild(btn);
   }

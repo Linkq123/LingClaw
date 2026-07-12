@@ -131,6 +131,16 @@ function updateModelThinkingFormat(model: ModelFormEntry, value: string): ModelF
   };
 }
 
+const THINKING_FORMAT_OPTIONS: readonly string[] = [
+  'openai',
+  'qwen',
+  'doubao',
+  'deepseek-v4',
+  'ollama',
+  'gpt-oss',
+  'ollama-gpt-oss',
+];
+
 type TabId = 'tab-general' | 'tab-skills' | 'tab-agents' | 'tab-models' | 'tab-mcp' | 'tab-s3';
 type StatusType = 'idle' | 'loading' | 'success' | 'error';
 type TabSaveMode = 'config' | 'skills';
@@ -536,6 +546,26 @@ function AgentsTab({
     [setModelValue],
   );
 
+  const setAllModels = useCallback(
+    (val: string) => {
+      if (!val) return;
+      const currentModel = (config.agents?.defaults?.model || {}) as Record<
+        string,
+        string | undefined
+      >;
+      const keys = new Set([...Object.keys(currentModel), ...AGENT_ROLES.map(({ key }) => key)]);
+      const newModel = Object.fromEntries(Array.from(keys, (key) => [key, val]));
+      onChange({
+        ...config,
+        agents: {
+          ...config.agents,
+          defaults: { ...(config.agents?.defaults || {}), model: newModel },
+        },
+      });
+    },
+    [config, onChange],
+  );
+
   const addSubAgentOverride = useCallback(() => {
     if (!selectedAgentName || !defaultNewSubAgentModel) return;
     setModelValue(subAgentOverrideKey(selectedAgentName), defaultNewSubAgentModel);
@@ -555,6 +585,21 @@ function AgentsTab({
       <p style={{ fontSize: 12, color: 'var(--dim)', marginBottom: 12 }}>
         {tr('settings.subAgentOrder')}
       </p>
+      <SettingsRow label={tr('settings.switchAllModels')}>
+        <select
+          value=""
+          aria-label={tr('settings.switchAllModels')}
+          disabled={allModels.length === 0}
+          onChange={(event) => setAllModels(event.target.value)}
+        >
+          <option value="">{tr('settings.switchAllModelsPlaceholder')}</option>
+          {allModels.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
+      </SettingsRow>
       {AGENT_ROLES.map(({ key, label }) => (
         <AgentRoleRow
           key={key}
@@ -672,6 +717,9 @@ function ModelEntryRow({
   const inputArr = Array.isArray(model.input) ? model.input : ['text'];
   const hasText = inputArr.includes('text');
   const hasImage = inputArr.includes('image');
+  const thinkingFormat = modelThinkingFormat(model);
+  const customThinkingFormat =
+    thinkingFormat && !THINKING_FORMAT_OPTIONS.includes(thinkingFormat) ? thinkingFormat : '';
 
   const setInput = (text: boolean, image: boolean) => {
     const arr: string[] = [];
@@ -774,16 +822,25 @@ function ModelEntryRow({
             gap: 4,
           }}
         >
-          Thinking Format
-          <input
-            type="text"
+          {tr('settings.thinkingFormat')}
+          <select
             aria-label={tr('settings.thinkingFormat')}
-            value={modelThinkingFormat(model)}
-            placeholder="openai"
-            title="Examples: openai, qwen, doubao, deepseek-v4, ollama, gpt-oss"
-            style={{ width: 120 }}
+            value={thinkingFormat}
+            style={{ width: 150 }}
             onChange={(e) => onChange(updateModelThinkingFormat(model, e.target.value))}
-          />
+          >
+            <option value="">{tr('settings.thinkingFormatDefault')}</option>
+            {customThinkingFormat ? (
+              <option value={customThinkingFormat}>
+                {tr('settings.thinkingFormatCustom', { value: customThinkingFormat })}
+              </option>
+            ) : null}
+            {THINKING_FORMAT_OPTIONS.map((format) => (
+              <option key={format} value={format}>
+                {format}
+              </option>
+            ))}
+          </select>
         </label>
         <span
           style={{
@@ -1012,20 +1069,10 @@ function ModelsTab({
     [clearProviderReset],
   );
 
-  const updateProvider = useCallback(
-    (p: ProviderFormData) => {
-      setProviders((prev) => {
-        const nextProviders = prev.map((old) => (old._key === p._key ? p : old));
-        const newModels = serializeProviderForms(nextProviders);
-        if (JSON.stringify(newModels) !== JSON.stringify(config.models)) {
-          onChange({ ...config, models: newModels });
-        }
-        return nextProviders;
-      });
-      setFormDirty(true);
-    },
-    [config, onChange],
-  );
+  const updateProvider = useCallback((p: ProviderFormData) => {
+    setProviders((prev) => prev.map((old) => (old._key === p._key ? p : old)));
+    setFormDirty(true);
+  }, []);
 
   const deleteProvider = useCallback(
     (rowKey: string) => {

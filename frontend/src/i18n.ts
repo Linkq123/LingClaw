@@ -295,6 +295,8 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'settings.field.lifecycleDays': 'Lifecycle (days)',
     'settings.removeModel': 'Remove model',
     'settings.thinkingFormat': 'Thinking Format',
+    'settings.thinkingFormatDefault': 'Default',
+    'settings.thinkingFormatCustom': '{value} (Custom)',
     'settings.deleteProvider': 'Delete provider',
     'settings.deleteServer': 'Delete server',
     'settings.subtitle': 'Configure runtime, providers, agents, tools, and storage.',
@@ -343,6 +345,8 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'settings.agentDefaults': 'Agent Default Models',
     'settings.agentDefaultsHelp':
       'Models must reference a provider configured in the Models tab (format: provider/model-id).',
+    'settings.switchAllModels': 'Switch all models',
+    'settings.switchAllModelsPlaceholder': 'Choose a model for every route',
     'settings.subAgentOrder':
       'Sub-agent resolution order is sub-agent-<name> -> sub-agent -> current parent Session model.',
     'settings.perSubAgentOverrides': 'Per-Sub-Agent Overrides',
@@ -707,6 +711,8 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'settings.field.lifecycleDays': '生命周期（天）',
     'settings.removeModel': '移除模型',
     'settings.thinkingFormat': '推理格式',
+    'settings.thinkingFormatDefault': '默认',
+    'settings.thinkingFormatCustom': '{value}（自定义）',
     'settings.deleteProvider': '删除服务商',
     'settings.deleteServer': '删除服务器',
     'settings.subtitle': '配置运行时、模型服务商、代理、工具和存储。',
@@ -751,6 +757,8 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'settings.features': '功能',
     'settings.agentDefaults': '代理默认模型',
     'settings.agentDefaultsHelp': '模型必须引用模型页中配置的服务商（格式：provider/model-id）。',
+    'settings.switchAllModels': '全部切换为',
+    'settings.switchAllModelsPlaceholder': '选择所有路由使用的模型',
     'settings.subAgentOrder':
       '子代理解析顺序：sub-agent-<name> -> sub-agent -> 当前父 Session 的有效模型。',
     'settings.perSubAgentOverrides': '子代理专用覆盖',

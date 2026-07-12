@@ -836,13 +836,32 @@ button {
   justify-content: flex-end;
 }
 
-.msg.user {
+.msg-row.user .msg-content {
+  display: flex;
+  flex: 0 1 auto;
+  flex-direction: column;
+  align-items: flex-end;
+  width: fit-content;
   max-width: min(72%, 720px);
-  padding: 11px 15px;
-  border: 1px solid color-mix(in srgb, var(--accent2) 12%, var(--border));
-  border-radius: 16px 16px 5px 16px;
-  background: color-mix(in srgb, var(--accent2) 9%, var(--surface));
+}
+
+.msg.user {
+  box-sizing: border-box;
+  width: fit-content;
+  max-width: 100%;
+  padding: 10px 16px;
+  border: 1px solid color-mix(in srgb, var(--border) 72%, transparent);
+  border-radius: 20px;
+  background: color-mix(in srgb, var(--surface2) 88%, var(--border) 12%);
   box-shadow: none;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+.msg-row.user .msg-time {
+  padding-inline: 4px;
 }
 
 .msg.assistant {
@@ -1606,7 +1625,7 @@ button {
 /* Dark refinements for legacy surfaces ---------------------------------- */
 
 :root[data-theme='dark'] .msg.user {
-  background: color-mix(in srgb, var(--accent2) 13%, var(--surface));
+  background: color-mix(in srgb, var(--surface2) 84%, var(--border) 16%);
 }
 
 :root[data-theme='dark'] .msg.assistant .markdown-table-wrap,
@@ -1884,7 +1903,7 @@ button {
     max-width: 100%;
   }
 
-  .msg.user {
+  .msg-row.user .msg-content {
     max-width: 88%;
   }
 

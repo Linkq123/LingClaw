@@ -406,4 +406,13 @@ describe('workspace shell', () => {
       /\.app-shell:has\(\.session-drawer\.is-collapsed\):has\(\.tool-drawer\.open\)[\s\S]*?var\(--workspace-sidebar-collapsed\)/,
     );
   });
+
+  it('keeps short user messages content-sized instead of collapsing percentage widths', () => {
+    expect(workspaceCss).toMatch(
+      /\.msg-row\.user \.msg-content \{[\s\S]*?width: fit-content;[\s\S]*?max-width: min\(72%, 720px\);/,
+    );
+    expect(workspaceCss).toMatch(
+      /\.msg\.user \{[\s\S]*?width: fit-content;[\s\S]*?max-width: 100%;[\s\S]*?word-break: normal;/,
+    );
+  });
 });

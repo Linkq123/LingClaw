@@ -2173,7 +2173,7 @@ describe('SettingsPage sub-agent model overrides', () => {
     vi.unstubAllGlobals();
   });
 
-  it('saves per-sub-agent overrides using discovered agent names', async () => {
+  it('adds a sub-agent override and switches every agent route to one model', async () => {
     let savedBody: unknown;
     const fetchMock = vi.fn<typeof fetch>((input, init) => {
       const url = typeof input === 'string' ? input : input.url;
@@ -2188,7 +2188,10 @@ describe('SettingsPage sub-agent model overrides', () => {
                     api: 'openai-completions',
                     baseUrl: 'https://api.openai.com/v1',
                     apiKey: 'sk-test',
-                    models: [{ id: 'gpt-4o-mini', input: ['text'] }],
+                    models: [
+                      { id: 'gpt-4o-mini', input: ['text'] },
+                      { id: 'gpt-4.1', input: ['text'] },
+                    ],
                   },
                 },
               },
@@ -2227,6 +2230,16 @@ describe('SettingsPage sub-agent model overrides', () => {
     });
 
     await act(async () => {
+      const select = document.querySelector('select[aria-label="Switch all models"]');
+      if (!(select instanceof HTMLSelectElement)) {
+        throw new Error('Switch all models select not found');
+      }
+      select.value = 'openai/gpt-4.1';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
       const save = document.getElementById('settings-save-btn');
       if (!(save instanceof HTMLButtonElement)) throw new Error('Save button not found');
       save.click();
@@ -2236,7 +2249,15 @@ describe('SettingsPage sub-agent model overrides', () => {
     const savedConfig = (
       savedBody as { config?: { agents?: { defaults?: { model?: Record<string, string> } } } }
     )?.config;
-    expect(savedConfig?.agents?.defaults?.model?.['sub-agent-reviewer']).toBe('openai/gpt-4o-mini');
+    expect(savedConfig?.agents?.defaults?.model).toEqual({
+      primary: 'openai/gpt-4.1',
+      fast: 'openai/gpt-4.1',
+      'sub-agent': 'openai/gpt-4.1',
+      memory: 'openai/gpt-4.1',
+      reflection: 'openai/gpt-4.1',
+      context: 'openai/gpt-4.1',
+      'sub-agent-reviewer': 'openai/gpt-4.1',
+    });
   });
 });
 
@@ -2461,11 +2482,28 @@ describe('SettingsPage model compat thinking format', () => {
       await flushMicrotasks();
     });
 
+    const select = document.querySelector('select[aria-label="Thinking Format"]');
+    if (!(select instanceof HTMLSelectElement)) {
+      throw new Error('Thinking Format select not found');
+    }
+    expect(select.value).toBe('qwen');
+    expect(Array.from(select.options).map((option) => option.value)).toEqual([
+      '',
+      'openai',
+      'qwen',
+      'doubao',
+      'deepseek-v4',
+      'ollama',
+      'gpt-oss',
+      'ollama-gpt-oss',
+    ]);
+
     await act(async () => {
-      const input = document.querySelector('input[aria-label="Thinking Format"]');
-      if (!(input instanceof HTMLInputElement)) throw new Error('Thinking Format input not found');
-      expect(input.value).toBe('qwen');
+      select.value = 'deepseek-v4';
+      select.dispatchEvent(new Event('change', { bubbles: true }));
+      await flushMicrotasks();
     });
+    expect(select.value).toBe('deepseek-v4');
   });
 
   it('loads openai-responses providers in the API type selector', async () => {
