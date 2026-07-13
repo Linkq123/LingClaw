@@ -51,6 +51,31 @@ function normalizeUsagePair(pair: [number, number] | undefined): { input: number
   };
 }
 
+function pairHasUsage(pair: [number, number] | undefined): boolean {
+  const normalized = normalizeUsagePair(pair);
+  return normalized.input + normalized.output > 0;
+}
+
+export function hasAnyUsageData(data: UsageData): boolean {
+  if (
+    (data.daily_input || 0) +
+      (data.daily_output || 0) +
+      (data.total_input || 0) +
+      (data.total_output || 0) >
+    0
+  ) {
+    return true;
+  }
+  if (Object.values(data.daily_roles || {}).some(pairHasUsage)) return true;
+  if (Object.values(data.total_roles || {}).some(pairHasUsage)) return true;
+  if (Object.values(data.daily_providers || {}).some(pairHasUsage)) return true;
+  return (data.usage_history || []).some(
+    (entry) =>
+      (entry.input || 0) + (entry.output || 0) > 0 ||
+      Object.values(entry.providers || {}).some(pairHasUsage),
+  );
+}
+
 function localDateStr(d: Date): string {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, '0');
@@ -81,21 +106,35 @@ function UsageSummary({ data }: { data: UsageData }) {
       : tr('usage.source', { input: inputSource, output: outputSource });
 
   const stats = [
-    { value: (data.daily_input || 0) + (data.daily_output || 0), label: tr('usage.todayTotal') },
-    { value: data.daily_input || 0, label: tr('usage.todayInput') },
-    { value: data.daily_output || 0, label: tr('usage.todayOutput') },
-    { value: total, label: tr('usage.allTimeTotal') },
-    { value: data.total_input || 0, label: tr('usage.allTimeInput') },
-    { value: data.total_output || 0, label: tr('usage.allTimeOutput') },
+    {
+      input: data.daily_input || 0,
+      output: data.daily_output || 0,
+      value: (data.daily_input || 0) + (data.daily_output || 0),
+      label: tr('usage.todayTotal'),
+    },
+    {
+      input: data.total_input || 0,
+      output: data.total_output || 0,
+      value: total,
+      label: tr('usage.allTimeTotal'),
+    },
   ];
 
   return (
     <div className="usage-summary">
       {stats.map((s) => (
-        <div key={s.label} className="usage-stat-card">
-          <div className="usage-stat-value">{formatTokenCount(s.value)}</div>
+        <article key={s.label} className="usage-stat-card">
           <div className="usage-stat-label">{s.label}</div>
-        </div>
+          <div className="usage-stat-value">{formatTokenCount(s.value)}</div>
+          <div className="usage-stat-breakdown">
+            <span>
+              {tr('usage.input')}: {formatTokenCount(s.input)}
+            </span>
+            <span>
+              {tr('usage.output')}: {formatTokenCount(s.output)}
+            </span>
+          </div>
+        </article>
       ))}
       <div className="usage-summary-note">{sourceNote}</div>
     </div>
@@ -125,12 +164,12 @@ function RoleBreakdown({ data }: { data: UsageData }) {
   }
 
   return (
-    <div className="usage-role-breakdown">
+    <div className="usage-role-breakdown" role="list">
       {names.map((name) => {
         const today = normalizeUsagePair(dailyRoles[name] as [number, number]);
         const tot = normalizeUsagePair(totalRoles[name] as [number, number]);
         return (
-          <article key={name} className="usage-role-card">
+          <article key={name} className="usage-role-card" role="listitem">
             <div className="usage-role-header">
               <h3>{name}</h3>
               <span className="usage-role-chip">{formatTokenCount(tot.input + tot.output)}</span>
@@ -279,7 +318,7 @@ function DailyChart({ data, days }: { data: UsageData; days: number }) {
     const chartW = w - padding.left - padding.right;
     const chartH = h - padding.top - padding.bottom;
 
-    const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const isDark = document.documentElement.dataset.theme === 'dark';
     const textColor = isDark ? '#b0b5c0' : '#7e8699';
     const gridColor = isDark ? 'rgba(255,255,255,.06)' : 'rgba(0,0,0,.06)';
 
@@ -352,7 +391,7 @@ function DailyChart({ data, days }: { data: UsageData; days: number }) {
     ctx.fillText(tr('usage.output'), padding.left + 74, legendY);
   }, [languageVersion, timeline]);
 
-  return <canvas ref={canvasRef} />;
+  return <canvas ref={canvasRef} role="img" aria-label={tr('usage.dailyUsage')} />;
 }
 
 // ── Provider bar chart ────────────────────────────────────────────
@@ -430,7 +469,7 @@ function ProviderChart({ data, days }: { data: UsageData; days: number }) {
 
     const providers = Object.keys(providerTotals).sort();
 
-    const isDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    const isDark = document.documentElement.dataset.theme === 'dark';
     const textColor = isDark ? '#b0b5c0' : '#7e8699';
 
     if (providers.length === 0) {
@@ -523,7 +562,7 @@ function ProviderChart({ data, days }: { data: UsageData; days: number }) {
     ctx.fillText(tr('usage.output'), padding.left + 74, legendY);
   }, [languageVersion, providerTotals]);
 
-  return <canvas ref={canvasRef} />;
+  return <canvas ref={canvasRef} role="img" aria-label={tr('usage.byProvider')} />;
 }
 
 // ── Main UsagePage component ──────────────────────────────────────────────────
@@ -538,6 +577,7 @@ export function UsagePage() {
   const [dailyRange, setDailyRange] = useState(7);
   const [providerRange, setProviderRange] = useState(7);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const requestGenerationRef = useRef(0);
 
   useEffect(() => {
     _open = () => {
@@ -599,8 +639,10 @@ export function UsagePage() {
   // in-flight requests when the overlay closes mid-load.
   const loadUsage = useCallback(
     async (signal?: AbortSignal) => {
+      const requestGeneration = ++requestGenerationRef.current;
       setLoading(true);
       setError('');
+      setUsageData(null);
       try {
         const usageUrl = usageSessionId
           ? `/api/usage?session=${encodeURIComponent(usageSessionId)}`
@@ -608,12 +650,21 @@ export function UsagePage() {
         const resp = await fetch(usageUrl, signal ? { signal } : undefined);
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
         const data: UsageData = await resp.json();
+        if (signal?.aborted || requestGeneration !== requestGenerationRef.current) return;
         setUsageData(data);
       } catch (e: unknown) {
-        if ((e as Error).name === 'AbortError') return;
-        setError(tr('usage.loadFailed', { error: (e as Error).message }));
+        if (
+          (e as Error).name === 'AbortError' ||
+          signal?.aborted ||
+          requestGeneration !== requestGenerationRef.current
+        ) {
+          return;
+        }
+        setError((e as Error).message);
       } finally {
-        if (!signal || !signal.aborted) setLoading(false);
+        if ((!signal || !signal.aborted) && requestGeneration === requestGenerationRef.current) {
+          setLoading(false);
+        }
       }
     },
     [usageSessionId],
@@ -623,12 +674,33 @@ export function UsagePage() {
     if (!visible) return;
     const controller = new AbortController();
     void loadUsage(controller.signal);
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      requestGenerationRef.current += 1;
+    };
   }, [visible, loadUsage]);
 
   const refreshUsage = useCallback(() => {
     void loadUsage();
   }, [loadUsage]);
+
+  const hasUsage = useMemo(() => (usageData ? hasAnyUsageData(usageData) : false), [usageData]);
+  const hasDailyData = useMemo(
+    () =>
+      usageData
+        ? buildDailyTimeline(usageData, dailyRange).some((point) => point.input + point.output > 0)
+        : false,
+    [dailyRange, usageData],
+  );
+  const hasProviderData = useMemo(
+    () =>
+      usageData
+        ? Object.values(buildProviderTotals(usageData, providerRange)).some(
+            (totals) => totals.input + totals.output > 0,
+          )
+        : false,
+    [providerRange, usageData],
+  );
 
   if (!visible) return null;
 
@@ -646,7 +718,7 @@ export function UsagePage() {
     >
       <div className="page-header">
         <h2 id="usage-dialog-title">{tr('usage.title')}</h2>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <div className="page-header-actions">
           <button className="btn-secondary" onClick={refreshUsage} disabled={loading}>
             <svg className={`icon${loading ? ' is-spinning' : ''}`} aria-hidden="true">
               <use href="#icon-refresh" />
@@ -675,7 +747,7 @@ export function UsagePage() {
               </svg>
             </span>
             <strong>{tr('usage.loadErrorTitle')}</strong>
-            <p>{error}</p>
+            <p>{tr('usage.loadFailed', { error })}</p>
             <button className="btn-secondary" onClick={refreshUsage} disabled={loading}>
               <svg className={`icon${loading ? ' is-spinning' : ''}`} aria-hidden="true">
                 <use href="#icon-refresh" />
@@ -694,7 +766,18 @@ export function UsagePage() {
             <strong>{tr('usage.loading')}</strong>
           </div>
         )}
-        {usageData && (
+        {usageData && !hasUsage && (
+          <div className="usage-empty-state" role="status">
+            <span className="usage-state-icon">
+              <svg className="icon" aria-hidden="true">
+                <use href="#icon-chart" />
+              </svg>
+            </span>
+            <strong>{tr('usage.emptyTitle')}</strong>
+            <p>{tr('usage.emptyBody')}</p>
+          </div>
+        )}
+        {usageData && hasUsage && (
           <>
             <UsageSummary data={usageData} />
 
@@ -710,6 +793,7 @@ export function UsagePage() {
                 <div className="usage-chart-header">
                   <h3>{tr('usage.dailyUsage')}</h3>
                   <select
+                    aria-label={tr('usage.dailyRange')}
                     value={dailyRange}
                     onChange={(e) => setDailyRange(Number(e.target.value))}
                   >
@@ -720,8 +804,12 @@ export function UsagePage() {
                     ))}
                   </select>
                 </div>
-                <div className="usage-chart-container" style={{ height: 220 }}>
-                  <DailyChart data={usageData} days={dailyRange} />
+                <div className="usage-chart-container">
+                  {hasDailyData ? (
+                    <DailyChart data={usageData} days={dailyRange} />
+                  ) : (
+                    <div className="usage-inline-empty">{tr('usage.noDailyData')}</div>
+                  )}
                 </div>
               </div>
 
@@ -729,6 +817,7 @@ export function UsagePage() {
                 <div className="usage-chart-header">
                   <h3>{tr('usage.byProvider')}</h3>
                   <select
+                    aria-label={tr('usage.providerRange')}
                     value={providerRange}
                     onChange={(e) => setProviderRange(Number(e.target.value))}
                   >
@@ -739,8 +828,12 @@ export function UsagePage() {
                     ))}
                   </select>
                 </div>
-                <div className="usage-chart-container" style={{ height: 220 }}>
-                  <ProviderChart data={usageData} days={providerRange} />
+                <div className="usage-chart-container">
+                  {hasProviderData ? (
+                    <ProviderChart data={usageData} days={providerRange} />
+                  ) : (
+                    <div className="usage-inline-empty">{tr('usage.noProviderData')}</div>
+                  )}
                 </div>
               </div>
             </div>

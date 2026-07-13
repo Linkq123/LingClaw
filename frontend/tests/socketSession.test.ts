@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 type AppStateModule = typeof import('../src/state.js');
 type SessionsRendererModule = typeof import('../src/renderers/sessions.js');
@@ -38,6 +38,15 @@ describe('socket session binding', () => {
   let sessionsRendererModule: SessionsRendererModule;
   let utilsModule: UtilsModule;
 
+  function openRowAction(rowSelector: string, action: 'rename' | 'delete') {
+    stateModule.dom.sessionDrawerList
+      ?.querySelector<HTMLButtonElement>(`${rowSelector} [data-session-action="menu"]`)
+      ?.click();
+    return stateModule.dom.sessionDrawer?.querySelector<HTMLButtonElement>(
+      `.session-drawer-row-menu [data-session-action="${action}"]`,
+    );
+  }
+
   function mountSessionDrawerDom() {
     document.body.innerHTML = `
       <span id="conn-dot"></span>
@@ -48,6 +57,7 @@ describe('socket session binding', () => {
           <h2 class="session-drawer-heading">Sessions</h2>
           <button id="session-drawer-new-btn"></button>
         </div>
+        <input id="session-drawer-search-input" type="search" />
         <div id="session-drawer-list"></div>
       </aside>
     `;
@@ -80,6 +90,10 @@ describe('socket session binding', () => {
     (globalThis as unknown as { WebSocket: unknown }).WebSocket =
       mockWebSocket as unknown as typeof WebSocket;
     mockWebSocket.mockReset();
+  });
+
+  afterEach(() => {
+    sessionsRendererModule.disposeSessionDrawer();
   });
 
   it('connects to default websocket path when no active session is selected', async () => {
@@ -248,9 +262,7 @@ describe('socket session binding', () => {
       ),
     ).toBeNull();
 
-    const deleteButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
-      '[data-session-id="project-alpha"] [data-session-action="delete"]',
-    );
+    const deleteButton = openRowAction('[data-session-id="project-alpha"]', 'delete');
     deleteButton?.click();
 
     expect(onDelete).toHaveBeenCalledWith('project-alpha');
@@ -362,6 +374,139 @@ describe('socket session binding', () => {
     expect(rows?.[0]?.getAttribute('data-session-id')).toBe('main');
   });
 
+  it('keeps main and the active session inside a twelve-row recent window', async () => {
+    stateModule.state.sessions = [
+      { id: 'main', name: 'Main', updated_at: 1 },
+      ...Array.from({ length: 16 }, (_, index) => ({
+        id: `session-${index + 1}`,
+        name: `Session ${index + 1}`,
+        updated_at: 100 - index,
+      })),
+    ];
+    stateModule.state.activeSessionId = 'session-16';
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete: vi.fn(),
+      onSwitch: vi.fn(),
+    });
+
+    expect(stateModule.dom.sessionDrawerList?.querySelectorAll('[data-session-id]')).toHaveLength(
+      12,
+    );
+    expect(
+      stateModule.dom.sessionDrawerList?.querySelector('[data-session-id="main"]'),
+    ).not.toBeNull();
+    expect(
+      stateModule.dom.sessionDrawerList?.querySelector('[data-session-id="session-16"]'),
+    ).not.toBeNull();
+
+    const earlierToggle = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '[data-session-earlier-toggle="true"]',
+    );
+    expect(earlierToggle?.getAttribute('aria-expanded')).toBe('false');
+    earlierToggle?.click();
+    expect(stateModule.dom.sessionDrawerList?.querySelectorAll('[data-session-id]')).toHaveLength(
+      17,
+    );
+  });
+
+  it('searches all sessions and groups, including collapsed earlier sessions', async () => {
+    stateModule.state.sessions = [
+      { id: 'main', name: 'Main', updated_at: 1 },
+      ...Array.from({ length: 14 }, (_, index) => ({
+        id: `archive-${index + 1}`,
+        name: index === 13 ? 'Quarterly Research' : `Archive ${index + 1}`,
+        updated_at: 100 - index,
+      })),
+    ];
+    stateModule.state.sessionGroups = [{ id: 'design-review', name: 'Design Review' }];
+    stateModule.state.activeSessionId = 'main';
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete: vi.fn(),
+      onSwitch: vi.fn(),
+      onSwitchGroup: vi.fn(),
+    });
+
+    const search = stateModule.dom.sessionDrawerSearchInput;
+    if (!search) throw new Error('Search input not found');
+    search.value = 'quarterly';
+    search.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(
+      stateModule.dom.sessionDrawerList?.querySelector('[data-session-id="archive-14"]'),
+    ).not.toBeNull();
+    expect(stateModule.dom.sessionDrawerList?.querySelectorAll('[data-session-id]')).toHaveLength(
+      1,
+    );
+
+    search.value = 'DESIGN-REVIEW';
+    search.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(
+      stateModule.dom.sessionDrawerList?.querySelector('[data-group-id="design-review"]'),
+    ).not.toBeNull();
+
+    search.value = 'missing';
+    search.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(stateModule.dom.sessionDrawerList?.textContent).toContain(
+      'No matching sessions or groups',
+    );
+  });
+
+  it('returns focus to a row menu trigger when Escape closes the menu', async () => {
+    stateModule.state.sessions = [
+      { id: 'main', name: 'Main' },
+      { id: 'research-notes', name: 'Research Notes' },
+    ];
+    stateModule.state.activeSessionId = 'main';
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete: vi.fn(),
+      onRename: vi.fn(),
+      onSwitch: vi.fn(),
+    });
+
+    const trigger = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '[data-session-id="research-notes"] [data-session-action="menu"]',
+    );
+    trigger?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    await Promise.resolve();
+    expect(trigger?.getAttribute('aria-expanded')).toBe('true');
+    expect(document.activeElement?.getAttribute('data-session-action')).toBe('rename');
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    expect(stateModule.dom.sessionDrawer?.querySelector('[role="menu"]')).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('disposes row menu state and global listeners cleanly', () => {
+    stateModule.state.sessions = [
+      { id: 'main', name: 'Main' },
+      { id: 'research-notes', name: 'Research Notes' },
+    ];
+    stateModule.state.activeSessionId = 'main';
+
+    sessionsRendererModule.initSessionDrawer({
+      onCreate: vi.fn(),
+      onDelete: vi.fn(),
+      onRename: vi.fn(),
+      onSwitch: vi.fn(),
+    });
+
+    const trigger = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
+      '[data-session-id="research-notes"] [data-session-action="menu"]',
+    );
+    trigger?.click();
+    expect(stateModule.dom.sessionDrawer?.querySelector('[role="menu"]')).not.toBeNull();
+
+    sessionsRendererModule.disposeSessionDrawer();
+
+    expect(stateModule.dom.sessionDrawer?.querySelector('[role="menu"]')).toBeNull();
+    expect(trigger?.getAttribute('aria-expanded')).toBe('false');
+  });
+
   it('renders duplicate valid session ids only once', async () => {
     stateModule.state.sessions = [
       { id: 'research-notes', name: 'Research Notes', updated_at: 20 },
@@ -398,9 +543,7 @@ describe('socket session binding', () => {
       onSwitch: vi.fn(),
     });
 
-    const renameButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
-      '[data-session-id="research-notes"] [data-session-action="rename"]',
-    );
+    const renameButton = openRowAction('[data-session-id="research-notes"]', 'rename');
     renameButton?.click();
 
     expect(onRename).toHaveBeenCalledWith('research-notes');
@@ -439,17 +582,10 @@ describe('socket session binding', () => {
     const switchGroupButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
       '[data-group-id="review-group"] [data-session-action="switch-group"]',
     );
-    const renameGroupButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
-      '[data-group-id="review-group"] [data-session-action="rename"]',
-    );
-    const deleteGroupButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
-      '[data-group-id="review-group"] [data-session-action="delete"]',
-    );
-
     createGroupButton?.click();
     switchGroupButton?.click();
-    renameGroupButton?.click();
-    deleteGroupButton?.click();
+    openRowAction('[data-group-id="review-group"]', 'rename')?.click();
+    openRowAction('[data-group-id="review-group"]', 'delete')?.click();
 
     expect(createGroupButton?.querySelector('use')?.getAttribute('href')).toBe('#icon-plus');
     expect(onCreateGroup).toHaveBeenCalled();
@@ -495,9 +631,7 @@ describe('socket session binding', () => {
     );
     switchButton?.click();
 
-    const deleteButton = stateModule.dom.sessionDrawerList?.querySelector<HTMLButtonElement>(
-      '[data-session-id="corrupt-session"] [data-session-action="delete"]',
-    );
+    const deleteButton = openRowAction('[data-session-id="corrupt-session"]', 'delete');
     deleteButton?.click();
 
     expect(switchButton?.disabled).toBe(true);

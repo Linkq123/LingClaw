@@ -8,6 +8,8 @@ type SessionsRendererModule = typeof import('../src/renderers/sessions.js');
 
 const indexHtml = readFileSync(resolve(process.cwd(), 'index.html'), 'utf8');
 const layoutCss = readFileSync(resolve(process.cwd(), 'src/css/layout.css'), 'utf8');
+const chatCss = readFileSync(resolve(process.cwd(), 'src/css/chat.css'), 'utf8');
+const responsiveCss = readFileSync(resolve(process.cwd(), 'src/css/responsive.css'), 'utf8');
 const workspaceCss = readFileSync(resolve(process.cwd(), 'src/css/workspace.css'), 'utf8');
 const mainSource = readFileSync(resolve(process.cwd(), 'src/main.ts'), 'utf8');
 const appCssPaths = Array.from(
@@ -411,8 +413,27 @@ describe('workspace shell', () => {
     expect(workspaceCss).toMatch(
       /\.msg-row\.user \{[\s\S]*?align-self: flex-end;[\s\S]*?width: fit-content;[\s\S]*?max-width: min\(72%, 720px\);[\s\S]*?margin-left: auto;/,
     );
-    expect(workspaceCss).toMatch(
+    expect(chatCss).toMatch(
       /\.msg\.user \{[\s\S]*?width: fit-content;[\s\S]*?max-width: 100%;[\s\S]*?word-break: normal;/,
+    );
+  });
+
+  it('does not restore decorative dark-mode gradients over the neutral chat styles', () => {
+    expect(responsiveCss).not.toMatch(/:root\[data-theme='dark'\] \.msg\.user\s*\{/);
+    expect(responsiveCss).not.toMatch(
+      /:root\[data-theme='dark'\] \.msg\.assistant (?:blockquote|pre)\s*\{/,
+    );
+    expect(responsiveCss).not.toMatch(
+      /:root\[data-theme='dark'\] \.msg\.assistant \.markdown-table-wrap\s*\{/,
+    );
+    expect(responsiveCss).not.toMatch(/:root\[data-theme='dark'\] #send\s*\{/);
+  });
+
+  it('keeps the chat edge clear and uses the SVG sprite for jump-to-latest', () => {
+    expect(layoutCss).not.toMatch(/#chat\s*\{[^}]*mask-image:/);
+    expect(layoutCss).not.toMatch(/#jump-to-latest::before/);
+    expect(indexHtml).toMatch(
+      /id="jump-to-latest"[\s\S]*?class="icon jump-to-latest-icon"[\s\S]*?href="#icon-chevron-down"/,
     );
   });
 

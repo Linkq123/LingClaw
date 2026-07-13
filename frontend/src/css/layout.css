@@ -64,7 +64,7 @@ header .session-id {
   padding: 2px 8px;
   border-radius: 999px;
   border: 1px solid color-mix(in srgb, var(--accent2) 22%, var(--border));
-  background: linear-gradient(135deg, rgba(214, 86, 110, 0.08), rgba(45, 139, 207, 0.1));
+  background: var(--panel-surface-alt);
   color: var(--dim);
   font-size: 11px;
   font-weight: 600;
@@ -75,14 +75,6 @@ header .session-id {
 .header-version {
   margin-left: auto;
   flex-shrink: 0;
-}
-.header-theme-toggle {
-  flex-shrink: 0;
-  border-radius: 999px;
-  padding: 4px 12px;
-  border-color: color-mix(in srgb, var(--accent2) 18%, var(--border));
-  background: color-mix(in srgb, var(--surface) 76%, transparent);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35);
 }
 .language-toggle-btn {
   flex-shrink: 0;
@@ -112,8 +104,7 @@ header .actions {
   position: relative;
   align-items: center;
 }
-header .actions button,
-.header-theme-toggle {
+header .actions button {
   border: 1px solid var(--border);
   color: var(--dim);
   padding: 4px 10px;
@@ -122,8 +113,7 @@ header .actions button,
   font-size: 12px;
   transition: all 0.2s;
 }
-header .actions button:hover,
-.header-theme-toggle:hover {
+header .actions button:hover {
   border-color: var(--accent2);
   color: var(--text);
   background: rgba(45, 139, 207, 0.06);
@@ -139,15 +129,6 @@ header .actions button.is-active {
   min-width: 78px;
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.02em;
-}
-.header-theme-toggle.theme-toggle-btn {
-  min-width: 84px;
-  justify-content: center;
-  padding: 4px 12px;
-  border-radius: 999px;
-  border-color: color-mix(in srgb, var(--accent2) 18%, var(--border));
-  background: color-mix(in srgb, var(--surface) 76%, transparent);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.35);
 }
 .usage-badge {
   font-size: 11px;
@@ -307,6 +288,46 @@ header .actions button.is-active {
   padding-right: 4px;
 }
 
+.session-drawer-search {
+  min-height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  border: 1px solid var(--panel-border-soft);
+  border-radius: 10px;
+  background: var(--panel-surface-alt);
+  color: var(--dim);
+}
+
+.session-drawer-search .icon {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+}
+
+.session-drawer-search input {
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  padding: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--text);
+  font: 12px/1.4 inherit;
+}
+
+.session-drawer-search input::placeholder {
+  color: var(--dim);
+  opacity: 0.82;
+}
+
+.session-drawer-search:focus-within {
+  border-color: color-mix(in srgb, var(--accent2) 54%, var(--panel-border-soft));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent2) 9%, transparent);
+}
+
 .session-drawer-empty {
   border: 1px dashed var(--panel-border-soft);
   border-radius: 8px;
@@ -342,6 +363,33 @@ header .actions button.is-active {
   color: var(--text);
   cursor: pointer;
   line-height: 1;
+}
+
+.session-drawer-section-collapsible {
+  margin-top: 2px;
+}
+
+.session-drawer-section-toggle {
+  width: 26px;
+  height: 26px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.session-drawer-section-toggle:hover,
+.session-drawer-section-toggle:focus-visible {
+  color: var(--text);
+  background: var(--panel-hover);
+}
+
+.session-drawer-section-toggle .icon {
+  width: 14px;
+  height: 14px;
 }
 
 .session-drawer-section-action:hover {
@@ -455,8 +503,7 @@ header .actions button.is-active {
 .session-drawer-row-actions {
   flex-shrink: 0;
   display: flex;
-  flex-direction: column;
-  gap: 4px;
+  align-items: center;
 }
 
 .session-drawer-row-action {
@@ -478,10 +525,56 @@ header .actions button.is-active {
     border-color 0.18s ease;
 }
 
-.session-drawer-row-delete {
-  border-color: color-mix(in srgb, var(--accent-error) 18%, var(--panel-border-soft));
-  background: color-mix(in srgb, var(--accent-error) 8%, var(--panel-surface));
-  color: color-mix(in srgb, var(--accent-error) 78%, var(--text));
+.session-drawer-row.has-open-menu .session-drawer-row-action {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.session-drawer-row-menu {
+  position: absolute;
+  z-index: 80;
+  width: 176px;
+  padding: 5px;
+  display: grid;
+  gap: 2px;
+  border: 1px solid var(--panel-border-soft);
+  border-radius: 11px;
+  background: var(--surface);
+  box-shadow: var(--panel-shadow-strong);
+}
+
+.session-drawer-row-menu-item {
+  width: 100%;
+  min-height: 38px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: 12px/1.3 inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-drawer-row-menu-item:hover,
+.session-drawer-row-menu-item:focus-visible {
+  outline: 0;
+  background: var(--panel-hover);
+}
+
+.session-drawer-row-menu-item.is-danger:hover,
+.session-drawer-row-menu-item.is-danger:focus-visible {
+  color: var(--accent-error);
+  background: color-mix(in srgb, var(--accent-error) 8%, transparent);
+}
+
+.session-drawer-row-menu-item .icon {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
 }
 
 .session-drawer-row:hover .session-drawer-row-action,
@@ -497,18 +590,7 @@ header .actions button.is-active {
   }
 }
 
-.session-drawer-row-rename:hover:not(:disabled) {
-  border-color: color-mix(in srgb, var(--accent2) 32%, var(--panel-border-soft));
-  background: color-mix(in srgb, var(--accent2) 14%, var(--panel-surface));
-}
-
-.session-drawer-row-delete:hover:not(:disabled) {
-  border-color: color-mix(in srgb, var(--accent-error) 32%, var(--panel-border-soft));
-  background: color-mix(in srgb, var(--accent-error) 14%, var(--panel-surface));
-}
-
 .session-drawer-row-action:disabled,
-.session-drawer-row-delete:disabled,
 .session-drawer-new-btn:disabled {
   opacity: 0.5;
   cursor: default;
@@ -537,20 +619,6 @@ header .actions button.is-active {
   gap: 10px;
   scroll-behavior: auto;
   overflow-anchor: none;
-  mask-image: linear-gradient(
-    to bottom,
-    transparent,
-    black 24px,
-    black calc(100% - 24px),
-    transparent
-  );
-  -webkit-mask-image: linear-gradient(
-    to bottom,
-    transparent,
-    black 24px,
-    black calc(100% - 24px),
-    transparent
-  );
 }
 
 /* ── Welcome screen ── */
@@ -621,9 +689,9 @@ header .actions button.is-active {
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.06);
 }
 
-#jump-to-latest::before {
-  content: '↓';
-  font-size: 12px;
+#jump-to-latest .jump-to-latest-icon {
+  width: 15px;
+  height: 15px;
 }
 #jump-to-latest .jump-to-latest-label {
   white-space: nowrap;
@@ -633,11 +701,7 @@ header .actions button.is-active {
   height: 20px;
   padding: 0 6px;
   border-radius: 999px;
-  background: linear-gradient(
-    135deg,
-    var(--accent2),
-    color-mix(in srgb, var(--accent2) 70%, #ffffff)
-  );
+  background: var(--accent2);
   color: #fff;
   font-size: 11px;
   font-weight: 700;
@@ -646,11 +710,7 @@ header .actions button.is-active {
   box-shadow: 0 6px 16px rgba(45, 139, 207, 0.24);
 }
 #jump-to-latest.has-state-only .jump-to-latest-badge {
-  background: linear-gradient(
-    135deg,
-    var(--accent),
-    color-mix(in srgb, var(--accent) 72%, #ffffff)
-  );
+  background: var(--accent);
   box-shadow: 0 6px 16px rgba(214, 86, 110, 0.24);
 }
 #jump-to-latest.visible {

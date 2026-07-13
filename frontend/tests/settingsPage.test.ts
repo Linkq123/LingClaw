@@ -3,15 +3,22 @@ import { act } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 
-import { SettingsPage, closeSettingsPage, openSettingsPage } from '../src/pages/SettingsPage.js';
+import {
+  SettingsPage,
+  closeSettingsPage,
+  openSettingsPage,
+  type SettingsSection,
+} from '../src/pages/SettingsPage.js';
 import {
   CONFIG_SAVED_EVENT,
   acceptComposerSocketModelPayloadRevision,
   beginComposerRevisionHandshake,
 } from '../src/composerAvailability.js';
+import { setLanguage } from '../src/i18n.js';
 import { state } from '../src/state.js';
 
 beforeEach(() => {
+  setLanguage('en');
   state.composerConfigRevision = null;
   state.composerSessionModelRevision = null;
   state.composerGroupModelRevision = null;
@@ -42,9 +49,9 @@ async function renderSettingsPage(): Promise<{ root: Root; container: HTMLDivEle
   return { root, container };
 }
 
-async function openAndLoad(sessionId?: string): Promise<void> {
+async function openAndLoad(sessionId?: string, initialSection?: SettingsSection): Promise<void> {
   await act(async () => {
-    openSettingsPage(sessionId);
+    openSettingsPage(sessionId, initialSection);
     await flushMicrotasks();
   });
 }
@@ -258,6 +265,41 @@ describe('SettingsPage shell layout and dirty state', () => {
       baseConfigFileEtag: 'a'.repeat(64),
     });
     expect(save.disabled).toBe(true);
+  });
+
+  it('opens a requested section and keeps the mobile section picker synchronized', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {},
+            discoveredAgents: [],
+          }),
+        ),
+      ),
+    );
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad('main', 'tab-models');
+
+    const picker = document.querySelector<HTMLSelectElement>(
+      '.settings-mobile-section-picker select',
+    );
+    expect(picker?.value).toBe('tab-models');
+    expect(document.getElementById('tab-models-panel')?.hasAttribute('hidden')).toBe(false);
+
+    await act(async () => {
+      if (!picker) throw new Error('Mobile settings picker not found');
+      setSelectValue(picker, 'tab-agents');
+      await flushMicrotasks();
+    });
+
+    expect(document.getElementById('tab-agents-panel')?.hasAttribute('hidden')).toBe(false);
+    expect(
+      document.querySelector('[role="tab"][aria-selected="true"]')?.getAttribute('data-tab'),
+    ).toBe('tab-agents');
   });
 
   it('preserves edits made while a config save is in flight', async () => {
@@ -2504,6 +2546,21 @@ describe('SettingsPage model compat thinking format', () => {
       await flushMicrotasks();
     });
     expect(select.value).toBe('deepseek-v4');
+
+    await act(async () => {
+      setLanguage('zh-CN');
+      await flushMicrotasks();
+    });
+
+    expect(document.querySelector('select[aria-label="推理格式"]')).toBe(select);
+    expect(document.querySelector('.provider-models-title')?.textContent).toBe('模型');
+    expect(document.querySelector('input[aria-label="模型 ID"]')).not.toBeNull();
+    expect(
+      Array.from(document.querySelectorAll('.model-entry-field')).map((node) =>
+        node.firstChild?.textContent?.trim(),
+      ),
+    ).toEqual(expect.arrayContaining(['上下文窗口', '最大 Token']));
+    expect(findPrimaryTestButton().textContent).toBe('测试');
   });
 
   it('loads openai-responses providers in the API type selector', async () => {

@@ -1,6 +1,6 @@
 import { dom, state } from './state.js';
 import { trapDialogFocus } from './pages/dialogFocus.js';
-import { syncSessionDrawerToggleChrome } from './renderers/sessions.js';
+import { closeSessionRowMenu, syncSessionDrawerToggleChrome } from './renderers/sessions.js';
 
 export type ShellPopover = 'view-controls' | 'commands' | null;
 
@@ -122,6 +122,7 @@ export function openMobileNavigation(trigger?: HTMLElement | null): void {
 
 export function closeMobileNavigation({ restoreFocus = false } = {}): void {
   const previousTrigger = lastNavigationTrigger;
+  closeSessionRowMenu();
   state.mobileNavigationOpen = false;
   lastNavigationTrigger = null;
   syncMobileNavigation();

@@ -19,6 +19,7 @@ export interface DomRefs {
   input: HTMLTextAreaElement | null;
   inputArea: HTMLElement | null;
   composerAvailabilityStatus: HTMLElement | null;
+  composerAvailabilityAction: HTMLButtonElement | null;
   composerAvailabilityRetry: HTMLButtonElement | null;
   jumpToLatestBtn: HTMLButtonElement | null;
   jumpToLatestBadge: HTMLElement | null;
@@ -31,6 +32,7 @@ export interface DomRefs {
   sessionIdEl: HTMLElement | null;
   sessionDrawer: HTMLElement | null;
   sessionDrawerList: HTMLElement | null;
+  sessionDrawerSearchInput: HTMLInputElement | null;
   sessionDrawerToggleBtn: HTMLButtonElement | null;
   sessionDrawerNewBtn: HTMLButtonElement | null;
   slashCommandMenu: HTMLElement | null;
@@ -295,6 +297,9 @@ export function initDomRefs() {
   dom.input = document.getElementById('input') as HTMLTextAreaElement | null;
   dom.inputArea = document.getElementById('input-area');
   dom.composerAvailabilityStatus = document.getElementById('composer-availability-status');
+  dom.composerAvailabilityAction = document.getElementById(
+    'composer-availability-action',
+  ) as HTMLButtonElement | null;
   dom.composerAvailabilityRetry = document.getElementById(
     'composer-availability-retry',
   ) as HTMLButtonElement | null;
@@ -309,6 +314,9 @@ export function initDomRefs() {
   dom.sessionIdEl = document.getElementById('session-id');
   dom.sessionDrawer = document.getElementById('session-drawer');
   dom.sessionDrawerList = document.getElementById('session-drawer-list');
+  dom.sessionDrawerSearchInput = document.getElementById(
+    'session-drawer-search-input',
+  ) as HTMLInputElement | null;
   dom.sessionDrawerToggleBtn = document.getElementById(
     'session-drawer-toggle-btn',
   ) as HTMLButtonElement | null;

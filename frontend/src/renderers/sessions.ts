@@ -3,6 +3,7 @@ import type { SessionGroupSummary, SessionSummary } from '../types.js';
 import { normalizePendingDeleteSessionId } from '../utils.js';
 import { tr } from '../i18n.js';
 import { iconMarkup } from '../icons.js';
+import type { IconName } from '../icons.js';
 
 export const SESSION_DRAWER_STORAGE_KEY = 'lingclaw.sessionDrawerExpanded';
 
@@ -26,6 +27,168 @@ type RenderableGroup = SessionGroupSummary & {
 };
 
 let callbacks: SessionDrawerCallbacks | null = null;
+const RECENT_SESSION_LIMIT = 12;
+
+let sessionSearchQuery = '';
+let earlierSessionsExpanded = false;
+let openRowMenuElement: HTMLElement | null = null;
+let openRowMenuTrigger: HTMLButtonElement | null = null;
+let openRowMenuId = '';
+let drawerListenerController: AbortController | null = null;
+
+type SessionRowAction = {
+  action: 'rename' | 'delete';
+  danger?: boolean;
+  icon: IconName;
+  label: string;
+  onSelect: () => void;
+};
+
+function normalizedSearchValue(value: string): string {
+  return value.trim().toLocaleLowerCase();
+}
+
+function matchesSearch(item: { id: string; name: string }, query: string): boolean {
+  if (!query) return true;
+  return `${item.name || ''}\n${item.id || ''}`.toLocaleLowerCase().includes(query);
+}
+
+export function closeSessionRowMenu({ restoreFocus = false } = {}): void {
+  const trigger = openRowMenuTrigger;
+  trigger?.setAttribute('aria-expanded', 'false');
+  trigger?.closest('.session-drawer-row')?.classList.remove('has-open-menu');
+  openRowMenuElement?.remove();
+  openRowMenuElement = null;
+  openRowMenuTrigger = null;
+  openRowMenuId = '';
+  if (restoreFocus && trigger?.isConnected) trigger.focus();
+}
+
+function focusMenuItem(menu: HTMLElement, position: 'first' | 'last'): void {
+  const items = Array.from(menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'));
+  const target = position === 'last' ? items.at(-1) : items[0];
+  target?.focus();
+}
+
+function positionSessionRowMenu(menu: HTMLElement, trigger: HTMLButtonElement): void {
+  const drawer = dom.sessionDrawer;
+  if (!drawer) return;
+  const drawerRect = drawer.getBoundingClientRect();
+  const triggerRect = trigger.getBoundingClientRect();
+  const width = menu.offsetWidth || 176;
+  const height = menu.offsetHeight || 92;
+  const left = Math.max(
+    8,
+    Math.min(triggerRect.right - drawerRect.left - width, drawerRect.width - width - 8),
+  );
+  const spaceBelow = drawerRect.bottom - triggerRect.bottom;
+  const idealTop =
+    spaceBelow >= height + 8
+      ? triggerRect.bottom - drawerRect.top + 4
+      : triggerRect.top - drawerRect.top - height - 4;
+  const top = Math.max(8, Math.min(idealTop, drawerRect.height - height - 8));
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+}
+
+function handleSessionRowMenuKeydown(event: KeyboardEvent, menu: HTMLElement): void {
+  const items = Array.from(menu.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'));
+  if (items.length === 0) return;
+  const currentIndex = items.indexOf(document.activeElement as HTMLButtonElement);
+  let nextIndex = currentIndex;
+  if (event.key === 'ArrowDown') nextIndex = (currentIndex + 1 + items.length) % items.length;
+  else if (event.key === 'ArrowUp') nextIndex = (currentIndex - 1 + items.length) % items.length;
+  else if (event.key === 'Home') nextIndex = 0;
+  else if (event.key === 'End') nextIndex = items.length - 1;
+  else if (event.key === 'Tab') {
+    closeSessionRowMenu();
+    return;
+  } else {
+    return;
+  }
+  event.preventDefault();
+  items[nextIndex]?.focus();
+}
+
+function openSessionRowMenu(
+  trigger: HTMLButtonElement,
+  menuId: string,
+  actions: SessionRowAction[],
+  focusPosition: 'first' | 'last' = 'first',
+): void {
+  if (openRowMenuId === menuId && openRowMenuTrigger === trigger) {
+    closeSessionRowMenu({ restoreFocus: true });
+    return;
+  }
+  closeSessionRowMenu();
+  const drawer = dom.sessionDrawer;
+  if (!drawer) return;
+
+  const menu = document.createElement('div');
+  menu.id = menuId;
+  menu.className = 'session-drawer-row-menu';
+  menu.setAttribute('role', 'menu');
+  menu.addEventListener('keydown', (event) => handleSessionRowMenuKeydown(event, menu));
+
+  for (const item of actions) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `session-drawer-row-menu-item${item.danger ? ' is-danger' : ''}`;
+    button.dataset.sessionAction = item.action;
+    button.setAttribute('role', 'menuitem');
+    button.innerHTML = `${iconMarkup(item.icon)}<span></span>`;
+    const label = button.querySelector('span');
+    if (label) label.textContent = item.label;
+    button.addEventListener('click', () => {
+      closeSessionRowMenu();
+      item.onSelect();
+    });
+    menu.appendChild(button);
+  }
+
+  drawer.appendChild(menu);
+  openRowMenuElement = menu;
+  openRowMenuTrigger = trigger;
+  openRowMenuId = menuId;
+  trigger.setAttribute('aria-expanded', 'true');
+  trigger.closest('.session-drawer-row')?.classList.add('has-open-menu');
+  positionSessionRowMenu(menu, trigger);
+  queueMicrotask(() => focusMenuItem(menu, focusPosition));
+}
+
+function appendSessionRowActions(
+  row: HTMLElement,
+  kind: 'session' | 'group',
+  itemId: string,
+  itemName: string,
+  actions: SessionRowAction[],
+): void {
+  if (actions.length === 0) return;
+  const actionGroup = document.createElement('div');
+  actionGroup.className = 'session-drawer-row-actions';
+  const trigger = document.createElement('button');
+  trigger.type = 'button';
+  trigger.className = 'session-drawer-row-action session-drawer-row-menu-trigger';
+  trigger.dataset.sessionAction = 'menu';
+  const menuId = `${kind}-row-menu-${encodeURIComponent(itemId)}`;
+  trigger.setAttribute('aria-haspopup', 'menu');
+  trigger.setAttribute('aria-expanded', 'false');
+  trigger.setAttribute('aria-controls', menuId);
+  trigger.setAttribute('aria-label', tr('session.moreActions', { name: itemName }));
+  trigger.title = tr('session.moreActions', { name: itemName });
+  trigger.innerHTML = iconMarkup('more');
+  trigger.addEventListener('click', (event) => {
+    event.stopPropagation();
+    openSessionRowMenu(trigger, menuId, actions);
+  });
+  trigger.addEventListener('keydown', (event) => {
+    if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+    event.preventDefault();
+    openSessionRowMenu(trigger, menuId, actions, event.key === 'ArrowUp' ? 'last' : 'first');
+  });
+  actionGroup.appendChild(trigger);
+  row.appendChild(actionGroup);
+}
 
 function identityNavigationBlocked(): boolean {
   return (
@@ -150,6 +313,34 @@ function renderableGroups(): RenderableGroup[] {
   return items;
 }
 
+function splitRecentSessions(sessions: RenderableSession[]): {
+  recent: RenderableSession[];
+  earlier: RenderableSession[];
+} {
+  const recent: RenderableSession[] = [];
+  const included = new Set<RenderableSession>();
+  const addById = (id: string) => {
+    const item = sessions.find((session) => session.id === id);
+    if (!item || included.has(item)) return;
+    recent.push(item);
+    included.add(item);
+  };
+
+  addById('main');
+  if (!state.activeGroupId) addById(state.activeSessionId);
+  for (const session of sessions) {
+    if (recent.length >= RECENT_SESSION_LIMIT) break;
+    if (included.has(session)) continue;
+    recent.push(session);
+    included.add(session);
+  }
+
+  return {
+    recent,
+    earlier: sessions.filter((session) => !included.has(session)),
+  };
+}
+
 function currentBadgeLabel(session: RenderableSession): string {
   if (session.pending) {
     return tr('common.switching');
@@ -237,6 +428,7 @@ function createSessionRow(session: RenderableSession): HTMLElement {
   }
   mainButton.addEventListener('click', () => {
     if (!mainButton.disabled) {
+      closeSessionRowMenu();
       callbacks?.onSwitch(session.id);
     }
   });
@@ -269,45 +461,25 @@ function createSessionRow(session: RenderableSession): HTMLElement {
   mainButton.appendChild(content);
   row.appendChild(mainButton);
 
-  const actions: HTMLElement[] = [];
+  const actions: SessionRowAction[] = [];
   if (isSessionRenameable(session)) {
-    const renameButton = document.createElement('button');
-    renameButton.type = 'button';
-    renameButton.className = 'session-drawer-row-action session-drawer-row-rename';
-    renameButton.dataset.sessionAction = 'rename';
-    renameButton.setAttribute(
-      'aria-label',
-      tr('session.rename', { name: session.name || session.id }),
-    );
-    renameButton.title = tr('session.rename', { name: session.name || session.id });
-    renameButton.innerHTML = iconMarkup('edit');
-    renameButton.addEventListener('click', () => {
-      callbacks?.onRename?.(session.id);
+    actions.push({
+      action: 'rename',
+      icon: 'edit',
+      label: tr('session.rename', { name: session.name || session.id }),
+      onSelect: () => callbacks?.onRename?.(session.id),
     });
-    actions.push(renameButton);
   }
   if (isSessionDeleteable(session)) {
-    const deleteButton = document.createElement('button');
-    deleteButton.type = 'button';
-    deleteButton.className = 'session-drawer-row-action session-drawer-row-delete';
-    deleteButton.dataset.sessionAction = 'delete';
-    deleteButton.setAttribute(
-      'aria-label',
-      tr('session.delete', { name: session.name || session.id }),
-    );
-    deleteButton.title = tr('session.delete', { name: session.name || session.id });
-    deleteButton.innerHTML = iconMarkup('trash');
-    deleteButton.addEventListener('click', () => {
-      callbacks?.onDelete(session.id);
+    actions.push({
+      action: 'delete',
+      danger: true,
+      icon: 'trash',
+      label: tr('session.delete', { name: session.name || session.id }),
+      onSelect: () => callbacks?.onDelete(session.id),
     });
-    actions.push(deleteButton);
   }
-  if (actions.length > 0) {
-    const actionGroup = document.createElement('div');
-    actionGroup.className = 'session-drawer-row-actions';
-    actionGroup.append(...actions);
-    row.appendChild(actionGroup);
-  }
+  appendSessionRowActions(row, 'session', session.id, session.name || session.id, actions);
 
   return row;
 }
@@ -334,6 +506,33 @@ function createSectionHeader(label: string, count: number, action?: () => void):
     });
     header.appendChild(button);
   }
+  return header;
+}
+
+function createEarlierSessionsHeader(count: number): HTMLElement {
+  const header = createSectionHeader(tr('session.sectionEarlier'), count);
+  header.classList.add('session-drawer-section-collapsible');
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'session-drawer-section-toggle';
+  button.dataset.sessionEarlierToggle = 'true';
+  button.setAttribute('aria-expanded', String(earlierSessionsExpanded));
+  button.setAttribute(
+    'aria-label',
+    earlierSessionsExpanded ? tr('session.hideEarlier') : tr('session.showEarlier', { count }),
+  );
+  button.title = button.getAttribute('aria-label') || '';
+  button.innerHTML = iconMarkup(earlierSessionsExpanded ? 'chevron-down' : 'chevron-right');
+  button.addEventListener('click', () => {
+    earlierSessionsExpanded = !earlierSessionsExpanded;
+    renderSessionDrawer();
+    queueMicrotask(() =>
+      dom.sessionDrawerList
+        ?.querySelector<HTMLButtonElement>('[data-session-earlier-toggle="true"]')
+        ?.focus(),
+    );
+  });
+  header.appendChild(button);
   return header;
 }
 
@@ -367,7 +566,10 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
   );
   if (isCurrentGroup) mainButton.setAttribute('aria-current', 'true');
   mainButton.addEventListener('click', () => {
-    if (!mainButton.disabled) callbacks?.onSwitchGroup?.(group.id);
+    if (!mainButton.disabled) {
+      closeSessionRowMenu();
+      callbacks?.onSwitchGroup?.(group.id);
+    }
   });
 
   const content = document.createElement('div');
@@ -396,7 +598,7 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
   mainButton.appendChild(content);
   row.appendChild(mainButton);
 
-  const actions: HTMLElement[] = [];
+  const actions: SessionRowAction[] = [];
   if (
     !identityNavigationBlocked() &&
     !group.pending &&
@@ -404,18 +606,12 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
     hasValidGroupId &&
     callbacks?.onRenameGroup
   ) {
-    const renameButton = document.createElement('button');
-    renameButton.type = 'button';
-    renameButton.className = 'session-drawer-row-action session-drawer-row-rename';
-    renameButton.dataset.sessionAction = 'rename';
-    renameButton.setAttribute(
-      'aria-label',
-      tr('session.renameGroup', { name: group.name || group.id }),
-    );
-    renameButton.title = tr('session.renameGroup', { name: group.name || group.id });
-    renameButton.innerHTML = iconMarkup('edit');
-    renameButton.addEventListener('click', () => callbacks?.onRenameGroup?.(group.id));
-    actions.push(renameButton);
+    actions.push({
+      action: 'rename',
+      icon: 'edit',
+      label: tr('session.renameGroup', { name: group.name || group.id }),
+      onSelect: () => callbacks?.onRenameGroup?.(group.id),
+    });
   }
   if (
     !identityNavigationBlocked() &&
@@ -423,25 +619,15 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
     hasValidGroupId &&
     callbacks?.onDeleteGroup
   ) {
-    const deleteButton = document.createElement('button');
-    deleteButton.type = 'button';
-    deleteButton.className = 'session-drawer-row-action session-drawer-row-delete';
-    deleteButton.dataset.sessionAction = 'delete';
-    deleteButton.setAttribute(
-      'aria-label',
-      tr('session.deleteGroup', { name: group.name || group.id }),
-    );
-    deleteButton.title = tr('session.deleteGroup', { name: group.name || group.id });
-    deleteButton.innerHTML = iconMarkup('trash');
-    deleteButton.addEventListener('click', () => callbacks?.onDeleteGroup?.(group.id));
-    actions.push(deleteButton);
+    actions.push({
+      action: 'delete',
+      danger: true,
+      icon: 'trash',
+      label: tr('session.deleteGroup', { name: group.name || group.id }),
+      onSelect: () => callbacks?.onDeleteGroup?.(group.id),
+    });
   }
-  if (actions.length > 0) {
-    const actionGroup = document.createElement('div');
-    actionGroup.className = 'session-drawer-row-actions';
-    actionGroup.append(...actions);
-    row.appendChild(actionGroup);
-  }
+  appendSessionRowActions(row, 'group', group.id, group.name || group.id, actions);
   return row;
 }
 
@@ -467,8 +653,57 @@ function applyDrawerChrome(): void {
 
 export function initSessionDrawer(nextCallbacks: SessionDrawerCallbacks): void {
   callbacks = nextCallbacks;
+  closeSessionRowMenu();
+  sessionSearchQuery = '';
+  earlierSessionsExpanded = false;
   state.sessionDrawerExpanded = loadDrawerPreference();
+  drawerListenerController?.abort();
+  drawerListenerController = new AbortController();
+  const { signal } = drawerListenerController;
+  if (dom.sessionDrawerSearchInput) {
+    dom.sessionDrawerSearchInput.value = '';
+    dom.sessionDrawerSearchInput.addEventListener(
+      'input',
+      () => {
+        sessionSearchQuery = normalizedSearchValue(dom.sessionDrawerSearchInput?.value || '');
+        renderSessionDrawer();
+      },
+      { signal },
+    );
+  }
+  document.addEventListener(
+    'pointerdown',
+    (event) => {
+      const target = event.target;
+      if (!(target instanceof Node) || !openRowMenuElement) return;
+      if (openRowMenuElement.contains(target) || openRowMenuTrigger?.contains(target)) return;
+      closeSessionRowMenu();
+    },
+    { capture: true, signal },
+  );
+  document.addEventListener(
+    'keydown',
+    (event) => {
+      if (event.key !== 'Escape' || !openRowMenuElement) return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeSessionRowMenu({ restoreFocus: true });
+    },
+    { capture: true, signal },
+  );
+  window.addEventListener('resize', () => closeSessionRowMenu(), { signal });
+  dom.sessionDrawerList?.addEventListener('scroll', () => closeSessionRowMenu(), {
+    passive: true,
+    signal,
+  });
   renderSessionDrawer();
+}
+
+export function disposeSessionDrawer(): void {
+  drawerListenerController?.abort();
+  drawerListenerController = null;
+  closeSessionRowMenu();
+  callbacks = null;
 }
 
 export function toggleSessionDrawerExpanded(): void {
@@ -479,6 +714,7 @@ export function toggleSessionDrawerExpanded(): void {
 
 export function renderSessionDrawer(): void {
   applyDrawerChrome();
+  closeSessionRowMenu();
 
   if (!dom.sessionDrawerList) {
     return;
@@ -502,8 +738,45 @@ export function renderSessionDrawer(): void {
   }
 
   const nodes: HTMLElement[] = [];
-  nodes.push(createSectionHeader(tr('session.sectionSessions'), sessions.length));
-  nodes.push(...sessions.map(createSessionRow));
+  if (sessionSearchQuery) {
+    const matchingSessions = sessions.filter((session) =>
+      matchesSearch(session, sessionSearchQuery),
+    );
+    const matchingGroups = groups.filter((group) => matchesSearch(group, sessionSearchQuery));
+    if (matchingSessions.length === 0 && matchingGroups.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'session-drawer-empty session-drawer-search-empty';
+      empty.textContent = tr('session.noMatches');
+      dom.sessionDrawerList.replaceChildren(empty);
+      return;
+    }
+    if (matchingSessions.length > 0) {
+      nodes.push(createSectionHeader(tr('session.sectionSessions'), matchingSessions.length));
+      nodes.push(...matchingSessions.map(createSessionRow));
+    }
+    if (matchingGroups.length > 0) {
+      nodes.push(createSectionHeader(tr('session.sectionGroups'), matchingGroups.length));
+      nodes.push(...matchingGroups.map(createGroupRow));
+    }
+    dom.sessionDrawerList.replaceChildren(...nodes);
+    return;
+  }
+
+  if (sessions.length > 0) {
+    const { recent, earlier } = splitRecentSessions(sessions);
+    nodes.push(createSectionHeader(tr('session.sectionRecent'), recent.length));
+    nodes.push(...recent.map(createSessionRow));
+    if (earlier.length > 0) {
+      nodes.push(createEarlierSessionsHeader(earlier.length));
+      if (earlierSessionsExpanded) nodes.push(...earlier.map(createSessionRow));
+    }
+  } else {
+    nodes.push(createSectionHeader(tr('session.sectionSessions'), 0));
+    const empty = document.createElement('div');
+    empty.className = 'session-drawer-empty session-drawer-empty-compact';
+    empty.textContent = tr('session.noSessions');
+    nodes.push(empty);
+  }
   nodes.push(
     createSectionHeader(tr('session.sectionGroups'), groups.length, callbacks?.onCreateGroup),
   );

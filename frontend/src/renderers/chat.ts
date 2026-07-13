@@ -73,9 +73,13 @@ export function addMsg(cls, text, timestamp = undefined, options: { trackUnread?
     const content = document.createElement('div');
     content.className = 'msg-content';
     content.appendChild(el);
-    const time = document.createElement('div');
+    const timestampValue = timestamp === undefined ? Number.NaN : Number(timestamp);
+    const timestampDate = new Date(timestampValue * 1000);
+    const messageDate = Number.isFinite(timestampDate.getTime()) ? timestampDate : new Date();
+    const time = document.createElement('time');
     time.className = 'msg-time';
-    time.textContent = timestamp ? formatTime(new Date(timestamp * 1000)) : formatTime(new Date());
+    time.dateTime = messageDate.toISOString();
+    time.textContent = formatTime(messageDate);
     content.appendChild(time);
     row.appendChild(content);
   } else {

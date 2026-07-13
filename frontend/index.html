@@ -40,6 +40,14 @@
         <circle cx="12" cy="12" r="1" />
         <circle cx="19" cy="12" r="1" />
       </symbol>
+      <symbol id="icon-search" viewBox="0 0 24 24">
+        <circle cx="11" cy="11" r="7" />
+        <path d="m20 20-4-4" />
+      </symbol>
+      <symbol id="icon-copy" viewBox="0 0 24 24">
+        <rect x="8" y="8" width="11" height="11" rx="2" />
+        <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" />
+      </symbol>
       <symbol id="icon-todos" viewBox="0 0 24 24">
         <path d="m4 6 2 2 4-4M12 6h8M4 12l2 2 4-4M12 12h8M4 18l2 2 4-4M12 18h8" />
       </symbol>
@@ -203,6 +211,19 @@
             <h2 class="session-drawer-heading" data-i18n="session.drawerLabel">Sessions</h2>
             <span class="sidebar-live-dot" aria-hidden="true"></span>
           </div>
+          <label class="session-drawer-search" for="session-drawer-search-input">
+            <svg class="icon" aria-hidden="true"><use href="#icon-search"></use></svg>
+            <input
+              id="session-drawer-search-input"
+              type="search"
+              autocomplete="off"
+              spellcheck="false"
+              data-i18n-placeholder="session.searchPlaceholder"
+              data-i18n-aria-label="session.searchAria"
+              placeholder="Search sessions"
+              aria-label="Search sessions and groups"
+            />
+          </label>
           <div id="session-drawer-list" class="session-drawer-list" aria-live="polite"></div>
 
           <footer class="sidebar-footer">
@@ -462,6 +483,9 @@
             data-i18n-aria-label="composer.jumpLatest"
             aria-label="Jump to latest messages"
           >
+            <svg class="icon jump-to-latest-icon" aria-hidden="true">
+              <use href="#icon-chevron-down"></use>
+            </svg>
             <span class="jump-to-latest-label" data-i18n="composer.jumpBottom">Back to bottom</span>
             <span class="jump-to-latest-badge" id="jump-to-latest-badge" hidden></span>
           </button>
@@ -570,6 +594,13 @@
               aria-live="polite"
             >
               <span id="composer-availability-message">Checking model configuration...</span>
+              <button
+                id="composer-availability-action"
+                class="composer-availability-action"
+                type="button"
+                data-action="resolve-composer-availability"
+                hidden
+              ></button>
               <button
                 id="composer-availability-retry"
                 class="composer-availability-retry"

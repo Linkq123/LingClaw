@@ -36,6 +36,12 @@ export type ComposerModelAvailability =
   | 'config-unavailable'
   | 'ready';
 
+export type ComposerAvailabilityResolution =
+  | 'configure-models'
+  | 'configure-agent'
+  | 'choose-session-model'
+  | null;
+
 function normalizeConfigRevision(value: unknown): number | null {
   if (value === null || value === undefined || value === '') return null;
   const revision = typeof value === 'number' ? value : Number(value);
@@ -161,6 +167,32 @@ function placeholderKey(): string {
   }
 }
 
+export function composerAvailabilityResolution(): ComposerAvailabilityResolution {
+  switch (state.composerModelAvailability) {
+    case 'models-unconfigured':
+      return 'configure-models';
+    case 'agent-model-unconfigured':
+      return 'configure-agent';
+    case 'session-model-unconfigured':
+      return 'choose-session-model';
+    default:
+      return null;
+  }
+}
+
+function composerResolutionLabel(resolution: ComposerAvailabilityResolution): string {
+  switch (resolution) {
+    case 'configure-models':
+      return tr('composer.configureModels');
+    case 'configure-agent':
+      return tr('composer.configureAgent');
+    case 'choose-session-model':
+      return tr('composer.chooseSessionModel');
+    default:
+      return '';
+  }
+}
+
 export function isComposerModelReady(): boolean {
   return state.composerModelAvailability === 'ready';
 }
@@ -282,9 +314,22 @@ export function syncComposerAvailability(): void {
       message.textContent = canSubmit ? '' : tr(key, vars);
     }
   }
+  const resolution = key === placeholderKey() ? composerAvailabilityResolution() : null;
+  if (dom.composerAvailabilityAction) {
+    dom.composerAvailabilityAction.hidden = canSubmit || resolution === null;
+    dom.composerAvailabilityAction.textContent = composerResolutionLabel(resolution);
+  }
+  const retryVisible =
+    !canSubmit &&
+    key === 'composer.configUnavailable' &&
+    state.composerModelAvailability === 'config-unavailable';
   if (dom.composerAvailabilityRetry) {
-    dom.composerAvailabilityRetry.hidden =
-      canSubmit || state.composerModelAvailability !== 'config-unavailable';
+    dom.composerAvailabilityRetry.hidden = !retryVisible;
+  }
+  if (dom.composerAvailabilityStatus) {
+    dom.composerAvailabilityStatus.dataset.hasAction = String(
+      (!canSubmit && resolution !== null) || retryVisible,
+    );
   }
   const attachmentChangesBlocked = Boolean(
     state.sessionSwitchInFlight ||

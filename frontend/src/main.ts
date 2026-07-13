@@ -163,6 +163,7 @@ import {
   captureComposerSessionTransitionFallbackCapabilities,
   captureComposerSessionTransitionTargetCapabilitiesBaseline,
   completeComposerSessionTransition,
+  composerAvailabilityResolution,
   composerSessionPayloadMatchesTransition,
   getComposerConnectionGeneration,
   groupModelRosterMatches,
@@ -206,6 +207,7 @@ import {
   restorePendingPlanAction,
 } from './renderers/pending-plan.js';
 import {
+  disposeSessionDrawer,
   initSessionDrawer,
   renderSessionDrawer,
   toggleSessionDrawerExpanded,
@@ -2380,6 +2382,23 @@ const actionHandlers = {
   'load-earlier': () => loadEarlierMessages(),
   'execute-plan': (el) => executePendingPlan(el),
   'retry-composer-config': () => void refreshComposerAvailability(),
+  'resolve-composer-availability': () => {
+    const resolution = composerAvailabilityResolution();
+    if (resolution === 'configure-models') {
+      openSettingsPage(state.activeSessionId || 'main', 'tab-models');
+      return;
+    }
+    if (resolution === 'configure-agent') {
+      openSettingsPage(state.activeSessionId || 'main', 'tab-agents');
+      return;
+    }
+    if (resolution === 'choose-session-model' && dom.input) {
+      dom.input.value = '/model ';
+      dom.input.dispatchEvent(new Event('input', { bubbles: true }));
+      dom.input.focus();
+      dom.input.setSelectionRange(dom.input.value.length, dom.input.value.length);
+    }
+  },
   'open-tool-drawer': (el) => openToolDrawerFromHeader(el),
   'toggle-tool': (el) => toggleTool(el),
   'toggle-execution-stack': (el) => toggleExecutionStack(el),
@@ -2721,6 +2740,7 @@ if (import.meta.hot) {
       chatResizeObserver = null;
     }
     disposeTheme();
+    disposeSessionDrawer();
     unsubscribeLanguageChange();
     cancelReconnect();
     document.removeEventListener('click', handleDocumentClick);

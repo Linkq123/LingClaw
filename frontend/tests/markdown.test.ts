@@ -1,5 +1,6 @@
-import { afterEach, describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import {
+  decorateCodeBlocks,
   extractMath,
   findProgressiveSplitPoint,
   isSentenceSplitChar,
@@ -7,6 +8,7 @@ import {
   preloadMarkdownEngine,
   renderMarkdown,
 } from '../src/markdown.js';
+import { setLanguage, translateDom } from '../src/i18n.js';
 import { finishAssistantStream } from '../src/handlers/stream.js';
 import { state } from '../src/state.js';
 
@@ -14,6 +16,46 @@ afterEach(() => {
   state.currentMsg = null;
   state.pendingAssistantText = '';
   document.body.innerHTML = '';
+  setLanguage('en');
+  vi.restoreAllMocks();
+});
+
+describe('code block decoration', () => {
+  it('adds one localized toolbar and copies only the code text', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText },
+    });
+    const container = document.createElement('div');
+    container.innerHTML = '<pre><code class="language-typescript">const value = 1;</code></pre>';
+
+    decorateCodeBlocks(container);
+    decorateCodeBlocks(container);
+
+    expect(container.querySelectorAll('.code-toolbar')).toHaveLength(1);
+    expect(container.querySelector('.code-lang-label')?.textContent).toBe('typescript');
+    const button = container.querySelector<HTMLButtonElement>('.copy-btn');
+    expect(button?.getAttribute('aria-label')).toBe('Copy code');
+    button?.click();
+    await Promise.resolve();
+    expect(writeText).toHaveBeenCalledWith('const value = 1;');
+    expect(button?.textContent).toContain('Copied');
+  });
+
+  it('localizes code toolbar labels for Chinese', () => {
+    const container = document.createElement('div');
+    container.innerHTML = '<pre><code>echo ok</code></pre>';
+
+    decorateCodeBlocks(container);
+    setLanguage('zh-CN');
+    translateDom(container);
+
+    expect(container.querySelector('.code-lang-label')?.textContent).toBe('代码');
+    const button = container.querySelector('.copy-btn');
+    expect(button?.textContent).toContain('复制代码');
+    expect(button?.getAttribute('aria-label')).toBe('复制代码');
+  });
 });
 
 describe('extractMath', () => {

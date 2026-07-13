@@ -118,8 +118,15 @@ describe('group sessions', () => {
       '[data-session-action="switch-group"]',
     );
     groupSwitchButton?.click();
-    groupRow?.querySelector<HTMLButtonElement>('[data-session-action="rename"]')?.click();
-    groupRow?.querySelector<HTMLButtonElement>('[data-session-action="delete"]')?.click();
+    const menuTrigger = groupRow?.querySelector<HTMLButtonElement>('[data-session-action="menu"]');
+    menuTrigger?.click();
+    stateModule.dom.sessionDrawer
+      ?.querySelector<HTMLButtonElement>('[role="menu"] [data-session-action="rename"]')
+      ?.click();
+    menuTrigger?.click();
+    stateModule.dom.sessionDrawer
+      ?.querySelector<HTMLButtonElement>('[role="menu"] [data-session-action="delete"]')
+      ?.click();
     stateModule.dom.sessionDrawerList
       ?.querySelector<HTMLButtonElement>('.session-drawer-section-action')
       ?.click();

@@ -49,9 +49,11 @@ let _close: (() => void) | null = null;
 // component can honour it as soon as its mount effect runs.
 let pendingOpen = false;
 let pendingSessionId = 'main';
+let pendingSection: SettingsSection = 'tab-general';
 
-export function openSettingsPage(sessionId?: string): void {
+export function openSettingsPage(sessionId?: string, initialSection?: SettingsSection): void {
   pendingSessionId = sessionId?.trim() || 'main';
+  pendingSection = initialSection || 'tab-general';
   if (_open) _open();
   else pendingOpen = true;
 }
@@ -141,7 +143,14 @@ const THINKING_FORMAT_OPTIONS: readonly string[] = [
   'ollama-gpt-oss',
 ];
 
-type TabId = 'tab-general' | 'tab-skills' | 'tab-agents' | 'tab-models' | 'tab-mcp' | 'tab-s3';
+export type SettingsSection =
+  | 'tab-general'
+  | 'tab-skills'
+  | 'tab-agents'
+  | 'tab-models'
+  | 'tab-mcp'
+  | 'tab-s3';
+type TabId = SettingsSection;
 type StatusType = 'idle' | 'loading' | 'success' | 'error';
 type TabSaveMode = 'config' | 'skills';
 
@@ -577,50 +586,42 @@ function AgentsTab({
   );
 
   return (
-    <div className="settings-group">
+    <div className="settings-group settings-agent-defaults">
       <div className="settings-group-title">{tr('settings.agentDefaults')}</div>
-      <p style={{ fontSize: 12, color: 'var(--dim)', marginBottom: 12 }}>
-        {tr('settings.agentDefaultsHelp')}
-      </p>
-      <p style={{ fontSize: 12, color: 'var(--dim)', marginBottom: 12 }}>
-        {tr('settings.subAgentOrder')}
-      </p>
-      <SettingsRow label={tr('settings.switchAllModels')}>
-        <select
-          value=""
-          aria-label={tr('settings.switchAllModels')}
-          disabled={allModels.length === 0}
-          onChange={(event) => setAllModels(event.target.value)}
-        >
-          <option value="">{tr('settings.switchAllModelsPlaceholder')}</option>
-          {allModels.map((option) => (
-            <option key={option} value={option}>
-              {option}
-            </option>
-          ))}
-        </select>
-      </SettingsRow>
-      {AGENT_ROLES.map(({ key, label }) => (
-        <AgentRoleRow
-          key={key}
-          roleKey={key}
-          label={label}
-          value={(model as Record<string, string | undefined>)[key]}
-          options={allModels}
-          onSetModel={setModel}
-        />
-      ))}
-      <div
-        style={{
-          marginTop: 18,
-          paddingTop: 14,
-          borderTop: '1px solid var(--border)',
-          display: 'grid',
-          gap: 10,
-        }}
-      >
-        <div style={{ fontSize: 12, fontWeight: 600 }}>{tr('settings.perSubAgentOverrides')}</div>
-        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+      <p className="settings-help-text">{tr('settings.agentDefaultsHelp')}</p>
+      <p className="settings-help-text">{tr('settings.subAgentOrder')}</p>
+      <div className="agent-model-bulk">
+        <SettingsRow label={tr('settings.switchAllModels')}>
+          <select
+            value=""
+            aria-label={tr('settings.switchAllModels')}
+            disabled={allModels.length === 0}
+            onChange={(event) => setAllModels(event.target.value)}
+          >
+            <option value="">{tr('settings.switchAllModelsPlaceholder')}</option>
+            {allModels.map((option) => (
+              <option key={option} value={option}>
+                {option}
+              </option>
+            ))}
+          </select>
+        </SettingsRow>
+      </div>
+      <div className="agent-role-grid">
+        {AGENT_ROLES.map(({ key, label }) => (
+          <AgentRoleRow
+            key={key}
+            roleKey={key}
+            label={label}
+            value={(model as Record<string, string | undefined>)[key]}
+            options={allModels}
+            onSetModel={setModel}
+          />
+        ))}
+      </div>
+      <section className="agent-overrides">
+        <div className="agent-overrides-title">{tr('settings.perSubAgentOverrides')}</div>
+        <div className="agent-overrides-add">
           <select
             value={selectedAgentName}
             onChange={(e) => setSelectedAgentName(e.target.value)}
@@ -646,12 +647,10 @@ function AgentsTab({
           </button>
         </div>
         {!defaultNewSubAgentModel && (
-          <div style={{ fontSize: 12, color: 'var(--dim)' }}>{tr('settings.addModelFirst')}</div>
+          <div className="settings-help-text">{tr('settings.addModelFirst')}</div>
         )}
         {subAgentOverrides.length === 0 ? (
-          <div style={{ fontSize: 12, color: 'var(--dim)' }}>
-            {tr('settings.noSubAgentOverrides')}
-          </div>
+          <div className="settings-help-text">{tr('settings.noSubAgentOverrides')}</div>
         ) : (
           subAgentOverrides.map(({ key, agentName, value }) => {
             const discovered = discoveredAgentByName.get(agentName);
@@ -659,25 +658,9 @@ function AgentsTab({
               ? `${agentName} (${discovered.source})`
               : `${agentName} (${tr('settings.notDiscovered')})`;
             return (
-              <div
-                key={key}
-                style={{
-                  display: 'grid',
-                  gap: 6,
-                  padding: '8px 0',
-                  borderTop: '1px solid var(--border)',
-                }}
-              >
-                <div
-                  style={{
-                    display: 'flex',
-                    gap: 8,
-                    alignItems: 'center',
-                    justifyContent: 'space-between',
-                    flexWrap: 'wrap',
-                  }}
-                >
-                  <div style={{ fontSize: 12, color: 'var(--dim)' }}>{label}</div>
+              <div key={key} className="agent-override-row">
+                <div className="agent-override-header">
+                  <div className="agent-override-name">{label}</div>
                   <button
                     className="btn-danger-sm"
                     title={tr('settings.removeOverride', { agent: agentName })}
@@ -698,12 +681,27 @@ function AgentsTab({
             );
           })
         )}
-      </div>
+      </section>
     </div>
   );
 }
 
 // ── Models Tab ────────────────────────────────────────────────────────────────
+
+function localizedTestLabel(
+  testState: 'idle' | 'testing' | 'ok' | 'fail',
+  fallbackLabel: string,
+): string {
+  if (testState === 'idle') return tr('settings.test');
+  if (testState === 'testing') return tr('settings.testing');
+  if (testState === 'fail') {
+    return fallbackLabel === 'Error' ? tr('common.error') : tr('common.failed');
+  }
+  if (fallbackLabel === 'Connected') return tr('settings.connected');
+  const toolsMatch = /^(\d+)\s+tools$/i.exec(fallbackLabel);
+  if (toolsMatch) return tr('settings.toolsCount', { count: toolsMatch[1] });
+  return fallbackLabel;
+}
 
 function ModelEntryRow({
   model,
@@ -729,39 +727,23 @@ function ModelEntryRow({
   };
 
   return (
-    <div
-      className="model-entry-form"
-      style={{
-        border: '1px solid var(--border)',
-        borderRadius: 6,
-        padding: 8,
-        marginBottom: 6,
-        background: 'var(--bg)',
-      }}
-    >
-      <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+    <div className="model-entry-form">
+      <div className="model-entry-main">
         <input
+          className="model-entry-id"
           type="text"
           value={model.id || ''}
           placeholder="model-id"
-          style={{ flex: 1, minWidth: 120 }}
+          aria-label={tr('settings.field.modelId')}
           onChange={(e) => onChange({ ...model, id: e.target.value })}
         />
-        <label
-          style={{
-            fontSize: 11,
-            display: 'flex',
-            alignItems: 'center',
-            gap: 3,
-            color: 'var(--dim)',
-          }}
-        >
+        <label className="model-entry-toggle">
           <input
             type="checkbox"
             checked={!!model.reasoning}
             onChange={(e) => onChange({ ...model, reasoning: e.target.checked || undefined })}
           />{' '}
-          Reasoning
+          {tr('settings.field.reasoning')}
         </label>
         <button
           className="btn-danger-sm"
@@ -774,59 +756,33 @@ function ModelEntryRow({
           </svg>
         </button>
       </div>
-      <div
-        style={{ display: 'flex', gap: 8, marginTop: 6, flexWrap: 'wrap', alignItems: 'center' }}
-      >
-        <label
-          style={{
-            fontSize: 11,
-            color: 'var(--dim)',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 4,
-          }}
-        >
-          Context Window
+      <div className="model-entry-meta">
+        <label className="model-entry-field">
+          {tr('settings.field.contextWindow')}
           <input
+            className="model-entry-number"
             type="number"
             value={model.contextWindow ?? ''}
             placeholder="128000"
-            style={{ width: 90 }}
             onChange={(e) => onChange({ ...model, contextWindow: numInputToValue(e.target.value) })}
           />
         </label>
-        <label
-          style={{
-            fontSize: 11,
-            color: 'var(--dim)',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 4,
-          }}
-        >
-          Max Tokens
+        <label className="model-entry-field">
+          {tr('settings.field.maxTokens')}
           <input
+            className="model-entry-number"
             type="number"
             value={model.maxTokens ?? ''}
             placeholder="16384"
-            style={{ width: 90 }}
             onChange={(e) => onChange({ ...model, maxTokens: numInputToValue(e.target.value) })}
           />
         </label>
-        <label
-          style={{
-            fontSize: 11,
-            color: 'var(--dim)',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 4,
-          }}
-        >
+        <label className="model-entry-field model-entry-thinking-field">
           {tr('settings.thinkingFormat')}
           <select
+            className="model-entry-thinking"
             aria-label={tr('settings.thinkingFormat')}
             value={thinkingFormat}
-            style={{ width: 150 }}
             onChange={(e) => onChange(updateModelThinkingFormat(model, e.target.value))}
           >
             <option value="">{tr('settings.thinkingFormatDefault')}</option>
@@ -842,32 +798,23 @@ function ModelEntryRow({
             ))}
           </select>
         </label>
-        <span
-          style={{
-            fontSize: 11,
-            color: 'var(--dim)',
-            display: 'flex',
-            alignItems: 'center',
-            gap: 6,
-            marginLeft: 4,
-          }}
-        >
-          Input:
-          <label style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+        <span className="model-entry-inputs">
+          {tr('settings.field.input')}:
+          <label>
             <input
               type="checkbox"
               checked={hasText}
               onChange={(e) => setInput(e.target.checked, hasImage)}
             />{' '}
-            Text
+            {tr('settings.field.text')}
           </label>
-          <label style={{ display: 'flex', alignItems: 'center', gap: 2 }}>
+          <label>
             <input
               type="checkbox"
               checked={hasImage}
               onChange={(e) => setInput(hasText, e.target.checked)}
             />{' '}
-            Image
+            {tr('settings.field.image')}
           </label>
         </span>
       </div>
@@ -910,23 +857,17 @@ function ProviderCardInner({
         : prov.testState === 'testing'
           ? 'btn-test testing'
           : 'btn-test';
+  const testLabel = localizedTestLabel(prov.testState, prov.testLabel);
 
   return (
     <div className="provider-card" data-provider-name={prov.name}>
       <div className="provider-card-header">
         <span className="provider-card-name">{prov.name}</span>
-        <div
-          style={{
-            display: 'flex',
-            gap: 6,
-            alignItems: 'center',
-            flexWrap: 'wrap',
-            justifyContent: 'flex-end',
-          }}
-        >
+        <div className="provider-card-actions">
           {prov.models.length > 0 && (
             <select
               value={prov.selectedTestModel}
+              aria-label={tr('settings.testModel')}
               style={{ maxWidth: 190, padding: '5px 8px' }}
               onChange={(e) => onChange({ ...prov, selectedTestModel: e.target.value })}
             >
@@ -941,7 +882,7 @@ function ProviderCardInner({
             </select>
           )}
           <button className={testBtnClass} onClick={() => onTest(prov, prov.selectedTestModel)}>
-            {prov.testLabel}
+            {testLabel}
           </button>
           <button
             className="btn-danger-sm"
@@ -955,7 +896,7 @@ function ProviderCardInner({
           </button>
         </div>
       </div>
-      <div className="provider-form" style={{ display: 'grid', gap: 8, marginTop: 8 }}>
+      <div className="provider-form">
         <SettingsRow label={tr('settings.field.apiType')}>
           <select value={prov.api} onChange={(e) => onChange({ ...prov, api: e.target.value })}>
             <option value="openai-completions">OpenAI Completions</option>
@@ -981,10 +922,8 @@ function ProviderCardInner({
           />
         </SettingsRow>
       </div>
-      <div style={{ marginTop: 10 }}>
-        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 6, color: 'var(--fg)' }}>
-          Models
-        </div>
+      <div className="provider-models">
+        <div className="provider-models-title">{tr('settings.field.models')}</div>
         {prov.models.map((m, i) => (
           <ModelEntryRow
             key={m._key}
@@ -1372,6 +1311,7 @@ function McpServerCardInner({
         : server.testState === 'testing'
           ? 'btn-test testing'
           : 'btn-test';
+  const testLabel = localizedTestLabel(server.testState, server.testLabel);
 
   return (
     <div className="provider-card" data-mcp-name={server.name}>
@@ -1392,10 +1332,10 @@ function McpServerCardInner({
               checked={server.enabled !== false}
               onChange={(e) => onChange({ ...server, enabled: e.target.checked })}
             />{' '}
-            Enabled
+            {tr('common.enabled')}
           </label>
           <button className={testBtnClass} onClick={() => onTest(server)}>
-            {server.testLabel}
+            {testLabel}
           </button>
           <button
             className="btn-danger-sm"
@@ -2856,6 +2796,20 @@ function SettingsShell({
             <h2>{tr('settings.title')}</h2>
             <p>{tr('settings.subtitle')}</p>
           </div>
+          <label className="settings-mobile-section-picker">
+            <span>{tr('settings.sectionPicker')}</span>
+            <select
+              value={activeTab}
+              disabled={corrupt}
+              onChange={(event) => changeTab(event.target.value as TabId)}
+            >
+              {tabs.map((tab) => (
+                <option key={tab.id} value={tab.id}>
+                  {tab.label}
+                </option>
+              ))}
+            </select>
+          </label>
           <div id="settings-tabs" className="page-tabs settings-nav" role="tablist">
             {tabs.map((tab) => (
               <button
@@ -2895,7 +2849,7 @@ function SettingsShell({
               <p>{corrupt ? tr('settings.configErrorSubtitle') : activeMeta.description}</p>
             </div>
             <div className="settings-topbar-actions">
-              <span className={statusClass} id="settings-status">
+              <span className={statusClass} id="settings-status" title={status.message}>
                 {status.message}
               </span>
               <button
@@ -3060,6 +3014,7 @@ export function SettingsPage() {
         return;
       }
       setSettingsSessionId(nextSessionId);
+      setActiveTab(pendingSection);
       if (!hasUnsavedChangesRef.current) setShowDiscardConfirm(false);
       setVisible(true);
     };
@@ -3068,6 +3023,7 @@ export function SettingsPage() {
     if (pendingOpen) {
       pendingOpen = false;
       setSettingsSessionId(pendingSessionId || 'main');
+      setActiveTab(pendingSection);
       setShowDiscardConfirm(false);
       setVisible(true);
     }

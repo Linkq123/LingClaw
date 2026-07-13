@@ -90,13 +90,16 @@ Frontend source lives in `frontend/` and builds into `static/`, which the Rust s
 - `frontend/src/icons.ts` — typed names and helpers for the local inline SVG sprite
 - `frontend/src/mobile.ts` — workspace popovers, transient mobile navigation, and responsive shell state
 - `frontend/src/composerAvailability.ts` — model/Agent configuration gate for composer availability, including server-validated effective Session/Group state, sanitized model-catalog classification, revision ordering/reconnect handshakes, retry/focus state, transition handling, and localized disabled states; model-independent slash commands may bypass the gate, but `/new` must not because it can call the compression model
-- `frontend/src/css/workspace.css` — final design tokens and modern workspace/responsive overrides
+- `frontend/src/css/workspace.css` — shared design tokens and cross-surface workspace shell rules
+- `frontend/src/css/layout.css` — session navigation, workspace header, and composer layout
+- `frontend/src/css/chat.css` — message rows, Markdown typography, code toolbar, and system notices
+- `frontend/src/css/pages.css` — Settings and Usage page-specific layout and surfaces
 - `frontend/src/renderers/` — chat, todos, tools, reasoning, subagent, orchestration, task-plan, and auto-trace panels
 - `frontend/src/renderers/execution-stack.ts` — groups one top-level Agent run's reasoning, tools, task plan, sub-agents, and orchestration into a single accessible live/complete activity stack; renderers must mount top-level process panels through this layer rather than creating independent timeline cards
 - `frontend/src/renderers/group-chat.ts` — renders Group speaker metadata separately from Markdown message content and maps protocol mentions to display names without changing persisted content
 - `frontend/src/renderers/todos.ts` — session-level todos panel and `/api/todos` persistence flow
 - `frontend/src/handlers/stream.ts` — streamed assistant/reasoning text handling
-- `frontend/src/pages/SettingsPage.tsx` and `frontend/src/pages/UsagePage.tsx` — React islands
+- `frontend/src/pages/SettingsPage.tsx` and `frontend/src/pages/UsagePage.tsx` — React islands; `openSettingsPage(sessionId?, initialSection?)` may open a targeted Settings category without discarding unsaved in-page state
 - `frontend/src/markdown.ts` and `frontend/src/highlighter.ts` — markdown/KaTeX pipeline and the size-bounded syntax-highlighting language set
 - `frontend/tests/` — Vitest coverage for frontend behavior
 
@@ -122,7 +125,10 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 - `session_control.delete_session` must keep the `/delete` safety model: never delete `main`, an active connected session, or a session with active/queued delegated work; successful deletion removes both persisted JSON and the default workspace directory.
 - `session_control.dispatch` is for controlling other sessions and must reject `main` as a target, including trimmed/normalized variants, so the main run never waits on a queued run behind itself.
 - OpenAI family currently has two protocol kinds: `openai-completions` (`/v1/chat/completions`) and `openai-responses` (`/v1/responses`). Both conversation paths use native upstream streaming; Responses requests set `stream: true` and map Responses SSE events into LingClaw's existing live events.
-- The frontend session switcher lives in a collapsible desktop sidebar. At `<=768px` it becomes a transient overlay drawer that defaults closed and must not change the persisted desktop expansion preference. Todos, Tools, Reasoning, and Auto Debug live in the view-controls popover.
+- The frontend session switcher lives in a collapsible desktop sidebar. Its recent section contains at most 12 rows total while forcing Main and the current Session to remain visible; remaining Sessions live in a collapsed earlier section. Local search must cover all Session/Group names and IDs without changing persisted data. Row rename/delete actions live in one keyboard-accessible menu. At `<=768px` the sidebar becomes a transient overlay drawer that defaults closed and must not change the persisted desktop expansion preference. Todos, Tools, Reasoning, and Auto Debug live in the view-controls popover.
+- Composer model-readiness errors must keep their localized placeholder and neutral disabled send state while exposing the narrowest recovery action: open Models, open Agents, prefill `/model `, or retry configuration loading. `openSettingsPage` accepts the target category for these entry points.
+- Settings uses its sidebar tablist on desktop and one category select on mobile; both controls share the same React form state so breakpoint changes and category switches never discard unsaved edits. Usage renders two summary cards only when usage exists and scopes empty states independently to role, daily, and provider data.
+- Repeated Markdown decoration must be idempotent. Each code block gets at most one local-SVG toolbar, and its copy action must read only the contained `code` text. Message timestamps use semantic `<time>` nodes and remain visible on touch devices.
 - Frontend action and status icons must use the inline SVG sprite in `frontend/index.html` through typed helpers from `frontend/src/icons.ts`; keep SVGs decorative with accessible labels on their controls, and do not introduce Emoji or Unicode glyphs as UI icons.
 - Top-level process UI uses one execution stack per Agent run. It may span multiple ReAct cycles, auto-collapses only when the user has not manually toggled it, filters Tool/Reasoning steps through the existing view state, and must not fabricate duration for history records that do not provide one.
 - Execution stacks are direct children of the scrollable flex chat column and must remain non-shrinking; long expanded details use the stack body as the single bounded scroll container rather than nesting scroll areas inside Reasoning/Sub-agent/Orchestration bodies.

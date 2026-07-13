@@ -6,6 +6,8 @@ import {
 } from './constants.js';
 import { escHtml, fallbackCopy, scheduleBackgroundTask, isAsciiDigit } from './utils.js';
 import { scrollDown, invalidateChatScrollCache } from './scroll.js';
+import { tr } from './i18n.js';
+import { createIcon } from './icons.js';
 
 type MarkdownDeps = {
   hljs: typeof import('./highlighter.js').default;
@@ -597,32 +599,51 @@ export function renderMathPlaceholders(html, mathBlocks, katexRenderer) {
 
 export function decorateCodeBlocks(container) {
   container.querySelectorAll('pre').forEach((pre) => {
+    if (pre.querySelector(':scope > .code-toolbar')) return;
     pre.style.position = 'relative';
     const codeEl = pre.querySelector('code');
-    if (codeEl) {
-      const cls = [...codeEl.classList].find((c) => c.startsWith('language-'));
-      if (cls) {
-        const label = document.createElement('span');
-        label.className = 'code-lang-label';
-        label.textContent = cls.replace('language-', '');
-        pre.appendChild(label);
-      }
+    const cls = codeEl ? [...codeEl.classList].find((c) => c.startsWith('language-')) : undefined;
+    const toolbar = document.createElement('div');
+    toolbar.className = 'code-toolbar';
+    const label = document.createElement('span');
+    label.className = 'code-lang-label';
+    if (cls) {
+      label.textContent = cls.replace('language-', '');
+    } else {
+      label.dataset.i18n = 'markdown.code';
+      label.textContent = tr('markdown.code');
     }
+    toolbar.appendChild(label);
     const btn = document.createElement('button');
+    btn.type = 'button';
     btn.className = 'copy-btn';
-    btn.textContent = '复制';
+    btn.dataset.i18nAriaLabel = 'markdown.copyCode';
+    btn.setAttribute('aria-label', tr('markdown.copyCode'));
+    btn.appendChild(createIcon('copy'));
+    const buttonLabel = document.createElement('span');
+    buttonLabel.dataset.i18n = 'markdown.copyCode';
+    buttonLabel.textContent = tr('markdown.copyCode');
+    btn.appendChild(buttonLabel);
     btn.onclick = () => {
-      const code = pre.querySelector('code');
-      const text = code?.textContent || pre.textContent;
+      const text = codeEl?.textContent || '';
       if (navigator.clipboard) {
         navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
       } else {
         fallbackCopy(text);
       }
-      btn.textContent = '已复制';
-      setTimeout(() => (btn.textContent = '复制'), 1500);
+      buttonLabel.dataset.i18n = 'markdown.copied';
+      btn.dataset.i18nAriaLabel = 'markdown.copied';
+      buttonLabel.textContent = tr('markdown.copied');
+      btn.setAttribute('aria-label', tr('markdown.copied'));
+      setTimeout(() => {
+        buttonLabel.dataset.i18n = 'markdown.copyCode';
+        btn.dataset.i18nAriaLabel = 'markdown.copyCode';
+        buttonLabel.textContent = tr('markdown.copyCode');
+        btn.setAttribute('aria-label', tr('markdown.copyCode'));
+      }, 1500);
     };
-    pre.appendChild(btn);
+    toolbar.appendChild(btn);
+    pre.insertBefore(toolbar, pre.firstChild);
   });
 }
 

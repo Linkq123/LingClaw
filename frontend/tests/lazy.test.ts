@@ -125,6 +125,24 @@ describe('lazy page bridge', () => {
     }
   });
 
+  it('openSettingsPage forwards an initial settings section', async () => {
+    const settingsOpen = vi.fn();
+    const el = document.createElement('div');
+    el.id = 'settings-page';
+    document.body.appendChild(el);
+
+    try {
+      const { lazy } = await makeLazy({ settingsOpen });
+
+      lazy.openSettingsPage('research', 'tab-models');
+      await flush();
+
+      expect(settingsOpen).toHaveBeenCalledWith('research', 'tab-models');
+    } finally {
+      document.body.removeChild(el);
+    }
+  });
+
   it('openSettingsPage called multiple times mounts React root only once', async () => {
     const settingsOpen = vi.fn();
     const renderFn = vi.fn();

@@ -21,6 +21,7 @@ import { createRoot } from 'react-dom/client';
 
 type SettingsModule = typeof import('./SettingsPage.js');
 type UsageModule = typeof import('./UsagePage.js');
+export type SettingsSection = import('./SettingsPage.js').SettingsSection;
 
 // ── Chunk download ────────────────────────────────────────────────────────────
 // Kept separate from mounting so prefetch has no side effects.
@@ -97,12 +98,13 @@ let usageOpenGeneration = 0;
 
 // ── Public bridge ─────────────────────────────────────────────────────────────
 
-export function openSettingsPage(sessionId?: string): void {
+export function openSettingsPage(sessionId?: string, initialSection?: SettingsSection): void {
   const gen = ++settingsOpenGeneration;
   void loadSettings()
     .then((mod) => {
       if (settingsOpenGeneration !== gen) return; // cancelled by a later close or open
-      mod.openSettingsPage(sessionId);
+      if (initialSection === undefined) mod.openSettingsPage(sessionId);
+      else mod.openSettingsPage(sessionId, initialSection);
     })
     .catch(() => {
       // Chunk load failed (e.g. network error). The user's click had no effect;

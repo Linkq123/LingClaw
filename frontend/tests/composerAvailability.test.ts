@@ -8,6 +8,7 @@ import {
   acceptComposerSocketModelPayloadRevision,
   beginComposerSessionTransition,
   beginComposerRevisionHandshake,
+  composerAvailabilityResolution,
   composerSessionPayloadMatchesTransition,
   getComposerConnectionGeneration,
   groupModelRosterMatches,
@@ -31,6 +32,7 @@ describe('composer model availability', () => {
       <button id="stop"></button>
       <p id="composer-availability-status">
         <span id="composer-availability-message"></span>
+        <button id="composer-availability-action"></button>
         <button id="composer-availability-retry"></button>
       </p>
     `;
@@ -208,6 +210,9 @@ describe('composer model availability', () => {
       'Configure a model in Settings before sending a message.',
     );
     expect(dom.composerAvailabilityStatus?.hidden).toBe(false);
+    expect(dom.composerAvailabilityAction?.hidden).toBe(false);
+    expect(dom.composerAvailabilityAction?.textContent).toBe('Configure models');
+    expect(composerAvailabilityResolution()).toBe('configure-models');
 
     setLanguage('zh-CN');
     applyComposerConfig({
@@ -215,6 +220,8 @@ describe('composer model availability', () => {
     });
     expect(dom.sendBtn?.disabled).toBe(true);
     expect(dom.input?.placeholder).toBe('Agent 模型未配置，请先在设置中指定主模型。');
+    expect(dom.composerAvailabilityAction?.textContent).toBe('配置代理模型');
+    expect(composerAvailabilityResolution()).toBe('configure-agent');
   });
 
   it('enables sending only after both models and the primary Agent model are configured', () => {
@@ -229,6 +236,7 @@ describe('composer model availability', () => {
     expect(dom.sendBtn?.disabled).toBe(false);
     expect(dom.input?.placeholder).toContain('Message LingClaw');
     expect(dom.composerAvailabilityStatus?.hidden).toBe(true);
+    expect(dom.composerAvailabilityAction?.hidden).toBe(true);
   });
 
   it('keeps sending disabled while config cannot be loaded', async () => {
@@ -359,6 +367,8 @@ describe('composer model availability', () => {
 
     expect(state.composerModelAvailability).toBe('session-model-unconfigured');
     expect(dom.input?.placeholder).toContain('current Session model is no longer available');
+    expect(dom.composerAvailabilityAction?.textContent).toBe('Choose model');
+    expect(composerAvailabilityResolution()).toBe('choose-session-model');
 
     setComposerExplicitPrimaryModelConfigured(true);
     expect(state.composerModelAvailability).toBe('session-model-unconfigured');
@@ -368,6 +378,7 @@ describe('composer model availability', () => {
     expect(dom.input?.placeholder).toBe(
       '当前 Session 的模型已不可用，请使用 /model 选择其他模型。',
     );
+    expect(dom.composerAvailabilityAction?.textContent).toBe('选择模型');
   });
 
   it('makes a config-only newer revision stale until the matching Session status arrives', () => {
