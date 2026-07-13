@@ -83,7 +83,7 @@ export function renderPendingPlanAction(plan: PlanReadyPayload | null | undefine
   button.dataset.planId = plan.plan_id;
   button.textContent = '开始执行';
   button.disabled = !canExecutePendingPlan();
-  if (button.disabled) button.setAttribute('aria-describedby', 'composer-availability-status');
+  if (button.disabled) button.setAttribute('aria-describedby', 'composer-availability-detail');
   action.appendChild(button);
   const time = content.querySelector('.msg-time');
   if (time) {

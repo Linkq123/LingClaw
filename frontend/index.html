@@ -553,7 +553,7 @@
                 rows="1"
                 role="combobox"
                 aria-label="Message input"
-                aria-describedby="composer-availability-status"
+                aria-describedby="composer-availability-detail"
                 aria-autocomplete="list"
                 aria-controls="slash-command-menu"
                 aria-expanded="false"
@@ -579,7 +579,7 @@
                 id="send"
                 data-i18n-aria-label="composer.send"
                 aria-label="Send message"
-                aria-describedby="composer-availability-status"
+                aria-describedby="composer-availability-detail"
                 disabled
               >
                 <span id="send-icon"
@@ -587,12 +587,10 @@
                 ></span>
               </button>
             </div>
-            <p
-              id="composer-availability-status"
-              class="composer-availability-status"
-              role="status"
-              aria-live="polite"
-            >
+            <p id="composer-availability-status" class="composer-availability-status" hidden>
+              <svg class="icon composer-availability-icon" aria-hidden="true">
+                <use href="#icon-info"></use>
+              </svg>
               <span id="composer-availability-message">Checking model configuration...</span>
               <button
                 id="composer-availability-action"
@@ -612,6 +610,14 @@
                 Retry
               </button>
             </p>
+            <span
+              id="composer-availability-detail"
+              class="visually-hidden"
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              >Checking model configuration...</span
+            >
           </div>
         </div>
 

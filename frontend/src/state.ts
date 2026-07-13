@@ -96,6 +96,9 @@ export interface AppState {
   groupRunStatuses: Map<string, { status: string; updatedAt: number }>;
   groupRunSessions: Map<string, string>;
   groupMembersDrawerOpen: boolean;
+  groupTargetPickerOpen: boolean;
+  groupTargetSearchQuery: string;
+  groupMemberMenuId: string;
   groupTargetMode: 'all' | 'selected' | 'mentions';
   groupSelectedTargets: string[];
   pendingDeleteSessionId: string;
@@ -208,6 +211,9 @@ export const state: AppState = {
   groupRunStatuses: new Map(),
   groupRunSessions: new Map(),
   groupMembersDrawerOpen: false,
+  groupTargetPickerOpen: false,
+  groupTargetSearchQuery: '',
+  groupMemberMenuId: '',
   groupTargetMode: 'all',
   groupSelectedTargets: [],
   pendingDeleteSessionId: '',

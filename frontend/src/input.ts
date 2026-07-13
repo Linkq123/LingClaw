@@ -16,6 +16,7 @@ import {
   filterGroupMentionMembers,
   findGroupMentionQuery,
   insertGroupMention,
+  mentionedGroupTargets,
   type GroupMentionMember,
   type GroupMentionQuery,
 } from './groupMentions.js';
@@ -450,6 +451,13 @@ export function send() {
         : [];
     if (targetMode === 'selected' && targets.length === 0) {
       addSystem(tr('group.selectMember'));
+      return;
+    }
+    if (
+      targetMode === 'mentions' &&
+      mentionedGroupTargets(text, state.activeGroupMembers).length === 0
+    ) {
+      addSystem(tr('group.mentionRequired'));
       return;
     }
     if (!areGroupMessageTargetsModelReady(text)) return;

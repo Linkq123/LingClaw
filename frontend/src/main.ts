@@ -6,6 +6,7 @@ import './css/layout.css';
 import './css/chat.css';
 import './css/panels.css';
 import './css/pages.css';
+import './css/action-dialog.css';
 import './css/responsive.css';
 import './css/workspace.css';
 
@@ -60,6 +61,7 @@ import {
   groupMemberName,
   refreshGroupMessages,
   renderGroupMessage,
+  syncGroupEmptyState,
 } from './renderers/group-chat.js';
 import { insertGroupMention as replaceGroupMentionQuery } from './groupMentions.js';
 import {
@@ -155,6 +157,14 @@ import {
   prefetchPageChunks,
 } from './pages/lazy.js';
 import { closeOverlayById, matchesOverlayDismissTarget } from './pages/overlay.js';
+import {
+  dismissActionDialog,
+  hasOpenActionDialog,
+  openActionDialog,
+  refreshActionDialog,
+  type ActionDialogRequest,
+  type ActionDialogSessionOption,
+} from './actionDialog.js';
 import {
   CONFIG_SAVED_EVENT,
   acceptComposerHttpModelPayloadRevision,
@@ -329,6 +339,7 @@ function refreshLocalizedUi() {
   renderTodosPanel();
   renderReactStatus();
   refreshExecutionStacks();
+  refreshActionDialog();
   if (state.activeToolPanel) {
     syncToolDrawer(state.activeToolPanel);
   }
@@ -508,13 +519,30 @@ function normalizeGroupMemberDetails(
   return out;
 }
 
+let groupMemberDrawerReturnTarget: HTMLElement | null = null;
+let groupMemberDrawerReturnSelector = '';
+
+function rememberGroupMemberDrawerTrigger(trigger: HTMLElement | null): void {
+  groupMemberDrawerReturnTarget = trigger;
+  groupMemberDrawerReturnSelector = trigger?.classList.contains('group-members-toggle')
+    ? '.group-members-toggle'
+    : trigger?.dataset.action === 'open-group-members'
+      ? '[data-action="open-group-members"]'
+      : '';
+}
+
 function resetGroupTargetControls() {
   state.activeGroupMembers = [];
   state.activeGroupMemberDetails = [];
   state.activeGroupPendingVotes = [];
   state.groupMembersDrawerOpen = false;
+  state.groupTargetPickerOpen = false;
+  state.groupTargetSearchQuery = '';
+  state.groupMemberMenuId = '';
   state.groupTargetMode = 'all';
   state.groupSelectedTargets = [];
+  groupMemberDrawerReturnTarget = null;
+  groupMemberDrawerReturnSelector = '';
   resetComposerGroupModelConfiguration();
   renderGroupTargetControls();
   renderGroupMemberDrawer();
@@ -558,8 +586,8 @@ function setActiveGroupMembers(
   state.activeGroupMemberDetails = normalizeGroupMemberDetails(memberDetails, normalized);
   state.activeGroupPendingVotes = normalizeGroupVotes(pendingVotes, normalizeGroupMembers);
   state.groupSelectedTargets = state.groupSelectedTargets.filter((target) => memberSet.has(target));
-  if (state.groupTargetMode === 'selected' && state.groupSelectedTargets.length === 0) {
-    state.groupSelectedTargets = [...normalized];
+  if (state.groupMemberMenuId && !memberSet.has(state.groupMemberMenuId)) {
+    state.groupMemberMenuId = '';
   }
   renderGroupTargetControls();
   renderGroupMemberDrawer();
@@ -572,9 +600,18 @@ function selectGroupTargetMode(mode: 'all' | 'selected' | 'mentions') {
   if (mode === 'selected' && state.groupSelectedTargets.length === 0) {
     state.groupSelectedTargets = [...state.activeGroupMembers];
   }
+  state.groupTargetPickerOpen = mode === 'selected';
+  state.groupTargetSearchQuery = '';
   renderGroupTargetControls();
   syncComposerAvailability();
   syncToolDrawerBounds();
+  queueMicrotask(() => {
+    if (mode === 'selected') {
+      document.querySelector<HTMLInputElement>('.group-target-picker-search input')?.focus();
+    } else {
+      document.querySelector<HTMLElement>(`.group-target-mode[data-mode="${mode}"]`)?.focus();
+    }
+  });
 }
 
 function toggleSelectedGroupTarget(memberId: string) {
@@ -589,6 +626,13 @@ function toggleSelectedGroupTarget(memberId: string) {
   renderGroupTargetControls();
   syncComposerAvailability();
   syncToolDrawerBounds();
+  queueMicrotask(() => {
+    document
+      .querySelector<HTMLElement>(
+        `.group-target-picker-option[data-target-id="${CSS.escape(memberId)}"] input`,
+      )
+      ?.focus();
+  });
 }
 
 function insertGroupMentionAtSelection(sessionId: string) {
@@ -611,9 +655,152 @@ function insertGroupMentionAtSelection(sessionId: string) {
   dom.input.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
-function toggleGroupMemberDrawer() {
-  state.groupMembersDrawerOpen = !state.groupMembersDrawerOpen;
+function closeGroupTargetPicker(restoreFocus = false): boolean {
+  if (!state.groupTargetPickerOpen) return false;
+  state.groupTargetPickerOpen = false;
+  renderGroupTargetControls();
+  if (restoreFocus) {
+    queueMicrotask(() =>
+      document.querySelector<HTMLElement>('.group-target-selection-toggle')?.focus(),
+    );
+  }
+  return true;
+}
+
+function closeGroupMemberMenu(restoreFocus = false): boolean {
+  const memberId = state.groupMemberMenuId;
+  if (!memberId) return false;
+  state.groupMemberMenuId = '';
   renderGroupMemberDrawer();
+  if (restoreFocus) {
+    queueMicrotask(() => {
+      document
+        .querySelector<HTMLElement>(
+          `.group-member-menu-trigger[data-session-id="${CSS.escape(memberId)}"]`,
+        )
+        ?.focus();
+    });
+  }
+  return true;
+}
+
+function closeGroupMemberDrawer(restoreFocus = false): void {
+  const returnTarget = groupMemberDrawerReturnTarget;
+  const returnSelector = groupMemberDrawerReturnSelector;
+  groupMemberDrawerReturnTarget = null;
+  groupMemberDrawerReturnSelector = '';
+  state.groupMembersDrawerOpen = false;
+  state.groupMemberMenuId = '';
+  renderGroupMemberDrawer();
+  renderGroupTargetControls();
+  if (restoreFocus) {
+    queueMicrotask(() => {
+      const target = returnTarget?.isConnected
+        ? returnTarget
+        : returnSelector
+          ? document.querySelector<HTMLElement>(returnSelector)
+          : null;
+      (target || document.querySelector<HTMLElement>('.group-members-toggle, #input'))?.focus();
+    });
+  }
+}
+
+function openGroupMemberDrawer(trigger: HTMLElement | null = null): void {
+  rememberGroupMemberDrawerTrigger(
+    trigger || (document.activeElement instanceof HTMLElement ? document.activeElement : null),
+  );
+  state.groupMembersDrawerOpen = true;
+  state.groupMemberMenuId = '';
+  closeGroupTargetPicker();
+  renderGroupMemberDrawer();
+  renderGroupTargetControls();
+  queueMicrotask(() =>
+    document.querySelector<HTMLElement>('#group-member-drawer .group-member-drawer-close')?.focus(),
+  );
+}
+
+function toggleGroupMemberDrawer(trigger: HTMLElement | null = null) {
+  if (state.groupMembersDrawerOpen) {
+    if (trigger) rememberGroupMemberDrawerTrigger(trigger);
+    closeGroupMemberDrawer(true);
+    return;
+  }
+  openGroupMemberDrawer(trigger);
+}
+
+function groupTargetPickerMembers(): GroupMemberDetail[] {
+  const details = new Map(state.activeGroupMemberDetails.map((detail) => [detail.id, detail]));
+  return state.activeGroupMembers.map(
+    (id) => details.get(id) || { id, name: groupMemberName(id), role: 'member' },
+  );
+}
+
+function renderGroupTargetPickerList(list: HTMLElement): void {
+  list.replaceChildren();
+  const query = state.groupTargetSearchQuery.trim().toLocaleLowerCase();
+  const members = groupTargetPickerMembers().filter((member) =>
+    `${member.name}\n${member.id}`.toLocaleLowerCase().includes(query),
+  );
+  if (members.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'group-target-picker-empty';
+    empty.textContent = tr('group.noMemberMatches');
+    list.appendChild(empty);
+    return;
+  }
+  const selected = new Set(state.groupSelectedTargets);
+  for (const member of members) {
+    const option = document.createElement('label');
+    option.className = 'group-target-picker-option';
+    option.dataset.targetId = member.id;
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.checked = selected.has(member.id);
+    checkbox.addEventListener('change', () => toggleSelectedGroupTarget(member.id));
+    const copy = document.createElement('span');
+    const name = document.createElement('strong');
+    name.textContent = member.name || member.id;
+    const meta = document.createElement('small');
+    meta.textContent = member.id;
+    copy.append(name, meta);
+    const model = document.createElement('span');
+    model.className = 'group-target-picker-model';
+    const configured = state.groupModelConfiguredMembers.has(member.id);
+    model.classList.toggle('is-missing', !configured);
+    model.textContent = tr(configured ? 'group.modelReady' : 'group.modelMissing');
+    option.append(checkbox, copy, model);
+    list.appendChild(option);
+  }
+}
+
+function renderGroupTargetPicker(): HTMLElement {
+  const popover = document.createElement('div');
+  popover.className = 'group-target-picker';
+  popover.id = 'group-target-picker';
+  popover.setAttribute('role', 'dialog');
+  popover.setAttribute('aria-label', tr('group.selectTargets'));
+
+  const searchWrap = document.createElement('label');
+  searchWrap.className = 'group-target-picker-search';
+  searchWrap.appendChild(createIcon('search'));
+  const search = document.createElement('input');
+  search.type = 'search';
+  search.autocomplete = 'off';
+  search.placeholder = tr('group.searchMembers');
+  search.setAttribute('aria-label', tr('group.searchMembers'));
+  search.value = state.groupTargetSearchQuery;
+  searchWrap.appendChild(search);
+
+  const list = document.createElement('div');
+  list.className = 'group-target-picker-list';
+  search.addEventListener('input', () => {
+    state.groupTargetSearchQuery = search.value;
+    renderGroupTargetPickerList(list);
+  });
+  renderGroupTargetPickerList(list);
+
+  popover.append(searchWrap, list);
+  return popover;
 }
 
 function renderGroupTargetControls() {
@@ -626,13 +813,20 @@ function renderGroupTargetControls() {
   }
   bar.hidden = false;
 
+  const primary = document.createElement('div');
+  primary.className = 'group-target-primary';
   const memberButton = document.createElement('button');
   memberButton.type = 'button';
   memberButton.className = 'group-members-toggle';
-  memberButton.textContent = tr('common.members', { count: state.activeGroupMembers.length });
+  memberButton.append(
+    createIcon('users'),
+    document.createTextNode(tr('common.members', { count: state.activeGroupMembers.length })),
+  );
   memberButton.setAttribute('aria-expanded', String(state.groupMembersDrawerOpen));
-  memberButton.addEventListener('click', toggleGroupMemberDrawer);
-  bar.appendChild(memberButton);
+  memberButton.setAttribute('aria-controls', 'group-member-drawer');
+  memberButton.setAttribute('aria-haspopup', 'dialog');
+  memberButton.addEventListener('click', () => toggleGroupMemberDrawer(memberButton));
+  primary.appendChild(memberButton);
 
   const modes = [
     { id: 'all' as const, label: tr('common.all') },
@@ -654,25 +848,69 @@ function renderGroupTargetControls() {
     button.addEventListener('click', () => selectGroupTargetMode(mode.id));
     modeGroup.appendChild(button);
   }
-  bar.appendChild(modeGroup);
+  primary.appendChild(modeGroup);
+  bar.appendChild(primary);
 
-  if (state.groupTargetMode !== 'selected') return;
-
-  const chips = document.createElement('div');
-  chips.className = 'group-target-members';
-  const selected = new Set(state.groupSelectedTargets);
-  for (const member of state.activeGroupMembers) {
-    const chip = document.createElement('button');
-    chip.type = 'button';
-    chip.className = 'group-target-member';
-    chip.classList.toggle('is-active', selected.has(member));
-    chip.setAttribute('aria-pressed', selected.has(member) ? 'true' : 'false');
-    chip.textContent = groupMemberName(member);
-    chip.title = member;
-    chip.addEventListener('click', () => toggleSelectedGroupTarget(member));
-    chips.appendChild(chip);
+  if (state.groupTargetMode === 'selected') {
+    const selection = document.createElement('div');
+    selection.className = 'group-target-selection';
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'group-target-selection-toggle';
+    toggle.append(
+      createIcon('users'),
+      document.createTextNode(
+        tr('group.selectedCount', { count: state.groupSelectedTargets.length }),
+      ),
+      createIcon('chevron-down'),
+    );
+    toggle.setAttribute('aria-expanded', String(state.groupTargetPickerOpen));
+    toggle.setAttribute('aria-controls', 'group-target-picker');
+    toggle.setAttribute('aria-haspopup', 'dialog');
+    toggle.addEventListener('click', () => {
+      const willOpen = !state.groupTargetPickerOpen;
+      state.groupTargetPickerOpen = willOpen;
+      renderGroupTargetControls();
+      queueMicrotask(() =>
+        document
+          .querySelector<HTMLElement>(
+            willOpen ? '.group-target-picker-search input' : '.group-target-selection-toggle',
+          )
+          ?.focus(),
+      );
+    });
+    selection.appendChild(toggle);
+    if (state.groupTargetPickerOpen) selection.appendChild(renderGroupTargetPicker());
+    bar.appendChild(selection);
+  } else if (state.groupTargetMode === 'mentions') {
+    const hint = document.createElement('p');
+    hint.className = 'group-target-hint';
+    hint.textContent = tr('group.mentionsHint');
+    bar.appendChild(hint);
   }
-  bar.appendChild(chips);
+
+  const modelStateKnown =
+    state.composerModelAvailability !== 'checking' &&
+    state.composerModelAvailability !== 'config-unavailable' &&
+    state.composerGroupModelRevision === state.composerConfigRevision;
+  const missingModels = modelStateKnown
+    ? state.activeGroupMembers.filter((member) => !state.groupModelConfiguredMembers.has(member))
+    : [];
+  if (missingModels.length > 0) {
+    const warning = document.createElement('div');
+    warning.className = 'group-target-warning';
+    warning.appendChild(createIcon('alert-triangle'));
+    const label = document.createElement('span');
+    label.textContent = tr('group.membersNeedModels', {
+      targets: missingModels.map(groupMemberName).join(', '),
+    });
+    const action = document.createElement('button');
+    action.type = 'button';
+    action.dataset.action = 'open-group-agent-settings';
+    action.textContent = tr('composer.configureAgent');
+    warning.append(label, action);
+    bar.appendChild(warning);
+  }
 }
 
 function renderGroupMemberDrawer() {
@@ -685,31 +923,54 @@ function renderGroupMemberDrawer() {
     drawer = document.createElement('aside');
     drawer.id = 'group-member-drawer';
     drawer.className = 'group-member-drawer';
+    drawer.setAttribute('role', 'dialog');
     document.body.appendChild(drawer);
   }
   drawer.classList.toggle('is-open', state.groupMembersDrawerOpen);
   drawer.setAttribute('aria-hidden', state.groupMembersDrawerOpen ? 'false' : 'true');
-  // Skip the (expensive) DOM rebuild while the drawer is closed; it is rebuilt when
-  // reopened via toggleGroupMemberDrawer. This avoids an O(events x members) re-render
-  // storm when member status events stream in during an @all dispatch.
+  drawer.toggleAttribute('inert', !state.groupMembersDrawerOpen);
+  drawer.setAttribute('aria-label', tr('group.members'));
   if (!state.groupMembersDrawerOpen) return;
+  const focused = document.activeElement;
+  const focusedAction =
+    focused instanceof HTMLElement && drawer.contains(focused)
+      ? focused.dataset.groupMemberFocus || ''
+      : '';
+  const focusedSessionId =
+    focused instanceof HTMLElement
+      ? focused.closest<HTMLElement>('.group-member-row')?.dataset.sessionId || ''
+      : '';
 
   const header = document.createElement('div');
   header.className = 'group-member-drawer-header';
+  const heading = document.createElement('div');
   const title = document.createElement('div');
   title.className = 'group-member-drawer-title';
   title.textContent = tr('group.members');
+  const subtitle = document.createElement('div');
+  subtitle.className = 'group-member-drawer-subtitle';
+  subtitle.textContent = tr('group.membersSummary', { count: state.activeGroupMembers.length });
+  heading.append(title, subtitle);
+  const headerActions = document.createElement('div');
+  headerActions.className = 'group-member-drawer-header-actions';
+  const mentionAllButton = document.createElement('button');
+  mentionAllButton.type = 'button';
+  mentionAllButton.className = 'group-member-mention-all';
+  mentionAllButton.dataset.groupMemberFocus = 'mention-all';
+  mentionAllButton.textContent = tr('group.mentionAllAction');
+  mentionAllButton.addEventListener('click', () => {
+    insertGroupMentionAtSelection('all');
+    closeGroupMemberDrawer();
+  });
   const closeButton = document.createElement('button');
   closeButton.type = 'button';
   closeButton.className = 'group-member-drawer-close';
+  closeButton.dataset.groupMemberFocus = 'close';
   closeButton.appendChild(createIcon('close'));
   closeButton.setAttribute('aria-label', tr('group.closeMembers'));
-  closeButton.addEventListener('click', () => {
-    state.groupMembersDrawerOpen = false;
-    renderGroupMemberDrawer();
-    renderGroupTargetControls();
-  });
-  header.append(title, closeButton);
+  closeButton.addEventListener('click', () => closeGroupMemberDrawer(true));
+  headerActions.append(mentionAllButton, closeButton);
+  header.append(heading, headerActions);
 
   const list = document.createElement('div');
   list.className = 'group-member-list';
@@ -720,57 +981,117 @@ function renderGroupMemberDrawer() {
 
     const main = document.createElement('div');
     main.className = 'group-member-main';
+    const nameLine = document.createElement('div');
+    nameLine.className = 'group-member-name-line';
     const name = document.createElement('div');
     name.className = 'group-member-name';
     name.textContent = detail.name || detail.id;
+    const role = document.createElement('span');
+    role.className = `group-member-role group-member-role--${detail.role}`;
+    role.textContent = groupMemberRoleLabel(detail.role);
+    nameLine.append(name, role);
     const meta = document.createElement('div');
     meta.className = 'group-member-meta';
-    meta.textContent = tr('group.memberMeta', {
+    meta.textContent = tr('group.memberStatusMeta', {
       id: detail.id,
-      role: groupMemberRoleLabel(detail.role),
       status: groupMemberStatus(detail.id),
     });
-    main.append(name, meta);
+    main.append(nameLine, meta);
 
     const actions = document.createElement('div');
     actions.className = 'group-member-actions';
+    let rowMenu: HTMLElement | null = null;
     if (detail.id !== 'main') {
       const mentionButton = document.createElement('button');
       mentionButton.type = 'button';
-      mentionButton.className = 'group-member-action';
-      mentionButton.textContent = '@';
-      mentionButton.title = tr('group.mention', { name: detail.name || detail.id });
-      mentionButton.addEventListener('click', () => insertGroupMentionAtSelection(detail.id));
-      actions.appendChild(mentionButton);
+      mentionButton.className = 'group-member-action group-member-mention';
+      mentionButton.dataset.groupMemberFocus = 'mention';
+      mentionButton.append(createIcon('message'), document.createTextNode('@'));
+      mentionButton.setAttribute(
+        'aria-label',
+        tr('group.mention', { name: detail.name || detail.id }),
+      );
+      mentionButton.addEventListener('click', () => {
+        insertGroupMentionAtSelection(detail.id);
+        closeGroupMemberDrawer();
+      });
+      const menuTrigger = document.createElement('button');
+      menuTrigger.type = 'button';
+      menuTrigger.className = 'group-member-action group-member-menu-trigger';
+      menuTrigger.dataset.sessionId = detail.id;
+      menuTrigger.dataset.groupMemberFocus = 'menu';
+      menuTrigger.appendChild(createIcon('more'));
+      menuTrigger.setAttribute('aria-haspopup', 'menu');
+      menuTrigger.setAttribute('aria-expanded', String(state.groupMemberMenuId === detail.id));
+      menuTrigger.setAttribute(
+        'aria-label',
+        tr('group.moreActions', { name: detail.name || detail.id }),
+      );
+      menuTrigger.addEventListener('click', () => {
+        const willOpen = state.groupMemberMenuId !== detail.id;
+        state.groupMemberMenuId = willOpen ? detail.id : '';
+        renderGroupMemberDrawer();
+        queueMicrotask(() => {
+          const row = Array.from(document.querySelectorAll<HTMLElement>('.group-member-row')).find(
+            (candidate) => candidate.dataset.sessionId === detail.id,
+          );
+          row
+            ?.querySelector<HTMLElement>(
+              willOpen ? '.group-member-row-menu [role="menuitem"]' : '.group-member-menu-trigger',
+            )
+            ?.focus();
+        });
+      });
+      actions.append(mentionButton, menuTrigger);
 
-      if (detail.role === 'member') {
-        const promoteButton = document.createElement('button');
-        promoteButton.type = 'button';
-        promoteButton.className = 'group-member-action';
-        promoteButton.textContent = tr('common.admin');
-        promoteButton.title = tr('group.promote', { name: detail.name || detail.id });
-        promoteButton.addEventListener('click', () => void promoteGroupMember(detail.id));
-        actions.appendChild(promoteButton);
+      if (state.groupMemberMenuId === detail.id) {
+        const menu = document.createElement('div');
+        menu.className = 'group-member-row-menu';
+        menu.setAttribute('role', 'menu');
+        if (detail.role === 'member') {
+          const promoteButton = document.createElement('button');
+          promoteButton.type = 'button';
+          promoteButton.setAttribute('role', 'menuitem');
+          promoteButton.dataset.groupMemberFocus = 'promote';
+          promoteButton.append(
+            createIcon('user-node'),
+            document.createTextNode(tr('common.admin')),
+          );
+          promoteButton.addEventListener('click', () => {
+            state.groupMemberMenuId = '';
+            renderGroupMemberDrawer();
+            document
+              .querySelector<HTMLElement>(
+                `.group-member-menu-trigger[data-session-id="${CSS.escape(detail.id)}"]`,
+              )
+              ?.focus();
+            void promoteGroupMember(detail.id);
+          });
+          menu.appendChild(promoteButton);
+        }
+        const removeButton = document.createElement('button');
+        removeButton.type = 'button';
+        removeButton.className = 'danger';
+        removeButton.setAttribute('role', 'menuitem');
+        removeButton.dataset.groupMemberFocus = 'remove';
+        removeButton.append(createIcon('trash'), document.createTextNode(tr('common.remove')));
+        removeButton.addEventListener('click', () => {
+          state.groupMemberMenuId = '';
+          renderGroupMemberDrawer();
+          document
+            .querySelector<HTMLElement>(
+              `.group-member-menu-trigger[data-session-id="${CSS.escape(detail.id)}"]`,
+            )
+            ?.focus();
+          void removeGroupMember(detail.id);
+        });
+        menu.appendChild(removeButton);
+        rowMenu = menu;
       }
-
-      const removeButton = document.createElement('button');
-      removeButton.type = 'button';
-      removeButton.className = 'group-member-action danger';
-      removeButton.textContent = tr('common.remove');
-      removeButton.title = tr('group.remove', { name: detail.name || detail.id });
-      removeButton.addEventListener('click', () => void removeGroupMember(detail.id));
-      actions.appendChild(removeButton);
-    } else {
-      const mentionAllButton = document.createElement('button');
-      mentionAllButton.type = 'button';
-      mentionAllButton.className = 'group-member-action';
-      mentionAllButton.textContent = '@all';
-      mentionAllButton.title = tr('group.mentionAll');
-      mentionAllButton.addEventListener('click', () => insertGroupMentionAtSelection('all'));
-      actions.appendChild(mentionAllButton);
     }
 
     row.append(main, actions);
+    if (rowMenu) row.appendChild(rowMenu);
     list.appendChild(row);
   }
 
@@ -795,6 +1116,19 @@ function renderGroupMemberDrawer() {
   }
 
   drawer.replaceChildren(header, list, votes);
+  if (focusedAction) {
+    queueMicrotask(() => {
+      const scope = focusedSessionId
+        ? Array.from(drawer!.querySelectorAll<HTMLElement>('.group-member-row')).find(
+            (row) => row.dataset.sessionId === focusedSessionId,
+          )
+        : drawer!;
+      const target = scope?.querySelector<HTMLElement>(
+        `[data-group-member-focus="${focusedAction}"]`,
+      );
+      (target || drawer!.querySelector<HTMLElement>('.group-member-drawer-close'))?.focus();
+    });
+  }
 }
 
 async function refreshSessionsList() {
@@ -861,21 +1195,32 @@ function performSwitchToSession(nextSessionId: string) {
 function performSwitchToGroup(nextGroupId: string) {
   if (sessionIdentityActionBlocked()) return;
   beginComposerSessionTransition();
-  resetComposerGroupModelConfiguration();
   enterGroupControlSession();
   state.activeGroupId = nextGroupId;
   persistActiveGroupId(nextGroupId);
-  state.activeGroupMembers = [];
   clearGroupRunState();
-  state.groupTargetMode = 'all';
-  state.groupSelectedTargets = [];
-  renderGroupTargetControls();
+  resetGroupTargetControls();
   state.sessionSwitchInFlight = true;
   renderSessionDrawer();
   reconnectToActiveSession(handleMessage);
 }
 
 let sessionCreateInFlight = false;
+
+function editableGroupSessions(): ActionDialogSessionOption[] {
+  const sessions = new Map<string, ActionDialogSessionOption>();
+  for (const session of state.sessions) {
+    const id = String(session.id || '').trim();
+    if (!id || id === 'main' || session.corrupt || sessions.has(id)) continue;
+    sessions.set(id, { id, name: String(session.name || '').trim() || id });
+  }
+  return [...sessions.values()];
+}
+
+function openWorkspaceActionDialog(request: ActionDialogRequest) {
+  if (state.mobileNavigationOpen) closeMobileNavigation({ restoreFocus: true });
+  return openActionDialog(request);
+}
 
 async function createSession() {
   if (sessionCreateInFlight || sessionIdentityActionBlocked()) return;
@@ -916,50 +1261,43 @@ async function createSession() {
 
 async function createGroup() {
   if (sessionCreateInFlight || sessionIdentityActionBlocked()) return;
-  const rawName = window.prompt(tr('session.promptGroupName'), tr('session.defaultGroupName'));
-  const name = rawName?.trim();
-  if (!name) return;
-  const defaultMembers = state.sessions
-    .filter((session) => !session.corrupt && session.id !== 'main')
-    .map((session) => session.id)
-    .join(', ');
-  const rawMembers = window.prompt(tr('session.promptGroupMembers'), defaultMembers);
-  const members = (rawMembers || '')
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean);
-  sessionCreateInFlight = true;
-  state.sessionIdentityMutationInFlight = true;
-  renderSessionDrawer();
-  syncComposerAvailability();
-  updateAttachButton();
-  try {
-    const created = await requestCreateSessionGroup(name, members);
-    upsertGroupSummary(created);
-    enterGroupControlSession();
-    beginComposerSessionTransition();
-    state.sessionSwitchInFlight = true;
-    resetComposerGroupModelConfiguration();
-    state.activeGroupId = created.id;
-    persistActiveGroupId(created.id);
-    clearGroupRunState();
-    setActiveGroupMembers(members);
-    renderSessionDrawer();
-    reconnectToActiveSession(handleMessage);
-  } catch (error) {
-    addError(
-      tr('session.errorCreateGroup', {
-        error: error instanceof Error ? error.message : String(error),
-      }),
-    );
-    renderSessionDrawer();
-  } finally {
-    sessionCreateInFlight = false;
-    state.sessionIdentityMutationInFlight = false;
-    renderSessionDrawer();
-    syncComposerAvailability();
-    updateAttachButton();
-  }
+  const sessions = editableGroupSessions();
+  const selectedMembers = sessions.some((session) => session.id === state.activeSessionId)
+    ? [state.activeSessionId]
+    : [];
+  await openWorkspaceActionDialog({
+    kind: 'create-group',
+    initialName: tr('session.defaultGroupName'),
+    sessions,
+    selectedMembers,
+    submit: async ({ name, members }) => {
+      sessionCreateInFlight = true;
+      state.sessionIdentityMutationInFlight = true;
+      renderSessionDrawer();
+      syncComposerAvailability();
+      updateAttachButton();
+      try {
+        const created = await requestCreateSessionGroup(name, members);
+        upsertGroupSummary(created);
+        enterGroupControlSession();
+        beginComposerSessionTransition();
+        state.sessionSwitchInFlight = true;
+        resetComposerGroupModelConfiguration();
+        state.activeGroupId = created.id;
+        persistActiveGroupId(created.id);
+        clearGroupRunState();
+        setActiveGroupMembers(members);
+        renderSessionDrawer();
+        reconnectToActiveSession(handleMessage);
+      } finally {
+        sessionCreateInFlight = false;
+        state.sessionIdentityMutationInFlight = false;
+        renderSessionDrawer();
+        syncComposerAvailability();
+        updateAttachButton();
+      }
+    },
+  });
 }
 
 function deleteSession(sessionId: string) {
@@ -967,11 +1305,17 @@ function deleteSession(sessionId: string) {
   if (!targetSessionId || state.activeGroupId || sessionIdentityActionBlocked()) return;
   if (targetSessionId === 'main' || targetSessionId === state.activeSessionId) return;
   if (!targetSessionId) return;
-  const confirmed = window.confirm(tr('session.confirmDelete', { id: targetSessionId }));
-  if (!confirmed) return;
-  state.pendingDeleteSessionId = targetSessionId;
-  renderSessionDrawer();
-  sendCmd(`/delete ${targetSessionId}`);
+  const current = state.sessions.find((session) => session.id === targetSessionId);
+  void openWorkspaceActionDialog({
+    kind: 'delete-session',
+    entityId: targetSessionId,
+    entityName: current?.name || targetSessionId,
+    submit: () => {
+      state.pendingDeleteSessionId = targetSessionId;
+      renderSessionDrawer();
+      sendCmd(`/delete ${targetSessionId}`);
+    },
+  });
 }
 
 async function renameSession(sessionId: string) {
@@ -979,44 +1323,42 @@ async function renameSession(sessionId: string) {
   if (!targetSessionId || sessionIdentityActionBlocked()) return;
   const current = state.sessions.find((session) => session.id === targetSessionId);
   if (current?.corrupt) return;
-  const raw = window.prompt(tr('session.promptName'), current?.name || targetSessionId);
-  const nextName = raw?.trim();
-  if (!nextName || nextName === (current?.name || targetSessionId)) return;
-
-  try {
-    const response = await fetch(`/api/session?session=${encodeURIComponent(targetSessionId)}`, {
-      method: 'PUT',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ name: nextName }),
-    });
-    const payload = await response.json().catch(() => ({}));
-    if (!response.ok) {
-      throw new Error(String(payload?.error || `HTTP ${response.status}`));
-    }
-
-    const updated = payload?.session;
-    if (updated?.id) {
-      const updatedSession: SessionSummary = {
-        id: String(updated.id),
-        name: String(updated.name ?? updated.id),
-        updated_at:
-          typeof updated.updated_at === 'number'
-            ? updated.updated_at
-            : Number(updated.updated_at ?? 0),
-        corrupt: updated.corrupt === true,
-      };
-      upsertSessionSummary(updatedSession);
-      if (updatedSession.id === state.activeSessionId) {
-        dom.sessionNameEl.textContent = updatedSession.name || tr('common.main');
+  await openWorkspaceActionDialog({
+    kind: 'rename-session',
+    entityId: targetSessionId,
+    entityName: current?.name || targetSessionId,
+    submit: async (nextName) => {
+      if (nextName === (current?.name || targetSessionId)) return;
+      const response = await fetch(`/api/session?session=${encodeURIComponent(targetSessionId)}`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name: nextName }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(String(payload?.error || `HTTP ${response.status}`));
       }
-      renderSessionDrawer();
-    }
-    void refreshSessionsList();
-  } catch (error) {
-    addError(
-      tr('session.errorRename', { error: error instanceof Error ? error.message : String(error) }),
-    );
-  }
+
+      const updated = payload?.session;
+      if (updated?.id) {
+        const updatedSession: SessionSummary = {
+          id: String(updated.id),
+          name: String(updated.name ?? updated.id),
+          updated_at:
+            typeof updated.updated_at === 'number'
+              ? updated.updated_at
+              : Number(updated.updated_at ?? 0),
+          corrupt: updated.corrupt === true,
+        };
+        upsertSessionSummary(updatedSession);
+        if (updatedSession.id === state.activeSessionId) {
+          dom.sessionNameEl.textContent = updatedSession.name || tr('common.main');
+        }
+        renderSessionDrawer();
+      }
+      void refreshSessionsList();
+    },
+  });
 }
 
 async function renameGroup(groupId: string) {
@@ -1024,9 +1366,7 @@ async function renameGroup(groupId: string) {
   if (!targetGroupId || sessionIdentityActionBlocked()) return;
   const current = state.sessionGroups.find((group) => group.id === targetGroupId);
   if (current?.corrupt) return;
-  const rawName = window.prompt(tr('session.promptGroupName'), current?.name || targetGroupId);
-  const nextName = rawName?.trim();
-  if (!nextName) return;
+  if (state.mobileNavigationOpen) closeMobileNavigation({ restoreFocus: true });
   let existingMembers: string[] = [];
   try {
     existingMembers = (await requestGetSessionGroup(targetGroupId)).members;
@@ -1038,66 +1378,61 @@ async function renameGroup(groupId: string) {
     );
     return;
   }
-  const rawMembers = window.prompt(tr('session.promptGroupMembers'), existingMembers.join(', '));
-  if (rawMembers == null) return;
-  const members = (rawMembers || '')
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean);
-  try {
-    const updated = await requestUpdateSessionGroup(targetGroupId, nextName, members);
-    upsertGroupSummary(updated);
-    if (updated.id === state.activeGroupId) {
-      dom.sessionNameEl.textContent = updated.name || updated.id;
-      setActiveGroupMembers(members);
-    }
-    renderSessionDrawer();
-    void refreshGroupsList();
-  } catch (error) {
-    addError(
-      tr('session.errorUpdateGroup', {
-        error: error instanceof Error ? error.message : String(error),
-      }),
-    );
-  }
+  await openWorkspaceActionDialog({
+    kind: 'edit-group',
+    groupId: targetGroupId,
+    initialName: current?.name || targetGroupId,
+    sessions: editableGroupSessions(),
+    selectedMembers: existingMembers,
+    submit: async ({ name, members }) => {
+      const updated = await requestUpdateSessionGroup(targetGroupId, name, members);
+      upsertGroupSummary(updated);
+      if (updated.id === state.activeGroupId) {
+        dom.sessionNameEl.textContent = updated.name || updated.id;
+        setActiveGroupMembers(members);
+      }
+      renderSessionDrawer();
+      void refreshGroupsList();
+    },
+  });
 }
 
 async function deleteGroup(groupId: string) {
   const targetGroupId = String(groupId || '').trim();
   if (!targetGroupId || sessionIdentityActionBlocked()) return;
-  const confirmed = window.confirm(tr('session.confirmDeleteGroup', { id: targetGroupId }));
-  if (!confirmed) return;
-  const changesActiveIdentity = state.activeGroupId === targetGroupId;
-  if (changesActiveIdentity) {
-    state.sessionIdentityMutationInFlight = true;
-    renderSessionDrawer();
-    syncComposerAvailability();
-    updateAttachButton();
-  }
-  try {
-    await requestDeleteSessionGroup(targetGroupId);
-    state.sessionGroups = state.sessionGroups.filter((group) => group.id !== targetGroupId);
-    if (state.activeGroupId === targetGroupId) {
-      leaveActiveGroupForSession();
-      beginComposerSessionTransition(false, state.activeSessionId);
-      state.sessionSwitchInFlight = true;
-      reconnectToActiveSession(handleMessage);
-    }
-    renderSessionDrawer();
-  } catch (error) {
-    addError(
-      tr('session.errorDeleteGroup', {
-        error: error instanceof Error ? error.message : String(error),
-      }),
-    );
-  } finally {
-    if (changesActiveIdentity) {
-      state.sessionIdentityMutationInFlight = false;
-      renderSessionDrawer();
-      syncComposerAvailability();
-      updateAttachButton();
-    }
-  }
+  const current = state.sessionGroups.find((group) => group.id === targetGroupId);
+  await openWorkspaceActionDialog({
+    kind: 'delete-group',
+    entityId: targetGroupId,
+    entityName: current?.name || targetGroupId,
+    submit: async () => {
+      const changesActiveIdentity = state.activeGroupId === targetGroupId;
+      if (changesActiveIdentity) {
+        state.sessionIdentityMutationInFlight = true;
+        renderSessionDrawer();
+        syncComposerAvailability();
+        updateAttachButton();
+      }
+      try {
+        await requestDeleteSessionGroup(targetGroupId);
+        state.sessionGroups = state.sessionGroups.filter((group) => group.id !== targetGroupId);
+        if (state.activeGroupId === targetGroupId) {
+          leaveActiveGroupForSession();
+          beginComposerSessionTransition(false, state.activeSessionId);
+          state.sessionSwitchInFlight = true;
+          reconnectToActiveSession(handleMessage);
+        }
+        renderSessionDrawer();
+      } finally {
+        if (changesActiveIdentity) {
+          state.sessionIdentityMutationInFlight = false;
+          renderSessionDrawer();
+          syncComposerAvailability();
+          updateAttachButton();
+        }
+      }
+    },
+  });
 }
 
 function applyGroupDetail(detail: {
@@ -1159,7 +1494,12 @@ function applyGroupModelConfiguration(
     : state.composerExplicitPrimaryModelConfigured
       ? state.activeGroupMembers
       : detail.model_override_members;
-  return setGroupModelConfiguredMembers(configuredMembers, detail.configRevision);
+  const applied = setGroupModelConfiguredMembers(configuredMembers, detail.configRevision);
+  if (applied) {
+    renderGroupTargetControls();
+    if (dom.chat?.querySelector('.group-empty-state')) syncGroupEmptyState();
+  }
+  return applied;
 }
 
 let activeGroupModelRefreshInFlight = false;
@@ -1326,22 +1666,24 @@ async function promoteGroupMember(sessionId: string) {
 async function removeGroupMember(sessionId: string) {
   if (!state.activeGroupId || sessionId === 'main') return;
   const label = groupMemberName(sessionId);
-  const confirmed = window.confirm(tr('group.confirmRemove', { name: label }));
-  if (!confirmed) return;
-  try {
-    const detail = await requestRemoveSessionGroupMember(state.activeGroupId, sessionId);
-    if (detail) {
-      applyGroupDetail(detail);
-    } else {
-      state.activeGroupMembers = state.activeGroupMembers.filter((member) => member !== sessionId);
-      setActiveGroupMembers(state.activeGroupMembers);
-    }
-    void refreshGroupsList();
-  } catch (error) {
-    addError(
-      tr('group.errorRemove', { error: error instanceof Error ? error.message : String(error) }),
-    );
-  }
+  const groupId = state.activeGroupId;
+  await openWorkspaceActionDialog({
+    kind: 'remove-group-member',
+    entityId: sessionId,
+    entityName: label,
+    submit: async () => {
+      const detail = await requestRemoveSessionGroupMember(groupId, sessionId);
+      if (detail) {
+        applyGroupDetail(detail);
+      } else {
+        state.activeGroupMembers = state.activeGroupMembers.filter(
+          (member) => member !== sessionId,
+        );
+        setActiveGroupMembers(state.activeGroupMembers);
+      }
+      void refreshGroupsList();
+    },
+  });
 }
 
 function appendRoundUsage(messageEl, inputTokens, outputTokens, firstTokenMs = null) {
@@ -1669,11 +2011,12 @@ function renderGroupHistory(data): void {
     }
   }
   setBusy(state.activeGroupRunIds.size > 0);
+  syncGroupEmptyState();
   scrollDown(true);
 }
 
 function groupMemberRoleLabel(role: GroupMemberDetail['role']): string {
-  if (role === 'owner') return tr('common.main');
+  if (role === 'owner') return tr('common.owner');
   if (role === 'admin') return tr('common.admin');
   return tr('common.member');
 }
@@ -2382,6 +2725,13 @@ const actionHandlers = {
   'load-earlier': () => loadEarlierMessages(),
   'execute-plan': (el) => executePendingPlan(el),
   'retry-composer-config': () => void refreshComposerAvailability(),
+  'open-group-members': (el) => {
+    if (!state.activeGroupId) return;
+    openGroupMemberDrawer(el instanceof HTMLElement ? el : null);
+  },
+  'open-group-agent-settings': () => {
+    openSettingsPage(state.activeSessionId || 'main', 'tab-agents');
+  },
   'resolve-composer-availability': () => {
     const resolution = composerAvailabilityResolution();
     if (resolution === 'configure-models') {
@@ -2425,6 +2775,19 @@ function handleDocumentClick(e: MouseEvent) {
   const target = e.target;
   if (!(target instanceof Element)) return;
 
+  if (
+    state.groupTargetPickerOpen &&
+    !target.closest('.group-target-selection, .group-target-mode[data-mode="selected"]')
+  ) {
+    closeGroupTargetPicker();
+  }
+  if (
+    state.groupMemberMenuId &&
+    !target.closest('.group-member-row-menu, .group-member-menu-trigger')
+  ) {
+    closeGroupMemberMenu();
+  }
+
   const el = target.closest('[data-action]');
   if (!el) {
     // Click on overlay backdrop to close
@@ -2441,6 +2804,20 @@ function handleDocumentClick(e: MouseEvent) {
 }
 
 function handleDocumentKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape' && hasOpenActionDialog()) {
+    e.preventDefault();
+    dismissActionDialog();
+    return;
+  }
+  if (e.key === 'Escape' && (closeGroupTargetPicker(true) || closeGroupMemberMenu(true))) {
+    e.preventDefault();
+    return;
+  }
+  if (e.key === 'Escape' && state.groupMembersDrawerOpen) {
+    e.preventDefault();
+    closeGroupMemberDrawer(true);
+    return;
+  }
   if (e.key === 'Tab' && trapToolDrawerFocus(e)) {
     return;
   }

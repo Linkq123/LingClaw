@@ -1,4 +1,5 @@
 import { tr } from '../i18n.js';
+import { createIcon } from '../icons.js';
 import { decorateGroupMentions } from '../groupMentions.js';
 import { scheduleMarkdownRender } from '../markdown.js';
 import { dom, state } from '../state.js';
@@ -77,6 +78,7 @@ function syncGroupMessage(row: HTMLElement): void {
 
 export function renderGroupMessage(message: GroupMessage): HTMLElement | null {
   if (!dom.chat) return null;
+  dom.chat.querySelector('.group-empty-state')?.remove();
   const role = String(message?.role || 'system');
   const sessionId = String(message?.session_id || '');
   const rawContent = String(message?.content || '');
@@ -109,6 +111,68 @@ export function renderGroupMessage(message: GroupMessage): HTMLElement | null {
   return row;
 }
 
+function activeGroupName(): string {
+  const summary = state.sessionGroups.find((group) => group.id === state.activeGroupId);
+  return summary?.name || dom.sessionNameEl?.textContent?.trim() || tr('group.nameFallback');
+}
+
+export function syncGroupEmptyState(): void {
+  if (!dom.chat) return;
+  const existing = dom.chat.querySelector<HTMLElement>('.group-empty-state');
+  if (!state.activeGroupId || dom.chat.querySelector('.msg-row.group-message')) {
+    existing?.remove();
+    return;
+  }
+
+  const section = existing || document.createElement('section');
+  section.className = 'group-empty-state';
+  section.id = 'group-empty-state';
+  section.replaceChildren();
+
+  const mark = document.createElement('div');
+  mark.className = 'group-empty-mark';
+  mark.appendChild(createIcon('users'));
+  const title = document.createElement('h1');
+  title.textContent = tr('group.emptyTitle', { name: activeGroupName() });
+  const description = document.createElement('p');
+  description.textContent = tr('group.emptyDescription', {
+    count: state.activeGroupMembers.length,
+  });
+  const owner = document.createElement('div');
+  owner.className = 'group-empty-owner';
+  owner.append(createIcon('user-node'), document.createTextNode(tr('group.emptyOwner')));
+  const actions = document.createElement('div');
+  actions.className = 'group-empty-actions';
+  const members = document.createElement('button');
+  members.type = 'button';
+  members.dataset.action = 'open-group-members';
+  members.append(createIcon('users'), document.createTextNode(tr('group.manageMembers')));
+  actions.appendChild(members);
+
+  const modelStateKnown =
+    state.composerModelAvailability !== 'checking' &&
+    state.composerModelAvailability !== 'config-unavailable' &&
+    state.composerGroupModelRevision === state.composerConfigRevision;
+  const hasMissingModel =
+    modelStateKnown &&
+    state.activeGroupMembers.some((member) => !state.groupModelConfiguredMembers.has(member));
+  if (hasMissingModel) {
+    const configure = document.createElement('button');
+    configure.type = 'button';
+    configure.className = 'secondary';
+    configure.dataset.action = 'open-group-agent-settings';
+    configure.append(
+      createIcon('settings'),
+      document.createTextNode(tr('composer.configureAgent')),
+    );
+    actions.appendChild(configure);
+  }
+
+  section.append(mark, title, description, owner, actions);
+  if (!existing) dom.chat.appendChild(section);
+}
+
 export function refreshGroupMessages(): void {
   dom.chat?.querySelectorAll<HTMLElement>('.msg-row.group-message').forEach(syncGroupMessage);
+  if (dom.chat?.querySelector('.group-empty-state')) syncGroupEmptyState();
 }

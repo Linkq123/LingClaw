@@ -647,4 +647,109 @@ describe('main model payload ordering', () => {
     composerModule.completeComposerSessionTransition();
     stateModule.state.sessionSwitchInFlight = false;
   });
+
+  it('clears the previous Group member UI before reconnecting to another Group', async () => {
+    stateModule.state.activeSessionId = 'main';
+    stateModule.state.activeGroupId = 'old-group';
+    stateModule.state.activeGroupMembers = ['old-worker'];
+    stateModule.state.activeGroupMemberDetails = [
+      { id: 'main', name: 'Main', role: 'owner' },
+      { id: 'old-worker', name: 'Old worker', role: 'member' },
+    ];
+    stateModule.state.activeGroupPendingVotes = [
+      {
+        id: 'old-vote',
+        action: 'remove',
+        target_session_id: 'old-worker',
+        requester_session_id: 'main',
+        approvals: ['main'],
+        threshold: 1,
+        created_at: 1,
+        updated_at: 1,
+      },
+    ];
+    stateModule.state.groupMembersDrawerOpen = true;
+    stateModule.state.groupTargetPickerOpen = true;
+    stateModule.state.groupTargetSearchQuery = 'old';
+    stateModule.state.groupMemberMenuId = 'old-worker';
+    stateModule.state.groupTargetMode = 'selected';
+    stateModule.state.groupSelectedTargets = ['old-worker'];
+    stateModule.state.sessionSwitchInFlight = false;
+    stateModule.state.sessionIdentityMutationInFlight = false;
+    stateModule.state.composerSessionIdentityPending = false;
+    stateModule.state.composerSessionTransitionPending = false;
+    stateModule.state.imageUploadInFlight = false;
+    stateModule.state.sessionGroups = [{ id: 'next-group', name: 'Next Group' }];
+
+    const { renderSessionDrawer } = await import('../src/renderers/sessions.js');
+    renderSessionDrawer();
+    stateModule.dom.sessionDrawerList
+      ?.querySelector<HTMLButtonElement>(
+        '[data-group-id="next-group"] [data-session-action="switch-group"]',
+      )
+      ?.click();
+
+    expect(stateModule.state.activeGroupId).toBe('next-group');
+    expect(stateModule.state.activeGroupMembers).toEqual([]);
+    expect(stateModule.state.activeGroupMemberDetails).toEqual([]);
+    expect(stateModule.state.activeGroupPendingVotes).toEqual([]);
+    expect(stateModule.state.groupMembersDrawerOpen).toBe(false);
+    expect(stateModule.state.groupTargetPickerOpen).toBe(false);
+    expect(stateModule.state.groupTargetSearchQuery).toBe('');
+    expect(stateModule.state.groupMemberMenuId).toBe('');
+    expect(stateModule.state.groupTargetMode).toBe('all');
+    expect(stateModule.state.groupSelectedTargets).toEqual([]);
+    expect(stateModule.state.sessionSwitchInFlight).toBe(true);
+
+    const nextGroupSocket = FakeWebSocket.instances.at(-1)!;
+    nextGroupSocket.receive({
+      type: 'group',
+      id: 'next-group',
+      name: 'Next Group',
+      members: ['worker-a'],
+      member_details: [{ id: 'worker-a', name: 'Worker A', role: 'member' }],
+      pending_votes: [],
+      model_member_ids: ['worker-a'],
+      model_configured_members: ['worker-a'],
+      explicitPrimaryModelConfigured: false,
+      configRevision: stateModule.state.composerConfigRevision,
+    });
+
+    const selectedMode = stateModule.dom.groupTargetBar?.querySelector<HTMLButtonElement>(
+      '.group-target-mode[data-mode="selected"]',
+    );
+    selectedMode?.click();
+    await Promise.resolve();
+    expect(document.activeElement).toBe(
+      stateModule.dom.groupTargetBar?.querySelector('.group-target-picker-search input'),
+    );
+
+    stateModule.dom.groupTargetBar
+      ?.querySelector<HTMLButtonElement>('.group-target-selection-toggle')
+      ?.click();
+    await Promise.resolve();
+    expect(document.activeElement).toBe(
+      stateModule.dom.groupTargetBar?.querySelector('.group-target-selection-toggle'),
+    );
+
+    stateModule.dom.groupTargetBar
+      ?.querySelector<HTMLButtonElement>('.group-members-toggle')
+      ?.click();
+    await Promise.resolve();
+    expect(document.querySelector('.group-member-role--owner')?.textContent).toBe('Owner');
+
+    document
+      .querySelector<HTMLButtonElement>('.group-member-menu-trigger[data-session-id="worker-a"]')
+      ?.click();
+    await Promise.resolve();
+    expect(document.activeElement?.getAttribute('role')).toBe('menuitem');
+
+    document
+      .querySelector<HTMLButtonElement>('.group-member-menu-trigger[data-session-id="worker-a"]')
+      ?.click();
+    await Promise.resolve();
+    expect(document.activeElement).toBe(
+      document.querySelector('.group-member-menu-trigger[data-session-id="worker-a"]'),
+    );
+  });
 });

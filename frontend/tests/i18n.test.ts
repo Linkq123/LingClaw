@@ -25,6 +25,11 @@ describe('i18n', () => {
     expect(tr('welcome.ready')).toBe('输入消息，或使用 / 命令开始。');
     expect(tr('workspace.subtitle')).toBe('本地工作区');
     expect(tr('workspace.viewControls')).toBe('视图控制');
+    expect(tr('dialog.createGroupTitle')).toBe('新建群聊');
+    expect(tr('common.owner')).toBe('所有者');
+    expect(tr('group.mentionsHint')).toContain('@提及');
+    expect(tr('group.mentionRequired')).toContain('@');
+    expect(tr('composer.statusAgentModelUnconfigured')).toBe('Agent 模型未配置');
     expect(tr('settings.configChangedWhileLoading')).toBe('加载期间配置发生变化，请重试。');
     expect(document.documentElement.lang).toBe('zh-CN');
     expect(localStorage.getItem('lingclaw.language')).toBe('zh-CN');

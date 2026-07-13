@@ -451,9 +451,50 @@ describe('workspace shell', () => {
     );
   });
 
+  it('keeps Group target controls reachable and isolates the closed member drawer', () => {
+    expect(workspaceCss).toMatch(/\.group-target-picker \{[\s\S]*?bottom: calc\(100% \+ 49px\);/);
+    expect(workspaceCss).toMatch(
+      /@media \(max-width: 768px\)[\s\S]*?\.group-members-toggle,[\s\S]*?min-height: 44px;/,
+    );
+    expect(workspaceCss).toMatch(
+      /@media \(max-width: 768px\)[\s\S]*?\.group-target-picker \{[\s\S]*?position: absolute;[\s\S]*?bottom: calc\(100% \+ 64px\);/,
+    );
+    expect(mainSource).toContain(
+      '.group-target-selection, .group-target-mode[data-mode="selected"]',
+    );
+    expect(mainSource).toContain('.group-member-row-menu, .group-member-menu-trigger');
+    expect(mainSource).toContain("drawer.toggleAttribute('inert', !state.groupMembersDrawerOpen);");
+    expect(mainSource).not.toMatch(/window\.(?:prompt|confirm)\s*\(/);
+  });
+
   it('exposes composer suggestions through an accessible combobox contract', () => {
+    expect(indexHtml).toMatch(
+      /id="composer-availability-status"[^>]*class="composer-availability-status"[^>]*hidden/,
+    );
     expect(indexHtml).toMatch(
       /<textarea[\s\S]*?id="input"[\s\S]*?role="combobox"[\s\S]*?aria-autocomplete="list"[\s\S]*?aria-controls="slash-command-menu"[\s\S]*?aria-expanded="false"[\s\S]*?aria-haspopup="listbox"/,
     );
+  });
+
+  it('lets a top-level action dialog own the keyboard above mobile navigation', () => {
+    const trigger = document.getElementById('mobile-navigation-toggle') as HTMLButtonElement;
+    mobileModule.initMobileListeners();
+    mobileModule.openMobileNavigation(trigger);
+    const overlay = document.createElement('div');
+    overlay.className = 'action-dialog-overlay';
+    const input = document.createElement('input');
+    overlay.appendChild(input);
+    document.body.appendChild(overlay);
+    const actionDialogKeydown = vi.fn();
+    overlay.addEventListener('keydown', actionDialogKeydown);
+
+    input.dispatchEvent(
+      new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }),
+    );
+
+    expect(actionDialogKeydown).toHaveBeenCalledOnce();
+    expect(stateModule.state.mobileNavigationOpen).toBe(true);
+    overlay.remove();
+    mobileModule.closeMobileNavigation();
   });
 });

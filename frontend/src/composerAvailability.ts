@@ -193,6 +193,23 @@ function composerResolutionLabel(resolution: ComposerAvailabilityResolution): st
   }
 }
 
+function compactStatusKey(availability: ComposerModelAvailability): string {
+  switch (availability) {
+    case 'models-unconfigured':
+      return 'composer.statusModelsUnconfigured';
+    case 'agent-model-unconfigured':
+      return 'composer.statusAgentModelUnconfigured';
+    case 'session-model-unconfigured':
+      return 'composer.statusSessionModelUnconfigured';
+    case 'config-unavailable':
+      return 'composer.statusConfigUnavailable';
+    case 'checking':
+      return 'composer.statusChecking';
+    case 'ready':
+      return '';
+  }
+}
+
 export function isComposerModelReady(): boolean {
   return state.composerModelAvailability === 'ready';
 }
@@ -272,15 +289,19 @@ export function syncComposerAvailability(): void {
       ? 'composer.uploadInProgress'
       : identityChangeBlocked
         ? 'composer.sessionChangeInProgress'
-        : groupTargetsMissing
-          ? 'group.selectMember'
-          : state.activeGroupId && groupReady
-            ? state.busy
-              ? 'composer.placeholderBusy'
-              : 'composer.placeholder'
-            : missingGroupTargets.length > 0
-              ? 'composer.groupTargetsUnconfigured'
-              : placeholderKey();
+        : state.composerModelAvailability === 'config-unavailable'
+          ? placeholderKey()
+          : groupTargetsMissing
+            ? state.groupTargetMode === 'mentions'
+              ? 'group.mentionRequired'
+              : 'group.selectMember'
+            : state.activeGroupId && groupReady
+              ? state.busy
+                ? 'composer.placeholderBusy'
+                : 'composer.placeholder'
+              : missingGroupTargets.length > 0
+                ? 'composer.groupTargetsUnconfigured'
+                : placeholderKey();
   const vars =
     missingGroupTargets.length > 0
       ? {
@@ -301,34 +322,55 @@ export function syncComposerAvailability(): void {
     (groupReady || modelFreeSlashCommand);
   if (dom.input) {
     dom.input.dataset.i18nPlaceholder = key;
+    dom.input.dataset.availability = canSubmit ? 'ready' : state.composerModelAvailability;
     dom.input.placeholder = tr(key, vars);
   }
   if (dom.sendBtn) {
     dom.sendBtn.disabled = !canSubmit;
     dom.sendBtn.title = canSubmit ? '' : tr(key, vars);
   }
-  if (dom.composerAvailabilityStatus) {
-    dom.composerAvailabilityStatus.hidden = canSubmit;
-    const message = document.getElementById('composer-availability-message');
-    if (message) {
-      message.textContent = canSubmit ? '' : tr(key, vars);
-    }
-  }
   const resolution = key === placeholderKey() ? composerAvailabilityResolution() : null;
-  if (dom.composerAvailabilityAction) {
-    dom.composerAvailabilityAction.hidden = canSubmit || resolution === null;
-    dom.composerAvailabilityAction.textContent = composerResolutionLabel(resolution);
-  }
   const retryVisible =
     !canSubmit &&
     key === 'composer.configUnavailable' &&
     state.composerModelAvailability === 'config-unavailable';
+  const visibleStatus =
+    !canSubmit && ((!state.activeGroupId && resolution !== null) || retryVisible);
+  const fullReason = canSubmit ? '' : tr(key, vars);
+  const compactKey = compactStatusKey(state.composerModelAvailability);
+  const compactLabel = compactKey ? tr(compactKey) : '';
+  const activeElement = document.activeElement;
+  const returnFocusFromRecovery = Boolean(
+    (activeElement === dom.composerAvailabilityAction && (!visibleStatus || resolution === null)) ||
+    (activeElement === dom.composerAvailabilityRetry && (!visibleStatus || !retryVisible)),
+  );
+  if (dom.inputArea) {
+    dom.inputArea.classList.toggle('has-composer-unavailable', !canSubmit);
+    dom.inputArea.dataset.composerAvailability = canSubmit
+      ? 'ready'
+      : state.composerModelAvailability;
+  }
+  if (dom.composerAvailabilityStatus) {
+    dom.composerAvailabilityStatus.hidden = !visibleStatus;
+    dom.composerAvailabilityStatus.dataset.kind = state.composerModelAvailability;
+    const message = document.getElementById('composer-availability-message');
+    if (message) message.textContent = visibleStatus ? compactLabel : '';
+  }
+  const detail = document.getElementById('composer-availability-detail');
+  if (detail && detail.textContent !== fullReason) detail.textContent = fullReason;
+  if (dom.composerAvailabilityAction) {
+    dom.composerAvailabilityAction.hidden = !visibleStatus || resolution === null;
+    dom.composerAvailabilityAction.textContent = composerResolutionLabel(resolution);
+  }
   if (dom.composerAvailabilityRetry) {
-    dom.composerAvailabilityRetry.hidden = !retryVisible;
+    dom.composerAvailabilityRetry.hidden = !visibleStatus || !retryVisible;
+  }
+  if (returnFocusFromRecovery) {
+    queueMicrotask(() => dom.input?.focus());
   }
   if (dom.composerAvailabilityStatus) {
     dom.composerAvailabilityStatus.dataset.hasAction = String(
-      (!canSubmit && resolution !== null) || retryVisible,
+      visibleStatus && (resolution !== null || retryVisible),
     );
   }
   const attachmentChangesBlocked = Boolean(
@@ -368,7 +410,7 @@ export function syncComposerAvailability(): void {
     button.disabled = !canExecute || executing;
     button.title = canExecute ? '' : tr(key);
     if (canExecute) button.removeAttribute('aria-describedby');
-    else button.setAttribute('aria-describedby', 'composer-availability-status');
+    else button.setAttribute('aria-describedby', 'composer-availability-detail');
   });
 }
 

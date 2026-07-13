@@ -27,14 +27,17 @@ describe('composer model availability', () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     document.body.innerHTML = `
-      <textarea id="input"></textarea>
-      <button id="send"></button>
-      <button id="stop"></button>
-      <p id="composer-availability-status">
-        <span id="composer-availability-message"></span>
-        <button id="composer-availability-action"></button>
-        <button id="composer-availability-retry"></button>
-      </p>
+      <div id="input-area">
+        <textarea id="input"></textarea>
+        <button id="send"></button>
+        <button id="stop"></button>
+        <p id="composer-availability-status">
+          <span id="composer-availability-message"></span>
+          <button id="composer-availability-action"></button>
+          <button id="composer-availability-retry"></button>
+        </p>
+        <span id="composer-availability-detail"></span>
+      </div>
     `;
     initDomRefs();
     state.busy = false;
@@ -207,6 +210,9 @@ describe('composer model availability', () => {
     expect(dom.sendBtn?.disabled).toBe(true);
     expect(dom.input?.placeholder).toBe('Configure a model in Settings before sending a message.');
     expect(document.getElementById('composer-availability-message')?.textContent).toBe(
+      'Model not configured',
+    );
+    expect(document.getElementById('composer-availability-detail')?.textContent).toBe(
       'Configure a model in Settings before sending a message.',
     );
     expect(dom.composerAvailabilityStatus?.hidden).toBe(false);
@@ -220,6 +226,9 @@ describe('composer model availability', () => {
     });
     expect(dom.sendBtn?.disabled).toBe(true);
     expect(dom.input?.placeholder).toBe('Agent 模型未配置，请先在设置中指定主模型。');
+    expect(document.getElementById('composer-availability-message')?.textContent).toBe(
+      'Agent 模型未配置',
+    );
     expect(dom.composerAvailabilityAction?.textContent).toBe('配置代理模型');
     expect(composerAvailabilityResolution()).toBe('configure-agent');
   });
@@ -248,6 +257,21 @@ describe('composer model availability', () => {
     expect(state.composerModelAvailability).toBe('config-unavailable');
     expect(dom.sendBtn?.disabled).toBe(true);
     expect(dom.input?.placeholder).toContain('configuration is unavailable');
+    expect(dom.composerAvailabilityRetry?.hidden).toBe(false);
+  });
+
+  it('keeps the configuration Retry action visible in Group chat', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('offline')));
+    state.activeGroupId = 'review-group';
+    state.activeGroupMembers = ['worker-a'];
+
+    await refreshComposerAvailability();
+
+    expect(state.composerModelAvailability).toBe('config-unavailable');
+    expect(dom.composerAvailabilityStatus?.hidden).toBe(false);
+    expect(document.getElementById('composer-availability-message')?.textContent).toBe(
+      'Configuration unavailable',
+    );
     expect(dom.composerAvailabilityRetry?.hidden).toBe(false);
   });
 
@@ -622,7 +646,10 @@ describe('composer model availability', () => {
     dom.input!.value = '/new';
     syncComposerAvailability();
     expect(dom.sendBtn?.disabled).toBe(true);
-    expect(dom.composerAvailabilityStatus?.hidden).toBe(false);
+    expect(dom.composerAvailabilityStatus?.hidden).toBe(true);
+    expect(document.getElementById('composer-availability-detail')?.textContent).toContain(
+      'Checking',
+    );
 
     beginComposerSessionTransition(true, 'target');
     dom.input!.value = '/switch another-target';
@@ -676,6 +703,19 @@ describe('composer model availability', () => {
     await retry;
   });
 
+  it('returns focus when a visible recovery action disappears after configuration updates', async () => {
+    applyComposerConfig({});
+    dom.composerAvailabilityAction?.focus();
+    expect(document.activeElement).toBe(dom.composerAvailabilityAction);
+
+    state.composerModelAvailability = 'ready';
+    syncComposerAvailability();
+    await Promise.resolve();
+
+    expect(dom.composerAvailabilityAction?.hidden).toBe(true);
+    expect(document.activeElement).toBe(dom.input);
+  });
+
   it('matches backend mention punctuation and reflects Group target readiness', () => {
     applyComposerConfig({});
     state.activeGroupId = 'review-group';
@@ -700,7 +740,10 @@ describe('composer model availability', () => {
     syncComposerAvailability();
     expect(dom.sendBtn?.disabled).toBe(true);
     expect(dom.input?.placeholder).toContain('Worker B');
-    expect(dom.composerAvailabilityStatus?.textContent).toContain('Worker B');
+    expect(dom.composerAvailabilityStatus?.hidden).toBe(true);
+    expect(document.getElementById('composer-availability-detail')?.textContent).toContain(
+      'Worker B',
+    );
   });
 
   it('clears transition pending state when a Group model payload arrives', () => {
@@ -758,7 +801,7 @@ describe('composer model availability', () => {
     dom.input!.value = 'Please review this without a mention';
     syncComposerAvailability();
     expect(dom.sendBtn?.disabled).toBe(true);
-    expect(dom.input?.placeholder).toBe('Select at least one group member before sending.');
+    expect(dom.input?.placeholder).toBe('Mention at least one group member before sending.');
   });
 
   it('does not reuse Group member readiness during a socket handshake', () => {

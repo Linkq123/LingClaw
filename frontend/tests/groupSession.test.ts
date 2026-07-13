@@ -256,6 +256,7 @@ describe('group sessions', () => {
 
   it('sends group messages with selected and mentions target modes', async () => {
     document.body.innerHTML = `
+      <main id="chat"></main>
       <div id="input-area">
         <div id="group-target-bar"></div>
         <div id="slash-command-menu" hidden></div>
@@ -303,6 +304,13 @@ describe('group sessions', () => {
       start_runs: true,
       run_mode: 'execute',
     });
+
+    stateModule.dom.input!.value = 'check frontend without a mention';
+    send();
+    expect(sendMock).toHaveBeenCalledTimes(2);
+    expect(stateModule.dom.chat?.textContent).toContain(
+      'Mention at least one group member before sending.',
+    );
 
     stopAgent();
 

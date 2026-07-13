@@ -189,7 +189,13 @@ export function initMobileListeners(): void {
   document.addEventListener(
     'keydown',
     (event) => {
-      if (!state.mobileNavigationOpen || !isMobileViewport()) return;
+      if (
+        !state.mobileNavigationOpen ||
+        !isMobileViewport() ||
+        document.querySelector('.action-dialog-overlay')
+      ) {
+        return;
+      }
       if (event.key === 'Escape') {
         event.preventDefault();
         event.stopPropagation();
