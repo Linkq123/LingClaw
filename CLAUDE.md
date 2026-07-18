@@ -160,8 +160,13 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 
 ## Documentation worth reading before larger changes
 
-- `README.md` — product overview, architecture narrative, config examples, command behavior
+- `README.md` / `README.en.md` — concise, user-first product landing pages; keep the two languages behaviorally aligned and do not move exhaustive config, commands, structs, or protocol tables back into them
+- `docs/user-guide.md` / `docs/user-guide.en.md` — Session/Group behavior, commands, tools, Skills, Sub-agents, memory, and images
+- `docs/configuration.md` / `docs/configuration.en.md` — Providers, models, Agent routing, MCP, S3, environment variables, and config reload/validation semantics
+- `docs/architecture.md` / `docs/architecture.en.md` — ReAct runtime, module ownership, Provider conversion, persistence, image flow, and security boundaries
 - `docs/backend-api.md` — HTTP and WebSocket protocol details
-- `docs/deploy.md` — install/deploy behavior, especially frontend-to-static packaging
+- `docs/deploy.md` / `docs/deploy.en.md` — install/deploy behavior, especially frontend-to-static packaging and the loopback-only network boundary
 - `docs/reference/templates/` — workspace prompt template files
 - `docs/reference/skills/` and `docs/reference/agents/` — built-in skills and sub-agents
+
+When user-facing behavior changes, update the narrowest owning document and its language peer. `.lingclaw.json.example` is the canonical modern configuration example; the configuration guides should use only minimal focused fragments and document legacy compatibility fields separately. Keep `docs/backend-api.md` as the canonical wire reference instead of duplicating event tables in README. README screenshots must be produced from isolated synthetic data and must not expose real sessions, local paths, endpoints, or credentials.

@@ -102,6 +102,7 @@ Key files:
 - ALWAYS treat MCP server config as untrusted runtime input: `mcpServers.*.cwd` must stay inside the current session workspace, and MCP defaults should inherit `toolTimeout`, not `execTimeout`
 - ALWAYS use `truncate()` (UTF-8–safe via `is_char_boundary()`) for byte-limited string slicing
 - **Mandatory code review**: After completing any code change, perform a code review before committing. Check correctness, security (OWASP Top 10), style compliance, error handling, and test coverage. Run `cargo test` and `cargo clippy` as part of the review. No commit without review.
+- Documentation ownership: keep `README.md` / `README.en.md` concise and user-first; route usage, configuration, architecture, deployment, and wire-protocol detail to their owning files under `docs/`. Maintain Chinese/English peers together, treat `.lingclaw.json.example` as the canonical modern config example, and create README screenshots only from isolated synthetic data.
 
 ## Coding Style
 
@@ -121,7 +122,7 @@ Key files:
 5. For Skill issues: check `build_system_prompt()` in `src/main.rs`; token/context logic in `src/context.rs`; `call_llm_stream()` and provider-specific streaming helpers in `src/providers.rs`; prompt loading in `src/prompts.rs`; template content in `docs/reference/templates/`
 6. For CLI issues: check `src/tools/mod.rs` for built-in tools, `src/tools/mcp.rs` for MCP-backed tools, plus `check_dangerous_command()`, `resolve_path()`, and `resolve_path_checked()` in `src/main.rs`
 7. For Loop issues: check `handle_socket()`, `run_tool_with_feedback()`, live replay helpers, and WebSocket event flow in `src/main.rs`
-8. For Config issues: check `src/config.rs` (`JsonConfig`, `JsonSettings`, `JsonMcpServerConfig`, `Config::load()`), then `run_setup_wizard()` in `src/cli.rs` and README/example config
+8. For Config issues: check `src/config.rs` (`JsonConfig`, `JsonSettings`, `JsonMcpServerConfig`, `Config::load()`), then `run_setup_wizard()` in `src/cli.rs`, `docs/configuration.md`, `docs/configuration.en.md`, and `.lingclaw.json.example`
 
 ## Output Format
 

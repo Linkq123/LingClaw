@@ -8,6 +8,8 @@
     "maxContextTokens": 32000,
     "maxOutputBytes": 51200,
     "maxFileBytes": 204800,
+    "openaiStreamIncludeUsage": false,
+    "anthropicPromptCaching": false,
     "structuredMemory": false,
     "dailyReflection": false,
     "enableStateDigest": true,

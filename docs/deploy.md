@@ -1,232 +1,245 @@
 # LingClaw 部署指南
 
-LingClaw 是单二进制 + 一组静态前端资源的架构，部署仍然很简单。前端源码位于 `frontend/`，通过 Vite 构建输出到 `static/`；运行时实际读取的是 `static/` 目录。普通源码包可直接使用仓库内已有的 `static/`，如果你改动了 `frontend/`，部署前需要先重新生成 `static/`。安装脚本会优先自动补齐 Node.js / `npm` 并重建前端；只有在你走手动构建流程时，才需要自己先准备 Node.js（建议当前 LTS 版本）。首次启动时会进入交互式 Setup Wizard，引导你配置 API Provider、Key 和默认模型，配置保存在 `~/.lingclaw/.lingclaw.json`。
+[简体中文](deploy.md) · [English](deploy.en.md) · [返回 README](../README.md)
 
-默认 Web 端口为 `18989`。
+LingClaw 由一个 Rust 二进制、`static/` Web 资源以及内置 Skills/Sub-agents 组成。默认监听 `127.0.0.1:18989`，数据位于当前用户的 `~/.lingclaw/`。
 
----
+> 安装脚本是推荐路径。只运行 `cargo install --path .` 不会自动把 `static/` 和 `docs/reference/` 内容部署到二进制旁边。
 
-## 1. Windows
+## 部署模型
 
-### 1.1 直接安装（推荐）
+```text
+Browser → http://127.0.0.1:18989 → lingclaw process
+                                      ├── ~/.lingclaw/.lingclaw.json
+                                      ├── sessions/ and groups/
+                                      └── <session-id>/workspace/
+```
 
-推荐直接使用安装脚本：
+- Runtime 始终绑定 loopback，不直接监听 LAN/public interface。
+- 本地浏览器直接访问；远程使用 SSH tunnel 或同机反向代理。
+- 前端源码在 `frontend/`，Vite 输出到 `static/`，Runtime 只提供构建产物。
+- Prompt templates 编译进二进制；系统 Skills/Sub-agents 仍需部署到 `~/.lingclaw/`。
+
+## Windows
+
+### 推荐安装
+
+在 PowerShell 中：
 
 ```powershell
+git clone https://github.com/Linkq123/LingClaw.git
+cd LingClaw
 powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
 ```
 
-脚本会自动：
+脚本会：
 
-- 检查 Rust 环境；若未安装则通过 `winget` 安装 `rustup`
-- 若缺少 Node.js / `npm`，或现有版本过旧，则通过 `winget` 自动安装符合前端构建要求的 Node.js LTS，并执行 `frontend\npm ci` 和 `npm run build`
-- 如果 Node.js 自动安装失败但仓库里已有 `static/index.html`，则回退到现有静态产物继续安装
-- 在 Windows 下预处理 `target\release\lingclaw.exe` 的占用问题，避免 `cargo build --release` 被旧文件卡住
-- 执行 `cargo build --release` 和 `cargo install --path . --force`
-- 将 `static/` 部署到 cargo bin 目录旁边，避免首页 404
-- 将 `docs/reference/skills/` 和 `docs/reference/agents/` 安装到 `%USERPROFILE%\.lingclaw\system-skills\`、`%USERPROFILE%\.lingclaw\system-agents\`
-- 执行安装后自检，确认 `lingclaw.exe` 和 `static/index.html` 都已就位
-- 最后让你选择 `Install`、`Install-daemon` 或 `Skip for now`
-- `Install` 路径会继续询问是否写入用户 PATH
+- 检查 Rust；缺失时通过 `winget` 安装 rustup。
+- 检查 Node.js >= 20.19.0 与 npm；需要时安装 Node.js LTS。
+- 执行 `frontend\npm ci` 与 `npm run build`；无法准备 Node 时回退到仓库已有 `static/index.html`。
+- 构建 release 二进制并安装到 Cargo bin。
+- 部署 `static/`、系统 Skills 和系统 Sub-agents。
+- 运行二进制、静态资源和版本自检。
+- 让用户选择 Install、Install-daemon 或暂不全局安装。
 
-如果你想安装后立刻进入 Setup Wizard 并自动拉起后台服务，可以直接：
+直接进入 Setup Wizard 并启动后台服务：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1 -Mode InstallDaemon
 ```
 
-### 1.2 手动从源码构建
+安装后如当前 shell 尚未刷新 PATH，若已接受 PATH 注册，可以重新打开 PowerShell 并运行 `lingclaw`；也可以在当前 shell 中从实际 Cargo 安装目录启动：
 
 ```powershell
-# 安装 Rust（如尚未安装）
-winget install Rustlang.Rustup
-
-# 克隆并构建
-git clone <repo-url> LingClaw
-cd LingClaw
-cargo build --release
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
+& (Join-Path $cargoHome 'bin\lingclaw.exe')
 ```
 
-如果你修改过 `frontend/`，或需要确保 Web UI 使用的是最新前端产物，再额外执行：
+### 手动构建
+
+手动构建同时需要 Node.js >= 20.19.0 与 npm。使用 winget 安装 Rust 和 Node.js：
 
 ```powershell
+winget install Rustlang.Rustup
+winget install OpenJS.NodeJS.LTS
+```
+
+首次安装后重新打开 PowerShell，再确认工具版本：
+
+```powershell
+rustc --version
+cargo --version
+node --version
+npm --version
+```
+
+```powershell
+git clone https://github.com/Linkq123/LingClaw.git
+cd LingClaw
+
 cd frontend
 npm ci
 npm run build
 cd ..
+
+cargo build --release
 ```
 
-产物位于 `target\release\lingclaw.exe`。
-
-直接从源码目录运行 `target\release\lingclaw.exe` 时，程序会自动从项目根目录发现 `static/`。如果你只把 `lingclaw.exe` 单独复制到别处运行，需要同时复制 `static/` 目录；若还要保留内置 Skills / Sub-Agents，则还需一并部署 `docs/reference/skills/` 和 `docs/reference/agents/`，或直接使用 `lingclaw install`。
-
-`lingclaw install -d <source-dir>` 会先构建 Rust 二进制；若检测到 `frontend/package.json` 且 `npm` 可用，还会自动执行前端构建并安装最新 `static/`。如果 `npm` 不可用但源码目录里已有可用的 `static/index.html`，则会回退到安装现有静态产物。`lingclaw update` 在源码目录内升级时，前端处理逻辑与这里保持一致。
-
-### 1.3 运行
+开发产物位于 `target\release\lingclaw.exe`。从仓库根目录直接运行时可以发现仓库中的 `static/`：
 
 ```powershell
-# 首次运行 — 进入 Setup Wizard，完成后自动后台启动
 .\target\release\lingclaw.exe
-
-# 重新配置 — 强制进入 Setup Wizard（已有配置自动备份，不覆盖历史备份）
-.\target\release\lingclaw.exe --install-daemon
 ```
 
-配置文件位于 `%USERPROFILE%\.lingclaw\.lingclaw.json`，支持手动编辑。参见项目根目录 `.lingclaw.json.example` 获取完整配置示例。
-
-LingClaw 默认以后台守护进程运行，通过 CLI 命令管理：
+若把二进制复制到其他目录，必须同时复制 `static/`。要保留系统 Skills/Sub-agents，还需部署 `docs/reference/skills/` 与 `docs/reference/agents/`，或者执行：
 
 ```powershell
-lingclaw start      # 启动服务
-lingclaw stop       # 停止服务
-lingclaw restart    # 重启服务
-lingclaw health     # 健康检查
-lingclaw status     # 详细状态（地址、版本、providers、models）
-lingclaw mcp-check  # 深度检查 MCP server 连接与工具发现
-lingclaw update     # 检查版本，有更新时 rebuild 并重启
-lingclaw install    # 从本地源码安装（当前目录）
-lingclaw install -d E:\path\to\src  # 从指定目录安装
-lingclaw help       # 查看帮助信息
-lingclaw --version  # 显示版本号
+.\target\release\lingclaw.exe install -d (Get-Location).Path
 ```
 
-浏览器打开 `http://127.0.0.1:18989`。
+该命令直接使用刚构建的开发二进制，因此不要求 `lingclaw` 已经位于 PATH。它会在 npm 可用时构建最新前端；否则要求源码中已有可用的 `static/index.html`。
 
-### 1.4 防火墙
+## Linux
 
-如需局域网访问，放通端口：
-
-```powershell
-New-NetFirewallRule -DisplayName "LingClaw" -Direction Inbound -LocalPort 18989 -Protocol TCP -Action Allow
-```
-
----
-
-## 2. Linux
-
-### 2.1 从源码构建
-
-推荐直接使用安装脚本：
+### 推荐安装
 
 ```bash
+git clone https://github.com/Linkq123/LingClaw.git
+cd LingClaw
 bash scripts/install-linux.sh
 ```
 
-脚本会自动：
+脚本支持 Ubuntu/Debian/Kali 与 CentOS/RHEL/Fedora/AlmaLinux/Rocky 的常见依赖路径，并会：
 
-- 检查 Rust 环境；若未安装则自动安装，已安装时跳过 Rust 安装本身
-- 按 Linux 发行版安装 `openssl` / `pkg-config` 构建依赖
-- 若缺少 Node.js / `npm`，或现有版本过旧，则优先自动下载符合前端构建要求的 Node.js LTS；必要时再回退到支持的发行版安装方式，并重建最新前端产物
-- 如果 Node.js 自动安装失败但仓库里已有 `static/index.html`，则回退到现有静态产物继续安装
-- 执行 `cargo build --release`
-- 将 `static/` 前端资源部署到 cargo bin 目录旁边，避免首页 404
-- 执行安装后自检，确认 `lingclaw` 二进制和 `static/index.html` 都已就位
-- 最后让你选择 `Install`、`Install-daemon` 或 `Skip for now`
-- `Install` 路径会继续询问是否持久化 PATH、是否添加 systemd 服务
+- 安装或复用 Rust。
+- 准备 OpenSSL 和 pkg-config 构建依赖。
+- 使用 Node.js >= 20.19.0 构建前端；必要时下载临时 Node runtime 或回退系统包。
+- 构建并安装二进制、`static/`、系统 Skills 与系统 Sub-agents。
+- 运行安装后自检，并可选择 PATH 与 systemd。
 
-说明：安装脚本会优先尝试自动构建最新的 `frontend/` 产物，并把生成后的 `static/` 一并部署。如果当前系统不支持自动安装 Node.js / `npm`，或者自动安装失败，但仓库里已经有可用的 `static/index.html`，脚本会回退到部署现有 `static/`。
+### 手动构建
 
-手动构建流程如下：
+除下面的系统构建依赖外，还需要 Node.js >= 20.19.0 与 npm。发行版自带的 Node.js 可能低于要求，请在继续前确认版本：
 
 ```bash
-# 安装 Rust（如尚未安装）
+node --version
+npm --version
+```
+
+Ubuntu/Debian 依赖：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential libssl-dev pkg-config curl git
+```
+
+Fedora/RHEL 系依赖：
+
+```bash
+sudo dnf install -y gcc openssl-devel pkgconfig curl git
+```
+
+构建和部署：
+
+```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source "$HOME/.cargo/env"
 
-# 克隆并构建
-git clone <repo-url> LingClaw
+git clone https://github.com/Linkq123/LingClaw.git
 cd LingClaw
 
-# 若修改了 frontend/ 或需要重建 Web UI，再额外执行
 cd frontend
 npm ci
 npm run build
 cd ..
 
 cargo build --release
-cargo install --path .
-mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin/static"
-cp -R static/. "${CARGO_HOME:-$HOME/.cargo}/bin/static/"
+cargo install --path . --force
+
+CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
+mkdir -p "$CARGO_BIN/static"
+cp -R static/. "$CARGO_BIN/static/"
 mkdir -p "$HOME/.lingclaw/system-skills" "$HOME/.lingclaw/system-agents"
 cp -R docs/reference/skills/. "$HOME/.lingclaw/system-skills/"
 cp -R docs/reference/agents/. "$HOME/.lingclaw/system-agents/"
 ```
-如果只执行 `cargo install --path .` 而没有同步部署 `static/`、`docs/reference/skills/`、`docs/reference/agents/`，`/api/health` 仍可能正常，但访问首页 `http://127.0.0.1:18989/` 会返回 404，且内置 Skills / Sub-Agents 不可用。如果你改动过 `frontend/` 却没有重新执行 Vite 构建，服务虽然能启动，但页面仍会停留在旧版静态资源。
 
-如果安装报错 `error: failed to run custom build command for openssl-sys`：
-- Ubuntu / Debian / Kali Linux
-```bash
-sudo apt-get update
-sudo apt-get install -y libssl-dev pkg-config
-```
-- CentOS / RHEL / Fedora / AlmaLinux
-```bash
-# CentOS/RHEL/AlmaLinux
-sudo yum install -y openssl-devel pkgconfig
-# Fedora
-sudo dnf install -y openssl-devel pkgconfig
-```
+如果不重新构建前端，可以使用仓库已有的 `static/`；但它可能不是 `frontend/` 源码对应的最新版本。
 
-产物位于 `target/release/lingclaw`。
+## 首次启动与服务管理
 
-### 2.2 运行
+如果刚通过推荐 Linux 脚本完成安装，当前 shell 不会继承安装进程临时添加的 PATH。接受 PATH 注册后可以重新打开终端；若要立即启动，直接运行：
 
 ```bash
-# 首次运行 — Setup Wizard 完成后自动后台启动
-./target/release/lingclaw
-
-# 重新配置
-./target/release/lingclaw --install-daemon
+"${CARGO_HOME:-$HOME/.cargo}/bin/lingclaw"
 ```
 
-配置文件位于 `~/.lingclaw/.lingclaw.json`，支持手动编辑。Linux 下 Setup Wizard 会额外询问是否添加 `systemd` 服务（yes/no）。
-
-CLI 管理命令（开启 PATH 后可直接使用）：
+已经能从 PATH 找到 LingClaw 时运行：
 
 ```bash
-lingclaw start      # 启动服务
-lingclaw stop       # 停止服务
-lingclaw restart    # 重启服务
-lingclaw health     # 健康检查
-lingclaw status     # 详细状态（含版本号）
-lingclaw mcp-check  # 深度检查 MCP server 连接与工具发现
-lingclaw update     # 检查版本，有更新时 rebuild 并重启
-lingclaw install    # 从本地源码安装（当前目录）
-lingclaw install -d /path/to/src  # 从指定目录安装
-lingclaw systemd-install    # 安装并启用 lingclaw.service
-lingclaw help       # 查看帮助信息
-lingclaw --version  # 显示版本号
+lingclaw
 ```
 
-`lingclaw install -d /path/to/src` 的前端行为与 Windows 相同：优先自动构建 `frontend/`，无法构建时再回退到现有 `static/`。
+首次运行进入 Setup Wizard，配置保存在：
 
-说明：
+- Windows：`%USERPROFILE%\.lingclaw\.lingclaw.json`
+- Linux：`~/.lingclaw/.lingclaw.json`
 
-- `start` / `restart` 会先执行受限的一次性 MCP preflight；失败只会给出警告，不会阻止服务启动
-- `mcp-check` 会按运行时超时配置做更深的 MCP 诊断，适合排查 `command`/`url`、OAuth/header、`cwd`、协议握手或 tools/resources/prompts 发现问题
-- 浏览器聊天页可用 `/mcp` 查看当前已加载的 MCP server transport、auth、capabilities、cache 和当前 session 启用状态；`/mcp refresh` 会清空 tools/resources/prompts 缓存、空闲会话和最近失败冷却状态并重新探测；服务端发出的 `notifications/tools/list_changed`、`notifications/resources/list_changed`、`notifications/prompts/list_changed` 会分别触发对应缓存刷新
-- MCP server 连续启动失败后会进入短暂冷却，避免每次请求都反复拉起失败进程；手动执行 `/mcp refresh` 可立即清除该冷却并重试
-- 运行时的 MCP 空闲会话会自动回收，因此 `mcp-check` 的一次性诊断进程和聊天页的长生命周期工具会话不会相互复用
-- `stop` 会优先走本地认证的优雅关停端点 `/api/shutdown`，超时后才回退到强制结束进程
+必须显式添加 Provider/Model，并为主 Agent 指定 `primary` 或使用 Session `/model`，普通对话才会启用。详见[配置指南](configuration.md)。
 
-### 2.3 systemd 服务（可选）
+管理命令：
 
-推荐直接在 Setup Wizard 里选择 `YES`，或在安装完成后运行：
+```bash
+lingclaw start          # 后台启动
+lingclaw stop           # 优先使用本地认证端点优雅停止
+lingclaw restart
+lingclaw health         # 快速健康检查
+lingclaw status         # 地址、版本、Providers、Models
+lingclaw mcp-check      # MCP 深度诊断
+lingclaw doctor         # 安装环境检查
+lingclaw update         # 从当前源码目录检查、重建、安装、重启
+lingclaw install        # 从当前源码目录安装
+lingclaw install -d DIR # 从指定源码目录安装
+lingclaw --version
+```
+
+`start` / `restart` 进行受限 MCP preflight；单个 MCP server 失败只产生警告，不阻止服务启动。`mcp-check` 使用运行时超时做更完整的握手和 catalog 诊断。
+
+服务启动后访问 [http://127.0.0.1:18989](http://127.0.0.1:18989)。
+
+## systemd
+
+Linux Setup Wizard 可以安装 systemd，也可以手动运行：
 
 ```bash
 lingclaw systemd-install
-
-# 查看状态与日志
 sudo systemctl status lingclaw.service
 journalctl -u lingclaw.service -f
 ```
 
-配置了 `systemd` 后，`lingclaw start`、`stop`、`restart` 会自动转为管理 `lingclaw.service`。`install` / `update` 触发服务恢复时，也会重启这个服务，而不是再额外起一个 `nohup` 进程。
-`systemd-install` 生成的 unit 会对可执行文件、工作目录和 `HOME` 环境值做引用处理，因此安装路径或家目录包含空格时也能正确启动。
+检测到 unit 后，`lingclaw start`、`stop` 和 `restart` 自动转发给 systemd。`install`/`update` 恢复服务时也会重启 unit，不另起 nohup 进程。
 
-### 2.4 反向代理（可选）
+unit 固定运行用户、工作目录、`HOME` 与可执行文件路径。Provider/MCP 使用的环境变量需要通过 unit Environment/EnvironmentFile 提供，不能依赖交互 shell 的临时 export。
 
-Nginx 示例，提供 HTTPS + WebSocket 代理：
+## 远程访问
+
+### SSH tunnel（推荐）
+
+服务保持 loopback 监听，在客户端执行：
+
+```bash
+ssh -L 18989:127.0.0.1:18989 user@server
+```
+
+然后本机打开 `http://127.0.0.1:18989`。该方式不改变 LingClaw 网络边界，也不会额外公开端口。
+
+### 反向代理
+
+反向代理必须运行在同一台主机，才能访问 LingClaw 的 loopback 端口。LingClaw 还会校验 `Host` 以及请求中存在的 `Origin`、`Referer` 必须指向 localhost 或 loopback 地址，因此代理必须将这三个请求头改写为本地地址；直接转发公网域名会得到 `403 Forbidden`。
+
+LingClaw 不提供公网用户认证。下面的请求头改写会把外部访问的认证边界交给反向代理；如果代理到外部网络，必须保留 HTTPS 和可靠认证配置。
+
+Nginx 示例：
 
 ```nginx
 server {
@@ -236,261 +249,145 @@ server {
     ssl_certificate     /etc/ssl/certs/lingclaw.pem;
     ssl_certificate_key /etc/ssl/private/lingclaw.key;
 
+    auth_basic "LingClaw";
+    auth_basic_user_file /etc/nginx/.htpasswd;
+
     location / {
         proxy_pass http://127.0.0.1:18989;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
+        proxy_set_header Host 127.0.0.1:18989;
+        proxy_set_header Origin http://127.0.0.1:18989;
+        proxy_set_header Referer http://127.0.0.1:18989/;
         proxy_read_timeout 3600s;
     }
 }
 ```
 
----
+只创建防火墙入站规则没有作用，因为 LingClaw 不绑定外部网卡。无法保证请求头改写与可靠认证时，请使用 SSH 隧道；不要使用不带认证的公网反向代理。
 
-## 3. Docker
+MCP Streamable HTTP 的 OAuth 回调地址当前固定为 `http://127.0.0.1:<port>/api/mcp/auth/callback`。远程浏览器仅通过公网反向代理访问时，授权服务会把回调发送到浏览器所在机器的 loopback，而不是 LingClaw 主机，因此无法完成授权。需要使用 MCP OAuth 时，请使用上面的 SSH tunnel，并从转发后的本地 `127.0.0.1:<port>` 打开 LingClaw；反向代理仍可用于不依赖该 OAuth 回调的功能。
 
-### 3.1 Dockerfile
+## Docker（实验性）
 
-在项目根目录创建 `Dockerfile`：
+LingClaw 当前没有可配置 listen host，容器内同样绑定 `127.0.0.1`。普通 `docker run -p 18989:18989` 无法访问容器 loopback 上的服务。
+
+在 Linux 上可以使用 host networking：
 
 ```dockerfile
-# ── 前端构建阶段 ──
-FROM node:20-bookworm-slim AS frontend-builder
+FROM node:24-bookworm-slim AS frontend-builder
 WORKDIR /build/frontend
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-# ── Rust 构建阶段 ──
-FROM rust:1.85-slim AS builder
+FROM rust:1-bookworm AS builder
 WORKDIR /build
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 COPY docs/reference/templates/ docs/reference/templates/
-RUN cargo build --release --locked 2>/dev/null || cargo build --release
+RUN cargo build --release --locked
 
-# ── 运行阶段 ──
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
-
-COPY --from=builder /build/target/release/lingclaw /usr/local/bin/
+COPY --from=builder /build/target/release/lingclaw /usr/local/bin/lingclaw
 COPY --from=frontend-builder /build/static/ /app/static/
 COPY docs/reference/skills/ /app/docs/reference/skills/
 COPY docs/reference/agents/ /app/docs/reference/agents/
-
 WORKDIR /app
-EXPOSE 18989
-
-ENV LINGCLAW_PORT=18989
 ENTRYPOINT ["lingclaw", "--serve"]
 ```
 
-> 这个 Dockerfile 会直接从 `frontend/` 重新构建最新的 `static/`，不依赖仓库里已有的前端产物。Docker 场景下可通过挂载 `~/.lingclaw/.lingclaw.json` 配置文件，也可通过 `-e` 传入环境变量作为覆盖。Prompt 模板已在编译期内嵌，运行时不要求容器内存在 `docs/reference/templates/`；但内置 Skills / Sub-Agents 依赖运行时磁盘目录发现，因此镜像中需要保留 `docs/reference/skills/` 和 `docs/reference/agents/`，否则它们不会被加载。
-
-### 3.2 构建镜像
+构建并运行：
 
 ```bash
-docker build -t lingclaw:latest .
-```
-
-### 3.3 运行容器
-
-> Docker 容器使用 `--serve` 前台模式运行。需提前挂载配置文件（容器内无法交互式运行 Setup Wizard）。
-
-```bash
+docker build -t lingclaw:local .
 docker run -d \
   --name lingclaw \
-  -p 18989:18989 \
+  --network host \
   -v lingclaw-data:/root/.lingclaw \
-  -v /path/to/.lingclaw.json:/root/.lingclaw/.lingclaw.json:ro \
-  lingclaw:latest
+  -v "$PWD/lingclaw.json:/root/.lingclaw/.lingclaw.json:ro" \
+  --restart unless-stopped \
+  lingclaw:local
 ```
 
-| 挂载卷 | 用途 |
-|--------|------|
-| `lingclaw-data` | 持久化默认会话和其他 session 数据（`~/.lingclaw/sessions/*.json`、`~/.lingclaw/<session-id>/workspace/`） |
-| `.lingclaw.json` | 配置文件（必须，容器不支持 Setup Wizard；bind mount 覆盖卷内同路径） |
+上例有意将单个 `lingclaw.json` 以只读方式挂载。此模式下 Settings 可以读取配置，但不能保存配置；请在宿主机编辑 `lingclaw.json` 后运行 `docker restart lingclaw`。
 
-### 3.4 Docker Compose
-
-```yaml
-services:
-  lingclaw:
-    build: .
-    ports:
-      - "18989:18989"
-    volumes:
-      - lingclaw-data:/root/.lingclaw
-      - ./lingclaw.json:/root/.lingclaw/.lingclaw.json:ro
-    restart: unless-stopped
-
-volumes:
-  lingclaw-data:
-```
-
-> 将 `.lingclaw.json.example` 复制为 `lingclaw.json` 并编辑后挂载即可。
-
-### 3.5 使用 Anthropic
-
-在 `lingclaw.json` 中配置 Anthropic provider：
-
-```json
-{
-  "models": {
-    "providers": {
-      "anthropic": {
-        "baseUrl": "https://api.anthropic.com",
-        "apiKey": "sk-ant-xxx",
-        "api": "anthropic",
-        "models": [{ "id": "claude-opus-4-7" }]
-      }
-    }
-  },
-  "agents": {
-    "defaults": {
-      "model": {
-        "primary": "anthropic/claude-opus-4-7",
-        "fast": "anthropic/claude-haiku-4-5"
-      }
-    }
-  }
-}
-```
-
-### 3.6 使用 Gemini
-
-在 `lingclaw.json` 中配置 Gemini provider：
-
-```json
-{
-  "models": {
-    "providers": {
-      "gemini": {
-        "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
-        "apiKey": "AIza-xxx",
-        "api": "gemini",
-        "models": [{ "id": "gemini-2.5-flash", "input": ["text", "image"] }]
-      }
-    }
-  },
-  "agents": {
-    "defaults": {
-      "model": {
-        "primary": "gemini/gemini-2.5-flash"
-      }
-    }
-  }
-}
-```
-
-也可以用环境变量快速启动：`GEMINI_API_KEY=AIza-xxx LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash lingclaw`。Gemini 图片输入使用本地预取后的 `inlineData`，因此与 Ollama 一样可以配合私网或 localhost 的 S3-compatible 图片网关。
-
----
-
-## 配置参考
-
-所有配置通过 `~/.lingclaw/.lingclaw.json` 管理（首次运行 Setup Wizard 自动创建）。参见 `.lingclaw.json.example` 获取完整示例。
-
-### settings 字段
-
-| JSON 字段 | 默认值 | 说明 | 环境变量覆盖 |
-|-----------|--------|------|--------------|
-| `port` | `18989` | HTTP 监听端口 | `LINGCLAW_PORT` |
-| `provider` | `"auto"` | 遗留兼容字段；仅在未使用 `models.providers` 时用于强制指定 `openai` / `anthropic` / `ollama` / `gemini` / `auto` | `LINGCLAW_PROVIDER` |
-| `apiKey` | — | 遗留兼容字段；新配置应优先写入 `models.providers.*.apiKey` | `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `OLLAMA_API_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY` |
-| `apiBase` | 按 provider 默认 | 遗留兼容字段；新配置应优先写入 `models.providers.*.baseUrl` | `OPENAI_API_BASE` / `OLLAMA_API_BASE` / `GEMINI_API_BASE` |
-| `execTimeout` | `30` | Shell 命令超时（秒） | `LINGCLAW_EXEC_TIMEOUT` |
-| `toolTimeout` | `30` | 非 shell 的 Act 阶段工具预算；MCP 默认也继承这个超时 | `LINGCLAW_TOOL_TIMEOUT` |
-| `subAgentTimeout` | `300` | 子代理总执行超时（秒，`0` 表示不限时） | `LINGCLAW_SUB_AGENT_TIMEOUT` |
-| `maxLlmRetries` | `2` | LLM HTTP 层瞬态错误重试次数（429/5xx/连接/超时） | `LINGCLAW_MAX_LLM_RETRIES` |
-| `maxContextTokens` | `32000` | 上下文窗口 Token 预算 | `LINGCLAW_MAX_CONTEXT_TOKENS` |
-| `maxOutputBytes` | `51200` | 工具输出截断阈值 | — |
-| `maxFileBytes` | `204800` | 文件读取大小上限 | — |
-| `structuredMemory` | `false` | 启用 Finish 后台结构化记忆抽取与后续 prompt 注入 | `LINGCLAW_STRUCTURED_MEMORY` |
-| `dailyReflection` | `false` | 启用多步任务完成后的后台 reflection 写入 | `LINGCLAW_DAILY_REFLECTION` |
-| `enableTaskPlan` | `false` | 启用运行期规则 `TaskPlan`、`## Task Plan` 动态 prompt 注入和 `task_plan` live event | — |
-| `enableS3` | `true` | 开启本地图片上传能力；仍需顶层 `s3` 配置完整可用 | `LINGCLAW_ENABLE_S3` |
-
-> 优先级：JSON 配置文件 > 环境变量 > 内置默认值
-
-> 新配置建议：用 `models.providers` 定义 provider 实例，用 `agents.defaults.model.primary` 选择默认模型。Setup Wizard 已不再写入 `settings.provider`、`settings.apiKey`、`settings.apiBase`。
->
-> `models.providers.*.baseUrl` / `models.providers.*.apiKey` 也支持精确的 `${ENV_NAME}` 占位符，服务启动时会按环境变量展开。
-
-### agents.defaults.model 字段
-
-| JSON 字段 | 说明 | 环境变量覆盖 |
-|-----------|------|--------------|
-| `primary` | 主 Agent 默认模型 | `LINGCLAW_MODEL` |
-| `fast` | 简单首轮查询优先使用的轻量模型；若当前上下文含图片，则仅在该模型支持图片输入时启用 | `LINGCLAW_FAST_MODEL` |
-| `sub-agent` | 子代理执行模型 | `LINGCLAW_SUB_AGENT_MODEL` |
-| `sub-agent-<name>` | 指定子代理的专属模型；未配置时回退到 `sub-agent`，再继承当前父 Session 的有效模型（无 Session override 时为 `primary`） | - |
-| `memory` | structured memory 后台抽取模型 | `LINGCLAW_MEMORY_MODEL` |
-| `reflection` | daily reflection 后台模型 | `LINGCLAW_REFLECTION_MODEL` |
-| `context` | 自动上下文压缩优先模型 | `LINGCLAW_CONTEXT_MODEL` |
-
-### mcpServers 与 s3
-
-- `mcpServers` 是顶层对象，每个 server 可配置 `transport`、`command`、`url`、`headers`、`auth`、`args`、`env`、`cwd`、`enabled`、`timeoutSecs`
-- `transport` 支持 `stdio` 与 `streamable-http`；未写 `transport` 且有 `command` 时按旧版 stdio 配置兼容
-- `mcpServers.*.cwd` 必须位于当前主会话工作区 `~/.lingclaw/main/workspace/` 内，否则会被拒绝启动
-- `mcpServers.*.timeoutSecs` 未设置时继承 `toolTimeout`
-- `mcpServers` 只声明 server catalog；升级后不会自动把 MCP tools 暴露给模型，需要在 Settings → MCP 中按 session 手动开启 server/tool
-- Streamable HTTP 的本地授权文件为 `~/.lingclaw/mcp-auth.json`，包含 access/refresh token 与 OAuth client 信息；部署备份时按敏感凭据处理
-- `env`、`headers`、`auth.clientId`、`auth.clientSecret` 支持精确 `${ENV_NAME}` 占位符，适合把 token 放在部署环境变量中
-- 顶层 `s3` 用于本地 JPEG/PNG 上传；OpenAI/Anthropic 需要可被远端 provider 访问的现签 URL，私网 endpoint 推荐配合 Gemini/Ollama 使用
-
-## 文件结构
-
-```
-lingclaw                        # 二进制
-frontend/                       # 前端源码（TypeScript + React + Vite）
-  src/                          # 应用源码
-  package.json                  # 前端依赖与脚本
-  vite.config.ts                # Vite 构建配置（输出到 ../static/）
-static/                         # 运行时前端产物（由 frontend/ 构建生成）
-  index.html                    # WebChat 入口
-  assets/                       # 打包后的 JS/CSS/字体等资源
-  branding/                     # 品牌资源
-docs/reference/templates/       # 6 个 Prompt 模板（BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/MEMORY.md）
-docs/reference/skills/          # 内置 system skills（运行时磁盘发现）
-docs/reference/agents/          # 内置 system sub-agents（运行时磁盘发现）
-~/.lingclaw/
-  .lingclaw.json                # 配置文件（Setup Wizard 自动创建）
-  mcp-auth.json                 # 可选：Streamable HTTP MCP OAuth/token 本地授权文件
-  sessions/                     # 磁盘持久化的会话 JSON
-    main.json                   # 默认会话存档
-    <session-id>.json           # 其他持久化 session 存档
-  <session-id>/workspace/       # 对应 session 工作区（含 prompt 文件、.lingclaw-mcp-policy.json、memory/ 日志）
-```
-
-其中 `docs/reference/templates/` 是可选的磁盘覆盖目录：
-
-- 编译时：必须存在，二进制会把这些模板内嵌进去。
-- 运行时：不是必需目录；若存在，则优先使用磁盘上的模板内容。
-
-## 验证部署
+如果需要通过 Settings 保存，请先把配置放在宿主目录中的 `.lingclaw.json`，再用一个可写的目录挂载替换上例的 named volume 和单文件挂载：
 
 ```bash
-# 健康检查
-curl http://127.0.0.1:18989/api/health
+mkdir -p "$PWD/lingclaw-data"
+cp lingclaw.json "$PWD/lingclaw-data/.lingclaw.json"
 
-# 预期返回
-# {"status":"ok","version":"0.6.1","model":"gpt-4o-mini","sessions":1}
+docker run -d \
+  --name lingclaw \
+  --network host \
+  -v "$PWD/lingclaw-data:/root/.lingclaw" \
+  --restart unless-stopped \
+  lingclaw:local
 ```
 
-浏览器打开 `http://<host>:18989` 即可使用。
+不要同时保留 `-v lingclaw-data:/root/.lingclaw`。LingClaw 的原子保存需要能够在该目录中创建临时文件并替换配置文件；请限制宿主目录权限，因为容器届时可以修改其中的凭据。
 
-聊天页交互说明：
+容器内不能交互完成 Setup Wizard，应先从 [`.lingclaw.json.example`](../.lingclaw.json.example) 创建 `lingclaw.json`。API Key 推荐通过环境变量传入，而不是写入镜像。
 
-- Agent 运行时，输入框里发送普通文本会作为“延迟干预”排队，不会打断当前 ReAct 周期；这些输入会在下一轮 Analyze 前送入模型
-- Agent 运行时，发送按钮会切换为停止按钮，点击后等价于发送 `/stop`
-- Agent 运行时，只允许 `/stop`、`/tool`、`/reasoning` 这类运行期控制命令立即执行；其余斜杠命令需要等当前轮次结束后再发送
-- Usage 页会同时展示 Provider 维度和 Model Role 维度的 Token Breakdown；`/api/usage` 也会返回 `daily_roles`、`total_roles` 以及 `usage_history[].roles`
-- 聊天页中由斜杠命令返回的 `success`、`system`、`error` 卡片支持手动关闭；运行中通知（如 `progress`、`context_pruned`、`context_compressed`）不会提供关闭按钮
-- 当已发现多个子代理时，模型可调用 `orchestrate` 工具进行 DAG 编排；前端会收到 `orchestrate_started`、`orchestrate_layer`、`orchestrate_task_*`、`orchestrate_completed` 事件用于展示执行进度
+Docker Desktop 是否支持等价 host networking 取决于平台和版本；未确认时不要假设 `-p` 可以绕过 loopback 限制。
+
+## 更新
+
+在源码目录中：
+
+```bash
+git pull --ff-only
+lingclaw update
+```
+
+`update` 会比较源码与已安装版本、停止现有服务、构建后端、准备前端、部署系统 Skills/Sub-agents，并在成功后恢复服务。Windows 会使用临时 helper 释放正在运行的 exe。
+
+更新失败时会尽力恢复之前的服务版本。更新前仍建议备份 `~/.lingclaw/`。
+
+## 备份与恢复
+
+停止服务后备份整个数据目录：
+
+```bash
+lingclaw stop
+tar -czf lingclaw-backup.tar.gz "$HOME/.lingclaw"
+```
+
+重点文件：
+
+- `.lingclaw.json`：配置和可能的明文凭据
+- `mcp-auth.json`：OAuth tokens
+- `sessions/`、`groups/`：历史与运行状态
+- `<session-id>/workspace/`：提示、Skills、Agents 和记忆
+
+恢复时使用相同用户目录权限，确认配置中的本地路径、MCP command 和 S3 identity 仍然有效，再启动服务。
+
+## 验证与排错
+
+```bash
+lingclaw --version
+lingclaw doctor
+lingclaw start
+lingclaw health
+lingclaw status
+lingclaw mcp-check
+```
+
+常见问题：
+
+| 症状 | 检查 |
+|---|---|
+| 首页 404 | `static/index.html` 是否部署到二进制旁边，或当前工作目录是否包含 `static/` |
+| 没有内置 Skills/Agents | `~/.lingclaw/system-skills/` 与 `system-agents/` 是否存在 |
+| 发送按钮禁用 | Provider 模型和 Agent `primary` 是否显式配置 |
+| 配置修改未生效 | 手工编辑后是否重启；Settings 是否保存成功 |
+| MCP 加载失败 | `lingclaw mcp-check`、command/url、cwd、环境变量和 OAuth |
+| 图片上传不可用 | `enableS3`、S3 字段、生命周期检查和模型 `input` |
+| 远程连接失败 | 是否使用 SSH tunnel/同机代理；服务不会监听外部网卡 |
+
+后端日志包含运行与错误信息，但不应公开分享含本机路径、Provider 响应或 MCP 配置的完整日志。

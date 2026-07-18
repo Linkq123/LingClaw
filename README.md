@@ -1,1090 +1,261 @@
 # LingClaw
 
 <p align="center">
-  <img src="static/branding/logo-wordmark.png" alt="LingClaw" width="420">
+  <img src="static/branding/logo-wordmark.png" alt="LingClaw" width="320">
 </p>
 
-LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Loop** 三层架构设计。
+<p align="center">
+  <strong>本地运行、Rust 构建的个人 AI Agent 工作台。</strong><br>
+  连接你选择的模型、工具、Skills 与会话，把推理、执行和协作收进一个可控的工作循环。
+</p>
 
-- **Skill** — LLM 推理层：系统提示、模型路由、上下文裁剪、思维模式、结构化记忆注入
-- **CLI** — 工具执行层：安全的命令/文件/网络工具、沙盒路径、SSRF 防护、安装与更新
-- **Loop** — 连接层：WebSocket 多会话运行时、流式输出、斜杠命令、持久化、异步记忆更新
+<p align="center">
+  <a href="README.md">简体中文</a> · <a href="README.en.md">English</a>
+</p>
 
-整个后端约 19900 行 Rust（`src/main.rs` 以 10000 行为硬预算）。架构核心是一个 **ReAct 风格的受控状态机**——在保留结构化 tool calling 的前提下，引入 `Analyze → Act → Observe → Finish` 显式阶段，让每一轮决策可追踪、可审计。
+<p align="center">
+  <img alt="Rust 2024" src="https://img.shields.io/badge/Rust-2024-2F3138?style=flat-square&logo=rust">
+  <img alt="Windows and Linux" src="https://img.shields.io/badge/Windows%20%7C%20Linux-supported-6554D9?style=flat-square">
+  <img alt="MIT License" src="https://img.shields.io/badge/license-MIT-438FD1?style=flat-square">
+</p>
 
-## Features
+<p align="center">
+  <img src="docs/assets/readme/zh/workspace.webp" alt="LingClaw 中文桌面工作台，展示会话导航、执行栈和工具检查器" width="100%">
+</p>
 
-- **10 个常驻标准工具 + 条件化图片查看**：`think`、`todos`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`；当工具结果下一轮的实际消费模型声明图片输入能力且已配置 S3 时，额外暴露只读 `view_image`，用于读取 Session 工作区内通过内容校验的 PNG/JPEG。另有动态工具：`task`（子代理委托，发现代理时注册）、`orchestrate`（多代理 DAG 编排，发现代理时注册）、`session_control`（仅 `main` 正常执行模式注册，用于跨 session/group 调度）
-- **MCP client（实验性）**：支持通过 `mcpServers` 配置接入 stdio 与 Streamable HTTP MCP server，发现 tools/resources/prompts，并以当前 session 的 Settings → MCP 权限为准手动启用 tools；配置 server 不再等于自动注入模型工具。运行时会处理分页、`ping` / 可选 `roots/list`、Streamable HTTP GET/SSE 通知、`notifications/*/list_changed` 缓存失效、工具超时取消、空闲回收和启动失败冷却；resources/prompts 只做只读浏览，需用户手动插入对话
-- **多会话与群聊**：默认会话仍为 `main`，但现在支持创建、切换、重命名、列出和删除其他持久化 session；新增 session 时后端会自动生成 6 位英数字 id，用户只需在需要时重命名；`main` 的 `session_control` 可创建/删除 session、查询单 session profile/能力/运行反馈，并可删除 group、升级群管理员、移除群成员。Groups 分区可创建持久化 session group，群聊消息写入 group 历史，被点名/广播的成员 session 会收到“群聊摘要 + main 指令”用户消息，并按自身模型、MCP、Skills、TaskPlan 设置异步并发执行；只有具有显式全局主模型或持久化 Session `/model` override 的目标成员才会启动，前后端都会阻止成员落入内置默认模型；群聊 UI 使用独立发送者信息和 Markdown 正文展示消息，`@` 提及会显示名称并提供键盘/鼠标候选，但实际协议仍严格写入 `@session-id`
-- **会话级 Todos**：新增结构化 `todos` 工具，维护每个 session 唯一的一份当前任务清单；采用“整表替换 + revision 乐观并发”协议，支持用户与主代理协同编辑、重连恢复、冲突检测，以及专用 todo 面板展示
-- **子代理（Sub-Agents）**：支持通过 `task` 工具委托任务给专用代理（explore、researcher、frontend-coder、backend-coder、general-coder、reviewer）；三层发现（system / global / session）、独立 ReAct 循环、Hook 集成、工具权限过滤（含 MCP 工具）
-- **运行期 Task Plan**：默认关闭；在 Settings → General → Features 开启 `Task Plan` 后，每轮 Analyze 前用规则生成临时 `TaskPlan`，结合用户请求、`WorkingState`、任务记忆、最近工具结果、可用工具和子代理，向模型软注入目标、步骤、工具/代理建议、验证建议与验收标准；它是运行期软指导，不会自动执行验证命令，也不会写入会话消息历史。聊天页“计划模式”对应 `plan_mode` 计划模式：先产出可批准的计划，再由用户点击“开始执行”
-- **文档化斜杠命令**：`/new`、`/model`、`/switch`、`/sessions`、`/delete`、`/think`、`/react`、`/tool`、`/reasoning`、`/stop`、`/skills`、`/skills-system`、`/skills-global`、`/skills-session`、`/agents`、`/status`、`/system-prompt`、`/mcp`、`/usage`、`/clear`、`/memory`、`/reflection`、`/help`
-- **多 Provider 模型路由**：OpenAI（Chat Completions / Responses）+ Anthropic + Ollama + Gemini，支持 `provider/model` 和纯 model ID
-- **OpenAI 双协议**：OpenAI family 现在支持保留原有 `openai-completions`（`/v1/chat/completions`）并新增 `openai-responses`（`/v1/responses`）；两者共享同一套模型解析与工具权限体系。对话路径下两者都使用原生上游流式调用，`openai-responses` 会设置 `stream: true` 并把 Responses SSE 事件映射为 LingClaw 现有前端事件流
-- **会话模型覆盖**：运行时通过 `/model` 切换当前活动 session 使用的模型；持久化 override 必须在当前配置中仍然有效，浏览器和服务端执行边界都会阻止未显式配置模型的 Agent run。Session 一旦存在失效 override 就不会静默回退到全局模型；Group 也按每个成员最终有效模型状态执行门禁。运行会固定复用启动时经过校验的配置/模型快照，task/orchestrate 未单独指定子代理模型时也继承该 Session 模型，避免热重载或委托执行落入内置默认模型；模型状态变化会同步到已连接的 Session/Group，状态/帮助等无模型命令仍可使用
-- **会话持久化**：默认 `main` 与其他 session 都会各自保存工作区、消息历史、视图状态和当前 todos 快照
-- **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
-- **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、克制专业的响应式工作台（本地 SVG 图标体系、紧凑空白状态、可折叠左侧会话导航、视图/命令弹层、桌面停靠式工具检查器与手机底部面板）。会话导航可按名称或 ID 搜索全部 Session/Group；前区包含 Main 和当前会话在内最多显示 12 项，其余会话折叠到“更早会话”，重命名与删除收纳在单行更多菜单。Session/Group 的创建、编辑、重命名、删除及成员移除使用带焦点管理、内联校验和异步错误反馈的应用内对话框。每轮 Reasoning、Tool、Task Plan、Sub-agent 和 Orchestration 会聚合为一个不会被聊天布局压缩的紧凑执行栈，运行时可在单一滚动区查看完整步骤、完成后折叠为仍可见的本地化摘要，详细工具结果仍进入检查器；稳定的 Markdown 分段渲染支持表格、代码块、任务列表、引用和数学公式等常见格式，代码块使用本地化语言/复制工具栏，主回复右下角显示本轮输入/输出 token 和首 token 耗时；输入框保留上下键历史导航、`/` 命令补全和群聊 `@` 成员补全，群聊上下文栏可切换全部、已选和 @提及派发模式，并提供成员搜索、模型缺失修复和专用空状态。首次使用时需要在 Settings 添加模型并为主 Agent 指定 `primary` 模型、显式设置有效的 `LINGCLAW_MODEL`，或通过 `/model` 为当前 Session 选择已配置模型，否则普通聊天和 `/new` 保持禁用并按当前语言提示缺失配置，同时通过紧凑状态操作直达 Models/Agents 或当前 Session `/model`；设置向导选择 Skip 或未添加任何模型时不会写入默认 primary，无需模型的状态、帮助及设置类 slash 命令仍可使用。Settings 页面支持 Provider/MCP 测试、Skills 与 MCP 权限、OAuth、资源浏览、代理模型一键统一及 `compat.thinkingFormat` 下拉编辑，手机端通过单个分类下拉框保留未保存表单状态；Usage 页面把今日与累计汇总为两张摘要卡，并在全零或局部无数据时只显示对应紧凑空态。前端支持浅色/深色主题与中文/英文切换，偏好保存在浏览器本地。
-- **图片附件与工具识图闭环**：聊天页通过 `+` 菜单在上传能力可用时提供本地 JPEG/PNG 图片上传；Runtime 还会从标准 MCP `image`、图片型嵌入式 `resource.blob` 和条件化只读 `view_image` 中提取结构化图片，经内容/大小/数量校验后上传到 S3，并把图片附在对应 `tool` 消息上供下一次主 Agent 或 Sub-agent 分析。普通工具文本、stdout、路径、URL、SVG/WebP 不会被自动读取。本地上传需要配置顶层 `s3`（S3-compatible）；OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；Gemini/Ollama 会由 LingClaw 本地预取为 base64/inlineData，可配合私网、localhost 或仅局域网可达的网关使用。每条用户消息及每个工具执行批次最多 10 张图片，单图上限 10MB；原始工具 Base64 不进入日志、WebSocket、模型文本或会话 JSON，只持久化 object key、S3 配置身份、名称和 MIME，并在请求/历史恢复时重新签名。图片缺失、上传失败或端点不兼容不会改变原工具结果或中止文本 loop；OpenAI-compatible Chat 仅在明确的图片/tool 内容兼容错误下去图重试一次。Sub-agent 会在自己的 loop 内消费图片，但不会把图片再次传给父 Agent
-- **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
-- **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
-- **Structured Memory（可选）**：启用 `structuredMemory` 后，Finish 阶段会异步抽取稳定偏好、项目上下文和长期事实，写入 workspace 下的 `structured_memory.json`，并记录 `structured_memory.audit.jsonl` 诊断轨迹；`/memory`、`/memory stats`、`/memory debug` 可查看状态与最近审计信息
-- **Daily Reflection（可选）**：启用 `dailyReflection` 后，多步任务完成时会在 Finish 后台异步生成简短 reflection，追加到 workspace 下的 `memory/YYYY-MM-DD.md`；`/reflection`、`/reflection today`、`/reflection yesterday`、`/reflection list` 可查看状态和已过滤的 reflection 条目
-- **更细粒度的 Token 统计**：Primary、Fast、Sub-Agent、Memory、Reflection、Context 六类模型角色都会分别累计 token；`/new` 压缩、自动上下文压缩、Structured Memory 和 Daily Reflection 的非流式调用也会计入 Usage
-- **可关闭的 Slash Command 卡片**：聊天页中由斜杠命令返回的 `success`、`system`、`error` 卡片支持点击关闭；运行进度和自动压缩通知仍保持常驻提示
-- **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环；运行时维护每轮临时 `WorkingState`，并在 `settings.enableTaskPlan` 开启时生成规则 `TaskPlan`，用于汇总 `TaskIntent`、证据、blocker、下一步动作、工具排序和验证建议，辅助 observation 摘要、动态 prompt 注入与 auto-think 信号
-- **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留；错误工具标记 `[FAILED]` 并附带耗时；在多工具、错误或超长结果场景下，还会触发轻量状态摘要来更新当前 `WorkingState`
-- **推理可见性控制**：默认开启 ReAct 阶段转换 WS 事件（`react_phase`），可通过 `/react on|off` 手动切换；浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
-- **plan_mode 计划模式**：输入框 `+` 菜单中的计划模式开启后，本轮只做理解、只读探索和计划输出；后端只暴露 `think`、`read_file`、`list_dir`、`search_files`、`http_fetch`、满足模型/S3 条件时的 `view_image`，以及 session policy 允许的只读 MCP 工具，不会写文件、执行命令、改 todo、调用子代理或提交推送。计划完成后 assistant 计划会进入会话历史，前端显示“开始执行”按钮，点击后发送 `execute_plan_id`，服务端追加 `Proceed with the approved plan.` 短确认 user 消息，再进入正常执行模式
-- **Auto 思维可观测性**：当 `/think auto` 且当前模型支持 reasoning effort 时，后端会额外发送 `auto_trace` WebSocket 事件；启用 `settings.enableTaskPlan` 后，每轮 Analyze 还会发送规则生成的 `task_plan` 事件用于前端 timeline 展示当前软计划、工具建议和验证建议；`/status` 会显示 live runtime think、auto signals 与 request budget 摘要，前端 `Auto Debug` 开关只在本地展示最新一条顶层轨迹，不会写回 session 配置
-- **结构化工具结果**：`ToolOutcome`（output + is_error + duration_ms + 内存图片输出），前缀式错误检测，schema 约束校验（required/type/range/length）；`tool_result` WS 事件携带耗时、错误标记及可选的安全签名图片摘要，绝不传输原始 Base64
-- **原子持久化**：会话存档先写 `.tmp` 再 rename（Windows 兼容），加载时自动修剪不完整工具调用
-- **会话版本控制**：`SESSION_VERSION = 7`，旧存档自动迁移并补齐 `show_tools` / `show_reasoning` / `show_react` / `todos` / `enabled_system_skills` / `pending_plan` 等字段默认值
-- **上下文裁剪追踪**：Analyze 阶段裁剪后发送 `context_pruned` WS 事件，包含移除消息数
-- **安全控制**：危险命令检测、沙盒路径解析、SSRF 阻断、重定向阻断、输出/文件大小上限
+LingClaw 把个人 AI 助手需要的模型路由、工具执行、会话工作区、记忆、MCP 和多代理协作放进一个本地服务。浏览器负责交互，Rust Runtime 负责状态、边界和持久化；你决定接入哪个 Provider、开放哪些工具，以及每个 Agent 使用什么模型。
 
-## Quick Start
+> LingClaw 面向本机单用户使用，默认只监听 `127.0.0.1`。它不是自带身份认证的公网多用户服务。
+
+## 快速开始
+
+### 准备
+
+- Git，以及能够访问 Rust、Node.js 和模型 Provider 的网络环境。
+- Windows 使用 PowerShell 5.1 或更高版本；Linux 使用 Bash。
+- 安装脚本会检查 Rust 和 Node.js `>= 20.19.0`。如果无法准备 Node.js，会在仓库包含可用 `static/` 时使用预构建前端。
+
+### Windows
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1   # Windows 一键安装/构建/部署 static/ 并执行安装后自检
+git clone https://github.com/Linkq123/LingClaw.git
+cd LingClaw
+powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1
+```
+
+### Linux
+
+```bash
+git clone https://github.com/Linkq123/LingClaw.git
+cd LingClaw
+bash scripts/install-linux.sh
+```
+
+安装脚本会构建 Rust 后端和最新前端，并部署内置 Skills 与 Sub-agents。快速开始时请选择 `Install`；如果希望以后直接输入 `lingclaw`，请同时接受 PATH 注册提示。
+
+安装器运行在子进程中，当前终端不会继承它临时添加的 PATH。接受 PATH 注册后，可以重新打开终端并运行：
+
+```bash
+lingclaw
+```
+
+也可以不重开终端，直接从 Cargo 安装目录启动：
+
+```powershell
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $HOME '.cargo' }
+& (Join-Path $cargoHome 'bin\lingclaw.exe')
 ```
 
 ```bash
-bash scripts/install-linux.sh   # Linux 一键安装/构建/部署 static/ 并执行安装后自检
+"${CARGO_HOME:-$HOME/.cargo}/bin/lingclaw"
+```
 
-cargo build --release
-cargo install --path .
-mkdir -p "${CARGO_HOME:-$HOME/.cargo}/bin/static"
-cp -R static/. "${CARGO_HOME:-$HOME/.cargo}/bin/static/"
-mkdir -p "$HOME/.lingclaw/system-skills" "$HOME/.lingclaw/system-agents"
-cp -R docs/reference/skills/. "$HOME/.lingclaw/system-skills/"
-cp -R docs/reference/agents/. "$HOME/.lingclaw/system-agents/"
+首次启动会打开 Setup Wizard。普通对话开始前，需要完成两项显式配置：
 
-# 首次运行打开设置向导
-lingclaw
+1. 添加至少一个模型 Provider 和模型。
+2. 为主 Agent 指定 `primary` 模型，或为当前 Session 使用 `/model` 选择已配置模型。
 
-# 服务管理
+LingClaw 不会在缺少配置时静默调用内置默认模型。配置完成并启动服务后，访问 [http://127.0.0.1:18989](http://127.0.0.1:18989)。
+
+输入区会区分不同的恢复路径：
+
+- Provider 或 Model 尚未配置时，直接打开 Settings → Models。
+- Agent `primary` 尚未配置时，直接打开 Settings → Agents。
+- 当前 Session 的模型覆盖失效时，预填 `/model ` 让你重新选择。
+
+这三种状态都会禁用普通发送，但仍允许状态、帮助和设置类命令，不会向未知模型发出请求。
+
+常用服务命令：
+
+```bash
 lingclaw start
 lingclaw stop
 lingclaw restart
 lingclaw status
-lingclaw mcp-check
-lingclaw update
 lingclaw doctor
-lingclaw install
-lingclaw install -d /path/to/source
-lingclaw systemd-install        # Linux: 安装并启用 lingclaw.service
-lingclaw health
-lingclaw help
-lingclaw --version
+lingclaw update
 ```
 
-手动执行 `cargo install --path .` 时，必须同步部署 `static/`、`docs/reference/skills/` 和 `docs/reference/agents/`；否则首页可能返回 404，且内置 Skills / Sub-Agents 不可用。Windows 优先推荐 `powershell -ExecutionPolicy Bypass -File .\scripts\install-windows.ps1`，Linux 优先推荐 `bash scripts/install-linux.sh`。
+安装细节、systemd、Docker 和反向代理说明见[部署指南](docs/deploy.md)。
 
-两个安装脚本都会优先尝试自动补齐满足前端构建要求的 Node.js / `npm` 并重建 `frontend/`；若自动安装失败但仓库里已有可用的 `static/index.html`，则会回退到现有静态产物继续安装。
+## 你可以用 LingClaw 做什么
 
-如果你使用的是手动 `cargo install --path .` 路径，并且修改了 `frontend/`，在复制 `static/` 之前先执行 `cd frontend && npm ci && npm run build`，把最新前端产物重新生成到 `static/`。如果改用 `lingclaw install -d /path/to/source`，命令会在检测到 `frontend/package.json` 且 `npm` 可用时自动构建前端；若 `npm` 不可用但仓库里已有可用的 `static/`，则回退为安装现有静态产物。`lingclaw update` 在源码目录内升级时也会沿用同一套前端准备与安装逻辑。
+### 让 Agent 在受控循环中完成任务
 
-前端体验相关改动建议在 `frontend/` 下同时执行 `npm run typecheck`、`npm test`、`npm run lint`、`npm run fmt:check` 和 `npm run build`；格式检查覆盖 Prettier 配置、HTML、CSS、TypeScript/TSX 与测试文件。Markdown 或流式渲染调整需要特别确认普通文本不会在完成时整段重绘，表格等跨段格式则能在最终阶段按需修正。
+LingClaw 使用 `Analyze → Act → Observe → Finish` 的 ReAct 状态机组织每轮工作。推理、工具调用、计划、Sub-agent 和 Orchestration 会聚合为可展开的执行栈；你可以查看过程、检查工具结果、在运行中追加指令或立即停止。
 
-服务启动后访问 http://127.0.0.1:18989 。
+### 连接不同模型与协议
 
-也可以只用环境变量：
+同一套 Session 和工具体系支持：
+
+- OpenAI-compatible Chat Completions
+- OpenAI Responses
+- Anthropic Messages
+- Gemini
+- Ollama
+
+模型按 `provider/model` 路由。Primary、Fast、Sub-agent、Memory、Reflection 和 Context 可以分别配置，Session 也可以保存自己的 `/model` 覆盖。
+
+### 用 Session 隔离上下文，用 Group 组织协作
+
+每个 Session 拥有独立工作区、提示文件、消息历史、Todos、记忆和能力配置。Group 可以把多个 Session 组织成群聊，支持广播、已选目标和 `@session-id` 精确提及；界面展示名称，协议始终使用稳定 ID。
+
+### 在内置工具、MCP 与 Skills 之间扩展能力
+
+LingClaw 提供文件、命令、搜索、网络、Todos 和条件化图片查看等标准工具。MCP client 可以连接 stdio 与 Streamable HTTP server，并按 Session 授权 tools、resources 和 prompts。Skills 则通过 `SKILL.md` 为 Agent 注入可发现、可覆盖的领域工作流。
+
+### 把任务委托给 Sub-agents
+
+`task` 用于单个委托，`orchestrate` 用于带依赖关系的 DAG 编排。内置代理覆盖探索、研究、前端、后端、通用实现和审查；每个 Sub-agent 在独立的受控 loop 中运行，并继承明确的模型与工具边界。
+
+### 保存记忆并处理视觉输入
+
+Session 可以维护人工可读的 `MEMORY.md`、每日日志、可选 Structured Memory 和 Daily Reflection。配置 S3-compatible 存储且模型声明图片输入能力后，用户附件、MCP 图片和 `view_image` 结果可以进入下一次模型请求；原始工具 Base64 不会写入日志、WebSocket 或会话 JSON。
+
+## 产品界面
+
+### 清晰的执行过程
+
+Reasoning、Tool、Task Plan、Sub-agent 和 Orchestration 统一进入单个执行栈。完成后保留紧凑摘要，展开时可查看每一步；工具参数、结果和图片进入独立 Inspector，不挤压主对话。
+
+### 面向协作的群聊
+
+<p align="center">
+  <img src="docs/assets/readme/zh/group.webp" alt="LingClaw 中文群聊界面，展示目标模式、成员状态和 Markdown 消息" width="860">
+</p>
+
+Group 上下文栏提供“全部 / 已选 / @提及”三种派发模式。Main 是永久 Owner，成员模型缺失、运行状态、管理操作和提及对象都会在界面中明确呈现。
+
+### 完整的移动端体验
+
+<p align="center">
+  <img src="docs/assets/readme/zh/mobile.webp" alt="LingClaw 中文移动端工作台" width="390">
+</p>
+
+会话导航在手机上使用全屏抽屉，工具详情改为底部面板，输入区适配安全区域与多行内容。关键触控目标不小于 44px，并保留键盘、焦点返回和减少动效支持。
+
+### 集中的 Settings 与 Usage
+
+Settings 使用同一份运行时配置快照管理 Providers、Models、Agent 路由、Skills、MCP 与 S3；保存前完成校验，并对并发编辑提供冲突提示。Usage 将今日与累计 Token、Agent role、Provider 和每日趋势放在同一个仪表盘中，空数据与部分数据都有明确状态。
+
+## 工作原理
+
+```mermaid
+flowchart LR
+    UI["Browser UI"] <-->|"WebSocket / HTTP"| Runtime["LingClaw Runtime"]
+    Runtime --> Loop["ReAct Agent Loop"]
+    Loop --> Providers["Configured Model Providers"]
+    Loop --> Tools["Built-in Tools"]
+    Tools --> MCP["MCP Servers"]
+    Runtime <--> Store["Local Session Workspaces"]
+    Tools --> S3["Optional S3-compatible Storage"]
+```
+
+- **Browser UI**：响应式工作台，负责会话导航、流式消息、执行栈、Settings 和 Usage。
+- **Runtime**：单个 Rust 进程，管理 WebSocket、配置快照、并发 Session、Group 派发和持久化。
+- **Agent Loop**：在明确的阶段与上限内选择模型、调用工具、吸收观察并完成回复。
+- **Workspace**：默认位于 `~/.lingclaw/<session-id>/workspace/`，包含提示、Skills、Agents 和记忆。
+
+更完整的模块、Provider 转换和持久化说明见[架构文档](docs/architecture.md)。
+
+## 数据与安全边界
+
+| 数据 | 默认位置或去向 | 何时离开本机 |
+|---|---|---|
+| 配置与凭据 | `~/.lingclaw/` | 不会整份自动同步；连接 Provider、MCP 或 S3 时，相应凭据会发送给该服务用于鉴权 |
+| Session、Group、Todos 与记忆存档 | `~/.lingclaw/` | 存档不自动同步；相关内容进入模型上下文时会发送给你选择的 Provider |
+| 提示、对话和工具观察 | 当前 Session 与 Runtime | 作为模型请求内容发送给你选择的 Provider |
+| 用户附件与工具图片 | 可选 S3-compatible 存储 | 仅在启用 S3 和图片能力后上传 |
+| MCP 数据 | 对应 MCP server | 由你启用的 server 与 tool 决定 |
+
+- Web 服务默认绑定 `127.0.0.1`，不会直接监听局域网或公网地址。
+- 配置、Session、Group、Todos 和记忆存档保存在本机 `~/.lingclaw/`，LingClaw 不会自动同步整份存档。
+- 模型请求可能包含系统提示、对话历史、工具观察，以及被注入上下文的 Todos 和记忆内容；这些内容会发送给你配置的模型 Provider，请以对应 Provider 的数据政策为准。
+- 本地图片上传与工具图片闭环依赖可选 S3-compatible 存储。OpenAI/Anthropic 需要可被远端访问的签名 URL；Gemini/Ollama 由 LingClaw 本地预取图片。
+- 文件工具限制在当前 Session 工作区；网络工具执行 SSRF 检查并禁止重定向；命令工具包含危险命令检测与超时。
+- MCP tool 是否可用由当前 Session policy 决定；可变更外部状态的 MCP tool 可以要求确认。
+
+LingClaw 能执行命令并修改工作区文件。请像使用其他本地开发 Agent 一样，审查工具权限并保护 `.lingclaw.json` 中的凭据。
+
+## 文档
+
+| 文档 | 内容 |
+|---|---|
+| [用户指南](docs/user-guide.md) | Session、Group、命令、工具、Skills、Sub-agents、记忆与图片 |
+| [配置指南](docs/configuration.md) | Providers、模型、Agent 路由、MCP、S3 和环境变量 |
+| [部署指南](docs/deploy.md) | Windows、Linux、systemd、Docker 与反向代理 |
+| [架构文档](docs/architecture.md) | ReAct loop、模块职责、Provider、安全和持久化 |
+| [后端接口](docs/backend-api.md) | HTTP API、WebSocket 事件与错误语义 |
+| [系统 Skills](docs/system-skills.zh-CN.md) | 随 LingClaw 分发的 Skills 清单 |
+
+规范的新式 JSON 配置示例见 [`.lingclaw.json.example`](.lingclaw.json.example)。
+
+## 开发
+
+### 后端
 
 ```bash
-# OpenAI
-OPENAI_API_KEY=sk-xxx LINGCLAW_MODEL=gpt-4o-mini lingclaw
-
-# Anthropic
-ANTHROPIC_API_KEY=sk-ant-xxx LINGCLAW_MODEL=claude-sonnet-4-20250514 lingclaw
-
-# Ollama
-LINGCLAW_PROVIDER=ollama LINGCLAW_MODEL=qwen3 OLLAMA_API_BASE=http://127.0.0.1:11434 lingclaw
-
-# Gemini
-GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash lingclaw
+cargo fmt --check
+cargo clippy --all-targets --all-features
+cargo test
+cargo build
 ```
 
-## Configuration
+### 前端
 
-配置文件在 `~/.lingclaw/.lingclaw.json`，首次运行由设置向导自动写入；如需本地图片上传，可在向导里额外配置顶层 `s3`，也可以之后手动补充。若要配合 OpenAI/Anthropic 使用，`s3.endpoint` 对应的现签 URL 必须公网可达；私网或 localhost 网关推荐与 Gemini/Ollama 搭配。
-
-```json
-{
-  "settings": {
-    "port": 18989,
-    "execTimeout": 30,
-    "toolTimeout": 30,
-    "subAgentTimeout": 300,
-    "maxLlmRetries": 2,
-    "maxContextTokens": 32000,
-    "maxOutputBytes": 51200,
-    "maxFileBytes": 204800,
-    "structuredMemory": false,
-    "dailyReflection": false,
-    "enableTaskPlan": false,
-    "enableS3": true
-  },
-  "models": {
-    "providers": {
-      "openai": {
-        "baseUrl": "https://api.openai.com/v1",
-        "apiKey": "sk-your-openai-key",
-        "api": "openai-completions",
-        "models": [
-          {
-            "id": "gpt-4o-mini",
-            "name": "gpt-4o-mini",
-            "reasoning": false,
-            "input": ["text", "image"],
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 128000,
-            "maxTokens": 16384
-          }
-        ]
-      },
-      "openai-responses": {
-        "baseUrl": "https://api.openai.com/v1",
-        "apiKey": "sk-your-openai-key",
-        "api": "openai-responses",
-        "models": [
-          {
-            "id": "gpt-5.5",
-            "name": "gpt-5.5",
-            "reasoning": true,
-            "compat": {
-              "reasoning": {
-                "summary": "auto"
-              }
-            },
-            "input": ["text", "image"],
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 400000,
-            "maxTokens": 32768
-          }
-        ]
-      },
-      "anthropic": {
-        "baseUrl": "https://api.anthropic.com",
-        "apiKey": "sk-ant-your-anthropic-key",
-        "api": "anthropic",
-        "models": [
-          {
-            "id": "claude-sonnet-4-20250514",
-            "name": "claude-sonnet-4-20250514",
-            "reasoning": false,
-            "input": ["text", "image"],
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 200000,
-            "maxTokens": 8192
-          }
-        ]
-      },
-      "ollama": {
-        "baseUrl": "http://127.0.0.1:11434",
-        "apiKey": "",
-        "api": "ollama",
-        "models": [
-          {
-            "id": "qwen3",
-            "name": "qwen3",
-            "reasoning": true,
-            "input": ["text"],
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 128000,
-            "maxTokens": 8192,
-            "compat": { "thinkingFormat": "ollama" }
-          }
-        ]
-      },
-      "gemini": {
-        "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
-        "apiKey": "AIza-your-gemini-key",
-        "api": "gemini",
-        "models": [
-          {
-            "id": "gemini-2.5-flash",
-            "name": "gemini-2.5-flash",
-            "reasoning": false,
-            "input": ["text", "image"],
-            "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 },
-            "contextWindow": 1048576,
-            "maxTokens": 8192
-          }
-        ]
-      }
-    }
-  },
-  "agents": {
-    "defaults": {
-      "model": {
-        "primary": "openai/gpt-4o-mini",
-        "fast": "openai/gpt-4o-mini",
-        "sub-agent": "openai/gpt-4o-mini",
-        "memory": "openai/gpt-4o-mini",
-        "reflection": "openai/gpt-4o-mini",
-        "context": "openai/gpt-4o-mini"
-      }
-    }
-  },
-  "s3": {
-    "endpoint": "https://s3.us-east-1.amazonaws.com",
-    "region": "us-east-1",
-    "bucket": "my-bucket",
-    "accessKey": "AKIA...",
-    "secretKey": "your-secret-key",
-    "prefix": "lingclaw/images/",
-    "urlExpirySecs": 604800,
-    "lifecycleDays": 14
-  }
-}
+```bash
+cd frontend
+npm ci
+npm run typecheck
+npm test
+npm run lint
+npm run fmt:check
+npm run build
 ```
 
-说明：
+前端源码位于 `frontend/`，Vite 构建产物写入 `static/`。仅执行 `cargo install --path .` 不会自动把这些静态资源和内置 Skills/Sub-agents 部署到二进制旁边，日常安装优先使用仓库脚本或 `lingclaw install`。
 
-- 推荐使用 `provider/model` 格式引用模型
-- 多个 provider 暴露同一 model ID 时，必须使用显式前缀
-- 新配置应通过 `models.providers` 定义 provider 实例，并用 `agents.defaults.model.primary` 选择默认模型
-- `structuredMemory` 默认为 `false`；启用后会在 Finish 阶段后台更新结构化记忆，并在后续 system prompt 中注入摘要；若配置了 `agents.defaults.model.memory` 或 `LINGCLAW_MEMORY_MODEL`，后台抽取优先使用该模型，否则回退到当前会话有效模型
-- `dailyReflection` 默认为 `false`；启用后会在满足轮次和冷却条件时，于 Finish 后台生成 post-execution reflection，并追加到 `memory/YYYY-MM-DD.md`；若配置了 `agents.defaults.model.reflection` 或 `LINGCLAW_REFLECTION_MODEL`，reflection 优先使用该模型，否则回退到 memory 模型，再回退到当前会话有效模型
-- `enableTaskPlan` 默认为 `false`；可在 Settings → General → Features 的 `Task Plan` 开关启用。启用后运行期会生成规则 `TaskPlan`，注入 `## Task Plan` 动态上下文并发送 `task_plan` live event；关闭时不生成、不注入、不发送，不影响 `plan_mode` 计划模式本身
-- 顶层 `s3` 为可选项；配置后聊天页会额外启用本地 JPEG/PNG 上传，上传对象以 object key 和不含明文凭据的配置身份持久化；仅当身份仍匹配时，历史回放和 provider 请求才会按当前配置重新现签 URL，配置轮换不会把旧 object key 误解释到新存储位置
-- 同一套 S3 也承载 MCP/`view_image` 工具图片。只有工具结果下一轮的 Agent 消费模型支持 `input: ["image"]` 时才会向该 loop 暴露 `view_image` 或注入工具图片；顶层首轮即使由 fast model 发起工具调用，能力判断也以随后分析结果的 primary model 为准。辅助压缩、记忆和反思调用只保留“工具结果包含图片”的文本标记，不重复消费视觉附件
-- AWS S3 若使用官方 endpoint，建议使用与 `region` 对应的区域 host；设置向导留空 endpoint 时会自动默认到该区域地址
-- OpenAI/Anthropic 直接使用现签 URL，因此 `s3.endpoint` 必须能被远端 provider 访问；Gemini/Ollama 路径会在本地预取并转成 base64/inlineData，可用于私网、localhost 或 VPN-only 网关
-- 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容，但 Setup Wizard 不再生成它们；新配置应省略这些字段
-- `models.providers.*.api` 目前支持 `openai-completions`、`openai-responses`、`anthropic`、`ollama`、`gemini`
-- `openai-completions` 会请求 `POST /v1/chat/completions`，保留现有 LingClaw 原生流式体验
-- `openai-responses` 会请求 `POST /v1/responses`；对话路径会设置 `stream: true` 并消费 Responses SSE 事件，将 `output_text`、reasoning summary、`function_call` 参数增量和最终 `response.completed` 映射回 LingClaw 现有消息结构与前端事件流
-- `models.providers.*.baseUrl` 和 `models.providers.*.apiKey` 支持精确的 `${ENV_NAME}` 占位符；运行时会按环境变量展开，例如 `"baseUrl": "${OPENAI_API_BASE}"`、`"apiKey": "${OPENAI_API_KEY}"`
-- `models.providers.*.models[].compat.thinkingFormat` 为可选字符串，用于显式指定 OpenAI-compatible 的 thinking / reasoning 方言；Settings → Models 的 `Thinking Format` 下拉框提供默认未设置及 `openai`、`qwen`、`doubao`、`deepseek-v4`、`ollama`、`gpt-oss`、`ollama-gpt-oss`，并会保留旧配置中的自定义值
-- `models.providers.*.models[].compat.reasoning.summary` 为可选字符串，仅在 `openai-responses` 下使用；写入后会透传到 `reasoning.summary`，未配置时默认发送 `"auto"`
-- `compat.thinkingFormat = "deepseek-v4"` 时，会额外发送 `thinking.type=enabled|disabled`；开启 thinking 时，`reasoning_effort` 仅使用 `high` / `max` 两档，其中 `minimal` / `low` / `medium` / `high` 都会收敛到 `high`，`xhigh` / `max` 会收敛到 `max`
-- `compat.thinkingFormat = "doubao"` 时，会显式发送 `thinking.type=enabled|disabled`；开启 thinking 时，`reasoning_effort` 仅支持 `low` / `medium` / `high` 三档，`minimal` 会收敛到 `low`，`xhigh` / `max` 会收敛到 `high`
-- Gemini 3 使用官方 `generationConfig.thinkingConfig`：`includeThoughts` 控制思考摘要是否流式返回，`thinkingLevel` 映射到 `MINIMAL`/`LOW`/`MEDIUM`/`HIGH`；原生 tool calling 会保留并回传 `functionCall.id`、`functionResponse.id`，并在响应提供真实 `thoughtSignature` 时随原始 `functionCall` part 回传，以兼容并行工具调用与 Gemini 的签名校验
-- Ollama 的 thinking / tool calling 依赖模型能力，推荐优先使用 `qwen3`、`gpt-oss`、`deepseek-r1` 等官方支持模型，而不是把任意本地模型都视为支持深度思考和工具调用
-- 可选的 `mcpServers` 顶层对象可声明 MCP server，例如 `transport`、`command`、`url`、`headers`、`auth`、`args`、`env`、`cwd`、`enabled`、`timeoutSecs`
-- `mcpServers.*.cwd` 必须落在当前 session workspace 内；未设置 `timeoutSecs` 时默认继承 `toolTimeout`
-- `transport` 支持 `stdio` 与 `streamable-http`；未配置 `transport` 且存在 `command` 时按 `stdio` 兼容，存在 `url` 时按 `streamable-http`
-- `mcpServers` 只声明 server catalog；新旧 session 默认不注入任何 MCP tools，需要在 Settings → MCP 中为当前 session 手动开启 server/tool 后才会进入模型工具列表
-- Streamable HTTP server 的 OAuth token 存在本地 `~/.lingclaw/mcp-auth.json`，access token 过期时会使用 refresh token 自动刷新；`headers`、`auth.clientId/clientSecret` 和 stdio `env` 值都支持精确 `${ENV_NAME}` 占位符
-- Settings → MCP 中的 client capability 开关目前用于控制是否向 MCP server 暴露当前 session workspace root；关闭时不会在 initialize 中声明 `roots`
-- `start` / `restart` 的 MCP 预检使用受限的一次性探测，不会把预检进程保留为运行时 MCP 会话；`mcp-check` 会按配置的运行时超时做更深诊断
-- `/mcp` 会在聊天页面列出当前已加载的 MCP servers、transport、auth/capability/cache 概况和当前 session 启用状态；如果某个 server 失败，页面会显示失败原因，便于排查启动、命令解析或超时问题
-- `/mcp refresh` 会清空当前 workspace 对应的 MCP tools/resources/prompts 缓存、空闲会话和最近失败冷却状态，然后重新探测已启用 servers；运行时空闲 MCP 会话也会自动回收，stdio 通知和 Streamable HTTP POST/GET SSE 中的 `notifications/tools/list_changed`、`notifications/resources/list_changed`、`notifications/prompts/list_changed` 会触发对应缓存刷新
-- 子代理只继承当前 session 已启用的 MCP tools，并继续按子代理 frontmatter 的 `mcp_policy` 做只读/全部过滤
+欢迎通过 Issues 和 Pull Requests 报告问题、补充文档或改进实现。
 
-聊天页运行时交互说明：
-
-- Agent 忙碌时，输入框中发送普通文本不会打断当前 tool/推理步骤，而是作为下一轮 Analyze 的纠偏输入
-- Agent 忙碌时，发送按钮会变为停止按钮；点击后等价于发送 `/stop`
-- Agent 忙碌时，只允许 `/stop`、`/tool`、`/reasoning` 立即执行；其他斜杠命令需等待当前运行结束
-
-### Structured Memory
-
-`structuredMemory` 是一个默认关闭的可选功能，用于维护一份**机器可读**的长期记忆，与人工编辑的 `MEMORY.md` 和 `memory/YYYY-MM-DD.md` 并存。
-
-- 启用方式：在 `settings.structuredMemory` 中设为 `true`，或设置环境变量 `LINGCLAW_STRUCTURED_MEMORY=true`
-- 存储位置：`~/.lingclaw/<session-id>/workspace/structured_memory.json`
-- 审计文件：`~/.lingclaw/<session-id>/workspace/structured_memory.audit.jsonl`
-- 更新时机：每轮回答完成后的 Finish 阶段，异步入队并做 3 秒 debounce，不阻塞主 agent loop
-- 模型选择：优先使用 `agents.defaults.model.memory` 或环境变量 `LINGCLAW_MEMORY_MODEL`；未设置时回退到当前会话有效模型
-- 提取来源：使用 user/assistant 对话内容，并附带 tool 调用名与 tool 结果首行摘要；会过滤自动生成的 `## Context Summary (auto-generated)` 压缩摘要
-- 合并策略：模型返回缺失字段时保留旧值；显式 `null` 会清空 `user_context`；`facts` 返回时按完整列表替换
-- 超时策略：memory 更新请求沿用 `toolTimeout` 预算，并设 30 秒下限，避免配置过小导致后台更新恒定超时
-- 查看状态：`/memory` 显示当前摘要和 updater 运行状态，`/memory stats` 显示 updater 计数器，`/memory debug` 额外显示最近审计记录
-
-### Daily Reflection
-
-`dailyReflection` 是一个默认关闭的可选功能，用于把多步任务结束后的简短复盘写入每日记忆文件。它与 `structuredMemory` 不同：前者写的是面向人阅读的 daily log 条目，后者维护的是机器可读的 `structured_memory.json`。
-
-- 启用方式：在 `settings.dailyReflection` 中设为 `true`，或设置环境变量 `LINGCLAW_DAILY_REFLECTION=true`
-- 存储位置：`~/.lingclaw/<session-id>/workspace/memory/YYYY-MM-DD.md`
-- 写入格式：reflection 会以 `## HH:MM Local — Reflection (...)` 形式追加到 daily memory 文件中，与 `/new` 写入的普通压缩摘要共存
-- 触发条件：仅在完成阶段触发，默认至少需要 3 个 agent cycle，并受 10 分钟冷却限制；不阻塞主 agent loop
-- 模型选择：优先使用 `agents.defaults.model.reflection` 或环境变量 `LINGCLAW_REFLECTION_MODEL`；未设置时回退到 `memory` 模型，再回退到当前会话有效模型
-- 查看状态：`/reflection` 显示 feature 状态、运行时冷却信息和今天的 reflection 预览；`/reflection today` 与 `/reflection yesterday` 显示完整 reflection 条目；`/reflection list` 只列出实际包含 reflection 的日期文件
-- 读取行为：`/reflection` 会从 `memory/YYYY-MM-DD.md` 中只提取带 `— Reflection` 头部的条目，自动忽略 `/new` 写入的普通摘要段落
-
-## Environment Variables
-
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `OPENAI_API_KEY` | provider 配置或空 | OpenAI API Key |
-| `ANTHROPIC_API_KEY` | provider 配置或 `OPENAI_API_KEY` | Anthropic API Key |
-| `OLLAMA_API_KEY` | provider 配置或空 | Ollama API Key，可留空用于本地实例 |
-| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | provider 配置或 `OPENAI_API_KEY` | Gemini API Key |
-| `LINGCLAW_PROVIDER` | 自动检测 | 强制指定 `openai`、`anthropic`、`ollama` 或 `gemini` |
-| `OPENAI_API_BASE` | `https://api.openai.com/v1` | 备用 API Base |
-| `OLLAMA_API_BASE` | `http://127.0.0.1:11434` | Ollama API Base |
-| `GEMINI_API_BASE` | `https://generativelanguage.googleapis.com/v1beta` | Gemini API Base |
-| `LINGCLAW_MODEL` | 未设置 | 显式主模型；未设置时内部兼容回退值不会被视为已配置，也不会允许启动 Agent 调用 |
-| `LINGCLAW_PORT` | `18989` | HTTP 端口 |
-| `LINGCLAW_EXEC_TIMEOUT` | `30` | Shell 命令超时（秒） |
-| `LINGCLAW_TOOL_TIMEOUT` | `30` | 非 shell 的 Act 阶段工具超时（秒），不适用于子代理 |
-| `LINGCLAW_SUB_AGENT_TIMEOUT` | `300` | 子代理总执行超时（秒，0=无限，仅 max_turns 和 /stop 限制） |
-| `LINGCLAW_MAX_LLM_RETRIES` | `2` | LLM API 瞬态错误（429/5xx/连接/超时）的 HTTP 级重试次数 |
-| `LINGCLAW_MAX_CONTEXT_TOKENS` | `32000` | 默认上下文 token 预算 |
-| `LINGCLAW_FAST_MODEL` | 无 | 简单首轮查询优先使用的轻量模型；若当前上下文含图片，则仅在该模型声明支持图片输入时使用（如 `openai/gpt-4o-mini`） |
-| `LINGCLAW_SUB_AGENT_MODEL` | 无 | 子代理委托任务使用的模型（如 `openai/gpt-4o-mini`） |
-| `LINGCLAW_MEMORY_MODEL` | 无 | structured memory 后台抽取优先使用的模型（如 `openai/gpt-4o-mini`） |
-| `LINGCLAW_REFLECTION_MODEL` | 无 | daily reflection 后台生成优先使用的模型（如 `openai/gpt-4o-mini`） |
-| `LINGCLAW_CONTEXT_MODEL` | 无 | 上下文自动压缩优先使用的模型（如 `openai/gpt-4o-mini`），未设置时回退到当前会话有效模型 |
-| `LINGCLAW_STRUCTURED_MEMORY` | `false` | 启用后台结构化记忆提取与 prompt 注入 |
-| `LINGCLAW_DAILY_REFLECTION` | `false` | 启用后台 daily reflection 生成与 `/reflection` 查看能力 |
-
-## Slash Commands
-
-| 命令 | 说明 |
-|---|---|
-| `/new` | 压缩对话到每日记忆，清空上下文 |
-| `/model [name]` | 查看可用模型或切换当前会话模型 |
-| `/think [level]` | 设置思维模式：`auto`、`off`、`minimal`、`low`、`medium`、`high`、`xhigh` |
-| `/react [on\|off]` | 切换 ReAct 阶段可见性（默认开启；启用后每次阶段转换发送 `react_phase` WS 事件） |
-| `/tool [on\|off]` | 切换工具卡片显示；该设置会持久化到当前 session 的视图状态 |
-| `/reasoning [on\|off]` | 切换 reasoning 面板显示；该设置会持久化到当前 session 的视图状态 |
-| `/stop` | 中断当前运行中的 agent；聊天页停止按钮与该命令等价 |
-| `/skills` | 列出可用工具和已安装的 Skills（含来源标签） |
-| `/skills-system [install\|uninstall <pattern>]` | 列出系统内置 Skills 状态；`install`/`uninstall` 子命令可运行时启用/禁用 Skill 或 Skill 组（如 `anthropics`、`anthropics/pdf`） |
-| `/skills-global` | 仅列出全局 Skills（`~/.lingclaw/skills/`） |
-| `/skills-session` | 仅列出当前 session Skills（workspace `skills/`） |
-| `/agents` | 列出已发现的子代理（含来源标签）以及每个子代理当前可用的有效工具列表（含 MCP 工具） |
-| `/status` | 显示当前有效模型/provider、runtime phase/cycle、上下文估算、最大输出 token、思维级别；当 `/think auto` 时额外显示 live `auto_signals` / `auto_decision` 摘要，token 数值按 K/M 显示 |
-| `/system-prompt` | 输出当前会话的新鲜系统提示词，以及该系统提示词按当前 provider 估算的 token 开销 |
-| `/mcp [refresh]` | 查看 MCP server transport、auth、capabilities、cache 和当前 session 启用状态；加上 `refresh` 时强制刷新 tools/resources/prompts 缓存并重建运行时 MCP 会话 |
-| `/usage` | 显示当前 session 的累计输入、输出、总 token 估算用量，以及今日输入、输出、总量估算；同时附带所有已加载 session 的今日总 token 汇总，按 K/M 显示 |
-| `/clear` | 清空消息和当前 session 的 todos 列表，保留系统提示；todos revision 会前进以拒绝旧写入 |
-| `/memory [stats\|debug]` | 查看当前 structured memory 摘要与 updater 状态；`stats` 仅显示运行状态，`debug` 额外显示最近审计记录 |
-| `/reflection [today\|yesterday\|list]` | 查看当前 daily reflection 状态与 reflection 条目；默认显示 feature 状态、冷却信息和今天的 reflection 预览，`list` 只列出实际包含 reflection 的日期文件 |
-| `/help` | 命令帮助 |
-
-聊天页里由斜杠命令生成的 `success`、`system`、`error` 卡片支持点击右上角关闭；`progress`、`context_pruned`、`context_compressed`、`context_compress_failed` 这类运行态通知不提供关闭按钮。
-
-聊天输入框在首字符输入 `/` 时会弹出 slash command 菜单：支持按前缀过滤、`↑/↓` 切换高亮项、`Tab` 补全、对非精确匹配用 `Enter` 或发送按钮先补全再发送，也支持直接用鼠标点击菜单项。
-
-导航栏中的 `Auto Debug` 为本地调试开关，默认关闭且不持久化到 session；开启后会把最近一条顶层 `auto_trace` 渲染为调试卡片，不影响正常聊天流与 slash command 输出。
-
-导航栏中的 `Todos: On/Off` 也是纯本地显示开关，默认关闭，只控制 todo 面板显隐；当前 session 的 todos 内容、revision 和保存状态仍以后端 `todos_state` / `/api/todos` 为准。
-
-Settings → Usage 页面以“今日”和“累计”两张摘要卡展示输入、输出和总 Token，并显示按 `Primary`、`Fast`、`Sub-Agent`、`Memory`、`Reflection`、`Context` 划分的扁平 Token Breakdown，以及每日趋势和服务商图表。全部数据为零时只显示一个紧凑空态；部分模块无数据时只替换对应区域。对于升级前已经存在的旧会话，角色级累计值会从 0.6.1 开始逐步建立；旧快照中仍保留的 provider 数据会继续在历史图表里展示。
-
-## Tools
-
-| 工具 | 说明 |
-|---|---|
-| `think` | 内部推理便签 |
-| `todos` | 会话级结构化任务清单（整表替换 + revision 冲突检测） |
-| `exec` | 运行 shell 命令，带超时和危险命令过滤 |
-| `read_file` | 读文件，支持可选行范围 |
-| `write_file` | 创建或覆写文件 |
-| `patch_file` | 查找替换文件片段 |
-| `delete_file` | 删除文件 |
-| `list_dir` | 列目录内容 |
-| `search_files` | 正则搜索工作区文件 |
-| `http_fetch` | HTTP GET，带 SSRF 防护和重定向阻断 |
-| `task` | 委托任务给子代理（当发现代理时动态注册）|
-| `orchestrate` | 按 DAG 计划编排多个子代理任务（当发现多个代理时动态注册）|
-| `session_control` | 仅 `main` session 正常执行模式可用；可列出轻量 session 名片、创建/删除 session、按需查询单 session 能力详情、创建/删除/治理群组、派发任务、收集结果和停止目标 run |
-
-## Skills
-
-Skills 是可安装的知识模块，教会 AI 助手如何完成特定领域的任务。每个 Skill 是一个独立目录，包含 `SKILL.md` 文件和可选的参考资源。
-
-### 三层来源
-
-Skills 从三个目录分层加载，后加载的同名 Skill 覆盖先前的：
-
-| 层级 | 目录 | 说明 |
-|------|------|------|
-| **System** | `docs/reference/skills/` 或 `~/.lingclaw/system-skills/` | 随程序分发的内置 Skills；安装时自动部署到 `~/.lingclaw/system-skills/` |
-| **Global** | `~/.lingclaw/skills/` | 跨 session 共享的全局 Skills |
-| **Session** | `~/.lingclaw/<session-id>/workspace/skills/` | 当前 session 专属 Skills |
-
-### 结构
+### 仓库结构
 
 ```text
-skills/
-├── my-skill/
-│   ├── SKILL.md          # 必需：YAML frontmatter + 指令正文
-│   ├── references/       # 可选：参考文档
-│   └── scripts/          # 可选：辅助脚本
-└── another-skill/
-    └── SKILL.md
+LingClaw/
+├── src/                    # Rust Runtime、Providers、Tools 与 CLI
+├── frontend/               # TypeScript 工作台与 React Settings/Usage
+├── static/                 # Vite 构建产物
+├── docs/
+│   ├── reference/          # Prompt templates、系统 Skills 与 Sub-agents
+│   └── assets/readme/      # 隔离演示数据生成的产品截图
+├── scripts/                # Windows 与 Linux 安装脚本
+├── .lingclaw.json.example  # 完整配置示例
+└── Cargo.toml
 ```
-
-### SKILL.md 格式
-
-```markdown
----
-name: my-skill
-description: 描述这个 Skill 做什么以及何时触发
----
-
-# 指令正文
-
-详细步骤、示例、规范等...
-```
-
-### 工作原理
-
-- **发现**：系统自动扫描三层目录下的 `skills/*/SKILL.md`
-- **元数据注入**：已启用的 Skill 名称、来源标签和描述在每轮对话的系统提示中呈现（Level 1）
-- **按需加载**：AI 在任务匹配时通过 `read_file` 读取完整 SKILL.md 内容（Level 2）。System 和 Global Skills 使用虚拟路径（如 `system://skills/anthropics/pdf/SKILL.md`、`~/.lingclaw/skills/xxx/SKILL.md`），`read_file`、`list_dir`、`search_files` 均可透明访问
-- **资源引用**：Skill 目录中的参考文件按需读取（Level 3）
-- **去重**：同名 Skill 按 System → Global → Session 顺序加载，后加载的覆盖先前的
-- **Session 级开关**：Settings → Skills 可为当前 session 开启/关闭系统内置 Skills；系统 Skills 默认不注入，只有开启并保存后才进入当前 session 的系统提示。Global 和 Session-local Skills 暂不在 Settings 中管理，仍按目录自动发现并注入
-- **运行时管理**：
-  - `/skills` — 列出所有 Skills（含来源标签）和工具
-  - `/skills-system` — 列出系统内置 Skills 状态（enabled/disabled）
-  - `/skills-system install <pattern>` — 启用 Skill（支持组级如 `anthropics` 或单个如 `anthropics/pdf`）
-  - `/skills-system uninstall <pattern>` — 关闭 Skill
-  - `/skills-global` — 仅列出全局 Skills
-  - `/skills-session` — 仅列出当前 session Skills
-- **部署**：`lingclaw install` 和 `lingclaw update` 会自动将 `docs/reference/skills/` 复制到 `~/.lingclaw/system-skills/`，并将 `docs/reference/agents/` 复制到 `~/.lingclaw/system-agents/`，确保系统 Skills / Sub-Agents 在安装后可用
-
-### 兼容性
-
-SKILL.md 的 YAML frontmatter 格式兼容 [Agent Skills 规范](https://agentskills.io)。你可以从 [anthropics/skills](https://github.com/anthropics/skills) 仓库获取社区 Skill 并放入任意层级的 `skills/` 目录。
-
-## Sub-Agents
-
-子代理是可委托的专用任务执行器。主 Agent 通过 `task` 工具将子任务分派给子代理，子代理在独立的 ReAct 循环中执行，完成后将结果返回给主 Agent。
-
-### 三层来源
-
-子代理从三个目录分层加载，后加载的同名代理覆盖先前的：
-
-| 层级 | 目录 | 说明 |
-|------|------|------|
-| **System** | `docs/reference/agents/` | 随程序分发的内置子代理 |
-| **Global** | `~/.lingclaw/agents/` | 跨 session 共享的全局子代理 |
-| **Session** | `~/.lingclaw/<session-id>/workspace/agents/` | 当前 session 专属子代理 |
-
-### 内置子代理
-
-| 名称 | 用途 |
-|------|------|
-| **explore** | 快速只读代码库探索和问答 |
-| **researcher** | 深度研究，综合多源信息 |
-| **frontend-coder** | 前端实现、UI 交互与样式调整 |
-| **backend-coder** | 后端逻辑、服务端流程与集成修改 |
-| **general-coder** | 通用实现任务与跨层小范围改动 |
-| **reviewer** | 代码审查与质量检查 |
-
-### AGENT.md 格式
-
-```markdown
----
-name: my-agent
-description: 描述这个子代理做什么
-max_turns: 15               # 可选：最大 ReAct 轮数（默认 15）
-tools:
-  allow: ["read_file", "list_dir", "search_files"]   # 白名单模式
-  # deny: ["exec", "write_file"]                      # 或黑名单模式
----
-
-# 系统提示正文
-
-详细的行为指令...
-```
-
-`tools.allow` / `tools.deny` 同时作用于内置工具和 `mcp__...` 形式暴露出的 MCP 工具名。若启用了 MCP server，可先用 `/agents` 查看当前子代理的有效工具列表，再决定是否在 `AGENT.md` 中做精确白名单或黑名单控制。
-
-### 模型选择
-
-子代理模型按以下顺序解析：
-
-1. **`agents.defaults.model.sub-agent-<name>`** — 指定子代理的专属模型（例如 `sub-agent-reviewer`）
-2. **`agents.defaults.model.sub-agent`** — 全局子代理模型配置（JSON 配置或 `LINGCLAW_SUB_AGENT_MODEL` 环境变量）
-3. **当前父 Session 的有效模型** — 若该 Session 有有效 `/model` override 则继承 override，否则使用 `agents.defaults.model.primary`
-
-`AGENT.md` 中即使存在遗留的 `model` 字段，当前版本也会忽略，不参与运行时模型选择。
-
-### 工作原理
-
-- **发现**：系统自动扫描三层目录下的 `agents/*/AGENT.md`，解析 YAML frontmatter
-- **动态注册**：当发现至少一个子代理时，`task` 工具会被动态添加到模型工具列表
-- **隔离执行**：子代理拥有独立的消息历史、过滤后的工具集、独立的 ReAct 循环；工具集同时可包含内置工具和 MCP 工具
-- **超时与安全**：子代理总执行时间受 `subAgentTimeout`（默认 300s）限制，内部各工具保留各自超时；`max_turns` 有 50 轮硬上限；`/stop` 和断开连接可随时取消
-- **Hook 集成**：子代理的工具执行经过 BeforeToolExec / AfterToolExec Hook 链，Reject 事件会转发给父 Agent
-- **递归阻断**：`task`、`orchestrate` 和 session 级 `todos` 始终被排除在子代理的工具集之外，防止无限委托或竞争同一份清单
-- **事件流**：`task_started`、`task_progress`、`task_tool`、`task_completed`、`task_failed` 事件实时流向前端
-- **查看代理**：`/agents` 列出所有已发现的子代理、来源以及当前过滤后的有效工具列表
-
----
-
-## Architecture
-
-### 总体视图
-
-```text
-┌──────────────────────────────────────────────────────────────────┐
-│                   Browser (static/ ← Vite build)                 │
-│   index.html · TypeScript modules · React islands (Settings/Usage)│
-└────────────────────────┬─────────────────────────────────────────┘
-                         │ WebSocket /ws
-┌────────────────────────▼─────────────────────────────────────────┐
-│                     Axum HTTP Server                             │
-│   GET /api/health · GET /api/sessions · POST/PUT /api/session    │
-│   POST /api/shutdown                                             │
-│   GET/PUT /api/config · POST /api/config/test-model              │
-│   POST /api/config/test-mcp · GET /api/usage                     │
-│   GET /ws (WebSocket upgrade)                                    │
-└────────────────────────┬─────────────────────────────────────────┘
-                         │
-┌────────────────────────▼─────────────────────────────────────────┐
-│                    Connection Layer (Loop)                        │
-│   handle_socket() · handle_command() · session persistence       │
-│   active_connections · session_clients · live_rounds             │
-│   memory queue · replay/rebind · refresh-safe active runs        │
-│   cooperative shutdown                                           │
-└───────┬──────────────────┬───────────────────┬───────────────────┘
-        │                  │                   │
-┌───────▼───────┐  ┌───────▼────────┐  ┌──────▼────────┐
-│  Agent Loop   │  │  Session Store │  │  Config       │
-│  ReAct FSM    │  │  会话持久化      │  │  模型路由      │
-│  ≤200 rounds  │  │  会话工作区      │  │  环境变量回退   │
-└───┬───────┬───┘  └────────────────┘  └───────────────┘
-    │       │
-┌───▼───┐ ┌─▼──────────────────┐
-│ Skill │ │      CLI           │
-│ Layer │ │    (Tools)         │
-└───┬───┘ └───┬────────────────┘
-    │         │
-┌───▼─────────▼────────────────────────────────────────────────────┐
-│                      Provider Layer                               │
-│   call_llm_stream() → OpenAI Chat SSE · Responses HTTP replay     │
-│   Anthropic SSE · Ollama NDJSON · Gemini SSE                      │
-│   ResolvedModel · thinking/reasoning 参数映射                      │
-│   tool_definitions_*() → OpenAI-family / Anthropic / Ollama       │
-│   / Gemini tool schemas                                           │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### 三层架构：Skill + CLI + Loop
-
-| 层 | 职责 | 代码位置 |
-|---|---|---|
-| **Skill** | LLM 推理、系统提示构建、上下文裁剪、token 估算、思维模式、结构化记忆注入 | `src/main.rs`（`build_system_prompt`, `prune_messages`, `estimate_tokens`）、`src/providers.rs`（流式调用）、`src/prompts.rs`（模板加载）、`src/memory.rs`（结构化记忆） |
-| **CLI** | 工具注册/分发/执行、路径沙盒、危险命令检测、SSRF 防护 | `src/tools/mod.rs`（注册表）、`src/tools/fs.rs`（文件工具）、`src/tools/net.rs`（网络工具）、`src/tools/exec.rs`（执行工具） |
-| **Loop** | WebSocket 处理、会话生命周期、斜杠命令、持久化、HTTP API | `src/main.rs`（`handle_socket`, `handle_command`, session 管理）、`src/todos.rs`（session 级 todos 校验/持久化/广播） |
-
-### ReAct 状态机
-
-Agent Loop 采用显式的 **ReAct 风格有限状态机**，将经典 ReAct 的 Thought → Action → Observation 循环转化为结构化阶段控制：
-
-运行中的用户干预不会强制截断当前阶段。LingClaw 会在阶段边界收集用户追加的普通文本，并在下一次 `Analyze` 前将其作为新的 user message 注入上下文；如果需要立刻停止当前轮次，使用 `/stop` 或聊天页停止按钮。
-
-如果浏览器在执行中刷新，后端会保留原来的 active run，并把新的 WebSocket 连接重绑到当前 live replay。刷新后的页面会继续接收流式输出，`/stop` 仍然可用，普通文本也会继续作为 deferred intervention 排队到下一次 `Analyze`。
-
-```text
-         ┌──────────────────────────────────────────────┐
-         │                Agent Loop                     │
-         │         (max 200 rounds per turn)             │
-         │                                               │
-         │  ┌─────────┐    ┌─────────┐    ┌──────────┐  │
-  user ──►  │ Analyze │───►│   Act   │───►│ Observe  │  │
-  msg    │  └─────────┘    └─────────┘    └────┬─────┘  │
-         │       ▲                              │        │
-         │       └──────────────────────────────┘        │
-         │                                               │
-         │                ┌──────────┐                   │
-         │                │  Finish  │──► response       │
-         │                └──────────┘                   │
-         └───────────────────────────────────────────────┘
-```
-
-| 阶段 | 含义 | 行为 |
-|---|---|---|
-| **Analyze** | 分析用户意图 | 模型分析请求，决定是直接回答还是使用工具。可借助 `think` 作为推理便签，并用 `todos` 维护多步任务清单。 |
-| **Act** | 执行工具 | 模型发出结构化 tool_calls，runtime 调用 `execute_tool()` 执行。所有路径经过安全检查。 |
-| **Observe** | 消化工具结果 | 工具结果以原始内容写入对话历史。大结果 (>4KB) 生成非破坏性摘要：WS `observation` 事件 + 系统提示注入。 |
-| **Finish** | 完成回答 | 显式结束当前循环：Analyze 阶段若模型未发出 tool_calls，则带内容回复记为 `complete`，空回复记为 `empty`，随后退出循环。 |
-
-#### 运行时认知层
-
-- **每轮携带临时 WorkingState**：挂在 `AgentPhaseState` 上，只在当前 run 内存在；核心字段包括 `intent`、`primary_goal`、`completed_steps`、`evidence`、`open_questions`、`uncertainties`、`next_actions`、`ready_to_finish`
-- **Observe 先规则更新，再按需轻量摘要**：成功工具写入完成步骤/证据，失败工具写入 blocker；只有在工具报错、结果超长或本轮工具数大于 2 时，才会调用 fast model 生成 JSON `StateDigestDelta`
-- **Analyze 动态注入任务上下文**：除基础 system prompt 外，还会按预算注入 `## Task State`、Relevant Past Experience、Tool Hints、Suggested Tool Order、Suggested Sub-Agents、Delegation Guidance；启用 `settings.enableTaskPlan` 后，还会额外注入规则生成的 `## Task Plan` 及其中的工具/验证建议。这些内容不进入静态 system prompt cache。`plan_mode: true` 会切换到只规划运行模式，但 `TaskPlan` 本身仍只是辅助上下文
-- **Finish 判定保持轻量**：Analyze 阶段通过 `evaluate_finish()` 仅根据“是否有内容 / 是否有 tool_calls”决定进入 Finish 或继续 Act；`WorkingState` 继续服务于上下文构建、auto-think 和 observation 汇总，而不是拦截 finish 出口
-
-**关键设计决策：**
-
-- **不回退到文本协议**：保留 OpenAI（Chat Completions / Responses）/ Anthropic / Ollama / Gemini 原生结构化 tool calling，不使用文本版 `Action: tool_name\nAction Input: {...}` 解析
-- **不污染对话历史**：完整思维链仅在 `think` 工具内部或 provider reasoning stream 中存在，不写入主消息序列
-- **推理可见性已实现**：默认启用 `react_phase` WS 事件，前端会显示阶段切换；可通过 `/react off` 关闭；`done` 事件始终包含结构化 `reason` 字段
-- **provider 层感知状态**：`auto` 模式下 `auto_think_level()` 根据循环深度动态调整推理预算（首轮 medium / 有 observation 时 high / 深轮 low）
-
-### Agent Loop 详解
-
-```text
-handle_socket()
-  │
-  ├─ 收到用户消息
-  │    ├─ 以 "/" 开头? → handle_command()
-  │    └─ 否 → 进入 Agent Loop
-  │
-  ├─ 'agent: loop (round < 200, match react_ctx.phase())
-  │    │
-  │    ├─ AgentPhase::Analyze
-  │    │    ├─ 构建 system prompt + 注入 observation hint
-  │    │    ├─ auto_think_level() 计算有效推理级别
-  │    │    ├─ prune messages
-  │    │    ├─ call_llm_stream() → 流式输出到前端
-  │    │    ├─ evaluate_finish() → Finish(reason) | Continue
-  │    │    ├─ 有 tool_calls → transition_to_act()
-  │    │    └─ 无 tool_calls → transition_to_finish(reason)
-  │    │
-  │    ├─ AgentPhase::Act
-  │    │    ├─ 安全检查
-  │    │    ├─ execute_tool() × N (含 task 工具 → 子代理委托)
-  │    │    ├─ 收集 ToolResultEntry
-  │    │    ├─ 持久化 tool result 到 session
-  │    │    └─ transition_to_observe()
-  │    │
-  │    ├─ AgentPhase::Observe
-  │    │    ├─ summarize_observations() → WS observation 事件
-  │    │    ├─ build_observation_context_hint() → 下轮 hint
-  │    │    ├─ 增量保存 session
-  │    │    └─ transition_to_analyze()
-  │    │
-  │    └─ AgentPhase::Finish
-  │         ├─ 增量保存 session
-  │         ├─ 运行 OnFinish hooks
-  │         ├─ enqueue structured memory update（启用时）
-  │         ├─ WS done 事件
-  │         └─ break
-  │    │
-  │    └─ cancel / timeout → 安全退出
-  │
-  └─ 返回控制权给 WebSocket 读循环
-```
-
-注：上面的流程图是简化视图。当前实现里，`Observe` 阶段还会同步更新 `WorkingState`、对齐 task memory 命中项，并在满足条件时触发轻量 state digest；下一轮 `Analyze` 会再把 `Task State`、任务记忆、工具排序建议、子代理/委托建议按预算动态注入；启用 `settings.enableTaskPlan` 后才会额外注入规则生成的 `Task Plan` 与验证建议。`plan_mode: true` 只切换到 plan_mode 计划模式，不再决定是否生成运行期 `TaskPlan`。
-
-### 模块地图
-
-```text
-src/
-├── main.rs            (~5900 行) — 共享类型, WebSocket/HTTP 处理, 系统提示构建, 安全检查, JSON fence/分词等通用辅助
-├── runtime_loop.rs    (~3060 行) — 阶段执行循环, WorkingState/session 协调, 动态 prompt 注入, 轻量 state digest, 干预持久化, orchestrate 执行
-│   └── runtime_loop/socket_input.rs (~550 行) — socket 空闲/忙碌输入辅助
-├── agent.rs           (~2340 行) — AgentPhase 状态机, TaskIntent/WorkingState, finish heuristic, 证据/不确定性归并, 观察结果摘要
-├── commands.rs        (~1630 行) — 斜杠命令处理器 (handle_command, /skills-system install/uninstall 等)
-├── todos.rs           (~360 行)  — session 级 todos 快照, 校验, revision 冲突处理, 事件构建
-├── cli.rs             (~3030 行) — CLI 子命令, 设置向导, PATH/systemd, 安装/更新, system skills 部署, doctor 就绪检查
-├── config.rs          (~1490 行) — Provider/Config/JsonConfig 结构体, 模型解析, 超时加载
-├── context.rs         (~570 行)  — token 估算, 上下文预算, 裁剪, 用量格式化
-├── providers.rs       (~4100 行) — OpenAI Chat/Responses、Anthropic、Ollama、Gemini 调用, 流式解析, 推理模式, prompt caching
-├── prompts.rs         (~1030 行) — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
-├── hooks.rs           (~830 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
-├── memory.rs          (~3020 行) — structured_memory.json 读写, task memory 检索/排序, prompt 注入, MemoryUpdateQueue, /memory 状态
-├── image_uploads.rs   (~760 行)  — 用户/工具图片的 S3 签名与上传, PNG/JPEG 校验, 生命周期管理, 附件令牌签发
-├── session_admin.rs   (~10 行)   — 全局用量统计
-├── session_store.rs   (~630 行)  — 会话持久化, 迁移, 磁盘 I/O
-├── socket_sync.rs     (~100 行)  — WebSocket 会话声明, 断线监听, 重绑定
-├── socket_tasks.rs    (~150 行)  — WebSocket 读写任务
-└── tools/
-    ├── mod.rs         (~1450 行) — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验, trace/ranking 推荐, orchestrate/task 定义
-    ├── image_view.rs  — 条件化只读 view_image, Session 工作区边界与 PNG/JPEG 内容校验
-    ├── fs.rs          (~380 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files + 虚拟 skill 路径
-    ├── net.rs         (~200 行)  — http_fetch, check_ssrf, is_private_ip
-    ├── exec.rs        (~80 行)   — exec (shell), think (scratchpad)
-    └── mcp.rs         (~5180 行) — MCP client (stdio/Streamable HTTP), OAuth, tools/resources/prompts, session policy, cache/session lifecycle
-├── subagents/
-│   ├── mod.rs         (~640 行)  — SubAgentSpec, ToolPermissions, AgentSource, catalog 渲染, agent 排序/委托建议, 工具过滤（含 MCP）
-│   ├── executor.rs    (~1340 行) — 隔离 mini-ReAct 执行循环, Hook 集成, MCP 工具调度, 父级事件流
-│   ├── discovery.rs   (~350 行)  — 三层发现 (system/global/session), YAML frontmatter 解析
-│   └── orchestrator.rs (~1000 行) — DAG 多代理编排引擎, 分层并行执行, 结果插值, 事件流
-
-frontend/                         — 前端源码 (TypeScript + React, Vite 构建输出到 static/)
-├── src/
-│   ├── main.ts                   — 入口模块（React 挂载、流式渲染、懒加载历史、智能滚动）
-│   ├── constants.ts              — 常量
-│   ├── icons.ts                  — 类型化 SVG sprite 引用与 DOM 图标创建工具
-│   ├── state.ts                  — 集中状态 + 类型化 DOM refs
-│   ├── types.ts                  — WS 事件类型、HistoryMessage、AppState 接口
-│   ├── types/config.ts           — Settings/Usage 配置类型接口
-│   ├── utils.ts                  — 纯工具函数
-│   ├── scroll.ts                 — 滚动/视口管理
-│   ├── markdown.ts               — Markdown/DOMPurify/KaTeX 管线
-│   ├── highlighter.ts            — 精简代码高亮语言集（common + PowerShell/Dockerfile）
-│   ├── socket.ts                 — WebSocket 连接
-│   ├── images.ts                 — 图片附件 + S3 上传
-│   ├── input.ts                  — 输入处理 + 历史导航
-│   ├── mobile.ts                 — 移动端菜单
-│   ├── eventBus.ts               — 泛型事件总线（subagent/orchestrate 面板用）
-│   ├── settingsValidation.ts     — Settings 表单纯验证逻辑
-│   ├── pages/
-│   │   ├── SettingsPage.tsx      — Settings 页面 React 岛屿（配置编辑、Provider/MCP 测试、session MCP 权限、resources/prompts 浏览）
-│   │   └── UsagePage.tsx         — Usage 页面 React 岛屿（Token 用量统计 + Canvas 图表）
-│   ├── handlers/stream.ts        — 流式响应处理
-│   ├── renderers/                — UI 渲染模块
-│   │   ├── chat.ts               — 聊天消息渲染
-│   │   ├── todos.ts              — session 级 todo 面板
-│   │   ├── tools.ts              — 工具面板
-│   │   ├── subagent.ts           — 子代理面板
-│   │   ├── orchestrate.ts        — DAG 编排面板
-│   │   ├── react-status.ts       — ReAct 状态指示器
-│   │   └── timeline.ts           — 时间线动画
-│   └── css/                      — 模块化样式 (base, layout, chat, panels, pages, responsive)
-├── tests/                        — Vitest 单元测试 (80 tests: utils + markdown)
-├── tsconfig.json                 — TypeScript 配置
-├── vite.config.ts                — Vite 构建配置 (输出到 ../static/)
-├── eslint.config.js              — ESLint flat config + Prettier
-└── .prettierrc                   — 代码格式化规则
-
-static/                           — Vite 构建输出 (由 frontend/ 生成, 不要手动编辑)
-├── index.html                    — 主页面
-├── assets/                       — 构建产物 (JS chunks, CSS, 字体)
-└── branding/                     — Logo 和品牌资源
-
-docs/reference/templates/       — 6 个提示模板文件 (BOOTSTRAP/AGENTS/IDENTITY/SOUL/USER/MEMORY.md)
-docs/reference/skills/          — 系统内置 Skills (安装时部署到 ~/.lingclaw/system-skills/)
-docs/reference/agents/          — 6 个内置子代理 (explore, researcher, frontend-coder, backend-coder, general-coder, reviewer)
-
-src/tests/                      — 模块测试文件 (~13600 行)
-```
-
-### 核心数据结构
-
-```rust
-enum Provider { OpenAI, OpenAIResponses, Anthropic, Ollama, Gemini }
-
-struct Config {
-    api_key, api_base, model, provider,
-    providers: HashMap<String, JsonProviderConfig>,
-  port, max_context_tokens, exec_timeout, tool_timeout,
-  max_output_bytes, max_file_bytes, structured_memory,
-}
-
-struct Session {
-    id, name, messages: Vec<ChatMessage>,
-    created_at, updated_at, tool_calls_count,
-    model_override: Option<String>,
-    think_level: String,       // "auto"|"off"|"minimal"|"low"|"medium"|"high"|"xhigh"
-    workspace: PathBuf,        // ~/.lingclaw/{id}/workspace/
-    show_tools: bool,
-    show_reasoning: bool,
-    show_react: bool,
-    todos: TodoSnapshot,
-    enabled_system_skills: HashSet<String>,   // 当前 session 启用注入的系统 Skill 模式
-    pending_plan: Option<PendingPlan>,
-    version: u32,              // 会话版本 (当前 SESSION_VERSION = 7)
-}
-
-struct TodoSnapshot {
-    revision: u64,
-    items: Vec<TodoItem>,
-    last_updated_by: TodoUpdatedBy,  // "user"|"assistant"
-    updated_at: u64,
-}
-
-struct TodoItem {
-    id: String,
-    content: String,
-    status: TodoStatus,             // "pending"|"in_progress"|"completed"
-}
-
-struct ChatMessage {
-    role: String,              // "system"|"user"|"assistant"|"tool"
-    content: Option<String>,
-    tool_calls: Option<Vec<ToolCall>>,
-    tool_call_id: Option<String>,
-    timestamp: Option<u64>,
-}
-
-struct ResolvedModel {
-    provider, api_base, api_key, model_id,
-    reasoning: bool,
-  thinking_format: Option<String>,  // "qwen"|"openai"|"doubao"|"anthropic"|"ollama"|"deepseek-v4"
-    max_tokens: Option<u64>,
-}
-
-struct StructuredMemory {
-  user_context: Option<String>,
-  facts: Vec<MemoryFact>,
-  updated_at: u64,
-}
-
-enum TaskIntent { Inform, Change, Investigate, Execute }
-
-struct WorkingState {
-    intent: TaskIntent,
-    primary_goal: Option<String>,
-    completed_steps: Vec<String>,
-    evidence: Vec<EvidenceItem>,
-    open_questions: Vec<String>,
-    uncertainties: Vec<UncertaintyItem>,
-    next_actions: Vec<String>,
-    ready_to_finish: bool,
-}
-
-// Agent 状态机 (src/agent.rs)
-enum AgentPhase {
-    Analyze,    // 分析用户意图，构建推理计划
-    Act,        // 执行工具调用
-    Observe,    // 消化工具结果，更新理解
-    Finish,     // 完成回答，退出循环
-}
-```
-
-### Provider 层
-
-四类 Provider + OpenAI 双协议支持，统一的调用接口：
-
-```text
-call_llm_stream(http, resolved, messages, tx, think_level, extra_tools)
-    │
-    ├─ resolved.provider == OpenAI
-    │    └─ call_llm_stream_openai()
-    │         ├─ convert_messages_to_openai()
-    │         ├─ tool_definitions()
-    │         ├─ think_level → reasoning_effort 映射
-    │         └─ SSE 流解析 → WebSocket 转发
-    │
-    ├─ resolved.provider == OpenAIResponses
-    │    └─ call_llm_stream_openai_responses()
-    │         ├─ convert_messages_to_openai_responses_input()
-    │         ├─ tools 扁平化为 Responses API function schema
-    │         ├─ think_level → reasoning.effort / reasoning.summary 映射
-    │         └─ Responses SSE 流解析 → WebSocket 转发
-    │
-    ├─ resolved.provider == Anthropic
-    │    └─ call_llm_stream_anthropic()
-    │         ├─ convert_messages_to_anthropic()
-    │         ├─ tool_definitions_anthropic()
-    │         ├─ think_level → budget_tokens 映射
-    │         └─ SSE 流解析 → WebSocket 转发
-    │
-    ├─ resolved.provider == Ollama
-    │    └─ call_llm_stream_ollama()
-    │         ├─ convert_messages_to_ollama()
-    │         ├─ tool_definitions_ollama()
-    │         ├─ think_level → think 映射
-    │         └─ NDJSON 流解析 → WebSocket 转发
-    │
-    └─ resolved.provider == Gemini
-         └─ call_llm_stream_gemini()
-              ├─ convert_messages_to_gemini()
-              ├─ tool_definitions_gemini()
-              ├─ Gemini 3 thinkingConfig(thinkingLevel/includeThoughts)
-              ├─ functionCall.id / functionResponse.id / thoughtSignature 回传
-              ├─ 图片 inlineData(base64)
-              └─ SSE 流解析 → WebSocket 转发
-```
-
-think_level 映射：
-
-| level | OpenAI reasoning_effort | Anthropic budget_tokens | Ollama think | Gemini 3 thinkingLevel |
-|---|---|---|---|---|
-| off | — | — | `false`（GPT-OSS 例外，无法完全关闭） | `MINIMAL`，`includeThoughts=false` |
-| minimal | low | 1024 | `true`；GPT-OSS 映射到 `low` | `MINIMAL` |
-| low | low | 4096 | `true`；GPT-OSS 映射到 `low` | `LOW` |
-| medium | medium | 10240 | `true`；GPT-OSS 映射到 `medium` | `MEDIUM` |
-| high | high | 16384 | `true`；GPT-OSS 映射到 `high` | `HIGH` |
-| xhigh | high | 32768 | `true`；GPT-OSS 映射到 `high` | `HIGH` |
-| auto | model 支持 reasoning? medium : off | 同左 | model 支持 reasoning? `true` : off | 解析后同目标 level |
-
-注：上表中的 `OpenAI reasoning_effort` 列描述的是默认 OpenAI-compatible 映射；如果显式配置了 `compat.thinkingFormat`，会按对应方言覆写：
-
-- `openai-responses`：使用 `reasoning.effort` / `reasoning.summary`；`off` 只在支持 `none` 的 gpt-5.1+ 非 pro 模型上发送 `none`，不支持时省略 `reasoning`；pro 模型非 `off` 档位会收敛到 `high`
-- `deepseek-v4`：开启 thinking 时仅发送 `high` / `max`，关闭时发送 `thinking.type=disabled`
-- `doubao`：发送 `thinking.type=enabled|disabled`，开启时仅发送 `low` / `medium` / `high`
-
-### 安全架构
-
-```text
-用户输入
-  │
-  ├─ Shell 命令 → check_dangerous_command() → 拒绝/放行
-  │
-  ├─ 文件路径 → resolve_path_checked(user_path, workspace)
-  │               → 禁止逃逸工作区沙盒
-  │
-  ├─ HTTP URL → check_ssrf(url)
-  │               → 仅允许 http/https 协议
-  │               → DNS 解析后拒绝私有 IP
-  │               → 禁用重定向 (redirect::Policy::none)
-  │
-  ├─ 输出大小 → max_output_bytes (50KB 默认)
-  │
-  └─ 文件大小 → max_file_bytes (200KB 默认)
-```
-
-关键安全规则：
-- 所有工具执行经过 `execute_tool()` 统一分发
-- `resolve_path_checked()` 用于用户提供的路径（逃逸即报错），`resolve_path()` 仅用于内部沙盒归一化
-- 网络工具为每个请求创建独立 `Client`，不复用共享 HTTP 客户端
-- Shell 命令有可配置超时（默认 30s）
-- 生产路径禁止 `.unwrap()`
-
-### 会话与持久化
-
-```text
-~/.lingclaw/
-├── .lingclaw.json          — 全局配置
-├── system-skills/          — 安装时部署的系统 Skills (从 docs/reference/skills/ 复制)
-├── system-agents/          — 安装时部署的系统子代理 (从 docs/reference/agents/ 复制)
-├── skills/                 — 全局 Skills (跨 session 共享)
-├── sessions/
-│   ├── main.json           — 默认会话存档
-│   └── <session-id>.json   — 其他 session 存档
-├── groups/
-│   └── <group-id>.json     — session group 群聊历史、成员和 run 状态
-├── <session-id>/workspace/ — 对应 session 工作区
-│   ├── AGENTS.md           — 核心代理行为
-│   ├── IDENTITY.md         — 主代理资料
-│   ├── SOUL.md             — 交互/工作风格偏好
-│   ├── USER.md             — 用户特定行为
-│   ├── MEMORY.md           — 持久记忆指南
-│   ├── structured_memory.json  — 机器可读结构化记忆（启用时生成）
-│   ├── skills/             — session 专属 Skills
-│   ├── agents/             — session 专属子代理
-│   └── memory/
-│       └── 2026-03-17.md   — 每日记忆
-```
-
-提示加载模式：
-
-| 模式 | 条件 | 加载文件 |
-|---|---|---|
-| **Bootstrap** | `BOOTSTRAP.md` 存在 | `BOOTSTRAP.md + AGENTS.md` |
-| **Normal** | `BOOTSTRAP.md` 不存在 | `AGENTS.md + IDENTITY.md + USER.md + SOUL.md`，然后加载当前 session 的 `MEMORY.md` + 今日/昨日记忆 |
-
-关键不变式：
-- 当 `IDENTITY.md` 和 `USER.md` 中的关键字段已被有效填写后，后端会自动删除 `BOOTSTRAP.md` 并切换到 Normal 模式
-- `/new` 只压缩对话 + 写入记忆 + 清空上下文，不重建 session
-- 重连不重建 `BOOTSTRAP.md`
-- 内置模板更新只影响后续新建 session；已有 session workspace 中的提示文件不会被自动覆盖
-- prompt 文件开头的 YAML frontmatter 只作为模板元数据保留，注入 system prompt 前会被剥离
-- 启用 `structuredMemory` 时，system prompt 会额外注入 `structured_memory.json` 的摘要，但不会替代人工维护的 `MEMORY.md`
-- 每轮 agent loop 后增量保存 session（原子写入：write .tmp → rename）
-- 会话切换前先保存到磁盘，失败时保留内存副本供重连恢复
-- 前端会把最近选中的 session id 保存在本地，页面刷新后优先重连该 session；`main` 在 session 列表中始终置顶
-- 加载时自动修剪不完整的工具调用事务（`trim_incomplete_tool_calls`）
-
-### WebSocket 协议
-
-客户端 → 服务端：
-
-```json
-{"text": "用户消息", "plan_mode": false}
-```
-
-旧客户端也可以直接发送纯文本。连接到 `/ws?group=<id>&session=main` 时，客户端消息使用 `{"type":"group_message", ...}`；停止 group 内 queued/running 成员 run 使用 `{"type":"group_stop"}`。`session=main` 是前端 group 控制 UI 的连接要求，不是浏览器/本地进程之间的安全授权边界；不要向 group socket 发送普通 session slash 命令。
-
-`session_control` 兼容提醒：显式 `targets[]` 最多 16 个、`message` 最多 32,000 字符；group 广播可省略 `targets` 并按 group members 上限派发；目标 session 必须先创建，调用方应使用 `list_sessions` 返回的精确大小写 id；`target_mode="mentions"` 未命中合法 `@session-id` 时会报错，不会回退成全员广播。群聊只把 `@session-id` 当作有效协议，前端会显示为 `@Session Name`；`@all` 覆盖但未直接点名的成员是可选回复，返回空或 `NO_REPLY` 不会写入群聊。
-
-服务端 → 客户端：
-
-连接重绑说明：如果页面在 active run 期间刷新，服务端不会取消正在执行的 agent loop，而是把新连接附着到已有 `live_round` 上继续转发后续事件与终态 `done/error`。
-
-| type | 用途 |
-|---|---|
-| `session` | 首次连接或当前绑定 session 刷新时的当前会话信息 |
-| `view_state` | `show_tools` / `show_reasoning` / `show_react` 状态同步 |
-| `todos_state` | 当前 session 的 todos 快照（revision / items / last_updated_by / updated_at） |
-| `history` | 当前会话历史消息 |
-| `session_group_list` | 当前已知 group 摘要列表，用于 session drawer 的 Groups 分区 |
-| `group` / `group_history` | 进入 `/ws?group=<id>&session=main` 时返回 group 元数据、群聊消息和 run 状态 |
-| `group_message` | group 聊天消息；`role=session` 的消息是成员 session 最终摘要 |
-| `group_run_started` / `group_member_status` / `group_run_completed` | 成员 session 被派发、运行状态变化和完成/失败/停止事件 |
-| `group_member_event` | 包装成员 session 的 live event，形如 `{ session_id, run_id, event }`；当前群聊 UI 默认隐藏普通过程卡片，只保留错误、管理/投票结果和成员最终回复 |
-| `start` | 新一轮回复开始 |
-| `auto_trace` | `think=auto` 的最新顶层决策轨迹（selected think、baseline、signals、escalators/dampeners/clamps） |
-| `task_plan` | 启用 `settings.enableTaskPlan` 后发送的当前 round/cycle 临时规则计划、工具/代理建议、验证建议与验收标准；进入 live replay，但不写入 session 历史 |
-| `plan_ready` | plan_mode 计划模式完成后发送，表示 assistant 计划已写入历史且可通过 `execute_plan_id` 开始执行 |
-| `delta` | 流式文本片段 |
-| `thinking_start` | 思维模式开始 |
-| `thinking_delta` | 思维流式片段 |
-| `thinking_done` | 思维模式结束 |
-| `tool_call` | 工具调用开始 |
-| `tool_progress` | 长耗时工具执行中的进度心跳（含 `elapsed_ms`） |
-| `tool_result` | 工具执行结果（含 `duration_ms`、`is_error` 及可选的安全签名 `images`） |
-| `tool_image_compatibility_warning` | OpenAI-compatible Chat 明确拒绝工具图片后触发的一次性本地化兼容警告；该轮会去图重试并继续纯文本 loop |
-| `done` | 响应完成 |
-| `react_phase` | ReAct 阶段转换（默认启用，可通过 `/react off` 关闭） |
-| `task_started` | 子代理开始执行 |
-| `task_progress` | 子代理 ReAct 周期进度 |
-| `task_tool` | 子代理工具调用（含 `agent`、`tool`、`id`） |
-| `task_completed` | 子代理完成（含 `cycles`、`tool_calls`、`duration_ms`） |
-| `task_failed` | 子代理失败（含 `error`、`cycles`、`tool_calls`、`duration_ms`） |
-| `orchestrate_started` | 多代理编排开始（含编排 id、任务总数与计划摘要） |
-| `orchestrate_layer` | 当前 DAG 层开始执行（含 layer 序号与任务列表） |
-| `orchestrate_task_started` | 编排中的单个任务开始执行 |
-| `orchestrate_task_completed` | 编排中的单个任务完成 |
-| `orchestrate_task_failed` | 编排中的单个任务失败 |
-| `orchestrate_task_skipped` | 编排中的单个任务因依赖失败或条件不满足被跳过 |
-| `orchestrate_completed` | 多代理编排完成（含总耗时与结果摘要） |
-| `observation` | 非破坏性工具结果摘要 |
-| `context_pruned` | 上下文裁剪通知（含 `removed_count`） |
-| `context_compressed` | 自动上下文压缩成功通知 |
-| `context_compress_failed` | 自动上下文压缩失败通知 |
-| `progress` | 命令处理中（不清除忙碌状态） |
-| `success` | 命令成功（成功样式） |
-| `system` | 中性系统消息 |
-| `error` | 错误消息 |
-
-初始化回放顺序通常为 `session -> view_state -> todos_state -> history`。`todos` 工具的调用与结果不会渲染到普通工具时间线，也不会出现在 `history` 载荷里；前端应始终以 `todos_state` 驱动专用 todo 面板。
-
-## HTTP API
-
-| 端点 | 方法 | 说明 |
-|---|---|---|
-| `/api/health` | GET | 健康检查（返回 `version`、`model`、`sessions`） |
-| `/api/sessions` | GET | 返回已知 session 列表（`main` 固定置顶） |
-| `/api/session` | POST | 创建新 session；后端随机生成 6 位英数字 id |
-| `/api/session?session=<id>` | PUT | 修改指定 session 的显示名称；不改变 session id 或工作区路径 |
-| `/api/session-groups` | GET | 返回已知 group 摘要列表 |
-| `/api/session-group` | POST | 创建 group，后端随机生成 group id |
-| `/api/session-group?group=<id>` | GET/PUT/DELETE | 读取、更新或删除指定 group；存在 `queued/running` 成员 run 时删除返回 `409` |
-| `/api/session-group/member?group=<id>&session=<id>` | PUT/DELETE | 升级 group admin 或从 group 移除成员；owner UI 直接生效，promoted admin 发起移除时走 2/3 投票 |
-| `/api/todos?session=<id>` | PUT | 原子替换当前 session 的 todos 清单；成功返回最新快照，revision 冲突返回 `409` + 当前快照 |
-| `/api/client-config` | GET | 返回前端配置（上传 token、S3 能力标记等） |
-| `/api/config` | GET | 读取原始 JSON 配置文件（含解析错误回退） |
-| `/api/config` | PUT | 校验并保存 JSON 配置文件（原子写入 + 备份恢复） |
-| `/api/config/test-model` | POST | 测试模型 Provider 连接（发送 "Hi" 并检查响应） |
-| `/api/config/test-mcp` | POST | 测试 MCP Server 连接（stdio/Streamable HTTP + tools/list） |
-| `/api/mcp/catalog?session=<id>` | GET | 返回 MCP server catalog、session policy、tools/resources/prompts 与授权状态 |
-| `/api/mcp/session-policy?session=<id>` | PUT | 保存当前 session 的 MCP server/tool 权限、mutating tool 确认策略和 client capability 开关 |
-| `/api/mcp/auth/start` | POST | 为 Streamable HTTP MCP server 启动 OAuth PKCE 授权 |
-| `/api/mcp/auth/callback` | GET/POST | 完成 MCP OAuth callback/token exchange |
-| `/api/mcp/auth/disconnect` | POST | 清除指定 MCP server 的本地授权并结束远程 session |
-| `/api/mcp/resource/read?session=<id>` | POST | 读取已启用 MCP server 的 resource，用于预览/手动插入 |
-| `/api/mcp/prompt/get?session=<id>` | POST | 获取已启用 MCP server 的 prompt，用于预览/手动插入 |
-| `/api/usage` | GET | 返回 Token 用量统计（今日/累计/来源），并额外提供 `daily_roles`、`total_providers`、`total_roles`，以及按天拆分后的 `usage_history[].providers` / `usage_history[].roles` |
-| `/api/upload-images` | POST | 上传本地图片到 S3（需启用 S3 配置） |
-| `/api/shutdown` | POST | 认证的本地关停端点（CLI 使用） |
-| `/ws` | GET | WebSocket 升级端点；`?session=<id>` 绑定单 session，`?group=<id>&session=main` 进入 group chat |
-
-## Session Workspace
-
-当前 session 拥有独立工作区 `~/.lingclaw/<session-id>/workspace/`，包含以下提示文件：
-
-| 文件 | 用途 |
-|---|---|
-| `BOOTSTRAP.md` | 初始引导指令 |
-| `AGENTS.md` | 核心代理行为 |
-| `IDENTITY.md` | 主代理资料 |
-| `SOUL.md` | 交互/工作风格偏好 |
-| `USER.md` | 用户特定行为指导 |
-| `MEMORY.md` | 持久记忆指导 |
-
-每个工作区还有 `memory/` 子目录，存放 `memory/YYYY-MM-DD.md` 每日日志。
-启用 `structuredMemory` 后，还会在同目录生成 `structured_memory.json`，供后台异步记忆抽取和后续 prompt 注入使用。
 
 ## 鸣谢
 
-- 感谢 openclaw、claude code、deer-flow、opencode
-- 感谢 vide-coding 伙伴：GPT-5.4、Claude Opus 4.6、Doubao-Seedream-4.5
-- 感谢 GitHub Copilot、VS Code
-- 感谢 豆包、千问
-- 感谢时间
+LingClaw 的设计受到 OpenClaw、Claude Code、DeerFlow、OpenCode、Agent Skills 规范以及开源 AI 工具生态的启发。感谢所有参与测试、审查和完善项目的人。
 
 ## License
 
-本项目采用 MIT License。
-完整条款见 [LICENSE](LICENSE)。
+LingClaw 使用 [MIT License](LICENSE)。
