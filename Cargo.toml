@@ -1,6 +1,6 @@
 [package]
 name = "lingclaw"
-version = "0.8.3"
+version = "0.8.4"
 edition = "2024"
 description = "A Rust personal AI assistant"
 license = "MIT"
@@ -23,3 +23,9 @@ hmac = "0.12"
 md-5 = "0.10"
 sha2 = "0.10"
 rpassword = "7"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }

@@ -14,7 +14,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 
 ## Features
 
-- **10 标准工具**：`think`、`todos`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`；另有动态工具：`task`（子代理委托，发现代理时注册）、`orchestrate`（多代理 DAG 编排，发现代理时注册）、`session_control`（仅 `main` 正常执行模式注册，用于跨 session/group 调度）
+- **10 个常驻标准工具 + 条件化图片查看**：`think`、`todos`、`exec`、`read_file`、`write_file`、`patch_file`、`delete_file`、`list_dir`、`search_files`、`http_fetch`；当工具结果下一轮的实际消费模型声明图片输入能力且已配置 S3 时，额外暴露只读 `view_image`，用于读取 Session 工作区内通过内容校验的 PNG/JPEG。另有动态工具：`task`（子代理委托，发现代理时注册）、`orchestrate`（多代理 DAG 编排，发现代理时注册）、`session_control`（仅 `main` 正常执行模式注册，用于跨 session/group 调度）
 - **MCP client（实验性）**：支持通过 `mcpServers` 配置接入 stdio 与 Streamable HTTP MCP server，发现 tools/resources/prompts，并以当前 session 的 Settings → MCP 权限为准手动启用 tools；配置 server 不再等于自动注入模型工具。运行时会处理分页、`ping` / 可选 `roots/list`、Streamable HTTP GET/SSE 通知、`notifications/*/list_changed` 缓存失效、工具超时取消、空闲回收和启动失败冷却；resources/prompts 只做只读浏览，需用户手动插入对话
 - **多会话与群聊**：默认会话仍为 `main`，但现在支持创建、切换、重命名、列出和删除其他持久化 session；新增 session 时后端会自动生成 6 位英数字 id，用户只需在需要时重命名；`main` 的 `session_control` 可创建/删除 session、查询单 session profile/能力/运行反馈，并可删除 group、升级群管理员、移除群成员。Groups 分区可创建持久化 session group，群聊消息写入 group 历史，被点名/广播的成员 session 会收到“群聊摘要 + main 指令”用户消息，并按自身模型、MCP、Skills、TaskPlan 设置异步并发执行；只有具有显式全局主模型或持久化 Session `/model` override 的目标成员才会启动，前后端都会阻止成员落入内置默认模型；群聊 UI 使用独立发送者信息和 Markdown 正文展示消息，`@` 提及会显示名称并提供键盘/鼠标候选，但实际协议仍严格写入 `@session-id`
 - **会话级 Todos**：新增结构化 `todos` 工具，维护每个 session 唯一的一份当前任务清单；采用“整表替换 + revision 乐观并发”协议，支持用户与主代理协同编辑、重连恢复、冲突检测，以及专用 todo 面板展示
@@ -27,7 +27,7 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **会话持久化**：默认 `main` 与其他 session 都会各自保存工作区、消息历史、视图状态和当前 todos 快照
 - **Bootstrap + Normal 双提示模式**：提示文件随会话创建、按模式动态加载
 - **流式浏览器 UI**：Axum WebSocket 后端 + Vite 构建的 TypeScript + React 混合前端（`frontend/` → `static/`），增量文本节点追加（`TextNode.nodeValue +=`）、统一 rAF 调度、智能跟随滚动、历史懒加载（初始渲染最近 50 条，工具调用链不切断）、克制专业的响应式工作台（本地 SVG 图标体系、紧凑空白状态、可折叠左侧会话导航、视图/命令弹层、桌面停靠式工具检查器与手机底部面板）。会话导航可按名称或 ID 搜索全部 Session/Group；前区包含 Main 和当前会话在内最多显示 12 项，其余会话折叠到“更早会话”，重命名与删除收纳在单行更多菜单。Session/Group 的创建、编辑、重命名、删除及成员移除使用带焦点管理、内联校验和异步错误反馈的应用内对话框。每轮 Reasoning、Tool、Task Plan、Sub-agent 和 Orchestration 会聚合为一个不会被聊天布局压缩的紧凑执行栈，运行时可在单一滚动区查看完整步骤、完成后折叠为仍可见的本地化摘要，详细工具结果仍进入检查器；稳定的 Markdown 分段渲染支持表格、代码块、任务列表、引用和数学公式等常见格式，代码块使用本地化语言/复制工具栏，主回复右下角显示本轮输入/输出 token 和首 token 耗时；输入框保留上下键历史导航、`/` 命令补全和群聊 `@` 成员补全，群聊上下文栏可切换全部、已选和 @提及派发模式，并提供成员搜索、模型缺失修复和专用空状态。首次使用时需要在 Settings 添加模型并为主 Agent 指定 `primary` 模型、显式设置有效的 `LINGCLAW_MODEL`，或通过 `/model` 为当前 Session 选择已配置模型，否则普通聊天和 `/new` 保持禁用并按当前语言提示缺失配置，同时通过紧凑状态操作直达 Models/Agents 或当前 Session `/model`；设置向导选择 Skip 或未添加任何模型时不会写入默认 primary，无需模型的状态、帮助及设置类 slash 命令仍可使用。Settings 页面支持 Provider/MCP 测试、Skills 与 MCP 权限、OAuth、资源浏览、代理模型一键统一及 `compat.thinkingFormat` 下拉编辑，手机端通过单个分类下拉框保留未保存表单状态；Usage 页面把今日与累计汇总为两张摘要卡，并在全零或局部无数据时只显示对应紧凑空态。前端支持浅色/深色主题与中文/英文切换，偏好保存在浏览器本地。
-- **图片附件**：聊天页通过 `+` 菜单在上传能力可用时提供本地 JPEG/PNG 图片上传；本地上传需要配置顶层 `s3`（S3-compatible）并会把文件写入临时对象存储。OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；Gemini/Ollama 会由 LingClaw 本地预取为 base64/inlineData 并持久化缓存到会话工作区，因此可配合私网、localhost 或仅局域网可达的网关使用；WebSocket 协议仍可接收受信任上传元信息或远程图片 URL；每条消息最多 10 张图片，支持 SSRF 防护、结构校验、10MB 大小上限；上传结果和附件签名会绑定当前 S3 配置身份，上传期间普通发送、Plan 执行和 Session/Group 导航会暂时锁定，若当前会话、连接、图片/S3 能力或存储配置在响应前变化，旧上传结果会被丢弃；Agent 忙碌时发送的图片附件会被丢弃（仅保留文本干预）
+- **图片附件与工具识图闭环**：聊天页通过 `+` 菜单在上传能力可用时提供本地 JPEG/PNG 图片上传；Runtime 还会从标准 MCP `image`、图片型嵌入式 `resource.blob` 和条件化只读 `view_image` 中提取结构化图片，经内容/大小/数量校验后上传到 S3，并把图片附在对应 `tool` 消息上供下一次主 Agent 或 Sub-agent 分析。普通工具文本、stdout、路径、URL、SVG/WebP 不会被自动读取。本地上传需要配置顶层 `s3`（S3-compatible）；OpenAI/Anthropic 直接消费现签 URL，因此对应 S3 端点必须能被远端 provider 访问；Gemini/Ollama 会由 LingClaw 本地预取为 base64/inlineData，可配合私网、localhost 或仅局域网可达的网关使用。每条用户消息及每个工具执行批次最多 10 张图片，单图上限 10MB；原始工具 Base64 不进入日志、WebSocket、模型文本或会话 JSON，只持久化 object key、S3 配置身份、名称和 MIME，并在请求/历史恢复时重新签名。图片缺失、上传失败或端点不兼容不会改变原工具结果或中止文本 loop；OpenAI-compatible Chat 仅在明确的图片/tool 内容兼容错误下去图重试一次。Sub-agent 会在自己的 loop 内消费图片，但不会把图片再次传给父 Agent
 - **运行中干预与中断**：Agent 忙碌时，输入框中的普通文本会作为“延迟干预”排队，在当前 ReAct 周期结束后、下一次 Analyze 前注入为新的 user message；发送按钮会切换为停止按钮，也可使用 `/stop` 中断当前运行
 - **`/new` 对话压缩**：将对话摘要追加到每日记忆，然后清空上下文
 - **Structured Memory（可选）**：启用 `structuredMemory` 后，Finish 阶段会异步抽取稳定偏好、项目上下文和长期事实，写入 workspace 下的 `structured_memory.json`，并记录 `structured_memory.audit.jsonl` 诊断轨迹；`/memory`、`/memory stats`、`/memory debug` 可查看状态与最近审计信息
@@ -37,9 +37,9 @@ LingClaw 是一个用 Rust 构建的个人 AI 助手，围绕 **Skill + CLI + Lo
 - **ReAct 显式状态机**：`match react_ctx.phase()` 驱动的 Analyze/Act/Observe/Finish 四阶段循环；运行时维护每轮临时 `WorkingState`，并在 `settings.enableTaskPlan` 开启时生成规则 `TaskPlan`，用于汇总 `TaskIntent`、证据、blocker、下一步动作、工具排序和验证建议，辅助 observation 摘要、动态 prompt 注入与 auto-think 信号
 - **非破坏性 Observation 摘要**：大工具结果生成 WS 事件 + 系统提示注入，原始结果始终完整保留；错误工具标记 `[FAILED]` 并附带耗时；在多工具、错误或超长结果场景下，还会触发轻量状态摘要来更新当前 `WorkingState`
 - **推理可见性控制**：默认开启 ReAct 阶段转换 WS 事件（`react_phase`），可通过 `/react on|off` 手动切换；浏览器前端会显示阶段切换，`done` 事件包含 `reason`（正常完成时 `complete` | `empty`，hard-cap 时 `hard_cap`）
-- **plan_mode 计划模式**：输入框 `+` 菜单中的计划模式开启后，本轮只做理解、只读探索和计划输出；后端只暴露 `think`、`read_file`、`list_dir`、`search_files`、`http_fetch` 以及 session policy 允许的只读 MCP 工具，不会写文件、执行命令、改 todo、调用子代理或提交推送。计划完成后 assistant 计划会进入会话历史，前端显示“开始执行”按钮，点击后发送 `execute_plan_id`，服务端追加 `Proceed with the approved plan.` 短确认 user 消息，再进入正常执行模式
+- **plan_mode 计划模式**：输入框 `+` 菜单中的计划模式开启后，本轮只做理解、只读探索和计划输出；后端只暴露 `think`、`read_file`、`list_dir`、`search_files`、`http_fetch`、满足模型/S3 条件时的 `view_image`，以及 session policy 允许的只读 MCP 工具，不会写文件、执行命令、改 todo、调用子代理或提交推送。计划完成后 assistant 计划会进入会话历史，前端显示“开始执行”按钮，点击后发送 `execute_plan_id`，服务端追加 `Proceed with the approved plan.` 短确认 user 消息，再进入正常执行模式
 - **Auto 思维可观测性**：当 `/think auto` 且当前模型支持 reasoning effort 时，后端会额外发送 `auto_trace` WebSocket 事件；启用 `settings.enableTaskPlan` 后，每轮 Analyze 还会发送规则生成的 `task_plan` 事件用于前端 timeline 展示当前软计划、工具建议和验证建议；`/status` 会显示 live runtime think、auto signals 与 request budget 摘要，前端 `Auto Debug` 开关只在本地展示最新一条顶层轨迹，不会写回 session 配置
-- **结构化工具结果**：`ToolOutcome`（output + is_error + duration_ms），前缀式错误检测，schema 约束校验（required/type/range/length），`tool_result` WS 事件携带耗时和错误标记
+- **结构化工具结果**：`ToolOutcome`（output + is_error + duration_ms + 内存图片输出），前缀式错误检测，schema 约束校验（required/type/range/length）；`tool_result` WS 事件携带耗时、错误标记及可选的安全签名图片摘要，绝不传输原始 Base64
 - **原子持久化**：会话存档先写 `.tmp` 再 rename（Windows 兼容），加载时自动修剪不完整工具调用
 - **会话版本控制**：`SESSION_VERSION = 7`，旧存档自动迁移并补齐 `show_tools` / `show_reasoning` / `show_react` / `todos` / `enabled_system_skills` / `pending_plan` 等字段默认值
 - **上下文裁剪追踪**：Analyze 阶段裁剪后发送 `context_pruned` WS 事件，包含移除消息数
@@ -251,6 +251,7 @@ GEMINI_API_KEY=AIza... LINGCLAW_PROVIDER=gemini LINGCLAW_MODEL=gemini-2.5-flash 
 - `dailyReflection` 默认为 `false`；启用后会在满足轮次和冷却条件时，于 Finish 后台生成 post-execution reflection，并追加到 `memory/YYYY-MM-DD.md`；若配置了 `agents.defaults.model.reflection` 或 `LINGCLAW_REFLECTION_MODEL`，reflection 优先使用该模型，否则回退到 memory 模型，再回退到当前会话有效模型
 - `enableTaskPlan` 默认为 `false`；可在 Settings → General → Features 的 `Task Plan` 开关启用。启用后运行期会生成规则 `TaskPlan`，注入 `## Task Plan` 动态上下文并发送 `task_plan` live event；关闭时不生成、不注入、不发送，不影响 `plan_mode` 计划模式本身
 - 顶层 `s3` 为可选项；配置后聊天页会额外启用本地 JPEG/PNG 上传，上传对象以 object key 和不含明文凭据的配置身份持久化；仅当身份仍匹配时，历史回放和 provider 请求才会按当前配置重新现签 URL，配置轮换不会把旧 object key 误解释到新存储位置
+- 同一套 S3 也承载 MCP/`view_image` 工具图片。只有工具结果下一轮的 Agent 消费模型支持 `input: ["image"]` 时才会向该 loop 暴露 `view_image` 或注入工具图片；顶层首轮即使由 fast model 发起工具调用，能力判断也以随后分析结果的 primary model 为准。辅助压缩、记忆和反思调用只保留“工具结果包含图片”的文本标记，不重复消费视觉附件
 - AWS S3 若使用官方 endpoint，建议使用与 `region` 对应的区域 host；设置向导留空 endpoint 时会自动默认到该区域地址
 - OpenAI/Anthropic 直接使用现签 URL，因此 `s3.endpoint` 必须能被远端 provider 访问；Gemini/Ollama 路径会在本地预取并转成 base64/inlineData，可用于私网、localhost 或 VPN-only 网关
 - 遗留字段 `settings.provider`、`settings.apiKey`、`settings.apiBase` 仍被读取以保持向后兼容，但 Setup Wizard 不再生成它们；新配置应省略这些字段
@@ -680,13 +681,14 @@ src/
 ├── prompts.rs         (~1030 行) — 提示文件初始化/加载, bootstrap baseline, Skills 发现/注入, 虚拟路径解析
 ├── hooks.rs           (~830 行)  — HookRegistry, AgentHook trait, 自动压缩上下文 hook
 ├── memory.rs          (~3020 行) — structured_memory.json 读写, task memory 检索/排序, prompt 注入, MemoryUpdateQueue, /memory 状态
-├── image_uploads.rs   (~760 行)  — S3 签名/上传, PNG/JPEG 校验, 生命周期管理, 附件令牌签发
+├── image_uploads.rs   (~760 行)  — 用户/工具图片的 S3 签名与上传, PNG/JPEG 校验, 生命周期管理, 附件令牌签发
 ├── session_admin.rs   (~10 行)   — 全局用量统计
 ├── session_store.rs   (~630 行)  — 会话持久化, 迁移, 磁盘 I/O
 ├── socket_sync.rs     (~100 行)  — WebSocket 会话声明, 断线监听, 重绑定
 ├── socket_tasks.rs    (~150 行)  — WebSocket 读写任务
 └── tools/
     ├── mod.rs         (~1450 行) — ToolSpec 注册表, tool_definitions(), execute_tool(), ToolOutcome, 参数校验, trace/ranking 推荐, orchestrate/task 定义
+    ├── image_view.rs  — 条件化只读 view_image, Session 工作区边界与 PNG/JPEG 内容校验
     ├── fs.rs          (~380 行)  — read_file, write_file, patch_file, delete_file, list_dir, search_files + 虚拟 skill 路径
     ├── net.rs         (~200 行)  — http_fetch, check_ssrf, is_private_ip
     ├── exec.rs        (~80 行)   — exec (shell), think (scratchpad)
@@ -1001,7 +1003,8 @@ think_level 映射：
 | `thinking_done` | 思维模式结束 |
 | `tool_call` | 工具调用开始 |
 | `tool_progress` | 长耗时工具执行中的进度心跳（含 `elapsed_ms`） |
-| `tool_result` | 工具执行结果（含 `duration_ms`、`is_error`） |
+| `tool_result` | 工具执行结果（含 `duration_ms`、`is_error` 及可选的安全签名 `images`） |
+| `tool_image_compatibility_warning` | OpenAI-compatible Chat 明确拒绝工具图片后触发的一次性本地化兼容警告；该轮会去图重试并继续纯文本 loop |
 | `done` | 响应完成 |
 | `react_phase` | ReAct 阶段转换（默认启用，可通过 `/react off` 关闭） |
 | `task_started` | 子代理开始执行 |

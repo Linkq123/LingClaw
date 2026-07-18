@@ -2671,6 +2671,17 @@ button {
   font-weight: 500;
 }
 
+.execution-step .tool-image-count {
+  flex: 0 0 auto;
+  color: var(--dim);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+
+.execution-step .tool-image-count[hidden] {
+  display: none;
+}
+
 .execution-step .tool-panel-failed .tool-status,
 .execution-step .subagent-failed .subagent-status,
 .execution-step .orchestrate-aborted .orchestrate-status {
@@ -2814,6 +2825,14 @@ button {
   .execution-step .tool-args-preview,
   .execution-step .reasoning-status {
     display: none;
+  }
+
+  .tool-image-gallery {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .tool-image-preview {
+    min-height: 44px;
   }
 
   .execution-step :is(.tool-status, .subagent-status, .orchestrate-status) {

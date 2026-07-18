@@ -4,7 +4,7 @@ description: "Read-only code review agent for bugs, regressions, security issues
 max_turns: 36
 mcp_policy: read_only
 tools:
-  allow: [think, read_file, list_dir, search_files]
+  allow: [think, read_file, view_image, list_dir, search_files]
   deny: []
 ---
 

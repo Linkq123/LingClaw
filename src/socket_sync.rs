@@ -78,6 +78,7 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
 }
 
 /// Build the session info payload including model capabilities.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_session_info_payload(
     session_id: &str,
     name: &str,

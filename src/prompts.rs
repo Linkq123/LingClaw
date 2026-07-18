@@ -1355,6 +1355,27 @@ pub(crate) fn build_system_prompt_with_query_cached_for_tool_mode(
     current_query: Option<&str>,
     tool_mode: SystemPromptToolMode,
 ) -> ChatMessage {
+    let view_image_available = config.s3.is_some() && config.model_supports_image(model);
+    build_system_prompt_with_query_cached_for_tool_mode_with_view_image(
+        config,
+        workspace,
+        model,
+        enabled_system_skills,
+        current_query,
+        tool_mode,
+        view_image_available,
+    )
+}
+
+pub(crate) fn build_system_prompt_with_query_cached_for_tool_mode_with_view_image(
+    config: &Config,
+    workspace: &Path,
+    model: &str,
+    enabled_system_skills: &HashSet<String>,
+    current_query: Option<&str>,
+    tool_mode: SystemPromptToolMode,
+    view_image_available: bool,
+) -> ChatMessage {
     let os_name = if cfg!(windows) {
         "Windows"
     } else if cfg!(target_os = "macos") {
@@ -1367,9 +1388,13 @@ pub(crate) fn build_system_prompt_with_query_cached_for_tool_mode(
     let local_time = local_snapshot.datetime_label();
     let agent_behavior_section = tool_mode.agent_behavior_section();
     let tool_lines = if tool_mode.is_plan_only() {
-        tools::render_read_only_tool_prompt_lines(config)
+        tools::render_read_only_tool_prompt_lines_with_view_image(config, view_image_available)
     } else {
-        tools::render_tool_prompt_lines_with_query(config, current_query)
+        tools::render_tool_prompt_lines_with_query_and_view_image(
+            config,
+            current_query,
+            view_image_available,
+        )
     };
     let prompt_files = load_session_prompt_files_with_snapshot(workspace, local_snapshot);
     let persona = prompt_files.persona;

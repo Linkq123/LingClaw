@@ -916,7 +916,7 @@ checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 
 [[package]]
 name = "lingclaw"
-version = "0.8.3"
+version = "0.8.4"
 dependencies = [
  "axum",
  "base64",
@@ -924,6 +924,7 @@ dependencies = [
  "futures",
  "getrandom 0.2.17",
  "hmac",
+ "libc",
  "md-5",
  "regex",
  "reqwest",
@@ -935,6 +936,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tower-http",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

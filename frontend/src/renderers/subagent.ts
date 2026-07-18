@@ -1,5 +1,5 @@
 import { dom, state } from '../state.js';
-import type { SubagentHistorySnapshot } from '../types.js';
+import type { ImageAttachment, SubagentHistorySnapshot } from '../types.js';
 import {
   escHtml,
   formatToolDuration,
@@ -17,7 +17,13 @@ import {
   resumeExecutionStackAutoCollapse,
 } from './execution-stack.js';
 import { pinReactStatusToBottom } from './react-status.js';
-import { closeToolDrawer, openToolDrawer, syncToolDrawer, mergeToolLiveOutput } from './tools.js';
+import {
+  closeToolDrawer,
+  openToolDrawer,
+  syncToolDrawer,
+  mergeToolLiveOutput,
+  normalizeToolImages,
+} from './tools.js';
 import {
   ensureModalBackdrop,
   moveModalHostToBody,
@@ -308,8 +314,10 @@ function syncToolBadgeDataset(
   toolResult = '',
   toolStatus: string = LABELS.running,
   hasResult: boolean = false,
+  images: ImageAttachment[] = [],
 ) {
   if (!badge) return;
+  const normalizedImages = normalizeToolImages(images);
   const formattedArgs = formatDetailText(toolArgs || '');
   const formattedResult = formatDetailText(toolResult || '');
   badge.dataset.toolName = toolName || 'tool';
@@ -318,6 +326,8 @@ function syncToolBadgeDataset(
   badge.dataset.toolLiveOutput = badge.dataset.toolLiveOutput || '';
   badge.dataset.toolHasResult = hasResult ? 'true' : 'false';
   badge.dataset.toolStatus = toolStatus;
+  badge.dataset.toolImages = JSON.stringify(normalizedImages);
+  badge.dataset.toolImageCount = String(normalizedImages.length);
   badge.title = [toolName || 'tool', toolStatus].filter(Boolean).join(' / ');
 }
 
@@ -831,6 +841,7 @@ export function addSubagentTool(ref: SubagentPanelRef, toolName, toolId, toolArg
   updateToolBadgeState(badge, LABELS.running, 'is-running');
   syncToolCount(panel);
   syncPanelActions(panel);
+  refreshExecutionStackForPanel(panel);
   scrollDown();
 }
 
@@ -1072,6 +1083,7 @@ export function restoreSubagentHistorySnapshot(
       tool?.result,
       tool?.is_error === true,
       tool?.name || 'tool',
+      tool?.images || [],
     );
   }
 
@@ -1098,6 +1110,7 @@ export function updateSubagentToolResult(
   result,
   isError = false,
   toolName = '',
+  images: ImageAttachment[] = [],
 ) {
   const panel = resolvePanel(ref);
   if (!panel) return;
@@ -1129,6 +1142,7 @@ export function updateSubagentToolResult(
     displayResult,
     stateLabel,
     showResult,
+    images,
   );
   badge.dataset.toolLiveOutput = '';
   updateToolBadgeState(badge, stateLabel, isError ? 'is-failed' : 'is-done');
@@ -1139,6 +1153,7 @@ export function updateSubagentToolResult(
 
   syncToolCount(panel);
   syncPanelActions(panel);
+  refreshExecutionStackForPanel(panel);
 
   if (isError) {
     pulseFocus(badge);

@@ -1,5 +1,145 @@
 use super::*;
 use crate::config::S3Config;
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+fn find_http_headers_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn read_http_put(stream: &mut std::net::TcpStream) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .expect("read timeout");
+    let mut request = Vec::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        let read = stream.read(&mut chunk).expect("request bytes");
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+        let Some(headers_end) = find_http_headers_end(&request) else {
+            continue;
+        };
+        let headers = String::from_utf8_lossy(&request[..headers_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap_or(0);
+        if request.len() >= headers_end + 4 + content_length {
+            break;
+        }
+    }
+}
+
+fn spawn_s3_put_server(statuses: Vec<&'static str>) -> (String, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let address = listener.local_addr().expect("address");
+    let handle = thread::spawn(move || {
+        for status in statuses {
+            let (mut stream, _) = listener.accept().expect("upload connection");
+            read_http_put(&mut stream);
+            let response =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            stream.write_all(response.as_bytes()).expect("response");
+            stream.flush().expect("flush");
+        }
+    });
+    (format!("http://{address}"), handle)
+}
+
+fn spawn_blocking_s3_put_server(
+    expected: usize,
+) -> (String, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let address = listener.local_addr().expect("address");
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_for_server = Arc::clone(&accepted);
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let release_for_server = Arc::clone(&release);
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut workers = Vec::new();
+        while workers.len() < expected && Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // On Windows an accepted socket can still behave as
+                    // nonblocking when the listener is nonblocking. The test
+                    // reader expects blocking semantics while request bytes
+                    // arrive in multiple chunks.
+                    stream
+                        .set_nonblocking(false)
+                        .expect("blocking upload connection");
+                    accepted_for_server.fetch_add(1, Ordering::SeqCst);
+                    let release = Arc::clone(&release_for_server);
+                    workers.push(thread::spawn(move || {
+                        read_http_put(&mut stream);
+                        let (released, wake) = &*release;
+                        let mut released = released.lock().expect("release lock");
+                        while !*released {
+                            released = wake.wait(released).expect("release wait");
+                        }
+                        stream
+                            .write_all(
+                                b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .expect("response");
+                    }));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept upload connection: {error}"),
+            }
+        }
+        let (released, wake) = &*release_for_server;
+        *released.lock().expect("release lock") = true;
+        wake.notify_all();
+        for worker in workers {
+            worker.join().expect("upload worker");
+        }
+    });
+    (format!("http://{address}"), accepted, handle)
+}
+
+fn tool_image(name: &str, data: Vec<u8>) -> ToolImageOutput {
+    ToolImageOutput {
+        data,
+        mime_type: "image/png".into(),
+        name: name.into(),
+    }
+}
+
+fn test_s3(endpoint: String) -> S3Config {
+    S3Config {
+        endpoint,
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "tool-images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    }
+}
 
 fn minimal_png() -> Vec<u8> {
     let mut data = Vec::new();
@@ -57,6 +197,119 @@ fn minimal_jpeg() -> Vec<u8> {
         0x01, 0x01, 0x11, 0x00, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x11,
         0x22, 0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x33, 0x44, 0xFF, 0xD9,
     ]
+}
+
+#[tokio::test]
+async fn upload_tool_images_preserves_order_and_keeps_base64_out_of_serialization() {
+    let (endpoint, server) = spawn_s3_put_server(vec!["200 OK", "200 OK"]);
+    let cfg = test_s3(endpoint);
+
+    let result = upload_tool_images(
+        &reqwest::Client::new(),
+        &cfg,
+        vec![
+            tool_image("first.png", minimal_png()),
+            tool_image("second.png", png_with_empty_idat_before_data()),
+        ],
+    )
+    .await;
+
+    server.join().expect("server");
+    assert!(result.warnings.is_empty());
+    assert_eq!(result.attachments.len(), 2);
+    assert_eq!(result.attachments[0].name.as_deref(), Some("first.png"));
+    assert_eq!(result.attachments[1].name.as_deref(), Some("second.png"));
+    assert!(result.attachments.iter().all(|image| image.data.is_none()));
+    let persisted = serde_json::to_string(&result.attachments).expect("serialize attachments");
+    assert!(!persisted.contains("iVBOR"));
+    assert!(!persisted.contains("\"data\""));
+}
+
+#[tokio::test]
+async fn upload_tool_image_groups_preserves_tool_association_and_global_limit() {
+    let (endpoint, server) = spawn_s3_put_server(vec!["200 OK", "200 OK"]);
+    let cfg = test_s3(endpoint);
+
+    let result = upload_tool_image_groups(
+        &reqwest::Client::new(),
+        &cfg,
+        vec![
+            vec![tool_image("first.png", minimal_png())],
+            vec![
+                tool_image("second.png", png_with_empty_idat_before_data()),
+                tool_image("skipped.png", minimal_png()),
+            ],
+        ],
+        2,
+    )
+    .await;
+
+    server.join().expect("server");
+    assert_eq!(result.attachments.len(), 2);
+    assert_eq!(result.attachments[0][0].name.as_deref(), Some("first.png"));
+    assert_eq!(result.attachments[1][0].name.as_deref(), Some("second.png"));
+    assert!(result.warnings[0].is_empty());
+    assert_eq!(result.warnings[1].len(), 1);
+    assert!(result.warnings[1][0].contains("at most 2"));
+}
+
+#[tokio::test]
+async fn upload_tool_image_groups_shares_concurrency_across_tools() {
+    let (endpoint, accepted, server) = spawn_blocking_s3_put_server(3);
+    let cfg = test_s3(endpoint);
+
+    let result = upload_tool_image_groups(
+        &reqwest::Client::new(),
+        &cfg,
+        vec![
+            vec![tool_image("first.png", minimal_png())],
+            vec![tool_image("second.png", minimal_png())],
+            vec![tool_image("third.png", minimal_png())],
+        ],
+        3,
+    )
+    .await;
+
+    server.join().expect("server");
+    assert_eq!(accepted.load(Ordering::SeqCst), 3);
+    assert!(result.warnings.iter().all(Vec::is_empty));
+    assert_eq!(result.attachments.iter().map(Vec::len).sum::<usize>(), 3);
+}
+
+#[tokio::test]
+async fn upload_tool_images_keeps_successes_when_one_upload_fails() {
+    let (endpoint, server) = spawn_s3_put_server(vec!["500 Internal Server Error", "200 OK"]);
+    let cfg = test_s3(endpoint);
+
+    let result = upload_tool_images(
+        &reqwest::Client::new(),
+        &cfg,
+        vec![
+            tool_image("first.png", minimal_png()),
+            tool_image("second.png", png_with_empty_idat_before_data()),
+        ],
+    )
+    .await;
+
+    server.join().expect("server");
+    assert_eq!(result.attachments.len(), 1);
+    assert_eq!(result.warnings.len(), 1);
+    assert!(result.warnings[0].contains("not attached"));
+}
+
+#[tokio::test]
+async fn upload_tool_images_rejects_invalid_content_without_contacting_s3() {
+    let cfg = test_s3("http://127.0.0.1:1".into());
+    let result = upload_tool_images(
+        &reqwest::Client::new(),
+        &cfg,
+        vec![tool_image("fake.png", b"not an image".to_vec())],
+    )
+    .await;
+
+    assert!(result.attachments.is_empty());
+    assert_eq!(result.warnings.len(), 1);
+    assert!(result.warnings[0].contains("valid PNG or JPEG"));
 }
 
 #[test]

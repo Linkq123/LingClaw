@@ -735,6 +735,66 @@
   overflow: auto;
 }
 
+.tool-image-gallery {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.tool-image-preview {
+  min-width: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid var(--panel-border-soft);
+  border-radius: 10px;
+  background: var(--panel-surface-alt);
+  color: var(--text);
+  cursor: zoom-in;
+  text-align: left;
+}
+
+.tool-image-preview:hover {
+  border-color: color-mix(in srgb, var(--accent2) 48%, var(--panel-border-soft));
+  background: var(--panel-hover);
+}
+
+.tool-image-preview:focus-visible {
+  outline: 2px solid var(--accent2);
+  outline-offset: 2px;
+}
+
+.tool-image-preview img {
+  display: block;
+  width: 100%;
+  height: 112px;
+  object-fit: cover;
+  background: var(--surface2);
+}
+
+.tool-image-name,
+.tool-image-error {
+  display: block;
+  padding: 7px 9px;
+  overflow: hidden;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-image-error {
+  min-height: 64px;
+  padding-top: 24px;
+  color: var(--accent-error);
+  text-align: center;
+  white-space: normal;
+}
+
+.tool-image-error[hidden] {
+  display: none;
+}
+
 /* ── Sub-agent panels ── */
 .subagent-panel {
   align-self: flex-start;

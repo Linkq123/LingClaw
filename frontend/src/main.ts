@@ -84,6 +84,9 @@ import {
   trapToolDrawerFocus,
   toggleTool,
   refreshToolPanelsLanguage,
+  previewToolImage,
+  claimToolImageCompatibilityWarning,
+  resetToolImageCompatibilityWarning,
 } from './renderers/tools.js';
 import { preloadMarkdownEngine, scheduleMarkdownRender } from './markdown.js';
 import {
@@ -1886,7 +1889,7 @@ function renderHistoryMessage(m, options: { followMarkdown?: boolean } = {}) {
         });
         break;
       }
-      addToolResult('', m.result, m.id, m.duration_ms ?? null, m.is_error === true);
+      addToolResult('', m.result, m.id, m.duration_ms ?? null, m.is_error === true, m.images || []);
       break;
     }
   }
@@ -2239,6 +2242,7 @@ function handleMessage(data) {
       break;
 
     case 'history': {
+      resetToolImageCompatibilityWarning();
       clearCompressionOutcome();
       closeToolDrawer();
       closeSubagentModal();
@@ -2315,6 +2319,7 @@ function handleMessage(data) {
       const isNewTurn = !state.busy || state.currentRoundStartedAt === 0;
       setBusy(true);
       if (isNewTurn) {
+        resetToolImageCompatibilityWarning();
         completeExecutionStack({ immediate: true });
         state.currentRoundStartedAt = performance.now();
         state.currentRoundFirstTokenAt = 0;
@@ -2551,6 +2556,7 @@ function handleMessage(data) {
           data.result,
           data.is_error,
           data.name,
+          data.images || [],
         );
         break;
       }
@@ -2564,7 +2570,14 @@ function handleMessage(data) {
         data.id,
         data.duration_ms ?? null,
         data.is_error === true,
+        data.images || [],
       );
+      break;
+
+    case 'tool_image_compatibility_warning':
+      if (claimToolImageCompatibilityWarning()) {
+        addSystem(tr('tool.compatibilityWarning'), 'info', { dismissible: true });
+      }
       break;
 
     case 'task_started':
@@ -2750,6 +2763,7 @@ const actionHandlers = {
     }
   },
   'open-tool-drawer': (el) => openToolDrawerFromHeader(el),
+  'preview-tool-image': (el) => previewToolImage(el),
   'toggle-tool': (el) => toggleTool(el),
   'toggle-execution-stack': (el) => toggleExecutionStack(el),
   'subagent-copy-summary': (el) => copySubagentSummary(el),

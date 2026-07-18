@@ -5,7 +5,7 @@ use std::{
     fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::mpsc,
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -679,7 +679,7 @@ fn convert_messages_to_anthropic_cache_control_moves_to_latest_cacheable_block()
     maybe_apply_anthropic_message_cache_control(&mut out, true);
 
     // The final user message should be promoted to text blocks and own the breakpoint.
-    let final_user_msg = &out[4];
+    let final_user_msg = out.last().expect("final user message");
     assert_eq!(final_user_msg["role"], "user");
     let final_blocks = final_user_msg["content"].as_array().unwrap();
     assert_eq!(final_blocks[0]["type"], "text");
@@ -687,7 +687,14 @@ fn convert_messages_to_anthropic_cache_control_moves_to_latest_cacheable_block()
     assert_eq!(final_blocks[0]["cache_control"]["type"], "ephemeral");
 
     // The preceding tool_result should remain untagged once a later block exists.
-    let tool_user_msg = &out[3];
+    let tool_user_msg = out
+        .iter()
+        .find(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|blocks| blocks.iter().any(|block| block["type"] == "tool_result"))
+        })
+        .expect("merged tool-result user message");
     assert_eq!(tool_user_msg["role"], "user");
     let content = tool_user_msg["content"].as_array().unwrap();
     let last_block = content.last().unwrap();
@@ -2575,6 +2582,8 @@ async fn build_gemini_body_inlines_images_and_function_declarations() {
             content: Some("describe".into()),
             images: Some(vec![ImageAttachment {
                 url: "memory://image.png".into(),
+                name: None,
+                mime_type: None,
                 s3_object_key: None,
                 s3_config_id: None,
                 cache_path: None,
@@ -3035,6 +3044,8 @@ async fn build_gemini_body_rejects_invalid_cached_image_data() {
         content: Some("describe".into()),
         images: Some(vec![ImageAttachment {
             url: "memory://bad-image".into(),
+            name: None,
+            mime_type: None,
             s3_object_key: None,
             s3_config_id: None,
             cache_path: None,
@@ -4588,6 +4599,609 @@ fn transient_error_rejects_unrecognized() {
 
 // ── Image attachment conversion tests ──────────────────────────
 
+const TOOL_IMAGE_TEST_PNG_BASE64: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+
+fn tool_image_test_attachment(url: &str) -> ImageAttachment {
+    ImageAttachment {
+        url: url.to_string(),
+        name: Some("chart.png".into()),
+        mime_type: Some("image/png".into()),
+        s3_object_key: None,
+        s3_config_id: None,
+        cache_path: None,
+        data: None,
+    }
+}
+
+fn tool_image_test_messages() -> Vec<ChatMessage> {
+    vec![
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![
+                ToolCall {
+                    id: "call_1".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "capture_chart".into(),
+                        arguments: r#"{"page":1}"#.into(),
+                    },
+                },
+                ToolCall {
+                    id: "call_2".into(),
+                    call_type: "function".into(),
+                    gemini_thought_signature: None,
+                    function: FunctionCall {
+                        name: "capture_chart".into(),
+                        arguments: r#"{"page":2}"#.into(),
+                    },
+                },
+            ]),
+            tool_call_id: None,
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("first chart captured".into()),
+            images: Some(vec![tool_image_test_attachment(
+                "https://storage.example.test/chart-1.png",
+            )]),
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("call_1".into()),
+            timestamp: None,
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("second chart captured".into()),
+            images: Some(vec![tool_image_test_attachment(
+                "https://storage.example.test/chart-2.png",
+            )]),
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("call_2".into()),
+            timestamp: None,
+        },
+    ]
+}
+
+fn tool_image_test_base64_map() -> std::collections::HashMap<String, String> {
+    [
+        "https://storage.example.test/chart-1.png",
+        "https://storage.example.test/chart-2.png",
+    ]
+    .into_iter()
+    .map(|url| (url.to_string(), TOOL_IMAGE_TEST_PNG_BASE64.to_string()))
+    .collect()
+}
+
+#[test]
+fn tool_images_follow_complete_openai_chat_tool_batch() {
+    let out = convert_messages_to_openai_with_options(&tool_image_test_messages(), false, None);
+
+    assert_eq!(out.len(), 4);
+    assert_eq!(out[1]["role"], "tool");
+    assert_eq!(out[2]["role"], "tool");
+    assert_eq!(out[3]["role"], "user");
+    let content = out[3]["content"].as_array().expect("visual content parts");
+    assert!(content[0]["text"].as_str().unwrap().contains("Untrusted"));
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[2]["image_url"]["url"],
+        "https://storage.example.test/chart-2.png"
+    );
+}
+
+#[test]
+fn tool_images_follow_function_outputs_for_openai_responses() {
+    let out = convert_messages_to_openai_responses_input(&tool_image_test_messages());
+
+    let first_output = out
+        .iter()
+        .position(|item| item["type"] == "function_call_output")
+        .expect("function output");
+    let first_image = out
+        .iter()
+        .position(|item| {
+            item["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| part["type"] == "input_image"))
+        })
+        .expect("visual observation");
+    assert!(first_output < first_image);
+    assert!(
+        out[first_image]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Untrusted")
+    );
+}
+
+#[test]
+fn anthropic_groups_tool_results_and_nests_images_in_original_result() {
+    let (_, out) = convert_messages_to_anthropic(&tool_image_test_messages());
+
+    assert_eq!(out.len(), 2);
+    let results = out[1]["content"].as_array().expect("grouped tool results");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["type"], "tool_result");
+    assert_eq!(results[1]["tool_use_id"], "call_2");
+    let first_content = results[0]["content"].as_array().expect("result blocks");
+    assert!(
+        first_content[1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Untrusted")
+    );
+    assert_eq!(first_content[2]["type"], "image");
+    assert_eq!(
+        first_content[2]["source"]["url"],
+        "https://storage.example.test/chart-1.png"
+    );
+}
+
+#[test]
+fn gemini_places_all_function_responses_before_tool_inline_data() {
+    let (_, contents) =
+        convert_messages_to_gemini(&tool_image_test_messages(), &tool_image_test_base64_map())
+            .expect("tool images should convert");
+
+    let parts = contents[1]["parts"]
+        .as_array()
+        .expect("tool response parts");
+    let function_positions = parts
+        .iter()
+        .enumerate()
+        .filter_map(|(index, part)| part.get("functionResponse").map(|_| index))
+        .collect::<Vec<_>>();
+    let first_inline = parts
+        .iter()
+        .position(|part| part.get("inlineData").is_some())
+        .expect("inline image");
+    assert_eq!(function_positions, vec![0, 1]);
+    assert!(function_positions.iter().all(|index| *index < first_inline));
+    assert_eq!(parts[first_inline]["inlineData"]["mimeType"], "image/png");
+}
+
+#[test]
+fn ollama_places_visual_observation_after_complete_tool_batch() {
+    let out =
+        convert_messages_to_ollama(&tool_image_test_messages(), &tool_image_test_base64_map());
+
+    assert_eq!(out.len(), 4);
+    assert_eq!(out[1]["role"], "tool");
+    assert_eq!(out[2]["role"], "tool");
+    assert_eq!(out[3]["role"], "user");
+    assert!(out[3]["content"].as_str().unwrap().contains("Untrusted"));
+    assert_eq!(out[3]["images"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn base64_providers_degrade_missing_tool_images_to_text() {
+    let messages = tool_image_test_messages();
+    let missing = std::collections::HashMap::new();
+
+    let ollama = convert_messages_to_ollama(&messages, &missing);
+    assert_eq!(ollama.len(), 4);
+    assert!(ollama[3].get("images").is_none());
+    assert!(
+        ollama[3]["content"]
+            .as_str()
+            .unwrap()
+            .contains("2 tool image(s) could not be attached")
+    );
+
+    let (_, gemini) =
+        convert_messages_to_gemini(&messages, &missing).expect("missing tool images are nonfatal");
+    assert!(
+        gemini[1]["parts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .any(|text| text.contains("tool image(s) could not be attached"))
+    );
+}
+
+#[test]
+fn gemini_degrades_corrupt_tool_images_without_aborting_the_request() {
+    let messages = tool_image_test_messages();
+    let mut images = tool_image_test_base64_map();
+    images.insert(
+        "https://storage.example.test/chart-1.png".to_string(),
+        base64::engine::general_purpose::STANDARD.encode(b"not an image"),
+    );
+
+    let (_, gemini) = convert_messages_to_gemini(&messages, &images)
+        .expect("corrupt tool images should be nonfatal");
+    let parts = gemini[1]["parts"].as_array().expect("tool result parts");
+
+    assert_eq!(
+        parts
+            .iter()
+            .filter(|part| part.get("inlineData").is_some())
+            .count(),
+        1
+    );
+    assert!(
+        parts
+            .iter()
+            .filter_map(|part| part["text"].as_str())
+            .any(|text| text.contains("1 tool image(s) could not be attached"))
+    );
+}
+
+#[test]
+fn openai_tool_image_fallback_classifier_is_narrow_and_strip_is_tool_only() {
+    assert!(is_openai_tool_image_compatibility_error(
+        "API 400 Bad Request: image_url is unsupported with tool messages"
+    ));
+    assert!(is_openai_tool_image_compatibility_error(
+        "API 422 Unprocessable Entity: multimodal content part is invalid after function_call"
+    ));
+    assert!(is_openai_tool_image_compatibility_error(
+        "API 400 Bad Request: image_url is invalid for role 'tool'"
+    ));
+    assert!(is_openai_tool_image_compatibility_error(
+        "API 400 Bad Request: invalid image_url in messages[3]"
+    ));
+    assert!(is_openai_tool_image_compatibility_error(
+        "API 422 Unprocessable Entity: invalid image content part"
+    ));
+    assert!(is_openai_tool_image_compatibility_error(
+        "API 422 Unprocessable Entity: this model does not support image inputs"
+    ));
+    assert!(!is_openai_tool_image_compatibility_error(
+        "API 401 Unauthorized: image_url credentials rejected for tool messages"
+    ));
+    assert!(!is_openai_tool_image_compatibility_error(
+        "API 429 Too Many Requests: image_url tool request throttled"
+    ));
+    assert!(!is_openai_tool_image_compatibility_error(
+        "API 400 Bad Request: invalid JSON schema"
+    ));
+    assert!(!is_openai_tool_image_compatibility_error(
+        "API 400 Bad Request: invalid tool_call schema"
+    ));
+    assert!(!is_openai_tool_image_compatibility_error(
+        "API 400 Bad Request: model provisioning is still pending"
+    ));
+
+    let mut messages = tool_image_test_messages();
+    assert!(strip_tool_images_for_compatibility(&mut messages));
+    assert!(messages[1].images.is_none());
+    assert!(messages[2].images.is_none());
+    assert!(
+        messages[1]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("Tool images are unavailable")
+    );
+}
+
+#[test]
+fn text_only_model_filter_removes_historical_images_without_mutating_text() {
+    let mut messages = tool_image_test_messages();
+    messages.insert(
+        0,
+        ChatMessage {
+            role: "user".into(),
+            content: Some("Earlier user attachment".into()),
+            images: Some(vec![tool_image_test_attachment(
+                "https://storage.example.test/user.png",
+            )]),
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    );
+
+    assert_eq!(strip_images_for_unsupported_model(&mut messages), 3);
+    assert!(messages.iter().all(|message| message.images.is_none()));
+    assert!(
+        messages[0]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("current text-only model")
+    );
+    assert!(
+        messages[2]
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("Tool images from an earlier run")
+    );
+    let openai = convert_messages_to_openai_with_options(&messages, false, None);
+    assert!(
+        !serde_json::to_string(&openai)
+            .unwrap()
+            .contains("image_url")
+    );
+}
+
+#[test]
+fn simple_llm_image_policy_preserves_images_for_subagent_finalization() {
+    let messages = tool_image_test_messages();
+
+    let auxiliary = prepare_simple_llm_messages(&messages, false);
+    assert!(
+        auxiliary
+            .iter()
+            .filter(|message| message.role == "tool")
+            .all(|message| message.images.is_none())
+    );
+
+    let finalization = prepare_simple_llm_messages(&messages, true);
+    assert!(
+        finalization
+            .iter()
+            .filter(|message| message.role == "tool")
+            .all(|message| message
+                .images
+                .as_ref()
+                .is_some_and(|images| !images.is_empty()))
+    );
+}
+
+#[test]
+fn openai_chat_retries_tool_images_once_with_text_only_context() {
+    let (api_base, request_rx, handle) = spawn_http_server_with_responses(vec![
+        MockHttpResponse {
+            status: "400 Bad Request",
+            content_type: "application/json",
+            body: r#"{"error":{"message":"image_url is unsupported"}}"#.into(),
+        },
+        MockHttpResponse {
+            status: "200 OK",
+            content_type: "text/event-stream",
+            body: concat!(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"fallback ok\"}}]}\n\n",
+                "data: [DONE]\n\n"
+            )
+            .into(),
+        },
+    ]);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base,
+        api_key: "test-key".into(),
+        model_id: "compatible-model".into(),
+        reasoning: false,
+        thinking_format: None,
+        openai_responses_reasoning_summary: None,
+        max_tokens: Some(64),
+        context_window: 128_000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let mut messages = tool_image_test_messages();
+    messages.insert(
+        0,
+        ChatMessage {
+            role: "system".into(),
+            content: Some(
+                "Available tools:\n**view_image** — Read a workspace image.\n**read_file** — Read text."
+                    .into(),
+            ),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    );
+    let extra_tools = vec![json!({
+        "type": "function",
+        "function": {
+            "name": "view_image",
+            "description": "Read an image",
+            "parameters": {"type": "object"},
+        },
+    })];
+    let (tx, mut rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+    let live_tx: LiveTx = tx;
+
+    let response = runtime
+        .block_on(async {
+            call_llm_stream_openai(
+                &http,
+                &resolved,
+                &messages,
+                None,
+                &live_tx,
+                "medium",
+                &extra_tools,
+                false,
+                0,
+            )
+            .await
+        })
+        .expect("the precise compatibility error should retry once");
+
+    let first = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("initial request");
+    let second = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("degraded request");
+    handle.join().expect("server thread should join");
+    assert!(first.body.contains("image_url"));
+    assert!(first.body.contains("view_image"));
+    assert!(!second.body.contains("image_url"));
+    assert!(!second.body.contains("view_image"));
+    assert!(second.body.contains("Tool images are unavailable"));
+    assert_eq!(response.message.content.as_deref(), Some("fallback ok"));
+    assert!(response.tool_image_compatibility_fallback);
+
+    let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "tool_image_compatibility_warning")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn openai_chat_reports_image_fallback_when_degraded_request_fails_transiently() {
+    let (api_base, request_rx, handle) = spawn_http_server_with_responses(vec![
+        MockHttpResponse {
+            status: "400 Bad Request",
+            content_type: "application/json",
+            body: r#"{"error":{"message":"image_url is unsupported with tool messages"}}"#.into(),
+        },
+        MockHttpResponse {
+            status: "503 Service Unavailable",
+            content_type: "application/json",
+            body: r#"{"error":{"message":"temporarily unavailable"}}"#.into(),
+        },
+    ]);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base,
+        api_key: "test-key".into(),
+        model_id: "compatible-model".into(),
+        reasoning: false,
+        thinking_format: None,
+        openai_responses_reasoning_summary: None,
+        max_tokens: Some(64),
+        context_window: 128_000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let messages = tool_image_test_messages();
+    let extra_tools = vec![json!({
+        "type": "function",
+        "function": {
+            "name": "view_image",
+            "description": "Read an image",
+            "parameters": {"type": "object"},
+        },
+    })];
+    let (live_tx, _live_rx) = tokio::sync::mpsc::channel(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+
+    let outcome = runtime.block_on(call_llm_stream_openai_attempt(
+        &http,
+        &resolved,
+        &messages,
+        None,
+        &live_tx,
+        "medium",
+        &extra_tools,
+        false,
+        0,
+    ));
+
+    let first = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("initial request");
+    let second = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("degraded request");
+    handle.join().expect("server thread should join");
+    assert!(first.body.contains("image_url"));
+    assert!(!second.body.contains("image_url"));
+    assert!(!second.body.contains("view_image"));
+    assert!(outcome.tool_image_compatibility_fallback);
+    let error = match outcome.result {
+        Err(error) => error,
+        Ok(_) => panic!("the degraded request should preserve its transient failure"),
+    };
+    assert!(is_transient_llm_error(&error));
+}
+
+#[test]
+fn openai_simple_retries_tool_images_once_with_text_only_context() {
+    let (api_base, request_rx, handle) = spawn_http_server_with_responses(vec![
+        MockHttpResponse {
+            status: "400 Bad Request",
+            content_type: "application/json",
+            body: r#"{"error":{"message":"image_url is unsupported with tool messages"}}"#.into(),
+        },
+        MockHttpResponse {
+            status: "200 OK",
+            content_type: "application/json",
+            body: r#"{"choices":[{"message":{"content":"fallback final"}}],"usage":{"prompt_tokens":21,"completion_tokens":4}}"#.into(),
+        },
+    ]);
+    let runtime = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let http = reqwest::Client::new();
+    let resolved = ResolvedModel {
+        provider: Provider::OpenAI,
+        api_base,
+        api_key: "test-key".into(),
+        model_id: "compatible-model".into(),
+        reasoning: false,
+        thinking_format: None,
+        openai_responses_reasoning_summary: None,
+        max_tokens: Some(64),
+        context_window: 128_000,
+        stream_include_usage: false,
+        anthropic_prompt_caching: false,
+    };
+    let mut messages = tool_image_test_messages();
+    messages.insert(
+        0,
+        ChatMessage {
+            role: "system".into(),
+            content: Some("Available tools:\n**view_image** — Read a workspace image.".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: None,
+            timestamp: None,
+        },
+    );
+
+    let response = runtime
+        .block_on(call_llm_simple_with_usage_inner(
+            &http,
+            &resolved,
+            &messages,
+            Path::new("."),
+            None,
+            "off",
+            0,
+            true,
+        ))
+        .expect("the forced-final compatibility request should retry once");
+
+    let first = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("initial request");
+    let second = request_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("degraded request");
+    handle.join().expect("server thread should join");
+    assert!(first.body.contains("image_url"));
+    assert!(first.body.contains("view_image"));
+    assert!(!second.body.contains("image_url"));
+    assert!(!second.body.contains("view_image"));
+    assert!(second.body.contains("Tool images are unavailable"));
+    assert_eq!(response.content, "fallback final");
+    assert_eq!(response.input_tokens, Some(21));
+    assert_eq!(response.output_tokens, Some(4));
+    assert!(response.tool_image_compatibility_fallback);
+}
+
 #[test]
 fn convert_messages_to_openai_user_with_images() {
     let messages = vec![ChatMessage {
@@ -4596,6 +5210,8 @@ fn convert_messages_to_openai_user_with_images() {
         images: Some(vec![
             ImageAttachment {
                 url: "https://example.com/a.png".into(),
+                name: None,
+                mime_type: None,
                 s3_object_key: None,
                 s3_config_id: None,
                 cache_path: None,
@@ -4603,6 +5219,8 @@ fn convert_messages_to_openai_user_with_images() {
             },
             ImageAttachment {
                 url: "https://example.com/b.jpg".into(),
+                name: None,
+                mime_type: None,
                 s3_object_key: None,
                 s3_config_id: None,
                 cache_path: None,
@@ -4637,6 +5255,8 @@ fn convert_messages_to_openai_strips_images_when_tool_messages_present() {
             content: Some("describe this".into()),
             images: Some(vec![ImageAttachment {
                 url: "https://example.com/a.png".into(),
+                name: None,
+                mime_type: None,
                 s3_object_key: None,
                 s3_config_id: None,
                 cache_path: None,
@@ -4698,6 +5318,8 @@ fn convert_messages_to_anthropic_user_with_images() {
         content: Some("what is this?".into()),
         images: Some(vec![ImageAttachment {
             url: "https://example.com/photo.png".into(),
+            name: None,
+            mime_type: None,
             s3_object_key: None,
             s3_config_id: None,
             cache_path: None,
@@ -4730,6 +5352,8 @@ fn convert_messages_to_ollama_user_with_images() {
         images: Some(vec![
             ImageAttachment {
                 url: "https://example.com/x.png".into(),
+                name: None,
+                mime_type: None,
                 s3_object_key: None,
                 s3_config_id: None,
                 cache_path: Some("C:/tmp/x.b64".into()),
@@ -4737,6 +5361,8 @@ fn convert_messages_to_ollama_user_with_images() {
             },
             ImageAttachment {
                 url: "https://example.com/y.jpg".into(),
+                name: None,
+                mime_type: None,
                 s3_object_key: None,
                 s3_config_id: None,
                 cache_path: Some("C:/tmp/y.b64".into()),
@@ -4777,6 +5403,8 @@ fn convert_messages_to_ollama_user_with_images_missing_b64() {
         content: Some("describe".into()),
         images: Some(vec![ImageAttachment {
             url: "https://example.com/x.png".into(),
+            name: None,
+            mime_type: None,
             s3_object_key: None,
             s3_config_id: None,
             cache_path: None,
@@ -4809,6 +5437,8 @@ async fn fetch_images_base64_reads_persisted_cache_without_refetch() {
         content: Some("describe".into()),
         images: Some(vec![ImageAttachment {
             url: "https://example.com/cached.png".into(),
+            name: None,
+            mime_type: None,
             s3_object_key: None,
             s3_config_id: None,
             cache_path: Some(cache_path),
@@ -4841,6 +5471,8 @@ async fn fetch_images_base64_skips_uncached_historical_fetch_failures() {
         content: Some("describe".into()),
         images: Some(vec![ImageAttachment {
             url: "http://127.0.0.1/stale.png".into(),
+            name: None,
+            mime_type: None,
             s3_object_key: None,
             s3_config_id: None,
             cache_path: None,
@@ -4884,6 +5516,8 @@ async fn fetch_images_base64_trusted_uploaded_urls_bypass_ssrf_on_cache_miss() {
         content: Some("describe".into()),
         images: Some(vec![ImageAttachment {
             url: "https://expired.example.test/old.png".into(),
+            name: None,
+            mime_type: None,
             s3_object_key: Some("images/2026/demo.png".into()),
             s3_config_id: None,
             cache_path: None,
@@ -4953,6 +5587,8 @@ fn materialize_image_urls_refreshes_uploaded_s3_urls() {
         content: Some("describe".into()),
         images: Some(vec![ImageAttachment {
             url: "https://expired.example.test/old.png".into(),
+            name: None,
+            mime_type: None,
             s3_object_key: Some("images/2026/demo.png".into()),
             s3_config_id: None,
             cache_path: None,
@@ -4994,6 +5630,8 @@ fn materialize_image_urls_drops_stale_s3_history_without_blocking_text() {
         images: Some(vec![
             ImageAttachment {
                 url: "https://expired.example.test/old.png".into(),
+                name: None,
+                mime_type: None,
                 s3_object_key: Some("images/2026/demo.png".into()),
                 s3_config_id: Some(original_config_id),
                 cache_path: None,
@@ -5001,6 +5639,8 @@ fn materialize_image_urls_drops_stale_s3_history_without_blocking_text() {
             },
             ImageAttachment {
                 url: "https://example.com/remote.png".into(),
+                name: None,
+                mime_type: None,
                 s3_object_key: None,
                 s3_config_id: None,
                 cache_path: None,
@@ -5049,6 +5689,8 @@ fn materialize_image_urls_replaces_stale_image_only_history_with_text() {
         content: Some(String::new()),
         images: Some(vec![ImageAttachment {
             url: "https://expired.example.test/old.png".into(),
+            name: None,
+            mime_type: None,
             s3_object_key: Some("images/2026/demo.png".into()),
             s3_config_id: Some(crate::image_uploads::s3_config_id(&original_cfg)),
             cache_path: None,

@@ -1620,6 +1620,7 @@ async fn execute_tool_with_live_output_drains_events_before_return() {
         &workspace,
         false,
         None,
+        None,
     )
     .await;
 
@@ -1685,6 +1686,7 @@ async fn execute_tool_with_live_output_preserves_queued_events() {
             &workspace,
             false,
             None,
+            None,
         ),
     )
     .await
@@ -1747,6 +1749,7 @@ async fn execute_tool_with_live_output_returns_when_live_queue_is_full() {
             &workspace,
             false,
             None,
+            None,
         ),
     )
     .await
@@ -1797,6 +1800,7 @@ async fn execute_tool_with_live_output_drops_extra_events_when_local_live_queue_
         &reqwest::Client::new(),
         &workspace,
         false,
+        None,
         None,
     )
     .await;
@@ -2313,6 +2317,8 @@ async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
+        tool_images_disabled: false,
+        tool_images_attached_in_batch: 0,
     };
 
     apply_run_cancel_outcome(&ctx, &mut phase_state).await;
@@ -2431,6 +2437,8 @@ fn phase_state_for_analyze_test() -> AgentPhaseState {
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
+        tool_images_disabled: false,
+        tool_images_attached_in_batch: 0,
     }
 }
 
@@ -2986,6 +2994,33 @@ async fn build_plan_only_tools_includes_only_read_only_builtins() {
     assert!(!names.contains(&crate::tools::TOOL_NAME_PATCH_FILE));
     assert!(!names.contains(&crate::tools::TOOL_NAME_DELETE_FILE));
     assert!(!names.contains(&crate::tools::TOOL_NAME_TODOS));
+    assert!(!names.contains(&crate::tools::TOOL_NAME_VIEW_IMAGE));
+
+    let unavailable_plan_names = available_tool_names_for_plan(&config, &workspace, false);
+    let available_plan_names = available_tool_names_for_plan(&config, &workspace, true);
+    let unavailable_read_only_names =
+        available_tool_names_for_plan_only(&config, &workspace, false);
+    let available_read_only_names = available_tool_names_for_plan_only(&config, &workspace, true);
+    assert!(
+        !unavailable_plan_names
+            .iter()
+            .any(|name| name == crate::tools::TOOL_NAME_VIEW_IMAGE)
+    );
+    assert!(
+        available_plan_names
+            .iter()
+            .any(|name| name == crate::tools::TOOL_NAME_VIEW_IMAGE)
+    );
+    assert!(
+        !unavailable_read_only_names
+            .iter()
+            .any(|name| name == crate::tools::TOOL_NAME_VIEW_IMAGE)
+    );
+    assert!(
+        available_read_only_names
+            .iter()
+            .any(|name| name == crate::tools::TOOL_NAME_VIEW_IMAGE)
+    );
 
     let _ = std::fs::remove_dir_all(&workspace);
 }
@@ -3113,13 +3148,128 @@ async fn execute_tool_call_rejects_session_control_in_plan_only_mode() {
         },
     };
 
-    let (outcome, effective_args) = execute_tool_call(&ctx, &mut phase_state, &tc)
+    let image_budget =
+        tools::mcp::ToolImageBudget::new(crate::image_uploads::MAX_IMAGE_UPLOAD_FILES);
+    let (outcome, effective_args) = execute_tool_call(&ctx, &mut phase_state, &tc, &image_budget)
         .await
         .expect("plan-only session_control rejection should be recorded");
 
     assert!(outcome.is_error);
     assert!(outcome.output.contains("rejected by plan mode"));
     assert!(effective_args.is_none());
+    let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn parallel_tool_timeout_pauses_while_waiting_for_ordered_image_budget() {
+    let image_budget = tools::mcp::ToolImageBudget::new(1);
+    let first = image_budget.for_call(0);
+    let second = image_budget.for_call(1);
+    let image_wait = second.subscribe_waiting();
+    let release_first = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        drop(first);
+    });
+    let future = async move {
+        second.wait_for_turn().await;
+        tools::ToolOutcome {
+            output: "completed after ordered image wait".into(),
+            is_error: false,
+            duration_ms: 0,
+            subagent_snapshot: None,
+            images: Vec::new(),
+        }
+    };
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let cancel = CancellationToken::new();
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        run_tool_with_feedback_with_image_wait(
+            &live_tx,
+            &cancel,
+            "call-2",
+            tools::TOOL_NAME_VIEW_IMAGE,
+            Some(Duration::from_millis(30)),
+            image_wait,
+            future,
+        ),
+    )
+    .await
+    .expect("ordered budget wait should not consume the tool timeout");
+    release_first.await.expect("release task should finish");
+
+    match result {
+        ToolRunState::Completed(outcome) => {
+            assert!(!outcome.is_error);
+            assert_eq!(outcome.output, "completed after ordered image wait");
+        }
+        ToolRunState::Abort => panic!("tool should not be cancelled"),
+    }
+}
+
+#[tokio::test]
+async fn run_act_phase_rejects_unavailable_view_image_in_parallel_batch() {
+    let state = Arc::new(test_app_state());
+    let workspace = temp_workspace("parallel-view-image-unavailable");
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    std::fs::write(workspace.join("note.txt"), "parallel read succeeded")
+        .expect("fixture should be written");
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, _live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: MAIN_SESSION_ID,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state.cycle_workspace = workspace.clone();
+    phase_state.react_ctx.transition_to_act();
+    phase_state.pending_tool_calls = vec![
+        ToolCall {
+            id: "call-view-image".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: crate::tools::TOOL_NAME_VIEW_IMAGE.into(),
+                arguments: r#"{"path":"missing.png"}"#.into(),
+            },
+        },
+        ToolCall {
+            id: "call-read-file".into(),
+            call_type: "function".into(),
+            gemini_thought_signature: None,
+            function: FunctionCall {
+                name: crate::tools::TOOL_NAME_READ_FILE.into(),
+                arguments: r#"{"path":"note.txt"}"#.into(),
+            },
+        },
+    ];
+
+    assert!(matches!(
+        run_act_phase(&ctx, &mut phase_state).await,
+        AgentPhaseControl::Continue
+    ));
+    assert_eq!(phase_state.collected_results.len(), 2);
+    assert!(phase_state.collected_results[0].is_error);
+    assert!(
+        phase_state.collected_results[0]
+            .result
+            .contains("requires an image-capable model")
+    );
+    assert!(
+        phase_state.collected_results[1]
+            .result
+            .contains("parallel read succeeded")
+    );
+
     let _ = std::fs::remove_dir_all(&workspace);
 }
 
@@ -3323,7 +3473,9 @@ async fn execute_tool_call_rejects_mutating_tools_in_plan_only_mode() {
         },
     };
 
-    let (outcome, effective_args) = execute_tool_call(&ctx, &mut phase_state, &tc)
+    let image_budget =
+        tools::mcp::ToolImageBudget::new(crate::image_uploads::MAX_IMAGE_UPLOAD_FILES);
+    let (outcome, effective_args) = execute_tool_call(&ctx, &mut phase_state, &tc, &image_budget)
         .await
         .expect("plan-only rejection should be recorded as a tool outcome");
 
@@ -3905,6 +4057,8 @@ async fn prepare_analyze_snapshot_applies_global_dynamic_budget_across_sections(
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
+        tool_images_disabled: false,
+        tool_images_attached_in_batch: 0,
     };
 
     phase_state.working_state.seed_from_query(Some(
@@ -4041,6 +4195,8 @@ async fn prepare_analyze_snapshot_preserves_todos_when_optional_sections_overflo
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
+        tool_images_disabled: false,
+        tool_images_attached_in_batch: 0,
     };
 
     prepare_analyze_snapshot(&ctx, &mut phase_state)
@@ -4168,6 +4324,8 @@ async fn prepare_analyze_snapshot_resets_runtime_auto_state_for_new_goal() {
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
+        tool_images_disabled: false,
+        tool_images_attached_in_batch: 0,
     };
     phase_state
         .working_state
@@ -4299,6 +4457,8 @@ async fn update_working_state_keeps_results_attached_to_their_original_query() {
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
+        tool_images_disabled: false,
+        tool_images_attached_in_batch: 0,
     };
 
     update_working_state(&ctx, &mut phase_state, &[]).await;
@@ -4408,6 +4568,8 @@ async fn update_working_state_reuses_same_cycle_task_memory_selection() {
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
+        tool_images_disabled: false,
+        tool_images_attached_in_batch: 0,
     };
 
     prepare_analyze_snapshot(&ctx, &mut phase_state)
@@ -4574,6 +4736,8 @@ async fn update_working_state_refreshes_task_memory_after_state_changes() {
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
+        tool_images_disabled: false,
+        tool_images_attached_in_batch: 0,
     };
 
     update_working_state(&ctx, &mut phase_state, &[]).await;
@@ -4664,6 +4828,8 @@ async fn prepare_analyze_snapshot_injects_fresh_task_state_each_time() {
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
+        tool_images_disabled: false,
+        tool_images_attached_in_batch: 0,
     };
 
     phase_state
@@ -4825,6 +4991,8 @@ async fn prepare_analyze_snapshot_injects_retrieved_task_memory() {
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
+        tool_images_disabled: false,
+        tool_images_attached_in_batch: 0,
     };
 
     prepare_analyze_snapshot(&ctx, &mut phase_state)
@@ -4937,6 +5105,8 @@ async fn prepare_analyze_snapshot_injects_agent_recommendations_and_delegation_g
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
+        tool_images_disabled: false,
+        tool_images_attached_in_batch: 0,
     };
 
     phase_state.working_state.seed_from_query(Some(
@@ -5087,6 +5257,8 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
+        tool_images_disabled: false,
+        tool_images_attached_in_batch: 0,
     };
 
     let response = providers::LlmResponse {
@@ -5121,6 +5293,7 @@ async fn apply_llm_response_persists_multi_tool_assistant_with_thinking() {
         },
         input_tokens: Some(123),
         output_tokens: Some(45),
+        tool_image_compatibility_fallback: false,
     };
 
     apply_llm_response(
@@ -5175,11 +5348,96 @@ fn test_s3_config() -> S3Config {
 fn test_image_attachment() -> ImageAttachment {
     ImageAttachment {
         url: "https://example.test/image.png".to_string(),
+        name: None,
+        mime_type: None,
         s3_object_key: None,
         s3_config_id: None,
         cache_path: None,
         data: None,
     }
+}
+
+#[tokio::test]
+async fn canceled_tool_image_upload_records_text_result_before_breaking() {
+    let mut config = test_config();
+    config.model = "openai/vision-model".to_string();
+    config.s3 = Some(test_s3_config());
+    config.providers.insert(
+        "openai".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "test-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![JsonModelEntry {
+                id: "vision-model".to_string(),
+                input: Some(vec!["text".to_string(), "image".to_string()]),
+                ..Default::default()
+            }],
+        },
+    );
+    let state = Arc::new(test_app_state_with_config(config));
+    let session_id = "tool-image-cancel".to_string();
+    state.sessions.lock().await.insert(
+        session_id.clone(),
+        test_session(&session_id, "Tool Image Cancel", None),
+    );
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    run_cancel.cancel();
+    let (live_tx, live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    drop(live_rx);
+    let config = state.config();
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: Arc::clone(&config),
+        model: config.model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    let tool_call = ToolCall {
+        id: "call-image-cancel".to_string(),
+        call_type: "function".to_string(),
+        gemini_thought_signature: None,
+        function: FunctionCall {
+            name: tools::TOOL_NAME_VIEW_IMAGE.to_string(),
+            arguments: r#"{"path":"chart.png"}"#.to_string(),
+        },
+    };
+    let result = tools::ToolOutcome {
+        output: "Image read successfully.".to_string(),
+        is_error: false,
+        duration_ms: 12,
+        subagent_snapshot: None,
+        images: vec![tools::ToolImageOutput {
+            data: vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+            mime_type: "image/png".to_string(),
+            name: "chart.png".to_string(),
+        }],
+    };
+
+    let control = record_tool_result(&ctx, &mut phase_state, &tool_call, result, None).await;
+
+    assert!(matches!(control, AgentPhaseControl::Break));
+    assert!(phase_state.run_detached);
+    assert_eq!(phase_state.collected_results.len(), 1);
+    let sessions = state.sessions.lock().await;
+    let session = sessions.get(&session_id).expect("session should exist");
+    let persisted = session
+        .messages
+        .last()
+        .expect("completed tool result should be persisted");
+    assert_eq!(persisted.role, "tool");
+    assert_eq!(persisted.tool_call_id.as_deref(), Some("call-image-cancel"));
+    assert!(persisted.images.is_none());
+    let content = persisted.content.as_deref().unwrap_or_default();
+    assert!(content.contains("Image read successfully."));
+    assert!(content.contains("run ended before upload completed"));
+    assert_eq!(session.tool_calls_count, 1);
 }
 
 #[test]
@@ -5240,6 +5498,95 @@ fn select_analyze_model_uses_fast_for_simple_text_turn() {
 
     assert_eq!(model, "openai/gpt-4o-mini");
     assert_eq!(role, crate::context::USAGE_ROLE_FAST);
+}
+
+#[test]
+fn tool_image_capability_follows_primary_consumer_after_fast_tool_call() {
+    let mut config = test_config();
+    config.model = "openai/gpt-4o".to_string();
+    config.fast_model = Some("openai/gpt-4o-mini".to_string());
+    config.s3 = Some(test_s3_config());
+    config.providers.insert(
+        "openai".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "test-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![
+                JsonModelEntry {
+                    id: "gpt-4o".to_string(),
+                    input: Some(vec!["text".to_string(), "image".to_string()]),
+                    ..Default::default()
+                },
+                JsonModelEntry {
+                    id: "gpt-4o-mini".to_string(),
+                    input: Some(vec!["text".to_string()]),
+                    ..Default::default()
+                },
+            ],
+        },
+    );
+
+    let (tool_call_model, _) = select_analyze_model(
+        &config,
+        &config.model,
+        config.fast_model.as_deref(),
+        0,
+        false,
+        Some("hello"),
+        false,
+    );
+
+    assert_eq!(tool_call_model, "openai/gpt-4o-mini");
+    assert!(!config.model_supports_image(&tool_call_model));
+    assert!(tool_images_available_for_consumer(
+        &config,
+        &config.model,
+        false
+    ));
+    assert!(!tool_images_available_for_consumer(
+        &config,
+        &config.model,
+        true
+    ));
+
+    config.providers.insert(
+        "openai".to_string(),
+        JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".to_string(),
+            api_key: "test-key".to_string(),
+            api: "openai-completions".to_string(),
+            models: vec![
+                JsonModelEntry {
+                    id: "gpt-4o".to_string(),
+                    input: Some(vec!["text".to_string()]),
+                    ..Default::default()
+                },
+                JsonModelEntry {
+                    id: "gpt-4o-mini".to_string(),
+                    input: Some(vec!["text".to_string(), "image".to_string()]),
+                    ..Default::default()
+                },
+            ],
+        },
+    );
+
+    let (tool_call_model, _) = select_analyze_model(
+        &config,
+        &config.model,
+        config.fast_model.as_deref(),
+        0,
+        false,
+        Some("hello"),
+        false,
+    );
+    assert_eq!(tool_call_model, "openai/gpt-4o-mini");
+    assert!(config.model_supports_image(&tool_call_model));
+    assert!(!tool_images_available_for_consumer(
+        &config,
+        &config.model,
+        false
+    ));
 }
 
 #[test]
@@ -5572,6 +5919,7 @@ fn update_llm_response_usage_uses_request_estimate_when_provider_usage_missing()
             },
             input_tokens: None,
             output_tokens: None,
+            tool_image_compatibility_fallback: false,
         };
 
         update_llm_response_usage(
@@ -5746,6 +6094,7 @@ fn update_llm_response_usage_uses_configured_provider_name() {
             },
             input_tokens: Some(321),
             output_tokens: Some(12),
+            tool_image_compatibility_fallback: false,
         };
 
         let config = state.config();

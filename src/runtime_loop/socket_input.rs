@@ -811,6 +811,8 @@ pub(crate) async fn handle_idle_socket_input(
                                             {
                                                 Ok(cache_path) => validated.push(ImageAttachment {
                                                     url: image_url,
+                                                    name: None,
+                                                    mime_type: None,
                                                     s3_object_key: trusted_object_key,
                                                     s3_config_id: trusted_s3_config_id,
                                                     cache_path: Some(cache_path),
@@ -835,6 +837,8 @@ pub(crate) async fn handle_idle_socket_input(
                                 } else {
                                     validated.push(ImageAttachment {
                                         url: image_url,
+                                        name: None,
+                                        mime_type: None,
                                         s3_object_key: trusted_object_key,
                                         s3_config_id: trusted_s3_config_id,
                                         cache_path: None,

@@ -3057,9 +3057,10 @@ fn source_label(source: SkillSource) -> &'static str {
     }
 }
 
-fn builtin_tool_names_for_session(session: &Session) -> Vec<&'static str> {
-    let mut tools = tools::tool_specs()
-        .iter()
+fn builtin_tool_names_for_session(config: &Config, session: &Session) -> Vec<&'static str> {
+    let model = session.effective_model(&config.model);
+    let mut tools = tools::available_builtin_tool_specs(config, Some(model))
+        .into_iter()
         .map(|spec| spec.name)
         .collect::<Vec<_>>();
     if !crate::subagents::discovery::discover_all_agents(&session.workspace).is_empty() {
@@ -3083,7 +3084,7 @@ fn render_capabilities_section(state: &AppState, session: &Session) -> Vec<Strin
         format!("- image_input: {}", config.model_supports_image(&model)),
         format!(
             "- builtin_tools: {}",
-            builtin_tool_names_for_session(session).join(", ")
+            builtin_tool_names_for_session(&config, session).join(", ")
         ),
     ];
     if skills.is_empty() {
@@ -4527,6 +4528,7 @@ pub(crate) async fn execute_session_control_tool(
             is_error: true,
             duration_ms: 0,
             subagent_snapshot: None,
+            images: Vec::new(),
         };
     }
     let started = std::time::Instant::now();
@@ -4538,6 +4540,7 @@ pub(crate) async fn execute_session_control_tool(
                 is_error: true,
                 duration_ms: started.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             };
         }
     };
@@ -4579,6 +4582,7 @@ pub(crate) async fn execute_session_control_tool(
         is_error: result.is_err(),
         duration_ms: started.elapsed().as_millis() as u64,
         subagent_snapshot: None,
+        images: Vec::new(),
     }
 }
 

@@ -20,8 +20,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::SubAgentSpec;
 use crate::{
-    ChatMessage, Config, LiveTx, SubagentHistorySnapshot, SubagentToolHistorySnapshot, agent,
-    context,
+    ChatMessage, Config, ImageAttachment, LiveTx, SubagentHistorySnapshot,
+    SubagentToolHistorySnapshot, agent, context,
     hooks::{self, HookRegistry, ToolHookInput, run_tool_hooks},
     live_send, prompts, providers, tools, truncate,
 };
@@ -201,6 +201,7 @@ fn interrupted_parallel_tool_outcome(
         is_error: true,
         duration_ms,
         subagent_snapshot: None,
+        images: Vec::new(),
     }
 }
 
@@ -274,21 +275,129 @@ async fn emit_subagent_tool_result_event(
     tool_name: &str,
     tool_id: &str,
     outcome: &tools::ToolOutcome,
+    images: &[ImageAttachment],
 ) {
-    let _ = live_send(
-        live_tx,
-        json!({
-            "type": "tool_result",
-            "task_id": task_id,
-            "subagent": agent_name,
-            "id": tool_id,
-            "name": tool_name,
-            "result": crate::truncate(&outcome.output, 8_000),
-            "duration_ms": outcome.duration_ms,
-            "is_error": outcome.is_error,
-        }),
+    let public_images = images
+        .iter()
+        .map(crate::image_uploads::public_image_payload)
+        .collect::<Vec<_>>();
+    let mut event = json!({
+        "type": "tool_result",
+        "task_id": task_id,
+        "subagent": agent_name,
+        "id": tool_id,
+        "name": tool_name,
+        "result": crate::truncate(&outcome.output, 8_000),
+        "duration_ms": outcome.duration_ms,
+        "is_error": outcome.is_error,
+    });
+    if !public_images.is_empty() {
+        event["images"] = json!(public_images);
+    }
+    let _ = live_send(live_tx, event).await;
+}
+
+fn append_subagent_tool_image_warning(outcome: &mut tools::ToolOutcome, warning: &str) {
+    outcome.output.push_str("\n\n[");
+    outcome.output.push_str(warning);
+    outcome.output.push(']');
+}
+
+fn discard_subagent_tool_images(
+    outcomes: &mut [Option<tools::ToolOutcome>],
+    image_counts: &[usize],
+    reason: &str,
+) -> Vec<Vec<ImageAttachment>> {
+    for (outcome, image_count) in outcomes.iter_mut().zip(image_counts.iter().copied()) {
+        let Some(outcome) = outcome.as_mut() else {
+            continue;
+        };
+        outcome.images.clear();
+        if image_count > 0 {
+            append_subagent_tool_image_warning(outcome, reason);
+        }
+    }
+    vec![Vec::new(); outcomes.len()]
+}
+
+async fn materialize_subagent_tool_image_batch(
+    outcomes: &mut [Option<tools::ToolOutcome>],
+    config: &Config,
+    model_id: &str,
+    http: &Client,
+    compatibility_disabled: bool,
+    max_images: usize,
+) -> Vec<Vec<ImageAttachment>> {
+    let outcome_count = outcomes.len();
+    let mut pending_groups = outcomes
+        .iter_mut()
+        .map(|outcome| {
+            outcome
+                .as_mut()
+                .map(|outcome| std::mem::take(&mut outcome.images))
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    if pending_groups.iter().all(Vec::is_empty) {
+        return vec![Vec::new(); outcome_count];
+    }
+
+    let unavailable_reason = if compatibility_disabled {
+        Some(
+            "Tool images were not attached because this endpoint disabled multimodal tool context for the current run.",
+        )
+    } else if !config.model_supports_image(model_id) {
+        Some("Tool images were not attached because the current model does not accept image input.")
+    } else if config.s3.is_none() {
+        Some("Tool images were not attached because S3 storage is not configured.")
+    } else {
+        None
+    };
+    if let Some(reason) = unavailable_reason {
+        for (outcome, images) in outcomes.iter_mut().zip(pending_groups.iter()) {
+            if !images.is_empty()
+                && let Some(outcome) = outcome.as_mut()
+            {
+                append_subagent_tool_image_warning(outcome, reason);
+            }
+        }
+        return vec![Vec::new(); outcome_count];
+    }
+
+    let mut remaining = max_images;
+    for (outcome, images) in outcomes.iter_mut().zip(pending_groups.iter_mut()) {
+        if images.len() > remaining {
+            let skipped = images.len() - remaining;
+            images.truncate(remaining);
+            if let Some(outcome) = outcome.as_mut() {
+                append_subagent_tool_image_warning(
+                    outcome,
+                    &format!(
+                        "{skipped} tool images were not attached because the execution batch limit is {}.",
+                        crate::image_uploads::MAX_IMAGE_UPLOAD_FILES
+                    ),
+                );
+            }
+        }
+        remaining = remaining.saturating_sub(images.len());
+    }
+
+    let s3_cfg = config.s3.as_ref().expect("S3 availability checked above");
+    let upload = crate::image_uploads::upload_tool_image_groups(
+        http,
+        s3_cfg,
+        pending_groups,
+        crate::image_uploads::MAX_IMAGE_UPLOAD_FILES,
     )
     .await;
+    for (outcome, warnings) in outcomes.iter_mut().zip(upload.warnings.iter()) {
+        if let Some(outcome) = outcome.as_mut() {
+            for warning in warnings {
+                append_subagent_tool_image_warning(outcome, warning);
+            }
+        }
+    }
+    upload.attachments
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -332,8 +441,12 @@ pub(crate) async fn execute_subagent_tool_with_live_output(
     workspace: &Path,
     _isolated_mcp_session: bool,
     replay_ctx: Option<crate::LiveOutputReplayCtx>,
+    image_budget: Option<tools::mcp::ToolImageBudget>,
 ) -> tools::ToolOutcome {
     let start = tokio::time::Instant::now();
+    let image_wait = image_budget
+        .as_ref()
+        .and_then(tools::mcp::ToolImageBudget::subscribe_waiting);
     let (event_tx, mut event_rx) =
         tokio::sync::mpsc::channel(tools::TOOL_LIVE_EVENT_CHANNEL_CAPACITY);
     let outcome = execute_subagent_tool(
@@ -345,6 +458,7 @@ pub(crate) async fn execute_subagent_tool_with_live_output(
         _isolated_mcp_session,
         None,
         Some(event_tx),
+        image_budget,
     );
     tokio::pin!(outcome);
     let mut forward_event = |stream, chunk: String| {
@@ -364,7 +478,7 @@ pub(crate) async fn execute_subagent_tool_with_live_output(
         }
     };
 
-    await_subagent_tool_outcome_with_live_events(
+    await_subagent_tool_outcome_with_live_events_and_image_wait(
         outcome.as_mut(),
         &mut event_rx,
         &mut forward_event,
@@ -372,12 +486,14 @@ pub(crate) async fn execute_subagent_tool_with_live_output(
         runtime_timeout_for_subagent_tool(tool_name, config),
         start,
         tool_name,
+        image_wait,
     )
     .await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn await_subagent_tool_outcome_with_live_events<F, Fut>(
-    mut outcome: Pin<&mut (dyn Future<Output = tools::ToolOutcome> + Send)>,
+    outcome: Pin<&mut (dyn Future<Output = tools::ToolOutcome> + Send)>,
     event_rx: &mut tools::BoundedToolEventReceiver,
     forward_event: &mut F,
     cancel: &CancellationToken,
@@ -389,9 +505,53 @@ where
     F: FnMut(&'static str, String) -> Fut,
     Fut: Future<Output = ()>,
 {
+    await_subagent_tool_outcome_with_live_events_and_image_wait(
+        outcome,
+        event_rx,
+        forward_event,
+        cancel,
+        timeout,
+        start,
+        tool_name,
+        None,
+    )
+    .await
+}
+
+async fn next_subagent_tool_image_wait_state(
+    receiver: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> Option<bool> {
+    let receiver = receiver.as_mut()?;
+    if receiver.changed().await.is_err() {
+        return None;
+    }
+    Some(*receiver.borrow_and_update())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn await_subagent_tool_outcome_with_live_events_and_image_wait<F, Fut>(
+    mut outcome: Pin<&mut (dyn Future<Output = tools::ToolOutcome> + Send)>,
+    event_rx: &mut tools::BoundedToolEventReceiver,
+    forward_event: &mut F,
+    cancel: &CancellationToken,
+    timeout: Option<Duration>,
+    start: tokio::time::Instant,
+    tool_name: &str,
+    mut image_wait: Option<tokio::sync::watch::Receiver<bool>>,
+) -> tools::ToolOutcome
+where
+    F: FnMut(&'static str, String) -> Fut,
+    Fut: Future<Output = ()>,
+{
     let has_timeout = timeout.is_some();
     let timeout_secs = timeout.map(|value| value.as_secs()).unwrap_or(0);
-    let sleep = tokio::time::sleep(timeout.unwrap_or(Duration::ZERO));
+    if !has_timeout {
+        image_wait = None;
+    }
+    let mut timeout_remaining = timeout.unwrap_or(Duration::ZERO);
+    let mut timeout_segment_started = tokio::time::Instant::now();
+    let mut timeout_active = has_timeout;
+    let sleep = tokio::time::sleep(timeout_remaining);
     tokio::pin!(sleep);
     let mut pending_result: Option<tools::ToolOutcome> = None;
     let mut event_rx_open = true;
@@ -432,14 +592,39 @@ where
                     is_error: true,
                     duration_ms: start.elapsed().as_millis() as u64,
                     subagent_snapshot: None,
+                    images: Vec::new(),
                 };
             }
-            _ = &mut sleep, if has_timeout => {
+            wait_state = next_subagent_tool_image_wait_state(&mut image_wait), if image_wait.is_some() => {
+                match wait_state {
+                    Some(true) if timeout_active => {
+                        timeout_remaining = timeout_remaining
+                            .saturating_sub(timeout_segment_started.elapsed());
+                        timeout_active = false;
+                    }
+                    Some(false) if !timeout_active => {
+                        timeout_segment_started = tokio::time::Instant::now();
+                        sleep.as_mut().reset(timeout_segment_started + timeout_remaining);
+                        timeout_active = true;
+                    }
+                    None => {
+                        image_wait = None;
+                        if !timeout_active {
+                            timeout_segment_started = tokio::time::Instant::now();
+                            sleep.as_mut().reset(timeout_segment_started + timeout_remaining);
+                            timeout_active = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ = &mut sleep, if timeout_active => {
                 return tools::ToolOutcome {
                     output: format!("{tool_name} error: tool execution timed out ({}s)", timeout_secs),
                     is_error: true,
                     duration_ms: start.elapsed().as_millis() as u64,
                     subagent_snapshot: None,
+                    images: Vec::new(),
                 };
             }
         }
@@ -532,6 +717,7 @@ async fn request_forced_final_response(
     http: &Client,
     workspace: &Path,
     messages: &[ChatMessage],
+    parent_live_tx: &LiveTx,
 ) -> Result<(Vec<ChatMessage>, providers::SimpleLlmResponse), String> {
     let mut final_messages = messages.to_vec();
     final_messages.push(ChatMessage {
@@ -548,7 +734,7 @@ async fn request_forced_final_response(
     let budget = context::message_budget_for_tool_defs(config, model_id, "off", &[]);
     context::prune_messages_for_provider(&mut final_messages, resolved.provider, budget);
 
-    let response = providers::call_llm_simple_with_usage(
+    let response = providers::call_llm_simple_with_usage_and_tool_images(
         http,
         resolved,
         &final_messages,
@@ -559,7 +745,49 @@ async fn request_forced_final_response(
     )
     .await?;
 
+    if response.tool_image_compatibility_fallback {
+        let _ = live_send(
+            parent_live_tx,
+            json!({
+                "type":"tool_image_compatibility_warning",
+                "provider":"openai_chat",
+            }),
+        )
+        .await;
+    }
+
     Ok((final_messages, response))
+}
+
+fn disable_subagent_tool_images_for_compatibility(
+    messages: &mut [ChatMessage],
+    allowed_tools: &mut Vec<String>,
+    tool_defs: &mut Vec<serde_json::Value>,
+    spec: &SubAgentSpec,
+    config: &Config,
+    workspace: &Path,
+) {
+    providers::strip_tool_images_for_compatibility(messages);
+    allowed_tools.retain(|tool| tool != tools::TOOL_NAME_VIEW_IMAGE);
+    tool_defs.retain(|definition| {
+        definition
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| definition.get("name").and_then(serde_json::Value::as_str))
+            != Some(tools::TOOL_NAME_VIEW_IMAGE)
+    });
+    if let Some(system) = messages
+        .first_mut()
+        .filter(|message| message.role == "system")
+    {
+        system.content = Some(build_subagent_system_prompt(
+            spec,
+            allowed_tools,
+            config,
+            workspace,
+        ));
+    }
 }
 
 /// Run a sub-agent with full isolation.
@@ -591,8 +819,12 @@ pub(crate) async fn run_subagent(
     tools::mcp::ensure_policy_tools_cached(config, workspace).await;
 
     // Build filtered tool definitions for this sub-agent (includes MCP tools).
-    let allowed_tools = super::filter_tools_for_agent_with_mcp(spec, config, workspace);
-    let tool_defs = build_filtered_tool_defs(&allowed_tools, config, workspace, resolved.provider);
+    let mut allowed_tools = super::filter_tools_for_agent_with_mcp(spec, config, workspace);
+    if !tools::view_image_available(config, &model_id) {
+        allowed_tools.retain(|tool| tool != tools::TOOL_NAME_VIEW_IMAGE);
+    }
+    let mut tool_defs =
+        build_filtered_tool_defs(&allowed_tools, config, workspace, resolved.provider);
 
     // Build isolated message history.
     let system_prompt = build_subagent_system_prompt(spec, &allowed_tools, config, workspace);
@@ -627,6 +859,7 @@ pub(crate) async fn run_subagent(
     let mut history_snapshot = SubagentHistorySnapshot::default();
     let mut aborted = false;
     let mut timed_out = false;
+    let mut tool_images_disabled = false;
 
     // Sub-agent deadline: 0 = unlimited.
     let sa_timeout = config.sub_agent_timeout;
@@ -674,6 +907,9 @@ pub(crate) async fn run_subagent(
         let budget =
             context::message_budget_for_tool_defs(config, &model_id, think_level, &tool_defs);
         context::prune_messages_for_provider(&mut messages, resolved.provider, budget);
+        if tool_images_disabled {
+            providers::strip_tool_images_for_compatibility(&mut messages);
+        }
 
         // Call LLM with the sub-agent's isolated context.
         // Agent-level retry: on transient HTTP errors, retry once before aborting.
@@ -696,7 +932,7 @@ pub(crate) async fn run_subagent(
                     }
                 });
 
-                let result = tokio::select! {
+                let call_outcome = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => {
                         aborted = true;
@@ -728,6 +964,19 @@ pub(crate) async fn run_subagent(
                         result
                     }
                 };
+
+                if call_outcome.tool_image_compatibility_fallback {
+                    tool_images_disabled = true;
+                    disable_subagent_tool_images_for_compatibility(
+                        &mut messages,
+                        &mut allowed_tools,
+                        &mut tool_defs,
+                        spec,
+                        config,
+                        workspace,
+                    );
+                }
+                let result = call_outcome.result;
 
                 match &result {
                     Err(e) if llm_attempt == 0 && providers::is_transient_llm_error(e) => {
@@ -789,6 +1038,10 @@ pub(crate) async fn run_subagent(
 
                 // Execute tool calls - parallel for read-only batches, sequential otherwise.
                 if let Some(ref tool_calls) = resp.message.tool_calls {
+                    let mut tool_images_attached_in_batch = 0usize;
+                    let image_budget = tools::mcp::ToolImageBudget::new(
+                        crate::image_uploads::MAX_IMAGE_UPLOAD_FILES,
+                    );
                     let mut all_read_only = tool_calls.len() > 1;
                     if all_read_only {
                         for tc in tool_calls {
@@ -805,7 +1058,7 @@ pub(crate) async fn run_subagent(
 
                     if !all_read_only {
                         // ── Sequential path ──────────────────────────────────────
-                        for tc in tool_calls {
+                        for (call_index, tc) in tool_calls.iter().enumerate() {
                             if cancel.is_cancelled() {
                                 aborted = true;
                                 break 'react;
@@ -816,6 +1069,7 @@ pub(crate) async fn run_subagent(
                                 timed_out = true;
                                 break 'react;
                             }
+                            let call_image_budget = image_budget.for_call(call_index);
 
                             // Check tool permission against the pre-computed
                             // allowed list (accounts for mcp_policy + deny overrides).
@@ -920,6 +1174,7 @@ pub(crate) async fn run_subagent(
                                         workspace,
                                         false,
                                         replay_ctx.clone(),
+                                        Some(call_image_budget.clone()),
                                     )
                                     .await,
                                     false,
@@ -939,6 +1194,7 @@ pub(crate) async fn run_subagent(
                                         workspace,
                                         false,
                                         replay_ctx.clone(),
+                                        Some(call_image_budget.clone()),
                                     ) => (res, false),
                                     _ = tokio::time::sleep_until(deadline) => {
                                         timed_out = true;
@@ -952,6 +1208,7 @@ pub(crate) async fn run_subagent(
                                                 is_error: true,
                                                 duration_ms: tool_started.elapsed().as_millis() as u64,
                                                 subagent_snapshot: None,
+                                                images: Vec::new(),
                                             },
                                             true,
                                         )
@@ -972,6 +1229,57 @@ pub(crate) async fn run_subagent(
                                 outcome,
                             )
                             .await;
+                            let mut outcome_batch = vec![Some(outcome)];
+                            let image_counts = outcome_batch
+                                .iter()
+                                .map(|outcome| {
+                                    outcome.as_ref().map_or(0, |outcome| outcome.images.len())
+                                })
+                                .collect::<Vec<_>>();
+                            let mut stop_after_recording = hit_deadline;
+                            let materialized = if hit_deadline {
+                                Err(
+                                    "Tool images were not attached because the sub-agent deadline was reached.",
+                                )
+                            } else {
+                                tokio::select! {
+                                    biased;
+                                    _ = cancel.cancelled() => {
+                                        aborted = true;
+                                        stop_after_recording = true;
+                                        Err("Tool images were not attached because the sub-agent was cancelled.")
+                                    }
+                                    _ = tokio::time::sleep_until(deadline), if !unlimited => {
+                                        aborted = true;
+                                        timed_out = true;
+                                        stop_after_recording = true;
+                                        Err("Tool images were not attached because the sub-agent deadline was reached.")
+                                    }
+                                    images = materialize_subagent_tool_image_batch(
+                                        &mut outcome_batch,
+                                        config,
+                                        &model_id,
+                                        http,
+                                        tool_images_disabled,
+                                        crate::image_uploads::MAX_IMAGE_UPLOAD_FILES
+                                            .saturating_sub(tool_images_attached_in_batch),
+                                    ) => Ok(images),
+                                }
+                            };
+                            let mut tool_image_batch = match materialized {
+                                Ok(images) => images,
+                                Err(reason) => discard_subagent_tool_images(
+                                    &mut outcome_batch,
+                                    &image_counts,
+                                    reason,
+                                ),
+                            };
+                            let outcome = outcome_batch
+                                .pop()
+                                .flatten()
+                                .expect("single sub-agent tool outcome");
+                            let tool_images = tool_image_batch.pop().unwrap_or_default();
+                            tool_images_attached_in_batch += tool_images.len();
 
                             emit_subagent_tool_result_event(
                                 parent_live_tx,
@@ -980,6 +1288,7 @@ pub(crate) async fn run_subagent(
                                 &tc.function.name,
                                 &tc.id,
                                 &outcome,
+                                &tool_images,
                             )
                             .await;
 
@@ -996,12 +1305,13 @@ pub(crate) async fn run_subagent(
                                 ),
                                 is_error: outcome.is_error,
                                 duration_ms: outcome.duration_ms,
+                                images: tool_images.clone(),
                             });
 
                             messages.push(ChatMessage {
                                 role: "tool".into(),
                                 content: Some(outcome.output),
-                                images: None,
+                                images: (!tool_images.is_empty()).then_some(tool_images),
                                 thinking: None,
                                 anthropic_thinking_blocks: None,
                                 tool_calls: None,
@@ -1009,7 +1319,7 @@ pub(crate) async fn run_subagent(
                                 timestamp: None,
                             });
 
-                            if hit_deadline {
+                            if stop_after_recording {
                                 break 'react;
                             }
                         }
@@ -1129,9 +1439,16 @@ pub(crate) async fn run_subagent(
                         let tool_futures: Vec<_> = tool_calls
                             .iter()
                             .zip(hook_evals.iter())
-                            .map(|(tc, he)| {
+                            .enumerate()
+                            .map(|(call_index, (tc, he))| {
+                                let call_image_budget = image_budget.for_call(call_index);
                                 if he.rejected_output.is_some() || he.disallowed {
-                                    return Box::pin(async { None })
+                                    return Box::pin(async move {
+                                        // Advance the ordered image budget for
+                                        // calls that never reach execution.
+                                        drop(call_image_budget);
+                                        None
+                                    })
                                         as std::pin::Pin<
                                             Box<
                                                 dyn std::future::Future<
@@ -1170,6 +1487,7 @@ pub(crate) async fn run_subagent(
                                             &ws,
                                             true,
                                             replay_ctx,
+                                            Some(call_image_budget),
                                         )
                                         .await,
                                     )
@@ -1188,24 +1506,23 @@ pub(crate) async fn run_subagent(
                             aborted = true;
                             timed_out |= batch_result.timed_out;
                         }
+                        let mut stop_after_recording = batch_result.interrupted;
 
-                        // Phase 4: Record results sequentially, apply AfterToolExec hooks.
+                        // Phase 4: Apply hooks in order, then upload every image
+                        // from the parallel tool batch through one shared
+                        // three-request concurrency gate. Result events remain
+                        // in their original tool-call order.
+                        let mut prepared_outcomes = Vec::with_capacity(tool_calls.len());
+                        let mut prepared_args = Vec::with_capacity(tool_calls.len());
+                        let mut rejected_outputs = Vec::with_capacity(tool_calls.len());
                         for (tc, (result_opt, he)) in tool_calls
                             .iter()
                             .zip(batch_result.results.into_iter().zip(hook_evals.into_iter()))
                         {
-                            total_tool_calls += 1;
                             if let Some(rejected_msg) = he.rejected_output {
-                                messages.push(ChatMessage {
-                                    role: "tool".into(),
-                                    content: Some(rejected_msg),
-                                    images: None,
-                                    thinking: None,
-                                    anthropic_thinking_blocks: None,
-                                    tool_calls: None,
-                                    tool_call_id: Some(tc.id.clone()),
-                                    timestamp: None,
-                                });
+                                prepared_outcomes.push(None);
+                                prepared_args.push(None);
+                                rejected_outputs.push(Some(rejected_msg));
                                 continue;
                             }
                             let eff_args = he
@@ -1226,6 +1543,80 @@ pub(crate) async fn run_subagent(
                                 batch_started.elapsed().as_millis() as u64,
                             )
                             .await;
+                            prepared_outcomes.push(Some(outcome));
+                            prepared_args.push(Some(eff_args.to_string()));
+                            rejected_outputs.push(None);
+                        }
+
+                        let image_counts = prepared_outcomes
+                            .iter()
+                            .map(|outcome| {
+                                outcome.as_ref().map_or(0, |outcome| outcome.images.len())
+                            })
+                            .collect::<Vec<_>>();
+                        let materialized = if batch_result.interrupted {
+                            Err(if batch_result.timed_out {
+                                "Tool images were not attached because the sub-agent deadline was reached."
+                            } else {
+                                "Tool images were not attached because the sub-agent was cancelled."
+                            })
+                        } else {
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    aborted = true;
+                                    stop_after_recording = true;
+                                    Err("Tool images were not attached because the sub-agent was cancelled.")
+                                }
+                                _ = tokio::time::sleep_until(deadline), if !unlimited => {
+                                    aborted = true;
+                                    timed_out = true;
+                                    stop_after_recording = true;
+                                    Err("Tool images were not attached because the sub-agent deadline was reached.")
+                                }
+                                images = materialize_subagent_tool_image_batch(
+                                    &mut prepared_outcomes,
+                                    config,
+                                    &model_id,
+                                    http,
+                                    tool_images_disabled,
+                                    crate::image_uploads::MAX_IMAGE_UPLOAD_FILES
+                                        .saturating_sub(tool_images_attached_in_batch),
+                                ) => Ok(images),
+                            }
+                        };
+                        let tool_image_batch = match materialized {
+                            Ok(images) => images,
+                            Err(reason) => discard_subagent_tool_images(
+                                &mut prepared_outcomes,
+                                &image_counts,
+                                reason,
+                            ),
+                        };
+
+                        for index in 0..tool_calls.len() {
+                            let tc = &tool_calls[index];
+                            total_tool_calls += 1;
+                            if let Some(rejected_msg) = rejected_outputs[index].take() {
+                                messages.push(ChatMessage {
+                                    role: "tool".into(),
+                                    content: Some(rejected_msg),
+                                    images: None,
+                                    thinking: None,
+                                    anthropic_thinking_blocks: None,
+                                    tool_calls: None,
+                                    tool_call_id: Some(tc.id.clone()),
+                                    timestamp: None,
+                                });
+                                continue;
+                            }
+                            let outcome = prepared_outcomes[index]
+                                .take()
+                                .expect("non-rejected parallel tool outcome");
+                            let tool_images = tool_image_batch[index].clone();
+                            let eff_args = prepared_args[index]
+                                .as_deref()
+                                .expect("non-rejected parallel tool arguments");
                             emit_subagent_tool_result_event(
                                 parent_live_tx,
                                 task_id,
@@ -1233,6 +1624,7 @@ pub(crate) async fn run_subagent(
                                 &tc.function.name,
                                 &tc.id,
                                 &outcome,
+                                &tool_images,
                             )
                             .await;
                             history_snapshot.tools.push(SubagentToolHistorySnapshot {
@@ -1251,11 +1643,12 @@ pub(crate) async fn run_subagent(
                                 ),
                                 is_error: outcome.is_error,
                                 duration_ms: outcome.duration_ms,
+                                images: tool_images.clone(),
                             });
                             messages.push(ChatMessage {
                                 role: "tool".into(),
                                 content: Some(outcome.output),
-                                images: None,
+                                images: (!tool_images.is_empty()).then_some(tool_images),
                                 thinking: None,
                                 anthropic_thinking_blocks: None,
                                 tool_calls: None,
@@ -1264,7 +1657,7 @@ pub(crate) async fn run_subagent(
                             });
                         }
 
-                        if batch_result.interrupted {
+                        if stop_after_recording {
                             break 'react;
                         }
                     } // end parallel path
@@ -1302,7 +1695,13 @@ pub(crate) async fn run_subagent(
 
     if !aborted && needs_forced_final_response(&messages) {
         match request_forced_final_response(
-            &model_id, &resolved, config, http, workspace, &messages,
+            &model_id,
+            &resolved,
+            config,
+            http,
+            workspace,
+            &messages,
+            parent_live_tx,
         )
         .await
         {
@@ -1549,22 +1948,24 @@ async fn execute_subagent_tool(
     isolated_mcp_session: bool,
     event_tx: Option<tools::ToolEventSender>,
     bounded_event_tx: Option<tools::BoundedToolEventSender>,
+    image_budget: Option<tools::mcp::ToolImageBudget>,
 ) -> tools::ToolOutcome {
     let mcp_policy = tools::mcp::load_session_policy(workspace);
-    let mcp_result = tools::mcp::execute_tool_for_policy(
+    let mcp_result = tools::mcp::execute_tool_for_policy_with_image_budget(
         name,
         args_str,
         config,
         workspace,
         isolated_mcp_session,
         &mcp_policy,
+        image_budget.clone(),
     )
     .await;
 
     if let Some(result) = mcp_result {
         result
     } else {
-        tools::execute_tool_with_bounded_live_events(
+        tools::execute_tool_with_bounded_live_events_and_image_budget(
             name,
             args_str,
             config,
@@ -1572,6 +1973,7 @@ async fn execute_subagent_tool(
             workspace,
             event_tx,
             bounded_event_tx,
+            image_budget,
         )
         .await
     }
@@ -1670,6 +2072,7 @@ mod tests {
                 &workspace,
                 false,
                 None,
+                None,
             ),
         )
         .await
@@ -1734,6 +2137,7 @@ mod tests {
                 &Client::new(),
                 &workspace,
                 false,
+                None,
                 None,
             ),
         )

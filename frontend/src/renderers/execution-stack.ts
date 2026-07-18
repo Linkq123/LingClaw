@@ -59,6 +59,20 @@ function syncStackSummary(stack: HTMLElement): void {
   const statusIcon = stack.querySelector<HTMLElement>('.execution-stack-status-icon');
   const duration = Number(stack.dataset.executionDuration || '');
   const parts = [stepCountText(visibleSteps.length)];
+  const imageCount = visibleSteps.reduce(
+    (total, step) =>
+      total +
+      Array.from(step.querySelectorAll<HTMLElement>('[data-tool-image-count]')).reduce(
+        (stepTotal, panel) => stepTotal + Number(panel.dataset.toolImageCount || 0),
+        0,
+      ),
+    0,
+  );
+  if (imageCount > 0) {
+    parts.push(
+      tr(imageCount === 1 ? 'tool.imageCountOne' : 'tool.imageCount', { count: imageCount }),
+    );
+  }
 
   if (Number.isFinite(duration) && duration > 0) {
     parts.push(formatToolDuration(duration));

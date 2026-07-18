@@ -1125,9 +1125,180 @@ fn render_call_result_prefers_text_and_structured_content() {
         "structuredContent": {"ok": true}
     }));
 
-    assert!(rendered.contains("hello"));
-    assert!(rendered.contains("[resource]"));
-    assert!(rendered.contains("structuredContent"));
+    assert!(rendered.output.contains("hello"));
+    assert!(rendered.output.contains("[resource]"));
+    assert!(rendered.output.contains("structuredContent"));
+    assert!(rendered.images.is_empty());
+}
+
+#[test]
+fn render_call_result_extracts_png_without_leaking_base64() {
+    let mut png = Vec::new();
+    png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    png.extend_from_slice(&[
+        0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    png.extend_from_slice(&[0, 0, 0, 1, b'I', b'D', b'A', b'T', 0, 0, 0, 0, 0]);
+    png.extend_from_slice(&[0, 0, 0, 0, b'I', b'E', b'N', b'D', 0, 0, 0, 0]);
+    let encoded = STANDARD.encode(&png);
+    let rendered = render_call_result(&json!({
+        "content": [{"type":"image", "data": encoded, "mimeType":"image/png"}],
+        "structuredContent": {"copy": encoded, "label": "keep me"}
+    }));
+
+    assert_eq!(rendered.images.len(), 1);
+    assert_eq!(rendered.images[0].mime_type, "image/png");
+    assert!(!rendered.output.contains(&encoded));
+    assert!(rendered.output.contains("image output"));
+    assert!(rendered.output.contains("[binary data omitted]"));
+    assert!(rendered.output.contains("keep me"));
+}
+
+#[test]
+fn render_call_result_redacts_known_image_payload_even_when_text_comes_first() {
+    let mut png = Vec::new();
+    png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    png.extend_from_slice(&[
+        0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    png.extend_from_slice(&[0, 0, 0, 1, b'I', b'D', b'A', b'T', 0, 0, 0, 0, 0]);
+    png.extend_from_slice(&[0, 0, 0, 0, b'I', b'E', b'N', b'D', 0, 0, 0, 0]);
+    let encoded = STANDARD.encode(&png);
+    let rendered = render_call_result(&json!({
+        "content": [
+            {"type":"text", "text":encoded},
+            {"type":"image", "data":encoded, "mimeType":"image/png"}
+        ]
+    }));
+
+    assert_eq!(rendered.images.len(), 1);
+    assert!(!rendered.output.contains(&encoded));
+    assert!(rendered.output.contains("[binary data omitted]"));
+}
+
+#[test]
+fn render_call_result_redacts_known_image_payload_embedded_in_text() {
+    let mut png = Vec::new();
+    png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    png.extend_from_slice(&[
+        0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    png.extend_from_slice(&[0, 0, 0, 1, b'I', b'D', b'A', b'T', 0, 0, 0, 0, 0]);
+    png.extend_from_slice(&[0, 0, 0, 0, b'I', b'E', b'N', b'D', 0, 0, 0, 0]);
+    let encoded = STANDARD.encode(&png);
+    let rendered = render_call_result(&json!({
+        "content": [
+            {
+                "type":"text",
+                "text":format!("preview=data:image/png;base64,{encoded}; source=mcp")
+            },
+            {"type":"image", "data":encoded, "mimeType":"image/png"}
+        ],
+        "structuredContent": {
+            "description": format!("embedded image: {encoded}")
+        }
+    }));
+
+    assert_eq!(rendered.images.len(), 1);
+    assert!(!rendered.output.contains(&encoded));
+    assert!(
+        rendered
+            .output
+            .contains("preview=data:image/png;base64,[binary data omitted]")
+    );
+    assert!(
+        rendered
+            .output
+            .contains("embedded image: [binary data omitted]")
+    );
+}
+
+#[test]
+fn shared_tool_image_budget_limits_decoding_across_mcp_results() {
+    let mut png = Vec::new();
+    png.extend_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+    png.extend_from_slice(&[
+        0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    png.extend_from_slice(&[0, 0, 0, 1, b'I', b'D', b'A', b'T', 0, 0, 0, 0, 0]);
+    png.extend_from_slice(&[0, 0, 0, 0, b'I', b'E', b'N', b'D', 0, 0, 0, 0]);
+    let encoded = STANDARD.encode(&png);
+    let result = json!({
+        "content": [{"type":"image", "data":encoded, "mimeType":"image/png"}]
+    });
+    let budget = ToolImageBudget::new(1);
+
+    let first = render_call_result_with_image_budget(&result, Some(&budget));
+    let second = render_call_result_with_image_budget(&result, Some(&budget));
+
+    assert_eq!(first.images.len(), 1);
+    assert!(second.images.is_empty());
+    assert!(second.output.contains("tool image batch limit reached"));
+}
+
+#[tokio::test]
+async fn tool_image_budget_reservations_follow_original_call_order() {
+    let budget = ToolImageBudget::new(1);
+    let first = budget.for_call(0);
+    let second = budget.for_call(1);
+    let (reserved_tx, mut reserved_rx) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        second.wait_for_turn().await;
+        let _ = reserved_tx.send(second.try_reserve());
+    });
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut reserved_rx)
+            .await
+            .is_err(),
+        "a later call must wait even when it reaches image processing first"
+    );
+    first.wait_for_turn().await;
+    assert!(first.try_reserve());
+    drop(first);
+
+    let second_reserved = tokio::time::timeout(Duration::from_secs(1), reserved_rx)
+        .await
+        .expect("later call should be released")
+        .expect("reservation task should report a result");
+    assert!(
+        !second_reserved,
+        "the earlier call must retain the only slot"
+    );
+}
+
+#[test]
+fn render_call_result_omits_audio_and_independent_structured_binary_payloads() {
+    let audio = STANDARD.encode(b"RIFF-fake-audio-payload-that-must-not-be-serialized");
+    let independent = STANDARD.encode(b"independent-structured-binary-payload");
+    let orphan = STANDARD.encode(vec![0xAB; 128]);
+    let rendered = render_call_result(&json!({
+        "content": [{"type":"audio", "data":audio, "mimeType":"audio/wav"}],
+        "structuredContent": {
+            "recording": {"mimeType":"audio/wav", "data":independent},
+            "orphanPayload":orphan,
+            "label":"keep me"
+        }
+    }));
+
+    assert!(rendered.images.is_empty());
+    assert!(!rendered.output.contains(&audio));
+    assert!(!rendered.output.contains(&independent));
+    assert!(!rendered.output.contains(&orphan));
+    assert!(rendered.output.contains("[binary data omitted]"));
+    assert!(rendered.output.contains("keep me"));
+}
+
+#[test]
+fn render_call_result_sanitizes_binary_payloads_in_fallback_results() {
+    let encoded = STANDARD.encode(b"fallback-binary-payload-that-must-not-leak");
+    let rendered = render_call_result(&json!({
+        "result": {"encoding":"base64", "data":encoded}
+    }));
+
+    assert!(!rendered.output.contains(&encoded));
+    assert!(rendered.output.contains("[binary data omitted]"));
 }
 
 #[test]

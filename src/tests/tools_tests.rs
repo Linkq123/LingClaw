@@ -1,5 +1,6 @@
 use super::*;
 use crate::tools::exec::forward_live_chunk;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use std::{collections::HashMap, time::Duration};
 
 fn test_config() -> Config {
@@ -37,6 +38,9 @@ fn test_config() -> Config {
         enable_task_plan: true,
     }
 }
+
+const ONE_PIXEL_PNG: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
 
 fn exec_test_workspace(name: &str) -> std::path::PathBuf {
     let unique = std::time::SystemTime::now()
@@ -288,6 +292,51 @@ async fn execute_tool_rejects_descending_read_file_range() {
     );
 
     let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn execute_tool_shares_batch_image_budget_with_view_image() {
+    let workspace = exec_test_workspace("view-image-budget");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+    tokio::fs::write(
+        workspace.join("pixel.png"),
+        STANDARD.decode(ONE_PIXEL_PNG).expect("valid PNG fixture"),
+    )
+    .await
+    .expect("fixture should be written");
+    let budget = mcp::ToolImageBudget::new(1);
+
+    let first = execute_tool_with_image_budget(
+        TOOL_NAME_VIEW_IMAGE,
+        r#"{"path":"pixel.png"}"#,
+        &test_config(),
+        &reqwest::Client::new(),
+        &workspace,
+        None,
+        Some(budget.for_call(0)),
+    )
+    .await;
+    let second = execute_tool_with_image_budget(
+        TOOL_NAME_VIEW_IMAGE,
+        r#"{"path":"pixel.png"}"#,
+        &test_config(),
+        &reqwest::Client::new(),
+        &workspace,
+        None,
+        Some(budget.for_call(1)),
+    )
+    .await;
+
+    assert!(!first.is_error);
+    assert_eq!(first.images.len(), 1);
+    assert!(!second.is_error);
+    assert!(second.images.is_empty());
+    assert!(second.output.contains("tool image batch limit reached"));
+
+    let _ = tokio::fs::remove_dir_all(workspace).await;
 }
 
 #[tokio::test]
@@ -780,6 +829,7 @@ fn is_read_only_tool_covers_expected_set() {
     for name in &[
         "think",
         "read_file",
+        "view_image",
         "list_dir",
         "search_files",
         "http_fetch",
@@ -805,6 +855,7 @@ fn is_parallelizable_tool_matches_read_only_tools_only() {
     for name in &[
         "think",
         "read_file",
+        "view_image",
         "list_dir",
         "search_files",
         "http_fetch",
@@ -911,6 +962,92 @@ fn render_tool_prompt_lines_with_query_compresses_irrelevant_tools() {
     assert!(rendered.contains("**exec**"));
     assert!(rendered.contains("**think**"));
     assert!(rendered.contains("Other available tools:"));
+    assert!(!rendered.contains("view_image"));
+}
+
+#[test]
+fn view_image_is_only_added_to_definitions_and_prompts_conditionally() {
+    let default_openai = tool_definitions_openai();
+    assert!(!default_openai.to_string().contains(TOOL_NAME_VIEW_IMAGE));
+    assert!(
+        !tool_definitions_anthropic()
+            .to_string()
+            .contains(TOOL_NAME_VIEW_IMAGE)
+    );
+    assert!(
+        !tool_definitions_gemini()
+            .to_string()
+            .contains(TOOL_NAME_VIEW_IMAGE)
+    );
+
+    for provider in [
+        Provider::OpenAI,
+        Provider::OpenAIResponses,
+        Provider::Anthropic,
+        Provider::Ollama,
+        Provider::Gemini,
+    ] {
+        let definition = conditional_view_image_definition(provider);
+        assert!(definition.to_string().contains(TOOL_NAME_VIEW_IMAGE));
+    }
+
+    let without = render_read_only_tool_prompt_lines_with_view_image(&test_config(), false);
+    let with = render_read_only_tool_prompt_lines_with_view_image(&test_config(), true);
+    assert!(!without.contains(TOOL_NAME_VIEW_IMAGE));
+    assert!(with.contains(TOOL_NAME_VIEW_IMAGE));
+}
+
+#[test]
+fn available_builtin_tool_catalog_follows_view_image_capabilities() {
+    let mut config = test_config();
+    let model = "openai/vision-model";
+
+    let names = available_builtin_tool_specs(&config, Some(model))
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect::<Vec<_>>();
+    assert!(names.contains(&TOOL_NAME_READ_FILE));
+    assert!(!names.contains(&TOOL_NAME_VIEW_IMAGE));
+
+    config.s3 = Some(crate::config::S3Config {
+        endpoint: "https://storage.example.test".into(),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    });
+    assert!(
+        !available_builtin_tool_specs(&config, Some(model))
+            .into_iter()
+            .any(|spec| spec.name == TOOL_NAME_VIEW_IMAGE)
+    );
+
+    config.providers.insert(
+        "openai".into(),
+        crate::config::JsonProviderConfig {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key: "test-key".into(),
+            api: "openai-completions".into(),
+            models: vec![crate::config::JsonModelEntry {
+                id: "vision-model".into(),
+                input: Some(vec!["text".into(), "image".into()]),
+                ..Default::default()
+            }],
+        },
+    );
+    assert!(
+        available_builtin_tool_specs(&config, Some(model))
+            .into_iter()
+            .any(|spec| spec.name == TOOL_NAME_VIEW_IMAGE)
+    );
+    assert!(
+        !available_builtin_tool_specs(&config, None)
+            .into_iter()
+            .any(|spec| spec.name == TOOL_NAME_VIEW_IMAGE)
+    );
 }
 
 #[test]

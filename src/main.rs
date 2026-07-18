@@ -119,6 +119,10 @@ pub(crate) fn session_ids_match(a: &str, b: &str) -> bool {
 const INBOUND_BUFFER_CAPACITY: usize = 128;
 static CONFIG_FILE_LOCK: std::sync::LazyLock<tokio::sync::RwLock<()>> =
     std::sync::LazyLock::new(|| tokio::sync::RwLock::new(()));
+static S3_LIFECYCLE_SYNC_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+static S3_LIFECYCLE_SYNCED_CONFIG_ID: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 /// Process-local, monotonically increasing runtime config revision. The value is
 /// paired with `AppState.config` while holding the same mutex so payload builders
 /// can never combine a Config snapshot with a revision from another update.
@@ -136,27 +140,33 @@ static CONFIG_REVISION_BUMPS_BY_STATE: std::sync::LazyLock<std::sync::Mutex<Hash
 // ── Data Models ──────────────────────────────────────────────────────────────
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
-struct ImageAttachment {
-    url: String,
+pub(crate) struct ImageAttachment {
+    pub(crate) url: String,
+    /// Human-readable display name. Older persisted attachments omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    /// Validated media type for tool images. Older user attachments may omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) mime_type: Option<String>,
     /// Persisted S3 object key for locally uploaded images so fresh
     /// presigned URLs can be generated for history replay and provider calls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    s3_object_key: Option<String>,
+    pub(crate) s3_object_key: Option<String>,
     /// Opaque identity of the S3 configuration that accepted this upload.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    s3_config_id: Option<String>,
+    pub(crate) s3_config_id: Option<String>,
     /// Persisted path to a cached base64 file inside the session workspace.
     /// This keeps historical Ollama images available across restarts without
     /// bloating the session JSON itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    cache_path: Option<String>,
+    pub(crate) cache_path: Option<String>,
     /// Cached base64-encoded image data.  Populated at intake so Ollama
     /// requests never re-fetch historical URLs.  Not persisted to disk
     /// (`skip_serializing`) to avoid bloating session files; after a reload
     /// the disk cache or legacy network fallback in `fetch_images_base64`
     /// handles it.
     #[serde(skip_serializing, default)]
-    data: Option<String>,
+    pub(crate) data: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -189,6 +199,8 @@ pub(crate) struct SubagentToolHistorySnapshot {
     pub is_error: bool,
     #[serde(default)]
     pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Default)]
@@ -747,6 +759,8 @@ struct LiveToolState {
     live_output: String,
     result: Option<String>,
     elapsed_ms: u64,
+    images: Vec<serde_json::Value>,
+    is_error: bool,
 }
 
 #[derive(Clone, Default)]
@@ -1664,6 +1678,8 @@ async fn record_tool_output_event_for_replay_and_client(
                         live_output,
                         result: None,
                         elapsed_ms: 0,
+                        images: Vec::new(),
+                        is_error: false,
                     });
                 }
             }
@@ -2087,6 +2103,8 @@ async fn dispatch_live_event(
                             live_output: String::new(),
                             result: None,
                             elapsed_ms: 0,
+                            images: Vec::new(),
+                            is_error: false,
                         });
                     }
                 }
@@ -2116,6 +2134,8 @@ async fn dispatch_live_event(
                                 live_output,
                                 result: None,
                                 elapsed_ms: 0,
+                                images: Vec::new(),
+                                is_error: false,
                             });
                         }
                     }
@@ -2138,6 +2158,8 @@ async fn dispatch_live_event(
                             live_output: String::new(),
                             result: None,
                             elapsed_ms,
+                            images: Vec::new(),
+                            is_error: false,
                         });
                     }
                 }
@@ -2156,10 +2178,14 @@ async fn dispatch_live_event(
                         let tool_id = event["id"].as_str().unwrap_or_default();
                         let mut result = event["result"].as_str().unwrap_or_default().to_string();
                         truncate_safe(&mut result, LIVE_REPLAY_CAP);
+                        let images = event["images"].as_array().cloned().unwrap_or_default();
+                        let is_error = event["is_error"].as_bool().unwrap_or(false);
                         if let Some(tool) = round.tools.iter_mut().find(|tool| tool.id == tool_id) {
                             tool.result = Some(result);
                             tool.elapsed_ms =
                                 event["duration_ms"].as_u64().unwrap_or(tool.elapsed_ms);
+                            tool.images = images;
+                            tool.is_error = is_error;
                         } else {
                             round.tools.push(LiveToolState {
                                 id: tool_id.to_string(),
@@ -2168,6 +2194,8 @@ async fn dispatch_live_event(
                                 live_output: String::new(),
                                 result: Some(result),
                                 elapsed_ms: event["duration_ms"].as_u64().unwrap_or(0),
+                                images,
+                                is_error,
                             });
                         }
                     }
@@ -2508,13 +2536,18 @@ fn live_round_replay_events(live_round: &LiveRoundState) -> Vec<serde_json::Valu
             }));
         }
         if let Some(result) = &tool.result {
-            events.push(json!({
+            let mut result_event = json!({
                 "type":"tool_result",
                 "id": tool.id,
                 "name": tool.name,
                 "result": result,
                 "duration_ms": tool.elapsed_ms,
-            }));
+                "is_error": tool.is_error,
+            });
+            if !tool.images.is_empty() {
+                result_event["images"] = json!(tool.images);
+            }
+            events.push(result_event);
         }
     }
 
@@ -4450,6 +4483,104 @@ async fn api_get_config(
     }
 }
 
+fn s3_lifecycle_needs_sync_with_id(
+    current: Option<&config::S3Config>,
+    synced_config_id: Option<&str>,
+) -> bool {
+    let Some(current) = current.filter(|cfg| cfg.lifecycle_days > 0) else {
+        return false;
+    };
+    let current_config_id = image_uploads::s3_config_id(current);
+    synced_config_id != Some(current_config_id.as_str())
+}
+
+fn s3_lifecycle_needs_sync(current: Option<&config::S3Config>) -> bool {
+    let synced_config_id = S3_LIFECYCLE_SYNCED_CONFIG_ID
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    s3_lifecycle_needs_sync_with_id(current, synced_config_id.as_deref())
+}
+
+fn s3_lifecycle_request_matches_current(
+    current: Option<&config::S3Config>,
+    requested_config_id: &str,
+) -> bool {
+    current
+        .filter(|cfg| cfg.lifecycle_days > 0)
+        .is_some_and(|cfg| image_uploads::s3_config_id(cfg) == requested_config_id)
+}
+
+async fn synchronize_s3_lifecycle(http: &Client, s3_cfg: &config::S3Config) {
+    let config_id = image_uploads::s3_config_id(s3_cfg);
+
+    let synchronized = match tokio::time::timeout(
+        Duration::from_secs(30),
+        image_uploads::ensure_s3_temp_image_lifecycle(http, s3_cfg),
+    )
+    .await
+    {
+        Ok(Ok(true)) => {
+            eprintln!(
+                "  S3 lifecycle: configured {}-day expiration for prefix '{}'",
+                s3_cfg.lifecycle_days, s3_cfg.prefix
+            );
+            true
+        }
+        Ok(Ok(false)) => {
+            eprintln!(
+                "  S3 lifecycle: verified {}-day expiration for prefix '{}'",
+                s3_cfg.lifecycle_days, s3_cfg.prefix
+            );
+            true
+        }
+        Ok(Err(error)) => {
+            eprintln!("WARNING: Failed to ensure S3 lifecycle rule: {error}");
+            false
+        }
+        Err(_) => {
+            eprintln!("WARNING: Timed out ensuring S3 lifecycle rule");
+            false
+        }
+    };
+    if synchronized {
+        *S3_LIFECYCLE_SYNCED_CONFIG_ID
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(config_id);
+    }
+}
+
+async fn ensure_configured_s3_lifecycle(http: &Client, s3_cfg: &config::S3Config) {
+    if !s3_lifecycle_needs_sync(Some(s3_cfg)) {
+        return;
+    }
+
+    // Serialize policy updates and re-check after waiting. This prevents two
+    // concurrent startup/Settings paths from issuing duplicate GET/PUT sequences.
+    let _sync_guard = S3_LIFECYCLE_SYNC_LOCK.lock().await;
+    if !s3_lifecycle_needs_sync(Some(s3_cfg)) {
+        return;
+    }
+    synchronize_s3_lifecycle(http, s3_cfg).await;
+}
+
+async fn ensure_current_configured_s3_lifecycle(state: &AppState, requested_config_id: &str) {
+    let _sync_guard = S3_LIFECYCLE_SYNC_LOCK.lock().await;
+    let current_config = state.config();
+    let Some(s3_cfg) = current_config.s3.as_ref() else {
+        return;
+    };
+    // A newer Settings save may have applied while this request waited for the
+    // lifecycle lock. Only the request matching the current S3 identity may
+    // write the bucket policy; the newer save will synchronize after us when
+    // it changed the identity while an older request was already in flight.
+    if !s3_lifecycle_request_matches_current(Some(s3_cfg), requested_config_id)
+        || !s3_lifecycle_needs_sync(Some(s3_cfg))
+    {
+        return;
+    }
+    synchronize_s3_lifecycle(&state.http, s3_cfg).await;
+}
+
 /// PUT /api/config — validate and save the JSON config file.
 async fn api_put_config(
     headers: HeaderMap,
@@ -4529,7 +4660,6 @@ async fn api_put_config(
         serde_json::to_string_pretty(&config_value).unwrap_or_else(|_| config_value.to_string());
 
     let _save_guard = CONFIG_FILE_LOCK.write().await;
-
     if let Some(base_etag) = base_config_file_etag {
         let current_content = read_config_file_snapshot_unlocked(&path).map_err(|error| {
             (
@@ -4574,6 +4704,9 @@ async fn api_put_config(
     // model/MCP changes take effect without a restart.
     let new_config = Config::load();
     let (applied_config, config_revision) = state.apply_runtime_config(new_config);
+    let s3_lifecycle_config_id = applied_config.s3.as_ref().and_then(|s3_cfg| {
+        s3_lifecycle_needs_sync(Some(s3_cfg)).then(|| image_uploads::s3_config_id(s3_cfg))
+    });
 
     // Collect an immutable same-revision snapshot for every connected Session
     // and Group while the write lock still protects this applied Config.
@@ -4582,8 +4715,16 @@ async fn api_put_config(
             .await;
 
     // Release the config file lock before any potentially backpressured socket
-    // send or slow MCP I/O.
+    // send or slow storage/MCP I/O.
     drop(_save_guard);
+
+    // A first-run S3 configuration is hot-reloaded without restarting the
+    // process. Ensure its lifecycle policy before the Settings save completes,
+    // just as startup does, so newly enabled image tools do not depend on a
+    // later restart to receive retention management.
+    if let Some(config_id) = s3_lifecycle_config_id.as_deref() {
+        ensure_current_configured_s3_lifecycle(&state, config_id).await;
+    }
 
     socket_sync::send_model_configuration_payloads(&state, model_configuration_payloads).await;
 
@@ -5152,34 +5293,8 @@ async fn main() {
     };
 
     let http = Client::new();
-    if let Some(s3_cfg) = config.s3.clone()
-        && s3_cfg.lifecycle_days > 0
-    {
-        match tokio::time::timeout(
-            Duration::from_secs(30),
-            image_uploads::ensure_s3_temp_image_lifecycle(&http, &s3_cfg),
-        )
-        .await
-        {
-            Ok(Ok(true)) => {
-                eprintln!(
-                    "  S3 lifecycle: configured {}-day expiration for prefix '{}'",
-                    s3_cfg.lifecycle_days, s3_cfg.prefix
-                );
-            }
-            Ok(Ok(false)) => {
-                eprintln!(
-                    "  S3 lifecycle: verified {}-day expiration for prefix '{}'",
-                    s3_cfg.lifecycle_days, s3_cfg.prefix
-                );
-            }
-            Ok(Err(error)) => {
-                eprintln!("WARNING: Failed to ensure S3 lifecycle rule: {error}");
-            }
-            Err(_) => {
-                eprintln!("WARNING: Timed out ensuring S3 lifecycle rule");
-            }
-        }
+    if let Some(s3_cfg) = config.s3.as_ref() {
+        ensure_configured_s3_lifecycle(&http, s3_cfg).await;
     }
 
     let state = Arc::new(AppState {

@@ -1057,12 +1057,19 @@ async fn handle_skills_command(
     current_session_id: &str,
     state: &AppState,
 ) -> CommandResult {
-    let workspace = state
+    let config = state.config();
+    let (workspace, model) = state
         .sessions
         .lock()
         .await
         .get(current_session_id)
-        .map(|s| s.workspace.clone());
+        .map(|session| {
+            (
+                Some(session.workspace.clone()),
+                Some(session.effective_model(&config.model).to_string()),
+            )
+        })
+        .unwrap_or((None, None));
 
     let ws = workspace.as_deref().unwrap_or(Path::new(""));
 
@@ -1079,8 +1086,8 @@ async fn handle_skills_command(
     };
 
     let mut output = if filter.is_none() {
-        let tool_list = tools::tool_specs()
-            .iter()
+        let tool_list = tools::available_builtin_tool_specs(&config, model.as_deref())
+            .into_iter()
             .map(|spec| {
                 let short = spec
                     .description
@@ -2028,17 +2035,22 @@ async fn list_daily_memory_files(memory_dir: &Path) -> String {
 
 async fn handle_agents_command(current_session_id: &str, state: &AppState) -> CommandResult {
     let config = state.config();
-    let workspace = {
+    let (workspace, run_model) = {
         let sessions = state.sessions.lock().await;
         match sessions.get(current_session_id) {
-            Some(s) => s.workspace.clone(),
+            Some(session) => (
+                session.workspace.clone(),
+                session.effective_model(&config.model).to_string(),
+            ),
             None => return command_result("Session not found", "error", false),
         }
     };
+    let mut delegated_config = (*config).clone();
+    delegated_config.model = run_model;
 
     // Warm only the MCP tools enabled for this session so `/agents` does not
     // contact disabled MCP servers while building the tool listing.
-    crate::tools::mcp::ensure_policy_tools_cached(&config, &workspace).await;
+    crate::tools::mcp::ensure_policy_tools_cached(&delegated_config, &workspace).await;
 
     let agents = crate::subagents::discovery::discover_all_agents(&workspace);
     if agents.is_empty() {
@@ -2056,13 +2068,17 @@ async fn handle_agents_command(current_session_id: &str, state: &AppState) -> Co
     let mut lines = Vec::with_capacity(agents.len() + 2);
     lines.push(format!("**{} sub-agent(s) available:**\n", agents.len()));
     for agent in &agents {
-        let tools = crate::subagents::filter_tools_for_agent_with_mcp(agent, &config, &workspace);
-        let tool_list = if tools.is_empty() {
+        let model_info = delegated_config.sub_agent_model_for(&agent.name);
+        let mut available_tools =
+            crate::subagents::filter_tools_for_agent_with_mcp(agent, &delegated_config, &workspace);
+        if !tools::view_image_available(&delegated_config, model_info) {
+            available_tools.retain(|tool| tool != tools::TOOL_NAME_VIEW_IMAGE);
+        }
+        let tool_list = if available_tools.is_empty() {
             "(no tools)".to_string()
         } else {
-            tools.join(", ")
+            available_tools.join(", ")
         };
-        let model_info = config.sub_agent_model_for(&agent.name);
         lines.push(format!(
             "- **{}** [`{}`] — {}\n  model: {} | max_turns: {} | tools: {}",
             agent.name,

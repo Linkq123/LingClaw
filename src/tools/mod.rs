@@ -1,5 +1,6 @@
 pub(crate) mod exec;
 pub(crate) mod fs;
+pub(crate) mod image_view;
 pub(crate) mod mcp;
 pub(crate) mod net;
 pub(crate) mod safety;
@@ -18,16 +19,41 @@ use tokio::sync::mpsc::{Receiver, Sender, UnboundedSender};
 use crate::{Config, Provider};
 
 /// Structured tool execution result with metadata.
+#[derive(Clone)]
+pub(crate) struct ToolImageOutput {
+    pub(crate) data: Vec<u8>,
+    pub(crate) mime_type: String,
+    pub(crate) name: String,
+}
+
+impl std::fmt::Debug for ToolImageOutput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ToolImageOutput")
+            .field(
+                "data",
+                &format_args!("<{} validated bytes>", self.data.len()),
+            )
+            .field("mime_type", &self.mime_type)
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
 pub(crate) struct ToolOutcome {
     pub output: String,
     pub is_error: bool,
     pub duration_ms: u64,
     pub subagent_snapshot: Option<crate::SubagentHistorySnapshot>,
+    /// Validated image bytes produced by the tool. These are consumed by the
+    /// runtime uploader and are never serialized into session or live payloads.
+    pub images: Vec<ToolImageOutput>,
 }
 
 pub(super) struct ToolHandlerOutput {
     output: String,
     is_error: Option<bool>,
+    images: Vec<ToolImageOutput>,
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +92,7 @@ impl ToolHandlerOutput {
         Self {
             output,
             is_error: None,
+            images: Vec::new(),
         }
     }
 
@@ -73,6 +100,15 @@ impl ToolHandlerOutput {
         Self {
             output,
             is_error: Some(is_error),
+            images: Vec::new(),
+        }
+    }
+
+    fn with_images(output: String, is_error: bool, images: Vec<ToolImageOutput>) -> Self {
+        Self {
+            output,
+            is_error: Some(is_error),
+            images,
         }
     }
 }
@@ -92,6 +128,7 @@ pub(crate) const TOOL_NAME_THINK: &str = "think";
 pub(crate) const TOOL_NAME_TODOS: &str = "todos";
 pub(crate) const TOOL_NAME_EXEC: &str = "exec";
 pub(crate) const TOOL_NAME_READ_FILE: &str = "read_file";
+pub(crate) const TOOL_NAME_VIEW_IMAGE: &str = "view_image";
 pub(crate) const TOOL_NAME_WRITE_FILE: &str = "write_file";
 pub(crate) const TOOL_NAME_PATCH_FILE: &str = "patch_file";
 pub(crate) const TOOL_NAME_LIST_DIR: &str = "list_dir";
@@ -110,6 +147,7 @@ pub(crate) fn tool_runtime_timeout(tool_name: &str, config: &Config) -> Option<D
     }
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct ToolSpec {
     pub(crate) name: &'static str,
     pub(crate) description: &'static str,
@@ -326,6 +364,22 @@ fn tool_parameters_read_file() -> serde_json::Value {
     })
 }
 
+fn tool_parameters_view_image() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096,
+                "description": "PNG or JPEG file path inside the session workspace"
+            }
+        },
+        "required": ["path"],
+        "additionalProperties": false
+    })
+}
+
 fn tool_parameters_write_file() -> serde_json::Value {
     json!({
         "type": "object",
@@ -474,6 +528,11 @@ fn tool_prompt_line_read_file(_: &Config) -> String {
     "**read_file** — Read file contents from the session workspace. Supports line range (start_line, end_line).".to_string()
 }
 
+fn tool_prompt_line_view_image(_: &Config) -> String {
+    "**view_image** — Read a PNG or JPEG from the session workspace for visual analysis."
+        .to_string()
+}
+
 fn tool_prompt_line_write_file(_: &Config) -> String {
     "**write_file** — Create or overwrite files inside the session workspace.".to_string()
 }
@@ -549,6 +608,45 @@ fn tool_handler_read_file<'a>(
     Box::pin(async move {
         ToolHandlerOutput::inferred(fs::tool_read_file(args, config, workspace).await)
     })
+}
+
+fn tool_handler_view_image<'a>(
+    args: &'a serde_json::Value,
+    _: &'a Config,
+    _: &'a Client,
+    workspace: &'a Path,
+    _: Option<ToolEventSender>,
+    _: Option<BoundedToolEventSender>,
+) -> ToolFuture<'a> {
+    Box::pin(async move {
+        let result = image_view::tool_view_image(args, workspace)
+            .await
+            .map(image_view::ToolViewImageOutcome::Image);
+        view_image_handler_output(result)
+    })
+}
+
+fn view_image_handler_output(
+    result: Result<image_view::ToolViewImageOutcome, String>,
+) -> ToolHandlerOutput {
+    match result {
+        Ok(image_view::ToolViewImageOutcome::Image(image)) => ToolHandlerOutput::with_images(
+            format!(
+                "Image read successfully: {} ({}, {} bytes).",
+                image.name,
+                image.mime_type,
+                image.data.len()
+            ),
+            false,
+            vec![image],
+        ),
+        Ok(image_view::ToolViewImageOutcome::Skipped(reason)) => {
+            ToolHandlerOutput::explicit(format!("Image was not attached: {reason}."), false)
+        }
+        Err(error) => {
+            ToolHandlerOutput::explicit(format!("{TOOL_NAME_VIEW_IMAGE} error: {error}"), true)
+        }
+    }
 }
 
 fn tool_handler_write_file<'a>(
@@ -834,6 +932,15 @@ pub(crate) fn tool_specs() -> &'static [ToolSpec] {
             trace_builder: trace_builder_read_file,
         },
         ToolSpec {
+            name: TOOL_NAME_VIEW_IMAGE,
+            description: "Read a validated PNG or JPEG from the session workspace and attach it as untrusted visual tool data for the next model cycle.",
+            relevance_hint: "view inspect image png jpeg screenshot photo diagram visual",
+            prompt_line: tool_prompt_line_view_image,
+            parameters: tool_parameters_view_image,
+            handler: tool_handler_view_image,
+            trace_builder: trace_builder_read_file,
+        },
+        ToolSpec {
             name: TOOL_NAME_WRITE_FILE,
             description: "Create a new file or overwrite an existing file with the given content.",
             relevance_hint: "create write save generate file content",
@@ -888,6 +995,26 @@ pub(crate) fn tool_specs() -> &'static [ToolSpec] {
             trace_builder: trace_builder_delete_file,
         },
     ]
+}
+
+pub(crate) fn view_image_available(config: &Config, model: &str) -> bool {
+    config.s3.is_some() && config.model_supports_image(model)
+}
+
+/// Return the built-in tools that are actually available for a model-backed
+/// Session. Conditional tools stay out of user- and agent-facing catalogs
+/// until the same capability gate used by the runtime is satisfied.
+pub(crate) fn available_builtin_tool_specs(
+    config: &Config,
+    model: Option<&str>,
+) -> Vec<&'static ToolSpec> {
+    tool_specs()
+        .iter()
+        .filter(|spec| {
+            spec.name != TOOL_NAME_VIEW_IMAGE
+                || model.is_some_and(|model| view_image_available(config, model))
+        })
+        .collect()
 }
 
 fn find_tool_spec(name: &str) -> Option<&'static ToolSpec> {
@@ -1159,7 +1286,15 @@ fn compact_tool_call_summary(text: &str) -> String {
     crate::truncate(&text.split_whitespace().collect::<Vec<_>>().join(" "), 180)
 }
 
-#[allow(dead_code)] // Compatibility wrapper for call sites that still want the full tool list.
+fn prompt_tool_specs(include_view_image: bool) -> Vec<ToolSpec> {
+    tool_specs()
+        .iter()
+        .filter(|spec| include_view_image || spec.name != TOOL_NAME_VIEW_IMAGE)
+        .copied()
+        .collect()
+}
+
+#[allow(dead_code)] // Compatibility wrapper for call sites that want the default tool list.
 pub(crate) fn render_tool_prompt_lines(config: &Config) -> String {
     render_tool_prompt_lines_with_query(config, None)
 }
@@ -1168,13 +1303,21 @@ pub(crate) fn render_tool_prompt_lines_with_query(
     config: &Config,
     current_query: Option<&str>,
 ) -> String {
-    let specs = tool_specs();
+    render_tool_prompt_lines_with_query_and_view_image(config, current_query, false)
+}
+
+pub(crate) fn render_tool_prompt_lines_with_query_and_view_image(
+    config: &Config,
+    current_query: Option<&str>,
+    include_view_image: bool,
+) -> String {
+    let specs = prompt_tool_specs(include_view_image);
     let prompt_lines: Vec<String> = specs
         .iter()
         .map(|spec| (spec.prompt_line)(config))
         .collect();
 
-    if let Some(selected) = select_ranked_tool_indices(specs, &prompt_lines, current_query, None) {
+    if let Some(selected) = select_ranked_tool_indices(&specs, &prompt_lines, current_query, None) {
         let mut display_order = selected.clone();
         display_order.sort_unstable();
 
@@ -1210,8 +1353,11 @@ pub(crate) fn render_tool_prompt_lines_with_query(
         .join("\n")
 }
 
-pub(crate) fn render_read_only_tool_prompt_lines(config: &Config) -> String {
-    tool_specs()
+pub(crate) fn render_read_only_tool_prompt_lines_with_view_image(
+    config: &Config,
+    include_view_image: bool,
+) -> String {
+    prompt_tool_specs(include_view_image)
         .iter()
         .filter(|spec| is_read_only_tool(spec.name))
         .map(|spec| (spec.prompt_line)(config))
@@ -1226,12 +1372,12 @@ pub(crate) fn render_ranked_tool_recommendations(
     current_query: Option<&str>,
     ranking: &ToolRankingContext,
 ) -> Option<String> {
-    let specs = tool_specs();
+    let specs = prompt_tool_specs(false);
     let prompt_lines: Vec<String> = specs
         .iter()
         .map(|spec| (spec.prompt_line)(config))
         .collect();
-    let selected = select_ranked_tool_indices(specs, &prompt_lines, current_query, Some(ranking))?;
+    let selected = select_ranked_tool_indices(&specs, &prompt_lines, current_query, Some(ranking))?;
 
     let mut lines = vec!["## Suggested Tool Order".to_string()];
     for (display_idx, idx) in selected.iter().enumerate() {
@@ -1374,6 +1520,7 @@ pub(crate) fn tool_definitions() -> serde_json::Value {
 pub(crate) fn tool_definitions_openai() -> serde_json::Value {
     let tools = tool_specs()
         .iter()
+        .filter(|spec| spec.name != TOOL_NAME_VIEW_IMAGE)
         .map(|spec| {
             json!({
                 "type": "function",
@@ -1395,6 +1542,7 @@ pub(crate) fn tool_definitions_ollama() -> serde_json::Value {
 pub(crate) fn tool_definitions_gemini() -> serde_json::Value {
     let tools = tool_specs()
         .iter()
+        .filter(|spec| spec.name != TOOL_NAME_VIEW_IMAGE)
         .map(|spec| {
             json!({
                 "name": spec.name,
@@ -1476,6 +1624,7 @@ fn normalize_gemini_schema(value: Value) -> Value {
 pub(crate) fn tool_definitions_anthropic() -> serde_json::Value {
     let tools = tool_specs()
         .iter()
+        .filter(|spec| spec.name != TOOL_NAME_VIEW_IMAGE)
         .map(|spec| {
             json!({
                 "name": spec.name,
@@ -1493,6 +1642,7 @@ pub(crate) fn read_only_tool_definitions_for_provider(
     tool_specs()
         .iter()
         .filter(|spec| is_read_only_tool(spec.name))
+        .filter(|spec| spec.name != TOOL_NAME_VIEW_IMAGE)
         .map(|spec| match provider {
             Provider::Anthropic => json!({
                 "name": spec.name,
@@ -1544,6 +1694,7 @@ pub(crate) fn is_read_only_tool(name: &str) -> bool {
         name,
         TOOL_NAME_THINK
             | TOOL_NAME_READ_FILE
+            | TOOL_NAME_VIEW_IMAGE
             | TOOL_NAME_LIST_DIR
             | TOOL_NAME_SEARCH_FILES
             | TOOL_NAME_HTTP_FETCH
@@ -1961,6 +2112,7 @@ pub(crate) fn orchestrate_tool_parameters() -> serde_json::Value {
     })
 }
 
+#[allow(dead_code)] // Compatibility wrapper for callers without a shared image budget.
 pub(crate) async fn execute_tool(
     name: &str,
     args_str: &str,
@@ -1969,8 +2121,29 @@ pub(crate) async fn execute_tool(
     workspace: &Path,
     event_tx: Option<ToolEventSender>,
 ) -> ToolOutcome {
-    execute_tool_with_bounded_live_events(name, args_str, config, http, workspace, event_tx, None)
-        .await
+    execute_tool_with_image_budget(name, args_str, config, http, workspace, event_tx, None).await
+}
+
+pub(crate) async fn execute_tool_with_image_budget(
+    name: &str,
+    args_str: &str,
+    config: &Config,
+    http: &Client,
+    workspace: &Path,
+    event_tx: Option<ToolEventSender>,
+    image_budget: Option<mcp::ToolImageBudget>,
+) -> ToolOutcome {
+    execute_tool_with_bounded_live_events_and_image_budget(
+        name,
+        args_str,
+        config,
+        http,
+        workspace,
+        event_tx,
+        None,
+        image_budget,
+    )
+    .await
 }
 
 pub(crate) async fn execute_tool_with_bounded_live_events(
@@ -1982,6 +2155,30 @@ pub(crate) async fn execute_tool_with_bounded_live_events(
     event_tx: Option<ToolEventSender>,
     bounded_event_tx: Option<BoundedToolEventSender>,
 ) -> ToolOutcome {
+    execute_tool_with_bounded_live_events_and_image_budget(
+        name,
+        args_str,
+        config,
+        http,
+        workspace,
+        event_tx,
+        bounded_event_tx,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn execute_tool_with_bounded_live_events_and_image_budget(
+    name: &str,
+    args_str: &str,
+    config: &Config,
+    http: &Client,
+    workspace: &Path,
+    event_tx: Option<ToolEventSender>,
+    bounded_event_tx: Option<BoundedToolEventSender>,
+    image_budget: Option<mcp::ToolImageBudget>,
+) -> ToolOutcome {
     let start = Instant::now();
 
     let args: serde_json::Value = match serde_json::from_str(args_str) {
@@ -1992,6 +2189,7 @@ pub(crate) async fn execute_tool_with_bounded_live_events(
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             };
         }
     };
@@ -2002,6 +2200,7 @@ pub(crate) async fn execute_tool_with_bounded_live_events(
             is_error: true,
             duration_ms: start.elapsed().as_millis() as u64,
             subagent_snapshot: None,
+            images: Vec::new(),
         };
     };
 
@@ -2012,11 +2211,17 @@ pub(crate) async fn execute_tool_with_bounded_live_events(
             is_error: true,
             duration_ms: start.elapsed().as_millis() as u64,
             subagent_snapshot: None,
+            images: Vec::new(),
         };
     }
 
-    let handler_output =
-        (spec.handler)(&args, config, http, workspace, event_tx, bounded_event_tx).await;
+    let handler_output = if name == TOOL_NAME_VIEW_IMAGE {
+        view_image_handler_output(
+            image_view::tool_view_image_with_budget(&args, workspace, image_budget.as_ref()).await,
+        )
+    } else {
+        (spec.handler)(&args, config, http, workspace, event_tx, bounded_event_tx).await
+    };
     let duration_ms = start.elapsed().as_millis() as u64;
     let is_error = handler_output
         .is_error
@@ -2027,6 +2232,31 @@ pub(crate) async fn execute_tool_with_bounded_live_events(
         is_error,
         duration_ms,
         subagent_snapshot: None,
+        images: handler_output.images,
+    }
+}
+
+pub(crate) fn conditional_view_image_definition(provider: Provider) -> serde_json::Value {
+    let spec = find_tool_spec(TOOL_NAME_VIEW_IMAGE).expect("view_image tool spec");
+    match provider {
+        Provider::Anthropic => json!({
+            "name": spec.name,
+            "description": spec.description,
+            "input_schema": (spec.parameters)(),
+        }),
+        Provider::Gemini => json!({
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": gemini_tool_parameters((spec.parameters)()),
+        }),
+        Provider::OpenAI | Provider::OpenAIResponses | Provider::Ollama => json!({
+            "type": "function",
+            "function": {
+                "name": spec.name,
+                "description": spec.description,
+                "parameters": (spec.parameters)(),
+            }
+        }),
     }
 }
 

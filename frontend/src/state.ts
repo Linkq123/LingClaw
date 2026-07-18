@@ -51,6 +51,8 @@ export interface DomRefs {
   toolDrawerArgs: HTMLElement | null;
   toolDrawerResult: HTMLElement | null;
   toolDrawerResultSection: HTMLElement | null;
+  toolDrawerImages: HTMLElement | null;
+  toolDrawerImagesSection: HTMLElement | null;
   attachBtn: HTMLButtonElement | null;
   imagePreviewBar: HTMLElement | null;
   attachPopup: HTMLElement | null;
@@ -156,6 +158,7 @@ export interface AppState {
   uploadTokenRequestSeq: number;
   pendingImages: ImageAttachment[];
   imageUploadInFlight: boolean;
+  toolImageCompatibilityWarningShown: boolean;
   inputHistory: string[];
   inputHistoryIndex: number;
   inputHistoryDraft: string;
@@ -280,6 +283,7 @@ export const state: AppState = {
   uploadTokenRequestSeq: 0,
   pendingImages: [],
   imageUploadInFlight: false,
+  toolImageCompatibilityWarningShown: false,
   inputHistory: [],
   inputHistoryIndex: -1,
   inputHistoryDraft: '',
@@ -349,6 +353,8 @@ export function initDomRefs() {
   dom.toolDrawerArgs = document.getElementById('tool-drawer-args');
   dom.toolDrawerResult = document.getElementById('tool-drawer-result');
   dom.toolDrawerResultSection = document.getElementById('tool-drawer-result-section');
+  dom.toolDrawerImages = document.getElementById('tool-drawer-images');
+  dom.toolDrawerImagesSection = document.getElementById('tool-drawer-images-section');
   dom.attachBtn = document.getElementById('attach-btn') as HTMLButtonElement | null;
   dom.imagePreviewBar = document.getElementById('image-preview-bar');
   dom.attachPopup = document.getElementById('attach-popup');

@@ -1,6 +1,8 @@
 use super::*;
 
-use crate::prompts::{SystemPromptToolMode, build_system_prompt_with_query_cached_for_tool_mode};
+use crate::prompts::{
+    SystemPromptToolMode, build_system_prompt_with_query_cached_for_tool_mode_with_view_image,
+};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64};
 use tokio::time::MissedTickBehavior;
@@ -312,6 +314,10 @@ struct AgentPhaseState {
     /// Token counters snapshotted at loop start for per-round delta calculation.
     usage_snap_input: u64,
     usage_snap_output: u64,
+    /// Run-local compatibility circuit breaker for endpoints that reject
+    /// multimodal observations following tool results.
+    tool_images_disabled: bool,
+    tool_images_attached_in_batch: usize,
 }
 
 /// Minimum interval between observe-phase incremental saves.
@@ -347,6 +353,9 @@ struct WorkingStateSessionData {
     fallback_model: String,
 }
 
+// Completed is the overwhelmingly common path. Keeping the outcome inline avoids
+// one heap allocation for every tool call; its current size remains modest.
+#[allow(clippy::large_enum_variant)]
 enum ToolRunState {
     Completed(tools::ToolOutcome),
     Abort,
@@ -777,13 +786,26 @@ async fn prepare_analyze_snapshot(
     } else {
         SystemPromptToolMode::Execute
     };
-    let mut fresh_system = build_system_prompt_with_query_cached_for_tool_mode(
-        &config,
+    let prompt_config = if phase_state.tool_images_disabled {
+        let mut config_without_tool_images = (*config).clone();
+        config_without_tool_images.s3 = None;
+        Arc::new(config_without_tool_images)
+    } else {
+        Arc::clone(&config)
+    };
+    // Tool outputs are consumed by the next Analyze cycle. After an initial
+    // fast-model tool call that cycle routes back to the run's primary model,
+    // so capability gating must follow the consumer rather than the producer.
+    let view_image_available =
+        tool_images_available_for_consumer(&config, &base_model, phase_state.tool_images_disabled);
+    let mut fresh_system = build_system_prompt_with_query_cached_for_tool_mode_with_view_image(
+        &prompt_config,
         &session.workspace,
         &model_str,
         &enabled_system_skills,
         latest_query.as_deref(),
         system_prompt_tool_mode,
+        view_image_available,
     );
 
     refresh_retrieved_task_memory(
@@ -796,9 +818,9 @@ async fn prepare_analyze_snapshot(
     let discovered_agents = crate::subagents::discovery::discover_all_agents(&session.workspace);
     let task_plan = if config.enable_task_plan {
         let available_tools = if phase_state.run_mode.is_plan_only() {
-            available_tool_names_for_plan_only(&config, &session.workspace)
+            available_tool_names_for_plan_only(&config, &session.workspace, view_image_available)
         } else {
-            available_tool_names_for_plan(&config, &session.workspace)
+            available_tool_names_for_plan(&config, &session.workspace, view_image_available)
         };
         let available_agent_names = if phase_state.run_mode.is_plan_only() {
             Vec::new()
@@ -1092,7 +1114,7 @@ async fn build_cycle_tools(
     resolved: &providers::ResolvedModel,
 ) -> Vec<serde_json::Value> {
     let config = ctx.config.clone();
-    if phase_state.run_mode.is_plan_only() {
+    let mut definitions = if phase_state.run_mode.is_plan_only() {
         build_plan_only_tools(&config, resolved.provider, &phase_state.cycle_workspace)
     } else {
         build_runtime_tools(
@@ -1102,7 +1124,19 @@ async fn build_cycle_tools(
             ctx.current_session_id,
         )
         .await
+    };
+    if tool_images_available_for_consumer(&config, &ctx.model, phase_state.tool_images_disabled) {
+        definitions.push(tools::conditional_view_image_definition(resolved.provider));
     }
+    definitions
+}
+
+fn tool_images_available_for_consumer(
+    config: &Config,
+    consumer_model: &str,
+    compatibility_disabled: bool,
+) -> bool {
+    !compatibility_disabled && tools::view_image_available(config, consumer_model)
 }
 
 fn tool_definition_name(value: &serde_json::Value) -> Option<&str> {
@@ -1144,9 +1178,14 @@ pub(crate) fn build_plan_only_tools(
     definitions
 }
 
-fn available_tool_names_for_plan(config: &Config, workspace: &Path) -> Vec<String> {
+fn available_tool_names_for_plan(
+    config: &Config,
+    workspace: &Path,
+    include_view_image: bool,
+) -> Vec<String> {
     let mut names = tools::tool_specs()
         .iter()
+        .filter(|spec| include_view_image || spec.name != tools::TOOL_NAME_VIEW_IMAGE)
         .map(|spec| spec.name.to_string())
         .collect::<Vec<_>>();
     let agents = crate::subagents::discovery::discover_all_agents(workspace);
@@ -1165,10 +1204,17 @@ fn available_tool_names_for_plan(config: &Config, workspace: &Path) -> Vec<Strin
     names
 }
 
-fn available_tool_names_for_plan_only(config: &Config, workspace: &Path) -> Vec<String> {
+fn available_tool_names_for_plan_only(
+    config: &Config,
+    workspace: &Path,
+    include_view_image: bool,
+) -> Vec<String> {
     let mut names = tools::tool_specs()
         .iter()
-        .filter(|spec| tools::is_read_only_tool(spec.name))
+        .filter(|spec| {
+            tools::is_read_only_tool(spec.name)
+                && (include_view_image || spec.name != tools::TOOL_NAME_VIEW_IMAGE)
+        })
         .map(|spec| spec.name.to_string())
         .collect::<Vec<_>>();
     let mcp_policy = tools::mcp::load_session_policy(workspace);
@@ -1399,6 +1445,7 @@ async fn apply_llm_response(
     advance_after_llm_response(ctx.live_tx, phase_state, &resp.message, latest_query).await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_tool(
     name: &str,
     args_str: &str,
@@ -1407,22 +1454,33 @@ async fn execute_tool(
     workspace: &Path,
     isolated_mcp_session: bool,
     event_tx: Option<tools::ToolEventSender>,
+    image_budget: Option<tools::mcp::ToolImageBudget>,
 ) -> tools::ToolOutcome {
     let mcp_policy = tools::mcp::load_session_policy(workspace);
-    let mcp_result = tools::mcp::execute_tool_for_policy(
+    let mcp_result = tools::mcp::execute_tool_for_policy_with_image_budget(
         name,
         args_str,
         config,
         workspace,
         isolated_mcp_session,
         &mcp_policy,
+        image_budget.clone(),
     )
     .await;
 
     if let Some(result) = mcp_result {
         result
     } else {
-        tools::execute_tool(name, args_str, config, http, workspace, event_tx).await
+        tools::execute_tool_with_image_budget(
+            name,
+            args_str,
+            config,
+            http,
+            workspace,
+            event_tx,
+            image_budget,
+        )
+        .await
     }
 }
 
@@ -1447,6 +1505,7 @@ async fn execute_todos_tool(
                     is_error: true,
                     duration_ms: start.elapsed().as_millis() as u64,
                     subagent_snapshot: None,
+                    images: Vec::new(),
                 };
             }
         };
@@ -1465,12 +1524,14 @@ async fn execute_todos_tool(
                 is_error: false,
                 duration_ms: start.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             },
             Err(error) => tools::ToolOutcome {
                 output: error.message(),
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             },
         }
     })
@@ -1482,6 +1543,7 @@ async fn execute_todos_tool(
             is_error: true,
             duration_ms: 0,
             subagent_snapshot: None,
+            images: Vec::new(),
         },
     }
 }
@@ -1497,6 +1559,7 @@ async fn execute_tool_with_live_output(
     workspace: &Path,
     isolated_mcp_session: bool,
     replay_ctx: Option<crate::LiveOutputReplayCtx>,
+    image_budget: Option<tools::mcp::ToolImageBudget>,
 ) -> tools::ToolOutcome {
     if name != tools::TOOL_NAME_EXEC {
         return execute_tool(
@@ -1507,6 +1570,7 @@ async fn execute_tool_with_live_output(
             workspace,
             isolated_mcp_session,
             None,
+            image_budget,
         )
         .await;
     }
@@ -1607,6 +1671,7 @@ async fn execute_task_tool(
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             };
         }
     };
@@ -1618,6 +1683,7 @@ async fn execute_task_tool(
             is_error: true,
             duration_ms: start.elapsed().as_millis() as u64,
             subagent_snapshot: None,
+            images: Vec::new(),
         };
     }
 
@@ -1629,6 +1695,7 @@ async fn execute_task_tool(
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             };
         }
     };
@@ -1641,6 +1708,7 @@ async fn execute_task_tool(
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             };
         }
     };
@@ -1665,6 +1733,7 @@ async fn execute_task_tool(
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             };
         }
     };
@@ -1790,6 +1859,7 @@ async fn execute_task_tool(
         is_error: outcome.aborted,
         duration_ms,
         subagent_snapshot: Some(history_snapshot),
+        images: Vec::new(),
     }
 }
 
@@ -1819,6 +1889,7 @@ async fn execute_orchestrate_tool(
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             };
         }
     };
@@ -1832,6 +1903,7 @@ async fn execute_orchestrate_tool(
             is_error: true,
             duration_ms: start.elapsed().as_millis() as u64,
             subagent_snapshot: None,
+            images: Vec::new(),
         };
     }
 
@@ -1847,6 +1919,7 @@ async fn execute_orchestrate_tool(
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             };
         }
     };
@@ -1860,6 +1933,7 @@ async fn execute_orchestrate_tool(
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             };
         }
     };
@@ -1915,6 +1989,7 @@ async fn execute_orchestrate_tool(
         is_error: outcome.aborted || outcome.has_non_completed_tasks(),
         duration_ms,
         subagent_snapshot: None,
+        images: Vec::new(),
     }
 }
 
@@ -1975,6 +2050,36 @@ async fn run_tool_with_feedback<F>(
 where
     F: std::future::Future<Output = tools::ToolOutcome>,
 {
+    run_tool_with_feedback_with_image_wait(
+        live_tx, cancel, tool_id, tool_name, timeout, None, future,
+    )
+    .await
+}
+
+async fn next_tool_image_wait_state(
+    receiver: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> Option<bool> {
+    let receiver = receiver.as_mut()?;
+    if receiver.changed().await.is_err() {
+        return None;
+    }
+    let waiting = *receiver.borrow_and_update();
+    Some(waiting)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_tool_with_feedback_with_image_wait<F>(
+    live_tx: &LiveTx,
+    cancel: &CancellationToken,
+    tool_id: &str,
+    tool_name: &str,
+    timeout: Option<Duration>,
+    mut image_wait: Option<tokio::sync::watch::Receiver<bool>>,
+    future: F,
+) -> ToolRunState
+where
+    F: std::future::Future<Output = tools::ToolOutcome>,
+{
     let start = std::time::Instant::now();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(TOOL_PROGRESS_HEARTBEAT_SECS));
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1982,7 +2087,13 @@ where
 
     let has_timeout = timeout.is_some();
     let timeout_secs = timeout.map(|t| t.as_secs()).unwrap_or(0);
-    let sleep = tokio::time::sleep(timeout.unwrap_or(Duration::ZERO));
+    if !has_timeout {
+        image_wait = None;
+    }
+    let mut timeout_remaining = timeout.unwrap_or(Duration::ZERO);
+    let mut timeout_segment_started = tokio::time::Instant::now();
+    let mut timeout_active = has_timeout;
+    let sleep = tokio::time::sleep(timeout_remaining);
     tokio::pin!(sleep);
     tokio::pin!(future);
 
@@ -1992,12 +2103,36 @@ where
             _ = cancel.cancelled() => {
                 return ToolRunState::Abort;
             }
-            _ = &mut sleep, if has_timeout => {
+            wait_state = next_tool_image_wait_state(&mut image_wait), if image_wait.is_some() => {
+                match wait_state {
+                    Some(true) if timeout_active => {
+                        timeout_remaining = timeout_remaining
+                            .saturating_sub(timeout_segment_started.elapsed());
+                        timeout_active = false;
+                    }
+                    Some(false) if !timeout_active => {
+                        timeout_segment_started = tokio::time::Instant::now();
+                        sleep.as_mut().reset(timeout_segment_started + timeout_remaining);
+                        timeout_active = true;
+                    }
+                    None => {
+                        image_wait = None;
+                        if !timeout_active {
+                            timeout_segment_started = tokio::time::Instant::now();
+                            sleep.as_mut().reset(timeout_segment_started + timeout_remaining);
+                            timeout_active = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ = &mut sleep, if timeout_active => {
                 return ToolRunState::Completed(tools::ToolOutcome {
                     output: format!("{tool_name} error: tool execution timed out ({}s)", timeout_secs),
                     is_error: true,
                     duration_ms: start.elapsed().as_millis() as u64,
                     subagent_snapshot: None,
+                    images: Vec::new(),
                 });
             }
             _ = heartbeat.tick() => {
@@ -2035,6 +2170,29 @@ fn is_plan_only_allowed_tool(tool_name: &str, config: &Config, workspace: &Path)
     tools::mcp::is_read_only_tool_name_for_policy(tool_name, config, workspace, &mcp_policy)
 }
 
+fn unavailable_view_image_outcome(
+    config: &Config,
+    consumer_model: &str,
+    tool_images_disabled: bool,
+    tool_name: &str,
+) -> Option<tools::ToolOutcome> {
+    if tool_name != tools::TOOL_NAME_VIEW_IMAGE
+        || tool_images_available_for_consumer(config, consumer_model, tool_images_disabled)
+    {
+        return None;
+    }
+
+    Some(tools::ToolOutcome {
+        output:
+            "view_image error: this tool requires an image-capable model and configured S3 storage."
+                .to_string(),
+        is_error: true,
+        duration_ms: 0,
+        subagent_snapshot: None,
+        images: Vec::new(),
+    })
+}
+
 /// Returns `(outcome, effective_args)` where `effective_args` is `None` when
 /// the tool was rejected by a BeforeToolExec hook (signals record_tool_result
 /// to skip AfterToolExec), or `Some(args_json)` with the actually-executed args.
@@ -2042,8 +2200,17 @@ async fn execute_tool_call(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
     tc: &ToolCall,
+    image_budget: &tools::mcp::ToolImageBudget,
 ) -> Result<(tools::ToolOutcome, Option<String>), AgentPhaseControl> {
     let config = ctx.config.clone();
+    if let Some(outcome) = unavailable_view_image_outcome(
+        &config,
+        &ctx.model,
+        phase_state.tool_images_disabled,
+        &tc.function.name,
+    ) {
+        return Ok((outcome, None));
+    }
     if phase_state.run_mode.is_plan_only()
         && !is_plan_only_allowed_tool(&tc.function.name, &config, &phase_state.cycle_workspace)
     {
@@ -2070,6 +2237,7 @@ async fn execute_tool_call(
                 is_error: true,
                 duration_ms: 0,
                 subagent_snapshot: None,
+                images: Vec::new(),
             },
             None,
         ));
@@ -2122,6 +2290,7 @@ async fn execute_tool_call(
                     is_error: true,
                     duration_ms: 0,
                     subagent_snapshot: None,
+                    images: Vec::new(),
                 },
                 None, // rejected — skip AfterToolExec
             ));
@@ -2205,6 +2374,7 @@ async fn execute_tool_call(
                     is_error: true,
                     duration_ms: 0,
                     subagent_snapshot: None,
+                    images: Vec::new(),
                 },
                 None,
             ));
@@ -2252,6 +2422,7 @@ async fn execute_tool_call(
                     state: Arc::clone(ctx.state),
                     session_id: ctx.current_session_id.to_string(),
                 }),
+                Some(image_budget.clone()),
             ),
         )
         .await
@@ -2269,13 +2440,23 @@ async fn execute_tool_call(
 /// `effective_args`: `Some(args_json)` = the args actually executed (used for
 /// AfterToolExec hook input); `None` = tool was rejected by BeforeToolExec —
 /// AfterToolExec hooks are skipped entirely.
-async fn record_tool_result(
+struct PreparedToolResult {
+    result: tools::ToolOutcome,
+    effective_args: Option<String>,
+}
+
+struct MaterializedToolImageBatch {
+    attachments: Vec<Vec<ImageAttachment>>,
+    stop_after_recording: bool,
+}
+
+async fn prepare_tool_result(
     ctx: &AgentRunCtx<'_>,
     phase_state: &mut AgentPhaseState,
     tc: &ToolCall,
     mut result: tools::ToolOutcome,
     effective_args: Option<&str>,
-) -> AgentPhaseControl {
+) -> PreparedToolResult {
     // ── AfterToolExec hook (skipped when tool was rejected) ──────────────
     let config = ctx.config.clone();
     if let Some(eff_args) = effective_args {
@@ -2302,22 +2483,205 @@ async fn record_tool_result(
         }
     }
 
-    if !tools::is_todos_tool(&tc.function.name)
-        && !live_send(
-            ctx.live_tx,
-            json!({
-                "type":"tool_result",
-                "id": tc.id,
-                "name": tc.function.name,
-                "result": result.output,
-                "duration_ms": result.duration_ms,
-                "is_error": result.is_error,
-            }),
-        )
-        .await
-    {
-        return AgentPhaseControl::Break;
+    PreparedToolResult {
+        result,
+        effective_args: effective_args.map(str::to_string),
     }
+}
+
+fn append_tool_image_warning(outcome: &mut tools::ToolOutcome, warning: &str) {
+    outcome.output.push_str("\n\n[");
+    outcome.output.push_str(warning);
+    outcome.output.push(']');
+}
+
+async fn materialize_tool_image_batch(
+    ctx: &AgentRunCtx<'_>,
+    phase_state: &mut AgentPhaseState,
+    prepared: &mut [Option<PreparedToolResult>],
+) -> MaterializedToolImageBatch {
+    let mut pending_groups = prepared
+        .iter_mut()
+        .map(|entry| {
+            entry
+                .as_mut()
+                .map(|entry| std::mem::take(&mut entry.result.images))
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let result_count = prepared.len();
+    let empty_result = || vec![Vec::new(); result_count];
+    if pending_groups.iter().all(Vec::is_empty) {
+        return MaterializedToolImageBatch {
+            attachments: empty_result(),
+            stop_after_recording: false,
+        };
+    }
+
+    let unavailable_reason = if phase_state.tool_images_disabled {
+        Some(
+            "Tool images were not attached because this endpoint disabled multimodal tool context for the current run.",
+        )
+    } else if !ctx.config.model_supports_image(&ctx.model) {
+        Some("Tool images were not attached because the current model does not accept image input.")
+    } else if ctx.config.s3.is_none() {
+        Some("Tool images were not attached because S3 storage is not configured.")
+    } else {
+        None
+    };
+    if let Some(reason) = unavailable_reason {
+        for (entry, images) in prepared.iter_mut().zip(pending_groups.iter()) {
+            if !images.is_empty()
+                && let Some(entry) = entry.as_mut()
+            {
+                append_tool_image_warning(&mut entry.result, reason);
+            }
+        }
+        return MaterializedToolImageBatch {
+            attachments: empty_result(),
+            stop_after_recording: false,
+        };
+    }
+
+    let mut remaining = crate::image_uploads::MAX_IMAGE_UPLOAD_FILES
+        .saturating_sub(phase_state.tool_images_attached_in_batch);
+    for (entry, images) in prepared.iter_mut().zip(pending_groups.iter_mut()) {
+        if images.len() > remaining {
+            let skipped = images.len() - remaining;
+            images.truncate(remaining);
+            if let Some(entry) = entry.as_mut() {
+                append_tool_image_warning(
+                    &mut entry.result,
+                    &format!(
+                        "{skipped} tool images were not attached because the execution batch limit is {}.",
+                        crate::image_uploads::MAX_IMAGE_UPLOAD_FILES
+                    ),
+                );
+            }
+        }
+        remaining = remaining.saturating_sub(images.len());
+    }
+
+    let s3_cfg = ctx
+        .config
+        .s3
+        .as_ref()
+        .expect("S3 availability checked above");
+    let groups_with_pending_images = pending_groups
+        .iter()
+        .map(|images| !images.is_empty())
+        .collect::<Vec<_>>();
+    let upload = tokio::select! {
+        biased;
+        _ = ctx.run_cancel.cancelled() => {
+            apply_run_cancel_outcome(ctx, phase_state).await;
+            None
+        }
+        _ = wait_for_active_run_stop_request(ctx.state, ctx.current_session_id) => {
+            // The socket reader records `/stop` in an atomic flag so it can
+            // bypass a full inbound queue. Dropping this shared batch future
+            // cancels every in-flight S3 upload together.
+            ctx.run_cancel.cancel();
+            apply_run_cancel_outcome(ctx, phase_state).await;
+            None
+        }
+        upload = crate::image_uploads::upload_tool_image_groups(
+            &ctx.state.http,
+            s3_cfg,
+            pending_groups,
+            crate::image_uploads::MAX_IMAGE_UPLOAD_FILES,
+        ) => Some(upload),
+    };
+
+    let Some(upload) = upload else {
+        for (entry, had_pending_images) in prepared.iter_mut().zip(groups_with_pending_images) {
+            if had_pending_images && let Some(entry) = entry.as_mut() {
+                append_tool_image_warning(
+                    &mut entry.result,
+                    "Tool images were not attached because the run ended before upload completed.",
+                );
+            }
+        }
+        return MaterializedToolImageBatch {
+            attachments: empty_result(),
+            stop_after_recording: true,
+        };
+    };
+
+    for ((entry, warnings), attachments) in prepared
+        .iter_mut()
+        .zip(upload.warnings.iter())
+        .zip(upload.attachments.iter())
+    {
+        if let Some(entry) = entry.as_mut() {
+            for warning in warnings {
+                append_tool_image_warning(&mut entry.result, warning);
+            }
+        }
+        phase_state.tool_images_attached_in_batch += attachments.len();
+    }
+    MaterializedToolImageBatch {
+        attachments: upload.attachments,
+        stop_after_recording: false,
+    }
+}
+
+async fn record_tool_result(
+    ctx: &AgentRunCtx<'_>,
+    phase_state: &mut AgentPhaseState,
+    tc: &ToolCall,
+    result: tools::ToolOutcome,
+    effective_args: Option<&str>,
+) -> AgentPhaseControl {
+    let prepared = prepare_tool_result(ctx, phase_state, tc, result, effective_args).await;
+    let mut batch = vec![Some(prepared)];
+    let mut image_batch = materialize_tool_image_batch(ctx, phase_state, &mut batch).await;
+    let prepared = batch.pop().flatten().expect("single prepared tool result");
+    let record_control = record_materialized_tool_result(
+        ctx,
+        phase_state,
+        tc,
+        prepared.result,
+        prepared.effective_args.as_deref(),
+        image_batch.attachments.pop().unwrap_or_default(),
+    )
+    .await;
+    if image_batch.stop_after_recording || matches!(record_control, AgentPhaseControl::Break) {
+        AgentPhaseControl::Break
+    } else {
+        AgentPhaseControl::Continue
+    }
+}
+
+async fn record_materialized_tool_result(
+    ctx: &AgentRunCtx<'_>,
+    phase_state: &mut AgentPhaseState,
+    tc: &ToolCall,
+    mut result: tools::ToolOutcome,
+    effective_args: Option<&str>,
+    tool_images: Vec<ImageAttachment>,
+) -> AgentPhaseControl {
+    let public_images = tool_images
+        .iter()
+        .map(crate::image_uploads::public_image_payload)
+        .collect::<Vec<_>>();
+
+    let live_event = if !tools::is_todos_tool(&tc.function.name) {
+        let mut event = json!({
+            "type":"tool_result",
+            "id": tc.id,
+            "name": tc.function.name,
+            "result": result.output,
+            "duration_ms": result.duration_ms,
+            "is_error": result.is_error,
+        });
+        if !public_images.is_empty() {
+            event["images"] = json!(public_images);
+        }
+        Some(event)
+    } else {
+        None
+    };
 
     let trace = tools::build_tool_execution_trace(&tc.function.name, effective_args);
     let call_summary = trace
@@ -2380,7 +2744,7 @@ async fn record_tool_result(
             session.messages.push(ChatMessage {
                 role: "tool".into(),
                 content: Some(result.output),
-                images: None,
+                images: (!tool_images.is_empty()).then_some(tool_images),
                 thinking: None,
                 anthropic_thinking_blocks: None,
                 tool_calls: None,
@@ -2391,7 +2755,13 @@ async fn record_tool_result(
         }
     }
 
-    AgentPhaseControl::Continue
+    if let Some(event) = live_event
+        && !live_send(ctx.live_tx, event).await
+    {
+        AgentPhaseControl::Break
+    } else {
+        AgentPhaseControl::Continue
+    }
 }
 
 #[cfg(test)]
@@ -2877,6 +3247,12 @@ async fn run_analyze_phase(
         }
         _ => (effective_think, final_msgs_snapshot, request_budget),
     };
+    if phase_state.tool_images_disabled {
+        providers::strip_tool_images_for_compatibility(&mut final_msgs_snapshot);
+    }
+    if !config.model_supports_image(&snapshot.model) {
+        providers::strip_images_for_unsupported_model(&mut final_msgs_snapshot);
+    }
 
     // Budget check uses the post-hook snapshot so hook-injected content is accounted for.
     let mut request_estimate = crate::context::estimate_request_tokens_for_provider(
@@ -3008,8 +3384,10 @@ async fn run_analyze_phase(
     // modify system prompt / think level which shouldn't change between retries of
     // the same logical request.
     let mut agent_llm_attempt = 0u8;
+    let mut retry_messages = final_msgs_snapshot;
+    let mut retry_tools = extra_tools;
     let llm_result = loop {
-        let result = tokio::select! {
+        let call_outcome = tokio::select! {
             biased;
             _ = ctx.run_cancel.cancelled() => {
                 apply_run_cancel_outcome(ctx, phase_state).await;
@@ -3018,16 +3396,26 @@ async fn run_analyze_phase(
             result = providers::call_llm_stream_with_tool_mode(
                 &ctx.state.http,
                 &resolved,
-                &final_msgs_snapshot,
+                &retry_messages,
                 &phase_state.cycle_workspace,
                 config.s3.as_ref(),
                 ctx.live_tx,
                 &effective_think,
-                &extra_tools,
+                &retry_tools,
                 !phase_state.run_mode.is_plan_only(),
                 config.max_llm_retries,
             ) => result,
         };
+
+        if call_outcome.tool_image_compatibility_fallback {
+            phase_state.tool_images_disabled = true;
+            providers::strip_tool_images_for_compatibility(&mut retry_messages);
+            retry_tools = providers::remove_view_image_capability_for_compatibility(
+                &mut retry_messages,
+                &retry_tools,
+            );
+        }
+        let result = call_outcome.result;
 
         match &result {
             Err(e) if agent_llm_attempt == 0 && providers::is_transient_llm_error(e) => {
@@ -3082,6 +3470,9 @@ async fn run_act_phase(
 ) -> AgentPhaseControl {
     let config = ctx.config.clone();
     phase_state.collected_results.clear();
+    phase_state.tool_images_attached_in_batch = 0;
+    let image_budget =
+        tools::mcp::ToolImageBudget::new(crate::image_uploads::MAX_IMAGE_UPLOAD_FILES);
     let tool_calls = std::mem::take(&mut phase_state.pending_tool_calls);
 
     let mut all_parallelizable = tool_calls.len() > 1;
@@ -3100,16 +3491,18 @@ async fn run_act_phase(
 
     if !all_parallelizable {
         // Sequential path: single tool call or any mutating tool in the batch.
-        for tc in &tool_calls {
+        for (call_index, tc) in tool_calls.iter().enumerate() {
             if ctx.run_cancel.is_cancelled() {
                 apply_run_cancel_outcome(ctx, phase_state).await;
                 return AgentPhaseControl::Break;
             }
 
-            let (result, eff_args) = match execute_tool_call(ctx, phase_state, tc).await {
-                Ok(pair) => pair,
-                Err(control) => return control,
-            };
+            let call_image_budget = image_budget.for_call(call_index);
+            let (result, eff_args) =
+                match execute_tool_call(ctx, phase_state, tc, &call_image_budget).await {
+                    Ok(pair) => pair,
+                    Err(control) => return control,
+                };
 
             if matches!(
                 record_tool_result(ctx, phase_state, tc, result, eff_args.as_deref()).await,
@@ -3131,6 +3524,19 @@ async fn run_act_phase(
         }
         let mut hook_results: Vec<HookEvalResult> = Vec::with_capacity(tool_calls.len());
         for tc in &tool_calls {
+            if let Some(outcome) = unavailable_view_image_outcome(
+                &config,
+                &ctx.model,
+                phase_state.tool_images_disabled,
+                &tc.function.name,
+            ) {
+                hook_results.push(HookEvalResult {
+                    effective_args: None,
+                    rejected: Some(outcome),
+                    reject_events: Vec::new(),
+                });
+                continue;
+            }
             let hook_input = ToolHookInput {
                 tool_name: tc.function.name.clone(),
                 tool_args: serde_json::from_str(&tc.function.arguments)
@@ -3157,6 +3563,7 @@ async fn run_act_phase(
                         is_error: true,
                         duration_ms: 0,
                         subagent_snapshot: None,
+                        images: Vec::new(),
                     }),
                     reject_events: events,
                 },
@@ -3215,15 +3622,21 @@ async fn run_act_phase(
         let futures: Vec<_> = tool_calls
             .iter()
             .zip(hook_results.iter())
-            .map(|(tc, hr)| {
+            .enumerate()
+            .map(|(call_index, (tc, hr))| {
+                let call_image_budget = image_budget.for_call(call_index);
                 if hr.rejected.is_some() {
                     // Rejected by hook — return a no-op future.
-                    return futures::future::Either::Left(async {
+                    return futures::future::Either::Left(async move {
+                        // Advance the ordered image budget so later calls do
+                        // not wait forever behind a hook-rejected call.
+                        drop(call_image_budget);
                         ToolRunState::Completed(tools::ToolOutcome {
                             output: String::new(), // placeholder, replaced below
                             is_error: true,
                             duration_ms: 0,
                             subagent_snapshot: None,
+                            images: Vec::new(),
                         })
                     });
                 }
@@ -3231,12 +3644,14 @@ async fn run_act_phase(
                     .effective_args
                     .as_deref()
                     .unwrap_or(&tc.function.arguments);
-                futures::future::Either::Right(run_tool_with_feedback(
+                let image_wait = call_image_budget.subscribe_waiting();
+                futures::future::Either::Right(run_tool_with_feedback_with_image_wait(
                     ctx.live_tx,
                     ctx.run_cancel,
                     &tc.id,
                     &tc.function.name,
                     runtime_timeout_for_tool(&tc.function.name, &config),
+                    image_wait,
                     execute_tool_with_live_output(
                         ctx.live_tx,
                         &tc.id,
@@ -3250,6 +3665,7 @@ async fn run_act_phase(
                             state: Arc::clone(ctx.state),
                             session_id: ctx.current_session_id.to_string(),
                         }),
+                        Some(call_image_budget),
                     ),
                 ))
             })
@@ -3257,10 +3673,11 @@ async fn run_act_phase(
 
         let results = futures::future::join_all(futures).await;
 
-        // 4. Record results in order, preserving stable tool IDs.
-        //    On abort, still record any already-completed results so the LLM
-        //    sees side effects (e.g. files written) that already happened.
+        // 4. Apply result hooks in order, then upload images for the entire
+        //    parallel batch through one shared three-request concurrency gate.
+        //    Events and persisted tool messages remain ordered by tool call.
         let mut should_break = false;
+        let mut prepared_batch = Vec::with_capacity(tool_calls.len());
         for (tc, (run_state, hr)) in tool_calls
             .iter()
             .zip(results.into_iter().zip(hook_results.into_iter()))
@@ -3274,18 +3691,41 @@ async fn run_act_phase(
             };
             match effective_run_state {
                 ToolRunState::Completed(result) => {
-                    if matches!(
-                        record_tool_result(ctx, phase_state, tc, result, after_args.as_deref())
+                    prepared_batch.push(Some(
+                        prepare_tool_result(ctx, phase_state, tc, result, after_args.as_deref())
                             .await,
-                        AgentPhaseControl::Break
-                    ) {
-                        should_break = true;
-                    }
+                    ));
                 }
                 ToolRunState::Abort => {
                     apply_run_cancel_outcome(ctx, phase_state).await;
                     should_break = true;
+                    prepared_batch.push(None);
                 }
+            }
+        }
+        let image_batch = materialize_tool_image_batch(ctx, phase_state, &mut prepared_batch).await;
+        should_break |= image_batch.stop_after_recording;
+        for ((tc, prepared), tool_images) in tool_calls
+            .iter()
+            .zip(prepared_batch.into_iter())
+            .zip(image_batch.attachments)
+        {
+            let Some(prepared) = prepared else {
+                continue;
+            };
+            if matches!(
+                record_materialized_tool_result(
+                    ctx,
+                    phase_state,
+                    tc,
+                    prepared.result,
+                    prepared.effective_args.as_deref(),
+                    tool_images,
+                )
+                .await,
+                AgentPhaseControl::Break
+            ) {
+                should_break = true;
             }
         }
         if should_break {
@@ -3651,6 +4091,22 @@ fn fire_stop_command_hook(state: &Arc<AppState>, session_id: &str, live_tx: &Liv
     });
 }
 
+async fn wait_for_active_run_stop_request(state: &Arc<AppState>, session_id: &str) {
+    let stop_requested = {
+        let runs = state.active_runs.lock().await;
+        runs.get(session_id)
+            .map(|run| Arc::clone(&run.stop_requested))
+    };
+    let Some(stop_requested) = stop_requested else {
+        std::future::pending::<()>().await;
+        return;
+    };
+
+    while !stop_requested.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn apply_run_cancel_outcome(ctx: &AgentRunCtx<'_>, phase_state: &mut AgentPhaseState) {
     let shared_stop_requested = {
         let runs = ctx.state.active_runs.lock().await;
@@ -3791,6 +4247,8 @@ pub(crate) async fn run_agent_session(
         last_save_instant: None,
         usage_snap_input: 0,
         usage_snap_output: 0,
+        tool_images_disabled: false,
+        tool_images_attached_in_batch: 0,
     };
 
     // Snapshot token counts at loop start so we can compute per-round delta.

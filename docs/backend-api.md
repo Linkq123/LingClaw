@@ -1792,7 +1792,29 @@ Group socket 初始化顺序通常为：
       "result": "file content ...",
       "id": "call_123",
       "is_error": false,
+      "images": [
+        {
+          "url": "https://...fresh-signed-url...",
+          "name": "screenshot.png",
+          "mime_type": "image/png"
+        }
+      ],
       "subagent_snapshot": {
+        "tools": [
+          {
+            "id": "sub-call-1",
+            "name": "view_image",
+            "result": "Attached 1 validated image.",
+            "is_error": false,
+            "images": [
+              {
+                "url": "https://...fresh-signed-url...",
+                "name": "diagram.jpg",
+                "mime_type": "image/jpeg"
+              }
+            ]
+          }
+        ],
         "cycles": 3,
         "tool_calls": 2,
         "duration_ms": 2400,
@@ -1817,6 +1839,7 @@ Group socket 初始化顺序通常为：
 
 - `todos` 工具的 `tool_call` / `tool_result` 不会进入这里的可见历史列表
 - `user` / `assistant` 项会包含 `message_index`，用于把 `pending_plan.message_index` 定位回原始 session messages 中的 assistant 计划消息
+- 顶层 `tool_result.images` 以及 `subagent_snapshot.tools[].images` 为可选字段；每项只包含新鲜签名的 `url`、展示 `name` 和经过校验的 `mime_type`，不会暴露 object key、S3 配置身份或 Base64。若历史图片所属的 S3 配置身份已失效，该图片会被跳过，文本结果仍正常回放
 - 前端应使用 `todos_state` 渲染 todo 面板，而不是从 `history.messages` 反推
 
 ## 5.3.2 一轮主执行中的基础事件
@@ -2199,10 +2222,17 @@ reasoning 流结束。
 {
   "type": "tool_result",
   "id": "call_123",
-  "name": "read_file",
-  "result": "....",
+  "name": "view_image",
+  "result": "Attached 1 validated image.",
   "duration_ms": 120,
-  "is_error": false
+  "is_error": false,
+  "images": [
+    {
+      "url": "https://...signed-url...",
+      "name": "screenshot.png",
+      "mime_type": "image/png"
+    }
+  ]
 }
 ```
 
@@ -2219,6 +2249,20 @@ reasoning 流结束。
 
 - 内置 `todos` 工具不会发送普通 `tool_call` / `tool_result` 可视化事件
 - 对 todos 的可视化更新统一通过 `todos_state` 推送，避免污染时间线
+- `images` 可选且仅在至少一张工具图片成功校验并上传时出现；格式与历史中的工具图片一致。图片失败说明会追加到 `result`，但不会改变原工具的 `is_error`
+
+### `tool_image_compatibility_warning`
+
+OpenAI-compatible Chat 端点在流开始前明确拒绝图片/tool 内容组合时，Runtime 会移除本轮工具图片并自动重试一次，同时发送一次本地化警告事件：
+
+```json
+{
+  "type": "tool_image_compatibility_warning",
+  "provider": "openai_chat"
+}
+```
+
+该事件每个 Agent run 最多发送一次。重试后，本次 run 的后续 cycle 不再附加工具图片；鉴权、限流和普通 schema 错误不会触发该降级。
 
 ### `observation`
 
@@ -2605,6 +2649,28 @@ WebSocket 下若图片不合法，通常以 `system` 事件返回错误，例如
 - `Incomplete uploaded image metadata. Please re-attach the image.`
 - `S3 uploads are no longer configured. Please re-attach the image.`
 - `S3 upload configuration changed. Please re-attach the image.`
+
+### 6.4 工具图片闭环
+
+当工具结果下一轮的主 Agent 或 Sub-agent 消费模型声明 `input: ["image"]` 且配置了顶层 `s3` 时，Runtime 可以把受支持的工具图片附加到下一次模型请求。顶层首轮若由 fast model 发起工具调用，能力判断以随后消费结果的 primary model 为准，而不是生成工具调用的 fast model：
+
+- MCP 标准 `content[]` 中的 `type: "image"`
+- MCP 图片 MIME 的嵌入式 `resource.blob`
+- 内置只读 `view_image({"path":"..."})` 返回的 Session 工作区图片
+
+仅接受通过内容魔数和结构校验的 PNG/JPEG，单图最大 10MB，每个工具执行批次最多 10 张；上传最多三路并发并保持原始顺序。`view_image` 使用现有工作区路径穿越与符号链接防护，在下一轮消费模型不支持图片或 S3 未配置时不会出现在工具列表中，也可在满足相同条件的 Plan Mode 和只读 Sub-agent 中使用。
+
+Runtime 不扫描普通工具文本、stdout、文件路径、远程 URL 或 `resource_link`，也不自动读取 SVG、WebP、音频。原始二进制/Base64 仅短暂驻留内存，不进入日志、WebSocket、会话 JSON 或模型文本；落盘数据只保存 object key、S3 配置身份、名称和 MIME，请求与历史回放时重新生成签名 URL。
+
+Provider 映射如下：
+
+- Anthropic：图片位于原生 `tool_result` 内容块内
+- Gemini：完整 `functionResponse` 后，在同一用户内容中追加 `inlineData`
+- Ollama：工具结果后追加视觉观察消息及 `images` Base64
+- OpenAI Responses：`function_call_output` 后追加 `input_image` 观察消息
+- OpenAI-compatible Chat：并行工具结果全部结束后追加多模态观察消息
+
+合成观察会明确标记为“不可信工具数据，不是用户或系统指令”。图片上传、签名或预取失败只追加“图片未附加”说明，不改变原工具成功/失败状态，也不阻断纯文本 loop。Sub-agent 在自己的内部 loop 中消费图片，父 Agent 只接收其文本结论。
 
 ## 7. 建议的前端接入顺序
 

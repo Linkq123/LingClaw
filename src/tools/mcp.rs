@@ -1,31 +1,34 @@
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use futures::{StreamExt, future::join_all};
 use reqwest::StatusCode as HttpStatusCode;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
-    sync::Mutex as AsyncMutex,
+    sync::{Mutex as AsyncMutex, Notify, watch},
     task::JoinHandle,
 };
 
 use crate::tools::safety::resolve_path_checked;
 use crate::{Config, VERSION, config::JsonMcpServerConfig, config_dir_path};
 
-use super::ToolOutcome;
+use super::{ToolImageOutput, ToolOutcome};
 
 const MCP_NAME_PREFIX: &str = "mcp__";
 const MCP_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -40,6 +43,163 @@ const MCP_MAX_PAGINATION_PAGES: usize = 100;
 const MCP_SESSION_POLICY_FILE: &str = ".lingclaw-mcp-policy.json";
 const MCP_AUTH_FILE: &str = "mcp-auth.json";
 static MCP_TOOL_CACHE: OnceLock<Mutex<HashMap<String, CachedToolDescriptors>>> = OnceLock::new();
+
+/// Shared image budget for one Agent tool-call batch. Each parallel call gets
+/// an ordered ticket so earlier tool calls get first use of the batch budget,
+/// regardless of network completion order.
+#[derive(Clone, Debug)]
+pub(crate) struct ToolImageBudget {
+    inner: Arc<ToolImageBudgetInner>,
+    call_index: Option<usize>,
+    _completion: Option<Arc<ToolImageCallCompletion>>,
+    wait_state: Option<Arc<ToolImageWaitState>>,
+}
+
+#[derive(Debug)]
+struct ToolImageBudgetInner {
+    remaining: AtomicUsize,
+    order: Mutex<ToolImageBudgetOrder>,
+    order_changed: Notify,
+}
+
+#[derive(Debug, Default)]
+struct ToolImageBudgetOrder {
+    next_call: usize,
+    completed_calls: BTreeSet<usize>,
+}
+
+#[derive(Debug)]
+struct ToolImageCallCompletion {
+    inner: Arc<ToolImageBudgetInner>,
+    call_index: usize,
+    completed: AtomicBool,
+}
+
+#[derive(Debug)]
+struct ToolImageWaitState {
+    waiting: watch::Sender<bool>,
+}
+
+struct ToolImageWaitGuard<'a> {
+    state: &'a ToolImageWaitState,
+}
+
+impl Drop for ToolImageWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.state.waiting.send_replace(false);
+    }
+}
+
+impl Drop for ToolImageCallCompletion {
+    fn drop(&mut self) {
+        if self.completed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let mut order = self
+            .inner
+            .order
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        order.completed_calls.insert(self.call_index);
+        loop {
+            let next_call = order.next_call;
+            if !order.completed_calls.remove(&next_call) {
+                break;
+            }
+            order.next_call = order.next_call.saturating_add(1);
+        }
+        drop(order);
+        self.inner.order_changed.notify_waiters();
+    }
+}
+
+impl ToolImageBudget {
+    pub(crate) fn new(max_images: usize) -> Self {
+        Self {
+            inner: Arc::new(ToolImageBudgetInner {
+                remaining: AtomicUsize::new(max_images),
+                order: Mutex::new(ToolImageBudgetOrder::default()),
+                order_changed: Notify::new(),
+            }),
+            call_index: None,
+            _completion: None,
+            wait_state: None,
+        }
+    }
+
+    /// Create a budget ticket for one tool call in the provider's original
+    /// call order. The ticket marks the call complete when its last clone is
+    /// dropped, including cancellation and timeout paths.
+    pub(crate) fn for_call(&self, call_index: usize) -> Self {
+        let (waiting, _) = watch::channel(false);
+        Self {
+            inner: Arc::clone(&self.inner),
+            call_index: Some(call_index),
+            _completion: Some(Arc::new(ToolImageCallCompletion {
+                inner: Arc::clone(&self.inner),
+                call_index,
+                completed: AtomicBool::new(false),
+            })),
+            wait_state: Some(Arc::new(ToolImageWaitState { waiting })),
+        }
+    }
+
+    /// Subscribe to time spent waiting for earlier tool calls. Parallel tool
+    /// runners use this signal to pause only their individual runtime timeout;
+    /// cancellation and the enclosing Agent/Sub-agent deadline remain active.
+    pub(crate) fn subscribe_waiting(&self) -> Option<watch::Receiver<bool>> {
+        self.wait_state
+            .as_ref()
+            .map(|state| state.waiting.subscribe())
+    }
+
+    /// Wait until every earlier tool call has completed. The root budget used
+    /// by compatibility wrappers has no call index and therefore never waits.
+    pub(crate) async fn wait_for_turn(&self) {
+        let Some(call_index) = self.call_index else {
+            return;
+        };
+
+        let mut wait_guard = None;
+
+        loop {
+            // Register before checking the condition to avoid losing a wakeup
+            // between the mutex check and awaiting the notification.
+            let changed = self.inner.order_changed.notified();
+            let ready = self
+                .inner
+                .order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .next_call
+                >= call_index;
+            if ready {
+                return;
+            }
+            if wait_guard.is_none()
+                && let Some(state) = self.wait_state.as_deref()
+            {
+                state.waiting.send_replace(true);
+                wait_guard = Some(ToolImageWaitGuard { state });
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) fn try_reserve(&self) -> bool {
+        self.inner
+            .remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+    }
+
+    pub(crate) fn release(&self) {
+        self.inner.remaining.fetch_add(1, Ordering::Release);
+    }
+}
 static MCP_RESOURCE_CACHE: OnceLock<Mutex<HashMap<String, CachedResourceDescriptors>>> =
     OnceLock::new();
 static MCP_PROMPT_CACHE: OnceLock<Mutex<HashMap<String, CachedPromptDescriptors>>> =
@@ -1445,7 +1605,7 @@ pub(crate) async fn execute_tool(
     config: &Config,
     workspace: &Path,
 ) -> Option<ToolOutcome> {
-    execute_tool_with_session_mode(name, args_str, config, workspace, false, None).await
+    execute_tool_with_session_mode(name, args_str, config, workspace, false, None, None).await
 }
 
 /// Execute an MCP tool with an isolated per-call session.
@@ -1458,9 +1618,10 @@ pub(crate) async fn execute_tool_isolated(
     config: &Config,
     workspace: &Path,
 ) -> Option<ToolOutcome> {
-    execute_tool_with_session_mode(name, args_str, config, workspace, true, None).await
+    execute_tool_with_session_mode(name, args_str, config, workspace, true, None, None).await
 }
 
+#[allow(dead_code)] // Compatibility wrapper for callers without a shared batch budget.
 pub(crate) async fn execute_tool_for_policy(
     name: &str,
     args_str: &str,
@@ -1469,6 +1630,27 @@ pub(crate) async fn execute_tool_for_policy(
     isolated_session: bool,
     policy: &McpSessionPolicy,
 ) -> Option<ToolOutcome> {
+    execute_tool_for_policy_with_image_budget(
+        name,
+        args_str,
+        config,
+        workspace,
+        isolated_session,
+        policy,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn execute_tool_for_policy_with_image_budget(
+    name: &str,
+    args_str: &str,
+    config: &Config,
+    workspace: &Path,
+    isolated_session: bool,
+    policy: &McpSessionPolicy,
+    image_budget: Option<ToolImageBudget>,
+) -> Option<ToolOutcome> {
     execute_tool_with_session_mode(
         name,
         args_str,
@@ -1476,6 +1658,7 @@ pub(crate) async fn execute_tool_for_policy(
         workspace,
         isolated_session,
         Some(policy),
+        image_budget,
     )
     .await
 }
@@ -1487,6 +1670,7 @@ async fn execute_tool_with_session_mode(
     workspace: &Path,
     isolated_session: bool,
     policy: Option<&McpSessionPolicy>,
+    image_budget: Option<ToolImageBudget>,
 ) -> Option<ToolOutcome> {
     if !is_mcp_tool_name(name) {
         return None;
@@ -1501,6 +1685,7 @@ async fn execute_tool_with_session_mode(
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             });
         }
     };
@@ -1522,6 +1707,7 @@ async fn execute_tool_with_session_mode(
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             });
         }
     }
@@ -1538,6 +1724,7 @@ async fn execute_tool_with_session_mode(
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             });
         }
         Err(error) => {
@@ -1546,6 +1733,7 @@ async fn execute_tool_with_session_mode(
                 is_error: true,
                 duration_ms: start.elapsed().as_millis() as u64,
                 subagent_snapshot: None,
+                images: Vec::new(),
             });
         }
     };
@@ -1558,6 +1746,7 @@ async fn execute_tool_with_session_mode(
             is_error: true,
             duration_ms: start.elapsed().as_millis() as u64,
             subagent_snapshot: None,
+            images: Vec::new(),
         });
     }
 
@@ -1572,6 +1761,7 @@ async fn execute_tool_with_session_mode(
             is_error: true,
             duration_ms: start.elapsed().as_millis() as u64,
             subagent_snapshot: None,
+            images: Vec::new(),
         });
     }
 
@@ -1608,11 +1798,16 @@ async fn execute_tool_with_session_mode(
                 .get("isError")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            if let Some(image_budget) = image_budget.as_ref() {
+                image_budget.wait_for_turn().await;
+            }
+            let rendered = render_call_result_with_image_budget(&result, image_budget.as_ref());
             Some(ToolOutcome {
-                output: render_call_result(&result),
+                output: rendered.output,
                 is_error,
                 duration_ms,
                 subagent_snapshot: None,
+                images: rendered.images,
             })
         }
         Err(error) => Some(ToolOutcome {
@@ -1620,6 +1815,7 @@ async fn execute_tool_with_session_mode(
             is_error: true,
             duration_ms,
             subagent_snapshot: None,
+            images: Vec::new(),
         }),
     }
 }
@@ -2075,40 +2271,338 @@ pub(crate) fn exposed_tool_matches_server(tool_name: &str, server_name: &str) ->
         .is_some_and(|(server_segment, _)| server_segment == sanitize_name_segment(server_name))
 }
 
-fn render_call_result(result: &Value) -> String {
+#[derive(Debug)]
+struct RenderedCallResult {
+    output: String,
+    images: Vec<ToolImageOutput>,
+}
+
+fn mcp_image_name(value: &Value, index: usize, mime_type: &str) -> String {
+    value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("uri")
+                .and_then(Value::as_str)
+                .and_then(|uri| uri.rsplit('/').next())
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| {
+            let extension = if mime_type == "image/png" {
+                "png"
+            } else {
+                "jpg"
+            };
+            format!("mcp-image-{}.{}", index + 1, extension)
+        })
+}
+
+fn extract_mcp_image(
+    source: &Value,
+    encoded: &str,
+    declared_mime: &str,
+    index: usize,
+    image_budget: &ToolImageBudget,
+) -> Result<ToolImageOutput, String> {
+    let normalized_mime = declared_mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    if !crate::image_uploads::is_supported_image_content_type(&normalized_mime) {
+        return Err(format!("unsupported image type '{declared_mime}'"));
+    }
+    if encoded.len() > crate::image_uploads::MAX_IMAGE_UPLOAD_BYTES.saturating_mul(2) {
+        return Err("encoded image exceeds the 10 MB limit".to_string());
+    }
+    if !image_budget.try_reserve() {
+        return Err("tool image batch limit reached".to_string());
+    }
+
+    let extracted = (|| {
+        let data = STANDARD
+            .decode(encoded)
+            .map_err(|_| "invalid Base64 image data".to_string())?;
+        if data.len() > crate::image_uploads::MAX_IMAGE_UPLOAD_BYTES {
+            return Err("decoded image exceeds the 10 MB limit".to_string());
+        }
+        let actual_mime = crate::image_uploads::detect_image_upload_content_type(&data)
+            .ok_or_else(|| "image bytes are not a valid PNG or JPEG".to_string())?;
+        let declared_matches = normalized_mime == actual_mime
+            || (normalized_mime == "image/jpg" && actual_mime == "image/jpeg");
+        if !declared_matches {
+            return Err(format!(
+                "declared image type '{declared_mime}' does not match '{actual_mime}'"
+            ));
+        }
+        Ok(ToolImageOutput {
+            name: mcp_image_name(source, index, actual_mime),
+            mime_type: actual_mime.to_string(),
+            data,
+        })
+    })();
+    if extracted.is_err() {
+        image_budget.release();
+    }
+    extracted
+}
+
+fn looks_like_base64_payload(value: &str) -> bool {
+    let value = value.trim();
+    value.len() >= 32
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'+' | b'/' | b'=' | b'-' | b'_' | b'\r' | b'\n')
+        })
+}
+
+fn redact_known_image_payloads(text: &str, known_image_payloads: &[&str]) -> String {
+    let mut redacted = text.to_string();
+    for payload in known_image_payloads
+        .iter()
+        .copied()
+        .filter(|payload| !payload.is_empty())
+    {
+        if redacted.contains(payload) {
+            redacted = redacted.replace(payload, "[binary data omitted]");
+        }
+    }
+    redacted
+}
+
+fn structured_object_is_binary(object: &serde_json::Map<String, Value>) -> bool {
+    let content_type = object
+        .get("mimeType")
+        .or_else(|| object.get("mime_type"))
+        .or_else(|| object.get("contentType"))
+        .or_else(|| object.get("content_type"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let item_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let encoding = object
+        .get("encoding")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+
+    matches!(item_type.as_str(), "image" | "audio" | "binary")
+        || (!content_type.is_empty()
+            && !content_type.starts_with("text/")
+            && content_type != "application/json")
+        || encoding.eq_ignore_ascii_case("base64")
+}
+
+fn redact_structured_binary_payloads(
+    value: &Value,
+    known_image_payloads: &[&str],
+    key_hint: Option<&str>,
+    binary_context: bool,
+) -> Value {
+    match value {
+        Value::String(text) => {
+            let redacted = redact_known_image_payloads(text, known_image_payloads);
+            if redacted != *text {
+                return Value::String(redacted);
+            }
+            let key = key_hint.unwrap_or("");
+            let lower = text.trim_start().to_ascii_lowercase();
+            let binary_key = matches!(
+                key.to_ascii_lowercase().as_str(),
+                "blob" | "base64" | "bytes" | "binary"
+            );
+            let data_key = key.eq_ignore_ascii_case("data");
+            let ordinary_text = matches!(key.to_ascii_lowercase().as_str(), "text" | "content");
+            let data_url =
+                !ordinary_text && lower.starts_with("data:") && lower.contains(";base64,");
+            let encoded_like = looks_like_base64_payload(text);
+            let generic_binary_signal = text.bytes().any(|byte| matches!(byte, b'+' | b'/' | b'='))
+                || (text.trim().len() >= 128
+                    && !text.trim().bytes().all(|byte| byte.is_ascii_hexdigit()));
+            let encoded_payload = !ordinary_text
+                && ((data_key && binary_context)
+                    || (encoded_like && (data_key || binary_context || generic_binary_signal)));
+            if binary_key || data_url || encoded_payload {
+                Value::String("[binary data omitted]".to_string())
+            } else {
+                value.clone()
+            }
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| {
+                    redact_structured_binary_payloads(
+                        item,
+                        known_image_payloads,
+                        key_hint,
+                        binary_context,
+                    )
+                })
+                .collect(),
+        ),
+        Value::Object(object) => {
+            let object_is_binary = binary_context || structured_object_is_binary(object);
+            Value::Object(
+                object
+                    .iter()
+                    .map(|(key, item)| {
+                        (
+                            key.clone(),
+                            redact_structured_binary_payloads(
+                                item,
+                                known_image_payloads,
+                                Some(key),
+                                object_is_binary,
+                            ),
+                        )
+                    })
+                    .collect(),
+            )
+        }
+        _ => value.clone(),
+    }
+}
+
+fn sanitized_mcp_value(value: &Value, known_image_payloads: &[&str]) -> Value {
+    redact_structured_binary_payloads(value, known_image_payloads, None, false)
+}
+
+fn collect_mcp_image_payloads(result: &Value) -> Vec<&str> {
+    result
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+            Some("image") => item.get("data").and_then(Value::as_str),
+            Some("resource") => item
+                .get("resource")
+                .and_then(|resource| resource.get("blob"))
+                .and_then(Value::as_str),
+            _ => None,
+        })
+        .collect()
+}
+
+fn render_call_result_with_image_budget(
+    result: &Value,
+    shared_budget: Option<&ToolImageBudget>,
+) -> RenderedCallResult {
     let mut parts = Vec::new();
+    let mut images = Vec::new();
+    // Collect standard image payloads before rendering any text so an MCP
+    // result cannot leak the same Base64 merely by placing a text item first.
+    let image_payloads = collect_mcp_image_payloads(result);
+    let local_budget;
+    let image_budget = match shared_budget {
+        Some(budget) => budget,
+        None => {
+            local_budget = ToolImageBudget::new(crate::image_uploads::MAX_IMAGE_UPLOAD_FILES);
+            &local_budget
+        }
+    };
 
     if let Some(content) = result.get("content").and_then(Value::as_array) {
         for item in content {
             if let Some(text) = item.get("text").and_then(Value::as_str)
                 && !text.is_empty()
             {
-                parts.push(text.to_string());
+                parts.push(redact_known_image_payloads(text, &image_payloads));
                 continue;
             }
             let item_type = item
                 .get("type")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
+            let image_source = match item_type {
+                "image" => item.get("data").and_then(Value::as_str).map(|data| {
+                    (
+                        item,
+                        data,
+                        item.get("mimeType").and_then(Value::as_str).unwrap_or(""),
+                    )
+                }),
+                "resource" => item.get("resource").and_then(|resource| {
+                    resource.get("blob").and_then(Value::as_str).map(|data| {
+                        (
+                            resource,
+                            data,
+                            resource
+                                .get("mimeType")
+                                .and_then(Value::as_str)
+                                .unwrap_or(""),
+                        )
+                    })
+                }),
+                _ => None,
+            };
+            if let Some((source, encoded, mime_type)) = image_source {
+                match extract_mcp_image(source, encoded, mime_type, images.len(), image_budget) {
+                    Ok(image) => {
+                        parts.push(format!(
+                            "[image output: {} ({})]",
+                            image.name, image.mime_type
+                        ));
+                        images.push(image);
+                    }
+                    Err(error) => parts.push(format!("[image not attached: {error}]")),
+                }
+                continue;
+            }
+            if item_type == "resource"
+                && let Some(resource) = item.get("resource")
+            {
+                if let Some(text) = resource.get("text").and_then(Value::as_str) {
+                    parts.push(text.to_string());
+                } else if resource.get("blob").is_some() {
+                    parts.push("[binary resource omitted]".to_string());
+                } else {
+                    parts.push("[resource metadata received]".to_string());
+                }
+                continue;
+            }
+            let sanitized = sanitized_mcp_value(item, &image_payloads);
             parts.push(format!(
                 "[{item_type}] {}",
-                serde_json::to_string_pretty(item).unwrap_or_else(|_| item.to_string())
+                serde_json::to_string_pretty(&sanitized).unwrap_or_else(|_| sanitized.to_string())
             ));
         }
     }
 
     if let Some(structured) = result.get("structuredContent") {
+        let structured = sanitized_mcp_value(structured, &image_payloads);
         parts.push(format!(
             "structuredContent:\n{}",
-            serde_json::to_string_pretty(structured).unwrap_or_else(|_| structured.to_string())
+            serde_json::to_string_pretty(&structured).unwrap_or_else(|_| structured.to_string())
         ));
     }
 
-    if parts.is_empty() {
-        serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string())
+    let output = if parts.is_empty() {
+        let sanitized = sanitized_mcp_value(result, &image_payloads);
+        serde_json::to_string_pretty(&sanitized).unwrap_or_else(|_| sanitized.to_string())
     } else {
         parts.join("\n\n")
-    }
+    };
+    RenderedCallResult { output, images }
+}
+
+#[cfg(test)]
+fn render_call_result(result: &Value) -> RenderedCallResult {
+    render_call_result_with_image_budget(result, None)
 }
 
 async fn list_tools(config: &Config, workspace: &Path) -> Vec<McpToolDescriptor> {

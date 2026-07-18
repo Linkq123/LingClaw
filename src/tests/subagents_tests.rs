@@ -10,6 +10,7 @@ use crate::subagents::{
     render_ranked_agent_recommendations,
 };
 use crate::{ChatMessage, agent, tools};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::Client;
 use tokio_util::sync::CancellationToken;
 
@@ -679,6 +680,31 @@ fn test_filter_tools_for_agent_with_mcp_no_servers() {
     assert_eq!(tools, builtin_only);
 }
 
+#[test]
+fn built_in_read_only_agents_allow_conditional_view_image() {
+    for (name, content) in [
+        (
+            "explore",
+            include_str!("../../docs/reference/agents/explore/AGENT.md"),
+        ),
+        (
+            "reviewer",
+            include_str!("../../docs/reference/agents/reviewer/AGENT.md"),
+        ),
+        (
+            "researcher",
+            include_str!("../../docs/reference/agents/researcher/AGENT.md"),
+        ),
+    ] {
+        let spec = crate::subagents::discovery::parse_agent_frontmatter_for_test(content)
+            .unwrap_or_else(|| panic!("{name} should have valid frontmatter"));
+        assert!(
+            spec.tools.is_allowed(tools::TOOL_NAME_VIEW_IMAGE),
+            "{name} should allow the conditional read-only view_image tool"
+        );
+    }
+}
+
 // --- MCP policy and tool classification tests ---
 
 use crate::subagents::{McpPolicy, is_mcp_tool_read_only};
@@ -1259,6 +1285,7 @@ async fn collect_parallel_tool_results_preserves_finished_results_on_deadline() 
             is_error: false,
             duration_ms: 1,
             subagent_snapshot: None,
+            images: Vec::new(),
         })
     })
         as std::pin::Pin<
@@ -1632,6 +1659,7 @@ async fn timeout_outcome_still_runs_after_tool_exec_hook() {
             is_error: true,
             duration_ms: 12,
             subagent_snapshot: None,
+            images: Vec::new(),
         },
     )
     .await;
@@ -2301,6 +2329,7 @@ async fn parallel_batch_interrupt_fires_hooks_only_for_completed_tools() {
             is_error: false,
             duration_ms: 1,
             subagent_snapshot: None,
+            images: Vec::new(),
         })
     })
         as std::pin::Pin<
@@ -2512,6 +2541,7 @@ async fn execute_subagent_tool_with_live_output_returns_on_cancellation() {
             &workspace,
             false,
             None,
+            None,
         ),
     )
     .await
@@ -2552,6 +2582,7 @@ async fn execute_subagent_tool_with_live_output_prefers_completed_result_over_ca
         &workspace,
         false,
         None,
+        None,
     )
     .await;
 
@@ -2559,6 +2590,62 @@ async fn execute_subagent_tool_with_live_output_prefers_completed_result_over_ca
     assert!(outcome.output.contains("Thought recorded"));
     assert!(outcome.output.contains("finished before cancellation"));
 
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+}
+
+#[tokio::test]
+async fn subagent_tool_timeout_pauses_while_waiting_for_ordered_image_budget() {
+    let workspace = unique_temp_workspace("lingclaw-subagent-ordered-image-budget");
+    let _ = tokio::fs::remove_dir_all(&workspace).await;
+    tokio::fs::create_dir_all(&workspace)
+        .await
+        .expect("workspace should be created");
+    let image_path = workspace.join("sample.png");
+    tokio::fs::write(
+        &image_path,
+        STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=")
+            .expect("valid PNG fixture"),
+    )
+    .await
+    .expect("PNG fixture should be written");
+
+    let image_budget = crate::tools::mcp::ToolImageBudget::new(1);
+    let first = image_budget.for_call(0);
+    let second = image_budget.for_call(1);
+    let release_first = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        drop(first);
+    });
+    let mut config = base_config();
+    config.tool_timeout = Duration::from_millis(30);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(crate::LIVE_EVENT_CHANNEL_CAPACITY);
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(1),
+        crate::subagents::executor::execute_subagent_tool_with_live_output(
+            &live_tx,
+            &CancellationToken::new(),
+            "task-1",
+            "agent-1",
+            crate::tools::TOOL_NAME_VIEW_IMAGE,
+            "call-2",
+            r#"{"path":"sample.png"}"#,
+            &config,
+            &Client::new(),
+            &workspace,
+            false,
+            None,
+            Some(second),
+        ),
+    )
+    .await
+    .expect("ordered budget wait should not consume the sub-agent tool timeout");
+    release_first.await.expect("release task should finish");
+
+    assert!(!outcome.is_error, "{}", outcome.output);
+    assert_eq!(outcome.images.len(), 1);
     let _ = tokio::fs::remove_dir_all(&workspace).await;
 }
 
@@ -2686,6 +2773,15 @@ async fn run_subagent_timeout_during_tool_exec_still_runs_after_tool_exec_hook()
     assert_eq!(outcome.cycles, 1);
     assert_eq!(outcome.tool_calls, 1);
     assert!(outcome.result.contains("timed out after"));
+    assert_eq!(outcome.history_snapshot.tools.len(), 1);
+    assert!(outcome.history_snapshot.tools[0].is_error);
+    assert!(
+        outcome.history_snapshot.tools[0]
+            .result
+            .as_deref()
+            .is_some_and(|result| result.contains("deadline exceeded")),
+        "the synthesized terminal tool result must be persisted before the sub-agent exits"
+    );
 }
 
 #[tokio::test]

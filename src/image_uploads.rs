@@ -1,10 +1,13 @@
 use base64::Engine;
+use futures::{StreamExt, stream};
 use reqwest::Client;
 
 use crate::config::S3Config;
 use hmac::{Hmac, Mac};
 use md5::Md5;
 use sha2::{Digest, Sha256};
+
+use crate::{ImageAttachment, tools::ToolImageOutput};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -790,6 +793,187 @@ pub(crate) const MAX_IMAGE_UPLOAD_FILES: usize = 10;
 pub(crate) const MAX_IMAGE_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 pub(crate) const MAX_IMAGE_UPLOAD_REQUEST_BYTES: usize =
     MAX_IMAGE_UPLOAD_FILES * MAX_IMAGE_UPLOAD_BYTES + (1024 * 1024);
+
+#[cfg(test)]
+pub(crate) struct ToolImageUploadResult {
+    pub(crate) attachments: Vec<ImageAttachment>,
+    pub(crate) warnings: Vec<String>,
+}
+
+pub(crate) struct ToolImageGroupUploadResult {
+    pub(crate) attachments: Vec<Vec<ImageAttachment>>,
+    pub(crate) warnings: Vec<Vec<String>>,
+}
+
+fn safe_tool_image_name(name: &str, index: usize, mime_type: &str) -> String {
+    let cleaned = name
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect::<String>();
+    let cleaned = crate::truncate(cleaned.trim(), 160);
+    if !cleaned.is_empty() {
+        return cleaned;
+    }
+    let extension = if mime_type == "image/png" {
+        "png"
+    } else {
+        "jpg"
+    };
+    format!("tool-image-{}.{}", index + 1, extension)
+}
+
+/// Validate and upload a full tool-result batch with one shared concurrency
+/// limit. Attachments and warnings stay associated with the originating tool,
+/// and each tool's original image order is preserved.
+pub(crate) async fn upload_tool_image_groups(
+    http: &Client,
+    cfg: &S3Config,
+    groups: Vec<Vec<ToolImageOutput>>,
+    max_images: usize,
+) -> ToolImageGroupUploadResult {
+    let group_count = groups.len();
+    let mut warnings = vec![Vec::new(); group_count];
+    let mut remaining = max_images;
+    let mut limited = Vec::new();
+    for (group_index, images) in groups.into_iter().enumerate() {
+        let accepted = images.len().min(remaining);
+        let skipped = images.len() - accepted;
+        if skipped > 0 {
+            warnings[group_index].push(format!(
+                "{skipped} tool images were not attached because a batch accepts at most {max_images}."
+            ));
+        }
+        remaining -= accepted;
+        limited.extend(
+            images
+                .into_iter()
+                .take(accepted)
+                .enumerate()
+                .map(|(image_index, image)| (group_index, image_index, image)),
+        );
+    }
+
+    let s3_config_id = s3_config_id(cfg);
+    let mut outcomes = stream::iter(limited)
+        .map(|(group_index, image_index, image)| {
+            let s3_config_id = s3_config_id.clone();
+            async move {
+                let name = safe_tool_image_name(&image.name, image_index, &image.mime_type);
+                if image.data.is_empty() {
+                    return (group_index, image_index, Err(format!("'{name}' is empty")));
+                }
+                if image.data.len() > MAX_IMAGE_UPLOAD_BYTES {
+                    return (
+                        group_index,
+                        image_index,
+                        Err(format!(
+                            "'{name}' exceeds the {} byte limit",
+                            MAX_IMAGE_UPLOAD_BYTES
+                        )),
+                    );
+                }
+                let Some(actual_mime) = detect_image_upload_content_type(&image.data) else {
+                    return (
+                        group_index,
+                        image_index,
+                        Err(format!("'{name}' is not a valid PNG or JPEG")),
+                    );
+                };
+                if actual_mime != image.mime_type
+                    && !(actual_mime == "image/jpeg" && image.mime_type == "image/jpg")
+                {
+                    return (
+                        group_index,
+                        image_index,
+                        Err(format!("'{name}' has mismatched image content")),
+                    );
+                }
+                let object_key = generate_s3_object_key(cfg, actual_mime, &image.data);
+                let upload = tokio::time::timeout(
+                    std::time::Duration::from_secs(60),
+                    s3_put_object(http, cfg, &object_key, &image.data, actual_mime),
+                )
+                .await;
+                match upload {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        return (group_index, image_index, Err(format!("'{name}': {error}")));
+                    }
+                    Err(_) => {
+                        return (
+                            group_index,
+                            image_index,
+                            Err(format!("'{name}': S3 upload timed out")),
+                        );
+                    }
+                }
+                let url = match s3_presigned_get_url(cfg, &object_key) {
+                    Ok(url) => url,
+                    Err(error) => {
+                        return (group_index, image_index, Err(format!("'{name}': {error}")));
+                    }
+                };
+                (
+                    group_index,
+                    image_index,
+                    Ok(ImageAttachment {
+                        url,
+                        name: Some(name),
+                        mime_type: Some(actual_mime.to_string()),
+                        s3_object_key: Some(object_key),
+                        s3_config_id: Some(s3_config_id.clone()),
+                        cache_path: None,
+                        // Tool bytes are released after the S3 upload. Providers
+                        // that require Base64 fetch the freshly signed S3 object
+                        // through the trusted-upload path for the next cycle.
+                        data: None,
+                    }),
+                )
+            }
+        })
+        .buffer_unordered(3)
+        .collect::<Vec<_>>()
+        .await;
+    outcomes.sort_by_key(|(group_index, image_index, _)| (*group_index, *image_index));
+
+    let mut attachments = vec![Vec::new(); group_count];
+    for (group_index, _, outcome) in outcomes {
+        match outcome {
+            Ok(attachment) => attachments[group_index].push(attachment),
+            Err(error) => {
+                warnings[group_index].push(format!("Tool image was not attached: {error}."))
+            }
+        }
+    }
+    ToolImageGroupUploadResult {
+        attachments,
+        warnings,
+    }
+}
+
+/// Validate and upload one tool result. This wrapper preserves the original
+/// internal API while sharing the same batch-level implementation.
+#[cfg(test)]
+pub(crate) async fn upload_tool_images(
+    http: &Client,
+    cfg: &S3Config,
+    images: Vec<ToolImageOutput>,
+) -> ToolImageUploadResult {
+    let mut result =
+        upload_tool_image_groups(http, cfg, vec![images], MAX_IMAGE_UPLOAD_FILES).await;
+    ToolImageUploadResult {
+        attachments: result.attachments.pop().unwrap_or_default(),
+        warnings: result.warnings.pop().unwrap_or_default(),
+    }
+}
+
+pub(crate) fn public_image_payload(image: &ImageAttachment) -> serde_json::Value {
+    serde_json::json!({
+        "url": image.url,
+        "name": image.name.as_deref().unwrap_or("image"),
+        "mime_type": image.mime_type.as_deref().unwrap_or("image/jpeg"),
+    })
+}
 
 #[cfg(test)]
 #[path = "tests/image_uploads_tests.rs"]

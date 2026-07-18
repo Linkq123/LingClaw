@@ -503,6 +503,8 @@ fn compression_source_text_includes_image_markers() {
     user_msg.images = Some(vec![
         ImageAttachment {
             url: "https://example.com/a.png".to_string(),
+            name: None,
+            mime_type: None,
             s3_object_key: None,
             s3_config_id: None,
             cache_path: None,
@@ -510,6 +512,8 @@ fn compression_source_text_includes_image_markers() {
         },
         ImageAttachment {
             url: "https://example.com/b.png".to_string(),
+            name: None,
+            mime_type: None,
             s3_object_key: None,
             s3_config_id: None,
             cache_path: None,
@@ -546,6 +550,37 @@ fn repeated_compression_excludes_previous_summary() {
     );
     assert!(source.contains("new question"));
     assert!(source.contains("follow up"));
+}
+
+#[test]
+fn live_round_replay_preserves_tool_result_images_and_error_state() {
+    let live_round = LiveRoundState {
+        tools: vec![LiveToolState {
+            id: "tool-image-1".to_string(),
+            name: "view_image".to_string(),
+            arguments: r#"{"path":"chart.png"}"#.to_string(),
+            result: Some("Image attached".to_string()),
+            elapsed_ms: 42,
+            images: vec![json!({
+                "url": "https://storage.example.test/chart.png",
+                "name": "chart.png",
+                "mime_type": "image/png",
+            })],
+            is_error: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+
+    let events = live_round_replay_events(&live_round);
+    let result = events
+        .iter()
+        .find(|event| event["type"] == "tool_result")
+        .expect("tool result should be replayed");
+
+    assert_eq!(result["images"][0]["name"], "chart.png");
+    assert_eq!(result["images"][0]["mime_type"], "image/png");
+    assert_eq!(result["is_error"], true);
 }
 
 #[test]
@@ -2103,6 +2138,8 @@ fn build_history_payload_hides_internal_image_cache_metadata() {
             content: Some("look".into()),
             images: Some(vec![ImageAttachment {
                 url: "https://example.com/photo.png".into(),
+                name: None,
+                mime_type: None,
                 s3_object_key: None,
                 s3_config_id: None,
                 cache_path: Some("C:/internal/cache/file.b64".into()),
@@ -2162,6 +2199,8 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
             content: Some("look".into()),
             images: Some(vec![ImageAttachment {
                 url: "https://expired.example.test/photo.png".into(),
+                name: None,
+                mime_type: None,
                 s3_object_key: Some("lingclaw/images/2026/demo.png".into()),
                 s3_config_id: None,
                 cache_path: None,
@@ -2231,6 +2270,90 @@ fn build_history_payload_with_s3_refreshes_uploaded_image_urls() {
         payload["messages"][0]["images"][0]["url"],
         "https://expired.example.test/photo.png"
     );
+}
+
+#[test]
+fn build_history_payload_resigns_tool_images_and_hides_storage_metadata() {
+    let s3_cfg = crate::config::S3Config {
+        endpoint: "https://minio.example.test/storage".into(),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "lingclaw/images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    };
+    let mut session = test_session("tool-image-history", "Tool image", None);
+    session.messages.extend([
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "image_call".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "view_image".into(),
+                    arguments: r#"{"path":"chart.png"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: Some(100),
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("image attached".into()),
+            images: Some(vec![ImageAttachment {
+                url: "https://expired.example.test/chart.png".into(),
+                name: Some("chart.png".into()),
+                mime_type: Some("image/png".into()),
+                s3_object_key: Some("lingclaw/images/chart.png".into()),
+                s3_config_id: Some(crate::image_uploads::s3_config_id(&s3_cfg)),
+                cache_path: None,
+                data: Some("raw-base64-must-stay-private".into()),
+            }]),
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("image_call".into()),
+            timestamp: Some(101),
+        },
+    ]);
+
+    let payload = crate::session_store::build_history_payload_with_s3(&session, Some(&s3_cfg));
+    let tool_result = payload["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool_result")
+        .expect("tool result");
+    let image = &tool_result["images"][0];
+    assert!(
+        image["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://minio.example.test/storage/bucket/lingclaw/images/chart.png?")
+    );
+    assert_eq!(image["name"], "chart.png");
+    assert_eq!(image["mime_type"], "image/png");
+    assert!(image.get("s3_object_key").is_none());
+    assert!(image.get("s3_config_id").is_none());
+    assert!(!payload.to_string().contains("raw-base64-must-stay-private"));
+
+    let mut replacement = s3_cfg.clone();
+    replacement.endpoint = "https://replacement.example.test/storage".into();
+    let payload = crate::session_store::build_history_payload_with_s3(&session, Some(&replacement));
+    let tool_result = payload["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool_result")
+        .unwrap();
+    assert!(tool_result.get("images").is_none());
 }
 
 #[test]
@@ -2457,6 +2580,7 @@ fn build_history_payload_includes_subagent_snapshot_on_task_results() {
                     result: Some("panic: startup config missing".into()),
                     is_error: false,
                     duration_ms: 12,
+                    images: Vec::new(),
                 }],
                 cycles: 1,
                 tool_calls: 1,
@@ -2567,6 +2691,7 @@ fn build_history_payload_redacts_exec_args_in_subagent_snapshot() {
                     result: Some("ok".into()),
                     is_error: false,
                     duration_ms: 12,
+                    images: Vec::new(),
                 }],
                 cycles: 1,
                 tool_calls: 1,
@@ -5136,6 +5261,7 @@ fn save_session_to_disk_redacts_exec_arguments_in_messages_and_snapshots() {
                     result: Some("ok".into()),
                     is_error: false,
                     duration_ms: 12,
+                    images: Vec::new(),
                 }],
                 success: true,
                 result_excerpt: Some("Found the issue in the logs.".into()),
@@ -5164,6 +5290,135 @@ fn save_session_to_disk_redacts_exec_arguments_in_messages_and_snapshots() {
     assert!(!serialized.contains("hook-secret"));
     assert!(!serialized.contains("nested-secret"));
     assert!(!serialized.contains("token-456"));
+}
+
+#[test]
+fn save_session_to_disk_persists_tool_image_identity_without_ephemeral_data() {
+    let session_id = format!("tool-image-save-{}-{}", std::process::id(), now_epoch());
+    let path = sessions_dir().join(format!("{session_id}.json"));
+    let workspace = session_workspace_path(&session_id);
+    let _guard = SavedSessionGuard {
+        session_id: session_id.clone(),
+        workspace: workspace.clone(),
+    };
+    let config_id = "storage-config-id".to_string();
+    let private_image = || ImageAttachment {
+        url: "https://storage.example.test/signed.png?private-signature".into(),
+        name: Some("chart.png".into()),
+        mime_type: Some("image/png".into()),
+        s3_object_key: Some("tool-images/chart.png".into()),
+        s3_config_id: Some(config_id.clone()),
+        cache_path: None,
+        data: Some("raw-base64-must-not-persist".into()),
+    };
+    let mut session = test_session(&session_id, "Tool image", None);
+    session.workspace = workspace;
+    session.messages.extend([
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "view_call".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "view_image".into(),
+                    arguments: r#"{"path":"chart.png"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: Some(100),
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("image attached".into()),
+            images: Some(vec![private_image()]),
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("view_call".into()),
+            timestamp: Some(101),
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "task_call".into(),
+                call_type: "function".into(),
+                gemini_thought_signature: None,
+                function: FunctionCall {
+                    name: "task".into(),
+                    arguments: r#"{"agent":"reviewer","prompt":"inspect"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            timestamp: Some(102),
+        },
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("sub-agent completed".into()),
+            images: None,
+            thinking: None,
+            anthropic_thinking_blocks: None,
+            tool_calls: None,
+            tool_call_id: Some("task_call".into()),
+            timestamp: Some(103),
+        },
+    ]);
+    session.subagent_snapshots.insert(
+        subagent_snapshot_storage_key("task_call", 1),
+        SubagentHistorySnapshot {
+            tools: vec![SubagentToolHistorySnapshot {
+                id: "nested_view".into(),
+                name: "view_image".into(),
+                arguments: Some(r#"{"path":"chart.png"}"#.into()),
+                result: Some("image attached".into()),
+                is_error: false,
+                duration_ms: 10,
+                images: vec![private_image()],
+            }],
+            success: true,
+            ..Default::default()
+        },
+    );
+
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime
+        .block_on(save_session_to_disk(&session))
+        .expect("session should save");
+    let payload: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("saved session"))
+            .expect("valid session JSON");
+    let serialized = payload.to_string();
+    assert!(!serialized.contains("private-signature"));
+    assert!(!serialized.contains("raw-base64-must-not-persist"));
+
+    let message_image = payload["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["tool_call_id"] == "view_call")
+        .and_then(|message| message["images"].as_array())
+        .and_then(|images| images.first())
+        .expect("persisted tool image");
+    assert_eq!(message_image["url"], "");
+    assert_eq!(message_image["s3_object_key"], "tool-images/chart.png");
+    assert_eq!(message_image["s3_config_id"], config_id);
+    assert_eq!(message_image["name"], "chart.png");
+    assert_eq!(message_image["mime_type"], "image/png");
+    assert!(message_image.get("data").is_none());
+
+    let nested_image = &payload["subagent_snapshots"]
+        [subagent_snapshot_storage_key("task_call", 1)]["tools"][0]["images"][0];
+    assert_eq!(nested_image["url"], "");
+    assert_eq!(nested_image["s3_object_key"], "tool-images/chart.png");
+    assert!(nested_image.get("data").is_none());
 }
 
 #[test]
@@ -5487,6 +5742,76 @@ fn generate_shutdown_token_returns_64_hex_chars() {
 
     assert_eq!(token.len(), 64);
     assert!(token.chars().all(|ch| ch.is_ascii_hexdigit()));
+}
+
+#[test]
+fn s3_lifecycle_sync_tracks_hot_loaded_storage_changes() {
+    let configured = crate::config::S3Config {
+        endpoint: "https://minio.example.test/storage".into(),
+        region: "us-east-1".into(),
+        bucket: "bucket".into(),
+        access_key: "access-key".into(),
+        secret_key: "secret-key".into(),
+        prefix: "images/".into(),
+        url_expiry_secs: 3600,
+        lifecycle_days: 14,
+    };
+
+    let mut synchronized = None;
+    assert!(s3_lifecycle_needs_sync_with_id(
+        Some(&configured),
+        synchronized.as_deref()
+    ));
+
+    synchronized = Some(image_uploads::s3_config_id(&configured));
+    assert!(!s3_lifecycle_needs_sync_with_id(
+        Some(&configured),
+        synchronized.as_deref()
+    ));
+
+    let mut changed = configured.clone();
+    changed.lifecycle_days = 30;
+    assert!(s3_lifecycle_needs_sync_with_id(
+        Some(&changed),
+        synchronized.as_deref()
+    ));
+    let configured_id = image_uploads::s3_config_id(&configured);
+    let changed_id = image_uploads::s3_config_id(&changed);
+    assert!(!s3_lifecycle_request_matches_current(
+        Some(&changed),
+        &configured_id
+    ));
+    assert!(s3_lifecycle_request_matches_current(
+        Some(&changed),
+        &changed_id
+    ));
+
+    // A failed/timeout attempt never inserts the changed identity, so an
+    // identical subsequent Settings save remains eligible for retry.
+    assert!(s3_lifecycle_needs_sync_with_id(
+        Some(&changed),
+        synchronized.as_deref()
+    ));
+
+    synchronized = Some(image_uploads::s3_config_id(&changed));
+    assert!(s3_lifecycle_needs_sync_with_id(
+        Some(&configured),
+        synchronized.as_deref()
+    ));
+
+    changed.lifecycle_days = 0;
+    assert!(!s3_lifecycle_request_matches_current(
+        Some(&changed),
+        &image_uploads::s3_config_id(&changed)
+    ));
+    assert!(!s3_lifecycle_needs_sync_with_id(
+        Some(&changed),
+        synchronized.as_deref()
+    ));
+    assert!(!s3_lifecycle_needs_sync_with_id(
+        None,
+        synchronized.as_deref()
+    ));
 }
 
 #[tokio::test]

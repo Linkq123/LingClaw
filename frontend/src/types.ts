@@ -2,6 +2,8 @@
 
 export interface ImageAttachment {
   url: string;
+  name?: string;
+  mime_type?: string;
   object_key?: string;
   attachment_token?: string;
   s3_config_id?: string;
@@ -30,6 +32,7 @@ export interface SubagentToolHistorySnapshot {
   result?: string;
   is_error?: boolean;
   duration_ms?: number;
+  images?: ImageAttachment[];
 }
 
 export interface SubagentHistorySnapshot {
@@ -192,6 +195,12 @@ export interface ToolResultEvent {
   is_error?: boolean;
   subagent?: string;
   task_id?: string;
+  images?: ImageAttachment[];
+}
+
+export interface ToolImageCompatibilityWarningEvent {
+  type: 'tool_image_compatibility_warning';
+  provider: 'openai_chat';
 }
 
 export interface TaskEvent {
@@ -444,6 +453,7 @@ export type WebSocketMessage =
   | ToolProgressEvent
   | ToolOutputEvent
   | ToolResultEvent
+  | ToolImageCompatibilityWarningEvent
   | TaskEvent
   | SystemEvent
   | ReactPhaseEvent

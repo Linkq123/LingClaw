@@ -11,12 +11,113 @@ import { pinReactStatusToBottom } from './react-status.js';
 import { tr } from '../i18n.js';
 import { trapDialogFocus } from '../pages/dialogFocus.js';
 import { iconMarkup } from '../icons.js';
+import type { ImageAttachment } from '../types.js';
 
 const TOOL_LIVE_OUTPUT_MAX_CHARS = 60000;
 const TOOL_LIVE_OUTPUT_TRUNCATED_PREFIX = '[live output truncated]\n';
 let lastToolDrawerFocus: HTMLElement | null = null;
 let toolDrawerFocusRaf = 0;
 let toolDrawerModal = false;
+
+export function claimToolImageCompatibilityWarning(): boolean {
+  if (state.toolImageCompatibilityWarningShown) return false;
+  state.toolImageCompatibilityWarningShown = true;
+  return true;
+}
+
+export function resetToolImageCompatibilityWarning(): void {
+  state.toolImageCompatibilityWarningShown = false;
+}
+
+export function normalizeToolImages(images: unknown): ImageAttachment[] {
+  if (!Array.isArray(images)) return [];
+  return images
+    .filter((image): image is ImageAttachment =>
+      Boolean(
+        image &&
+        typeof image === 'object' &&
+        typeof image.url === 'string' &&
+        isSafeToolImageUrl(image.url),
+      ),
+    )
+    .map((image, index) => ({
+      url: image.url,
+      name: typeof image.name === 'string' && image.name.trim() ? image.name : `image-${index + 1}`,
+      mime_type: typeof image.mime_type === 'string' ? image.mime_type : undefined,
+    }));
+}
+
+function isSafeToolImageUrl(value: string): boolean {
+  try {
+    const protocol = new URL(value).protocol.toLowerCase();
+    return protocol === 'https:' || protocol === 'http:';
+  } catch {
+    return false;
+  }
+}
+
+function panelToolImages(panel: HTMLElement): ImageAttachment[] {
+  try {
+    return normalizeToolImages(JSON.parse(panel.dataset.toolImages || '[]'));
+  } catch {
+    return [];
+  }
+}
+
+function toolImageCountText(count: number): string {
+  return tr(count === 1 ? 'tool.imageCountOne' : 'tool.imageCount', { count });
+}
+
+function syncPanelImageCount(panel: HTMLElement, images: ImageAttachment[]): void {
+  panel.dataset.toolImages = JSON.stringify(images);
+  panel.dataset.toolImageCount = String(images.length);
+  const count = panel.querySelector<HTMLElement>('.tool-image-count');
+  if (!count) return;
+  count.hidden = images.length === 0;
+  count.textContent = images.length ? toolImageCountText(images.length) : '';
+}
+
+function renderToolImageGallery(host: HTMLElement | null, images: ImageAttachment[]): void {
+  if (!host) return;
+  host.replaceChildren();
+  for (const image of images) {
+    const name = image.name || 'image';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'tool-image-preview';
+    button.dataset.action = 'preview-tool-image';
+    button.dataset.imageUrl = image.url;
+    button.setAttribute('aria-label', tr('tool.previewImage', { name }));
+
+    const thumbnail = document.createElement('img');
+    thumbnail.src = image.url;
+    thumbnail.alt = name;
+    thumbnail.loading = 'lazy';
+    thumbnail.decoding = 'async';
+    thumbnail.setAttribute('loading', 'lazy');
+    thumbnail.setAttribute('decoding', 'async');
+    const label = document.createElement('span');
+    label.className = 'tool-image-name';
+    label.textContent = name;
+    const error = document.createElement('span');
+    error.className = 'tool-image-error';
+    error.textContent = tr('tool.imageLoadFailed');
+    error.hidden = true;
+    thumbnail.addEventListener('error', () => {
+      button.classList.add('is-error');
+      thumbnail.hidden = true;
+      error.hidden = false;
+    });
+    button.append(thumbnail, error, label);
+    host.appendChild(button);
+  }
+}
+
+export function previewToolImage(button: HTMLElement): void {
+  const url = button.dataset.imageUrl;
+  if (!url || !isSafeToolImageUrl(url)) return;
+  window.open(url, '_blank', 'noopener,noreferrer');
+}
 
 function isToolDrawerModalViewport(): boolean {
   if (typeof window.matchMedia === 'function') {
@@ -124,6 +225,8 @@ export function addToolCall(name, args, id) {
   panel.dataset.toolResult = '';
   panel.dataset.toolLiveOutput = '';
   panel.dataset.toolHasResult = 'false';
+  panel.dataset.toolImages = '[]';
+  panel.dataset.toolImageCount = '0';
   panel.dataset.toolStatus = tr('tool.running');
 
   panel.innerHTML = `
@@ -131,6 +234,7 @@ export function addToolCall(name, args, id) {
       <span class="tool-icon">${iconMarkup('bolt')}</span>
       <span class="tool-name">${escHtml(name)}</span>
       <span class="tool-args-preview">${escHtml(truncateStr(args, 80))}</span>
+      <span class="tool-image-count" hidden></span>
       <span class="tool-status">${escHtml(tr('tool.running'))}</span>
     </button>
   `;
@@ -173,7 +277,15 @@ export function appendToolOutput(id, stream, chunk) {
   }
 }
 
-export function addToolResult(name, result, id, durationMs = null, isError = false) {
+export function addToolResult(
+  name,
+  result,
+  id,
+  durationMs = null,
+  isError = false,
+  images: ImageAttachment[] = [],
+) {
+  const normalizedImages = normalizeToolImages(images);
   const panel = findToolPanel(id);
   if (panel) {
     panel.dataset.toolResult = result;
@@ -181,6 +293,7 @@ export function addToolResult(name, result, id, durationMs = null, isError = fal
     panel.dataset.toolHasResult = 'true';
     panel.dataset.toolDurationMs = durationMs == null ? '' : String(durationMs);
     panel.dataset.toolIsError = String(isError);
+    syncPanelImageCount(panel, normalizedImages);
     const durationLabel = formatToolDuration(durationMs);
     panel.dataset.toolStatus = isError
       ? durationLabel
@@ -211,6 +324,8 @@ export function addToolResult(name, result, id, durationMs = null, isError = fal
   el.dataset.toolHasResult = 'true';
   el.dataset.toolDurationMs = durationMs == null ? '' : String(durationMs);
   el.dataset.toolIsError = String(isError);
+  el.dataset.toolImages = '[]';
+  el.dataset.toolImageCount = '0';
   const durationLabel = formatToolDuration(durationMs);
   el.dataset.toolStatus = isError
     ? durationLabel
@@ -223,10 +338,12 @@ export function addToolResult(name, result, id, durationMs = null, isError = fal
     <button type="button" class="tool-header" data-action="open-tool-drawer" aria-haspopup="dialog">
       <span class="tool-icon">${iconMarkup('clipboard')}</span>
       <span class="tool-name">${escHtml(name)} result</span>
+      <span class="tool-image-count" hidden></span>
       <span class="tool-status">${escHtml(el.dataset.toolStatus)}</span>
     </button>
   `;
   el.classList.add('tool-panel-ready');
+  syncPanelImageCount(el, normalizedImages);
   el.classList.toggle('tool-panel-failed', isError);
   const currentRow = state.currentMsg ? state.currentMsg.closest('.msg-row') : null;
   mountExecutionPanel(el, 'result', currentRow);
@@ -244,6 +361,7 @@ export function syncToolDrawer(panel) {
   const hasResult = panel.dataset.toolHasResult === 'true';
   const detailText = hasResult ? toolResult : toolLiveOutput;
   const hasDetail = detailText.trim().length > 0;
+  const images = panelToolImages(panel);
   const statusText =
     panel.dataset.toolStatus || (hasResult ? tr('tool.resultReturned') : tr('tool.running'));
 
@@ -252,6 +370,8 @@ export function syncToolDrawer(panel) {
   if (dom.toolDrawerArgs) dom.toolDrawerArgs.textContent = toolArgs || tr('tool.argumentsEmpty');
   if (dom.toolDrawerResult) dom.toolDrawerResult.textContent = detailText;
   if (dom.toolDrawerResultSection) dom.toolDrawerResultSection.hidden = !hasDetail;
+  renderToolImageGallery(dom.toolDrawerImages, images);
+  if (dom.toolDrawerImagesSection) dom.toolDrawerImagesSection.hidden = images.length === 0;
 }
 
 export function openToolDrawer(panel, trigger: HTMLElement | null = null) {
@@ -339,5 +459,12 @@ export function refreshToolPanelsLanguage(): void {
       panel.dataset.toolStatus = status;
       const statusEl = panel.querySelector<HTMLElement>('.tool-status');
       if (statusEl) statusEl.textContent = status;
+      const imageCount = Number(panel.dataset.toolImageCount || 0);
+      const imageCountEl = panel.querySelector<HTMLElement>('.tool-image-count');
+      if (imageCountEl) {
+        imageCountEl.hidden = imageCount === 0;
+        imageCountEl.textContent = imageCount ? toolImageCountText(imageCount) : '';
+      }
     });
+  if (state.activeToolPanel) syncToolDrawer(state.activeToolPanel);
 }

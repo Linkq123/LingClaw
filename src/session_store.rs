@@ -557,12 +557,30 @@ fn build_session_persist_payload(session: &Session) -> Result<String, String> {
     sanitize_session_messages(&mut messages);
     for message in &mut messages {
         crate::tools::sanitize_chat_message_tool_calls_in_place(message);
+        if message.role == "tool"
+            && let Some(images) = message.images.as_mut()
+        {
+            for image in images {
+                if image.s3_object_key.is_some() {
+                    // Signed URLs are request-scoped. Persist the stable object
+                    // identity and regenerate a URL on each restore/request.
+                    image.url.clear();
+                }
+            }
+        }
     }
     let subagent_snapshots =
         normalize_subagent_snapshots_for_messages(&messages, &session.subagent_snapshots)
             .into_iter()
             .map(|(key, mut snapshot)| {
                 crate::tools::sanitize_subagent_snapshot_tool_args_in_place(&mut snapshot);
+                for tool in &mut snapshot.tools {
+                    for image in &mut tool.images {
+                        if image.s3_object_key.is_some() {
+                            image.url.clear();
+                        }
+                    }
+                }
                 (key, snapshot)
             })
             .collect();
@@ -878,11 +896,38 @@ pub(crate) fn build_history_payload_with_s3(
                         "id":tool_call_id,
                         "is_error": session.failed_tool_results.contains(tool_call_id),
                     });
+                    if let Some(images) = msg.images.as_ref() {
+                        let public_images = images
+                            .iter()
+                            .filter_map(|image| {
+                                if !crate::image_uploads::stored_s3_config_matches(
+                                    image.s3_config_id.as_deref(),
+                                    s3_cfg,
+                                ) {
+                                    return None;
+                                }
+                                let url = crate::image_uploads::resolve_image_url(
+                                    &image.url,
+                                    image.s3_object_key.as_deref(),
+                                    s3_cfg,
+                                )
+                                .ok()?;
+                                Some(json!({
+                                    "url": url,
+                                    "name": image.name.as_deref().unwrap_or("image"),
+                                    "mime_type": image.mime_type.as_deref().unwrap_or("image/jpeg"),
+                                }))
+                            })
+                            .collect::<Vec<_>>();
+                        if !public_images.is_empty() {
+                            entry["images"] = json!(public_images);
+                        }
+                    }
                     if let Some(snapshot_key) = snapshot_key.as_deref()
                         && let Some(snapshot) = snapshot_lookup.get(snapshot_key)
                     {
                         entry["subagent_snapshot"] =
-                            json!(sanitize_subagent_snapshot_for_history(snapshot));
+                            sanitize_subagent_snapshot_for_history_with_s3(snapshot, s3_cfg);
                     }
                     msgs.push(entry);
                 }
@@ -901,12 +946,52 @@ pub(crate) fn build_history_payload_with_s3(
     payload
 }
 
-fn sanitize_subagent_snapshot_for_history(
+fn sanitize_subagent_snapshot_for_history_with_s3(
     snapshot: &crate::SubagentHistorySnapshot,
-) -> crate::SubagentHistorySnapshot {
+    s3_cfg: Option<&crate::config::S3Config>,
+) -> serde_json::Value {
     let mut sanitized = snapshot.clone();
     crate::tools::sanitize_subagent_snapshot_tool_args_in_place(&mut sanitized);
-    sanitized
+    let mut value = json!(sanitized);
+    let Some(tool_values) = value
+        .get_mut("tools")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return value;
+    };
+    for (tool_value, tool) in tool_values.iter_mut().zip(sanitized.tools.iter()) {
+        let public_images = tool
+            .images
+            .iter()
+            .filter_map(|image| {
+                if !crate::image_uploads::stored_s3_config_matches(
+                    image.s3_config_id.as_deref(),
+                    s3_cfg,
+                ) {
+                    return None;
+                }
+                let url = crate::image_uploads::resolve_image_url(
+                    &image.url,
+                    image.s3_object_key.as_deref(),
+                    s3_cfg,
+                )
+                .ok()?;
+                Some(json!({
+                    "url": url,
+                    "name": image.name.as_deref().unwrap_or("image"),
+                    "mime_type": image.mime_type.as_deref().unwrap_or("image/jpeg"),
+                }))
+            })
+            .collect::<Vec<_>>();
+        if let Some(object) = tool_value.as_object_mut() {
+            if public_images.is_empty() {
+                object.remove("images");
+            } else {
+                object.insert("images".to_string(), json!(public_images));
+            }
+        }
+    }
+    value
 }
 
 fn sanitize_exec_tool_args_in_session(session: &mut Session) {
