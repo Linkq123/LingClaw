@@ -738,6 +738,21 @@ describe('main model payload ordering', () => {
     await Promise.resolve();
     expect(document.querySelector('.group-member-role--owner')?.textContent).toBe('Owner');
 
+    document.querySelector<HTMLButtonElement>('.group-member-mention')?.click();
+    expect(stateModule.state.groupTargetMode).toBe('mentions');
+    expect(stateModule.state.groupTargetPickerOpen).toBe(false);
+    expect(stateModule.dom.input?.value).toBe('@worker-a ');
+    expect(
+      stateModule.dom.groupTargetBar
+        ?.querySelector('.group-target-mode[data-mode="mentions"]')
+        ?.getAttribute('aria-pressed'),
+    ).toBe('true');
+
+    stateModule.dom.groupTargetBar
+      ?.querySelector<HTMLButtonElement>('.group-members-toggle')
+      ?.click();
+    await Promise.resolve();
+
     document
       .querySelector<HTMLButtonElement>('.group-member-menu-trigger[data-session-id="worker-a"]')
       ?.click();

@@ -20,6 +20,9 @@ describe('group mention menu', () => {
     stateModule.initDomRefs();
     stateModule.state.activeGroupId = 'review-group';
     stateModule.state.activeGroupMembers = ['worker-a', 'worker-b'];
+    stateModule.state.groupTargetMode = 'all';
+    stateModule.state.groupTargetPickerOpen = true;
+    stateModule.state.groupTargetSearchQuery = '前端';
     stateModule.state.activeGroupMemberDetails = [
       { id: 'worker-a', name: '前端助手', role: 'member' },
       { id: 'worker-b', name: '后端助手', role: 'admin' },
@@ -46,7 +49,12 @@ describe('group mention menu', () => {
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     expect(input.value).toBe('请问，@worker-a ');
     expect(menu.hidden).toBe(true);
+    expect(stateModule.state.groupTargetMode).toBe('mentions');
+    expect(stateModule.state.groupTargetPickerOpen).toBe(false);
+    expect(stateModule.state.groupTargetSearchQuery).toBe('');
+    expect(document.activeElement).toBe(input);
 
+    stateModule.state.groupTargetMode = 'all';
     input.value = 'Ask @';
     input.setSelectionRange(input.value.length, input.value.length);
     input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -54,6 +62,43 @@ describe('group mention menu', () => {
     expect(workerB).not.toBeNull();
     workerB?.click();
     expect(input.value).toBe('Ask @worker-b ');
+    expect(stateModule.state.groupTargetMode).toBe('mentions');
+  });
+
+  it('dispatches an inserted mention only to mentioned group members', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = { readyState: 1, send: sendMock } as unknown as WebSocket;
+    stateModule.state.activeGroupId = 'review-group';
+    stateModule.state.activeGroupMembers = ['worker-a', 'worker-b'];
+    stateModule.state.activeGroupMemberDetails = [
+      { id: 'worker-a', name: 'Worker A', role: 'member' },
+      { id: 'worker-b', name: 'Worker B', role: 'member' },
+    ];
+    stateModule.state.groupModelConfiguredMembers = new Set(['worker-a', 'worker-b']);
+    stateModule.state.groupTargetMode = 'all';
+    stateModule.state.pendingImages = [];
+    stateModule.state.planModeEnabled = false;
+
+    const { initInputListeners, send } = await import('../src/input.js');
+    initInputListeners();
+    const input = stateModule.dom.input!;
+    input.value = '@Work';
+    input.setSelectionRange(input.value.length, input.value.length);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    stateModule.dom.slashCommandMenu
+      ?.querySelector<HTMLButtonElement>('[data-mention-id="worker-a"]')
+      ?.click();
+
+    send();
+
+    expect(JSON.parse(sendMock.mock.calls[0][0])).toMatchObject({
+      type: 'group_message',
+      text: '@worker-a',
+      targets: [],
+      target_mode: 'mentions',
+    });
   });
 
   it('closes with Escape and never opens outside group chat', async () => {

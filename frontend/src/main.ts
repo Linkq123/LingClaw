@@ -111,7 +111,12 @@ import {
   syncRestoredSessionCapabilities,
   updateS3ConfigIdentity,
 } from './images.js';
-import { sendCmd, initInputListeners, refreshInputMenus } from './input.js';
+import {
+  activateGroupMentionTargetMode,
+  sendCmd,
+  initInputListeners,
+  refreshInputMenus,
+} from './input.js';
 import {
   toggleMobileMenu,
   closeMobileMenu,
@@ -654,6 +659,7 @@ function insertGroupMentionAtSelection(sessionId: string) {
     sessionId,
   );
   dom.input.value = replacement.value;
+  activateGroupMentionTargetMode();
   dom.input.focus();
   dom.input.setSelectionRange(replacement.cursor, replacement.cursor);
   dom.input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -3092,7 +3098,12 @@ syncToolDrawerBounds();
 updateJumpToLatestVisibility();
 
 initImageListeners();
-initInputListeners();
+initInputListeners({
+  onGroupMentionTargetModeActivated: () => {
+    renderGroupTargetControls();
+    syncToolDrawerBounds();
+  },
+});
 initMobileListeners();
 void refreshComposerAvailability();
 

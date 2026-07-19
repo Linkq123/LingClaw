@@ -36,6 +36,19 @@ let slashMenuActiveIndex = 0;
 let mentionMenuSuggestions: GroupMentionMember[] = [];
 let mentionMenuActiveIndex = 0;
 let activeMentionQuery: GroupMentionQuery | null = null;
+let onGroupMentionTargetModeActivated: (() => void) | null = null;
+
+export type InputListenerOptions = {
+  onGroupMentionTargetModeActivated?: () => void;
+};
+
+export function activateGroupMentionTargetMode(): void {
+  if (!state.activeGroupId) return;
+  state.groupTargetMode = 'mentions';
+  state.groupTargetPickerOpen = false;
+  state.groupTargetSearchQuery = '';
+  onGroupMentionTargetModeActivated?.();
+}
 
 function closeSlashCommandMenu() {
   const menu = dom.slashCommandMenu;
@@ -140,6 +153,7 @@ function applyGroupMentionSuggestion(candidate: GroupMentionMember): void {
   }
   const replacement = insertGroupMention(dom.input.value, currentQuery, candidate.id);
   dom.input.value = replacement.value;
+  activateGroupMentionTargetMode();
   dom.input.focus();
   dom.input.setSelectionRange(replacement.cursor, replacement.cursor);
   dom.input.style.height = 'auto';
@@ -585,7 +599,10 @@ export function sendCmd(cmd) {
   state.ws.send(normalizedCmd);
 }
 
-export function initInputListeners() {
+export function initInputListeners(options: InputListenerOptions = {}) {
+  if (options.onGroupMentionTargetModeActivated) {
+    onGroupMentionTargetModeActivated = options.onGroupMentionTargetModeActivated;
+  }
   if (_listenerInit) return;
   _listenerInit = true;
   dom.input.addEventListener('keydown', (e) => {
