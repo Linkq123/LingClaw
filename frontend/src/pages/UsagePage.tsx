@@ -1,90 +1,128 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import type { UsageData } from '../types/config.js';
-import { subscribeLanguageChange, tr } from '../i18n.js';
-import { trapDialogFocus } from './dialogFocus.js';
+import { isChinese, subscribeLanguageChange, tr } from '../i18n.js';
+import '../css/usage-console.css';
 
-// ── Module-level bridge ───────────────────────────────────────────────────────
-
-let _open: (() => void) | null = null;
-let _close: (() => void) | null = null;
-// See note on the same flag in SettingsPage.tsx.
+let openBridge: (() => void) | null = null;
+let closeBridge: (() => void) | null = null;
 let pendingOpen = false;
-let _usageSessionId = '';
+let bridgeSessionId = '';
 
 export function openUsagePage(sessionId?: string): void {
-  if (sessionId) {
-    _usageSessionId = sessionId;
-  }
-  if (_open) _open();
+  if (sessionId !== undefined) bridgeSessionId = sessionId;
+  if (openBridge) openBridge();
   else pendingOpen = true;
 }
+
 export function closeUsagePage(): void {
   pendingOpen = false;
-  _close?.();
-}
-// ── Format helpers ────────────────────────────────────────────────────────────
-
-const ROLE_ORDER = ['Primary', 'Fast', 'Sub-Agent', 'Memory', 'Reflection', 'Context'];
-const RANGE_OPTIONS: ReadonlyArray<number> = [7, 14, 30];
-const PROVIDER_COLORS = [
-  '#2d8bcf',
-  '#c06b9e',
-  '#6c63ff',
-  '#e8a838',
-  '#44c4a1',
-  '#d65c5c',
-  '#8b7ec8',
-  '#3ea8b5',
-];
-
-function formatTokenCount(n: number | undefined): string {
-  if (n == null) return '0';
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1).replace(/\.0$/, '') + 'M';
-  if (n >= 1_000) return (n / 1_000).toFixed(1).replace(/\.0$/, '') + 'K';
-  return String(n);
+  closeBridge?.();
 }
 
-function normalizeUsagePair(pair: [number, number] | undefined): { input: number; output: number } {
-  return {
-    input: Array.isArray(pair) ? pair[0] || 0 : 0,
-    output: Array.isArray(pair) ? pair[1] || 0 : 0,
+export const USAGE_RANGE_OPTIONS = [7, 14, 30] as const;
+export type UsageRange = (typeof USAGE_RANGE_OPTIONS)[number];
+export type UsageBreakdownScope = 'range' | 'total';
+
+export interface UsagePair {
+  input: number;
+  output: number;
+  total: number;
+}
+
+export interface UsageTimelinePoint extends UsagePair {
+  date: string;
+  label: string;
+}
+
+export interface UsageRankingEntry extends UsagePair {
+  name: string;
+  unattributed?: boolean;
+}
+
+export interface UsageDashboardAggregate {
+  timeline: UsageTimelinePoint[];
+  today: UsagePair;
+  allTime: UsagePair;
+  range: UsagePair;
+  average: UsagePair;
+  activeDays: number;
+  peak: UsageTimelinePoint | null;
+  providers: {
+    range: UsageRankingEntry[];
+    total: UsageRankingEntry[];
   };
+  roles: {
+    range: UsageRankingEntry[];
+    total: UsageRankingEntry[];
+  };
+  hasUsage: boolean;
 }
 
-function pairHasUsage(pair: [number, number] | undefined): boolean {
-  const normalized = normalizeUsagePair(pair);
-  return normalized.input + normalized.output > 0;
+export interface UsageViewState {
+  loading: boolean;
+  refreshing: boolean;
+  error: string;
+  hasData: boolean;
 }
 
-export function hasAnyUsageData(data: UsageData): boolean {
-  if (
-    (data.daily_input || 0) +
-      (data.daily_output || 0) +
-      (data.total_input || 0) +
-      (data.total_output || 0) >
-    0
-  ) {
-    return true;
-  }
-  if (Object.values(data.daily_roles || {}).some(pairHasUsage)) return true;
-  if (Object.values(data.total_roles || {}).some(pairHasUsage)) return true;
-  if (Object.values(data.daily_providers || {}).some(pairHasUsage)) return true;
-  return (data.usage_history || []).some(
-    (entry) =>
-      (entry.input || 0) + (entry.output || 0) > 0 ||
-      Object.values(entry.providers || {}).some(pairHasUsage),
-  );
+export interface UsageViewProps {
+  sessionId?: string;
+  active?: boolean;
+  className?: string;
+  onRequestClose?: () => void;
+  onStateChange?: (state: UsageViewState) => void;
 }
 
-function localDateStr(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
+const UNATTRIBUTED = '__unattributed__';
+const ROLE_ORDER = ['Primary', 'Fast', 'Sub-Agent', 'Memory', 'Reflection', 'Context'];
 
-function formatDateLabel(d: Date): string {
-  return `${d.getMonth() + 1}/${d.getDate()}`;
+type UsageCopyKey =
+  | 'session'
+  | 'rangeAverage'
+  | 'activeDays'
+  | 'rangeTotal'
+  | 'peakDay'
+  | 'composition'
+  | 'byRole'
+  | 'selectedRange'
+  | 'cumulative'
+  | 'unattributed'
+  | 'dataTable'
+  | 'date'
+  | 'total'
+  | 'refreshing'
+  | 'rangeSummary'
+  | 'share'
+  | 'noRoleRangeData'
+  | 'noProviderRangeData';
+
+const USAGE_COPY: Record<UsageCopyKey, { en: string; zh: string }> = {
+  session: { en: 'Session', zh: '会话' },
+  rangeAverage: { en: 'Daily average', zh: '范围日均' },
+  activeDays: { en: 'Active days', zh: '活跃天数' },
+  rangeTotal: { en: 'Range total', zh: '范围总量' },
+  peakDay: { en: 'Peak day', zh: '峰值日' },
+  composition: { en: 'Input / Output', zh: '输入 / 输出构成' },
+  byRole: { en: 'By Agent role', zh: '按 Agent 角色' },
+  selectedRange: { en: 'Selected range', zh: '所选范围' },
+  cumulative: { en: 'Cumulative', zh: '累计' },
+  unattributed: { en: 'Unattributed', zh: '未归因' },
+  dataTable: { en: 'View data table', zh: '查看数据表' },
+  date: { en: 'Date', zh: '日期' },
+  total: { en: 'Total', zh: '总计' },
+  refreshing: { en: 'Refreshing usage data…', zh: '正在刷新用量数据…' },
+  rangeSummary: { en: 'Range summary', zh: '范围摘要' },
+  share: { en: 'Share', zh: '占比' },
+  noRoleRangeData: { en: 'No role data for this view', zh: '当前视图暂无角色数据' },
+  noProviderRangeData: { en: 'No provider data for this view', zh: '当前视图暂无服务商数据' },
+};
+
+function usageCopy(key: UsageCopyKey): string {
+  const translationKey = `usage.${key}`;
+  const translated = tr(translationKey);
+  if (translated !== translationKey) return translated;
+  const copy = USAGE_COPY[key];
+  return isChinese() ? copy.zh : copy.en;
 }
 
 function useLanguageVersion(): number {
@@ -93,753 +131,871 @@ function useLanguageVersion(): number {
   return version;
 }
 
-// ── Summary section ───────────────────────────────────────────────────────────
-
-function UsageSummary({ data }: { data: UsageData }) {
-  const total = (data.total_input || 0) + (data.total_output || 0);
-  const inputSource = data.input_source || 'estimated';
-  const outputSource = data.output_source || 'estimated';
-  const sourceScope = data.source_scope || 'latest_update';
-  const sourceNote =
-    sourceScope === 'latest_update'
-      ? tr('usage.latestSource', { input: inputSource, output: outputSource })
-      : tr('usage.source', { input: inputSource, output: outputSource });
-
-  const stats = [
-    {
-      input: data.daily_input || 0,
-      output: data.daily_output || 0,
-      value: (data.daily_input || 0) + (data.daily_output || 0),
-      label: tr('usage.todayTotal'),
-    },
-    {
-      input: data.total_input || 0,
-      output: data.total_output || 0,
-      value: total,
-      label: tr('usage.allTimeTotal'),
-    },
-  ];
-
-  return (
-    <div className="usage-summary">
-      {stats.map((s) => (
-        <article key={s.label} className="usage-stat-card">
-          <div className="usage-stat-label">{s.label}</div>
-          <div className="usage-stat-value">{formatTokenCount(s.value)}</div>
-          <div className="usage-stat-breakdown">
-            <span>
-              {tr('usage.input')}: {formatTokenCount(s.input)}
-            </span>
-            <span>
-              {tr('usage.output')}: {formatTokenCount(s.output)}
-            </span>
-          </div>
-        </article>
-      ))}
-      <div className="usage-summary-note">{sourceNote}</div>
-    </div>
-  );
+function safeNumber(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
-// ── Role breakdown ────────────────────────────────────────────────────────────
+function usagePair(input: unknown, output: unknown, explicitTotal?: unknown): UsagePair {
+  const safeInput = safeNumber(input);
+  const safeOutput = safeNumber(output);
+  return {
+    input: safeInput,
+    output: safeOutput,
+    total: Math.max(safeInput + safeOutput, safeNumber(explicitTotal)),
+  };
+}
 
-function RoleBreakdown({ data }: { data: UsageData }) {
-  const dailyRoles = data.daily_roles || {};
-  const totalRoles = data.total_roles || {};
-  const names = Array.from(
-    new Set([...ROLE_ORDER, ...Object.keys(dailyRoles), ...Object.keys(totalRoles)]),
-  ).filter((name) => {
-    if (!name) return false;
-    const today = normalizeUsagePair(dailyRoles[name] as [number, number]);
-    const tot = normalizeUsagePair(totalRoles[name] as [number, number]);
-    return today.input + today.output + tot.input + tot.output > 0;
+function normalizePair(pair: [number, number] | undefined): UsagePair {
+  return usagePair(pair?.[0], pair?.[1]);
+}
+
+function addPair(target: UsagePair, value: UsagePair): UsagePair {
+  return usagePair(target.input + value.input, target.output + value.output);
+}
+
+function localDateString(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function dateLabel(date: Date): string {
+  return `${date.getMonth() + 1}/${date.getDate()}`;
+}
+
+function timelineDates(
+  days: number,
+  now: Date,
+): Array<{ date: string; label: string; isToday: boolean }> {
+  const normalizedDays = Math.max(1, Math.floor(days));
+  const result: Array<{ date: string; label: string; isToday: boolean }> = [];
+  for (let offset = normalizedDays - 1; offset >= 0; offset -= 1) {
+    const date = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    date.setDate(date.getDate() - offset);
+    result.push({ date: localDateString(date), label: dateLabel(date), isToday: offset === 0 });
+  }
+  return result;
+}
+
+export function buildUsageTimeline(
+  data: UsageData,
+  days: number,
+  now: Date = new Date(),
+): UsageTimelinePoint[] {
+  const history = new Map((data.usage_history || []).map((entry) => [entry.date, entry]));
+  return timelineDates(days, now).map(({ date, label, isToday }) => {
+    const entry = history.get(date);
+    const pair = isToday
+      ? usagePair(data.daily_input, data.daily_output)
+      : usagePair(entry?.input, entry?.output);
+    return { date, label, ...pair };
   });
+}
 
-  if (names.length === 0) {
-    return (
-      <div className="usage-role-breakdown">
-        <p className="usage-empty-note">{tr('usage.noRoleData')}</p>
-      </div>
-    );
+function addDimension(
+  target: Map<string, UsagePair>,
+  values: Record<string, [number, number]> | undefined,
+): void {
+  for (const [name, rawPair] of Object.entries(values || {})) {
+    if (!name) continue;
+    const pair = normalizePair(rawPair);
+    if (pair.total <= 0) continue;
+    target.set(name, addPair(target.get(name) || usagePair(0, 0), pair));
   }
-
-  return (
-    <div className="usage-role-breakdown" role="list">
-      {names.map((name) => {
-        const today = normalizeUsagePair(dailyRoles[name] as [number, number]);
-        const tot = normalizeUsagePair(totalRoles[name] as [number, number]);
-        return (
-          <article key={name} className="usage-role-card" role="listitem">
-            <div className="usage-role-header">
-              <h3>{name}</h3>
-              <span className="usage-role-chip">{formatTokenCount(tot.input + tot.output)}</span>
-            </div>
-            <div className="usage-role-metrics">
-              <div className="usage-role-metric">
-                <span className="usage-role-kicker">{tr('usage.today')}</span>
-                <strong>{formatTokenCount(today.input + today.output)}</strong>
-                <span>
-                  {tr('usage.inOut', {
-                    input: formatTokenCount(today.input),
-                    output: formatTokenCount(today.output),
-                  })}
-                </span>
-              </div>
-              <div className="usage-role-metric">
-                <span className="usage-role-kicker">{tr('usage.allTime')}</span>
-                <strong>{formatTokenCount(tot.input + tot.output)}</strong>
-                <span>
-                  {tr('usage.inOut', {
-                    input: formatTokenCount(tot.input),
-                    output: formatTokenCount(tot.output),
-                  })}
-                </span>
-              </div>
-            </div>
-          </article>
-        );
-      })}
-    </div>
-  );
 }
 
-// ── Daily line chart ──────────────────────────────────────────────────────────
-
-interface DayPoint {
-  date: string;
-  label: string;
-  input: number;
-  output: number;
-}
-
-function buildDailyTimeline(data: UsageData, days: number): DayPoint[] {
-  const history = data.usage_history || [];
-  const today = new Date();
-  const timeline: DayPoint[] = [];
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(today);
-    d.setDate(d.getDate() - i);
-    const dateStr = localDateStr(d);
-    const label = formatDateLabel(d);
-    if (i === 0) {
-      timeline.push({
-        date: dateStr,
-        label,
-        input: data.daily_input || 0,
-        output: data.daily_output || 0,
-      });
+function rangeDimension(
+  data: UsageData,
+  days: number,
+  now: Date,
+  field: 'providers' | 'roles',
+): Map<string, UsagePair> {
+  const history = new Map((data.usage_history || []).map((entry) => [entry.date, entry]));
+  const totals = new Map<string, UsagePair>();
+  for (const date of timelineDates(days, now)) {
+    if (date.isToday) {
+      addDimension(totals, field === 'providers' ? data.daily_providers : data.daily_roles);
     } else {
-      const snap = history.find((h) => h.date === dateStr);
-      timeline.push({ date: dateStr, label, input: snap?.input || 0, output: snap?.output || 0 });
-    }
-  }
-  return timeline;
-}
-
-function drawDataLine(
-  ctx: CanvasRenderingContext2D,
-  timeline: DayPoint[],
-  stepX: number,
-  padding: { top: number; right: number; bottom: number; left: number },
-  getY: (v: number) => number,
-  accessor: (d: DayPoint) => number,
-  color: string,
-  fillColor: string,
-) {
-  const n = timeline.length;
-  if (n === 0) return;
-  ctx.beginPath();
-  for (let i = 0; i < n; i++) {
-    const x = padding.left + i * stepX;
-    const y = getY(accessor(timeline[i]));
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.lineTo(padding.left + (n - 1) * stepX, getY(0));
-  ctx.lineTo(padding.left, getY(0));
-  ctx.closePath();
-  ctx.fillStyle = fillColor;
-  ctx.fill();
-
-  ctx.beginPath();
-  for (let i = 0; i < n; i++) {
-    const x = padding.left + i * stepX;
-    const y = getY(accessor(timeline[i]));
-    if (i === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
-  }
-  ctx.strokeStyle = color;
-  ctx.lineWidth = 2;
-  ctx.stroke();
-
-  for (let i = 0; i < n; i++) {
-    const val = accessor(timeline[i]);
-    if (val === 0) continue;
-    const x = padding.left + i * stepX;
-    const y = getY(val);
-    ctx.beginPath();
-    ctx.arc(x, y, 3, 0, Math.PI * 2);
-    ctx.fillStyle = color;
-    ctx.fill();
-  }
-}
-
-function DailyChart({ data, days }: { data: UsageData; days: number }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const languageVersion = useLanguageVersion();
-
-  // Memoize the timeline so that unrelated parent re-renders (e.g. range
-  // selector on the sibling chart, loading flag flips) don't force us to
-  // recompute O(days) history lookups. `data` identity is stable between
-  // fetches so depending on the whole object here is correct.
-  const timeline = useMemo(() => buildDailyTimeline(data, days), [data, days]);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const parent = canvas.parentElement;
-    if (!parent) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const rect = parent.getBoundingClientRect();
-    if (rect.width <= 32 || rect.height <= 32) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    const w = rect.width - 32;
-    const h = rect.height - 32;
-    canvas.width = w * dpr;
-    canvas.height = h * dpr;
-    canvas.style.width = w + 'px';
-    canvas.style.height = h + 'px';
-    ctx.scale(dpr, dpr);
-
-    const padding = { top: 24, right: 20, bottom: 44, left: 60 };
-    const chartW = w - padding.left - padding.right;
-    const chartH = h - padding.top - padding.bottom;
-
-    const isDark = document.documentElement.dataset.theme === 'dark';
-    const textColor = isDark ? '#b0b5c0' : '#7e8699';
-    const gridColor = isDark ? 'rgba(255,255,255,.06)' : 'rgba(0,0,0,.06)';
-
-    let maxVal = 0;
-    for (const p of timeline) if (p.input + p.output > maxVal) maxVal = p.input + p.output;
-    if (maxVal === 0) maxVal = 100;
-
-    const gridLines = 4;
-    for (let i = 0; i <= gridLines; i++) {
-      const y = padding.top + (chartH / gridLines) * i;
-      ctx.strokeStyle = gridColor;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(padding.left, y);
-      ctx.lineTo(padding.left + chartW, y);
-      ctx.stroke();
-      const val = maxVal - (maxVal / gridLines) * i;
-      ctx.fillStyle = textColor;
-      ctx.font = '11px system-ui';
-      ctx.textAlign = 'right';
-      ctx.fillText(formatTokenCount(Math.round(val)), padding.left - 8, y + 4);
-    }
-
-    const n = timeline.length;
-    if (n === 0) return;
-    const stepX = n > 1 ? chartW / (n - 1) : 0;
-    const getY = (val: number) => padding.top + chartH - (val / maxVal) * chartH;
-
-    drawDataLine(
-      ctx,
-      timeline,
-      stepX,
-      padding,
-      getY,
-      (d) => d.input,
-      '#2d8bcf',
-      'rgba(45,139,207,.12)',
-    );
-    drawDataLine(
-      ctx,
-      timeline,
-      stepX,
-      padding,
-      getY,
-      (d) => d.output,
-      '#c06b9e',
-      'rgba(192,107,158,.12)',
-    );
-
-    for (let i = 0; i < n; i++) {
-      const x = padding.left + i * stepX;
-      ctx.fillStyle = textColor;
-      ctx.font = '10px system-ui';
-      ctx.textAlign = 'center';
-      if (n <= 7 || i % 2 === 0 || i === n - 1) {
-        ctx.fillText(timeline[i].label, x, h - padding.bottom + 16);
-      }
-    }
-
-    const legendY = h - 6;
-    ctx.font = '11px system-ui';
-    ctx.fillStyle = '#2d8bcf';
-    ctx.fillRect(padding.left, legendY - 6, 10, 3);
-    ctx.fillStyle = textColor;
-    ctx.textAlign = 'left';
-    ctx.fillText(tr('usage.input'), padding.left + 14, legendY);
-    ctx.fillStyle = '#c06b9e';
-    ctx.fillRect(padding.left + 60, legendY - 6, 10, 3);
-    ctx.fillStyle = textColor;
-    ctx.fillText(tr('usage.output'), padding.left + 74, legendY);
-  }, [languageVersion, timeline]);
-
-  return <canvas ref={canvasRef} role="img" aria-label={tr('usage.dailyUsage')} />;
-}
-
-// ── Provider bar chart ────────────────────────────────────────────
-
-interface ProviderTotals {
-  input: number;
-  output: number;
-}
-
-function buildProviderTotals(data: UsageData, days: number): Record<string, ProviderTotals> {
-  const history = data.usage_history || [];
-  const today = new Date();
-  const totals: Record<string, ProviderTotals> = {};
-
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date(today);
-    d.setDate(d.getDate() - i);
-    const dateStr = localDateStr(d);
-
-    if (i === 0) {
-      const dp = data.daily_providers || {};
-      for (const [name, pair] of Object.entries(dp)) {
-        if (!totals[name]) totals[name] = { input: 0, output: 0 };
-        totals[name].input += (pair as [number, number])[0] || 0;
-        totals[name].output += (pair as [number, number])[1] || 0;
-      }
-    } else {
-      const snap = history.find((h) => h.date === dateStr);
-      if (snap?.providers) {
-        for (const [name, pair] of Object.entries(snap.providers)) {
-          if (!totals[name]) totals[name] = { input: 0, output: 0 };
-          totals[name].input += (pair as [number, number])[0] || 0;
-          totals[name].output += (pair as [number, number])[1] || 0;
-        }
-      }
+      addDimension(totals, history.get(date.date)?.[field]);
     }
   }
   return totals;
 }
 
-function truncateLabel(name: string, maxChars: number): string {
-  if (name.length <= maxChars) return name;
-  if (maxChars <= 1) return name.slice(0, maxChars);
-  return name.slice(0, maxChars - 1) + '…';
-}
+function rankDimension(values: Map<string, UsagePair>, target: UsagePair): UsageRankingEntry[] {
+  const entries: UsageRankingEntry[] = Array.from(values, ([name, pair]) => ({
+    name,
+    ...pair,
+  })).sort((left, right) => right.total - left.total || left.name.localeCompare(right.name));
+  if (entries.length === 0) return [];
 
-function ProviderChart({ data, days }: { data: UsageData; days: number }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const languageVersion = useLanguageVersion();
-
-  // Memoize the aggregated provider totals so the effect only re-runs when
-  // the underlying data actually changes. `data` identity is stable between
-  // fetches so depending on the whole object here is correct.
-  const providerTotals = useMemo(() => buildProviderTotals(data, days), [data, days]);
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const parent = canvas.parentElement;
-    if (!parent) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    const rect = parent.getBoundingClientRect();
-    if (rect.width <= 32 || rect.height <= 32) return;
-
-    const dpr = window.devicePixelRatio || 1;
-    const w = rect.width - 32;
-    const h = rect.height - 32;
-    canvas.width = w * dpr;
-    canvas.height = h * dpr;
-    canvas.style.width = w + 'px';
-    canvas.style.height = h + 'px';
-    ctx.scale(dpr, dpr);
-
-    const providers = Object.keys(providerTotals).sort();
-
-    const isDark = document.documentElement.dataset.theme === 'dark';
-    const textColor = isDark ? '#b0b5c0' : '#7e8699';
-
-    if (providers.length === 0) {
-      ctx.clearRect(0, 0, w, h);
-      ctx.fillStyle = textColor;
-      ctx.font = '13px system-ui';
-      ctx.textAlign = 'center';
-      ctx.fillText(tr('usage.noProviderData'), w / 2, h / 2);
-      return;
-    }
-
-    const gridColor = isDark ? 'rgba(255,255,255,.06)' : 'rgba(0,0,0,.06)';
-    const padding = { top: 24, right: 20, bottom: 48, left: 60 };
-    const chartW = w - padding.left - padding.right;
-    const chartH = h - padding.top - padding.bottom;
-
-    const groupCount = providers.length;
-    const groupGap = 24;
-    const barGap = 4;
-    const availW = chartW - groupGap * (groupCount + 1);
-    const barWidth = Math.min(32, Math.max(12, availW / (groupCount * 2)));
-    const groupWidth = barWidth * 2 + barGap;
-
-    let maxVal = 0;
-    for (const t of Object.values(providerTotals)) maxVal = Math.max(maxVal, t.input, t.output);
-    if (maxVal === 0) maxVal = 100;
-
-    const gridLines = 4;
-    for (let i = 0; i <= gridLines; i++) {
-      const y = padding.top + (chartH / gridLines) * i;
-      ctx.strokeStyle = gridColor;
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(padding.left, y);
-      ctx.lineTo(padding.left + chartW, y);
-      ctx.stroke();
-      const val = maxVal - (maxVal / gridLines) * i;
-      ctx.fillStyle = textColor;
-      ctx.font = '11px system-ui';
-      ctx.textAlign = 'right';
-      ctx.fillText(formatTokenCount(Math.round(val)), padding.left - 8, y + 4);
-    }
-
-    const totalWidth = groupWidth * groupCount + groupGap * (groupCount - 1);
-    const startX = padding.left + (chartW - totalWidth) / 2;
-
-    providers.forEach((name, gi) => {
-      const t = providerTotals[name];
-      const gx = startX + gi * (groupWidth + groupGap);
-      const color = PROVIDER_COLORS[gi % PROVIDER_COLORS.length];
-
-      // Input bar
-      const inputH = (t.input / maxVal) * chartH;
-      ctx.fillStyle = color;
-      ctx.globalAlpha = 0.9;
-      ctx.fillRect(gx, padding.top + chartH - inputH, barWidth, inputH);
-      ctx.globalAlpha = 1;
-
-      // Output bar
-      const outputH = (t.output / maxVal) * chartH;
-      ctx.fillStyle = color;
-      ctx.globalAlpha = 0.5;
-      ctx.fillRect(gx + barWidth + barGap, padding.top + chartH - outputH, barWidth, outputH);
-      ctx.globalAlpha = 1;
-
-      // Label
-      const labelX = gx + groupWidth / 2;
-      ctx.fillStyle = textColor;
-      ctx.font = '10px system-ui';
-      ctx.textAlign = 'center';
-      const maxLabelChars = Math.max(3, Math.floor(groupWidth / 6));
-      ctx.fillText(truncateLabel(name, maxLabelChars), labelX, h - padding.bottom + 16);
+  const attributed = entries.reduce((sum, entry) => addPair(sum, entry), usagePair(0, 0));
+  const missingInput = Math.max(0, target.input - attributed.input);
+  const missingOutput = Math.max(0, target.output - attributed.output);
+  if (missingInput + missingOutput > 0) {
+    entries.push({
+      name: UNATTRIBUTED,
+      ...usagePair(missingInput, missingOutput),
+      unattributed: true,
     });
+  }
 
-    // Legend
-    const legendY = h - 4;
-    ctx.font = '11px system-ui';
-    ctx.fillStyle = '#2d8bcf';
-    ctx.globalAlpha = 0.9;
-    ctx.fillRect(padding.left, legendY - 7, 10, 6);
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = textColor;
-    ctx.textAlign = 'left';
-    ctx.fillText(tr('usage.input'), padding.left + 14, legendY);
-    ctx.fillStyle = '#2d8bcf';
-    ctx.globalAlpha = 0.5;
-    ctx.fillRect(padding.left + 60, legendY - 7, 10, 6);
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = textColor;
-    ctx.fillText(tr('usage.output'), padding.left + 74, legendY);
-  }, [languageVersion, providerTotals]);
-
-  return <canvas ref={canvasRef} role="img" aria-label={tr('usage.byProvider')} />;
+  return entries;
 }
 
-// ── Main UsagePage component ──────────────────────────────────────────────────
+function cumulativeDimension(
+  values: Record<string, [number, number]> | undefined,
+  target: UsagePair,
+): UsageRankingEntry[] {
+  const totals = new Map<string, UsagePair>();
+  addDimension(totals, values);
+  return rankDimension(totals, target);
+}
 
-export function UsagePage() {
+function dimensionHasUsage(values: Record<string, [number, number]> | undefined): boolean {
+  return Object.values(values || {}).some((value) => normalizePair(value).total > 0);
+}
+
+export function hasAnyUsageData(data: UsageData): boolean {
+  if (
+    usagePair(data.daily_input, data.daily_output).total > 0 ||
+    usagePair(data.total_input, data.total_output, data.total).total > 0 ||
+    dimensionHasUsage(data.daily_providers) ||
+    dimensionHasUsage(data.total_providers) ||
+    dimensionHasUsage(data.daily_roles) ||
+    dimensionHasUsage(data.total_roles)
+  ) {
+    return true;
+  }
+  return (data.usage_history || []).some(
+    (entry) =>
+      usagePair(entry.input, entry.output).total > 0 ||
+      dimensionHasUsage(entry.providers) ||
+      dimensionHasUsage(entry.roles),
+  );
+}
+
+export function buildUsageDashboard(
+  data: UsageData,
+  days: number,
+  now: Date = new Date(),
+): UsageDashboardAggregate {
+  const timeline = buildUsageTimeline(data, days, now);
+  const today = usagePair(data.daily_input, data.daily_output);
+  const allTime = usagePair(data.total_input, data.total_output, data.total);
+  const range = timeline.reduce((sum, point) => addPair(sum, point), usagePair(0, 0));
+  const safeDays = Math.max(1, Math.floor(days));
+  const average = usagePair(range.input / safeDays, range.output / safeDays);
+  const activeDays = timeline.filter((point) => point.total > 0).length;
+  const peak = timeline.reduce<UsageTimelinePoint | null>(
+    (current, point) => (!current || point.total > current.total ? point : current),
+    null,
+  );
+  const providerRange = rangeDimension(data, safeDays, now, 'providers');
+  const roleRange = rangeDimension(data, safeDays, now, 'roles');
+
+  const providers = {
+    range: rankDimension(providerRange, range),
+    total: cumulativeDimension(data.total_providers, allTime),
+  };
+  const roles = {
+    range: rankDimension(roleRange, range),
+    total: cumulativeDimension(data.total_roles, allTime),
+  };
+  const hasUsage = hasAnyUsageData(data);
+
+  return {
+    timeline,
+    today,
+    allTime,
+    range,
+    average,
+    activeDays,
+    peak: peak?.total ? peak : null,
+    providers,
+    roles,
+    hasUsage,
+  };
+}
+
+export function formatTokenCount(value: number | undefined): string {
+  const number = safeNumber(value);
+  if (number >= 1_000_000) return `${(number / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+  if (number >= 1_000) return `${(number / 1_000).toFixed(1).replace(/\.0$/, '')}K`;
+  return String(Math.round(number));
+}
+
+function formatPercent(value: number, total: number): string {
+  if (total <= 0) return '0%';
+  const percent = (value / total) * 100;
+  return `${percent >= 10 ? percent.toFixed(0) : percent.toFixed(1)}%`;
+}
+
+function MetricCard({ label, value, detail }: { label: string; value: string; detail: string }) {
+  return (
+    <article className="usage-console-metric usage-stat-card">
+      <span>{label}</span>
+      <strong>{value}</strong>
+      <small>{detail}</small>
+    </article>
+  );
+}
+
+function RangePicker({
+  value,
+  onChange,
+}: {
+  value: UsageRange;
+  onChange: (range: UsageRange) => void;
+}) {
+  return (
+    <div className="usage-console-range" aria-label={tr('usage.dailyRange')} role="group">
+      {USAGE_RANGE_OPTIONS.map((range) => (
+        <button
+          key={range}
+          type="button"
+          className={value === range ? 'is-active' : ''}
+          aria-pressed={value === range}
+          onClick={() => onChange(range)}
+        >
+          {tr('usage.days', { count: range })}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function TrendChart({ aggregate }: { aggregate: UsageDashboardAggregate }) {
+  const chartId = useId();
+  const chartTitleId = `${chartId}-title`;
+  const width = 720;
+  const height = 250;
+  const padding = { top: 18, right: 16, bottom: 40, left: 50 };
+  const chartWidth = width - padding.left - padding.right;
+  const chartHeight = height - padding.top - padding.bottom;
+  const max = Math.max(1, ...aggregate.timeline.map((point) => point.total));
+  const slotWidth = chartWidth / aggregate.timeline.length;
+  const barWidth = Math.max(4, Math.min(22, slotWidth * 0.58));
+  const labelEvery = aggregate.timeline.length <= 7 ? 1 : aggregate.timeline.length <= 14 ? 2 : 5;
+  const pointDescriptions = aggregate.timeline.map((point, index) => ({
+    id: `${chartId}-point-${index}`,
+    text: `${point.date}: ${tr('usage.input')} ${formatTokenCount(point.input)}, ${tr(
+      'usage.output',
+    )} ${formatTokenCount(point.output)}, ${usageCopy('total')} ${formatTokenCount(point.total)}`,
+  }));
+
+  return (
+    <>
+      <svg
+        className="usage-console-trend"
+        viewBox={`0 0 ${width} ${height}`}
+        role="group"
+        aria-labelledby={chartTitleId}
+      >
+        <title id={chartTitleId}>{tr('usage.dailyUsage')}</title>
+        {[0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+          const y = padding.top + chartHeight * ratio;
+          return (
+            <g key={ratio} aria-hidden="true">
+              <line x1={padding.left} x2={width - padding.right} y1={y} y2={y} />
+              <text x={padding.left - 8} y={y + 4} textAnchor="end">
+                {formatTokenCount(max * (1 - ratio))}
+              </text>
+            </g>
+          );
+        })}
+        {aggregate.timeline.map((point, index) => {
+          const x = padding.left + slotWidth * index + (slotWidth - barWidth) / 2;
+          const inputHeight = (point.input / max) * chartHeight;
+          const outputHeight = (point.output / max) * chartHeight;
+          const bottom = padding.top + chartHeight;
+          const tooltipWidth = 138;
+          const tooltipX = Math.max(
+            padding.left,
+            Math.min(width - padding.right - tooltipWidth, x + barWidth / 2 - tooltipWidth / 2),
+          );
+          const tooltipY = Math.max(padding.top, bottom - inputHeight - outputHeight - 34);
+          const description = pointDescriptions[index];
+          return (
+            <g
+              key={point.date}
+              className="usage-console-trend-point"
+              tabIndex={0}
+              role="img"
+              aria-label={point.date}
+              aria-describedby={description.id}
+            >
+              <rect
+                className="usage-console-bar-input"
+                x={x}
+                y={bottom - inputHeight}
+                width={barWidth}
+                height={inputHeight}
+                rx="2"
+              />
+              <rect
+                className="usage-console-bar-output"
+                x={x}
+                y={bottom - inputHeight - outputHeight}
+                width={barWidth}
+                height={outputHeight}
+                rx="2"
+              />
+              {(index % labelEvery === 0 || index === aggregate.timeline.length - 1) && (
+                <text aria-hidden="true" x={x + barWidth / 2} y={height - 15} textAnchor="middle">
+                  {point.label}
+                </text>
+              )}
+              <g className="usage-console-trend-tooltip" aria-hidden="true">
+                <rect x={tooltipX} y={tooltipY} width={tooltipWidth} height="26" rx="6" />
+                <text x={tooltipX + tooltipWidth / 2} y={tooltipY + 17} textAnchor="middle">
+                  {point.label} · {formatTokenCount(point.total)}
+                </text>
+              </g>
+            </g>
+          );
+        })}
+      </svg>
+      <div className="usage-console-chart-descriptions">
+        {pointDescriptions.map((description) => (
+          <span key={description.id} id={description.id}>
+            {description.text}
+          </span>
+        ))}
+      </div>
+      <div className="usage-console-legend" aria-hidden="true">
+        <span>
+          <i className="is-input" />
+          {tr('usage.input')}
+        </span>
+        <span>
+          <i className="is-output" />
+          {tr('usage.output')}
+        </span>
+      </div>
+      <details className="usage-console-data-table">
+        <summary>{usageCopy('dataTable')}</summary>
+        <div>
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">{usageCopy('date')}</th>
+                <th scope="col">{tr('usage.input')}</th>
+                <th scope="col">{tr('usage.output')}</th>
+                <th scope="col">{usageCopy('total')}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {aggregate.timeline.map((point) => (
+                <tr key={point.date}>
+                  <th scope="row">
+                    <time dateTime={point.date}>{point.date}</time>
+                  </th>
+                  <td>{point.input}</td>
+                  <td>{point.output}</td>
+                  <td>{point.total}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </>
+  );
+}
+
+function CompositionChart({ pair }: { pair: UsagePair }) {
+  const radius = 42;
+  const circumference = 2 * Math.PI * radius;
+  const inputRatio = pair.total > 0 ? pair.input / pair.total : 0;
+  const inputDash = circumference * inputRatio;
+  const outputDash = Math.max(0, circumference - inputDash);
+
+  return (
+    <div className="usage-console-composition">
+      <svg viewBox="0 0 120 120" role="img" aria-label={usageCopy('composition')}>
+        <circle className="usage-console-donut-track" cx="60" cy="60" r={radius} />
+        <circle
+          className="usage-console-donut-input"
+          cx="60"
+          cy="60"
+          r={radius}
+          strokeDasharray={`${inputDash} ${circumference - inputDash}`}
+        />
+        <circle
+          className="usage-console-donut-output"
+          cx="60"
+          cy="60"
+          r={radius}
+          strokeDasharray={`${outputDash} ${circumference - outputDash}`}
+          strokeDashoffset={-inputDash}
+        />
+        <text x="60" y="57" textAnchor="middle">
+          {formatTokenCount(pair.total)}
+        </text>
+        <text className="usage-console-donut-caption" x="60" y="73" textAnchor="middle">
+          {usageCopy('total')}
+        </text>
+      </svg>
+      <dl>
+        <div>
+          <dt>
+            <i className="is-input" />
+            {tr('usage.input')}
+          </dt>
+          <dd>
+            <strong>{formatTokenCount(pair.input)}</strong>
+            <span>{formatPercent(pair.input, pair.total)}</span>
+          </dd>
+        </div>
+        <div>
+          <dt>
+            <i className="is-output" />
+            {tr('usage.output')}
+          </dt>
+          <dd>
+            <strong>{formatTokenCount(pair.output)}</strong>
+            <span>{formatPercent(pair.output, pair.total)}</span>
+          </dd>
+        </div>
+      </dl>
+    </div>
+  );
+}
+
+function ScopePicker({
+  value,
+  onChange,
+  label,
+}: {
+  value: UsageBreakdownScope;
+  onChange: (scope: UsageBreakdownScope) => void;
+  label: string;
+}) {
+  return (
+    <div className="usage-console-scope" role="group" aria-label={label}>
+      {(['range', 'total'] as const).map((scope) => (
+        <button
+          key={scope}
+          type="button"
+          aria-pressed={value === scope}
+          className={value === scope ? 'is-active' : ''}
+          onClick={() => onChange(scope)}
+        >
+          {scope === 'range' ? usageCopy('selectedRange') : usageCopy('cumulative')}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function Ranking({ entries, emptyText }: { entries: UsageRankingEntry[]; emptyText: string }) {
+  if (entries.length === 0) return <div className="usage-console-inline-empty">{emptyText}</div>;
+  const max = Math.max(1, ...entries.map((entry) => entry.total));
+  const total = entries.reduce((sum, entry) => sum + entry.total, 0);
+  return (
+    <ol className="usage-console-ranking">
+      {entries.map((entry) => (
+        <li key={entry.name} className={entry.unattributed ? 'is-unattributed' : ''}>
+          <div className="usage-console-rank-label">
+            <span title={entry.unattributed ? usageCopy('unattributed') : entry.name}>
+              {entry.unattributed ? usageCopy('unattributed') : entry.name}
+            </span>
+            <strong>{formatTokenCount(entry.total)}</strong>
+          </div>
+          <div className="usage-console-rank-track" aria-hidden="true">
+            <i style={{ width: `${(entry.total / max) * 100}%` }} />
+          </div>
+          <small>
+            {tr('usage.inOut', {
+              input: formatTokenCount(entry.input),
+              output: formatTokenCount(entry.output),
+            })}
+            {' · '}
+            {formatPercent(entry.total, total)} {usageCopy('share')}
+          </small>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function LoadingSkeleton() {
+  return (
+    <div className="usage-console-skeleton" role="status" aria-label={tr('usage.loading')}>
+      <div className="usage-console-skeleton-metrics">
+        {Array.from({ length: 4 }, (_, index) => (
+          <i key={index} />
+        ))}
+      </div>
+      <i className="usage-console-skeleton-chart" />
+    </div>
+  );
+}
+
+export function UsageView({
+  sessionId = '',
+  active = true,
+  className = '',
+  onRequestClose,
+  onStateChange,
+}: UsageViewProps) {
   useLanguageVersion();
-  const [visible, setVisible] = useState(false);
-  const [usageData, setUsageData] = useState<UsageData | null>(null);
+  const [data, setData] = useState<UsageData | null>(null);
+  const [dataSessionId, setDataSessionId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
-  const [usageSessionId, setUsageSessionId] = useState('');
-  const [dailyRange, setDailyRange] = useState(7);
-  const [providerRange, setProviderRange] = useState(7);
-  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const [range, setRange] = useState<UsageRange>(7);
+  const [providerScope, setProviderScope] = useState<UsageBreakdownScope>('range');
+  const [roleScope, setRoleScope] = useState<UsageBreakdownScope>('range');
   const requestGenerationRef = useRef(0);
+  const activeRequestRef = useRef<AbortController | null>(null);
+  const dataRef = useRef<UsageData | null>(null);
+  const dataSessionIdRef = useRef<string | null>(null);
+  const requestedSession = sessionId || 'main';
 
-  useEffect(() => {
-    _open = () => {
-      setUsageSessionId(_usageSessionId);
-      setVisible(true);
-    };
-    _close = () => setVisible(false);
-    if (pendingOpen) {
-      pendingOpen = false;
-      setUsageSessionId(_usageSessionId);
-      setVisible(true);
-    }
-    return () => {
-      _open = null;
-      _close = null;
-    };
-  }, []);
-
-  // Toggle the container element's hidden attribute
-  useEffect(() => {
-    const el = document.getElementById('usage-page');
-    if (el) el.hidden = !visible;
-  }, [visible]);
-
-  useEffect(() => {
-    if (!visible) return;
-    previousFocusRef.current =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    document.body.classList.add('page-dialog-open');
-    const focusTimer = window.setTimeout(() => {
-      document.querySelector<HTMLButtonElement>('.usage-panel .page-close')?.focus();
-    }, 0);
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (
-        event.key === 'Tab' &&
-        trapDialogFocus(event, document.querySelector<HTMLElement>('.usage-panel'))
-      ) {
-        event.stopPropagation();
-        return;
-      }
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      event.stopPropagation();
-      setVisible(false);
-    };
-    window.addEventListener('keydown', onKeyDown, true);
-    return () => {
-      window.clearTimeout(focusTimer);
-      window.removeEventListener('keydown', onKeyDown, true);
-      document.body.classList.remove('page-dialog-open');
-      const previous = previousFocusRef.current;
-      previousFocusRef.current = null;
-      if (previous?.isConnected) previous.focus();
-    };
-  }, [visible]);
-
-  // Shared loader: used by both the visibility effect and the manual refresh
-  // button. Accepts an optional AbortSignal so the visibility effect can cancel
-  // in-flight requests when the overlay closes mid-load.
   const loadUsage = useCallback(
-    async (signal?: AbortSignal) => {
-      const requestGeneration = ++requestGenerationRef.current;
-      setLoading(true);
+    async (preserveData: boolean) => {
+      activeRequestRef.current?.abort();
+      const controller = new AbortController();
+      activeRequestRef.current = controller;
+      const generation = ++requestGenerationRef.current;
+      if (preserveData && dataSessionIdRef.current === requestedSession && dataRef.current) {
+        setLoading(false);
+        setRefreshing(true);
+      } else {
+        setRefreshing(false);
+        setLoading(true);
+        dataRef.current = null;
+        dataSessionIdRef.current = null;
+        setData(null);
+        setDataSessionId(null);
+      }
       setError('');
-      setUsageData(null);
+
       try {
-        const usageUrl = usageSessionId
-          ? `/api/usage?session=${encodeURIComponent(usageSessionId)}`
+        const url = sessionId
+          ? `/api/usage?session=${encodeURIComponent(sessionId)}`
           : '/api/usage';
-        const resp = await fetch(usageUrl, signal ? { signal } : undefined);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const data: UsageData = await resp.json();
-        if (signal?.aborted || requestGeneration !== requestGenerationRef.current) return;
-        setUsageData(data);
-      } catch (e: unknown) {
+        const response = await fetch(url, { signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const payload = (await response.json()) as UsageData;
+        if (controller.signal.aborted || generation !== requestGenerationRef.current) return;
+        dataRef.current = payload;
+        dataSessionIdRef.current = requestedSession;
+        setData(payload);
+        setDataSessionId(requestedSession);
+      } catch (caught: unknown) {
+        const exception = caught as Error;
         if (
-          (e as Error).name === 'AbortError' ||
-          signal?.aborted ||
-          requestGeneration !== requestGenerationRef.current
+          exception.name === 'AbortError' ||
+          controller.signal.aborted ||
+          generation !== requestGenerationRef.current
         ) {
           return;
         }
-        setError((e as Error).message);
+        setError(exception.message);
       } finally {
-        if ((!signal || !signal.aborted) && requestGeneration === requestGenerationRef.current) {
+        if (!controller.signal.aborted && generation === requestGenerationRef.current) {
           setLoading(false);
+          setRefreshing(false);
+          activeRequestRef.current = null;
         }
       }
     },
-    [usageSessionId],
+    [requestedSession, sessionId],
   );
 
   useEffect(() => {
-    if (!visible) return;
-    const controller = new AbortController();
-    void loadUsage(controller.signal);
+    if (!active) {
+      activeRequestRef.current?.abort();
+      activeRequestRef.current = null;
+      requestGenerationRef.current += 1;
+      setLoading(false);
+      setRefreshing(false);
+      return;
+    }
+    if (dataSessionIdRef.current === requestedSession && dataRef.current) return;
+    void loadUsage(false);
     return () => {
-      controller.abort();
+      activeRequestRef.current?.abort();
+      activeRequestRef.current = null;
       requestGenerationRef.current += 1;
     };
-  }, [visible, loadUsage]);
+  }, [active, loadUsage, requestedSession]);
 
-  const refreshUsage = useCallback(() => {
-    void loadUsage();
-  }, [loadUsage]);
-
-  const hasUsage = useMemo(() => (usageData ? hasAnyUsageData(usageData) : false), [usageData]);
-  const hasDailyData = useMemo(
-    () =>
-      usageData
-        ? buildDailyTimeline(usageData, dailyRange).some((point) => point.input + point.output > 0)
-        : false,
-    [dailyRange, usageData],
-  );
-  const hasProviderData = useMemo(
-    () =>
-      usageData
-        ? Object.values(buildProviderTotals(usageData, providerRange)).some(
-            (totals) => totals.input + totals.output > 0,
-          )
-        : false,
-    [providerRange, usageData],
+  useEffect(
+    () => () => {
+      activeRequestRef.current?.abort();
+      requestGenerationRef.current += 1;
+    },
+    [],
   );
 
-  if (!visible) return null;
+  const currentData = dataSessionId === requestedSession ? data : null;
+  const visibleLoading = loading;
+  const aggregate = useMemo(
+    () => (currentData ? buildUsageDashboard(currentData, range) : null),
+    [currentData, range],
+  );
+  const viewState = useMemo<UsageViewState>(
+    () => ({ loading: visibleLoading, refreshing, error, hasData: Boolean(currentData) }),
+    [currentData, error, refreshing, visibleLoading],
+  );
+  useEffect(() => onStateChange?.(viewState), [onStateChange, viewState]);
 
-  // Note: RANGE_OPTIONS lives at module scope to keep a stable reference
-  // across renders.
+  const sourceNote = currentData
+    ? currentData.source_scope === 'latest_update'
+      ? tr('usage.latestSource', {
+          input: currentData.input_source || 'estimated',
+          output: currentData.output_source || 'estimated',
+        })
+      : tr('usage.source', {
+          input: currentData.input_source || 'estimated',
+          output: currentData.output_source || 'estimated',
+        })
+    : '';
 
-  // Render inside #usage-page overlay (panel content only)
   return (
-    <div
-      className="page-panel page-panel-wide usage-panel"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="usage-dialog-title"
-      tabIndex={-1}
+    <section
+      className={`usage-console-view ${className}`.trim()}
+      aria-labelledby="usage-view-title"
+      aria-busy={visibleLoading || refreshing}
     >
-      <div className="page-header">
-        <h2 id="usage-dialog-title">{tr('usage.title')}</h2>
-        <div className="page-header-actions">
-          <button className="btn-secondary" onClick={refreshUsage} disabled={loading}>
-            <svg className={`icon${loading ? ' is-spinning' : ''}`} aria-hidden="true">
+      <header className="usage-console-toolbar">
+        <div>
+          <h2 id="usage-view-title" tabIndex={-1}>
+            {tr('usage.title')}
+          </h2>
+          <p>
+            <span>{usageCopy('session')}</span>
+            <code>{requestedSession}</code>
+          </p>
+        </div>
+        <div className="usage-console-toolbar-actions">
+          <RangePicker value={range} onChange={setRange} />
+          <button
+            type="button"
+            className="usage-console-refresh"
+            onClick={() => void loadUsage(true)}
+            disabled={visibleLoading || refreshing}
+          >
+            <svg
+              className={`icon${visibleLoading || refreshing ? ' is-spinning' : ''}`}
+              aria-hidden="true"
+            >
               <use href="#icon-refresh" />
             </svg>
-            <span>{loading ? tr('usage.loading') : tr('usage.refresh')}</span>
+            <span>{refreshing ? usageCopy('refreshing') : tr('usage.refresh')}</span>
           </button>
-          <button
-            className="page-close"
-            title={tr('common.close')}
-            aria-label={tr('common.close')}
-            onClick={() => setVisible(false)}
-          >
-            <svg className="icon" aria-hidden="true">
-              <use href="#icon-close" />
-            </svg>
+          {onRequestClose && (
+            <button
+              type="button"
+              className="usage-console-close"
+              aria-label={tr('common.close')}
+              title={tr('common.close')}
+              onClick={onRequestClose}
+            >
+              <svg className="icon" aria-hidden="true">
+                <use href="#icon-close" />
+              </svg>
+            </button>
+          )}
+        </div>
+      </header>
+
+      <div className="usage-console-live" role="status" aria-live="polite">
+        {refreshing ? usageCopy('refreshing') : ''}
+      </div>
+
+      {error && currentData && (
+        <div className="usage-console-alert" role="alert">
+          <span>{tr('usage.loadFailed', { error })}</span>
+          <button type="button" onClick={() => void loadUsage(true)} disabled={refreshing}>
+            {tr('usage.retry')}
           </button>
         </div>
-      </div>
+      )}
 
-      <div className="page-body usage-page-body" id="usage-body">
-        {error && (
-          <div className="usage-error-state" role="alert">
-            <span className="usage-state-icon">
-              <svg className="icon" aria-hidden="true">
-                <use href="#icon-activity" />
-              </svg>
-            </span>
-            <strong>{tr('usage.loadErrorTitle')}</strong>
-            <p>{tr('usage.loadFailed', { error })}</p>
-            <button className="btn-secondary" onClick={refreshUsage} disabled={loading}>
-              <svg className={`icon${loading ? ' is-spinning' : ''}`} aria-hidden="true">
-                <use href="#icon-refresh" />
-              </svg>
-              <span>{tr('usage.retry')}</span>
-            </button>
+      {!currentData && visibleLoading && <LoadingSkeleton />}
+
+      {!currentData && !visibleLoading && error && (
+        <div className="usage-console-state" role="alert">
+          <svg className="icon" aria-hidden="true">
+            <use href="#icon-activity" />
+          </svg>
+          <strong>{tr('usage.loadErrorTitle')}</strong>
+          <p>{tr('usage.loadFailed', { error })}</p>
+          <button type="button" onClick={() => void loadUsage(false)} disabled={visibleLoading}>
+            {tr('usage.retry')}
+          </button>
+        </div>
+      )}
+
+      {currentData && aggregate && !aggregate.hasUsage && (
+        <div className="usage-console-state" role="status">
+          <svg className="icon" aria-hidden="true">
+            <use href="#icon-chart" />
+          </svg>
+          <strong>{tr('usage.emptyTitle')}</strong>
+          <p>{tr('usage.emptyBody')}</p>
+        </div>
+      )}
+
+      {currentData && aggregate?.hasUsage && (
+        <div className="usage-console-content">
+          <div className="usage-console-metrics">
+            <MetricCard
+              label={tr('usage.todayTotal')}
+              value={formatTokenCount(aggregate.today.total)}
+              detail={tr('usage.inOut', {
+                input: formatTokenCount(aggregate.today.input),
+                output: formatTokenCount(aggregate.today.output),
+              })}
+            />
+            <MetricCard
+              label={tr('usage.allTimeTotal')}
+              value={formatTokenCount(aggregate.allTime.total)}
+              detail={tr('usage.inOut', {
+                input: formatTokenCount(aggregate.allTime.input),
+                output: formatTokenCount(aggregate.allTime.output),
+              })}
+            />
+            <MetricCard
+              label={usageCopy('rangeAverage')}
+              value={formatTokenCount(aggregate.average.total)}
+              detail={tr('usage.days', { count: range })}
+            />
+            <MetricCard
+              label={usageCopy('activeDays')}
+              value={String(aggregate.activeDays)}
+              detail={`${aggregate.activeDays} / ${range}`}
+            />
           </div>
-        )}
-        {!usageData && !error && loading && (
-          <div className="usage-loading-state" role="status">
-            <span className="usage-state-icon">
-              <svg className="icon is-spinning" aria-hidden="true">
-                <use href="#icon-refresh" />
-              </svg>
-            </span>
-            <strong>{tr('usage.loading')}</strong>
+
+          <section className="usage-console-panel usage-console-trend-panel">
+            <header>
+              <div>
+                <span>{usageCopy('rangeSummary')}</span>
+                <h3>{tr('usage.dailyUsage')}</h3>
+              </div>
+              <dl>
+                <div>
+                  <dt>{usageCopy('rangeTotal')}</dt>
+                  <dd>{formatTokenCount(aggregate.range.total)}</dd>
+                </div>
+                <div>
+                  <dt>{usageCopy('peakDay')}</dt>
+                  <dd>
+                    {aggregate.peak
+                      ? `${aggregate.peak.label} · ${formatTokenCount(aggregate.peak.total)}`
+                      : '—'}
+                  </dd>
+                </div>
+              </dl>
+            </header>
+            {aggregate.range.total > 0 ? (
+              <TrendChart aggregate={aggregate} />
+            ) : (
+              <div className="usage-console-inline-empty">{tr('usage.noDailyData')}</div>
+            )}
+          </section>
+
+          <div className="usage-console-grid">
+            <section className="usage-console-panel">
+              <header>
+                <h3>{usageCopy('composition')}</h3>
+              </header>
+              <CompositionChart pair={aggregate.range} />
+            </section>
+
+            <section className="usage-console-panel">
+              <header>
+                <h3>{tr('usage.byProvider')}</h3>
+                <ScopePicker
+                  value={providerScope}
+                  onChange={setProviderScope}
+                  label={tr('usage.providerRange')}
+                />
+              </header>
+              <Ranking
+                entries={aggregate.providers[providerScope]}
+                emptyText={usageCopy('noProviderRangeData')}
+              />
+            </section>
+
+            <section className="usage-console-panel">
+              <header>
+                <h3>{usageCopy('byRole')}</h3>
+                <ScopePicker
+                  value={roleScope}
+                  onChange={setRoleScope}
+                  label={tr('usage.roleBreakdown')}
+                />
+              </header>
+              <Ranking
+                entries={sortRoles(aggregate.roles[roleScope])}
+                emptyText={usageCopy('noRoleRangeData')}
+              />
+            </section>
           </div>
-        )}
-        {usageData && !hasUsage && (
-          <div className="usage-empty-state" role="status">
-            <span className="usage-state-icon">
-              <svg className="icon" aria-hidden="true">
-                <use href="#icon-chart" />
-              </svg>
-            </span>
-            <strong>{tr('usage.emptyTitle')}</strong>
-            <p>{tr('usage.emptyBody')}</p>
-          </div>
-        )}
-        {usageData && hasUsage && (
-          <>
-            <UsageSummary data={usageData} />
 
-            <div className="usage-role-section">
-              <div className="usage-chart-header">
-                <h3>{tr('usage.roleBreakdown')}</h3>
-              </div>
-              <RoleBreakdown data={usageData} />
-            </div>
+          <p className="usage-console-source-note">{sourceNote}</p>
+        </div>
+      )}
+    </section>
+  );
+}
 
-            <div className="usage-charts-section">
-              <div className="usage-chart-wrap">
-                <div className="usage-chart-header">
-                  <h3>{tr('usage.dailyUsage')}</h3>
-                  <select
-                    aria-label={tr('usage.dailyRange')}
-                    value={dailyRange}
-                    onChange={(e) => setDailyRange(Number(e.target.value))}
-                  >
-                    {RANGE_OPTIONS.map((value) => (
-                      <option key={value} value={value}>
-                        {tr('usage.days', { count: value })}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="usage-chart-container">
-                  {hasDailyData ? (
-                    <DailyChart data={usageData} days={dailyRange} />
-                  ) : (
-                    <div className="usage-inline-empty">{tr('usage.noDailyData')}</div>
-                  )}
-                </div>
-              </div>
+export function sortRoles(entries: UsageRankingEntry[]): UsageRankingEntry[] {
+  const order = new Map(ROLE_ORDER.map((name, index) => [name.toLowerCase(), index]));
+  return [...entries].sort((left, right) => {
+    const totalDifference = right.total - left.total;
+    if (totalDifference !== 0) return totalDifference;
+    const leftOrder = order.get(left.name.toLowerCase()) ?? ROLE_ORDER.length;
+    const rightOrder = order.get(right.name.toLowerCase()) ?? ROLE_ORDER.length;
+    if (leftOrder !== rightOrder) return leftOrder - rightOrder;
+    if (left.unattributed !== right.unattributed) return left.unattributed ? 1 : -1;
+    return left.name.localeCompare(right.name);
+  });
+}
 
-              <div className="usage-chart-wrap">
-                <div className="usage-chart-header">
-                  <h3>{tr('usage.byProvider')}</h3>
-                  <select
-                    aria-label={tr('usage.providerRange')}
-                    value={providerRange}
-                    onChange={(e) => setProviderRange(Number(e.target.value))}
-                  >
-                    {RANGE_OPTIONS.map((value) => (
-                      <option key={value} value={value}>
-                        {tr('usage.days', { count: value })}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div className="usage-chart-container">
-                  {hasProviderData ? (
-                    <ProviderChart data={usageData} days={providerRange} />
-                  ) : (
-                    <div className="usage-inline-empty">{tr('usage.noProviderData')}</div>
-                  )}
-                </div>
-              </div>
-            </div>
-          </>
-        )}
-      </div>
-    </div>
+/** Compatibility island used until every caller mounts UsageView through Console. */
+export function UsagePage() {
+  const [visible, setVisible] = useState(false);
+  const [sessionId, setSessionId] = useState('');
+
+  useEffect(() => {
+    openBridge = () => {
+      setSessionId(bridgeSessionId);
+      setVisible(true);
+    };
+    closeBridge = () => setVisible(false);
+    if (pendingOpen) {
+      pendingOpen = false;
+      setSessionId(bridgeSessionId);
+      setVisible(true);
+    }
+    return () => {
+      openBridge = null;
+      closeBridge = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    const root = document.getElementById('usage-page');
+    if (root) root.hidden = !visible;
+  }, [visible]);
+
+  if (!visible) return null;
+  return (
+    <UsageView
+      sessionId={sessionId}
+      active={visible}
+      className="usage-console-compat"
+      onRequestClose={() => setVisible(false)}
+    />
   );
 }

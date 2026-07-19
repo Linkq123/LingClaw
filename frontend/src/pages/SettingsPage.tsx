@@ -20,25 +20,22 @@ import {
   refreshComposerAvailability,
 } from '../composerAvailability.js';
 import {
-  validateProviderName,
   validateMcpCwdValue,
-  validateModelsConfigDraftShape,
   validateMcpConfigDraftShape,
   buildModelOptions,
   isBuiltinProviderName,
 } from '../settingsValidation.js';
-import {
-  buildProviderForms,
-  createModelFormEntry,
-  createProviderForm,
-  normalizeModelsConfig,
-  serializeProviderForms,
-} from './settingsModels.js';
-import type { ModelFormEntry, ProviderFormData } from './settingsModels.js';
+import { normalizeModelsConfig } from './settingsModels.js';
 import { subscribeLanguageChange, tr } from '../i18n.js';
-import { trapDialogFocus } from './dialogFocus.js';
 import { iconHref } from '../icons.js';
 import type { IconName } from '../icons.js';
+import {
+  createConsoleTransitionController,
+  type ConsoleTransitionController,
+} from './consoleTransition.js';
+import { UsageView } from './UsagePage.js';
+import { ModelsConsole } from './ModelsConsole.js';
+import { resumeChatScrollTracking, suspendChatScrollTracking } from '../scroll.js';
 
 // ── Module-level bridge (imperative open/close from main.ts) ──────────────────
 
@@ -48,22 +45,61 @@ let _close: (() => void) | null = null;
 // the first time `openSettingsPage` is called. Remember the intent so the
 // component can honour it as soon as its mount effect runs.
 let pendingOpen = false;
-let pendingSessionId = 'main';
-let pendingSection: SettingsSection = 'tab-general';
+export type ConsoleRoute =
+  | { page: 'settings'; sessionId: string; section: SettingsSection }
+  | { page: 'usage'; sessionId: string };
+let pendingRoute: ConsoleRoute = {
+  page: 'settings',
+  sessionId: 'main',
+  section: 'tab-general',
+};
+
+function routeSection(route: ConsoleRoute): ConsoleSection {
+  return route.page === 'usage' ? 'tab-usage' : route.section;
+}
 
 export function openSettingsPage(sessionId?: string, initialSection?: SettingsSection): void {
-  pendingSessionId = sessionId?.trim() || 'main';
-  pendingSection = initialSection || 'tab-general';
+  pendingRoute = {
+    page: 'settings',
+    sessionId: sessionId?.trim() || 'main',
+    section: initialSection || 'tab-general',
+  };
   if (_open) _open();
   else pendingOpen = true;
 }
+
+export function openUsageConsolePage(sessionId?: string): void {
+  pendingRoute = { page: 'usage', sessionId: sessionId?.trim() || 'main' };
+  if (_open) _open();
+  else pendingOpen = true;
+}
+
 export function closeSettingsPage(): void {
   pendingOpen = false;
   _close?.();
 }
+
+export const closeConsolePage = closeSettingsPage;
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 type TriBool = boolean | undefined;
+
+function hasActiveConsoleEscapeLayer(documentRef: Document): boolean {
+  return Array.from(
+    documentRef.querySelectorAll<HTMLElement>(
+      '[aria-modal="true"], [data-console-escape-layer="true"]',
+    ),
+  ).some((modal) => {
+    let current: HTMLElement | null = modal;
+    while (current) {
+      if (current.hidden || current.inert || current.getAttribute('aria-hidden') === 'true') {
+        return false;
+      }
+      current = current.parentElement;
+    }
+    return true;
+  });
+}
 
 async function fetchLatestConfigResponse(init: RequestInit = {}): Promise<ConfigApiResponse> {
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -112,37 +148,6 @@ function numInputToValue(s: string): number | undefined {
   return isNaN(n) ? undefined : n;
 }
 
-function asPlainRecord(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
-  return value as Record<string, unknown>;
-}
-
-function modelThinkingFormat(model: ModelFormEntry): string {
-  const compat = asPlainRecord(model.compat);
-  return typeof compat?.thinkingFormat === 'string' ? compat.thinkingFormat : '';
-}
-
-function updateModelThinkingFormat(model: ModelFormEntry, value: string): ModelFormEntry {
-  const trimmed = value.trim();
-  const compat = { ...(asPlainRecord(model.compat) || {}) };
-  if (trimmed) compat.thinkingFormat = trimmed;
-  else delete compat.thinkingFormat;
-  return {
-    ...model,
-    compat: Object.keys(compat).length > 0 ? compat : undefined,
-  };
-}
-
-const THINKING_FORMAT_OPTIONS: readonly string[] = [
-  'openai',
-  'qwen',
-  'doubao',
-  'deepseek-v4',
-  'ollama',
-  'gpt-oss',
-  'ollama-gpt-oss',
-];
-
 export type SettingsSection =
   | 'tab-general'
   | 'tab-skills'
@@ -150,9 +155,10 @@ export type SettingsSection =
   | 'tab-models'
   | 'tab-mcp'
   | 'tab-s3';
-type TabId = SettingsSection;
+export type ConsoleSection = SettingsSection | 'tab-usage';
+type TabId = ConsoleSection;
 type StatusType = 'idle' | 'loading' | 'success' | 'error';
-type TabSaveMode = 'config' | 'skills';
+type TabSaveMode = 'config' | 'skills' | 'none';
 
 interface TabMeta {
   id: TabId;
@@ -168,6 +174,7 @@ const SETTINGS_TAB_ICONS: Record<TabId, IconName> = {
   'tab-models': 'reasoning',
   'tab-mcp': 'workflow',
   'tab-s3': 'database',
+  'tab-usage': 'chart',
 };
 
 const SETTINGS_TAB_DEFS: ReadonlyArray<{
@@ -183,10 +190,10 @@ const SETTINGS_TAB_DEFS: ReadonlyArray<{
     saveMode: 'config',
   },
   {
-    id: 'tab-skills',
-    labelKey: 'settings.tab.skills',
-    descriptionKey: 'settings.tab.skillsDesc',
-    saveMode: 'skills',
+    id: 'tab-models',
+    labelKey: 'settings.tab.models',
+    descriptionKey: 'settings.tab.modelsDesc',
+    saveMode: 'config',
   },
   {
     id: 'tab-agents',
@@ -195,10 +202,10 @@ const SETTINGS_TAB_DEFS: ReadonlyArray<{
     saveMode: 'config',
   },
   {
-    id: 'tab-models',
-    labelKey: 'settings.tab.models',
-    descriptionKey: 'settings.tab.modelsDesc',
-    saveMode: 'config',
+    id: 'tab-skills',
+    labelKey: 'settings.tab.skills',
+    descriptionKey: 'settings.tab.skillsDesc',
+    saveMode: 'skills',
   },
   {
     id: 'tab-mcp',
@@ -211,6 +218,12 @@ const SETTINGS_TAB_DEFS: ReadonlyArray<{
     labelKey: 'settings.tab.s3',
     descriptionKey: 'settings.tab.s3Desc',
     saveMode: 'config',
+  },
+  {
+    id: 'tab-usage',
+    labelKey: 'usage.title',
+    descriptionKey: 'usage.consoleDescription',
+    saveMode: 'none',
   },
 ];
 
@@ -256,6 +269,10 @@ function sortForStableSerialize(value: unknown): unknown {
 
 function serializeConfigForDirty(config: AppConfig): string {
   return JSON.stringify(sortForStableSerialize(normalizeConfigForSave(config)));
+}
+
+function serializeModelsForDirty(models: AppConfig['models']): string {
+  return JSON.stringify(sortForStableSerialize(normalizeModelsConfig(models) || null));
 }
 
 // Stable role list — extracted to module scope to preserve referential identity
@@ -686,7 +703,7 @@ function AgentsTab({
   );
 }
 
-// ── Models Tab ────────────────────────────────────────────────────────────────
+// ── MCP Tab ───────────────────────────────────────────────────────────────────
 
 function localizedTestLabel(
   testState: 'idle' | 'testing' | 'ok' | 'fail',
@@ -702,457 +719,6 @@ function localizedTestLabel(
   if (toolsMatch) return tr('settings.toolsCount', { count: toolsMatch[1] });
   return fallbackLabel;
 }
-
-function ModelEntryRow({
-  model,
-  onChange,
-  onDelete,
-}: {
-  model: ModelFormEntry;
-  onChange: (m: ModelFormEntry) => void;
-  onDelete: () => void;
-}) {
-  const inputArr = Array.isArray(model.input) ? model.input : ['text'];
-  const hasText = inputArr.includes('text');
-  const hasImage = inputArr.includes('image');
-  const thinkingFormat = modelThinkingFormat(model);
-  const customThinkingFormat =
-    thinkingFormat && !THINKING_FORMAT_OPTIONS.includes(thinkingFormat) ? thinkingFormat : '';
-
-  const setInput = (text: boolean, image: boolean) => {
-    const arr: string[] = [];
-    if (text) arr.push('text');
-    if (image) arr.push('image');
-    onChange({ ...model, input: arr.length > 0 ? arr : undefined });
-  };
-
-  return (
-    <div className="model-entry-form">
-      <div className="model-entry-main">
-        <input
-          className="model-entry-id"
-          type="text"
-          value={model.id || ''}
-          placeholder="model-id"
-          aria-label={tr('settings.field.modelId')}
-          onChange={(e) => onChange({ ...model, id: e.target.value })}
-        />
-        <label className="model-entry-toggle">
-          <input
-            type="checkbox"
-            checked={!!model.reasoning}
-            onChange={(e) => onChange({ ...model, reasoning: e.target.checked || undefined })}
-          />{' '}
-          {tr('settings.field.reasoning')}
-        </label>
-        <button
-          className="btn-danger-sm"
-          title={tr('settings.removeModel')}
-          aria-label={tr('settings.removeModel')}
-          onClick={onDelete}
-        >
-          <svg className="icon" aria-hidden="true" focusable="false">
-            <use href={iconHref('trash')} />
-          </svg>
-        </button>
-      </div>
-      <div className="model-entry-meta">
-        <label className="model-entry-field">
-          {tr('settings.field.contextWindow')}
-          <input
-            className="model-entry-number"
-            type="number"
-            value={model.contextWindow ?? ''}
-            placeholder="128000"
-            onChange={(e) => onChange({ ...model, contextWindow: numInputToValue(e.target.value) })}
-          />
-        </label>
-        <label className="model-entry-field">
-          {tr('settings.field.maxTokens')}
-          <input
-            className="model-entry-number"
-            type="number"
-            value={model.maxTokens ?? ''}
-            placeholder="16384"
-            onChange={(e) => onChange({ ...model, maxTokens: numInputToValue(e.target.value) })}
-          />
-        </label>
-        <label className="model-entry-field model-entry-thinking-field">
-          {tr('settings.thinkingFormat')}
-          <select
-            className="model-entry-thinking"
-            aria-label={tr('settings.thinkingFormat')}
-            value={thinkingFormat}
-            onChange={(e) => onChange(updateModelThinkingFormat(model, e.target.value))}
-          >
-            <option value="">{tr('settings.thinkingFormatDefault')}</option>
-            {customThinkingFormat ? (
-              <option value={customThinkingFormat}>
-                {tr('settings.thinkingFormatCustom', { value: customThinkingFormat })}
-              </option>
-            ) : null}
-            {THINKING_FORMAT_OPTIONS.map((format) => (
-              <option key={format} value={format}>
-                {format}
-              </option>
-            ))}
-          </select>
-        </label>
-        <span className="model-entry-inputs">
-          {tr('settings.field.input')}:
-          <label>
-            <input
-              type="checkbox"
-              checked={hasText}
-              onChange={(e) => setInput(e.target.checked, hasImage)}
-            />{' '}
-            {tr('settings.field.text')}
-          </label>
-          <label>
-            <input
-              type="checkbox"
-              checked={hasImage}
-              onChange={(e) => setInput(hasText, e.target.checked)}
-            />{' '}
-            {tr('settings.field.image')}
-          </label>
-        </span>
-      </div>
-    </div>
-  );
-}
-
-function ProviderCardInner({
-  prov,
-  onChange,
-  onDelete,
-  onTest,
-}: {
-  prov: ProviderFormData;
-  onChange: (p: ProviderFormData) => void;
-  onDelete: (rowKey: string) => void;
-  onTest: (p: ProviderFormData, modelId: string) => void;
-}) {
-  useLanguageVersion();
-  const addModel = () => {
-    onChange({
-      ...prov,
-      models: [...prov.models, createModelFormEntry(prov.name, { id: '', input: ['text'] })],
-    });
-  };
-  const updateModel = (i: number, m: ModelFormEntry) => {
-    const models = [...prov.models];
-    models[i] = m;
-    onChange({ ...prov, models });
-  };
-  const deleteModel = (i: number) => {
-    onChange({ ...prov, models: prov.models.filter((_, j) => j !== i) });
-  };
-
-  const testBtnClass =
-    prov.testState === 'ok'
-      ? 'btn-test test-ok'
-      : prov.testState === 'fail'
-        ? 'btn-test test-fail'
-        : prov.testState === 'testing'
-          ? 'btn-test testing'
-          : 'btn-test';
-  const testLabel = localizedTestLabel(prov.testState, prov.testLabel);
-
-  return (
-    <div className="provider-card" data-provider-name={prov.name}>
-      <div className="provider-card-header">
-        <span className="provider-card-name">{prov.name}</span>
-        <div className="provider-card-actions">
-          {prov.models.length > 0 && (
-            <select
-              value={prov.selectedTestModel}
-              aria-label={tr('settings.testModel')}
-              style={{ maxWidth: 190, padding: '5px 8px' }}
-              onChange={(e) => onChange({ ...prov, selectedTestModel: e.target.value })}
-            >
-              {prov.models.map(
-                (m) =>
-                  m.id && (
-                    <option key={m._key} value={m.id}>
-                      {m.id}
-                    </option>
-                  ),
-              )}
-            </select>
-          )}
-          <button className={testBtnClass} onClick={() => onTest(prov, prov.selectedTestModel)}>
-            {testLabel}
-          </button>
-          <button
-            className="btn-danger-sm"
-            title={tr('settings.deleteProvider')}
-            aria-label={tr('settings.deleteProvider')}
-            onClick={() => onDelete(prov._key)}
-          >
-            <svg className="icon" aria-hidden="true" focusable="false">
-              <use href={iconHref('trash')} />
-            </svg>
-          </button>
-        </div>
-      </div>
-      <div className="provider-form">
-        <SettingsRow label={tr('settings.field.apiType')}>
-          <select value={prov.api} onChange={(e) => onChange({ ...prov, api: e.target.value })}>
-            <option value="openai-completions">OpenAI Completions</option>
-            <option value="openai-responses">OpenAI Responses</option>
-            <option value="anthropic">Anthropic</option>
-            <option value="ollama">Ollama</option>
-            <option value="gemini">Gemini</option>
-          </select>
-        </SettingsRow>
-        <SettingsRow label={tr('settings.field.baseUrl')}>
-          <input
-            type="text"
-            value={prov.baseUrl}
-            placeholder="https://api.openai.com/v1"
-            onChange={(e) => onChange({ ...prov, baseUrl: e.target.value })}
-          />
-        </SettingsRow>
-        <SettingsRow label={tr('settings.field.apiKey')}>
-          <input
-            type="password"
-            value={prov.apiKey}
-            onChange={(e) => onChange({ ...prov, apiKey: e.target.value })}
-          />
-        </SettingsRow>
-      </div>
-      <div className="provider-models">
-        <div className="provider-models-title">{tr('settings.field.models')}</div>
-        {prov.models.map((m, i) => (
-          <ModelEntryRow
-            key={m._key}
-            model={m}
-            onChange={(nm) => updateModel(i, nm)}
-            onDelete={() => deleteModel(i)}
-          />
-        ))}
-        <button className="btn-secondary" style={{ marginTop: 6, fontSize: 11 }} onClick={addModel}>
-          {tr('settings.addModel')}
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// Memoize so that editing a different provider doesn't re-render this card.
-// The `onChange`/`onDelete`/`onTest` props are held stable by the parent via
-// `useCallback`, so a default shallow compare is sufficient.
-const ProviderCard = React.memo(ProviderCardInner);
-
-function ModelsTab({
-  config,
-  onChange,
-  onStatus,
-}: {
-  config: AppConfig;
-  onChange: (c: AppConfig) => void;
-  onStatus: (msg: string, type?: string) => void;
-}) {
-  const initialProviders = config.models?.providers || {};
-  const [providers, setProviders] = useState<ProviderFormData[]>(() =>
-    buildProviderForms(initialProviders),
-  );
-  const [jsonText, setJsonText] = useState<string>(() =>
-    JSON.stringify(config.models || { providers: {} }, null, 2),
-  );
-  const [jsonError, setJsonError] = useState('');
-  const [jsonDirty, setJsonDirty] = useState(false);
-  const [formDirty, setFormDirty] = useState(false);
-  const providerResetTimersRef = useRef<Map<string, number>>(new Map());
-
-  // When external config changes (e.g. JSON apply), re-sync form state
-  useEffect(() => {
-    const p = config.models?.providers || {};
-    setProviders((previousProviders) => buildProviderForms(p, previousProviders));
-    setJsonText(JSON.stringify(config.models || { providers: {} }, null, 2));
-    setJsonError('');
-    setJsonDirty(false);
-    setFormDirty(false);
-  }, [config.models]);
-
-  useEffect(() => {
-    const resetTimers = providerResetTimersRef.current;
-    return () => {
-      for (const timeoutId of resetTimers.values()) {
-        window.clearTimeout(timeoutId);
-      }
-      resetTimers.clear();
-    };
-  }, []);
-
-  const clearProviderReset = useCallback((rowKey: string) => {
-    const timeoutId = providerResetTimersRef.current.get(rowKey);
-    if (timeoutId !== undefined) {
-      window.clearTimeout(timeoutId);
-      providerResetTimersRef.current.delete(rowKey);
-    }
-  }, []);
-
-  const scheduleProviderReset = useCallback(
-    (rowKey: string) => {
-      clearProviderReset(rowKey);
-      const timeoutId = window.setTimeout(() => {
-        providerResetTimersRef.current.delete(rowKey);
-        setProviders((prev) =>
-          prev.map((p) => (p._key === rowKey ? { ...p, testState: 'idle', testLabel: 'Test' } : p)),
-        );
-      }, 4000);
-      providerResetTimersRef.current.set(rowKey, timeoutId);
-    },
-    [clearProviderReset],
-  );
-
-  const updateProvider = useCallback((p: ProviderFormData) => {
-    setProviders((prev) => prev.map((old) => (old._key === p._key ? p : old)));
-    setFormDirty(true);
-  }, []);
-
-  const deleteProvider = useCallback(
-    (rowKey: string) => {
-      clearProviderReset(rowKey);
-      setProviders((prev) => prev.filter((p) => p._key !== rowKey));
-      setFormDirty(true);
-    },
-    [clearProviderReset],
-  );
-
-  const addProvider = () => {
-    const name = prompt('Enter provider name:');
-    if (!name) return;
-    try {
-      const existing = Object.fromEntries(providers.map((p) => [p.name, true]));
-      const trimmed = validateProviderName(name, existing);
-      setProviders([...providers, createProviderForm(trimmed)]);
-      setFormDirty(true);
-    } catch (e: unknown) {
-      onStatus((e as Error).message, 'error');
-    }
-  };
-
-  const applyJson = () => {
-    if (formDirty) {
-      onStatus(
-        'Models form has unapplied changes. Save or discard them before applying Raw JSON.',
-        'error',
-      );
-      return;
-    }
-    try {
-      const parsed = JSON.parse(jsonText.trim() || '{}');
-      validateModelsConfigDraftShape(parsed);
-      const newConfig = {
-        ...config,
-        models: normalizeModelsConfig(parsed as AppConfig['models']),
-      };
-      onChange(newConfig);
-      setJsonError('');
-      onStatus('Applied Models JSON', 'success');
-    } catch (e: unknown) {
-      setJsonError((e as Error).message);
-    }
-  };
-
-  const testProvider = useCallback(
-    async (prov: ProviderFormData, modelId: string) => {
-      if (!modelId) {
-        onStatus('No model selected', 'error');
-        return;
-      }
-      // Match by stable row key so delayed resets cannot hit a newly recreated
-      // provider with the same name.
-      const applyResult = (state: ProviderFormData['testState'], label: string) => {
-        setProviders((prev) =>
-          prev.map((p) =>
-            p._key === prov._key ? { ...p, testState: state, testLabel: label } : p,
-          ),
-        );
-      };
-      clearProviderReset(prov._key);
-      applyResult('testing', 'Testing...');
-      try {
-        const resp = await fetch('/api/config/test-model', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            providerName: prov.name,
-            baseUrl: prov.baseUrl,
-            apiKey: prov.apiKey,
-            api: prov.api || 'openai-completions',
-            modelId,
-          }),
-        });
-        const data = await resp.json();
-        if (data.ok) applyResult('ok', 'Connected');
-        else {
-          applyResult('fail', 'Failed');
-          onStatus(data.error || 'Connection failed', 'error');
-        }
-      } catch (e: unknown) {
-        applyResult('fail', 'Error');
-        onStatus((e as Error).message, 'error');
-      }
-      scheduleProviderReset(prov._key);
-    },
-    [clearProviderReset, onStatus, scheduleProviderReset],
-  );
-
-  // Expose providers → parent config on mount and whenever providers change
-  // (parent calls collectModels on save)
-  useEffect(() => {
-    const newModels = serializeProviderForms(providers);
-    // Only propagate if we actually changed (avoid loops)
-    if (JSON.stringify(newModels) !== JSON.stringify(config.models)) {
-      onChange({ ...config, models: newModels });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [providers]);
-
-  return (
-    <>
-      {providers.map((prov) => (
-        <ProviderCard
-          key={prov._key}
-          prov={prov}
-          onChange={updateProvider}
-          onDelete={deleteProvider}
-          onTest={testProvider}
-        />
-      ))}
-      <button className="btn-secondary" style={{ marginTop: 10 }} onClick={addProvider}>
-        {tr('settings.addProvider')}
-      </button>
-      <details style={{ marginTop: 16 }}>
-        <summary style={{ fontSize: 12, color: 'var(--dim)', cursor: 'pointer' }}>
-          {tr('settings.advancedRawJson')}
-        </summary>
-        <div className="json-editor-wrap" style={{ marginTop: 8 }}>
-          <textarea
-            className={`json-editor${jsonDirty && jsonError ? ' has-error' : ''}`}
-            spellCheck={false}
-            value={jsonText}
-            onChange={(e) => {
-              setJsonText(e.target.value);
-              setJsonDirty(true);
-              setJsonError('');
-            }}
-          />
-          {jsonError && <div className="json-editor-error">{jsonError}</div>}
-          <button className="btn-secondary" style={{ marginTop: 6 }} onClick={applyJson}>
-            {tr('settings.applyJson')}
-          </button>
-        </div>
-      </details>
-    </>
-  );
-}
-
-// ── MCP Tab ───────────────────────────────────────────────────────────────────
 
 interface McpFormEntry extends McpServerConfig {
   _key: string;
@@ -1480,12 +1046,14 @@ function McpTab({
   onChange,
   onStatus,
   onPolicyDirtyChange,
+  onComposerInsert,
 }: {
   config: AppConfig;
   sessionId: string;
   onChange: (c: AppConfig) => void;
   onStatus: (msg: string, type?: string) => void;
   onPolicyDirtyChange?: (dirty: boolean) => void;
+  onComposerInsert: (input: HTMLTextAreaElement) => void;
 }) {
   const [servers, setServers] = useState<McpFormEntry[]>(() => buildMcpForms(config.mcpServers));
   const [jsonText, setJsonText] = useState(() => JSON.stringify(config.mcpServers || {}, null, 2));
@@ -1519,7 +1087,10 @@ function McpTab({
     const needsBreak = input.value.length > 0 && !input.value.endsWith('\n');
     input.setRangeText(`${needsBreak ? '\n\n' : ''}${text}`, start, end, 'end');
     input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.focus();
+    // The workspace is hidden and inert while the full-screen Console is
+    // active. Let the shell return first, then focus the composer once it is
+    // available again.
+    onComposerInsert(input);
     return true;
   };
 
@@ -2568,6 +2139,7 @@ function S3Tab({ config, onChange }: { config: AppConfig; onChange: (c: AppConfi
 function CorruptConfigView({
   data,
   conflict,
+  onDirtyChange,
   onStatus,
   onConflict,
   onReload,
@@ -2575,6 +2147,7 @@ function CorruptConfigView({
 }: {
   data: ConfigApiResponse;
   conflict: boolean;
+  onDirtyChange: (dirty: boolean) => void;
   onStatus: (msg: string, type?: string) => void;
   onConflict: () => void;
   onReload: () => void;
@@ -2589,7 +2162,8 @@ function CorruptConfigView({
     setRawText(data.raw || '');
     setHasError(true);
     setErrorMsg(data.parse_error || '');
-  }, [data]);
+    onDirtyChange(false);
+  }, [data, onDirtyChange]);
 
   const save = async () => {
     if (saving || conflict) return;
@@ -2668,7 +2242,9 @@ function CorruptConfigView({
           style={{ minHeight: 300 }}
           value={rawText}
           onChange={(e) => {
-            setRawText(e.target.value);
+            const nextRawText = e.target.value;
+            setRawText(nextRawText);
+            onDirtyChange(nextRawText !== (data.raw || ''));
             setHasError(false);
             setErrorMsg('');
           }}
@@ -2696,6 +2272,7 @@ function SettingsShell({
   tabs,
   status,
   configDirty,
+  modelsDraftDirty,
   configConflict,
   skillsDirty,
   mcpDirty,
@@ -2713,6 +2290,7 @@ function SettingsShell({
   tabs: ReadonlyArray<TabMeta>;
   status: { message: string; type: StatusType };
   configDirty: boolean;
+  modelsDraftDirty: boolean;
   configConflict: boolean;
   skillsDirty: boolean;
   mcpDirty: boolean;
@@ -2745,123 +2323,180 @@ function SettingsShell({
     window.setTimeout(() => tabRefs.current[tabId]?.focus(), 0);
   };
 
+  const isTabDisabled = (tabId: TabId) =>
+    corrupt && tabId !== 'tab-general' && tabId !== 'tab-usage';
+
   const changeTab = (tabId: TabId) => {
-    if (corrupt) return;
+    if (isTabDisabled(tabId)) return;
     onTabChange(tabId);
   };
 
   const handleTabKeyDown = (event: React.KeyboardEvent<HTMLButtonElement>, tabId: TabId) => {
-    const currentIndex = tabs.findIndex((tab) => tab.id === tabId);
+    const enabledTabs = tabs.filter((tab) => !isTabDisabled(tab.id));
+    const currentIndex = enabledTabs.findIndex((tab) => tab.id === tabId);
     if (currentIndex < 0) return;
 
     let nextIndex = currentIndex;
     if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
-      nextIndex = (currentIndex + 1) % tabs.length;
+      nextIndex = (currentIndex + 1) % enabledTabs.length;
     } else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
-      nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+      nextIndex = (currentIndex - 1 + enabledTabs.length) % enabledTabs.length;
     } else if (event.key === 'Home') {
       nextIndex = 0;
     } else if (event.key === 'End') {
-      nextIndex = tabs.length - 1;
+      nextIndex = enabledTabs.length - 1;
     } else {
       return;
     }
 
     event.preventDefault();
-    const nextTab = tabs[nextIndex].id;
+    const nextTab = enabledTabs[nextIndex].id;
     changeTab(nextTab);
     focusTab(nextTab);
   };
 
   const canSaveConfig = !corrupt && activeMeta.saveMode === 'config';
-  const hasUnsavedChanges = configDirty || skillsDirty || mcpDirty;
+  const hasUnsavedChanges = configDirty || modelsDraftDirty || skillsDirty || mcpDirty;
+  const isUsage = activeTab === 'tab-usage';
+  const showConfigError = corrupt && !isUsage;
   const dirtySections = [
     configDirty ? 'Config' : '',
+    modelsDraftDirty && !configDirty ? tr('settings.tab.models') : '',
     skillsDirty ? tr('settings.tab.skills') : '',
     mcpDirty ? 'MCP' : '',
   ].filter(Boolean);
 
   return (
-    <div
-      className="page-panel settings-panel"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="settings-dialog-title"
-      tabIndex={-1}
-    >
-      <div className="settings-shell">
+    <main className="console-page-surface" aria-labelledby="settings-dialog-title">
+      <div className="settings-shell console-shell">
         <aside className="settings-sidebar" aria-label={tr('settings.sectionsAria')}>
           <div className="settings-sidebar-head">
-            <div className="settings-eyebrow">LingClaw</div>
-            <h2>{tr('settings.title')}</h2>
-            <p>{tr('settings.subtitle')}</p>
+            <div className="console-brand-row">
+              <span className="console-brand-mark" aria-hidden="true">
+                <img src="/branding/logo-mark.png" alt="" />
+              </span>
+              <span className="console-brand-copy">
+                <strong>LingClaw</strong>
+                <span>{tr('console.title')}</span>
+              </span>
+            </div>
+            <button
+              className="console-return-button"
+              type="button"
+              title={tr('console.backToWorkspace')}
+              aria-label={tr('console.backToWorkspace')}
+              onClick={onRequestClose}
+            >
+              <svg className="icon" aria-hidden="true">
+                <use href="#icon-chevron-left" />
+              </svg>
+              <span>{tr('console.backToWorkspace')}</span>
+            </button>
           </div>
           <label className="settings-mobile-section-picker">
             <span>{tr('settings.sectionPicker')}</span>
-            <select
-              value={activeTab}
-              disabled={corrupt}
-              onChange={(event) => changeTab(event.target.value as TabId)}
-            >
+            <select value={activeTab} onChange={(event) => changeTab(event.target.value as TabId)}>
               {tabs.map((tab) => (
-                <option key={tab.id} value={tab.id}>
+                <option
+                  key={tab.id}
+                  value={tab.id}
+                  disabled={corrupt && tab.id !== 'tab-general' && tab.id !== 'tab-usage'}
+                >
                   {tab.label}
                 </option>
               ))}
             </select>
           </label>
           <div id="settings-tabs" className="page-tabs settings-nav" role="tablist">
-            {tabs.map((tab) => (
-              <button
-                key={tab.id}
-                ref={(node) => {
-                  tabRefs.current[tab.id] = node;
-                }}
-                id={`${tab.id}-button`}
-                role="tab"
-                type="button"
-                className={`page-tab settings-nav-item${activeTab === tab.id ? ' active' : ''}`}
-                data-tab={tab.id}
-                aria-selected={activeTab === tab.id}
-                aria-controls={`${tab.id}-panel`}
-                disabled={corrupt}
-                onClick={() => changeTab(tab.id)}
-                onKeyDown={(event) => handleTabKeyDown(event, tab.id)}
-              >
-                <span className="settings-nav-icon" aria-hidden="true">
-                  <svg className="icon">
-                    <use href={iconHref(SETTINGS_TAB_ICONS[tab.id])} />
-                  </svg>
-                </span>
-                <span className="settings-nav-label">{tab.label}</span>
-                <span className="settings-nav-description">{tab.description}</span>
-              </button>
+            {tabs.map((tab, index) => (
+              <React.Fragment key={tab.id}>
+                {index === 0 || tab.id === 'tab-usage' ? (
+                  <span
+                    className={`console-nav-group-label${
+                      tab.id === 'tab-usage' ? ' is-observe' : ''
+                    }`}
+                    role="presentation"
+                  >
+                    {tr(tab.id === 'tab-usage' ? 'console.observability' : 'console.configuration')}
+                  </span>
+                ) : null}
+                <button
+                  ref={(node) => {
+                    tabRefs.current[tab.id] = node;
+                  }}
+                  id={`${tab.id}-button`}
+                  role="tab"
+                  type="button"
+                  className={`page-tab settings-nav-item${
+                    tab.id === 'tab-usage' ? ' console-nav-observe' : ''
+                  }${activeTab === tab.id ? ' active' : ''}`}
+                  data-tab={tab.id}
+                  aria-selected={activeTab === tab.id}
+                  aria-controls={`${tab.id}-panel`}
+                  aria-label={tab.label}
+                  title={tab.label}
+                  disabled={isTabDisabled(tab.id)}
+                  onClick={() => changeTab(tab.id)}
+                  onKeyDown={(event) => handleTabKeyDown(event, tab.id)}
+                >
+                  <span className="settings-nav-icon" aria-hidden="true">
+                    <svg className="icon">
+                      <use href={iconHref(SETTINGS_TAB_ICONS[tab.id])} />
+                    </svg>
+                  </span>
+                  <span className="settings-nav-label">{tab.label}</span>
+                  <span className="settings-nav-description">{tab.description}</span>
+                </button>
+              </React.Fragment>
             ))}
           </div>
         </aside>
 
         <section className="settings-main">
           <div className="settings-topbar">
+            <button
+              className="console-mobile-back"
+              type="button"
+              title={tr('console.backToWorkspace')}
+              aria-label={tr('console.backToWorkspace')}
+              onClick={onRequestClose}
+            >
+              <svg className="icon" aria-hidden="true">
+                <use href="#icon-chevron-left" />
+              </svg>
+            </button>
             <div className="settings-title-block">
               <h2 id="settings-dialog-title" ref={titleRef} tabIndex={-1}>
-                {corrupt ? tr('settings.configError') : activeMeta.label}
+                {showConfigError ? tr('settings.configError') : activeMeta.label}
               </h2>
-              <p>{corrupt ? tr('settings.configErrorSubtitle') : activeMeta.description}</p>
+              <p>{showConfigError ? tr('settings.configErrorSubtitle') : activeMeta.description}</p>
             </div>
             <div className="settings-topbar-actions">
-              <span className={statusClass} id="settings-status" title={status.message}>
-                {status.message}
-              </span>
-              <button
-                className="page-close"
-                title={tr('common.close')}
-                aria-label={tr('common.close')}
-                onClick={onRequestClose}
-              >
-                <svg className="icon" aria-hidden="true">
-                  <use href="#icon-close" />
-                </svg>
-              </button>
+              {!isUsage && (
+                <span className={statusClass} id="settings-status" title={status.message}>
+                  {status.message}
+                </span>
+              )}
+              {canSaveConfig && configConflict && (
+                <button
+                  className="btn-secondary console-reload-button"
+                  type="button"
+                  onClick={onReloadConfig}
+                  disabled={status.type === 'loading'}
+                >
+                  {tr('settings.reloadLatest')}
+                </button>
+              )}
+              {canSaveConfig && (
+                <button
+                  className="btn-primary console-save-button"
+                  id="settings-save-btn"
+                  onClick={onSaveConfig}
+                  disabled={!configDirty || configConflict || status.type === 'loading'}
+                >
+                  {tr('settings.save')}
+                </button>
+              )}
             </div>
           </div>
 
@@ -2891,40 +2526,41 @@ function SettingsShell({
             {children}
           </div>
 
-          <div className="settings-footer">
-            <div className="settings-footer-note">
-              {hasUnsavedChanges
-                ? tr('settings.unsaved')
-                : activeMeta.saveMode === 'skills'
-                  ? tr('settings.skillsIndependent')
-                  : tr('settings.noUnsaved')}
-            </div>
-            {canSaveConfig && (
-              <div className="settings-footer-actions">
-                {configConflict && (
-                  <button
-                    className="btn-secondary"
-                    type="button"
-                    onClick={onReloadConfig}
-                    disabled={status.type === 'loading'}
-                  >
-                    {tr('settings.reloadLatest')}
-                  </button>
-                )}
-                <button
-                  className="btn-primary"
-                  id="settings-save-btn"
-                  onClick={onSaveConfig}
-                  disabled={!configDirty || configConflict || status.type === 'loading'}
-                >
-                  {tr('settings.save')}
-                </button>
+          {!isUsage && (
+            <div className="settings-footer">
+              <div className="settings-footer-note">
+                {hasUnsavedChanges
+                  ? tr('settings.unsaved')
+                  : activeMeta.saveMode === 'skills'
+                    ? tr('settings.skillsIndependent')
+                    : tr('settings.noUnsaved')}
               </div>
-            )}
-          </div>
+              {canSaveConfig && (
+                <div className="settings-footer-actions">
+                  {configConflict && (
+                    <button
+                      className="btn-secondary settings-mobile-reload"
+                      type="button"
+                      onClick={onReloadConfig}
+                      disabled={status.type === 'loading'}
+                    >
+                      {tr('settings.reloadLatest')}
+                    </button>
+                  )}
+                  <button
+                    className="btn-primary settings-mobile-save"
+                    onClick={onSaveConfig}
+                    disabled={!configDirty || configConflict || status.type === 'loading'}
+                  >
+                    {tr('settings.save')}
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </section>
       </div>
-    </div>
+    </main>
   );
 }
 
@@ -2933,6 +2569,7 @@ function SettingsShell({
 export function SettingsPage() {
   useLanguageVersion();
   const [visible, setVisible] = useState(false);
+  const [consoleRendered, setConsoleRendered] = useState(false);
   const [config, setConfig] = useState<AppConfig>({});
   const [savedConfig, setSavedConfig] = useState<AppConfig>({});
   const [configBaseline, setConfigBaseline] = useState(() => serializeConfigForDirty({}));
@@ -2948,30 +2585,58 @@ export function SettingsPage() {
   const [settingsSessionId, setSettingsSessionId] = useState('main');
   const [skillsDirty, setSkillsDirty] = useState(false);
   const [mcpDirty, setMcpDirty] = useState(false);
+  const [modelsDraftDirty, setModelsDraftDirty] = useState(false);
+  const [corruptDraftDirty, setCorruptDraftDirty] = useState(false);
+  const [modelsBaselineRevision, setModelsBaselineRevision] = useState(0);
+  const [consoleInstanceRevision, setConsoleInstanceRevision] = useState(0);
   const [showDiscardConfirm, setShowDiscardConfirm] = useState(false);
   const requestCloseRef = useRef<() => void>(() => setVisible(false));
   const visibleRef = useRef(false);
   const settingsSessionIdRef = useRef('main');
   const hasUnsavedChangesRef = useRef(false);
   const configRef = useRef<AppConfig>({});
+  const modelsDraftDirtyRef = useRef(false);
   const saveInFlightRef = useRef(false);
-  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const resetConsoleChildrenOnOpenRef = useRef(false);
+  const transitionControllerRef = useRef<ConsoleTransitionController | null>(null);
+  const workspaceRestoreTargetRef = useRef<HTMLElement | null>(null);
+
+  const updateConsoleVisibility = useCallback((nextVisible: boolean) => {
+    // Keep the imperative intent in sync before React flushes the state update.
+    // This prevents an older close transition from unmounting a lazily opened Console.
+    visibleRef.current = nextVisible;
+    setVisible(nextVisible);
+  }, []);
+
+  const updateModelsDraftDirty = useCallback((dirty: boolean) => {
+    // ModelsConsole can hold blank cards or unapplied JSON that are not represented
+    // by configRef yet, so save/load conflict checks must see this immediately.
+    modelsDraftDirtyRef.current = dirty;
+    setModelsDraftDirty(dirty);
+  }, []);
 
   const configDirty = useMemo(
     () => serializeConfigForDirty(config) !== configBaseline,
     [config, configBaseline],
   );
-  const hasUnsavedChanges = configDirty || skillsDirty || mcpDirty;
+  const hasUnsavedChanges =
+    configDirty || modelsDraftDirty || corruptDraftDirty || skillsDirty || mcpDirty;
 
   const closeWithoutPrompt = useCallback(() => {
+    // The Console remains mounted during its exit transition. Rebuild its child
+    // tree on the next open so a rapid reopen cannot revive discarded local drafts.
+    resetConsoleChildrenOnOpenRef.current = true;
     setShowDiscardConfirm(false);
     setConfig(savedConfig);
     setConfigBaseline(serializeConfigForDirty(savedConfig));
     setConfigConflict(false);
-    setVisible(false);
+    updateModelsDraftDirty(false);
+    setCorruptDraftDirty(false);
+    setModelsBaselineRevision((revision) => revision + 1);
+    updateConsoleVisibility(false);
     setSkillsDirty(false);
     setMcpDirty(false);
-  }, [savedConfig]);
+  }, [savedConfig, updateConsoleVisibility, updateModelsDraftDirty]);
 
   const requestClose = useCallback(() => {
     if (hasUnsavedChanges) {
@@ -3001,10 +2666,14 @@ export function SettingsPage() {
     configRef.current = config;
   }, [config]);
 
+  useEffect(() => {
+    modelsDraftDirtyRef.current = modelsDraftDirty;
+  }, [modelsDraftDirty]);
+
   // Register bridge functions
   useEffect(() => {
     _open = () => {
-      const nextSessionId = pendingSessionId || 'main';
+      const nextSessionId = pendingRoute.sessionId || 'main';
       if (
         visibleRef.current &&
         hasUnsavedChangesRef.current &&
@@ -3013,43 +2682,83 @@ export function SettingsPage() {
         setShowDiscardConfirm(true);
         return;
       }
+      if (resetConsoleChildrenOnOpenRef.current) {
+        resetConsoleChildrenOnOpenRef.current = false;
+        setConsoleInstanceRevision((revision) => revision + 1);
+        setVisitedTabs(new Set([routeSection(pendingRoute)]));
+      }
       setSettingsSessionId(nextSessionId);
-      setActiveTab(pendingSection);
+      setActiveTab(routeSection(pendingRoute));
       if (!hasUnsavedChangesRef.current) setShowDiscardConfirm(false);
-      setVisible(true);
+      setConsoleRendered(true);
+      updateConsoleVisibility(true);
     };
     _close = () => requestCloseRef.current();
     // Honour any open request that arrived before the lazy chunk finished loading.
     if (pendingOpen) {
       pendingOpen = false;
-      setSettingsSessionId(pendingSessionId || 'main');
-      setActiveTab(pendingSection);
+      setSettingsSessionId(pendingRoute.sessionId || 'main');
+      setActiveTab(routeSection(pendingRoute));
       setShowDiscardConfirm(false);
-      setVisible(true);
+      setConsoleRendered(true);
+      updateConsoleVisibility(true);
     }
     return () => {
       _open = null;
       _close = null;
     };
+  }, [updateConsoleVisibility]);
+
+  useEffect(() => {
+    const workspace = document.getElementById('app-workspace');
+    const consolePage = document.getElementById('console-page');
+    if (!workspace || !consolePage) return;
+    const chat = document.getElementById('chat');
+    const controller = createConsoleTransitionController({
+      workspace,
+      consolePage,
+      workspacePortalRoot: document.getElementById('workspace-portal-root'),
+      scrollTargets: chat instanceof HTMLElement ? [chat] : [],
+      onBeforeWorkspaceHide: suspendChatScrollTracking,
+      onAfterWorkspaceShow: resumeChatScrollTracking,
+    });
+    transitionControllerRef.current = controller;
+    return () => {
+      controller.dispose();
+      transitionControllerRef.current = null;
+    };
   }, []);
 
-  // Toggle the container element's hidden attribute (React is mounted inside #settings-page)
+  // The workspace remains mounted while the controller swaps accessibility,
+  // focus, and visual state between the two top-level surfaces.
   useEffect(() => {
-    const el = document.getElementById('settings-page');
-    if (el) el.hidden = !visible;
-  }, [visible]);
-
-  useEffect(() => {
-    if (!visible) return;
-    previousFocusRef.current =
-      document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    document.body.classList.add('page-dialog-open');
-    return () => {
-      document.body.classList.remove('page-dialog-open');
-      const previous = previousFocusRef.current;
-      previousFocusRef.current = null;
-      if (previous?.isConnected) previous.focus();
-    };
+    const controller = transitionControllerRef.current;
+    const legacyHost = document.getElementById('settings-page');
+    if (!controller) {
+      if (legacyHost) legacyHost.hidden = !visible;
+      if (!visible && !visibleRef.current) setConsoleRendered(false);
+      return;
+    }
+    if (visible) {
+      document.body.classList.add('console-view-open');
+      const focusTarget = document.getElementById('settings-dialog-title');
+      void controller.showConsole({
+        focusTarget: focusTarget instanceof HTMLElement ? focusTarget : undefined,
+      });
+      return;
+    }
+    document.body.classList.remove('console-view-open');
+    // On the first lazy mount the open bridge may already have queued
+    // visible=true while this effect still observes the initial false render.
+    // The controller starts on Workspace, so asking it to "restore" that same
+    // surface would move focus to its fallback before showConsole can capture
+    // the real Settings/Usage opener.
+    if (controller.surface === 'workspace' && controller.desiredSurface === 'workspace') return;
+    const restoreTarget = workspaceRestoreTargetRef.current;
+    workspaceRestoreTargetRef.current = null;
+    void controller.showWorkspace({ restoreTarget }).then((completed) => {
+      if (completed && !visibleRef.current) setConsoleRendered(false);
+    });
   }, [visible]);
 
   useEffect(() => {
@@ -3063,14 +2772,8 @@ export function SettingsPage() {
   useEffect(() => {
     if (!visible) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (
-        event.key === 'Tab' &&
-        trapDialogFocus(event, document.querySelector<HTMLElement>('.settings-panel'))
-      ) {
-        event.stopPropagation();
-        return;
-      }
       if (event.key !== 'Escape') return;
+      if (hasActiveConsoleEscapeLayer(document)) return;
       event.preventDefault();
       event.stopPropagation();
       if (showDiscardConfirm) setShowDiscardConfirm(false);
@@ -3084,30 +2787,40 @@ export function SettingsPage() {
     if (!hasUnsavedChanges) setShowDiscardConfirm(false);
   }, [hasUnsavedChanges]);
 
-  const applyLoadedConfigResponse = useCallback((data: ConfigApiResponse): boolean => {
-    setDiscoveredAgents(data.discoveredAgents || []);
-    setLoadedConfigFileEtag(
-      typeof data.configFileEtag === 'string' ? data.configFileEtag : undefined,
-    );
-    setConfigConflict(false);
-    if (data.parse_error) {
-      setCorruptData(data);
-      setConfig({});
-      setSavedConfig({});
-      setConfigBaseline(serializeConfigForDirty({}));
-      setStatus({ message: tr('settings.syntaxErrors'), type: 'error' });
-      return false;
-    }
-    const nextConfig = data.config || {};
-    setCorruptData(null);
-    setConfig(nextConfig);
-    setSavedConfig(nextConfig);
-    setConfigBaseline(serializeConfigForDirty(nextConfig));
-    if (!hasUnsavedChangesRef.current) setShowDiscardConfirm(false);
-    setStatus({ message: tr('settings.loadedFrom', { path: data.path }), type: 'success' });
-    dispatchConfigSaved(nextConfig, data);
-    return true;
-  }, []);
+  const applyLoadedConfigResponse = useCallback(
+    (data: ConfigApiResponse): boolean => {
+      setDiscoveredAgents(data.discoveredAgents || []);
+      setLoadedConfigFileEtag(
+        typeof data.configFileEtag === 'string' ? data.configFileEtag : undefined,
+      );
+      setConfigConflict(false);
+      if (data.parse_error) {
+        setCorruptData(data);
+        setActiveTab((current) => (current === 'tab-usage' ? current : 'tab-general'));
+        setConfig({});
+        setSavedConfig({});
+        setConfigBaseline(serializeConfigForDirty({}));
+        updateModelsDraftDirty(false);
+        setCorruptDraftDirty(false);
+        setModelsBaselineRevision((revision) => revision + 1);
+        setStatus({ message: tr('settings.syntaxErrors'), type: 'error' });
+        return false;
+      }
+      const nextConfig = data.config || {};
+      setCorruptData(null);
+      setConfig(nextConfig);
+      setSavedConfig(nextConfig);
+      setConfigBaseline(serializeConfigForDirty(nextConfig));
+      updateModelsDraftDirty(false);
+      setCorruptDraftDirty(false);
+      setModelsBaselineRevision((revision) => revision + 1);
+      if (!hasUnsavedChangesRef.current) setShowDiscardConfirm(false);
+      setStatus({ message: tr('settings.loadedFrom', { path: data.path }), type: 'success' });
+      dispatchConfigSaved(nextConfig, data);
+      return true;
+    },
+    [updateModelsDraftDirty],
+  );
 
   const reloadLatestConfig = useCallback(async () => {
     setStatus({ message: tr('settings.loading'), type: 'loading' });
@@ -3131,7 +2844,10 @@ export function SettingsPage() {
       setStatus({ message: tr('settings.loading'), type: 'loading' });
       try {
         const data = await fetchLatestConfigResponse({ signal: controller.signal });
-        if (serializeConfigForDirty(configRef.current) !== configSnapshotAtRequest) {
+        if (
+          serializeConfigForDirty(configRef.current) !== configSnapshotAtRequest ||
+          modelsDraftDirtyRef.current
+        ) {
           setConfigConflict(true);
           setStatus({ message: tr('settings.configConflict'), type: 'error' });
           return;
@@ -3213,6 +2929,7 @@ export function SettingsPage() {
   const saveConfig = async () => {
     if (saveInFlightRef.current || configConflict) return;
     const requestConfigSnapshot = serializeConfigForDirty(config);
+    const requestModelsSnapshot = serializeModelsForDirty(config.models);
     const finalConfig = normalizeConfigForSave(config);
 
     try {
@@ -3256,7 +2973,10 @@ export function SettingsPage() {
         const sameSavedFile =
           typeof data.configFileEtag === 'string' && data.configFileEtag === latest.configFileEtag;
         if (!sameSavedFile) {
-          if (serializeConfigForDirty(configRef.current) === requestConfigSnapshot) {
+          if (
+            serializeConfigForDirty(configRef.current) === requestConfigSnapshot &&
+            !modelsDraftDirtyRef.current
+          ) {
             applyLoadedConfigResponse(latest);
           } else {
             setConfigConflict(true);
@@ -3275,6 +2995,13 @@ export function SettingsPage() {
       );
       setSavedConfig(finalConfig);
       setConfigBaseline(serializeConfigForDirty(finalConfig));
+      if (
+        serializeModelsForDirty(configRef.current.models) === requestModelsSnapshot &&
+        !modelsDraftDirtyRef.current
+      ) {
+        updateModelsDraftDirty(false);
+        setModelsBaselineRevision((revision) => revision + 1);
+      }
       setLoadedConfigFileEtag(
         typeof data.configFileEtag === 'string' ? data.configFileEtag : undefined,
       );
@@ -3305,15 +3032,22 @@ export function SettingsPage() {
     });
   }, []);
 
-  if (!visible) return null;
+  const returnToComposerAfterInsert = useCallback((input: HTMLTextAreaElement) => {
+    workspaceRestoreTargetRef.current = input;
+    requestCloseRef.current();
+  }, []);
 
-  // Render the inner page-panel; the outer #settings-page overlay is managed via useEffect above
+  if (!consoleRendered) return null;
+
+  // Visited panels stay mounted inside the full-screen Console so local drafts survive navigation.
   return (
     <SettingsShell
+      key={consoleInstanceRevision}
       activeTab={activeTab}
       tabs={settingsTabs()}
       status={status}
-      configDirty={configDirty}
+      configDirty={configDirty || corruptDraftDirty}
+      modelsDraftDirty={modelsDraftDirty}
       configConflict={configConflict}
       skillsDirty={skillsDirty}
       mcpDirty={mcpDirty}
@@ -3328,19 +3062,42 @@ export function SettingsPage() {
     >
       {corruptData ? (
         <>
-          <CorruptConfigView
-            data={corruptData}
-            conflict={configConflict}
-            onStatus={handleStatus}
-            onConflict={() => {
-              setConfigConflict(true);
-              setStatus({ message: tr('settings.configConflict'), type: 'error' });
-            }}
-            onReload={() => void reloadLatestConfig()}
-            onReloaded={(d) => {
-              applyLoadedConfigResponse(d);
-            }}
-          />
+          <section
+            id="tab-general-panel"
+            className="settings-corrupt-panel"
+            role="tabpanel"
+            aria-labelledby="tab-general-button"
+            hidden={activeTab !== 'tab-general'}
+          >
+            <CorruptConfigView
+              data={corruptData}
+              conflict={configConflict}
+              onDirtyChange={setCorruptDraftDirty}
+              onStatus={handleStatus}
+              onConflict={() => {
+                setConfigConflict(true);
+                setStatus({ message: tr('settings.configConflict'), type: 'error' });
+              }}
+              onReload={() => void reloadLatestConfig()}
+              onReloaded={(d) => {
+                applyLoadedConfigResponse(d);
+              }}
+            />
+          </section>
+          {visitedTabs.has('tab-usage') && (
+            <section
+              id="tab-usage-panel"
+              role="tabpanel"
+              aria-labelledby="tab-usage-button"
+              hidden={activeTab !== 'tab-usage'}
+            >
+              <UsageView
+                sessionId={settingsSessionId}
+                active={visible && activeTab === 'tab-usage'}
+                className="is-embedded"
+              />
+            </section>
+          )}
         </>
       ) : (
         <>
@@ -3381,7 +3138,13 @@ export function SettingsPage() {
               aria-labelledby="tab-models-button"
               hidden={activeTab !== 'tab-models'}
             >
-              <ModelsTab config={config} onChange={setConfig} onStatus={handleStatus} />
+              <ModelsConsole
+                config={config}
+                onChange={setConfig}
+                onStatus={handleStatus}
+                baselineRevision={modelsBaselineRevision}
+                onDraftDirtyChange={updateModelsDraftDirty}
+              />
             </section>
           )}
           {visitedTabs.has('tab-mcp') && (
@@ -3397,6 +3160,7 @@ export function SettingsPage() {
                 onChange={setConfig}
                 onStatus={handleStatus}
                 onPolicyDirtyChange={setMcpDirty}
+                onComposerInsert={returnToComposerAfterInsert}
               />
             </section>
           )}
@@ -3408,6 +3172,20 @@ export function SettingsPage() {
               hidden={activeTab !== 'tab-s3'}
             >
               <S3Tab config={config} onChange={setConfig} />
+            </section>
+          )}
+          {visitedTabs.has('tab-usage') && (
+            <section
+              id="tab-usage-panel"
+              role="tabpanel"
+              aria-labelledby="tab-usage-button"
+              hidden={activeTab !== 'tab-usage'}
+            >
+              <UsageView
+                sessionId={settingsSessionId}
+                active={visible && activeTab === 'tab-usage'}
+                className="is-embedded"
+              />
             </section>
           )}
         </>

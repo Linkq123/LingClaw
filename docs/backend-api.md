@@ -1105,7 +1105,13 @@ Streamable HTTP 运行时会在 initialize 后维护 GET SSE 通知流，并记�
 
 ## 4.9 GET /api/usage
 
-返回当前默认 session（`main`）的 token 统计。
+返回指定 Session 的 Token 统计。
+
+### 查询参数
+
+- `session=<id>`（可选）：指定要查询的 Session；省略时默认查询 `main`
+- Session ID 不合法时返回 `400 Bad Request`
+- 有效 Session 尚未载入内存时，后端会尝试从磁盘恢复；找不到时返回字段完整的零值统计，而不是 `404`
 
 ### 响应
 
@@ -1154,9 +1160,8 @@ Streamable HTTP 运行时会在 initialize 后维护 GET SSE 通知流，并记�
 
 - `daily_*`: 当日统计
 - `total_*`: 当前会话累计统计
-- `input_source` / `output_source`:
-  - 常见值：`provider`、`estimated`
-- `source_scope`: 当前固定为 `latest_update`
+- `input_source` / `output_source`：最近一次统计更新的来源，常见值为 `provider`、`estimated`；不表示累计统计的整体精度
+- `source_scope`: 当前固定为 `latest_update`，用于明确上述来源字段的作用范围
 - `providers` / `roles`: 值格式均为 `[input_tokens, output_tokens]`
 
 ## 4.10 PUT /api/todos

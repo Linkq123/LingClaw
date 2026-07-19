@@ -202,6 +202,7 @@ export interface UsageData {
   daily_output?: number;
   total_input?: number;
   total_output?: number;
+  total?: number;
   input_source?: string;
   output_source?: string;
   source_scope?: string;
@@ -212,6 +213,8 @@ export interface UsageData {
     input: number;
     output: number;
     providers?: Record<string, [number, number]>;
+    roles?: Record<string, [number, number]>;
   }>;
   daily_providers?: Record<string, [number, number]>;
+  total_providers?: Record<string, [number, number]>;
 }

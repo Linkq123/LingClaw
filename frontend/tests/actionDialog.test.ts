@@ -6,7 +6,10 @@ import { setLanguage } from '../src/i18n.js';
 describe('application action dialog', () => {
   beforeEach(() => {
     dismissActionDialog();
-    document.body.innerHTML = '<button id="opener">Open</button>';
+    document.body.innerHTML = `
+      <button id="opener">Open</button>
+      <div id="workspace-portal-root"></div>
+    `;
     document.getElementById('opener')?.focus();
     setLanguage('en');
   });
@@ -28,6 +31,9 @@ describe('application action dialog', () => {
     await Promise.resolve();
 
     const input = document.querySelector<HTMLInputElement>('.action-dialog-field input')!;
+    expect(document.querySelector('.action-dialog-overlay')?.parentElement?.id).toBe(
+      'workspace-portal-root',
+    );
     expect(document.activeElement).toBe(input);
     input.value = '   ';
     input.dispatchEvent(new Event('input', { bubbles: true }));

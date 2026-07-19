@@ -1,3 +1,5 @@
+import { appendWorkspacePortal } from '../workspacePortal.js';
+
 export interface ModalHostElement extends HTMLElement {
   _modalHostParent?: HTMLElement | null;
   _modalHostNextSibling?: ChildNode | null;
@@ -106,7 +108,7 @@ export function moveModalHostToBody(host: ModalHostElement | null, config: Modal
   host._modalHostPlaceholder = placeholder;
   parent.replaceChild(placeholder, host);
   host.classList.add(config.hostClass);
-  document.body.appendChild(host);
+  appendWorkspacePortal(host);
 }
 
 export function restoreModalHost(
@@ -144,6 +146,6 @@ export function ensureModalBackdrop(config: ModalBackdropConfig) {
   backdrop.className = config.className;
   backdrop.dataset.action = config.closeAction;
   backdrop.hidden = true;
-  document.body.appendChild(backdrop);
+  appendWorkspacePortal(backdrop);
   return backdrop;
 }

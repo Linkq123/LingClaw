@@ -35,7 +35,48 @@ export function cancelToolDrawerBoundsSync(): void {
 // mutation is in flight. The cache is invalidated on scroll events, on chat
 // resize, and whenever a message is appended (`invalidateChatScrollCache`).
 let cachedDistance: number | null = null;
+
+interface SuspendedChatScroll {
+  chat: HTMLElement;
+  top: number;
+  left: number;
+  distanceFromBottom: number;
+  autoFollow: boolean;
+}
+
+let suspendedChatScroll: SuspendedChatScroll | null = null;
+
+export function suspendChatScrollTracking(): void {
+  if (suspendedChatScroll) return;
+  const chat = dom.chat;
+  if (!chat?.isConnected) return;
+  const distance = chat.scrollHeight - chat.scrollTop - chat.clientHeight;
+  suspendedChatScroll = {
+    chat,
+    top: chat.scrollTop,
+    left: chat.scrollLeft,
+    distanceFromBottom: distance,
+    // Raw geometry is the source of truth here: autoFollowChat can still be
+    // waiting for its scroll/rAF update when the Console opens.
+    autoFollow: state.autoFollowChat || distance <= AUTO_SCROLL_THRESHOLD,
+  };
+  cachedDistance = distance;
+}
+
+export function resumeChatScrollTracking(): void {
+  const snapshot = suspendedChatScroll;
+  if (!snapshot) return;
+  suspendedChatScroll = null;
+  cachedDistance = null;
+  if (snapshot.chat.isConnected) {
+    snapshot.chat.scrollLeft = snapshot.left;
+    snapshot.chat.scrollTop = snapshot.autoFollow ? snapshot.chat.scrollHeight : snapshot.top;
+  }
+  setAutoFollowChat(snapshot.autoFollow);
+}
+
 export function invalidateChatScrollCache(): void {
+  if (suspendedChatScroll) return;
   cachedDistance = null;
 }
 export function distanceFromBottom(): number {
@@ -110,7 +151,7 @@ export function queueUnreadContent({ countable = false } = {}) {
 }
 
 export function syncChatScrollState() {
-  if (state.suppressScrollTracking) return;
+  if (state.suppressScrollTracking || suspendedChatScroll) return;
   // A real scroll event invalidates the cached distance so the next read
   // reflects the user's new position.
   invalidateChatScrollCache();
@@ -125,6 +166,22 @@ export function jumpToLatest() {
 export function scrollDown(force = false) {
   if (state.bulkRenderingChat) {
     return false;
+  }
+
+  if (suspendedChatScroll) {
+    const shouldFollow =
+      force ||
+      state.autoFollowChat ||
+      suspendedChatScroll.distanceFromBottom <= AUTO_SCROLL_THRESHOLD;
+    if (shouldFollow) {
+      suspendedChatScroll.autoFollow = true;
+    }
+    if (force) {
+      setAutoFollowChat(true);
+    } else if (!shouldFollow) {
+      markChatUpdateOffscreen();
+    }
+    return shouldFollow;
   }
 
   const shouldFollow = force || state.autoFollowChat || isChatNearBottom();

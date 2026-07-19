@@ -159,9 +159,8 @@
       </symbol>
     </svg>
 
-    <a class="skip-link" href="#input" data-i18n="header.skipToInput">Skip to message input</a>
-
     <div class="main" id="app-workspace">
+      <a class="skip-link" href="#input" data-i18n="header.skipToInput">Skip to message input</a>
       <div class="app-shell">
         <button
           class="mobile-navigation-backdrop"
@@ -662,13 +661,14 @@
       </div>
     </div>
 
-    <div
-      class="tool-drawer-backdrop"
-      id="tool-drawer-backdrop"
-      data-action="close-tool-drawer"
-    ></div>
-    <div class="page-overlay" id="settings-page" hidden></div>
-    <div class="page-overlay" id="usage-page" hidden></div>
+    <div id="workspace-portal-root">
+      <div
+        class="tool-drawer-backdrop"
+        id="tool-drawer-backdrop"
+        data-action="close-tool-drawer"
+      ></div>
+    </div>
+    <div class="console-page-host" id="console-page" hidden></div>
 
     <script type="module" src="/src/main.ts"></script>
   </body>

@@ -9,6 +9,7 @@ import './css/pages.css';
 import './css/action-dialog.css';
 import './css/responsive.css';
 import './css/workspace.css';
+import './css/console.css';
 
 import { initTheme, cycleTheme, disposeTheme } from './theme.js';
 import { initI18n, tr, toggleLanguage, subscribeLanguageChange, translateDom } from './i18n.js';
@@ -154,12 +155,11 @@ import {
 } from './renderers/orchestrate.js';
 import {
   openSettingsPage,
-  closeSettingsPage,
   openUsagePage,
-  closeUsagePage,
+  closeConsolePage,
   prefetchPageChunks,
 } from './pages/lazy.js';
-import { closeOverlayById, matchesOverlayDismissTarget } from './pages/overlay.js';
+import { matchesOverlayDismissTarget } from './pages/overlay.js';
 import {
   dismissActionDialog,
   hasOpenActionDialog,
@@ -168,6 +168,7 @@ import {
   type ActionDialogRequest,
   type ActionDialogSessionOption,
 } from './actionDialog.js';
+import { appendWorkspacePortal, isConsoleSurfaceActive } from './workspacePortal.js';
 import {
   CONFIG_SAVED_EVENT,
   acceptComposerHttpModelPayloadRevision,
@@ -927,7 +928,7 @@ function renderGroupMemberDrawer() {
     drawer.id = 'group-member-drawer';
     drawer.className = 'group-member-drawer';
     drawer.setAttribute('role', 'dialog');
-    document.body.appendChild(drawer);
+    appendWorkspacePortal(drawer);
   }
   drawer.classList.toggle('is-open', state.groupMembersDrawerOpen);
   drawer.setAttribute('aria-hidden', state.groupMembersDrawerOpen ? 'false' : 'true');
@@ -2705,11 +2706,7 @@ const actionHandlers = {
     openUsagePage(state.activeSessionId);
   },
   'close-page': (el) => {
-    const overlay = el.closest('.page-overlay');
-    if (!(overlay instanceof HTMLElement)) return;
-    if (!closeOverlayById(overlay.id, closeSettingsPage, closeUsagePage)) {
-      overlay.hidden = true;
-    }
+    if (el.closest('#console-page')) closeConsolePage();
   },
   cmd: (el) => {
     const cmd = el.dataset.cmd;
@@ -2804,11 +2801,9 @@ function handleDocumentClick(e: MouseEvent) {
 
   const el = target.closest('[data-action]');
   if (!el) {
-    // Click on overlay backdrop to close
+    // Generic non-React overlays may still dismiss through their backdrop.
     if (target instanceof HTMLElement && target.classList.contains('page-overlay')) {
-      if (!closeOverlayById(target.id, closeSettingsPage, closeUsagePage)) {
-        target.hidden = true;
-      }
+      target.hidden = true;
     }
     return;
   }
@@ -2818,6 +2813,12 @@ function handleDocumentClick(e: MouseEvent) {
 }
 
 function handleDocumentKeydown(e: KeyboardEvent) {
+  // The Console is a separate full-screen surface and owns its keyboard
+  // interactions. Workspace drawers, overlays, and shortcuts can remain
+  // mounted beneath it, so do not let their global handlers steal focus or
+  // open hidden UI while the Console is active.
+  if (isConsoleSurfaceActive()) return;
+
   if (e.key === 'Escape' && hasOpenActionDialog()) {
     e.preventDefault();
     dismissActionDialog();
@@ -2844,8 +2845,7 @@ function handleDocumentKeydown(e: KeyboardEvent) {
     closeMobileNavigation({ restoreFocus: true });
     closeSubagentModal();
     closeOrchestrateTaskModal();
-    closeSettingsPage();
-    closeUsagePage();
+    closeConsolePage();
     closeShortcutsOverlay();
     return;
   }
@@ -2946,7 +2946,7 @@ function ensureShortcutsOverlay(): HTMLElement {
       closeShortcutsOverlay();
     }
   });
-  document.body.appendChild(el);
+  appendWorkspacePortal(el);
   shortcutsOverlay = el;
   return el;
 }

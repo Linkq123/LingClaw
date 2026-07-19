@@ -1,0 +1,833 @@
+.usage-console-view {
+  --usage-accent: #6554d9;
+  --usage-accent-hover: #5848c7;
+  --usage-input: #6554d9;
+  --usage-output: #42a5c7;
+  width: 100%;
+  min-width: 0;
+  min-height: 100%;
+  color: var(--text);
+  background: color-mix(in srgb, var(--bg) 72%, var(--surface));
+}
+
+.usage-console-compat {
+  position: fixed;
+  inset: 0;
+  z-index: 220;
+  overflow: auto;
+}
+
+.usage-console-toolbar {
+  position: sticky;
+  z-index: 5;
+  top: 0;
+  min-height: 72px;
+  padding: 12px clamp(16px, 3vw, 32px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface) 95%, transparent);
+  backdrop-filter: blur(12px);
+}
+
+.usage-console-toolbar h2 {
+  margin: 0;
+  font-size: 20px;
+  line-height: 1.2;
+}
+
+.usage-console-toolbar p {
+  margin: 5px 0 0;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--dim);
+  font-size: 11px;
+}
+
+.usage-console-toolbar code {
+  max-width: 32ch;
+  padding: 1px 5px;
+  overflow: hidden;
+  color: var(--text);
+  background: var(--surface2);
+  border-radius: 4px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-console-toolbar-actions,
+.usage-console-range,
+.usage-console-scope {
+  display: flex;
+  align-items: center;
+}
+
+.usage-console-toolbar-actions {
+  gap: 9px;
+}
+
+.usage-console-range,
+.usage-console-scope {
+  padding: 3px;
+  gap: 2px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface2);
+}
+
+.usage-console-range button,
+.usage-console-scope button,
+.usage-console-refresh,
+.usage-console-close,
+.usage-console-alert button,
+.usage-console-state button {
+  border: 0;
+  color: var(--dim);
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+}
+
+.usage-console-range button,
+.usage-console-scope button {
+  min-height: 30px;
+  padding: 5px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.usage-console-range button:hover,
+.usage-console-scope button:hover {
+  color: var(--text);
+}
+
+.usage-console-range button.is-active,
+.usage-console-scope button.is-active {
+  color: var(--text);
+  background: var(--surface);
+  box-shadow: 0 1px 3px rgba(18, 22, 38, 0.08);
+}
+
+.usage-console-refresh,
+.usage-console-close {
+  min-height: 38px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--text);
+  background: var(--surface);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.usage-console-close {
+  width: 38px;
+  padding: 0;
+}
+
+.usage-console-refresh:hover,
+.usage-console-close:hover {
+  border-color: color-mix(in srgb, var(--usage-accent) 48%, var(--border));
+}
+
+.usage-console-refresh:disabled,
+.usage-console-alert button:disabled,
+.usage-console-state button:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+
+.usage-console-live {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+.usage-console-content,
+.usage-console-skeleton,
+.usage-console-state {
+  width: min(1440px, 100%);
+  margin: 0 auto;
+}
+
+.usage-console-content {
+  padding: clamp(18px, 3vw, 32px);
+  display: grid;
+  gap: 18px;
+}
+
+.usage-console-metrics,
+.usage-console-skeleton-metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.usage-console-metric {
+  min-width: 0;
+  min-height: 112px;
+  padding: 17px 18px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.usage-console-metric > span {
+  color: var(--dim);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.usage-console-metric strong {
+  margin-top: 8px;
+  font-family: var(--font-mono);
+  font-size: clamp(25px, 3vw, 32px);
+  line-height: 1;
+  letter-spacing: -0.04em;
+}
+
+.usage-console-metric small {
+  margin-top: 9px;
+  overflow: hidden;
+  color: var(--dim);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-console-panel {
+  min-width: 0;
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+.usage-console-panel > header {
+  min-height: 36px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.usage-console-panel > header h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.usage-console-panel > header > div > span {
+  display: block;
+  margin-bottom: 5px;
+  color: var(--usage-accent);
+  font-size: 10px;
+  font-weight: 750;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.usage-console-trend-panel > header dl {
+  margin: 0;
+  display: flex;
+  gap: 24px;
+}
+
+.usage-console-trend-panel > header dl div {
+  display: grid;
+  gap: 3px;
+}
+
+.usage-console-trend-panel dt {
+  color: var(--dim);
+  font-size: 10px;
+}
+
+.usage-console-trend-panel dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.usage-console-trend {
+  width: 100%;
+  height: auto;
+  min-height: 220px;
+  margin-top: 10px;
+  overflow: visible;
+}
+
+.usage-console-trend line {
+  stroke: color-mix(in srgb, var(--border) 68%, transparent);
+  stroke-width: 1;
+}
+
+.usage-console-trend text {
+  fill: var(--dim);
+  font:
+    10px system-ui,
+    sans-serif;
+}
+
+.usage-console-trend-point:focus {
+  outline: none;
+}
+
+.usage-console-trend-point:focus > rect {
+  stroke: var(--text);
+  stroke-width: 1.5;
+}
+
+.usage-console-trend-tooltip {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 160ms ease;
+}
+
+.usage-console-trend-tooltip rect {
+  fill: var(--text);
+  stroke: var(--surface);
+  stroke-width: 1;
+}
+
+.usage-console-trend-tooltip text {
+  fill: var(--surface);
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.usage-console-trend-point:hover .usage-console-trend-tooltip,
+.usage-console-trend-point:focus .usage-console-trend-tooltip {
+  opacity: 1;
+}
+
+.usage-console-chart-descriptions {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+
+.usage-console-bar-input {
+  fill: var(--usage-input);
+}
+
+.usage-console-bar-output {
+  fill: var(--usage-output);
+}
+
+.usage-console-legend {
+  display: flex;
+  justify-content: center;
+  gap: 18px;
+  color: var(--dim);
+  font-size: 11px;
+}
+
+.usage-console-legend span,
+.usage-console-composition dt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.usage-console-legend i,
+.usage-console-composition i {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+}
+
+.usage-console-legend .is-input,
+.usage-console-composition .is-input {
+  background: var(--usage-input);
+}
+
+.usage-console-legend .is-output,
+.usage-console-composition .is-output {
+  background: var(--usage-output);
+}
+
+.usage-console-data-table {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  color: var(--dim);
+  font-size: 11px;
+}
+
+.usage-console-data-table summary {
+  width: max-content;
+  padding: 10px 0 0;
+  cursor: pointer;
+}
+
+.usage-console-data-table > div {
+  margin-top: 10px;
+  overflow-x: auto;
+}
+
+.usage-console-data-table table {
+  width: 100%;
+  min-width: 460px;
+  border-collapse: collapse;
+  color: var(--text);
+}
+
+.usage-console-data-table th,
+.usage-console-data-table td {
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: right;
+}
+
+.usage-console-data-table th:first-child {
+  text-align: left;
+}
+
+.usage-console-grid {
+  display: grid;
+  grid-template-columns: minmax(260px, 0.75fr) repeat(2, minmax(300px, 1fr));
+  gap: 14px;
+  align-items: stretch;
+}
+
+.usage-console-composition {
+  min-height: 210px;
+  display: grid;
+  grid-template-columns: minmax(120px, 0.8fr) minmax(130px, 1fr);
+  align-items: center;
+  gap: 12px;
+}
+
+.usage-console-composition svg {
+  width: min(180px, 100%);
+  margin: auto;
+}
+
+.usage-console-composition circle {
+  fill: none;
+  stroke-width: 12;
+  transform: rotate(-90deg);
+  transform-origin: 60px 60px;
+}
+
+.usage-console-donut-track {
+  stroke: var(--surface2);
+}
+
+.usage-console-donut-input {
+  stroke: var(--usage-input);
+}
+
+.usage-console-donut-output {
+  stroke: var(--usage-output);
+}
+
+.usage-console-composition svg text {
+  fill: var(--text);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.usage-console-composition svg .usage-console-donut-caption {
+  fill: var(--dim);
+  font:
+    9px system-ui,
+    sans-serif;
+  font-weight: 500;
+}
+
+.usage-console-composition dl {
+  margin: 0;
+  display: grid;
+  gap: 12px;
+}
+
+.usage-console-composition dl > div {
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+
+.usage-console-composition dt {
+  color: var(--dim);
+  font-size: 11px;
+}
+
+.usage-console-composition dd {
+  margin: 6px 0 0 14px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.usage-console-composition dd strong {
+  font-family: var(--font-mono);
+  font-size: 16px;
+}
+
+.usage-console-composition dd span {
+  color: var(--dim);
+  font-size: 11px;
+}
+
+.usage-console-scope button {
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 10px;
+}
+
+.usage-console-ranking {
+  min-height: 210px;
+  margin: 13px 0 0;
+  padding: 0;
+  display: grid;
+  align-content: start;
+  gap: 13px;
+  list-style: none;
+}
+
+.usage-console-ranking li {
+  min-width: 0;
+}
+
+.usage-console-rank-label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.usage-console-rank-label span {
+  overflow: hidden;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-console-rank-label strong {
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.usage-console-rank-track {
+  height: 5px;
+  margin-top: 7px;
+  overflow: hidden;
+  border-radius: 99px;
+  background: var(--surface2);
+}
+
+.usage-console-rank-track i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--usage-accent);
+}
+
+.usage-console-ranking li.is-unattributed .usage-console-rank-track i {
+  background: var(--dim);
+  opacity: 0.62;
+}
+
+.usage-console-ranking small {
+  display: block;
+  margin-top: 5px;
+  overflow: hidden;
+  color: var(--dim);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.usage-console-inline-empty {
+  min-height: 210px;
+  display: grid;
+  place-items: center;
+  color: var(--dim);
+  font-size: 12px;
+  text-align: center;
+}
+
+.usage-console-source-note {
+  margin: -4px 2px 8px;
+  color: var(--dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.usage-console-alert {
+  width: min(1376px, calc(100% - 36px));
+  margin: 14px auto 0;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border: 1px solid color-mix(in srgb, var(--accent-error) 30%, var(--border));
+  border-radius: 9px;
+  color: var(--accent-error);
+  background: color-mix(in srgb, var(--accent-error) 5%, var(--surface));
+  font-size: 11px;
+}
+
+.usage-console-alert button {
+  flex: none;
+  color: inherit;
+  font-weight: 700;
+}
+
+.usage-console-state {
+  min-height: min(560px, calc(100dvh - 74px));
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  text-align: center;
+}
+
+.usage-console-state > .icon {
+  width: 28px;
+  height: 28px;
+  color: var(--dim);
+}
+
+.usage-console-state strong {
+  font-size: 16px;
+}
+
+.usage-console-state p {
+  max-width: 480px;
+  margin: 0;
+  color: var(--dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.usage-console-state button {
+  min-height: 38px;
+  margin-top: 4px;
+  padding: 0 14px;
+  border-radius: 8px;
+  color: #fff;
+  background: var(--usage-accent);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.usage-console-skeleton {
+  padding: clamp(18px, 3vw, 32px);
+  display: grid;
+  gap: 18px;
+}
+
+.usage-console-skeleton i {
+  display: block;
+  border-radius: 12px;
+  background: linear-gradient(90deg, var(--surface2), var(--surface), var(--surface2));
+  background-size: 240% 100%;
+  animation: usage-console-shimmer 1.4s ease-in-out infinite;
+}
+
+.usage-console-skeleton-metrics i {
+  height: 112px;
+}
+
+.usage-console-skeleton-chart {
+  height: 330px;
+}
+
+@keyframes usage-console-shimmer {
+  from {
+    background-position: 100% 0;
+  }
+  to {
+    background-position: -100% 0;
+  }
+}
+
+@media (max-width: 1180px) {
+  .usage-console-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .usage-console-grid > :first-child {
+    grid-column: 1 / -1;
+  }
+
+  .usage-console-composition {
+    grid-template-columns: 180px minmax(200px, 1fr);
+  }
+}
+
+@media (max-width: 820px) {
+  .usage-console-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .usage-console-toolbar-actions {
+    width: 100%;
+  }
+
+  .usage-console-range {
+    flex: 1;
+  }
+
+  .usage-console-range button {
+    flex: 1;
+  }
+
+  .usage-console-metrics,
+  .usage-console-skeleton-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .usage-console-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .usage-console-grid > :first-child {
+    grid-column: auto;
+  }
+}
+
+@media (max-width: 768px) {
+  .usage-console-range button,
+  .usage-console-scope button,
+  .usage-console-refresh,
+  .usage-console-close {
+    min-height: 44px;
+  }
+
+  .usage-console-close {
+    min-width: 44px;
+  }
+}
+
+@media (max-width: 560px) {
+  .usage-console-toolbar {
+    padding: 10px 12px;
+  }
+
+  .usage-console-toolbar h2 {
+    font-size: 18px;
+  }
+
+  .usage-console-toolbar-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 44px;
+  }
+
+  .usage-console-range {
+    grid-column: 1 / -1;
+    grid-row: 1;
+  }
+
+  .usage-console-refresh {
+    min-height: 44px;
+  }
+
+  .usage-console-close {
+    width: 44px;
+    min-height: 44px;
+  }
+
+  .usage-console-content,
+  .usage-console-skeleton {
+    padding: 14px 12px 24px;
+  }
+
+  .usage-console-metrics,
+  .usage-console-skeleton-metrics {
+    gap: 8px;
+  }
+
+  .usage-console-metric {
+    min-height: 94px;
+    padding: 13px;
+  }
+
+  .usage-console-metric strong {
+    font-size: 24px;
+  }
+
+  .usage-console-panel {
+    padding: 14px;
+  }
+
+  .usage-console-trend-panel > header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .usage-console-trend-panel > header dl {
+    width: 100%;
+    justify-content: space-between;
+  }
+
+  .usage-console-trend {
+    min-width: 620px;
+  }
+
+  .usage-console-trend-panel {
+    overflow: hidden;
+  }
+
+  .usage-console-trend-panel > .usage-console-trend {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .usage-console-composition {
+    grid-template-columns: 126px minmax(0, 1fr);
+  }
+
+  .usage-console-scope button {
+    min-height: 44px;
+  }
+}
+
+@media (max-width: 370px) {
+  .usage-console-metrics,
+  .usage-console-skeleton-metrics,
+  .usage-console-composition {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .usage-console-skeleton i,
+  .usage-console-trend-tooltip {
+    animation: none;
+    transition: none;
+  }
+}

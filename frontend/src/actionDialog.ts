@@ -1,6 +1,7 @@
 import { createIcon } from './icons.js';
 import { tr } from './i18n.js';
 import { trapDialogFocus } from './pages/dialogFocus.js';
+import { appendWorkspacePortal } from './workspacePortal.js';
 
 export interface ActionDialogSessionOption {
   id: string;
@@ -482,7 +483,7 @@ export function openActionDialog(request: ActionDialogRequest): Promise<ActionDi
   panel.setAttribute('aria-labelledby', 'action-dialog-title');
   panel.tabIndex = -1;
   overlay.appendChild(panel);
-  document.body.appendChild(overlay);
+  appendWorkspacePortal(overlay);
   document.body.classList.add('action-dialog-open');
 
   return new Promise((resolve) => {

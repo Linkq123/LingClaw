@@ -95,7 +95,10 @@ Frontend source lives in `frontend/` and builds into `static/`, which the Rust s
 - `frontend/src/css/workspace.css` — shared design tokens and cross-surface workspace shell rules
 - `frontend/src/css/layout.css` — session navigation, workspace header, and composer layout
 - `frontend/src/css/chat.css` — message rows, Markdown typography, code toolbar, and system notices
-- `frontend/src/css/pages.css` — Settings and Usage page-specific layout and surfaces
+- `frontend/src/css/pages.css` — shared Settings form controls and page-level content primitives
+- `frontend/src/css/console.css` — full-screen Console shell, workspace/Console transitions, responsive navigation, and sticky save surfaces
+- `frontend/src/css/models-console.css` — Provider filters, model-card grid, responsive inspector, Raw JSON, and add-provider dialog
+- `frontend/src/css/usage-console.css` — session-scoped Usage metrics, SVG charts, rankings, loading, and partial-data states
 - `frontend/src/css/action-dialog.css` — application dialog layout, controls, and mobile bottom-sheet presentation
 - `frontend/src/renderers/` — chat, todos, tools, reasoning, subagent, orchestration, task-plan, and auto-trace panels
 - `frontend/src/renderers/execution-stack.ts` — groups one top-level Agent run's reasoning, tools, task plan, sub-agents, and orchestration into a single accessible live/complete activity stack; renderers must mount top-level process panels through this layer rather than creating independent timeline cards, and tool step summaries derive image counts from the associated result
@@ -103,11 +106,13 @@ Frontend source lives in `frontend/` and builds into `static/`, which the Rust s
 - `frontend/src/renderers/group-chat.ts` — renders Group speaker metadata and the Group-specific empty state, and maps protocol mentions to display names without changing persisted content
 - `frontend/src/renderers/todos.ts` — session-level todos panel and `/api/todos` persistence flow
 - `frontend/src/handlers/stream.ts` — streamed assistant/reasoning text handling
-- `frontend/src/pages/SettingsPage.tsx` and `frontend/src/pages/UsagePage.tsx` — React islands; `openSettingsPage(sessionId?, initialSection?)` may open a targeted Settings category without discarding unsaved in-page state
+- `frontend/src/pages/lazy.ts` — lazily mounts the single full-screen Console React root and preserves the latest Settings/Usage open intent
+- `frontend/src/pages/SettingsPage.tsx`, `frontend/src/pages/ModelsConsole.tsx`, and `frontend/src/pages/UsagePage.tsx` — unified Console, model-card workspace, and session-scoped SVG Usage dashboard; `openSettingsPage(sessionId?, initialSection?)` may target a Settings category and `openUsagePage(sessionId?)` targets Usage without discarding state in visited views
+- `frontend/src/pages/consoleTransition.ts` — swaps the workspace and Console as sibling full-screen surfaces, including `inert`/`aria-hidden`, focus restoration, native View Transitions, CSS fallback, and reduced-motion behavior; body-level workspace overlays must mount through `frontend/src/workspacePortal.ts` so `#workspace-portal-root` is isolated with the workspace
 - `frontend/src/markdown.ts` and `frontend/src/highlighter.ts` — markdown/KaTeX pipeline and the size-bounded syntax-highlighting language set
 - `frontend/tests/` — Vitest coverage for frontend behavior
 
-Most of the frontend is vanilla TypeScript with direct DOM manipulation. React is used mainly for the Settings and Usage pages.
+Most of the frontend is vanilla TypeScript with direct DOM manipulation. React is used mainly for the full-screen Console and its Settings and Usage views.
 
 ## Runtime and data flow details that matter
 
@@ -132,7 +137,8 @@ Most of the frontend is vanilla TypeScript with direct DOM manipulation. React i
 - OpenAI family currently has two protocol kinds: `openai-completions` (`/v1/chat/completions`) and `openai-responses` (`/v1/responses`). Both conversation paths use native upstream streaming; Responses requests set `stream: true` and map Responses SSE events into LingClaw's existing live events.
 - The frontend session switcher lives in a collapsible desktop sidebar. Its recent section contains at most 12 rows total while forcing Main and the current Session to remain visible; remaining Sessions live in a collapsed earlier section. Local search must cover all Session/Group names and IDs without changing persisted data. Row rename/delete actions live in one keyboard-accessible menu. At `<=768px` the sidebar becomes a transient overlay drawer that defaults closed and must not change the persisted desktop expansion preference. Todos, Tools, Reasoning, and Auto Debug live in the view-controls popover.
 - Composer model-readiness errors must keep their full localized reason in the placeholder and accessibility detail, use a neutral disabled send state, and show only a short visible status with the narrowest recovery action: open Models, open Agents, prefill `/model `, or retry configuration loading. Transient checking/identity states are announced without adding a duplicate visible sentence. `openSettingsPage` accepts the target category for these entry points.
-- Settings uses its sidebar tablist on desktop and one category select on mobile; both controls share the same React form state so breakpoint changes and category switches never discard unsaved edits. Usage renders two summary cards only when usage exists and scopes empty states independently to role, daily, and provider data.
+- Settings and Usage share one lazily mounted full-screen Console root rather than modal overlays. Keep visited views mounted so category changes preserve drafts and filters; leaving the Console is the boundary for unsaved-change confirmation. The workspace remains mounted but must be `inert` and `aria-hidden` while Console is active, and return must restore the originating focus and scroll position. Desktop uses the Console sidebar, intermediate widths use its compact icon navigation, and mobile uses one category select.
+- Models uses searchable, capability-filtered cards with a responsive inspector; preserve stable form keys, unknown configuration metadata, custom thinking formats, Raw JSON draft rules, validation, ETag conflict handling, and the existing save semantics. Usage requests `/api/usage?session=<id>` for its active Session and derives 7/14/30-day metrics, SVG trends/composition, and Provider/Agent-role rankings without inventing unavailable cost, latency, request-count, or cross-Session data. Refreshes retain previous data, and empty states remain scoped to the affected dimension.
 - Repeated Markdown decoration must be idempotent. Each code block gets at most one local-SVG toolbar, and its copy action must read only the contained `code` text. Message timestamps use semantic `<time>` nodes and remain visible on touch devices.
 - Frontend action and status icons must use the inline SVG sprite in `frontend/index.html` through typed helpers from `frontend/src/icons.ts`; keep SVGs decorative with accessible labels on their controls, and do not introduce Emoji or Unicode glyphs as UI icons.
 - Top-level process UI uses one execution stack per Agent run. It may span multiple ReAct cycles, auto-collapses only when the user has not manually toggled it, filters Tool/Reasoning steps through the existing view state, and must not fabricate duration for history records that do not provide one.

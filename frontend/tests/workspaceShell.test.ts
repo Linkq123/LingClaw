@@ -177,6 +177,22 @@ describe('workspace shell', () => {
     stateModule.state.imageUploadInFlight = false;
   });
 
+  it('keeps the message-input skip link inside the inert workspace surface', () => {
+    const documentFromIndex = new DOMParser().parseFromString(indexHtml, 'text/html');
+    const workspace = documentFromIndex.getElementById('app-workspace');
+    const skipLink = documentFromIndex.querySelector('.skip-link[href="#input"]');
+
+    expect(workspace).not.toBeNull();
+    expect(skipLink).not.toBeNull();
+    expect(workspace?.contains(skipLink)).toBe(true);
+  });
+
+  it('suspends workspace keyboard handlers while the full-screen Console is active', () => {
+    expect(mainSource).toMatch(
+      /function handleDocumentKeydown\(e: KeyboardEvent\) \{[\s\S]*?if \(isConsoleSurfaceActive\(\)\) return;/,
+    );
+  });
+
   it('opens mobile navigation without changing the persisted desktop drawer state', () => {
     stateModule.state.sessionDrawerExpanded = false;
     const trigger = document.getElementById('mobile-navigation-toggle') as HTMLButtonElement;

@@ -154,9 +154,11 @@ Group 上下文栏提供“全部 / 已选 / @提及”三种派发模式。Main
 
 会话导航在手机上使用全屏抽屉，工具详情改为底部面板，输入区适配安全区域与多行内容。关键触控目标不小于 44px，并保留键盘、焦点返回和减少动效支持。
 
-### 集中的 Settings 与 Usage
+### 全屏 Console 与可视化 Usage
 
-Settings 使用同一份运行时配置快照管理 Providers、Models、Agent 路由、Skills、MCP 与 S3；保存前完成校验，并对并发编辑提供冲突提示。Usage 将今日与累计 Token、Agent role、Provider 和每日趋势放在同一个仪表盘中，空数据与部分数据都有明确状态。
+Settings 与 Usage 位于独立的全屏 LingClaw Console，与工作区平级切换。桌面端使用侧栏导航，窄屏改用紧凑的分类选择器；切换分类会保留已访问页面的表单草稿，返回工作区时恢复焦点，并尊重系统的减少动效偏好。
+
+Models 以可搜索、可按 Provider 和能力筛选的卡片展示，响应式检查器集中编辑连接信息与模型字段。其余设置继续使用同一份运行时配置快照并提供保存校验与并发冲突提示。Usage 按当前 Session 展示 7 / 14 / 30 天 Token 趋势、输入输出构成、Provider 与 Agent role 排名，以及今日、累计、日均和活跃天数指标；图表使用可访问的本地 SVG，并分别处理空数据和部分数据。
 
 ## 工作原理
 
@@ -171,7 +173,7 @@ flowchart LR
     Tools --> S3["Optional S3-compatible Storage"]
 ```
 
-- **Browser UI**：响应式工作台，负责会话导航、流式消息、执行栈、Settings 和 Usage。
+- **Browser UI**：响应式工作台，负责会话导航、流式消息和执行栈，并通过全屏 Console 管理 Settings 与 Usage。
 - **Runtime**：单个 Rust 进程，管理 WebSocket、配置快照、并发 Session、Group 派发和持久化。
 - **Agent Loop**：在明确的阶段与上限内选择模型、调用工具、吸收观察并完成回复。
 - **Workspace**：默认位于 `~/.lingclaw/<session-id>/workspace/`，包含提示、Skills、Agents 和记忆。
@@ -242,7 +244,7 @@ npm run build
 ```text
 LingClaw/
 ├── src/                    # Rust Runtime、Providers、Tools 与 CLI
-├── frontend/               # TypeScript 工作台与 React Settings/Usage
+├── frontend/               # TypeScript 工作台与 React Console/Settings/Usage
 ├── static/                 # Vite 构建产物
 ├── docs/
 │   ├── reference/          # Prompt templates、系统 Skills 与 Sub-agents

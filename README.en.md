@@ -154,9 +154,11 @@ The group context bar provides All, Selected, and @mention dispatch modes. Main 
 
 Session navigation becomes a full-screen drawer on phones, tool details become a bottom sheet, and the composer respects safe areas and multiline content. Critical touch targets remain at least 44px, with keyboard navigation, focus return, and reduced-motion support intact.
 
-### Centralized Settings and Usage
+### Full-screen Console and visual Usage
 
-Settings manages providers, models, agent routing, skills, MCP, and S3 against one runtime configuration snapshot. It validates before saving and reports concurrent-edit conflicts. Usage combines daily and lifetime tokens, agent roles, providers, and daily trends in one dashboard with explicit empty and partial-data states.
+Settings and Usage live in a dedicated full-screen LingClaw Console that switches at the same level as the workspace. Desktop layouts use sidebar navigation, while narrow screens use a compact category picker. Switching categories preserves drafts in visited views, returning to the workspace restores focus, and transitions respect the system reduced-motion preference.
+
+Models are presented as searchable cards with Provider and capability filters, while a responsive inspector concentrates connection and model fields. Other settings continue to use one runtime configuration snapshot with validation and concurrent-edit conflict reporting. Usage is scoped to the current Session and visualizes 7-, 14-, or 30-day Token trends, input/output composition, Provider and Agent role rankings, plus today, lifetime, daily-average, and active-day metrics. Accessible local SVG charts handle empty and partial data independently.
 
 ## How it works
 
@@ -171,7 +173,7 @@ flowchart LR
     Tools --> S3["Optional S3-compatible Storage"]
 ```
 
-- **Browser UI** — Responsive workspace for session navigation, streaming messages, execution stacks, Settings, and Usage.
+- **Browser UI** — Responsive workspace for session navigation, streaming messages, and execution stacks, with Settings and Usage managed in the full-screen Console.
 - **Runtime** — A single Rust process that manages WebSockets, configuration snapshots, concurrent sessions, group dispatch, and persistence.
 - **Agent Loop** — Selects a model, invokes tools, absorbs observations, and finishes within explicit phases and limits.
 - **Workspace** — Stored at `~/.lingclaw/<session-id>/workspace/` by default, containing prompts, skills, agents, and memory.
@@ -242,7 +244,7 @@ Issues and pull requests are welcome for bug reports, documentation improvements
 ```text
 LingClaw/
 ├── src/                    # Rust runtime, providers, tools, and CLI
-├── frontend/               # TypeScript workspace and React Settings/Usage
+├── frontend/               # TypeScript workspace and React Console/Settings/Usage
 ├── static/                 # Vite build output
 ├── docs/
 │   ├── reference/          # Prompt templates, bundled skills, and sub-agents

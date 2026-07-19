@@ -77,9 +77,9 @@ function findPrimaryTestButton(): HTMLButtonElement {
 }
 
 function findCloseButton(): HTMLButtonElement {
-  const button = document.querySelector('button[aria-label="Close"]');
+  const button = document.querySelector('button.console-return-button');
   if (!(button instanceof HTMLButtonElement)) {
-    throw new Error('Close button not found');
+    throw new Error('Console return button not found');
   }
   return button;
 }
@@ -201,6 +201,50 @@ describe('SettingsPage shell layout and dirty state', () => {
     delete (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
       .IS_REACT_ACT_ENVIRONMENT;
     vi.unstubAllGlobals();
+    delete (document as Document & { startViewTransition?: unknown }).startViewTransition;
+  });
+
+  it('keeps the Console rendered when an open request arrives before the lazy root mounts', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: true }));
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {},
+            discoveredAgents: [],
+          }),
+        ),
+      ),
+    );
+    document.body.innerHTML = `
+      <div id="app-workspace">
+        <textarea id="input"></textarea>
+        <button id="console-opener">Open</button>
+      </div>
+      <section id="console-page" hidden><div id="settings-page"></div></section>
+    `;
+
+    const opener = document.getElementById('console-opener') as HTMLButtonElement;
+    opener.focus();
+    openSettingsPage('main', 'tab-models');
+    const container = document.getElementById('settings-page') as HTMLDivElement;
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(React.createElement(SettingsPage));
+      await flushMicrotasks();
+    });
+
+    expect(document.getElementById('console-page')?.hidden).toBe(false);
+    expect(document.querySelector('.console-page-surface')).not.toBeNull();
+    expect(document.getElementById('tab-models-panel')?.hasAttribute('hidden')).toBe(false);
+
+    await act(async () => {
+      findCloseButton().click();
+      await flushMicrotasks();
+    });
+    expect(document.activeElement).toBe(opener);
   });
 
   it('renders left-navigation tabs and saves dirty config from the settings action bar', async () => {
@@ -230,7 +274,15 @@ describe('SettingsPage shell layout and dirty state', () => {
     const tabs = Array.from(document.querySelectorAll('[role="tab"]'));
     expect(document.querySelector('[role="tablist"]')).not.toBeNull();
     expect(tabs.map((tab) => tab.textContent?.trim()).join(' ')).toContain('General');
-    expect(tabs).toHaveLength(6);
+    expect(tabs).toHaveLength(7);
+    expect(tabs.map((tab) => tab.textContent?.trim()).join(' ')).toContain('Usage');
+    expect(findCloseButton().getAttribute('aria-label')).toBe('Back to workspace');
+    expect(
+      tabs.every(
+        (tab) =>
+          tab.getAttribute('aria-label') === tab.querySelector('.settings-nav-label')?.textContent,
+      ),
+    ).toBe(true);
 
     await act(async () => {
       findButtonByText('S3').click();
@@ -265,6 +317,290 @@ describe('SettingsPage shell layout and dirty state', () => {
       baseConfigFileEtag: 'a'.repeat(64),
     });
     expect(save.disabled).toBe(true);
+  });
+
+  it('keeps an unsaved Settings draft mounted while visiting Usage', async () => {
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config' && (!init || !('method' in init) || !init.method)) {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: { settings: { port: 18989 } },
+            configFileEtag: 'b'.repeat(64),
+          }),
+        );
+      }
+      if (url === '/api/usage') {
+        return Promise.resolve(
+          jsonResponse({
+            daily_input: 0,
+            daily_output: 0,
+            total_input: 0,
+            total_output: 0,
+            usage_history: [],
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      setInputValue(findInputByPlaceholder('18989'), '19000');
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      findButtonByText('Token Usage').click();
+      await flushMicrotasks();
+    });
+    expect(document.getElementById('tab-usage-panel')?.hasAttribute('hidden')).toBe(false);
+    expect(document.querySelector('[role="dialog"][aria-modal="true"]')).toBeNull();
+
+    await act(async () => {
+      findButtonByText('General').click();
+      await flushMicrotasks();
+    });
+
+    expect(findInputByPlaceholder('18989').value).toBe('19000');
+    expect((document.getElementById('settings-save-btn') as HTMLButtonElement).disabled).toBe(
+      false,
+    );
+    expect(document.body.textContent).toContain('You have unsaved changes.');
+  });
+
+  it('does not revive discarded child drafts when the Console is reopened mid-transition', async () => {
+    const transitions: Array<ReturnType<typeof deferred<void>>> = [];
+    (
+      document as Document & {
+        startViewTransition: (update: () => void) => {
+          updateCallbackDone: Promise<void>;
+          finished: Promise<void>;
+        };
+      }
+    ).startViewTransition = (update) => {
+      update();
+      const transition = deferred<void>();
+      transitions.push(transition);
+      return { updateCallbackDone: Promise.resolve(), finished: transition.promise };
+    };
+    const fetchMock = vi.fn<typeof fetch>((input) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config') {
+        return Promise.resolve(jsonResponse({ path: '/tmp/config.json', config: {} }));
+      }
+      if (url === '/api/session-skills?session=main') {
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            skills: [
+              {
+                id: 'reviewer',
+                name: 'Reviewer',
+                path: '/tmp/reviewer/SKILL.md',
+                enabled: true,
+              },
+            ],
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    document.body.innerHTML = `
+      <div id="app-workspace"><button id="console-opener">Open</button></div>
+      <div id="workspace-portal-root"></div>
+      <section id="console-page" hidden><div id="settings-page"></div></section>
+    `;
+    const container = document.getElementById('settings-page') as HTMLDivElement;
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(React.createElement(SettingsPage));
+      await flushMicrotasks();
+      openSettingsPage('main', 'tab-skills');
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      findSkillCheckbox('reviewer').click();
+      await flushMicrotasks();
+    });
+    expect(findSkillCheckbox('reviewer').checked).toBe(false);
+    expect(document.body.textContent).toContain('You have unsaved changes.');
+
+    await act(async () => {
+      findCloseButton().click();
+      await flushMicrotasks();
+    });
+    const discard = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find(
+      (button) => button.textContent?.trim() === 'Discard Changes',
+    );
+    if (!discard) throw new Error('Discard button not found');
+
+    await act(async () => {
+      discard.click();
+      await flushMicrotasks();
+      openSettingsPage('main', 'tab-skills');
+      await flushMicrotasks();
+    });
+
+    expect(findSkillCheckbox('reviewer').checked).toBe(true);
+    expect(
+      fetchMock.mock.calls.filter(([input]) => {
+        const url = typeof input === 'string' ? input : input.url;
+        return url === '/api/session-skills?session=main';
+      }),
+    ).toHaveLength(2);
+
+    await act(async () => {
+      for (const transition of transitions) transition.resolve(undefined);
+      await flushMicrotasks();
+    });
+  });
+
+  it('does not remount previously visited panels on a later Console visit', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: true }));
+    const fetchMock = vi.fn<typeof fetch>((input) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config') {
+        return Promise.resolve(jsonResponse({ path: '/tmp/config.json', config: {} }));
+      }
+      if (url === '/api/session-skills?session=main') {
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            skills: [],
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    document.body.innerHTML = `
+      <div id="app-workspace"><button id="console-opener">Open</button></div>
+      <div id="workspace-portal-root"></div>
+      <section id="console-page" hidden><div id="settings-page"></div></section>
+    `;
+    const container = document.getElementById('settings-page') as HTMLDivElement;
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(React.createElement(SettingsPage));
+      await flushMicrotasks();
+      openSettingsPage('main', 'tab-skills');
+      await flushMicrotasks();
+    });
+
+    expect(document.getElementById('tab-skills-panel')).not.toBeNull();
+    expect(
+      fetchMock.mock.calls.filter(([input]) => {
+        const url = typeof input === 'string' ? input : input.url;
+        return url === '/api/session-skills?session=main';
+      }),
+    ).toHaveLength(1);
+
+    await act(async () => {
+      findCloseButton().click();
+      await flushMicrotasks();
+      openSettingsPage('main', 'tab-general');
+      await flushMicrotasks();
+    });
+
+    expect(document.getElementById('tab-general-panel')).not.toBeNull();
+    expect(document.getElementById('tab-skills-panel')).toBeNull();
+    expect(
+      fetchMock.mock.calls.filter(([input]) => {
+        const url = typeof input === 'string' ? input : input.url;
+        return url === '/api/session-skills?session=main';
+      }),
+    ).toHaveLength(1);
+  });
+
+  it('returns to and focuses the composer after inserting an MCP resource', async () => {
+    vi.stubGlobal('matchMedia', vi.fn().mockReturnValue({ matches: true }));
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config') {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              mcpServers: {
+                docs: {
+                  transport: 'streamable-http',
+                  url: 'https://docs.example/mcp',
+                  enabled: true,
+                },
+              },
+            },
+          }),
+        );
+      }
+      if (url === '/api/mcp/catalog?session=main') {
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            policy: {
+              enabledServers: ['docs'],
+              enabledTools: [],
+              confirmMutatingTools: false,
+              clientCapabilities: {},
+            },
+            servers: [
+              {
+                id: 'docs',
+                name: 'docs',
+                transport: 'streamable-http',
+                configuredEnabled: true,
+                enabled: true,
+                authenticated: false,
+                toolCount: 0,
+                resourceCount: 1,
+                promptCount: 0,
+              },
+            ],
+            tools: [],
+            resources: [{ server: 'docs', uri: 'docs://guide', name: 'Guide' }],
+            prompts: [],
+          }),
+        );
+      }
+      if (url === '/api/mcp/resource/read?session=main' && init?.method === 'POST') {
+        return Promise.resolve(jsonResponse({ ok: true, result: { text: 'Guide content' } }));
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    document.body.innerHTML = `
+      <div id="app-workspace">
+        <button id="console-opener">Open</button>
+        <textarea id="input"></textarea>
+      </div>
+      <div id="workspace-portal-root"></div>
+      <section id="console-page" hidden><div id="settings-page"></div></section>
+    `;
+    const composer = document.getElementById('input') as HTMLTextAreaElement;
+    const container = document.getElementById('settings-page') as HTMLDivElement;
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(React.createElement(SettingsPage));
+      await flushMicrotasks();
+      openSettingsPage('main', 'tab-mcp');
+      await flushMicrotasks();
+    });
+
+    await act(async () => {
+      findButtonByText('Read').click();
+      await flushMicrotasks();
+    });
+
+    expect(composer.value).toContain('Guide content');
+    expect(document.getElementById('app-workspace')?.hidden).toBe(false);
+    expect(document.getElementById('console-page')?.hidden).toBe(true);
+    expect(document.activeElement).toBe(composer);
   });
 
   it('opens a requested section and keeps the mobile section picker synchronized', async () => {
@@ -364,6 +700,147 @@ describe('SettingsPage shell layout and dirty state', () => {
     expect(document.body.textContent).toContain('You have unsaved changes.');
   });
 
+  it('does not discard a blank model draft created while another config save is in flight', async () => {
+    const pendingSave = deferred<Response>();
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config' && init?.method === 'PUT') return pendingSave.promise;
+      if (url === '/api/config') {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              settings: { port: 18989 },
+              models: {
+                providers: {
+                  gateway: {
+                    api: 'openai-completions',
+                    models: [{ id: 'model-one', input: ['text'] }],
+                  },
+                },
+              },
+            },
+            configFileEtag: 'a'.repeat(64),
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+    const save = document.getElementById('settings-save-btn');
+    if (!(save instanceof HTMLButtonElement)) throw new Error('Save button not found');
+
+    await act(async () => {
+      setInputValue(findInputByPlaceholder('18989'), '19000');
+      await flushMicrotasks();
+      save.click();
+      await flushMicrotasks();
+    });
+    await act(async () => {
+      findButtonByText('Models').click();
+      await flushMicrotasks();
+      const addModel = Array.from(document.querySelectorAll('button')).find(
+        (button) => button.textContent?.trim() === 'Add model',
+      );
+      if (!(addModel instanceof HTMLButtonElement)) throw new Error('Add model button not found');
+      addModel.click();
+      await flushMicrotasks();
+    });
+    expect(document.querySelectorAll('.models-console-card')).toHaveLength(2);
+
+    await act(async () => {
+      pendingSave.resolve(jsonResponse({ ok: true, configFileEtag: 'b'.repeat(64) }));
+      await pendingSave.promise;
+      await flushMicrotasks();
+    });
+
+    expect(document.querySelectorAll('.models-console-card')).toHaveLength(2);
+    await act(async () => {
+      findCloseButton().click();
+      await flushMicrotasks();
+    });
+    expect(document.querySelector('.settings-discard-dialog')).not.toBeNull();
+  });
+
+  it('keeps an internal model draft when a rejected save revision requires a newer readback', async () => {
+    const pendingSave = deferred<Response>();
+    let getCount = 0;
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config' && init?.method === 'PUT') {
+        return pendingSave.promise;
+      }
+      if (url === '/api/config') {
+        getCount += 1;
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              settings: { port: getCount === 1 ? 18989 : 19191 },
+              models: {
+                providers: {
+                  gateway: {
+                    api: 'openai-completions',
+                    models: [{ id: 'model-one', input: ['text'] }],
+                  },
+                },
+              },
+            },
+            configRevision: getCount === 1 ? 10 : 12,
+            configFileEtag: (getCount === 1 ? 'a' : 'c').repeat(64),
+          }),
+        );
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+    const save = document.getElementById('settings-save-btn');
+    if (!(save instanceof HTMLButtonElement)) throw new Error('Save button not found');
+    await act(async () => {
+      setInputValue(findInputByPlaceholder('18989'), '19000');
+      await flushMicrotasks();
+      save.click();
+      await flushMicrotasks();
+    });
+    await act(async () => {
+      findButtonByText('Models').click();
+      await flushMicrotasks();
+    });
+    const addModel = Array.from(document.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Add model',
+    );
+    if (!(addModel instanceof HTMLButtonElement)) throw new Error('Add model button not found');
+
+    await act(async () => {
+      addModel.click();
+      await flushMicrotasks();
+    });
+    expect(document.querySelectorAll('.models-console-card')).toHaveLength(2);
+
+    await act(async () => {
+      pendingSave.resolve(
+        jsonResponse({
+          ok: true,
+          configRevision: 9,
+          configFileEtag: 'b'.repeat(64),
+        }),
+      );
+      await pendingSave.promise;
+      await flushMicrotasks();
+    });
+    await vi.waitFor(() => expect(getCount).toBe(2));
+
+    expect(document.querySelectorAll('.models-console-card')).toHaveLength(2);
+    expect(document.body.textContent).toContain('Configuration changed elsewhere.');
+    expect(save.disabled).toBe(true);
+  });
+
   it('does not overwrite config edits made while the initial load is in flight', async () => {
     const initialLoad = deferred<Response>();
     let getCount = 0;
@@ -409,8 +886,11 @@ describe('SettingsPage shell layout and dirty state', () => {
     expect(save.disabled).toBe(true);
     expect(document.body.textContent).toContain('Configuration changed elsewhere.');
 
+    const mobileReload = document.querySelector<HTMLButtonElement>('.settings-mobile-reload');
+    expect(mobileReload?.textContent).toContain('Reload latest');
+
     await act(async () => {
-      findButtonByText('Reload latest').click();
+      mobileReload?.click();
       await flushMicrotasks();
     });
 
@@ -2524,42 +3004,41 @@ describe('SettingsPage model compat thinking format', () => {
       await flushMicrotasks();
     });
 
-    const select = document.querySelector('select[aria-label="Thinking Format"]');
-    if (!(select instanceof HTMLSelectElement)) {
-      throw new Error('Thinking Format select not found');
-    }
-    expect(select.value).toBe('qwen');
-    expect(Array.from(select.options).map((option) => option.value)).toEqual([
-      '',
-      'openai',
-      'qwen',
-      'doubao',
-      'deepseek-v4',
-      'ollama',
-      'gpt-oss',
-      'ollama-gpt-oss',
-    ]);
-
     await act(async () => {
-      select.value = 'deepseek-v4';
-      select.dispatchEvent(new Event('change', { bubbles: true }));
+      const card = document.querySelector('.models-console-card');
+      if (!(card instanceof HTMLButtonElement)) throw new Error('Model card not found');
+      card.click();
       await flushMicrotasks();
     });
-    expect(select.value).toBe('deepseek-v4');
+
+    const input = document.querySelector('input[list="models-console-thinking-formats"]');
+    if (!(input instanceof HTMLInputElement)) {
+      throw new Error('Thinking Format input not found');
+    }
+    expect(input.value).toBe('qwen');
+    expect(
+      Array.from(document.querySelectorAll('#models-console-thinking-formats option')).map(
+        (option) => (option as HTMLOptionElement).value,
+      ),
+    ).toEqual(['openai', 'qwen', 'doubao', 'deepseek-v4', 'ollama', 'gpt-oss', 'ollama-gpt-oss']);
+
+    await act(async () => {
+      setInputValue(input, 'deepseek-v4');
+      await flushMicrotasks();
+    });
+    expect(input.value).toBe('deepseek-v4');
 
     await act(async () => {
       setLanguage('zh-CN');
       await flushMicrotasks();
     });
 
-    expect(document.querySelector('select[aria-label="推理格式"]')).toBe(select);
-    expect(document.querySelector('.provider-models-title')?.textContent).toBe('模型');
-    expect(document.querySelector('input[aria-label="模型 ID"]')).not.toBeNull();
-    expect(
-      Array.from(document.querySelectorAll('.model-entry-field')).map((node) =>
-        node.firstChild?.textContent?.trim(),
-      ),
-    ).toEqual(expect.arrayContaining(['上下文窗口', '最大 Token']));
+    const inspector = document.querySelector('.models-console-inspector');
+    expect(inspector?.textContent).toContain('推理格式');
+    expect(inspector?.textContent).toContain('模型 ID');
+    expect(inspector?.textContent).toContain('上下文窗口');
+    expect(inspector?.textContent).toContain('最大 Token');
+    expect(document.querySelector('input[list="models-console-thinking-formats"]')).toBe(input);
     expect(findPrimaryTestButton().textContent).toBe('测试');
   });
 
@@ -2598,12 +3077,294 @@ describe('SettingsPage model compat thinking format', () => {
     });
 
     await act(async () => {
-      const select = document.querySelector('.provider-form select');
+      const select = document.querySelector('.models-console-connection-grid select');
       if (!(select instanceof HTMLSelectElement)) throw new Error('API type select not found');
       expect(select.value).toBe('openai-responses');
       expect(Array.from(select.options).some((option) => option.value === 'openai-responses')).toBe(
         true,
       );
     });
+  });
+
+  it('treats a newly added blank model card as an unsaved Console draft', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              models: {
+                providers: {
+                  gateway: {
+                    api: 'openai-completions',
+                    baseUrl: 'https://gateway.example/v1',
+                    apiKey: 'secret',
+                    models: [{ id: 'model-one', input: ['text'] }],
+                  },
+                },
+              },
+            },
+          }),
+        ),
+      ),
+    );
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad(undefined, 'tab-models');
+    const addModel = Array.from(document.querySelectorAll('button')).find(
+      (button) => button.textContent?.trim() === 'Add model',
+    );
+    if (!(addModel instanceof HTMLButtonElement)) throw new Error('Add model button not found');
+
+    await act(async () => {
+      addModel.click();
+      await flushMicrotasks();
+    });
+    expect(document.querySelectorAll('.models-console-card')).toHaveLength(2);
+
+    await act(async () => {
+      findCloseButton().click();
+      await flushMicrotasks();
+    });
+    expect(document.querySelector('.settings-discard-dialog')).not.toBeNull();
+    expect(document.querySelector('.console-page-surface')).not.toBeNull();
+  });
+
+  it('lets a nested provider dialog consume Escape before the Console shell', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              models: {
+                providers: {
+                  gateway: {
+                    api: 'openai-completions',
+                    models: [{ id: 'model-one' }],
+                  },
+                },
+              },
+            },
+          }),
+        ),
+      ),
+    );
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad(undefined, 'tab-models');
+    const addProvider = Array.from(document.querySelectorAll('button')).find((button) =>
+      button.textContent?.includes('Add provider'),
+    );
+    if (!(addProvider instanceof HTMLButtonElement)) {
+      throw new Error('Add provider button not found');
+    }
+    await act(async () => {
+      addProvider.click();
+      await flushMicrotasks();
+    });
+    expect(document.querySelector('[aria-modal="true"]')).not.toBeNull();
+
+    const escapedToDocument = vi.fn();
+    document.addEventListener('keydown', escapedToDocument);
+    await act(async () => {
+      const input = document.querySelector('.models-console-dialog input');
+      if (!(input instanceof HTMLInputElement)) throw new Error('Provider name input not found');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await flushMicrotasks();
+    });
+    document.removeEventListener('keydown', escapedToDocument);
+    expect(document.querySelector('[aria-modal="true"]')).toBeNull();
+    expect(escapedToDocument).not.toHaveBeenCalled();
+    expect(document.querySelector('.console-page-surface')).not.toBeNull();
+    expect(document.querySelector('.settings-discard-dialog')).toBeNull();
+  });
+
+  it('lets a model delete confirmation consume Escape before the Console shell', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              models: {
+                providers: {
+                  gateway: {
+                    api: 'openai-completions',
+                    models: [{ id: 'model-one' }],
+                  },
+                },
+              },
+            },
+          }),
+        ),
+      ),
+    );
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad(undefined, 'tab-models');
+    await act(async () => {
+      const card = document.querySelector<HTMLButtonElement>('.models-console-card');
+      card?.click();
+      await flushMicrotasks();
+      const remove = document.querySelector<HTMLButtonElement>('.models-console-delete-button');
+      remove?.click();
+      await flushMicrotasks();
+    });
+    expect(document.querySelector('.models-console-inspector-confirm')).not.toBeNull();
+
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await flushMicrotasks();
+    });
+
+    expect(document.querySelector('.models-console-inspector-confirm')).toBeNull();
+    expect(document.querySelector('.console-page-surface')).not.toBeNull();
+    expect(document.querySelector('.settings-discard-dialog')).toBeNull();
+  });
+
+  it('ignores hidden persistent modals when Escape dismisses the discard prompt', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: { settings: { port: 18989 } },
+          }),
+        ),
+      ),
+    );
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+    await act(async () => {
+      setInputValue(findInputByPlaceholder('18989'), '19000');
+      await flushMicrotasks();
+      findCloseButton().click();
+      await flushMicrotasks();
+    });
+    expect(document.querySelector('.settings-discard-dialog')).not.toBeNull();
+
+    const hiddenModal = document.createElement('div');
+    hiddenModal.hidden = true;
+    hiddenModal.setAttribute('aria-modal', 'true');
+    document.body.append(hiddenModal);
+    await act(async () => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      await flushMicrotasks();
+    });
+
+    expect(document.querySelector('.settings-discard-dialog')).toBeNull();
+    expect(document.querySelector('.console-page-surface')).not.toBeNull();
+  });
+
+  it('keeps General available as the recovery route for corrupt configuration', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            parse_error: 'unexpected token',
+            raw: '{',
+          }),
+        ),
+      ),
+    );
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad(undefined, 'tab-usage');
+    const general = document.querySelector<HTMLButtonElement>('[data-tab="tab-general"]');
+    const agents = document.querySelector<HTMLButtonElement>('[data-tab="tab-agents"]');
+    expect(general?.disabled).toBe(false);
+    expect(agents?.disabled).toBe(true);
+
+    await act(async () => {
+      general?.focus();
+      general?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowRight', bubbles: true }));
+      await flushMicrotasks();
+    });
+    const usage = document.querySelector<HTMLButtonElement>('[data-tab="tab-usage"]');
+    expect(usage?.getAttribute('aria-selected')).toBe('true');
+
+    await act(async () => {
+      usage?.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true }));
+      await flushMicrotasks();
+    });
+    expect(general?.getAttribute('aria-selected')).toBe('true');
+    expect(document.body.textContent).toContain('Config file has syntax errors');
+  });
+
+  it('opens corrupt configuration directly on the General recovery editor', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(() =>
+        Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            parse_error: 'unexpected token',
+            raw: '{',
+          }),
+        ),
+      ),
+    );
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad(undefined, 'tab-models');
+
+    expect(document.querySelector('[data-tab="tab-general"]')?.getAttribute('aria-selected')).toBe(
+      'true',
+    );
+    expect(document.getElementById('tab-general-panel')?.hasAttribute('hidden')).toBe(false);
+    expect(document.querySelector<HTMLTextAreaElement>('.json-editor')?.value).toBe('{');
+  });
+
+  it('preserves a corrupt-config recovery draft while visiting Usage', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>((input) => {
+        const url = typeof input === 'string' ? input : input.url;
+        if (url === '/api/config') {
+          return Promise.resolve(
+            jsonResponse({
+              path: '/tmp/config.json',
+              parse_error: 'unexpected token',
+              raw: '{',
+            }),
+          );
+        }
+        if (url.startsWith('/api/usage')) return Promise.resolve(jsonResponse({}));
+        throw new Error(`Unexpected fetch URL: ${url}`);
+      }),
+    );
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+    const editor = document.querySelector<HTMLTextAreaElement>('.json-editor');
+    if (!editor) throw new Error('Recovery editor not found');
+    await act(async () => {
+      setTextareaValue(editor, '{"settings":{"port":19000}}');
+      findButtonByText('Token Usage').click();
+      await flushMicrotasks();
+    });
+
+    expect(document.getElementById('tab-general-panel')?.hasAttribute('hidden')).toBe(true);
+    await act(async () => {
+      findButtonByText('General').click();
+      await flushMicrotasks();
+    });
+    expect(document.querySelector<HTMLTextAreaElement>('.json-editor')?.value).toBe(
+      '{"settings":{"port":19000}}',
+    );
+
+    await act(async () => {
+      findCloseButton().click();
+      await flushMicrotasks();
+    });
+    expect(document.querySelector('.settings-discard-dialog')).not.toBeNull();
   });
 });
