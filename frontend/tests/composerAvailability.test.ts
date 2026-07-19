@@ -218,6 +218,7 @@ describe('composer model availability', () => {
     expect(dom.composerAvailabilityStatus?.hidden).toBe(false);
     expect(dom.composerAvailabilityAction?.hidden).toBe(false);
     expect(dom.composerAvailabilityAction?.textContent).toBe('Configure models');
+    expect(dom.inputArea?.classList.contains('has-composer-unavailable')).toBe(true);
     expect(composerAvailabilityResolution()).toBe('configure-models');
 
     setLanguage('zh-CN');
@@ -796,12 +797,14 @@ describe('composer model availability', () => {
     syncComposerAvailability();
     expect(dom.sendBtn?.disabled).toBe(true);
     expect(dom.input?.placeholder).toBe('Select at least one group member before sending.');
+    expect(dom.inputArea?.classList.contains('has-composer-unavailable')).toBe(false);
 
     state.groupTargetMode = 'mentions';
     dom.input!.value = 'Please review this without a mention';
     syncComposerAvailability();
     expect(dom.sendBtn?.disabled).toBe(true);
     expect(dom.input?.placeholder).toBe('Mention at least one group member before sending.');
+    expect(dom.inputArea?.classList.contains('has-composer-unavailable')).toBe(false);
   });
 
   it('does not reuse Group member readiness during a socket handshake', () => {

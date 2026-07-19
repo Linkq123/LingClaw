@@ -339,13 +339,14 @@ export function syncComposerAvailability(): void {
   const fullReason = canSubmit ? '' : tr(key, vars);
   const compactKey = compactStatusKey(state.composerModelAvailability);
   const compactLabel = compactKey ? tr(compactKey) : '';
+  const useUnavailableComposerLayout = !canSubmit && key.startsWith('composer.');
   const activeElement = document.activeElement;
   const returnFocusFromRecovery = Boolean(
     (activeElement === dom.composerAvailabilityAction && (!visibleStatus || resolution === null)) ||
     (activeElement === dom.composerAvailabilityRetry && (!visibleStatus || !retryVisible)),
   );
   if (dom.inputArea) {
-    dom.inputArea.classList.toggle('has-composer-unavailable', !canSubmit);
+    dom.inputArea.classList.toggle('has-composer-unavailable', useUnavailableComposerLayout);
     dom.inputArea.dataset.composerAvailability = canSubmit
       ? 'ready'
       : state.composerModelAvailability;
