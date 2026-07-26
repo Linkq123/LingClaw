@@ -25,6 +25,7 @@ import {
   areGroupMessageTargetsModelReady,
   beginComposerSessionTransition,
   canBypassComposerModelGate,
+  canSendWhileStorageProtected,
   isComposerModelReady,
   syncComposerAvailability,
 } from './composerAvailability.js';
@@ -446,6 +447,9 @@ export function send() {
 
   const text = dom.input.value.trim();
   if (!text && state.pendingImages.length === 0) return;
+  const protectedReadOnlyCommand =
+    state.storageMode === 'protected' && canSendWhileStorageProtected(text);
+  if (state.storageMode === 'protected' && !protectedReadOnlyCommand) return;
 
   if (state.activeGroupId) {
     if (state.imageUploadInFlight) return;
@@ -595,6 +599,7 @@ export function sendCmd(cmd) {
   if ((!canSendWhileBusy(normalizedCmd) && state.busy) || !state.ws || state.ws.readyState !== 1) {
     return;
   }
+  if (state.storageMode === 'protected' && !canSendWhileStorageProtected(normalizedCmd)) return;
   setBusy(true);
   state.ws.send(normalizedCmd);
 }

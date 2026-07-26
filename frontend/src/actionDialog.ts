@@ -453,9 +453,9 @@ async function submitActionDialog(): Promise<void> {
   }
 }
 
-function closeActionDialog(result: ActionDialogResult | null): void {
+function closeActionDialog(result: ActionDialogResult | null, force = false): void {
   const dialog = activeDialog;
-  if (!dialog || dialog.busy) return;
+  if (!dialog || (dialog.busy && !force)) return;
   activeDialog = null;
   dialog.overlay.remove();
   document.body.classList.remove('action-dialog-open');
@@ -557,5 +557,11 @@ export function hasOpenActionDialog(): boolean {
 export function dismissActionDialog(): boolean {
   if (!activeDialog || activeDialog.busy) return false;
   closeActionDialog(null);
+  return true;
+}
+
+export function forceDismissActionDialog(): boolean {
+  if (!activeDialog) return false;
+  closeActionDialog(null, true);
   return true;
 }

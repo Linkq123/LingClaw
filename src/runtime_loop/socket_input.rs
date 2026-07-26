@@ -3,7 +3,6 @@ use super::*;
 use std::collections::HashSet;
 
 use crate::prompts::build_system_prompt;
-use crate::session_store::load_session_from_disk;
 use crate::socket_sync::broadcast_session_list_payload;
 use serde::Deserialize;
 use serde_json::json;
@@ -115,7 +114,12 @@ pub(crate) async fn ensure_session_ready(
         Some(id) => crate::session_store::validate_session_id(id)?.to_string(),
         None => MAIN_SESSION_ID.to_string(),
     };
-    let saved_session_id = crate::session_store::canonical_saved_session_id(&session_id);
+    // Serialize creation and canonical lookup using the same gate as persistence.
+    // On Windows the gate key is case-insensitive, so concurrent aliases cannot
+    // both observe a missing Session and create separate durable rows.
+    let persist_gate = crate::session_store::session_persist_gate(&session_id);
+    let _persist_guard = persist_gate.lock().await;
+    let saved_session_id = crate::session_store::canonical_saved_session_id_result(&session_id)?;
     let effective_session_id = saved_session_id
         .as_deref()
         .unwrap_or(&session_id)
@@ -142,57 +146,80 @@ pub(crate) async fn ensure_session_ready(
     } else {
         effective_session_id.clone()
     };
-    let persisted_session_path =
-        crate::session_store::sessions_dir().join(format!("{effective_session_id}.json"));
-    let persisted_session_tmp_path =
-        crate::session_store::sessions_dir().join(format!("{effective_session_id}.json.tmp"));
-    let persisted_session_exists = saved_session_id.is_some()
-        || match tokio::fs::try_exists(&persisted_session_path).await {
-            Ok(exists) => exists,
-            Err(err) => {
+    #[cfg(not(test))]
+    let persisted_session_exists = saved_session_id.is_some();
+    #[cfg(test)]
+    let persisted_session_exists = {
+        let persisted_session_path =
+            crate::session_store::sessions_dir().join(format!("{effective_session_id}.json"));
+        let persisted_session_tmp_path =
+            crate::session_store::sessions_dir().join(format!("{effective_session_id}.json.tmp"));
+        saved_session_id.is_some()
+            || match tokio::fs::try_exists(&persisted_session_path).await {
+                Ok(exists) => exists,
+                Err(err) => {
+                    return Err(format!(
+                        "Failed to inspect persisted session '{}': {err}",
+                        session_id
+                    ));
+                }
+            }
+            || match tokio::fs::try_exists(&persisted_session_tmp_path).await {
+                Ok(exists) => exists,
+                Err(err) => {
+                    return Err(format!(
+                        "Failed to inspect persisted session '{}': {err}",
+                        session_id
+                    ));
+                }
+            }
+    };
+    let mut cleanup_fresh_workspace = false;
+    let (mut session, created_fresh) =
+        match crate::session_store::load_session_from_storage_result(&effective_session_id)? {
+            Some(session) => (session, false),
+            None if persisted_session_exists => {
                 return Err(format!(
-                    "Failed to inspect persisted session '{}': {err}",
-                    session_id
+                    "Session '{}' is corrupt and could not be loaded.",
+                    effective_session_id
                 ));
             }
-        }
-        || match tokio::fs::try_exists(&persisted_session_tmp_path).await {
-            Ok(exists) => exists,
-            Err(err) => {
-                return Err(format!(
-                    "Failed to inspect persisted session '{}': {err}",
-                    session_id
-                ));
+            None => {
+                if !state.storage_is_writable() {
+                    return Err(
+                        "Local storage is in protected mode. Repair it and restart LingClaw."
+                            .to_string(),
+                    );
+                }
+                cleanup_fresh_workspace =
+                    !crate::session_workspace_path(&effective_session_id).exists();
+                let mut session = Session::new_with_id(&effective_session_id, &display_name);
+                let model = session.effective_model(&config.model).to_string();
+                let sys = build_system_prompt(
+                    &config,
+                    &session.workspace,
+                    &model,
+                    &session.enabled_system_skills,
+                );
+                session.messages.push(sys);
+                (session, true)
             }
         };
-    let (mut session, created_fresh) = match load_session_from_disk(&effective_session_id) {
-        Some(session) => (session, false),
-        None if persisted_session_exists => {
-            return Err(format!(
-                "Session '{}' is corrupt and could not be loaded.",
-                effective_session_id
-            ));
-        }
-        None => {
-            let mut session = Session::new_with_id(&effective_session_id, &display_name);
-            let model = session.effective_model(&config.model).to_string();
-            let sys = build_system_prompt(
-                &config,
-                &session.workspace,
-                &model,
-                &session.enabled_system_skills,
-            );
-            session.messages.push(sys);
-            (session, true)
-        }
-    };
     refresh_session_system_prompt(state, &mut session);
 
-    if created_fresh && let Err(error) = save_session_to_disk(&session).await {
-        eprintln!(
-            "Warning: failed to persist session {} on creation: {error}; keeping in memory",
+    if created_fresh
+        && let Err(error) = crate::session_store::save_session_to_disk_locked(&session).await
+    {
+        if cleanup_fresh_workspace {
+            crate::session_control::cleanup_failed_created_session(
+                &effective_session_id,
+                &session.workspace,
+            );
+        }
+        return Err(format!(
+            "Failed to persist newly created Session '{}': {error}",
             effective_session_id
-        );
+        ));
     }
 
     let final_session_id = session.id.clone();
@@ -251,20 +278,23 @@ pub(crate) async fn resolve_or_create_socket_session(
     }
 }
 
-pub(crate) async fn known_session_ids(state: &AppState) -> HashSet<String> {
+pub(crate) async fn known_session_ids(state: &AppState) -> Result<HashSet<String>, String> {
     let mut known_ids =
-        crate::session_store::list_saved_session_ids_in_dir(&crate::session_store::sessions_dir());
+        crate::session_store::list_saved_session_ids_result(&crate::session_store::sessions_dir())
+            .map_err(|_| {
+                "Local storage is in protected mode. Repair it and restart LingClaw.".to_string()
+            })?;
     let sessions = state.sessions.lock().await;
     known_ids.extend(sessions.keys().cloned());
     known_ids.insert(MAIN_SESSION_ID.to_string());
-    known_ids
+    Ok(known_ids)
 }
 
 pub(crate) async fn resolve_session_target_for_command(
     state: &AppState,
     target: &str,
 ) -> Result<String, String> {
-    let known_ids = known_session_ids(state).await;
+    let known_ids = known_session_ids(state).await?;
     crate::session_store::resolve_session_target(target, &known_ids)
 }
 
@@ -309,6 +339,11 @@ pub(crate) async fn handle_idle_socket_input(
                 }),
             )
             .await;
+            return IdleSocketInputAction::Continue;
+        }
+
+        if !state.storage_is_writable() {
+            crate::send_storage_status(tx, state).await;
             return IdleSocketInputAction::Continue;
         }
 
@@ -366,6 +401,31 @@ pub(crate) async fn handle_idle_socket_input(
         )
         .await;
         return IdleSocketInputAction::Continue;
+    }
+
+    if !state.storage_is_writable() {
+        let command = trimmed
+            .strip_prefix('/')
+            .and_then(|value| value.split_whitespace().next())
+            .unwrap_or_default();
+        let read_only_command = matches!(
+            command.to_ascii_lowercase().as_str(),
+            "help" | "status" | "usage" | "sessions"
+        );
+        if !read_only_command {
+            ws_send(
+                tx,
+                &json!({
+                    "type": "storage_status",
+                    "storage": {
+                        "mode": "protected",
+                        "code": "storage_protected",
+                    },
+                }),
+            )
+            .await;
+            return IdleSocketInputAction::Continue;
+        }
     }
 
     if trimmed.starts_with('/') {
@@ -620,25 +680,29 @@ pub(crate) async fn handle_idle_socket_input(
                         .await;
                         return IdleSocketInputAction::Continue;
                     }
-                    let execute_plan_error = {
+                    let persist_gate =
+                        crate::session_store::session_persist_gate(current_session_id);
+                    let _persist_guard = persist_gate.lock().await;
+                    let execute_plan_mutation = {
                         let mut sessions = state.sessions.lock().await;
                         match sessions.get_mut(current_session_id) {
-                            None => Some(json!({
+                            None => Err(json!({
                                 "type":"error",
                                 "content":"Current session not found.",
                             })),
                             Some(session) => match session.pending_plan.as_ref().cloned() {
-                                None => Some(json!({
+                                None => Err(json!({
                                     "type":"system",
                                     "content":"No pending plan is available to execute.",
                                     "dismissible": true,
                                 })),
-                                Some(pending_plan) if pending_plan.id != plan_id => Some(json!({
+                                Some(pending_plan) if pending_plan.id != plan_id => Err(json!({
                                     "type":"system",
                                     "content":"The requested plan is no longer pending for this session.",
                                     "dismissible": true,
                                 })),
                                 Some(_) => {
+                                    let previous_session = session.clone();
                                     let execution_message = approved_plan_execution_message();
                                     session.pending_plan = None;
                                     session.messages.push(ChatMessage {
@@ -652,28 +716,57 @@ pub(crate) async fn handle_idle_socket_input(
                                         timestamp: Some(now_epoch()),
                                     });
                                     session.updated_at = now_epoch();
-                                    None
+                                    Ok((previous_session, session.clone()))
                                 }
                             },
                         }
                     };
-                    if let Some(event) = execute_plan_error {
+                    let (previous_session, session_to_save) = match execute_plan_mutation {
+                        Ok(mutation) => mutation,
+                        Err(event) => {
+                            drop(_persist_guard);
+                            super::release_agent_run_reservation(
+                                state,
+                                current_session_id,
+                                &reservation,
+                            )
+                            .await;
+                            ws_send(tx, &event).await;
+                            return IdleSocketInputAction::Continue;
+                        }
+                    };
+                    if let Err(error) =
+                        crate::session_store::save_session_to_disk_locked(&session_to_save).await
+                    {
+                        {
+                            let mut sessions = state.sessions.lock().await;
+                            if let Some(session) = sessions.get_mut(current_session_id) {
+                                *session = previous_session;
+                            }
+                        }
+                        drop(_persist_guard);
                         super::release_agent_run_reservation(
                             state,
                             current_session_id,
                             &reservation,
                         )
                         .await;
-                        ws_send(tx, &event).await;
+                        eprintln!(
+                            "ERROR: failed to persist session before executing an approved plan: {error}"
+                        );
+                        crate::send_storage_status(tx, state).await;
+                        if state.storage_is_writable() {
+                            ws_send(
+                                tx,
+                                &json!({
+                                    "type":"error",
+                                    "content":"The approved plan could not be saved, so the Agent run was not started.",
+                                    "dismissible":true,
+                                }),
+                            )
+                            .await;
+                        }
                         return IdleSocketInputAction::Continue;
-                    }
-                    if let Err(e) = crate::session_store::save_current_session_to_disk(
-                        state,
-                        current_session_id,
-                    )
-                    .await
-                    {
-                        eprintln!("Warning: failed to save session before executing plan: {e}");
                     }
                     return IdleSocketInputAction::StartAgent {
                         run_mode: AgentRunMode::Execute,
@@ -962,9 +1055,12 @@ pub(crate) async fn handle_idle_socket_input(
         return IdleSocketInputAction::Continue;
     }
 
-    let appended = {
+    let persist_gate = crate::session_store::session_persist_gate(current_session_id);
+    let _persist_guard = persist_gate.lock().await;
+    let mutation = {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(current_session_id) {
+            let previous_session = session.clone();
             session.messages.push(ChatMessage {
                 role: "user".into(),
                 content: Some(msg_text),
@@ -977,13 +1073,14 @@ pub(crate) async fn handle_idle_socket_input(
             });
             session.pending_plan = None;
             session.updated_at = now_epoch();
-            true
+            Some((previous_session, session.clone()))
         } else {
-            false
+            None
         }
     };
 
-    if !appended {
+    let Some((previous_session, session_to_save)) = mutation else {
+        drop(_persist_guard);
         super::release_agent_run_reservation(state, current_session_id, &reservation).await;
         ws_send(
             tx,
@@ -994,12 +1091,31 @@ pub(crate) async fn handle_idle_socket_input(
         )
         .await;
         return IdleSocketInputAction::Continue;
-    }
+    };
 
-    if let Err(e) =
-        crate::session_store::save_current_session_to_disk(state, current_session_id).await
-    {
-        eprintln!("Warning: failed to save session before starting agent: {e}");
+    if let Err(error) = crate::session_store::save_session_to_disk_locked(&session_to_save).await {
+        {
+            let mut sessions = state.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(current_session_id) {
+                *session = previous_session;
+            }
+        }
+        drop(_persist_guard);
+        super::release_agent_run_reservation(state, current_session_id, &reservation).await;
+        eprintln!("ERROR: failed to persist session before starting Agent: {error}");
+        crate::send_storage_status(tx, state).await;
+        if state.storage_is_writable() {
+            ws_send(
+                tx,
+                &json!({
+                    "type":"error",
+                    "content":"The message could not be saved, so the Agent run was not started.",
+                    "dismissible":true,
+                }),
+            )
+            .await;
+        }
+        return IdleSocketInputAction::Continue;
     }
 
     IdleSocketInputAction::StartAgent {
@@ -1017,15 +1133,25 @@ pub(super) async fn persist_pending_interventions(
     if pending_interventions.is_empty() {
         return false;
     }
+    if !state.storage_is_writable() {
+        return false;
+    }
+
+    let persist_gate = crate::session_store::session_persist_gate(current_session_id);
+    let _persist_guard = persist_gate.lock().await;
+    if !state.storage_is_writable() {
+        return false;
+    }
 
     let drained = std::mem::take(pending_interventions);
-    let changed = {
+    let mutation = {
         let mut sessions = state.sessions.lock().await;
         if let Some(session) = sessions.get_mut(current_session_id) {
-            for text in drained {
+            let previous = session.clone();
+            for text in &drained {
                 session.messages.push(ChatMessage {
                     role: "user".into(),
-                    content: Some(text),
+                    content: Some(text.clone()),
                     images: None,
                     thinking: None,
                     anthropic_thinking_blocks: None,
@@ -1036,19 +1162,30 @@ pub(super) async fn persist_pending_interventions(
             }
             session.pending_plan = None;
             session.updated_at = now_epoch();
-            true
+            Some((previous, session.clone()))
         } else {
-            false
+            None
         }
     };
 
-    if changed
-        && let Err(e) =
-            crate::session_store::save_current_session_to_disk(state, current_session_id).await
-    {
-        eprintln!("Warning: failed to save pending interventions: {e}");
+    let Some((previous, session_to_save)) = mutation else {
+        pending_interventions.extend(drained);
+        return false;
+    };
+
+    if let Err(error) = crate::session_store::save_session_to_disk_locked(&session_to_save).await {
+        let mut sessions = state.sessions.lock().await;
+        if sessions.get(current_session_id).is_some_and(|current| {
+            serde_json::to_vec(current).ok() == serde_json::to_vec(&session_to_save).ok()
+        }) {
+            sessions.insert(current_session_id.to_string(), previous);
+        }
+        pending_interventions.extend(drained);
+        eprintln!("ERROR: failed to save pending interventions: {error}");
+        return false;
     }
-    changed
+
+    true
 }
 
 pub(super) async fn drain_shared_interventions(
@@ -1187,7 +1324,13 @@ async fn build_busy_command_events(
         events.push(payload);
     }
     if result.session_list_changed {
-        events.push(crate::socket_sync::build_session_list_payload(state));
+        match crate::socket_sync::build_session_list_payload(state) {
+            Ok(payload) => events.push(payload),
+            Err(_) => events.push(json!({
+                "type": "storage_status",
+                "storage": crate::storage_status_payload(state),
+            })),
+        }
     }
 
     Some(events)
@@ -1228,6 +1371,7 @@ pub(super) async fn drain_busy_socket_messages(
     run_cancel: &CancellationToken,
 ) -> bool {
     let mut drained = 0;
+    let mut storage_status_sent = false;
     while drained < MAX_DRAIN_PER_TICK {
         let msg = match inbound_rx.try_recv() {
             Ok(msg) => msg,
@@ -1238,6 +1382,20 @@ pub(super) async fn drain_busy_socket_messages(
         if trimmed.eq_ignore_ascii_case("/stop") {
             run_cancel.cancel();
             return true;
+        }
+        if !state.storage_is_writable() {
+            if !storage_status_sent {
+                let _ = live_send(
+                    live_tx,
+                    json!({
+                        "type": "storage_status",
+                        "storage": crate::storage_status_payload(state),
+                    }),
+                )
+                .await;
+                storage_status_sent = true;
+            }
+            continue;
         }
         if let Some(events) = build_busy_command_events(trimmed, current_session_id, state).await {
             for event in events {

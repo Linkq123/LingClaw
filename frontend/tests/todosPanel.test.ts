@@ -33,6 +33,7 @@ describe('todos panel', () => {
     dom.todosPanel = null;
     dom.chat = document.getElementById('chat');
     state.activeSessionId = 'session-alpha';
+    state.storageMode = 'healthy';
     state.showTodos = true;
     state.sessionSwitchInFlight = false;
     state.todoDrafts = new Map();
@@ -48,6 +49,7 @@ describe('todos panel', () => {
     dom.todosPanel = null;
     dom.chat = null;
     state.activeSessionId = '';
+    state.storageMode = 'healthy';
     state.showTodos = true;
     state.sessionSwitchInFlight = false;
     state.todoDrafts = new Map();
@@ -120,6 +122,20 @@ describe('todos panel', () => {
 
     addButton?.click();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('disables todo edits while storage is protected', () => {
+    state.storageMode = 'protected';
+    applyTodosState({
+      type: 'todos_state',
+      revision: 1,
+      items: [{ id: 'todo-1', content: 'Keep readable', status: 'pending' }],
+      last_updated_by: 'assistant',
+      updated_at: 0,
+    });
+
+    expect(dom.todosPanel?.querySelector<HTMLInputElement>('.todo-row-input')?.disabled).toBe(true);
+    expect(dom.todosPanel?.querySelector<HTMLButtonElement>('.todos-add-btn')?.disabled).toBe(true);
   });
 
   it('sends PUT requests for status changes, text edits, reorders, deletes, and adds', async () => {

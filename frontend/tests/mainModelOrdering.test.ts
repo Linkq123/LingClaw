@@ -767,4 +767,45 @@ describe('main model payload ordering', () => {
       document.querySelector('.group-member-menu-trigger[data-session-id="worker-a"]'),
     );
   });
+
+  it('applies the sticky storage protection event to workspace write controls', () => {
+    const currentSocket = FakeWebSocket.instances.at(-1)!;
+    stateModule.state.composerModelAvailability = 'ready';
+    stateModule.state.composerEffectiveModelConfigured = true;
+    stateModule.state.composerSessionIdentityPending = false;
+    stateModule.state.sessionSwitchInFlight = false;
+    stateModule.state.sessionIdentityMutationInFlight = false;
+    stateModule.state.busy = true;
+    stateModule.state.pendingDeleteSessionId = 'worker-a';
+    stateModule.state.activeGroupRunIds.add('run-storage-protected');
+    if (stateModule.dom.stopBtn) {
+      stateModule.dom.stopBtn.style.display = 'flex';
+      stateModule.dom.stopBtn.disabled = false;
+    }
+
+    currentSocket.receive({
+      type: 'storage_status',
+      storage: { mode: 'protected', code: 'storage_protected' },
+    });
+
+    expect(stateModule.state.storageMode).toBe('protected');
+    expect(document.documentElement.dataset.storageMode).toBe('protected');
+    expect(stateModule.state.busy).toBe(false);
+    expect(stateModule.state.pendingDeleteSessionId).toBe('');
+    expect(stateModule.state.activeGroupRunIds.size).toBe(0);
+    expect(stateModule.dom.stopBtn?.disabled).toBe(true);
+    expect(stateModule.dom.sendBtn?.disabled).toBe(true);
+    expect(stateModule.dom.sessionDrawerNewBtn?.disabled).toBe(true);
+    expect(stateModule.dom.input?.placeholder).toContain('protected mode');
+    expect(
+      document.querySelector<HTMLButtonElement>(
+        'button[data-action="cmd-close-menu"][data-cmd="/clear"]',
+      )?.disabled,
+    ).toBe(true);
+    expect(
+      document.querySelector<HTMLButtonElement>(
+        '.group-member-menu-trigger[data-session-id="worker-a"]',
+      )?.disabled,
+    ).toBe(true);
+  });
 });

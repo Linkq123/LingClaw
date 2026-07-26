@@ -2,11 +2,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
-    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
 
-use crate::{MAIN_SESSION_ID, config_dir_path, now_epoch};
+#[cfg(test)]
+use std::path::{Path, PathBuf};
+
+use crate::{MAIN_SESSION_ID, now_epoch};
+
+#[cfg(test)]
+use crate::config_dir_path;
 
 pub(crate) const GROUP_VERSION: u32 = 2;
 
@@ -17,6 +22,7 @@ const STALE_GROUP_RUN_ERROR: &str = "Run stopped because the server restarted be
 type GroupPersistGateLock =
     OnceLock<Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 static GROUP_PERSIST_GATES: GroupPersistGateLock = OnceLock::new();
+static GROUP_ROSTER_GATE: OnceLock<Arc<tokio::sync::Mutex<()>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SessionGroup {
@@ -137,6 +143,7 @@ impl SessionGroupSummary {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn corrupt(id: String) -> Self {
         Self {
             id,
@@ -175,6 +182,7 @@ pub(crate) fn group_has_active_runs(group: &SessionGroup) -> bool {
         .any(|run| is_active_group_run_status(&run.status))
 }
 
+#[cfg(test)]
 pub(crate) fn groups_dir() -> PathBuf {
     config_dir_path()
         .unwrap_or_else(|| PathBuf::from(".lingclaw"))
@@ -187,12 +195,24 @@ fn group_persist_gates()
 }
 
 pub(crate) fn group_persist_gate(group_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let group_id = validate_group_id(group_id).unwrap_or(group_id.trim());
+    let group_id = if cfg!(windows) {
+        group_id.to_ascii_lowercase()
+    } else {
+        group_id.to_string()
+    };
     let mut guard = group_persist_gates()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     guard
-        .entry(group_id.to_string())
+        .entry(group_id)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+pub(crate) fn group_roster_gate() -> Arc<tokio::sync::Mutex<()>> {
+    GROUP_ROSTER_GATE
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
 
@@ -300,7 +320,7 @@ pub(crate) fn generate_available_group_id() -> Result<String, String> {
         if validate_group_id(&id).is_err() {
             continue;
         }
-        if canonical_saved_group_id(&id).is_some() {
+        if canonical_saved_group_id_result(&id)?.is_some() {
             continue;
         }
         return Ok(id);
@@ -308,14 +328,17 @@ pub(crate) fn generate_available_group_id() -> Result<String, String> {
     Err("Failed to generate a unique group id".to_string())
 }
 
+#[cfg(test)]
 pub(crate) fn group_path(id: &str) -> PathBuf {
     groups_dir().join(format!("{id}.json"))
 }
 
+#[cfg(test)]
 fn tmp_group_path(id: &str) -> PathBuf {
     groups_dir().join(format!("{id}.json.tmp"))
 }
 
+#[cfg(test)]
 fn group_file_id(path: &Path) -> Option<String> {
     let file_name = path.file_name().and_then(|name| name.to_str())?;
     let id = file_name
@@ -324,6 +347,7 @@ fn group_file_id(path: &Path) -> Option<String> {
     validate_group_id(id).ok().map(str::to_string)
 }
 
+#[cfg(test)]
 fn saved_group_file_ids() -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -340,6 +364,7 @@ fn saved_group_file_ids() -> Vec<String> {
     out
 }
 
+#[cfg(test)]
 pub(crate) fn load_group_from_path(path: &Path) -> Option<SessionGroup> {
     let data = std::fs::read_to_string(path).ok()?;
     let mut group: SessionGroup = serde_json::from_str(&data).ok()?;
@@ -376,55 +401,113 @@ pub(crate) fn normalize_group(group: &mut SessionGroup) {
     }
 }
 
+pub(crate) fn load_group_from_storage_result(id: &str) -> Result<Option<SessionGroup>, String> {
+    #[cfg(not(test))]
+    {
+        let Some(id) = canonical_saved_group_id_result(id)? else {
+            return Ok(None);
+        };
+        crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .load_group_blocking(&id)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    {
+        let Some(id) =
+            canonical_saved_group_id(id).or_else(|| validate_group_id(id).ok().map(str::to_string))
+        else {
+            return Ok(None);
+        };
+        let path = group_path(&id);
+        let tmp_path = tmp_group_path(&id);
+        let primary = load_group_from_path(&path);
+        let tmp_available = tmp_path.exists();
+        Ok(match (primary, tmp_available) {
+            (Some(group), false) => Some(group),
+            (None, true) => load_group_from_path(&tmp_path),
+            (Some(group), true) => {
+                let primary_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                let tmp_mtime = std::fs::metadata(&tmp_path).and_then(|m| m.modified()).ok();
+                if tmp_mtime >= primary_mtime {
+                    load_group_from_path(&tmp_path).or(Some(group))
+                } else {
+                    let _ = std::fs::remove_file(tmp_path);
+                    Some(group)
+                }
+            }
+            (None, false) => None,
+        })
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn load_group_from_disk(id: &str) -> Option<SessionGroup> {
-    let id =
-        canonical_saved_group_id(id).or_else(|| validate_group_id(id).ok().map(str::to_string))?;
-    let path = group_path(&id);
-    let tmp_path = tmp_group_path(&id);
-    let primary = load_group_from_path(&path);
-    let tmp_available = tmp_path.exists();
-    match (primary, tmp_available) {
-        (Some(group), false) => Some(group),
-        (None, true) => load_group_from_path(&tmp_path),
-        (Some(group), true) => {
-            let primary_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-            let tmp_mtime = std::fs::metadata(&tmp_path).and_then(|m| m.modified()).ok();
-            if tmp_mtime >= primary_mtime {
-                load_group_from_path(&tmp_path).or(Some(group))
-            } else {
-                let _ = std::fs::remove_file(tmp_path);
-                Some(group)
+    load_group_from_storage_result(id).ok().flatten()
+}
+
+pub(crate) fn canonical_saved_group_id_result(id: &str) -> Result<Option<String>, String> {
+    #[cfg(not(test))]
+    {
+        let id = validate_group_id(id)?;
+        crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .canonical_group_id_blocking(id)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    {
+        let id = match validate_group_id(id) {
+            Ok(id) => id,
+            Err(_) => return Ok(None),
+        };
+        let mut fallback = None;
+        for saved_id in saved_group_file_ids() {
+            if saved_id == id {
+                return Ok(Some(saved_id));
+            }
+            if cfg!(windows) && saved_id.eq_ignore_ascii_case(id) {
+                fallback = Some(saved_id);
             }
         }
-        (None, false) => None,
+        Ok(fallback)
     }
 }
 
+#[cfg(test)]
 pub(crate) fn canonical_saved_group_id(id: &str) -> Option<String> {
-    let id = validate_group_id(id).ok()?;
-    let mut fallback = None;
-    for saved_id in saved_group_file_ids() {
-        if saved_id == id {
-            return Some(saved_id);
-        }
-        if cfg!(windows) && saved_id.eq_ignore_ascii_case(id) {
-            fallback = Some(saved_id);
-        }
-    }
-    fallback
+    canonical_saved_group_id_result(id).ok().flatten()
 }
 
-pub(crate) fn list_saved_group_summaries() -> Vec<SessionGroupSummary> {
-    let mut out = Vec::new();
-    for id in saved_group_file_ids() {
-        if let Some(group) = load_group_from_disk(&id) {
-            out.push(SessionGroupSummary::from_group(&group));
-        } else {
-            out.push(SessionGroupSummary::corrupt(id));
-        }
+pub(crate) fn list_saved_group_summaries_result() -> Result<Vec<SessionGroupSummary>, String> {
+    #[cfg(not(test))]
+    {
+        crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .list_group_summaries_blocking()
+            .map_err(|error| error.to_string())
     }
-    sort_group_summaries(&mut out);
-    out
+
+    #[cfg(test)]
+    {
+        let mut out = Vec::new();
+        for id in saved_group_file_ids() {
+            if let Some(group) = load_group_from_disk(&id) {
+                out.push(SessionGroupSummary::from_group(&group));
+            } else {
+                out.push(SessionGroupSummary::corrupt(id));
+            }
+        }
+        sort_group_summaries(&mut out);
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn list_saved_group_summaries() -> Vec<SessionGroupSummary> {
+    list_saved_group_summaries_result().unwrap_or_default()
 }
 
 fn mark_stale_active_runs(group: &mut SessionGroup, now: u64) -> usize {
@@ -450,7 +533,7 @@ async fn recover_stale_group_runs_for_ids(group_ids: Vec<String>) -> Result<usiz
     for group_id in group_ids {
         let gate = group_persist_gate(&group_id);
         let _guard = gate.lock().await;
-        let Some(mut group) = load_group_from_disk(&group_id) else {
+        let Some(mut group) = load_group_from_storage_result(&group_id)? else {
             continue;
         };
         let changed = mark_stale_active_runs(&mut group, now_epoch());
@@ -464,16 +547,30 @@ async fn recover_stale_group_runs_for_ids(group_ids: Vec<String>) -> Result<usiz
 }
 
 pub(crate) async fn recover_stale_group_runs_on_startup() -> Result<usize, String> {
-    if let Err(error) = std::fs::read_dir(groups_dir()) {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            return Ok(0);
-        }
-        return Err(error.to_string());
+    #[cfg(not(test))]
+    {
+        let ids = crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .list_group_ids()
+            .await
+            .map_err(|error| error.to_string())?;
+        recover_stale_group_runs_for_ids(ids).await
     }
 
-    recover_stale_group_runs_for_ids(saved_group_file_ids()).await
+    #[cfg(test)]
+    {
+        if let Err(error) = std::fs::read_dir(groups_dir()) {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(0);
+            }
+            return Err(error.to_string());
+        }
+
+        recover_stale_group_runs_for_ids(saved_group_file_ids()).await
+    }
 }
 
+#[cfg(test)]
 pub(crate) fn sort_group_summaries(summaries: &mut [SessionGroupSummary]) {
     summaries.sort_by(|a, b| {
         b.updated_at
@@ -483,37 +580,64 @@ pub(crate) fn sort_group_summaries(summaries: &mut [SessionGroupSummary]) {
 }
 
 pub(crate) async fn save_group_to_disk_locked(group: &SessionGroup) -> Result<(), String> {
-    tokio::fs::create_dir_all(groups_dir())
-        .await
-        .map_err(|error| error.to_string())?;
-    let payload = serde_json::to_string(group).map_err(|error| error.to_string())?;
-    let tmp = tmp_group_path(&group.id);
-    let target = group_path(&group.id);
-    tokio::fs::write(&tmp, payload)
-        .await
-        .map_err(|error| error.to_string())?;
-    if let Err(error) = crate::session_store::replace_session_file_from_temp(&target, &tmp) {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(error);
+    #[cfg(not(test))]
+    {
+        return crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .save_group(group)
+            .await
+            .map_err(|error| error.to_string());
     }
-    Ok(())
+
+    #[cfg(test)]
+    {
+        tokio::fs::create_dir_all(groups_dir())
+            .await
+            .map_err(|error| error.to_string())?;
+        let payload = serde_json::to_string(group).map_err(|error| error.to_string())?;
+        let tmp = tmp_group_path(&group.id);
+        let target = group_path(&group.id);
+        tokio::fs::write(&tmp, payload)
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Err(error) = crate::session_store::replace_session_file_from_temp(&target, &tmp) {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(error);
+        }
+        Ok(())
+    }
 }
 
 pub(crate) async fn delete_group_from_disk_locked(id: &str) -> Result<(), String> {
-    let id = validate_group_id(id)?.to_string();
-    let path = group_path(&id);
-    let tmp = tmp_group_path(&id);
-    match tokio::fs::remove_file(&path).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.to_string()),
+    let id = canonical_saved_group_id_result(id)?
+        .or_else(|| validate_group_id(id).ok().map(str::to_string))
+        .ok_or_else(|| "Invalid group id.".to_string())?;
+    #[cfg(not(test))]
+    {
+        crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .delete_group(&id)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
     }
-    match tokio::fs::remove_file(&tmp).await {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.to_string()),
+
+    #[cfg(test)]
+    {
+        let path = group_path(&id);
+        let tmp = tmp_group_path(&id);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        match tokio::fs::remove_file(&tmp).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 /// Content-derived fingerprint of one persisted session file. Including the parsed
@@ -521,6 +645,7 @@ pub(crate) async fn delete_group_from_disk_locked(id: &str) -> Result<(), String
 /// a rename always changes the signature, even when the serialized byte length is
 /// unchanged within the same coarse filesystem mtime tick.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg(test)]
 struct SavedSessionNameSignature {
     id: String,
     name: String,
@@ -529,16 +654,20 @@ struct SavedSessionNameSignature {
 }
 
 #[derive(Clone, Debug)]
+#[cfg(test)]
 struct SavedSessionNameCache {
     signatures: Vec<SavedSessionNameSignature>,
     names: HashMap<String, String>,
 }
 
+#[cfg(test)]
 type SavedSessionNameCacheLock = OnceLock<Mutex<Option<SavedSessionNameCache>>>;
+#[cfg(test)]
 static SAVED_SESSION_NAME_CACHE: SavedSessionNameCacheLock = OnceLock::new();
 
 /// Build the content-derived signature from already-parsed session summaries. Pure (no I/O)
 /// so it can be unit-tested directly without touching the global sessions dir or cache.
+#[cfg(test)]
 fn signatures_from_summaries(
     summaries: &[crate::session_store::SessionSummary],
 ) -> Vec<SavedSessionNameSignature> {
@@ -556,38 +685,48 @@ fn signatures_from_summaries(
 }
 
 pub(crate) fn saved_session_name_map() -> HashMap<String, String> {
-    // Parse the sessions directory once; derive both the content signature and the name
-    // map from the same summaries so renames (even same-length, same-mtime-tick) always
-    // invalidate the cache, and so no second directory pass is performed on a miss.
-    let summaries = crate::session_store::list_saved_session_summaries_in_dir(
-        &crate::session_store::sessions_dir(),
-    );
-    let signatures = signatures_from_summaries(&summaries);
-    let cache = SAVED_SESSION_NAME_CACHE.get_or_init(|| Mutex::new(None));
+    #[cfg(not(test))]
     {
-        let guard = cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(cached) = guard.as_ref()
-            && cached.signatures == signatures
+        crate::storage::Database::global()
+            .and_then(|database| database.session_name_map_blocking())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    {
+        // Parse the sessions directory once; derive both the content signature and the name
+        // map from the same summaries so renames (even same-length, same-mtime-tick) always
+        // invalidate the cache, and so no second directory pass is performed on a miss.
+        let summaries = crate::session_store::list_saved_session_summaries_in_dir(
+            &crate::session_store::sessions_dir(),
+        );
+        let signatures = signatures_from_summaries(&summaries);
+        let cache = SAVED_SESSION_NAME_CACHE.get_or_init(|| Mutex::new(None));
         {
-            return cached.names.clone();
+            let guard = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(cached) = guard.as_ref()
+                && cached.signatures == signatures
+            {
+                return cached.names.clone();
+            }
         }
+        let names = summaries
+            .into_iter()
+            .map(|summary| (summary.id, summary.name))
+            .collect::<HashMap<_, _>>();
+        {
+            let mut guard = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *guard = Some(SavedSessionNameCache {
+                signatures,
+                names: names.clone(),
+            });
+        }
+        names
     }
-    let names = summaries
-        .into_iter()
-        .map(|summary| (summary.id, summary.name))
-        .collect::<HashMap<_, _>>();
-    {
-        let mut guard = cache
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = Some(SavedSessionNameCache {
-            signatures,
-            names: names.clone(),
-        });
-    }
-    names
 }
 
 pub(crate) fn group_member_details(

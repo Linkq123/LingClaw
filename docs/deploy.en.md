@@ -11,7 +11,8 @@ LingClaw consists of one Rust binary, `static/` web assets, and bundled skills/s
 ```text
 Browser → http://127.0.0.1:18989 → lingclaw process
                                       ├── ~/.lingclaw/.lingclaw.json
-                                      ├── sessions/ and groups/
+                                      ├── lingclaw.db
+                                      ├── backups/
                                       └── <session-id>/workspace/
 ```
 
@@ -187,6 +188,8 @@ The first run opens the Setup Wizard. Configuration is stored at:
 
 Normal chat remains disabled until a provider/model and main-agent `primary` (or session `/model`) are explicit. See [Configuration](configuration.en.md).
 
+If the user directory still contains legacy `sessions/` or `groups/`, the first launch migrates them into `lingclaw.db` before binding the listener. Corruption, an invalid ID, or a broken reference stops startup and identifies the file. On success, the original directories stay permanently under `backups/sqlite-migration-<timestamp>/`.
+
 Management commands:
 
 ```bash
@@ -200,6 +203,8 @@ lingclaw doctor         # Installation environment checks
 lingclaw update         # Check, rebuild, install, and restart from source
 lingclaw install        # Install from the current source directory
 lingclaw install -d DIR # Install from a chosen source directory
+lingclaw db status      # Inspect SQLite read-only; never creates a missing DB
+lingclaw db backup      # Create and verify a consistent online SQLite snapshot
 lingclaw --version
 ```
 
@@ -351,6 +356,16 @@ On failure, the updater attempts to restore the previous service. Back up `~/.li
 
 ## Backup and restore
 
+Create a consistent SQLite snapshot while the service is running:
+
+```bash
+lingclaw db status
+lingclaw db backup
+lingclaw db backup /path/to/lingclaw-snapshot.db
+```
+
+The default destination is `~/.lingclaw/backups/lingclaw-<timestamp>.db`. The command refuses to overwrite an existing target and verifies integrity after completion. It backs up `lingclaw.db` only, not configuration, MCP OAuth, or workspaces.
+
 Stop the service and archive the full data directory:
 
 ```bash
@@ -362,10 +377,11 @@ Important data:
 
 - `.lingclaw.json` — Configuration and possible plaintext credentials
 - `mcp-auth.json` — OAuth tokens
-- `sessions/` and `groups/` — History and run state
+- `lingclaw.db` — Sessions, groups, messages, todos, usage, and sub-agent snapshots
+- `backups/` — Manual snapshots, schema-upgrade snapshots, and permanent legacy-JSON migration backups
 - `<session-id>/workspace/` — Prompts, skills, agents, and memory
 
-Restore with the same user ownership and verify local paths, MCP commands, and S3 identity before starting the service.
+There is no `db restore` command in this release. Stop LingClaw before restoring the complete user directory or replacing `lingclaw.db` with a verified snapshot. Preserve user ownership and verify local paths, MCP commands, and S3 identity before starting the service.
 
 ## Verification and troubleshooting
 

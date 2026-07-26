@@ -258,6 +258,8 @@ export function showWelcome() {
     const btn = document.createElement('button');
     btn.dataset.action = 'cmd';
     btn.dataset.cmd = cmd;
+    btn.disabled = state.storageMode === 'protected' && cmd === '/clear';
+    if (btn.disabled) btn.dataset.storageProtectedDisabled = 'true';
     btn.appendChild(createIcon(icon));
     const text = document.createElement('span');
     text.dataset.i18n = labelKey;

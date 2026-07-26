@@ -94,7 +94,11 @@ lingclaw restart
 lingclaw status
 lingclaw doctor
 lingclaw update
+lingclaw db status
+lingclaw db backup
 ```
+
+Session、Group、消息、Todos、Usage 和 Sub-agent 快照存放在 `~/.lingclaw/lingclaw.db`。从旧版升级时，LingClaw 会在监听端口前严格校验并迁移原有 `sessions/`、`groups/` JSON；原文件会永久保留在 `~/.lingclaw/backups/sqlite-migration-*/`，不会继续双写。
 
 安装细节、systemd、Docker 和反向代理说明见[部署指南](docs/deploy.md)。
 
@@ -130,7 +134,7 @@ LingClaw 提供文件、命令、搜索、网络、Todos 和条件化图片查�
 
 ### 保存记忆并处理视觉输入
 
-Session 可以维护人工可读的 `MEMORY.md`、每日日志、可选 Structured Memory 和 Daily Reflection。配置 S3-compatible 存储且模型声明图片输入能力后，用户附件、MCP 图片和 `view_image` 结果可以进入下一次模型请求；原始工具 Base64 不会写入日志、WebSocket 或会话 JSON。
+Session 可以维护人工可读的 `MEMORY.md`、每日日志、可选 Structured Memory 和 Daily Reflection。配置 S3-compatible 存储且模型声明图片输入能力后，用户附件、MCP 图片和 `view_image` 结果可以进入下一次模型请求；原始工具 Base64 不会写入日志、WebSocket 或 SQLite。
 
 ## 产品界面
 
@@ -169,12 +173,14 @@ flowchart LR
     Loop --> Providers["Configured Model Providers"]
     Loop --> Tools["Built-in Tools"]
     Tools --> MCP["MCP Servers"]
+    Runtime <--> DB["SQLite Core Storage"]
     Runtime <--> Store["Local Session Workspaces"]
     Tools --> S3["Optional S3-compatible Storage"]
 ```
 
 - **Browser UI**：响应式工作台，负责会话导航、流式消息和执行栈，并通过全屏 Console 管理 Settings 与 Usage。
 - **Runtime**：单个 Rust 进程，管理 WebSocket、配置快照、并发 Session、Group 派发和持久化。
+- **SQLite**：`~/.lingclaw/lingclaw.db` 是 Session、消息、Todos、Usage、Sub-agent 快照和 Group 数据的唯一持久化来源；工作区文件和配置仍保留在文件系统中。
 - **Agent Loop**：在明确的阶段与上限内选择模型、调用工具、吸收观察并完成回复。
 - **Workspace**：默认位于 `~/.lingclaw/<session-id>/workspace/`，包含提示、Skills、Agents 和记忆。
 
@@ -185,13 +191,15 @@ flowchart LR
 | 数据 | 默认位置或去向 | 何时离开本机 |
 |---|---|---|
 | 配置与凭据 | `~/.lingclaw/` | 不会整份自动同步；连接 Provider、MCP 或 S3 时，相应凭据会发送给该服务用于鉴权 |
-| Session、Group、Todos 与记忆存档 | `~/.lingclaw/` | 存档不自动同步；相关内容进入模型上下文时会发送给你选择的 Provider |
+| Session、Group、消息、Todos 与 Usage | `~/.lingclaw/lingclaw.db` | 数据库不自动同步；相关内容进入模型上下文时会发送给你选择的 Provider |
+| Workspace 提示、Skills、Agents 与记忆文件 | `~/.lingclaw/<session-id>/workspace/` | 被注入模型上下文时会发送给你选择的 Provider |
 | 提示、对话和工具观察 | 当前 Session 与 Runtime | 作为模型请求内容发送给你选择的 Provider |
 | 用户附件与工具图片 | 可选 S3-compatible 存储 | 仅在启用 S3 和图片能力后上传 |
 | MCP 数据 | 对应 MCP server | 由你启用的 server 与 tool 决定 |
 
 - Web 服务默认绑定 `127.0.0.1`，不会直接监听局域网或公网地址。
-- 配置、Session、Group、Todos 和记忆存档保存在本机 `~/.lingclaw/`，LingClaw 不会自动同步整份存档。
+- 配置、SQLite 核心数据和 Session Workspace 保存在本机 `~/.lingclaw/`，LingClaw 不会自动同步整份存档。
+- 运行中可用 `lingclaw db backup [PATH]` 创建一致的 SQLite 快照；完整灾备仍应同时备份配置、MCP 认证和 Workspace 文件。
 - 模型请求可能包含系统提示、对话历史、工具观察，以及被注入上下文的 Todos 和记忆内容；这些内容会发送给你配置的模型 Provider，请以对应 Provider 的数据政策为准。
 - 本地图片上传与工具图片闭环依赖可选 S3-compatible 存储。OpenAI/Anthropic 需要可被远端访问的签名 URL；Gemini/Ollama 由 LingClaw 本地预取图片。
 - 文件工具限制在当前 Session 工作区；网络工具执行 SSRF 检查并禁止重定向；命令工具包含危险命令检测与超时。

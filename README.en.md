@@ -94,7 +94,11 @@ lingclaw restart
 lingclaw status
 lingclaw doctor
 lingclaw update
+lingclaw db status
+lingclaw db backup
 ```
+
+Sessions, groups, messages, todos, usage, and sub-agent snapshots live in `~/.lingclaw/lingclaw.db`. On upgrade from the JSON store, LingClaw validates and migrates the old `sessions/` and `groups/` directories before opening its listener. The originals remain permanently under `~/.lingclaw/backups/sqlite-migration-*/`; LingClaw does not dual-write them.
 
 See the [deployment guide](docs/deploy.en.md) for installation details, systemd, Docker, and reverse proxies.
 
@@ -130,7 +134,7 @@ Use `task` for a single delegation and `orchestrate` for dependency-aware DAG ex
 
 ### Retain memory and work with visual input
 
-Sessions can maintain a human-readable `MEMORY.md`, daily notes, optional Structured Memory, and Daily Reflection. With S3-compatible storage and an image-capable model, user attachments, MCP images, and `view_image` results can enter the next model request. Raw tool Base64 is never written to logs, WebSocket events, or session JSON.
+Sessions can maintain a human-readable `MEMORY.md`, daily notes, optional Structured Memory, and Daily Reflection. With S3-compatible storage and an image-capable model, user attachments, MCP images, and `view_image` results can enter the next model request. Raw tool Base64 is never written to logs, WebSocket events, or SQLite.
 
 ## Product experience
 
@@ -169,12 +173,14 @@ flowchart LR
     Loop --> Providers["Configured Model Providers"]
     Loop --> Tools["Built-in Tools"]
     Tools --> MCP["MCP Servers"]
+    Runtime <--> DB["SQLite Core Storage"]
     Runtime <--> Store["Local Session Workspaces"]
     Tools --> S3["Optional S3-compatible Storage"]
 ```
 
 - **Browser UI** — Responsive workspace for session navigation, streaming messages, and execution stacks, with Settings and Usage managed in the full-screen Console.
 - **Runtime** — A single Rust process that manages WebSockets, configuration snapshots, concurrent sessions, group dispatch, and persistence.
+- **SQLite** — `~/.lingclaw/lingclaw.db` is the only persistent source for sessions, messages, todos, usage, sub-agent snapshots, and groups; configuration and workspace files remain on the filesystem.
 - **Agent Loop** — Selects a model, invokes tools, absorbs observations, and finishes within explicit phases and limits.
 - **Workspace** — Stored at `~/.lingclaw/<session-id>/workspace/` by default, containing prompts, skills, agents, and memory.
 
@@ -185,13 +191,15 @@ See the [architecture guide](docs/architecture.en.md) for modules, provider conv
 | Data | Default location or destination | When it leaves the machine |
 |---|---|---|
 | Configuration and credentials | `~/.lingclaw/` | The whole file is not synchronized automatically; credentials are sent to the corresponding provider, MCP server, or S3 service for authentication |
-| Session, group, todo, and memory archives | `~/.lingclaw/` | Archives are not synchronized automatically; relevant content is sent to your selected provider when it enters model context |
+| Sessions, groups, messages, todos, and usage | `~/.lingclaw/lingclaw.db` | The database is not synchronized automatically; relevant content is sent to your selected provider when it enters model context |
+| Workspace prompts, skills, agents, and memory files | `~/.lingclaw/<session-id>/workspace/` | Sent to your selected provider when injected into model context |
 | Prompts, conversations, and tool observations | Current session and runtime | Sent to your selected provider as model-request content |
 | User attachments and tool images | Optional S3-compatible storage | Uploaded only when S3 and image capability are enabled |
 | MCP data | The corresponding MCP server | Determined by the servers and tools you enable |
 
 - The web service binds to `127.0.0.1` by default and does not listen directly on a LAN or public interface.
-- Configuration, session, group, todo, and memory archives are stored under `~/.lingclaw/`; LingClaw does not automatically synchronize the complete archives.
+- Configuration, SQLite core data, and session workspaces stay under `~/.lingclaw/`; LingClaw does not automatically synchronize the complete archive.
+- Use `lingclaw db backup [PATH]` for a consistent live SQLite snapshot. A complete disaster-recovery backup must also include configuration, MCP authentication, and workspace files.
 - Model requests may contain system prompts, conversation history, tool observations, and todo or memory content injected into context. This content is sent to the model providers you configure, whose data policies apply.
 - Local image uploads and tool-image feedback require optional S3-compatible storage. OpenAI and Anthropic require signed URLs reachable by the provider; Gemini and Ollama images are fetched by LingClaw locally.
 - File tools stay inside the current session workspace. Network tools perform SSRF checks and reject redirects. Command tools apply dangerous-command checks and timeouts.

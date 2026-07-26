@@ -3911,10 +3911,23 @@ async fn run_finish_phase(
         None
     };
 
-    if let Err(e) =
+    if let Err(error) =
         session_store::save_current_session_to_disk(ctx.state, ctx.current_session_id).await
     {
-        eprintln!("Warning: failed to save session at finish phase: {e}");
+        eprintln!("ERROR: failed to save session at finish phase: {error}");
+        phase_state.run_failed = true;
+        if ctx.state.storage_is_writable() {
+            let _ = live_send(
+                ctx.live_tx,
+                json!({
+                    "type":"error",
+                    "content":"The final Agent state could not be saved.",
+                    "dismissible":true,
+                }),
+            )
+            .await;
+        }
+        return AgentPhaseControl::Break;
     }
 
     let snapshot = {
@@ -4331,8 +4344,7 @@ pub(crate) async fn run_agent_session(
             current_session_id,
             &mut phase_state.pending_interventions,
         )
-        .await;
-        true
+        .await
     } else {
         false
     };

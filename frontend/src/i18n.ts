@@ -241,6 +241,9 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'composer.configureAgent': 'Set Agent model',
     'composer.chooseSessionModel': 'Choose model',
     'composer.groupTargetsUnconfigured': 'Configure models for: {targets}.',
+    'storage.protectedLabel': 'Storage protected',
+    'storage.protectedDescription':
+      'Local storage is in protected mode. Repair the database and restart LingClaw.',
     'composer.aria': 'Message input',
     'composer.moreOptions': 'More options',
     'composer.addImage': 'Add image',
@@ -897,6 +900,8 @@ const STRINGS: Record<Language, Record<string, string>> = {
     'composer.configureAgent': '配置代理模型',
     'composer.chooseSessionModel': '选择模型',
     'composer.groupTargetsUnconfigured': '以下成员未配置模型：{targets}。',
+    'storage.protectedLabel': '存储已保护',
+    'storage.protectedDescription': '本地存储已进入保护模式。请修复数据库并重启 LingClaw。',
     'composer.aria': '消息输入框',
     'composer.moreOptions': '更多选项',
     'composer.addImage': '添加图片',

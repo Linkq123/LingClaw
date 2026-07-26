@@ -51,6 +51,7 @@ export async function ensureUploadTokenInternal(forceRefresh: boolean): Promise<
 
 function attachmentChangesBlocked(): boolean {
   return Boolean(
+    state.storageMode === 'protected' ||
     state.sessionSwitchInFlight ||
     state.sessionIdentityMutationInFlight ||
     state.composerSessionTransitionPending ||
@@ -61,6 +62,7 @@ function attachmentChangesBlocked(): boolean {
 
 export function updateAttachButton() {
   const sessionTransitionBlocked = Boolean(
+    state.storageMode === 'protected' ||
     state.sessionSwitchInFlight ||
     state.sessionIdentityMutationInFlight ||
     state.composerSessionTransitionPending ||
@@ -220,6 +222,7 @@ export async function uploadLocalImages(files) {
     s3ConfigId: state.s3ConfigId,
   };
   const uploadContextIsCurrent = () =>
+    state.storageMode !== 'protected' &&
     state.activeSessionId === uploadContext.sessionId &&
     state.activeGroupId === uploadContext.groupId &&
     state.ws === uploadContext.socket &&

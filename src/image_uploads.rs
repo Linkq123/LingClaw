@@ -533,6 +533,56 @@ pub(crate) async fn s3_put_object(
     Ok(())
 }
 
+pub(crate) async fn s3_delete_object(
+    http: &Client,
+    cfg: &S3Config,
+    object_key: &str,
+) -> Result<(), String> {
+    let now = chrono::Utc::now();
+    let date_stamp = now.format("%Y%m%d").to_string();
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let url = format!(
+        "{}/{}/{}",
+        cfg.endpoint,
+        cfg.bucket,
+        uri_encode(object_key, false)
+    );
+    let parsed = reqwest::Url::parse(&url).map_err(|e| format!("Invalid S3 URL: {e}"))?;
+    let host = s3_host_with_port(&parsed);
+    let content_sha256 = sha256_hash(&[]);
+    let canonical_uri = canonical_uri_from_url(&parsed);
+    let canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:{content_sha256}\nx-amz-date:{amz_date}\n");
+    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let canonical_request = format!(
+        "DELETE\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{content_sha256}"
+    );
+    let authorization = s3_authorization_header(
+        cfg,
+        &date_stamp,
+        &amz_date,
+        &canonical_request,
+        signed_headers,
+    );
+    let response = http
+        .delete(&url)
+        .header("x-amz-content-sha256", &content_sha256)
+        .header("x-amz-date", &amz_date)
+        .header("Authorization", &authorization)
+        .send()
+        .await
+        .map_err(|error| format!("S3 DELETE failed: {error}"))?;
+    if !response.status().is_success() && response.status() != reqwest::StatusCode::NOT_FOUND {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!(
+            "S3 DELETE failed (HTTP {status}): {}",
+            crate::truncate(&body, 512)
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn s3_presigned_get_url(cfg: &S3Config, object_key: &str) -> Result<String, String> {
     let now = chrono::Utc::now();
     let date_stamp = now.format("%Y%m%d").to_string();

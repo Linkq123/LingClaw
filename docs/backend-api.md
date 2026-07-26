@@ -88,6 +88,11 @@
    - 例如 `GET /api/config`
    - body 中带 `parse_error`、`raw`、`line`、`column`
 
+4. SQLite 保护模式
+   - 核心存储运行期发生 I/O、损坏或约束故障后，相关 HTTP 写请求返回 `503 Service Unavailable`
+   - body 固定包含 `{ "error": "...", "code": "storage_protected" }`
+   - 该状态在当前进程内保持粘性；修复存储后需要重启 LingClaw
+
 ### 3.3 会话范围
 
 服务端默认会话为 `main`，同时支持多个持久化 session 和持久化 session group。`/api/sessions` 会返回当前已加载或已持久化的 session 摘要；`/api/session-groups` 返回 group 摘要；普通 WebSocket 连接可通过查询参数 `?session=<id>` 绑定到指定 session，省略时回退到 `main`；group chat 使用 `?group=<id>&session=main` 连接。每个 session 还持有一份当前 `todos` 快照（`revision`、`items[]`、`last_updated_by`、`updated_at`），随会话一起持久化；执行 `/clear` 时会清空 `items[]` 并推进 `revision`，从而拒绝旧的 in-flight 写入。
@@ -105,7 +110,10 @@
   "status": "ok",
   "version": "2.x.x",
   "model": "openai/gpt-4o-mini",
-  "sessions": 1
+  "sessions": 1,
+  "storage": {
+    "mode": "healthy"
+  }
 }
 ```
 
@@ -115,6 +123,8 @@
 - `version`：后端版本
 - `model`：当前默认模型
 - `sessions`：当前内存中会话数量
+- `storage.mode`：`healthy` 或 `protected`
+- `storage.code`：仅保护模式存在，固定为 `storage_protected`。健康接口本身仍返回 `200`，客户端应检查该字段决定是否允许核心数据写入
 
 ## 4.2 GET /api/sessions
 
@@ -182,7 +192,7 @@
 
 ### 说明
 
-- 新 session 会立即写入 `~/.lingclaw/sessions/<id>.json`
+- 新 Session 会立即写入 `~/.lingclaw/lingclaw.db`；其 Workspace 仍位于 `~/.lingclaw/<id>/workspace/`
 - 创建成功后会广播新的 session 列表
 - 若随机 id 碰撞，后端会重新生成；连续失败返回 `500`
 
@@ -228,7 +238,7 @@
 
 ## 4.2.3 Session Group APIs
 
-Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group 元数据、成员 session id、升级管理员、待投票项、群聊消息和成员 run 状态。`main` 是每个 group 的隐式 owner/admin，不放入 `members[]`，因此不会被 group dispatch 派发。Group 有独立历史；被派发的成员 session 也会收到一条固定格式用户消息，内容为 group 上下文摘要和 main 指令，因此 group 历史与成员 session 历史都会被写入。
+Session Group 持久化在 `~/.lingclaw/lingclaw.db`，包含 Group 元数据、成员 Session ID、升级管理员、待投票项、群聊消息和成员 run 状态。`main` 是每个 Group 的隐式 owner/admin，不写入成员表，因此不会被 Group dispatch 派发。Group 有独立历史；被派发的成员 Session 也会收到一条固定格式用户消息，内容为 Group 上下文摘要和 Main 指令，因此 Group 历史与成员 Session 历史都会被写入。
 
 ### GET /api/session-groups
 
@@ -323,7 +333,7 @@ Session group 持久化在 `~/.lingclaw/groups/<group-id>.json`，包含 group �
 
 ### DELETE /api/session-group?group=<id>
 
-删除 group JSON 和残留 `.tmp` 文件，并广播新的 group 列表。不存在返回 `404`。如果 group 里仍有 `queued` 或 `running` 的成员 run，后端会返回 `409 Conflict`；调用方需要先通过 group socket 发送 `{"type":"group_stop"}` 或调用 `session_control.stop` 停止这些 run，再删除 group。
+在 SQLite 事务中删除 Group 及其关联的成员、投票、消息和运行记录，然后广播新的 Group 列表。不存在返回 `404`。如果 Group 里仍有 `queued` 或 `running` 的成员 run，后端会返回 `409 Conflict`；调用方需要先通过 Group socket 发送 `{"type":"group_stop"}` 或调用 `session_control.stop` 停止这些 run，再删除 Group。
 
 ### PUT /api/session-group/member?group=<id>&session=<session-id>
 
@@ -1616,7 +1626,7 @@ Group socket 初始化顺序通常为：
 
 - `list_sessions`: 返回轻量 session 名片；每行包含 `model`、`status` 和 `updated_at`，列表级别额外显示 `TaskPlan: enabled/disabled (global setting)`。为避免每次列表查询扫描所有 workspace，`agent` / `user` 摘要与 `skills` / `mcp_tools` 精确计数固定显示为 `unknown`；需要能力详情时使用 `describe_session`
 - `create_session`: 创建一个新的持久化 session；后端生成随机 session id，可传入 `name`、`purpose`、`identity_profile`、`user_profile`、`style_profile`、`agent_notes` 初始化新 session 的 prompt 文件
-- `delete_session`: 删除已存在的非 `main` session；复用 `/delete` 安全约束，拒绝 `main`、当前 active 连接以及有 active/queued delegated work 的 session，成功后删除 session JSON 与 workspace 并广播 session list
+- `delete_session`: 删除已存在的非 `main` Session；复用 `/delete` 安全约束，拒绝 `main`、当前 active 连接以及有 active/queued delegated work 的 Session。成功后先在 SQLite 事务中删除 Session 并清理 Group 成员/投票，再删除 Workspace 并广播列表
 - `describe_session`: 按需查询单个 session 详情；参数为 `target`（兼容别名 `session_id`）、可选 `sections=["profile","capabilities","runtime","groups"]` 和 `max_chars`；未提供 `sections` 时默认返回 `profile`、`capabilities`、`runtime`
 - `list_groups`: 返回 group 摘要
 - `create_group`: 创建 group
@@ -1660,6 +1670,31 @@ Group socket 初始化顺序通常为：
 下表列出前端需要处理的主要事件。
 
 ## 5.3.1 会话与历史
+
+### `storage_status`
+
+普通 Session 与 Group WebSocket 建立后都会收到当前存储状态；运行期首次进入保护模式时还会向所有连接广播一次：
+
+```json
+{
+  "type": "storage_status",
+  "storage": {
+    "mode": "healthy"
+  }
+}
+```
+
+```json
+{
+  "type": "storage_status",
+  "storage": {
+    "mode": "protected",
+    "code": "storage_protected"
+  }
+}
+```
+
+保护模式会取消活动 Agent/Group run，并禁止普通消息、图片上传、Session/Group/Todo、Session Skills 和 MCP Session policy 等 SQLite 写操作。Session、历史、Usage 和配置读取继续可用；`.lingclaw.json` 是独立文件，仍可保存。服务端不通过协议暴露原始 SQL 错误；客户端应显示本地化修复提示并要求用户修复后重启。
 
 ### `session`
 

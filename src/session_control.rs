@@ -45,6 +45,11 @@ static GROUP_RUN_CONTROLS: std::sync::LazyLock<
 
 const DIRECT_RUN_RETAIN_SECS: u64 = 10 * 60;
 
+fn storage_protected_control_error() -> String {
+    "session_control error: local storage is in protected mode; repair it and restart LingClaw."
+        .to_string()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DirectRunStatus {
     Queued,
@@ -210,7 +215,7 @@ async fn resolve_existing_target_session_ids(
             continue;
         }
 
-        let Some(session) = session_store::load_session_from_disk(&target) else {
+        let Some(session) = session_store::load_session_from_storage_result(&target)? else {
             return Err(format!(
                 "Session '{}' not found. Create it first with session_control.create_session.",
                 target
@@ -250,7 +255,7 @@ async fn prepare_dispatch_targets(
     max_targets: usize,
 ) -> Result<Vec<String>, String> {
     let group_members = if let Some(group_id) = group_id {
-        let group = session_group::load_group_from_disk(group_id)
+        let group = session_group::load_group_from_storage_result(group_id)?
             .ok_or_else(|| format!("Group '{}' not found", group_id))?;
         Some(group.members)
     } else {
@@ -390,7 +395,7 @@ fn active_group_run_statuses_by_session() -> HashMap<String, String> {
     for (run_id, group_id, session_id) in controls {
         let group = groups
             .entry(group_id.clone())
-            .or_insert_with(|| session_group::load_group_from_disk(&group_id));
+            .or_insert_with(|| session_group::load_group_from_storage_result(&group_id));
         // A control entry exists, so a run was registered and is likely in-flight. If the
         // group cannot be read (transient IO / parse error / concurrent rename) or the run
         // is missing from the loaded group, report "unknown" rather than "running": the
@@ -398,11 +403,15 @@ fn active_group_run_statuses_by_session() -> HashMap<String, String> {
         // legitimate delete is still refused on the safe side, while the session list
         // (session_runtime_status_from_snapshots / merge_group_session_status) treats any
         // non queued/running status as inactive, so the session is not shown falsely busy.
-        let status = group
-            .as_ref()
-            .and_then(|group| group.runs.iter().find(|run| run.id == run_id))
-            .map(|run| run.status.as_str())
-            .unwrap_or("unknown");
+        let status = match group {
+            Ok(Some(group)) => group
+                .runs
+                .iter()
+                .find(|run| run.id == run_id)
+                .map(|run| run.status.as_str())
+                .unwrap_or("unknown"),
+            Ok(None) | Err(_) => "unknown",
+        };
         merge_group_session_status(&mut statuses, session_id, status.to_string(), now_epoch());
     }
     statuses
@@ -412,15 +421,23 @@ fn active_group_run_statuses_by_session() -> HashMap<String, String> {
 }
 
 fn saved_group_has_active_run_for_session(session_id: &str) -> bool {
-    session_group::list_saved_group_summaries()
-        .into_iter()
-        .filter_map(|summary| session_group::load_group_from_disk(&summary.id))
-        .any(|group| {
-            group.runs.iter().any(|run| {
-                run.session_id == session_id
-                    && session_group::is_active_group_run_status(&run.status)
-            })
-        })
+    let Ok(summaries) = session_group::list_saved_group_summaries_result() else {
+        return true;
+    };
+    for summary in summaries {
+        let Ok(group) = session_group::load_group_from_storage_result(&summary.id) else {
+            return true;
+        };
+        let Some(group) = group else {
+            continue;
+        };
+        if group.runs.iter().any(|run| {
+            run.session_id == session_id && session_group::is_active_group_run_status(&run.status)
+        }) {
+            return true;
+        }
+    }
+    false
 }
 
 fn clear_group_run_control(run_id: &str) {
@@ -498,6 +515,32 @@ fn stop_direct_runs_for_targets(targets: &[String]) -> usize {
         }
         stopped
     })
+}
+
+#[cfg(not(test))]
+pub(crate) fn cancel_all_active_runs_for_storage() -> usize {
+    let group_runs = with_group_run_controls(|runs| {
+        let mut stopped = 0usize;
+        for run in runs.values() {
+            run.cancel.cancel();
+            stopped += 1;
+        }
+        stopped
+    });
+    let direct_runs = with_direct_runs(|runs| {
+        let mut stopped = 0usize;
+        for run in runs.values_mut() {
+            if !run.status.is_active() {
+                continue;
+            }
+            run.status = DirectRunStatus::Stopped;
+            run.updated_at = now_epoch();
+            run.cancel.cancel();
+            stopped += 1;
+        }
+        stopped
+    });
+    group_runs + direct_runs
 }
 
 fn direct_runs_for_session(session_id: &str) -> Vec<(String, DirectRunStatus, u64)> {
@@ -581,13 +624,17 @@ fn merge_direct_session_status(
     }
 }
 
-fn all_groups_for_session(session_id: &str) -> Vec<SessionGroup> {
+fn all_groups_for_session(session_id: &str) -> Result<Vec<SessionGroup>, String> {
     let mut groups = Vec::new();
-    for summary in session_group::list_saved_group_summaries() {
+    for summary in session_group::list_saved_group_summaries_result()
+        .map_err(|_| storage_protected_control_error())?
+    {
         if summary.corrupt {
             continue;
         }
-        let Some(group) = session_group::load_group_from_disk(&summary.id) else {
+        let Some(group) = session_group::load_group_from_storage_result(&summary.id)
+            .map_err(|_| storage_protected_control_error())?
+        else {
             continue;
         };
         let is_member = group.members.iter().any(|member| member == session_id);
@@ -601,7 +648,7 @@ fn all_groups_for_session(session_id: &str) -> Vec<SessionGroup> {
             .cmp(&a.updated_at)
             .then_with(|| a.id.cmp(&b.id))
     });
-    groups
+    Ok(groups)
 }
 
 fn group_run_status_from_groups(session_id: &str, groups: &[SessionGroup]) -> Option<String> {
@@ -1334,7 +1381,7 @@ where
     let group_id = session_group::validate_group_id(group_id)?.to_string();
     let gate = session_group::group_persist_gate(&group_id);
     let _guard = gate.lock().await;
-    let mut group = session_group::load_group_from_disk(&group_id)
+    let mut group = session_group::load_group_from_storage_result(&group_id)?
         .ok_or_else(|| format!("Group '{}' not found", group_id))?;
     let result = f(&mut group)?;
     group.updated_at = now_epoch();
@@ -1451,7 +1498,7 @@ async fn update_run_status(
     let updated = {
         let gate = session_group::group_persist_gate(&group_id);
         let _guard = gate.lock().await;
-        let mut group = session_group::load_group_from_disk(&group_id)
+        let mut group = session_group::load_group_from_storage_result(&group_id)?
             .ok_or_else(|| format!("Group '{}' not found", group_id))?;
         let now = now_epoch();
         let updated = group
@@ -1570,12 +1617,12 @@ fn target_prompt(
     }
 }
 
-fn target_group_context(group_id: &str, budget: usize) -> String {
-    let mut context = session_group::load_group_from_disk(group_id)
+fn target_group_context(group_id: &str, budget: usize) -> Result<String, String> {
+    let mut context = session_group::load_group_from_storage_result(group_id)?
         .map(|group| collect_group_summary(&group))
         .unwrap_or_else(|| "No group context is available.".to_string());
     crate::truncate_safe(&mut context, budget.clamp(500, 8_000));
-    context
+    Ok(context)
 }
 
 fn stored_group_run_prompt(message: &str) -> String {
@@ -1730,8 +1777,13 @@ async fn dispatch_group_mentions_from_session_result(
     if mention_depth >= 1 || is_no_reply_result(content) {
         return;
     }
-    let Some(group) = session_group::load_group_from_disk(group_id) else {
-        return;
+    let group = match session_group::load_group_from_storage_result(group_id) {
+        Ok(Some(group)) => group,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("ERROR: failed to read group before mention follow-up: {error}");
+            return;
+        }
     };
     let is_admin = group.admins.iter().any(|admin| admin == source_session_id);
     let direct_mentions = mentions_from_text(content, &group.members)
@@ -1809,11 +1861,11 @@ async fn dispatch_group_mentions_from_session_result(
     }
 }
 
-async fn group_run_is_active(group_id: &str, run_id: &str) -> bool {
-    session_group::load_group_from_disk(group_id)
+async fn group_run_is_active(group_id: &str, run_id: &str) -> Result<bool, String> {
+    Ok(session_group::load_group_from_storage_result(group_id)?
         .and_then(|group| group.runs.into_iter().find(|run| run.id == run_id))
         .map(|run| matches!(run.status.as_str(), "queued" | "running"))
-        .unwrap_or(false)
+        .unwrap_or(false))
 }
 
 /// A group websocket event plus whether it may be dropped under backpressure. Producers
@@ -1948,13 +2000,21 @@ async fn group_model_configuration(
         (model_configuration, unresolved)
     };
     for member in unresolved {
-        if let Some(session) = session_store::load_session_from_disk(&member) {
-            record_group_member_model_configuration(
-                &mut model_configuration,
-                &member,
-                &session,
-                config,
-            );
+        match session_store::load_session_from_storage_result(&member) {
+            Ok(Some(session)) => {
+                record_group_member_model_configuration(
+                    &mut model_configuration,
+                    &member,
+                    &session,
+                    config,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!(
+                    "ERROR: failed to read group member model configuration for {member}: {error}"
+                );
+            }
         }
     }
     model_configuration
@@ -2097,8 +2157,15 @@ pub(crate) async fn collect_group_model_configuration_payloads(
     };
     let mut payloads = Vec::with_capacity(group_ids.len());
     for group_id in group_ids {
-        let Some(group) = session_group::load_group_from_disk(&group_id) else {
-            continue;
+        let group = match session_group::load_group_from_storage_result(&group_id) {
+            Ok(Some(group)) => group,
+            Ok(None) => continue,
+            Err(error) => {
+                eprintln!(
+                    "ERROR: failed to collect model configuration for group {group_id}: {error}"
+                );
+                continue;
+            }
         };
         let payload =
             group_model_configuration_payload_with_config(state, &group, config, config_revision)
@@ -2241,8 +2308,31 @@ async fn run_target_run(
     // destructive ops, so if a delete completed while this run waited on the lock the target
     // is gone. Abort instead of recreating it as an orphan via `ensure_session_ready`. This
     // closes the residual window left after the delete gate's under-lock re-check.
-    let target_exists = state.sessions.lock().await.contains_key(&run.session_id)
-        || session_store::load_session_from_disk(&run.session_id).is_some();
+    let target_exists = if state.sessions.lock().await.contains_key(&run.session_id) {
+        true
+    } else {
+        match session_store::load_session_from_storage_result(&run.session_id) {
+            Ok(session) => session.is_some(),
+            Err(error) => {
+                eprintln!(
+                    "ERROR: failed to verify delegated target session {}: {error}",
+                    run.session_id
+                );
+                if let Some(group_id) = run.group_id.as_deref() {
+                    mark_group_run_failed(
+                        state.as_ref(),
+                        group_id,
+                        &run.run_id,
+                        "Local storage is unavailable.".to_string(),
+                    )
+                    .await;
+                } else {
+                    update_direct_run_status(&run.run_id, DirectRunStatus::Failed);
+                }
+                return;
+            }
+        }
+    };
     if !target_exists {
         if let Some(group_id) = run.group_id.as_deref() {
             mark_group_run_failed(
@@ -2257,11 +2347,19 @@ async fn run_target_run(
         }
         return;
     }
-    if let Some(group_id) = run.group_id.as_deref()
-        && !group_run_is_active(group_id, &run.run_id).await
-    {
-        clear_group_run_control(&run.run_id);
-        return;
+    if let Some(group_id) = run.group_id.as_deref() {
+        match group_run_is_active(group_id, &run.run_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                clear_group_run_control(&run.run_id);
+                return;
+            }
+            Err(error) => {
+                eprintln!("ERROR: failed to read delegated group run state: {error}");
+                clear_group_run_control(&run.run_id);
+                return;
+            }
+        }
     }
     if run.group_id.is_none() && !direct_run_is_active(&run.run_id) {
         return;
@@ -2271,11 +2369,19 @@ async fn run_target_run(
         mark_started_run_stopped(state.as_ref(), &run).await;
         return;
     }
-    if let Some(group_id) = run.group_id.as_deref()
-        && !group_run_is_active(group_id, &run.run_id).await
-    {
-        clear_group_run_control(&run.run_id);
-        return;
+    if let Some(group_id) = run.group_id.as_deref() {
+        match group_run_is_active(group_id, &run.run_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                clear_group_run_control(&run.run_id);
+                return;
+            }
+            Err(error) => {
+                eprintln!("ERROR: failed to re-read delegated group run state: {error}");
+                clear_group_run_control(&run.run_id);
+                return;
+            }
+        }
     }
     if run.group_id.is_none() && !direct_run_is_active(&run.run_id) {
         return;
@@ -2578,9 +2684,9 @@ async fn dispatch_to_sessions(
                 })),
             )
             .await;
-            if let Some(group) = session_group::load_group_from_disk(group_id) {
-                send_group_history(state, group_id, &group).await;
-            }
+            let group = session_group::load_group_from_storage_result(group_id)?
+                .ok_or_else(|| format!("Group '{}' not found", group_id))?;
+            send_group_history(state, group_id, &group).await;
         }
         for group_run in group_runs {
             let control = DelegatedRunControl {
@@ -2632,7 +2738,8 @@ async fn dispatch_to_sessions(
     let group_context = request
         .group_id
         .as_deref()
-        .map(|group_id| target_group_context(group_id, request.summary_budget));
+        .map(|group_id| target_group_context(group_id, request.summary_budget))
+        .transpose()?;
 
     for run in runs.clone() {
         let prompt = target_prompt(
@@ -2651,12 +2758,16 @@ async fn dispatch_to_sessions(
     }
 
     if request.wait {
-        wait_for_runs(state, &runs, request.summary_budget).await;
+        wait_for_runs(state, &runs, request.summary_budget).await?;
     }
     Ok(runs)
 }
 
-async fn wait_for_runs(state: &AppState, runs: &[StartedRun], _summary_budget: usize) {
+async fn wait_for_runs(
+    state: &AppState,
+    runs: &[StartedRun],
+    _summary_budget: usize,
+) -> Result<(), String> {
     let timeout = state.config().sub_agent_timeout;
     let deadline = run_wait_deadline(timeout);
     loop {
@@ -2667,10 +2778,11 @@ async fn wait_for_runs(state: &AppState, runs: &[StartedRun], _summary_budget: u
             .collect::<HashSet<_>>()
             .into_iter()
             .map(|group_id| {
-                let group = session_group::load_group_from_disk(&group_id);
-                (group_id, group)
+                session_group::load_group_from_storage_result(&group_id)
+                    .map(|group| (group_id, group))
             })
-            .collect::<HashMap<_, _>>();
+            .collect::<Result<HashMap<_, _>, _>>();
+        let group_snapshots = group_snapshots?;
         let mut complete = true;
         for run in runs {
             let active = if let Some(group_id) = run.group_id.as_deref() {
@@ -2694,6 +2806,7 @@ async fn wait_for_runs(state: &AppState, runs: &[StartedRun], _summary_budget: u
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    Ok(())
 }
 
 fn run_wait_deadline(timeout: Duration) -> Option<tokio::time::Instant> {
@@ -2714,7 +2827,7 @@ pub(crate) async fn handle_group_socket_message(
         return Err("Group message cannot be empty.".to_string());
     }
     validate_message_len(&text)?;
-    let group = session_group::load_group_from_disk(group_id)
+    let group = session_group::load_group_from_storage_result(group_id)?
         .ok_or_else(|| format!("Group '{}' not found", group_id))?;
     let mut optional_targets = HashSet::new();
     let dispatch_targets = if payload.start_runs {
@@ -2824,7 +2937,7 @@ pub(crate) async fn handle_group_socket_message(
         send_group_history(
             state,
             group_id,
-            &session_group::load_group_from_disk(group_id)
+            &session_group::load_group_from_storage_result(group_id)?
                 .ok_or_else(|| format!("Group '{}' not found", group_id))?,
         )
         .await;
@@ -2892,7 +3005,7 @@ fn collect_group_summary(group: &SessionGroup) -> String {
     lines.join("\n")
 }
 
-async fn session_list_output(state: &AppState) -> String {
+async fn session_list_output(state: &AppState) -> Result<String, String> {
     struct LoadedSessionListSnapshot {
         summary: SessionSummary,
         model: String,
@@ -2900,7 +3013,8 @@ async fn session_list_output(state: &AppState) -> String {
 
     let config = state.config();
     let mut summaries =
-        session_store::list_saved_session_summaries_in_dir(&session_store::sessions_dir());
+        session_store::list_saved_session_summaries_result(&session_store::sessions_dir())
+            .map_err(|_| storage_protected_control_error())?;
     let loaded_sessions = {
         let sessions = state.sessions.lock().await;
         sessions
@@ -2972,12 +3086,14 @@ async fn session_list_output(state: &AppState) -> String {
         lines.push("  agent: unknown (use describe_session)".to_string());
         lines.push("  user: unknown (use describe_session)".to_string());
     }
-    lines.join("\n")
+    Ok(lines.join("\n"))
 }
 
-fn group_list_output() -> String {
+fn group_list_output() -> Result<String, String> {
     let mut lines = vec!["Session groups:".to_string()];
-    for summary in session_group::list_saved_group_summaries() {
+    for summary in session_group::list_saved_group_summaries_result()
+        .map_err(|_| storage_protected_control_error())?
+    {
         lines.push(format!(
             "- {} ({}) members={} messages={} running={}{}",
             summary.id,
@@ -2988,7 +3104,7 @@ fn group_list_output() -> String {
             if summary.corrupt { " corrupt" } else { "" }
         ));
     }
-    lines.join("\n")
+    Ok(lines.join("\n"))
 }
 
 async fn load_session_for_description(state: &AppState, target: &str) -> Result<Session, String> {
@@ -3001,7 +3117,8 @@ async fn load_session_for_description(state: &AppState, target: &str) -> Result<
             return Ok(session.clone());
         }
     }
-    session_store::load_session_from_disk(&target)
+    session_store::load_session_from_storage_result(&target)
+        .map_err(|_| storage_protected_control_error())?
         .ok_or_else(|| format!("Session '{}' not found", target))
 }
 
@@ -3248,7 +3365,7 @@ async fn describe_session_from_tool(state: &AppState, args: &Value) -> Result<St
         .iter()
         .any(|section| matches!(section.as_str(), "runtime" | "groups"))
     {
-        all_groups_for_session(&session.id)
+        all_groups_for_session(&session.id)?
     } else {
         Vec::new()
     };
@@ -3501,7 +3618,7 @@ async fn generate_available_session_id_for_tool(state: &AppState) -> Result<Stri
                 continue;
             }
         }
-        if session_store::canonical_saved_session_id(&id).is_some() {
+        if session_store::canonical_saved_session_id_result(&id)?.is_some() {
             continue;
         }
         if crate::session_workspace_path(&id).exists() {
@@ -3512,10 +3629,15 @@ async fn generate_available_session_id_for_tool(state: &AppState) -> Result<Stri
     Err("session_control error: failed to generate a unique session id".to_string())
 }
 
-fn cleanup_failed_created_session(session_id: &str, workspace: &Path) {
-    let _ = std::fs::remove_file(session_store::sessions_dir().join(format!("{session_id}.json")));
-    let _ =
-        std::fs::remove_file(session_store::sessions_dir().join(format!("{session_id}.json.tmp")));
+pub(crate) fn cleanup_failed_created_session(session_id: &str, workspace: &Path) {
+    #[cfg(test)]
+    {
+        let _ =
+            std::fs::remove_file(session_store::sessions_dir().join(format!("{session_id}.json")));
+        let _ = std::fs::remove_file(
+            session_store::sessions_dir().join(format!("{session_id}.json.tmp")),
+        );
+    }
     let expected_workspace = crate::session_workspace_path(session_id);
     if workspace != expected_workspace {
         return;
@@ -3581,7 +3703,7 @@ async fn create_session_from_tool(state: &Arc<AppState>, args: &Value) -> Result
             return Err("session_control error: generated session id already exists".to_string());
         }
     }
-    if session_store::canonical_saved_session_id(&session_id).is_some() {
+    if session_store::canonical_saved_session_id_result(&session_id)?.is_some() {
         return Err("session_control error: generated session id already exists".to_string());
     }
 
@@ -3701,7 +3823,7 @@ fn validate_message_len(message: &str) -> Result<(), String> {
 /// command (`handle_delete_command` in `commands.rs`) and `session_control.delete_session`.
 /// Rejects the caller's own session, the main session, an active connected session, a
 /// running session, or any session with active/queued delegated work (direct runs,
-/// in-flight group runs, or saved group runs), then removes the persisted JSON and the
+/// in-flight group runs, or saved group runs), then removes the persisted state and the
 /// default workspace directory. Returns the success message; callers are responsible for
 /// broadcasting the updated session list.
 pub(crate) async fn delete_session_with_safety_checks(
@@ -3744,7 +3866,7 @@ pub(crate) async fn delete_session_with_safety_checks(
 
     // Hold the target's session-control lock across the final delegated-work re-check
     // and the destructive operations. `run_target_run` takes this same lock before it
-    // writes an orphan session JSON via `append_target_session_message`, so serializing
+    // persists an orphan session via `append_target_session_message`, so serializing
     // here closes the TOCTOU window where a group/direct dispatch registers a run after
     // the checks above pass. Lock order matches `run_target_run` (session_control_lock
     // first, group_persist_gate later), so the group prune below cannot deadlock.
@@ -3768,53 +3890,133 @@ pub(crate) async fn delete_session_with_safety_checks(
         ));
     }
 
-    let session_file = session_store::sessions_dir().join(format!("{target_session_id}.json"));
-    let workspace_root = crate::session_workspace_path(&target_session_id)
-        .parent()
-        .map(|path| path.to_path_buf());
-    // Remove the persisted JSON and the in-memory entry before the workspace directory.
-    // The session list is built from saved JSON files plus the in-memory map, so doing
+    let roster_gate = session_group::group_roster_gate();
+    let roster_guard = roster_gate.lock().await;
+    #[cfg(not(test))]
+    let mut affected_group_ids = {
+        let mut affected_group_ids = Vec::new();
+        for summary in session_group::list_saved_group_summaries_result()
+            .map_err(|_| storage_protected_control_error())?
+        {
+            if summary.corrupt {
+                continue;
+            }
+            let Some(group) = session_group::load_group_from_storage_result(&summary.id)
+                .map_err(|_| storage_protected_control_error())?
+            else {
+                continue;
+            };
+            let references = group
+                .members
+                .iter()
+                .any(|member| member == &target_session_id)
+                || group.admins.iter().any(|admin| admin == &target_session_id)
+                || group.pending_votes.iter().any(|vote| {
+                    vote.target_session_id == target_session_id.as_str()
+                        || vote.requester_session_id == target_session_id.as_str()
+                        || vote
+                            .approvals
+                            .iter()
+                            .any(|approval| approval == &target_session_id)
+                });
+            if references {
+                affected_group_ids.push(summary.id);
+            }
+        }
+        affected_group_ids
+    };
+    let workspace_root = session_store::session_workspace_root_for_delete(&target_session_id)?;
+    #[cfg(not(test))]
+    let group_guards = {
+        let mut affected_group_ids = affected_group_ids.clone();
+        affected_group_ids.sort();
+        affected_group_ids.dedup();
+        let mut guards = Vec::with_capacity(affected_group_ids.len());
+        for group_id in affected_group_ids {
+            guards.push(
+                session_group::group_persist_gate(&group_id)
+                    .lock_owned()
+                    .await,
+            );
+        }
+        guards
+    };
+    // Remove the persisted session and the in-memory entry before the workspace directory.
+    // The session list is built from SQLite plus the in-memory map, so doing
     // this first means a later workspace-removal failure can no longer leave a session
     // that is still listed but has no workspace; at worst an orphan workspace dir remains.
-    match tokio::fs::try_exists(&session_file).await {
-        Ok(true) => tokio::fs::remove_file(&session_file)
-            .await
-            .map_err(|error| {
-                format!("Failed to delete session file for {target_session_id}: {error}")
-            })?,
-        Ok(false) => {}
-        Err(error) => return Err(format!("Failed to inspect session file: {error}")),
+    let delete_outcome = session_store::delete_session_from_storage(&target_session_id)
+        .await
+        .map_err(|error| format!("Failed to delete session {target_session_id}: {error}"))?;
+    let _persisted_deleted = delete_outcome.deleted;
+    #[cfg(not(test))]
+    {
+        affected_group_ids.extend(delete_outcome.affected_group_ids);
+        affected_group_ids.sort();
+        affected_group_ids.dedup();
     }
     let removed = {
         let mut sessions = state.sessions.lock().await;
         sessions.remove(&target_session_id).is_some()
     };
-    // The session is now unlisted (JSON + in-memory entry gone), so prune it from every
-    // saved group before the workspace step. Doing this here (rather than after) means a
-    // workspace-removal failure that returns early still cannot leave a ghost group member
-    // that fails `all`/`@member` dispatch resolution or shows as a phantom in member lists.
+    #[cfg(not(test))]
+    let mut group_notifications_incomplete = false;
+    #[cfg(test)]
+    let group_notifications_incomplete = false;
+    #[cfg(test)]
     prune_session_from_all_groups(state, &target_session_id).await;
-    if let Some(workspace_root) = workspace_root {
-        match tokio::fs::try_exists(&workspace_root).await {
-            Ok(true) => tokio::fs::remove_dir_all(&workspace_root)
-                .await
-                .map_err(|error| {
-                    format!("Failed to delete session workspace for {target_session_id}: {error}")
-                })?,
-            Ok(false) => {}
-            Err(error) => return Err(format!("Failed to inspect session workspace: {error}")),
+    #[cfg(not(test))]
+    if !affected_group_ids.is_empty() {
+        for group_id in &affected_group_ids {
+            match session_group::load_group_from_storage_result(group_id) {
+                Ok(Some(group)) => send_group_info(state, &group).await,
+                Ok(None) => {}
+                Err(error) => {
+                    group_notifications_incomplete = true;
+                    eprintln!(
+                        "WARNING: Session {target_session_id} was deleted, but Group {group_id} could not be refreshed: {error}"
+                    );
+                }
+            }
         }
+        crate::broadcast_group_list_payload(state).await;
     }
-    Ok(if removed {
+    #[cfg(not(test))]
+    drop(group_guards);
+    drop(roster_guard);
+    let workspace_cleanup_warning = match tokio::fs::try_exists(&workspace_root).await {
+        Ok(true) => tokio::fs::remove_dir_all(&workspace_root)
+            .await
+            .err()
+            .map(|error| {
+                format!("session workspace cleanup was incomplete for {target_session_id}: {error}")
+            }),
+        Ok(false) => None,
+        Err(error) => Some(format!(
+            "session workspace cleanup could not inspect {target_session_id}: {error}"
+        )),
+    };
+    let mut message = if removed {
         format!("Deleted session: {target_session_id}")
     } else {
         format!("Deleted saved session: {target_session_id}")
-    })
+    };
+    if let Some(warning) = workspace_cleanup_warning {
+        eprintln!("WARNING: {warning}");
+        message.push_str("\nWarning: ");
+        message.push_str(&warning);
+    }
+    if group_notifications_incomplete {
+        message.push_str(
+            "\nWarning: Some Group notifications could not be refreshed. Repair local storage and restart LingClaw.",
+        );
+    }
+    Ok(message)
 }
 
 /// True when the session has active or queued delegated work that must be stopped before
 /// the session can be safely deleted: an active direct run, an in-flight group run, or a
-/// queued/running run recorded in a saved group on disk.
+/// queued/running run recorded in a persisted group.
 fn session_has_active_delegated_work(session_id: &str) -> bool {
     direct_run_status_for_session(session_id).is_some_and(DirectRunStatus::is_active)
         || active_group_run_statuses_by_session()
@@ -3844,7 +4046,7 @@ pub(crate) async fn delete_group_from_control(
     let group_id = session_group::validate_group_id(group_id)?.to_string();
     let gate = session_group::group_persist_gate(&group_id);
     let _guard = gate.lock().await;
-    let group = session_group::load_group_from_disk(&group_id)
+    let group = session_group::load_group_from_storage_result(&group_id)?
         .ok_or_else(|| format!("Group '{}' not found", group_id))?;
     if session_group::group_has_active_runs(&group) {
         return Err(format!(
@@ -3967,7 +4169,7 @@ pub(crate) async fn promote_group_admin_from_control(
     let (run_ids, updated_runs, group) = {
         let gate = session_group::group_persist_gate(&group_id);
         let _guard = gate.lock().await;
-        let mut group = session_group::load_group_from_disk(&group_id)
+        let mut group = session_group::load_group_from_storage_result(&group_id)?
             .ok_or_else(|| format!("Group '{}' not found", group_id))?;
         if !group
             .members
@@ -4020,6 +4222,7 @@ fn remove_member_from_group(group: &mut SessionGroup, target_session_id: &str) {
 /// `mutate_group_result`; groups that fail to load or no longer reference the id are left
 /// untouched. Failures are logged, never propagated: the session is already deleted and a
 /// stale group reference must not turn a successful delete into an error.
+#[cfg(test)]
 async fn prune_session_from_all_groups(state: &AppState, deleted_session_id: &str) {
     // `main` is never a group member and is never deletable, so this only runs for workers.
     let mut pruned_any = false;
@@ -4078,7 +4281,7 @@ pub(crate) async fn remove_group_member_direct(
     let (run_ids, updated_runs, group) = {
         let gate = session_group::group_persist_gate(&group_id);
         let _guard = gate.lock().await;
-        let mut group = session_group::load_group_from_disk(&group_id)
+        let mut group = session_group::load_group_from_storage_result(&group_id)?
             .ok_or_else(|| format!("Group '{}' not found", group_id))?;
         if !group
             .members
@@ -4146,7 +4349,7 @@ async fn request_group_member_removal_vote(
     let (run_ids, updated_runs, group) = {
         let gate = session_group::group_persist_gate(&group_id);
         let _guard = gate.lock().await;
-        let mut group = session_group::load_group_from_disk(&group_id)
+        let mut group = session_group::load_group_from_storage_result(&group_id)?
             .ok_or_else(|| format!("Group '{}' not found", group_id))?;
         if !group
             .admins
@@ -4313,10 +4516,14 @@ async fn remove_group_member_from_tool(state: &AppState, args: &Value) -> Result
 
 async fn create_group_from_tool(state: &AppState, args: &Value) -> Result<String, String> {
     validate_tool_array_len(args, "members", SESSION_CONTROL_MEMBERS_MAX_ITEMS)?;
+    let roster_gate = session_group::group_roster_gate();
+    let _roster_guard = roster_gate.lock().await;
     let group_id = session_group::generate_available_group_id()?;
     let name = tool_args_string(args, "name").unwrap_or_else(|| format!("Group {group_id}"));
     let name = session_group::validate_group_name(&name)?;
-    let group = SessionGroup::new(&group_id, &name, tool_args_array(args, "members"));
+    let members = canonicalize_existing_group_members(tool_args_array(args, "members"))
+        .map_err(group_member_resolution_control_error)?;
+    let group = SessionGroup::new(&group_id, &name, members);
     let gate = session_group::group_persist_gate(&group_id);
     let _guard = gate.lock().await;
     session_group::save_group_to_disk_locked(&group).await?;
@@ -4340,6 +4547,12 @@ async fn update_group_from_tool(state: &AppState, args: &Value) -> Result<String
         .get("members")
         .and_then(Value::as_array)
         .map(|_| tool_args_array(args, "members"));
+    let roster_gate = session_group::group_roster_gate();
+    let _roster_guard = roster_gate.lock().await;
+    let members = members
+        .map(canonicalize_existing_group_members)
+        .transpose()
+        .map_err(group_member_resolution_control_error)?;
     let group = mutate_group(&group_id, |group| {
         if let Some(name) = name {
             group.name = name;
@@ -4451,7 +4664,7 @@ async fn stop_group_runs(
     let (run_ids, updated_runs) = {
         let gate = session_group::group_persist_gate(&group_id);
         let _guard = gate.lock().await;
-        let mut group = session_group::load_group_from_disk(&group_id)
+        let mut group = session_group::load_group_from_storage_result(&group_id)?
             .ok_or_else(|| format!("Group '{}' not found", group_id))?;
         if targets.is_empty() {
             targets = group
@@ -4549,11 +4762,11 @@ pub(crate) async fn execute_session_control_tool(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let result = match action {
-        "list_sessions" => Ok(session_list_output(state).await),
+        "list_sessions" => session_list_output(state).await,
         "create_session" => create_session_from_tool(state, &args).await,
         "delete_session" => delete_session_from_tool(state, &args).await,
         "describe_session" => describe_session_from_tool(state, &args).await,
-        "list_groups" => Ok(group_list_output()),
+        "list_groups" => group_list_output(),
         "create_group" => create_group_from_tool(state, &args).await,
         "update_group" => update_group_from_tool(state, &args).await,
         "delete_group" => delete_group_from_tool(state, &args).await,
@@ -4565,9 +4778,13 @@ pub(crate) async fn execute_session_control_tool(
             let group_id = tool_args_string(&args, "group_id")
                 .ok_or_else(|| "session_control error: group_id is required".to_string());
             match group_id {
-                Ok(group_id) => session_group::load_group_from_disk(&group_id)
-                    .map(|group| collect_group_summary(&group))
-                    .ok_or_else(|| format!("Group '{}' not found", group_id)),
+                Ok(group_id) => {
+                    session_group::load_group_from_storage_result(&group_id).and_then(|group| {
+                        group
+                            .map(|group| collect_group_summary(&group))
+                            .ok_or_else(|| format!("Group '{}' not found", group_id))
+                    })
+                }
                 Err(error) => Err(error),
             }
         }
@@ -4614,13 +4831,15 @@ pub(crate) struct SessionGroupRequest {
 
 pub(crate) async fn api_session_groups(
     State(_state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
-    Json(json!({
-        "groups": session_group::list_saved_group_summaries()
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let groups = session_group::list_saved_group_summaries_result()
+        .map_err(|_| crate::storage_protected_api_error())?;
+    Ok(Json(json!({
+        "groups": groups
             .into_iter()
             .map(|summary| summary.to_json())
             .collect::<Vec<_>>()
-    }))
+    })))
 }
 
 async fn generate_available_group_id() -> Result<String, (StatusCode, Json<serde_json::Value>)> {
@@ -4632,6 +4851,86 @@ async fn generate_available_group_id() -> Result<String, (StatusCode, Json<serde
     })
 }
 
+#[derive(Debug)]
+enum GroupMemberResolutionError {
+    Missing(Vec<String>),
+    Storage(String),
+}
+
+fn canonicalize_existing_group_members(
+    members: Vec<String>,
+) -> Result<Vec<String>, GroupMemberResolutionError> {
+    let members = session_group::normalize_members(members);
+    let mut canonical_members = Vec::with_capacity(members.len());
+    let mut missing_members = Vec::new();
+    let mut seen = HashSet::new();
+    for member in members {
+        match session_store::canonical_saved_session_id_result(&member) {
+            Ok(Some(canonical)) => {
+                let key = if cfg!(windows) {
+                    canonical.to_ascii_lowercase()
+                } else {
+                    canonical.clone()
+                };
+                if seen.insert(key) {
+                    canonical_members.push(canonical);
+                }
+            }
+            Ok(None) => missing_members.push(member),
+            Err(error) => return Err(GroupMemberResolutionError::Storage(error)),
+        }
+    }
+    if missing_members.is_empty() {
+        Ok(canonical_members)
+    } else {
+        Err(GroupMemberResolutionError::Missing(missing_members))
+    }
+}
+
+fn group_member_resolution_control_error(error: GroupMemberResolutionError) -> String {
+    match error {
+        GroupMemberResolutionError::Missing(members) => format!(
+            "session_control error: unknown group member session(s): {}",
+            members.join(", ")
+        ),
+        GroupMemberResolutionError::Storage(error) => {
+            format!("session_control error: failed to validate group members: {error}")
+        }
+    }
+}
+
+fn canonicalize_requested_group_members(
+    members: Vec<String>,
+) -> Result<Vec<String>, (StatusCode, Json<serde_json::Value>)> {
+    canonicalize_existing_group_members(members).map_err(|error| match error {
+        GroupMemberResolutionError::Missing(missing_members) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!(
+                    "Unknown group member session(s): {}",
+                    missing_members.join(", ")
+                )
+            })),
+        ),
+        GroupMemberResolutionError::Storage(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("Failed to validate group members: {error}") })),
+        ),
+    })
+}
+
+fn group_save_api_error(error: String) -> (StatusCode, Json<serde_json::Value>) {
+    let status = if error.starts_with(crate::storage::GROUP_MISSING_SESSIONS_ERROR_PREFIX) {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    (
+        status,
+        Json(json!({ "error": format!("Failed to save group: {error}") })),
+    )
+}
+
 pub(crate) async fn api_post_session_group(
     headers: HeaderMap,
     State(state): State<Arc<AppState>>,
@@ -4639,24 +4938,21 @@ pub(crate) async fn api_post_session_group(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     crate::validate_local_request_headers(&headers)?;
 
+    let roster_gate = session_group::group_roster_gate();
+    let _roster_guard = roster_gate.lock().await;
     let group_id = generate_available_group_id().await?;
     let name = match request.name.as_deref() {
         Some(name) => session_group::validate_group_name(name)
             .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?,
         None => format!("Group {group_id}"),
     };
-    let group =
-        session_group::SessionGroup::new(&group_id, &name, request.members.unwrap_or_default());
+    let members = canonicalize_requested_group_members(request.members.unwrap_or_default())?;
+    let group = session_group::SessionGroup::new(&group_id, &name, members);
     let gate = session_group::group_persist_gate(&group_id);
     let _guard = gate.lock().await;
     session_group::save_group_to_disk_locked(&group)
         .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to save group: {error}") })),
-            )
-        })?;
+        .map_err(group_save_api_error)?;
 
     crate::broadcast_group_list_payload(&state).await;
     Ok(Json(json!({
@@ -4677,12 +4973,14 @@ pub(crate) async fn api_get_session_group(
     })?;
     let group_id = session_group::validate_group_id(group_id)
         .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
-    let group = session_group::load_group_from_disk(group_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("Group '{}' not found", group_id) })),
-        )
-    })?;
+    let group = session_group::load_group_from_storage_result(group_id)
+        .map_err(|_| crate::storage_protected_api_error())?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("Group '{}' not found", group_id) })),
+            )
+        })?;
     Ok(Json(json!({"group": group_json(&state, &group).await})))
 }
 
@@ -4694,6 +4992,8 @@ pub(crate) async fn api_put_session_group(
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     crate::validate_local_request_headers(&headers)?;
 
+    let roster_gate = session_group::group_roster_gate();
+    let _roster_guard = roster_gate.lock().await;
     let group_id = query.group.as_deref().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
@@ -4705,12 +5005,14 @@ pub(crate) async fn api_put_session_group(
         .to_string();
     let gate = session_group::group_persist_gate(&group_id);
     let _guard = gate.lock().await;
-    let mut group = session_group::load_group_from_disk(&group_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("Group '{}' not found", group_id) })),
-        )
-    })?;
+    let mut group = session_group::load_group_from_storage_result(&group_id)
+        .map_err(|_| crate::storage_protected_api_error())?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("Group '{}' not found", group_id) })),
+            )
+        })?;
     if let Some(name) = request.name.as_deref() {
         group.name = session_group::validate_group_name(name)
             .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?;
@@ -4721,18 +5023,13 @@ pub(crate) async fn api_put_session_group(
     // and bumps the version; it is idempotent on the already-normalized members we
     // loaded from disk, so running it once is sufficient either way.
     if let Some(members) = request.members {
-        group.members = members;
+        group.members = canonicalize_requested_group_members(members)?;
     }
     session_group::normalize_group(&mut group);
     group.updated_at = now_epoch();
     session_group::save_group_to_disk_locked(&group)
         .await
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Failed to save group: {error}") })),
-            )
-        })?;
+        .map_err(group_save_api_error)?;
 
     send_group_info(&state, &group).await;
     crate::broadcast_group_list_payload(&state).await;
@@ -4760,12 +5057,14 @@ pub(crate) async fn api_delete_session_group(
         .to_string();
     let gate = session_group::group_persist_gate(&group_id);
     let _guard = gate.lock().await;
-    let group = session_group::load_group_from_disk(&group_id).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("Group '{}' not found", group_id) })),
-        )
-    })?;
+    let group = session_group::load_group_from_storage_result(&group_id)
+        .map_err(|_| crate::storage_protected_api_error())?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": format!("Group '{}' not found", group_id) })),
+            )
+        })?;
     if session_group::group_has_active_runs(&group) {
         return Err((
             StatusCode::CONFLICT,

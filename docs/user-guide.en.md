@@ -21,6 +21,8 @@ The backend generates a six-character alphanumeric ID when creating a session. Y
 
 Navigation search matches names and IDs. The recent area shows at most 12 entries and always includes Main and the active session. Everything else appears under Earlier sessions.
 
+Structured session state is no longer stored as separate JSON files. Messages, todos, usage, sub-agent snapshots, and group data live in `~/.lingclaw/lingclaw.db`. Prompt files, skills, agents, Structured Memory, and normal Markdown remain in their workspaces. The first launch after an upgrade migrates the old store automatically and permanently retains the original JSON under `~/.lingclaw/backups/sqlite-migration-*/`.
+
 ### Groups
 
 A group organizes several sessions into one conversation. Main handles governance but is not dispatched as a regular member. Three target modes are available:
@@ -54,6 +56,12 @@ A session `/model` override affects that session only and takes priority over gl
 The desktop sidebar creates, searches, and switches sessions and groups. Settings, Usage, theme, and language live at the bottom. Desktop expansion is saved as `lingclaw.sessionDrawerExpanded`; mobile navigation stays in memory and closes after selection, backdrop click, or Escape.
 
 Session and group create, edit, rename, delete, and member-removal flows use in-app dialogs. They support focus trapping, Escape and backdrop close, inline validation, asynchronous errors, and a busy submission state.
+
+### Storage protection mode
+
+If the runtime detects a SQLite I/O, integrity, or constraint failure, it enters sticky protection mode for the remainder of the process and cancels active agent/group runs. Sessions, history, usage, and independent configuration files remain readable, while message sends, uploads, and session/group/todo database mutations are disabled. Fix the disk-space, permission, or database problem and restart LingClaw; the UI does not expose raw SQL errors.
+
+Use `lingclaw db status` for a read-only database inspection, or run `lingclaw db backup [PATH]` while the service is live to create a consistent snapshot. This command covers SQLite core data only; a complete backup also includes `.lingclaw.json`, `mcp-auth.json`, and session workspaces.
 
 ### Conversation and execution stack
 

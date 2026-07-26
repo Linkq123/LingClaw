@@ -183,6 +183,25 @@
   justify-content: space-between;
   gap: 12px;
 }
+
+.console-storage-warning {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 24px 0;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent-warn) 42%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent-warn) 8%, var(--surface));
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.console-storage-warning .icon {
+  flex: none;
+  color: var(--accent-warn);
+}
 .settings-discard-dialog strong {
   display: block;
   color: var(--text);
@@ -1234,6 +1253,10 @@
     margin: 12px 16px 0;
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .console-storage-warning {
+    margin-inline: 16px;
   }
   .settings-discard-actions {
     justify-content: flex-end;

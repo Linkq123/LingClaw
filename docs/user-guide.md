@@ -21,6 +21,8 @@
 
 会话导航按名称或 ID 搜索。最近区域最多显示 12 项，并始终包含 Main 和当前会话；其余内容收进“更早会话”。
 
+Session 的结构化状态不再保存为单独 JSON：消息、Todos、Usage、Sub-agent 快照和 Group 数据统一位于 `~/.lingclaw/lingclaw.db`。提示文件、Skills、Agents、Structured Memory 和普通 Markdown 仍保留在各自的 Workspace 中。首次从旧版启动时会自动迁移；旧 JSON 会移动到 `~/.lingclaw/backups/sqlite-migration-*/` 永久留存。
+
 ### Group
 
 Group 把多个 Session 组织为群聊。Main 负责治理，但不会作为普通 dispatch member 重复执行成员任务。群聊支持三种目标模式：
@@ -54,6 +56,12 @@ Session 的 `/model` 覆盖只影响该 Session，并优先于全局 `primary`�
 桌面端左侧栏用于创建、搜索和切换 Session/Group，底部进入 Settings、Usage、主题和语言。桌面展开偏好保存在 `lingclaw.sessionDrawerExpanded`；手机导航只保存在内存，选择会话、点击遮罩或按 Escape 后关闭。
 
 Session/Group 的创建、编辑、重命名、删除和移除成员使用应用内对话框。对话框支持键盘焦点循环、Escape、遮罩关闭、内联校验、异步错误和提交忙碌态。
+
+### 存储保护模式
+
+Runtime 检测到 SQLite I/O、完整性或约束故障后，会进入本次进程内不可逆的保护模式并取消活动 Agent/Group run。页面仍可读取 Session、历史、Usage 和独立配置文件，但会禁用发送消息、上传、Session/Group/Todo 等数据库写操作。修复磁盘空间、权限或数据库问题后重启 LingClaw；界面不会展示原始 SQL 错误。
+
+可用 `lingclaw db status` 只读检查数据库，也可在服务运行时执行 `lingclaw db backup [PATH]` 创建一致快照。备份命令只覆盖 SQLite 核心数据；完整备份还需包含 `.lingclaw.json`、`mcp-auth.json` 和 Session Workspace。
 
 ### 对话与执行栈
 

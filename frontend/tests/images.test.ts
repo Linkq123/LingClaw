@@ -225,6 +225,7 @@ describe('local image upload lifecycle', () => {
     state.sessionIdentityMutationInFlight = false;
     state.composerSessionIdentityPending = false;
     state.composerSessionTransitionPending = false;
+    state.storageMode = 'healthy';
     state.composerModelAvailability = 'ready';
     state.imageCapable = true;
     state.s3Capable = true;
@@ -309,6 +310,32 @@ describe('local image upload lifecycle', () => {
     const pending = uploadLocalImages([new File(['image'], 'image.png', { type: 'image/png' })]);
 
     state.s3Capable = false;
+    upload.resolve(
+      jsonResponse({
+        s3_config_id: 's3-a',
+        images: [
+          {
+            url: 'https://images.example/stale.png',
+            object_key: 'uploads/stale.png',
+            attachment_token: 'attachment-token',
+            s3_config_id: 's3-a',
+          },
+        ],
+        urls: ['https://images.example/stale.png'],
+      }),
+    );
+    await pending;
+
+    expect(state.pendingImages).toEqual([]);
+    expect(dom.chat?.textContent).toContain('upload was discarded');
+  });
+
+  it('discards an in-flight upload when storage enters protected mode', async () => {
+    const upload = deferredResponse();
+    vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockReturnValue(upload.promise));
+    const pending = uploadLocalImages([new File(['image'], 'image.png', { type: 'image/png' })]);
+
+    state.storageMode = 'protected';
     upload.resolve(
       jsonResponse({
         s3_config_id: 's3-a',

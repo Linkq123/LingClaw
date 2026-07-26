@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { dismissActionDialog, openActionDialog, refreshActionDialog } from '../src/actionDialog.js';
+import {
+  dismissActionDialog,
+  forceDismissActionDialog,
+  openActionDialog,
+  refreshActionDialog,
+} from '../src/actionDialog.js';
 import { setLanguage } from '../src/i18n.js';
 
 describe('application action dialog', () => {
@@ -183,6 +188,37 @@ describe('application action dialog', () => {
 
     resolveSubmit();
     await expect(resultPromise).resolves.toEqual({ kind: 'delete-session' });
+  });
+
+  it('allows a system status change to close a busy dialog', async () => {
+    let resolveSubmit!: () => void;
+    const submit = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          resolveSubmit = resolve;
+        }),
+    );
+    const resultPromise = openActionDialog({
+      kind: 'delete-session',
+      entityId: 'worker-a',
+      entityName: 'Worker A',
+      submit,
+    });
+    await Promise.resolve();
+    document
+      .querySelector<HTMLFormElement>('.action-dialog-form')
+      ?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(document.querySelector('.action-dialog-panel')?.getAttribute('aria-busy')).toBe('true');
+    expect(forceDismissActionDialog()).toBe(true);
+    await expect(resultPromise).resolves.toBeNull();
+    expect(document.querySelector('.action-dialog-overlay')).toBeNull();
+
+    resolveSubmit();
+    await Promise.resolve();
+    expect(document.querySelector('.action-dialog-overlay')).toBeNull();
   });
 
   it('keeps one active dialog and cancels with Escape when idle', async () => {

@@ -104,6 +104,7 @@ import {
 } from './socket.js';
 import {
   ensureUploadTokenInternal,
+  closeAttachPopup,
   updateAttachButton,
   dropUnavailablePendingUploads,
   initImageListeners,
@@ -167,6 +168,7 @@ import {
 import { matchesOverlayDismissTarget } from './pages/overlay.js';
 import {
   dismissActionDialog,
+  forceDismissActionDialog,
   hasOpenActionDialog,
   openActionDialog,
   refreshActionDialog,
@@ -174,6 +176,7 @@ import {
   type ActionDialogSessionOption,
 } from './actionDialog.js';
 import { appendWorkspacePortal, isConsoleSurfaceActive } from './workspacePortal.js';
+import { publishStorageStatus } from './storageStatus.js';
 import {
   CONFIG_SAVED_EVENT,
   acceptComposerHttpModelPayloadRevision,
@@ -1037,7 +1040,9 @@ function renderGroupMemberDrawer() {
         'aria-label',
         tr('group.moreActions', { name: detail.name || detail.id }),
       );
+      menuTrigger.disabled = storageWriteBlocked();
       menuTrigger.addEventListener('click', () => {
+        if (menuTrigger.disabled) return;
         const willOpen = state.groupMemberMenuId !== detail.id;
         state.groupMemberMenuId = willOpen ? detail.id : '';
         renderGroupMemberDrawer();
@@ -1061,6 +1066,7 @@ function renderGroupMemberDrawer() {
         if (detail.role === 'member') {
           const promoteButton = document.createElement('button');
           promoteButton.type = 'button';
+          promoteButton.disabled = storageWriteBlocked();
           promoteButton.setAttribute('role', 'menuitem');
           promoteButton.dataset.groupMemberFocus = 'promote';
           promoteButton.append(
@@ -1081,6 +1087,7 @@ function renderGroupMemberDrawer() {
         }
         const removeButton = document.createElement('button');
         removeButton.type = 'button';
+        removeButton.disabled = storageWriteBlocked();
         removeButton.className = 'danger';
         removeButton.setAttribute('role', 'menuitem');
         removeButton.dataset.groupMemberFocus = 'remove';
@@ -1185,6 +1192,10 @@ function sessionIdentityActionBlocked(): boolean {
   );
 }
 
+function storageWriteBlocked(): boolean {
+  return state.storageMode === 'protected';
+}
+
 function performSwitchToSession(nextSessionId: string) {
   if (sessionIdentityActionBlocked()) return;
   beginComposerSessionTransition(false, nextSessionId);
@@ -1233,7 +1244,7 @@ function openWorkspaceActionDialog(request: ActionDialogRequest) {
 }
 
 async function createSession() {
-  if (sessionCreateInFlight || sessionIdentityActionBlocked()) return;
+  if (storageWriteBlocked() || sessionCreateInFlight || sessionIdentityActionBlocked()) return;
   sessionCreateInFlight = true;
   state.sessionIdentityMutationInFlight = true;
   renderSessionDrawer();
@@ -1270,7 +1281,7 @@ async function createSession() {
 }
 
 async function createGroup() {
-  if (sessionCreateInFlight || sessionIdentityActionBlocked()) return;
+  if (storageWriteBlocked() || sessionCreateInFlight || sessionIdentityActionBlocked()) return;
   const sessions = editableGroupSessions();
   const selectedMembers = sessions.some((session) => session.id === state.activeSessionId)
     ? [state.activeSessionId]
@@ -1312,7 +1323,14 @@ async function createGroup() {
 
 function deleteSession(sessionId: string) {
   const targetSessionId = String(sessionId || '').trim();
-  if (!targetSessionId || state.activeGroupId || sessionIdentityActionBlocked()) return;
+  if (
+    storageWriteBlocked() ||
+    !targetSessionId ||
+    state.activeGroupId ||
+    sessionIdentityActionBlocked()
+  ) {
+    return;
+  }
   if (targetSessionId === 'main' || targetSessionId === state.activeSessionId) return;
   if (!targetSessionId) return;
   const current = state.sessions.find((session) => session.id === targetSessionId);
@@ -1330,7 +1348,7 @@ function deleteSession(sessionId: string) {
 
 async function renameSession(sessionId: string) {
   const targetSessionId = String(sessionId || '').trim();
-  if (!targetSessionId || sessionIdentityActionBlocked()) return;
+  if (storageWriteBlocked() || !targetSessionId || sessionIdentityActionBlocked()) return;
   const current = state.sessions.find((session) => session.id === targetSessionId);
   if (current?.corrupt) return;
   await openWorkspaceActionDialog({
@@ -1373,7 +1391,7 @@ async function renameSession(sessionId: string) {
 
 async function renameGroup(groupId: string) {
   const targetGroupId = String(groupId || '').trim();
-  if (!targetGroupId || sessionIdentityActionBlocked()) return;
+  if (storageWriteBlocked() || !targetGroupId || sessionIdentityActionBlocked()) return;
   const current = state.sessionGroups.find((group) => group.id === targetGroupId);
   if (current?.corrupt) return;
   if (state.mobileNavigationOpen) closeMobileNavigation({ restoreFocus: true });
@@ -1409,7 +1427,7 @@ async function renameGroup(groupId: string) {
 
 async function deleteGroup(groupId: string) {
   const targetGroupId = String(groupId || '').trim();
-  if (!targetGroupId || sessionIdentityActionBlocked()) return;
+  if (storageWriteBlocked() || !targetGroupId || sessionIdentityActionBlocked()) return;
   const current = state.sessionGroups.find((group) => group.id === targetGroupId);
   await openWorkspaceActionDialog({
     kind: 'delete-group',
@@ -1661,7 +1679,7 @@ function applySessionModelConfiguration(data): boolean {
 }
 
 async function promoteGroupMember(sessionId: string) {
-  if (!state.activeGroupId) return;
+  if (storageWriteBlocked() || !state.activeGroupId || sessionId === 'main') return;
   try {
     const detail = await requestPromoteSessionGroupAdmin(state.activeGroupId, sessionId);
     applyGroupDetail(detail);
@@ -1674,7 +1692,7 @@ async function promoteGroupMember(sessionId: string) {
 }
 
 async function removeGroupMember(sessionId: string) {
-  if (!state.activeGroupId || sessionId === 'main') return;
+  if (storageWriteBlocked() || !state.activeGroupId || sessionId === 'main') return;
   const label = groupMemberName(sessionId);
   const groupId = state.activeGroupId;
   await openWorkspaceActionDialog({
@@ -2111,10 +2129,77 @@ function recoverFromInvalidActiveGroup(): void {
   reconnectToActiveSession(handleMessage);
 }
 
+function applyStorageStatus(data: unknown): void {
+  const payload = data as { storage?: { mode?: unknown } } | null;
+  const mode = payload?.storage?.mode;
+  if (mode !== 'healthy' && mode !== 'protected') return;
+
+  const changed = state.storageMode !== mode;
+  state.storageMode = mode;
+  publishStorageStatus(mode);
+
+  if (mode === 'protected') {
+    closeAttachPopup();
+    closeGroupTargetPicker();
+    closeGroupMemberMenu();
+    if (changed && hasOpenActionDialog()) forceDismissActionDialog();
+    state.pendingDeleteSessionId = '';
+    state.activeGroupRunIds.clear();
+    if (state.busy) {
+      clearCompressionOutcome();
+      finishAssistantStream({ discardIfEmpty: true });
+      finishReasoningStream();
+      if (state.reasoningPanel) {
+        state.reasoningPanel.classList.remove('reasoning-active');
+        finalizeOrDiscardLiveReasoningPanel(state.reasoningPanel);
+      }
+      finishTaskPlanPanel();
+      clearReactStatus();
+      completeExecutionStack({ failed: true });
+      state.reasoningPanel = null;
+      resetRoundTimers();
+      restorePendingPlanAction();
+      restoreComposerSessionTransitionWithCapabilities();
+      setBusy(false);
+    }
+  }
+
+  const readOnlyCommands = new Set(['/help', '/status', '/usage', '/sessions']);
+  document
+    .querySelectorAll<HTMLButtonElement>(
+      'button[data-action="cmd"][data-cmd], button[data-action="cmd-close-menu"][data-cmd]',
+    )
+    .forEach((button) => {
+      const command = String(button.dataset.cmd || '')
+        .trim()
+        .split(/\s+/, 1)[0]
+        .toLowerCase();
+      const blocked = mode === 'protected' && !readOnlyCommands.has(command);
+      if (blocked && !button.disabled) {
+        button.dataset.storageProtectedDisabled = 'true';
+        button.disabled = true;
+      } else if (!blocked && button.dataset.storageProtectedDisabled === 'true') {
+        delete button.dataset.storageProtectedDisabled;
+        button.disabled = false;
+      }
+    });
+
+  syncComposerAvailability();
+  updateAttachButton();
+  renderSessionDrawer();
+  renderTodosPanel();
+  renderGroupTargetControls();
+  renderGroupMemberDrawer();
+}
+
 // ── handleMessage ──
 
 function handleMessage(data) {
   switch (data.type) {
+    case 'storage_status':
+      applyStorageStatus(data);
+      break;
+
     case 'session_group_list':
       state.sessionGroups = normalizeSessionGroupListPayload(data);
       renderSessionDrawer();

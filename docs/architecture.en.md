@@ -14,7 +14,8 @@ flowchart TB
     Loop --> Prompt["Prompt, Skills, Memory, Context"]
     Loop --> Providers["OpenAI / Anthropic / Gemini / Ollama"]
     Loop --> Tools["Built-ins / MCP / Sub-agents"]
-    Sessions <--> Disk["Atomic local persistence"]
+    Sessions <--> SQLite["SQLite core storage"]
+    Sessions <--> Disk["Session workspace files"]
     Tools --> Images["Optional S3 image pipeline"]
 ```
 
@@ -64,8 +65,9 @@ When historical data has no reliable start time, the frontend omits duration. A 
 | `context.rs` | Token estimates, request budgets, pruning |
 | `hooks.rs` | LLM/Tool/Command lifecycle and automatic context compression |
 | `prompts.rs` | Workspace prompts, Bootstrap, skill discovery and injection |
-| `session_store.rs` | Session schema, migration, and atomic disk I/O |
-| `session_group.rs` | Group store, members, admins, voting, and replay payloads |
+| `storage/` | SQLite schema, session/group repositories, legacy JSON migration, status inspection, and online backup |
+| `session_store.rs` | Session runtime adapter, normalization, and workspace compatibility logic |
+| `session_group.rs` | Group model, members, admins, voting, and replay payloads |
 | `session_control.rs` | Main-only cross-session/group control plane and dispatch |
 | `todos.rs` | Todo validation, revision conflicts, and broadcast |
 | `memory.rs` | Structured Memory, Daily Reflection, and queues |
@@ -134,8 +136,8 @@ The orchestrator validates a DAG, runs topological layers concurrently, propagat
 ~/.lingclaw/
 ├── .lingclaw.json
 ├── mcp-auth.json
-├── sessions/<session-id>.json
-├── groups/<group-id>.json
+├── lingclaw.db
+├── backups/
 ├── system-skills/
 ├── system-agents/
 ├── skills/
@@ -153,9 +155,13 @@ The orchestrator validates a DAG, runs topological layers concurrently, propagat
     └── agents/
 ```
 
-A session archive includes messages, model override, think/view state, todos, skill policy, pending plan, and usage. The current `SESSION_VERSION = 7`; loading older archives fills defaults and trims incomplete tool transactions.
+`lingclaw.db` is the only persistent source for sessions, messages, todos, usage, sub-agent snapshots, and group data. Complex provider fields use JSON columns, while identity, order, time, and tool IDs remain queryable columns. Message saves fingerprint the common prefix and rewrite only the changed tail; multi-table session/group updates commit in one transaction. SQLite runs with WAL, `foreign_keys=ON`, `synchronous=NORMAL`, and a five-second busy timeout, with ownership and schema tracked through `application_id`, `schema_migrations`, and `user_version`.
 
-Disk writes create a `.tmp` file and rename it, including Windows destination-replacement recovery. A session updated in memory but failing to persist is not immediately discarded, allowing a later save to retry.
+On the first launch that finds old `sessions/` or `groups/`, the runtime migrates before binding its listener. It applies primary/`.tmp` recovery, validates IDs, references, and hashes, atomically moves the directories to `backups/sqlite-migration-<timestamp>/`, then imports, verifies, and records completion in one SQLite transaction. A two-phase journal resumes interrupted migrations. Successful migration never reads or writes the JSON store again, and the backup is never deleted automatically. Schema upgrades create a consistent database backup first.
+
+A runtime SQLite I/O, corruption, or constraint error places the process in sticky `protected` mode. Active agent/group runs are cancelled and core database writes are rejected, while reads and independent `.lingclaw.json` saves remain available. HTTP returns stable `503 storage_protected` responses and WebSockets broadcast `storage_status`; restart after fixing the external problem.
+
+Workspace prompts, Markdown memory, Structured Memory, skills, and agents remain filesystem data. Session deletion commits the database transaction—including group membership and vote cleanup—before removing the workspace. A file-cleanup failure can leave an orphan directory but cannot resurrect the deleted database entity.
 
 ### Bootstrap prompt
 
@@ -199,7 +205,7 @@ sequenceDiagram
     R->>P: Fresh signed URL or local inline data
 ```
 
-The runtime never guesses images from arbitrary text, stdout, paths, or URLs. Raw Base64 does not enter logs, WebSocket payloads, model text, or session JSON. A tool batch retains at most 10 images, upload concurrency is limited to three, and result order follows tool-call order.
+The runtime never guesses images from arbitrary text, stdout, paths, or URLs. Raw Base64 does not enter logs, WebSocket payloads, model text, or SQLite. A tool batch retains at most 10 images, upload concurrency is limited to three, and result order follows tool-call order.
 
 Signing depends on the S3 configuration identity. After identity changes, an old key is skipped instead of being re-signed under the new configuration. Image failure adds an unavailable notice without changing the original tool success state.
 

@@ -11,7 +11,8 @@ LingClaw 由一个 Rust 二进制、`static/` Web 资源以及内置 Skills/Sub-
 ```text
 Browser → http://127.0.0.1:18989 → lingclaw process
                                       ├── ~/.lingclaw/.lingclaw.json
-                                      ├── sessions/ and groups/
+                                      ├── lingclaw.db
+                                      ├── backups/
                                       └── <session-id>/workspace/
 ```
 
@@ -187,6 +188,8 @@ lingclaw
 
 必须显式添加 Provider/Model，并为主 Agent 指定 `primary` 或使用 Session `/model`，普通对话才会启用。详见[配置指南](configuration.md)。
 
+如果用户目录仍包含旧版 `sessions/` 或 `groups/`，首次启动会在监听端口前迁移到 `lingclaw.db`。任何损坏、非法 ID 或引用错误都会中止启动并指出文件路径；成功后原目录保存在 `backups/sqlite-migration-<timestamp>/`，不会自动删除。
+
 管理命令：
 
 ```bash
@@ -200,6 +203,8 @@ lingclaw doctor         # 安装环境检查
 lingclaw update         # 从当前源码目录检查、重建、安装、重启
 lingclaw install        # 从当前源码目录安装
 lingclaw install -d DIR # 从指定源码目录安装
+lingclaw db status      # 只读检查 SQLite，不存在时不会创建
+lingclaw db backup      # 在线创建并校验一致的 SQLite 快照
 lingclaw --version
 ```
 
@@ -351,6 +356,16 @@ lingclaw update
 
 ## 备份与恢复
 
+服务运行时可以先创建 SQLite 一致快照：
+
+```bash
+lingclaw db status
+lingclaw db backup
+lingclaw db backup /path/to/lingclaw-snapshot.db
+```
+
+默认快照写入 `~/.lingclaw/backups/lingclaw-<timestamp>.db`。命令拒绝覆盖已有目标并在完成后执行完整性校验。它只备份 `lingclaw.db`，不包含配置、MCP OAuth 或 Workspace。
+
 停止服务后备份整个数据目录：
 
 ```bash
@@ -362,10 +377,11 @@ tar -czf lingclaw-backup.tar.gz "$HOME/.lingclaw"
 
 - `.lingclaw.json`：配置和可能的明文凭据
 - `mcp-auth.json`：OAuth tokens
-- `sessions/`、`groups/`：历史与运行状态
+- `lingclaw.db`：Session、Group、消息、Todos、Usage 和 Sub-agent 快照
+- `backups/`：手工数据库快照、Schema 升级快照和永久旧 JSON 迁移备份
 - `<session-id>/workspace/`：提示、Skills、Agents 和记忆
 
-恢复时使用相同用户目录权限，确认配置中的本地路径、MCP command 和 S3 identity 仍然有效，再启动服务。
+本轮没有 `db restore` 命令。恢复时必须先停止 LingClaw，再还原完整用户目录或用已验证快照替换 `lingclaw.db`，保持相同用户目录权限；确认配置中的本地路径、MCP command 和 S3 identity 后再启动服务。
 
 ## 验证与排错
 

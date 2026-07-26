@@ -476,6 +476,65 @@ async fn handle_idle_socket_input_releases_reservation_when_session_is_missing()
 }
 
 #[tokio::test]
+async fn handle_idle_socket_input_does_not_start_when_the_user_message_cannot_be_saved() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "persist-failure-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let original_session = test_session(&session_id, "Persist Failure", None);
+    let original_updated_at = original_session.updated_at;
+    let original_message_count = original_session.messages.len();
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), original_session);
+    }
+
+    let failure_path = crate::session_store::sessions_dir().join(format!("{session_id}.json.tmp"));
+    std::fs::create_dir_all(&failure_path).expect("failure sentinel directory should be created");
+
+    let action = handle_idle_socket_input(
+        "this message must be durable".into(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    std::fs::remove_dir_all(&failure_path).expect("failure sentinel should be removed");
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    assert!(!state.active_runs.lock().await.contains_key(&session_id));
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&session_id)
+        .expect("session should remain loaded");
+    assert_eq!(session.messages.len(), original_message_count);
+    assert_eq!(session.updated_at, original_updated_at);
+    drop(sessions);
+
+    let storage_event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(storage_event["type"], "storage_status");
+    let error_event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(error_event["type"], "error");
+    assert!(
+        error_event["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Agent run was not started"))
+    );
+}
+
+#[tokio::test]
 async fn handle_idle_socket_input_accepts_plan_only_payload() {
     let state = Arc::new(test_app_state());
     let session_id = MAIN_SESSION_ID.to_string();
@@ -636,6 +695,75 @@ async fn handle_idle_socket_input_executes_matching_pending_plan() {
     );
     let _ = std::fs::remove_file(
         crate::session_store::sessions_dir().join(format!("{session_id}.json")),
+    );
+}
+
+#[tokio::test]
+async fn handle_idle_socket_input_restores_the_pending_plan_when_approval_cannot_be_saved() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "plan-persist-failure-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut current_session_id = session_id.clone();
+    let current_session_ref = Arc::new(Mutex::new(session_id.clone()));
+    let cancel = CancellationToken::new();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(8);
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+    let mut session = test_session(&session_id, "Plan Persist Failure", None);
+    session.pending_plan = Some(crate::PendingPlan {
+        id: "plan_persist_failure".into(),
+        original_user_message_index: 0,
+        assistant_plan_message_index: 0,
+        created_at: 10,
+    });
+    let original_updated_at = session.updated_at;
+    let original_message_count = session.messages.len();
+    {
+        let mut sessions = state.sessions.lock().await;
+        sessions.insert(session_id.clone(), session);
+    }
+
+    let failure_path = crate::session_store::sessions_dir().join(format!("{session_id}.json.tmp"));
+    std::fs::create_dir_all(&failure_path).expect("failure sentinel directory should be created");
+
+    let action = handle_idle_socket_input(
+        r#"{"execute_plan_id":"plan_persist_failure"}"#.into(),
+        &mut current_session_id,
+        &current_session_ref,
+        1,
+        &state,
+        &tx,
+        &live_tx,
+        &cancel,
+        &Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+
+    std::fs::remove_dir_all(&failure_path).expect("failure sentinel should be removed");
+    assert!(matches!(action, IdleSocketInputAction::Continue));
+    assert!(!state.active_runs.lock().await.contains_key(&session_id));
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&session_id)
+        .expect("session should remain loaded");
+    assert_eq!(session.messages.len(), original_message_count);
+    assert_eq!(session.updated_at, original_updated_at);
+    assert_eq!(
+        session.pending_plan.as_ref().map(|plan| plan.id.as_str()),
+        Some("plan_persist_failure")
+    );
+    drop(sessions);
+
+    let storage_event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(storage_event["type"], "storage_status");
+    let error_event = recv_json_with_timeout(&mut rx).await;
+    assert_eq!(error_event["type"], "error");
+    assert!(
+        error_event["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Agent run was not started"))
     );
 }
 
@@ -1111,6 +1239,15 @@ async fn model_configuration_send_does_not_let_one_backpressured_session_block_o
     );
     send_task.abort();
     let _ = send_task.await;
+}
+
+#[cfg(windows)]
+#[test]
+fn session_persist_gate_is_shared_by_case_aliases() {
+    let upper = crate::session_store::session_persist_gate("CaseAliasGate");
+    let lower = crate::session_store::session_persist_gate("casealiasgate");
+
+    assert!(Arc::ptr_eq(&upper, &lower));
 }
 
 #[cfg(windows)]
@@ -2325,6 +2462,50 @@ async fn apply_run_cancel_outcome_treats_shared_stop_as_user_stop() {
 
     assert!(phase_state.run_stopped);
     assert!(!phase_state.run_detached);
+    assert!(!stop_requested.load(std::sync::atomic::Ordering::Relaxed));
+}
+
+#[tokio::test]
+async fn apply_run_cancel_outcome_treats_storage_cancellation_as_detach() {
+    let state = Arc::new(test_app_state());
+    let session_id = MAIN_SESSION_ID.to_string();
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let stop_requested = Arc::new(AtomicBool::new(false));
+    let deferred_interventions = Arc::new(Mutex::new(DeferredInterventionState::open()));
+    let (live_tx, _live_rx) =
+        tokio::sync::mpsc::channel::<serde_json::Value>(LIVE_EVENT_CHANNEL_CAPACITY);
+
+    {
+        let mut runs = state.active_runs.lock().await;
+        runs.insert(
+            session_id.clone(),
+            SessionRunBinding {
+                connection_id: 1,
+                cancel: run_cancel.clone(),
+                stop_requested: stop_requested.clone(),
+                deferred_interventions,
+            },
+        );
+    }
+
+    run_cancel.cancel();
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+
+    apply_run_cancel_outcome(&ctx, &mut phase_state).await;
+
+    assert!(!phase_state.run_stopped);
+    assert!(phase_state.run_detached);
+    assert!(!phase_state.shutting_down);
     assert!(!stop_requested.load(std::sync::atomic::Ordering::Relaxed));
 }
 
@@ -3686,6 +3867,71 @@ async fn run_finish_phase_plan_only_empty_response_does_not_register_old_plan() 
         crate::session_store::sessions_dir().join(format!("{session_id}.json")),
     );
     let _ = std::fs::remove_dir_all(&workspace);
+}
+
+#[tokio::test]
+async fn run_finish_phase_does_not_report_completion_when_persistence_fails() {
+    let state = Arc::new(test_app_state());
+    let session_id = format!(
+        "finish-persist-failure-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut session = test_session(&session_id, "Finish Persist Failure", None);
+    session.messages.push(ChatMessage {
+        role: "assistant".into(),
+        content: Some("completed response".into()),
+        images: None,
+        thinking: None,
+        anthropic_thinking_blocks: None,
+        tool_calls: None,
+        tool_call_id: None,
+        timestamp: None,
+    });
+    state
+        .sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
+
+    let failure_path = crate::session_store::sessions_dir().join(format!("{session_id}.json.tmp"));
+    std::fs::create_dir_all(&failure_path).expect("failure sentinel directory should be created");
+
+    let cancel = CancellationToken::new();
+    let run_cancel = CancellationToken::new();
+    let (live_tx, mut live_rx): (LiveTx, mpsc::Receiver<serde_json::Value>) =
+        mpsc::channel(LIVE_EVENT_CHANNEL_CAPACITY);
+    let ctx = AgentRunCtx {
+        state: &state,
+        config: state.config(),
+        model: state.config().model.clone(),
+        current_session_id: &session_id,
+        cancel: &cancel,
+        live_tx: &live_tx,
+        run_cancel: &run_cancel,
+    };
+    let mut phase_state = phase_state_for_analyze_test();
+    phase_state
+        .react_ctx
+        .transition_to_finish(agent::FinishReason::Complete);
+
+    let control = run_finish_phase(&ctx, &mut phase_state).await;
+
+    std::fs::remove_dir_all(&failure_path).expect("failure sentinel should be removed");
+    assert!(matches!(control, AgentPhaseControl::Break));
+    assert!(phase_state.run_failed);
+    let error = live_rx
+        .try_recv()
+        .expect("persistence failure should be reported");
+    assert_eq!(error["type"].as_str(), Some("error"));
+    assert!(
+        error["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("could not be saved"))
+    );
+    assert!(
+        live_rx.try_recv().is_err(),
+        "a failed final save must not emit done or finish hooks"
+    );
 }
 
 #[tokio::test]
@@ -5861,6 +6107,71 @@ fn persist_pending_interventions_appends_user_messages() {
     assert!(saved.pending_plan.is_none());
     assert_eq!(saved.messages.len(), 3);
     let _ = std::fs::remove_file(crate::session_store::sessions_dir().join("session-a.json"));
+}
+
+#[test]
+fn persist_pending_interventions_keeps_messages_when_session_is_missing() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = std::sync::Arc::new(test_app_state());
+    let mut pending = vec!["follow-up detail".to_string()];
+
+    let changed = rt.block_on(persist_pending_interventions(
+        &state,
+        "missing-session",
+        &mut pending,
+    ));
+
+    assert!(!changed);
+    assert_eq!(pending, vec!["follow-up detail".to_string()]);
+}
+
+#[test]
+fn persist_pending_interventions_rolls_back_when_the_save_fails() {
+    let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
+    let state = std::sync::Arc::new(test_app_state());
+    let session_id = format!(
+        "intervention-persist-failure-{}",
+        crate::generate_random_session_id().expect("random session id")
+    );
+    let mut session = test_session(&session_id, "Intervention Persist Failure", None);
+    session.updated_at = 1;
+    let original = session.clone();
+    rt.block_on(async {
+        state
+            .sessions
+            .lock()
+            .await
+            .insert(session_id.clone(), session);
+    });
+
+    let failure_path = crate::session_store::sessions_dir().join(format!("{session_id}.json.tmp"));
+    std::fs::create_dir_all(&failure_path).expect("failure sentinel directory should be created");
+    let mut pending = vec!["must remain pending".to_string()];
+
+    let changed = rt.block_on(persist_pending_interventions(
+        &state,
+        &session_id,
+        &mut pending,
+    ));
+
+    std::fs::remove_dir_all(&failure_path).expect("failure sentinel should be removed");
+    assert!(!changed);
+    assert_eq!(pending, vec!["must remain pending".to_string()]);
+    let restored = rt.block_on(async {
+        state
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("session should remain loaded")
+    });
+    assert_eq!(restored.messages.len(), original.messages.len());
+    assert_eq!(restored.updated_at, original.updated_at);
+    assert_eq!(
+        restored.pending_plan.as_ref().map(|plan| plan.id.as_str()),
+        original.pending_plan.as_ref().map(|plan| plan.id.as_str())
+    );
 }
 
 #[test]

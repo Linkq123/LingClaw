@@ -2338,7 +2338,7 @@ async fn delete_command_rejects_running_session_without_active_connection() {
 }
 
 #[tokio::test]
-async fn delete_command_unlists_session_when_workspace_removal_fails() {
+async fn delete_command_succeeds_with_a_warning_when_workspace_removal_fails() {
     let session_id = unique_session_id("delete-fs-failure");
     let state = AppState {
         config: std::sync::Mutex::new(Arc::new(test_config())),
@@ -2407,16 +2407,17 @@ async fn delete_command_unlists_session_when_workspace_removal_fails() {
     .await
     .expect("command should resolve");
 
-    assert_eq!(result.response_type, "error");
+    assert_eq!(result.response_type, "system");
+    assert!(result.response.contains("Deleted session:"));
     assert!(
         result
             .response
-            .contains("Failed to delete session workspace")
+            .contains("session workspace cleanup was incomplete")
     );
     // Deletion removes the persisted JSON and the in-memory entry BEFORE the
     // workspace dir, so a workspace-removal failure can never leave a session that
-    // is still listed but has no workspace. The session is unlisted (memory + JSON
-    // gone) and the error reports the leftover workspace; the orphan dir remains.
+    // is still listed but has no workspace. The successful response reports the
+    // leftover orphan workspace as a warning.
     assert!(!state.sessions.lock().await.contains_key(&session_id));
     assert!(
         !tokio::fs::try_exists(&session_file)

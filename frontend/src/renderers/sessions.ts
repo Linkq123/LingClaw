@@ -368,6 +368,7 @@ function currentGroupBadgeLabel(group: RenderableGroup): string {
 
 function isSessionDeleteable(session: RenderableSession): boolean {
   return (
+    state.storageMode !== 'protected' &&
     !state.activeGroupId &&
     !identityNavigationBlocked() &&
     !session.pending &&
@@ -379,6 +380,7 @@ function isSessionDeleteable(session: RenderableSession): boolean {
 
 function isSessionRenameable(session: RenderableSession): boolean {
   return (
+    state.storageMode !== 'protected' &&
     !identityNavigationBlocked() &&
     !session.pending &&
     hasValidId(session.id) &&
@@ -500,7 +502,7 @@ function createSectionHeader(label: string, count: number, action?: () => void):
         ? tr('session.newGroup')
         : tr('session.newSessionShort');
     button.setAttribute('aria-label', button.title);
-    button.disabled = identityNavigationBlocked();
+    button.disabled = state.storageMode === 'protected' || identityNavigationBlocked();
     button.addEventListener('click', () => {
       if (!button.disabled) action();
     });
@@ -600,6 +602,7 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
 
   const actions: SessionRowAction[] = [];
   if (
+    state.storageMode !== 'protected' &&
     !identityNavigationBlocked() &&
     !group.pending &&
     !group.corrupt &&
@@ -614,6 +617,7 @@ function createGroupRow(group: RenderableGroup): HTMLElement {
     });
   }
   if (
+    state.storageMode !== 'protected' &&
     !identityNavigationBlocked() &&
     !group.pending &&
     hasValidGroupId &&
@@ -645,7 +649,8 @@ function applyDrawerChrome(): void {
     dom.sessionDrawerNewBtn.innerHTML = `${iconMarkup('plus')}<span class="sidebar-new-label">${tr(
       'session.newSession',
     )}</span>`;
-    dom.sessionDrawerNewBtn.disabled = identityNavigationBlocked();
+    dom.sessionDrawerNewBtn.disabled =
+      state.storageMode === 'protected' || identityNavigationBlocked();
     dom.sessionDrawerNewBtn.setAttribute('aria-label', tr('session.newSessionShort'));
     dom.sessionDrawerNewBtn.title = tr('session.newSessionShort');
   }

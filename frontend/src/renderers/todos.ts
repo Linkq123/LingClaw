@@ -125,7 +125,9 @@ async function persistTodos(
   nextItems: TodoItem[],
   options: { focusId?: string | null; savingItemId?: string | null } = {},
 ): Promise<boolean> {
-  if (state.todoSaving || state.sessionSwitchInFlight) return false;
+  if (state.storageMode === 'protected' || state.todoSaving || state.sessionSwitchInFlight) {
+    return false;
+  }
 
   const requestSessionId = currentSessionId();
   const requestBaseRevision = state.todos.revision;
@@ -348,7 +350,8 @@ export function renderTodosPanel(): void {
   const panel = ensureTodosPanel();
   if (!panel) return;
 
-  const disabled = state.todoSaving || state.sessionSwitchInFlight;
+  const disabled =
+    state.storageMode === 'protected' || state.todoSaving || state.sessionSwitchInFlight;
   const snapshot = state.todos;
 
   const header = document.createElement('div');

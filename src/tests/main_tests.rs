@@ -26,6 +26,47 @@ fn explicit_model_environment_requires_a_nonempty_value() {
 }
 
 #[test]
+fn default_session_failure_only_allows_protected_read_only_startup() {
+    assert!(!should_continue_after_default_session_error(
+        &storage::StorageStatus::default()
+    ));
+    assert!(should_continue_after_default_session_error(
+        &storage::StorageStatus {
+            mode: storage::StorageMode::Protected,
+            reason: Some("corrupt persisted Main".to_string()),
+        }
+    ));
+}
+
+#[test]
+fn successful_external_upload_is_rejected_if_storage_protects_mid_request() {
+    assert!(should_replace_with_storage_protected(
+        true,
+        true,
+        StatusCode::OK,
+        false,
+    ));
+    assert!(!should_replace_with_storage_protected(
+        true,
+        false,
+        StatusCode::OK,
+        false,
+    ));
+    assert!(should_replace_with_storage_protected(
+        true,
+        false,
+        StatusCode::INTERNAL_SERVER_ERROR,
+        false,
+    ));
+    assert!(!should_replace_with_storage_protected(
+        true,
+        true,
+        StatusCode::OK,
+        true,
+    ));
+}
+
+#[test]
 fn configured_models_available_uses_the_runtime_provider_catalog() {
     let mut config = test_config();
     assert!(!configured_models_available(&config));
@@ -4508,6 +4549,21 @@ fn build_global_today_usage_sums_all_sessions() {
 }
 
 #[test]
+fn global_today_usage_marks_persisted_failures_as_partial() {
+    let partial = crate::session_admin::build_global_today_usage_from_parts(2_300, 560, None);
+    assert!(partial.contains("input_tokens: 2.3K"));
+    assert!(partial.contains("output_tokens: 560"));
+    assert!(partial.contains("data_status: partial"));
+    assert!(partial.contains("persisted Session usage unavailable"));
+
+    let complete =
+        crate::session_admin::build_global_today_usage_from_parts(2_300, 560, Some((700, 440)));
+    assert!(complete.contains("input_tokens: 3K"));
+    assert!(complete.contains("output_tokens: 1K"));
+    assert!(!complete.contains("data_status: partial"));
+}
+
+#[test]
 fn gather_global_today_usage_includes_unloaded_persisted_sessions() {
     let rt = tokio::runtime::Runtime::new().expect("runtime should be created");
     let state = test_app_state();
@@ -4585,7 +4641,16 @@ fn validate_session_id_rejects_windows_reserved_device_names() {
 
 #[test]
 fn validate_session_id_rejects_reserved_top_level_config_dirs_case_insensitively() {
-    for id in ["Skills", "SESSIONS", "System-Agents", "SYSTEM-SKILLS"] {
+    for id in [
+        "Skills",
+        "SESSIONS",
+        "System-Agents",
+        "SYSTEM-SKILLS",
+        "BACKUPS",
+        "LingClaw.DB-WAL",
+        "SQLITE-MIGRATION.JSON",
+        "SQLITE-MIGRATION.JSON.TMP",
+    ] {
         let err = crate::session_store::validate_session_id(id)
             .expect_err("reserved config dir variant should be rejected");
         assert!(err.contains("reserved"), "{id}: {err}");
@@ -4596,9 +4661,16 @@ fn validate_session_id_rejects_reserved_top_level_config_dirs_case_insensitively
 fn validate_session_id_rejects_reserved_top_level_config_dirs() {
     for id in [
         "agents",
+        "backups",
+        "lingclaw.db",
+        "lingclaw.db-journal",
+        "lingclaw.db-shm",
+        "lingclaw.db-wal",
         "memory",
         "sessions",
         "skills",
+        "sqlite-migration.json",
+        "sqlite-migration.json.tmp",
         "static",
         "system-agents",
         "system-skills",
@@ -4607,6 +4679,27 @@ fn validate_session_id_rejects_reserved_top_level_config_dirs() {
             .expect_err("reserved config dir should be rejected");
         assert!(err.contains("reserved"), "{id}: {err}");
     }
+}
+
+#[test]
+fn session_workspace_delete_guard_rejects_storage_owned_roots() {
+    for id in [
+        "backups",
+        "lingclaw.db",
+        "lingclaw.db-wal",
+        "sqlite-migration.json",
+    ] {
+        let error = crate::session_store::session_workspace_root_for_delete(id)
+            .expect_err("storage-owned root must never be deletable as a session workspace");
+        assert!(error.contains("reserved") || error.contains("storage-owned"));
+    }
+
+    let root = crate::session_store::session_workspace_root_for_delete("ordinary-session")
+        .expect("ordinary session workspace should be deletable");
+    assert_eq!(
+        root.file_name().and_then(|name| name.to_str()),
+        Some("ordinary-session")
+    );
 }
 
 #[test]
@@ -5998,6 +6091,20 @@ async fn api_session_group_crud_round_trip() {
     let state = Arc::new(test_app_state());
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    let unique = now_epoch().to_string();
+    let worker_a = format!("group-worker-a-{unique}");
+    let worker_b = format!("group-worker-b-{unique}");
+    let mut saved_session_guards = Vec::new();
+    for worker in [&worker_a, &worker_b] {
+        let session = test_session(worker, worker, None);
+        crate::session_store::save_session_to_disk(&session)
+            .await
+            .expect("group member session should be saved");
+        saved_session_guards.push(SavedSessionGuard {
+            session_id: worker.clone(),
+            workspace: session.workspace,
+        });
+    }
 
     let Json(create_payload) = api_post_session_group(
         headers.clone(),
@@ -6005,9 +6112,9 @@ async fn api_session_group_crud_round_trip() {
         Json(SessionGroupRequest {
             name: Some("Review Group".to_string()),
             members: Some(vec![
-                "worker-a".to_string(),
-                "worker-b".to_string(),
-                "worker-a".to_string(),
+                worker_a.clone(),
+                worker_b.clone(),
+                worker_a.clone(),
                 "main".to_string(),
                 "bad/name".to_string(),
             ]),
@@ -6036,7 +6143,7 @@ async fn api_session_group_crud_round_trip() {
     assert_eq!(get_payload["group"]["id"].as_str(), Some(group_id.as_str()));
     assert_eq!(
         get_payload["group"]["members"],
-        json!(["worker-a", "worker-b"])
+        json!([worker_a.clone(), worker_b.clone()])
     );
     assert_eq!(get_payload["group"]["version"].as_u64(), Some(2));
     assert_eq!(get_payload["group"]["member_details"][0]["id"], "main");
@@ -6050,7 +6157,7 @@ async fn api_session_group_crud_round_trip() {
         State(state.clone()),
         Json(SessionGroupRequest {
             name: Some("Backend Review".to_string()),
-            members: Some(vec!["worker-a".to_string()]),
+            members: Some(vec![worker_a.clone()]),
         }),
     )
     .await
@@ -6079,13 +6186,27 @@ async fn api_put_session_group_name_only_preserves_members() {
     let state = Arc::new(test_app_state());
     let mut headers = HeaderMap::new();
     headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    let unique = format!("{}-{}", now_epoch(), std::process::id());
+    let worker_a = format!("keep-worker-a-{unique}");
+    let worker_b = format!("keep-worker-b-{unique}");
+    let mut saved_session_guards = Vec::new();
+    for worker in [&worker_a, &worker_b] {
+        let session = test_session(worker, worker, None);
+        crate::session_store::save_session_to_disk(&session)
+            .await
+            .expect("group member session should be saved");
+        saved_session_guards.push(SavedSessionGuard {
+            session_id: worker.clone(),
+            workspace: session.workspace,
+        });
+    }
 
     let Json(create_payload) = api_post_session_group(
         headers.clone(),
         State(state.clone()),
         Json(SessionGroupRequest {
             name: Some("Keep Members".to_string()),
-            members: Some(vec!["worker-a".to_string(), "worker-b".to_string()]),
+            members: Some(vec![worker_a.clone(), worker_b.clone()]),
         }),
     )
     .await
@@ -6121,10 +6242,7 @@ async fn api_put_session_group_name_only_preserves_members() {
     )
     .await
     .expect("group should load");
-    assert_eq!(
-        get_payload["group"]["members"],
-        json!(["worker-a", "worker-b"])
-    );
+    assert_eq!(get_payload["group"]["members"], json!([worker_a, worker_b]));
 
     let _ = api_delete_session_group(
         Query(GroupQuery {
@@ -6135,6 +6253,32 @@ async fn api_put_session_group_name_only_preserves_members() {
     )
     .await
     .expect("group should delete");
+}
+
+#[tokio::test]
+async fn api_post_session_group_rejects_missing_members() {
+    let state = Arc::new(test_app_state());
+    let mut headers = HeaderMap::new();
+    headers.insert("host", HeaderValue::from_static("127.0.0.1:18989"));
+    let missing = format!("missing-group-member-{}", now_epoch());
+
+    let (status, Json(payload)) = api_post_session_group(
+        headers,
+        State(state),
+        Json(SessionGroupRequest {
+            name: Some("Invalid Group".to_string()),
+            members: Some(vec![missing.clone()]),
+        }),
+    )
+    .await
+    .expect_err("a missing session must be rejected before persistence");
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        payload["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(&missing))
+    );
 }
 
 #[tokio::test]

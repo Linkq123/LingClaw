@@ -1,13 +1,18 @@
 use serde::Serialize;
 use serde_json::json;
 use std::{
-    collections::{HashMap, HashSet, hash_map::DefaultHasher},
-    hash::{Hash, Hasher},
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
+};
+
+#[cfg(test)]
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
     time::SystemTime,
 };
 
@@ -19,6 +24,7 @@ use crate::{
 use super::{AppState, ChatMessage};
 
 #[derive(Clone)]
+#[cfg(test)]
 struct PersistedSessionCacheEntry {
     payload_hash: u64,
     payload_len: usize,
@@ -70,13 +76,16 @@ impl SessionSummary {
     }
 }
 
+#[cfg(test)]
 type PersistedSessionCacheLock = OnceLock<Mutex<HashMap<String, PersistedSessionCacheEntry>>>;
+#[cfg(test)]
 static PERSISTED_SESSION_CACHE: PersistedSessionCacheLock = OnceLock::new();
 static SESSION_SAVE_WRITES: AtomicU64 = AtomicU64::new(0);
 static SESSION_SAVE_SKIPS: AtomicU64 = AtomicU64::new(0);
 type SessionPersistGateLock = OnceLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 static SESSION_PERSIST_GATES: SessionPersistGateLock = OnceLock::new();
 
+#[cfg(test)]
 fn session_persist_cache() -> &'static Mutex<HashMap<String, PersistedSessionCacheEntry>> {
     PERSISTED_SESSION_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -86,26 +95,34 @@ fn session_persist_gates() -> &'static Mutex<HashMap<String, Arc<tokio::sync::Mu
 }
 
 pub(crate) fn session_persist_gate(session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+    let gate_key = if cfg!(windows) {
+        session_id.to_ascii_lowercase()
+    } else {
+        session_id.to_string()
+    };
     let mut guard = session_persist_gates()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     guard
-        .entry(session_id.to_string())
+        .entry(gate_key)
         .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
         .clone()
 }
 
+#[cfg(test)]
 fn session_payload_hash(data: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     data.hash(&mut hasher);
     hasher.finish()
 }
 
+#[cfg(test)]
 async fn session_file_signature(path: &Path) -> Option<(Option<SystemTime>, u64)> {
     let metadata = tokio::fs::metadata(path).await.ok()?;
     Some((metadata.modified().ok(), metadata.len()))
 }
 
+#[cfg(test)]
 fn should_skip_session_write(
     session_id: &str,
     payload_hash: u64,
@@ -126,6 +143,7 @@ fn should_skip_session_write(
     })
 }
 
+#[cfg(test)]
 fn update_session_persist_cache(
     session_id: &str,
     payload_hash: u64,
@@ -197,13 +215,42 @@ pub(crate) fn session_persist_metrics() -> (u64, u64) {
 
 const RESERVED_SESSION_IDS: &[&str] = &[
     "agents",
+    "backups",
+    "lingclaw.db",
+    "lingclaw.db-journal",
+    "lingclaw.db-shm",
+    "lingclaw.db-wal",
     "memory",
     "sessions",
     "skills",
+    "sqlite-migration.json",
+    "sqlite-migration.json.lingclaw-save-backup",
+    "sqlite-migration.json.recovery-backup",
+    "sqlite-migration.json.recovery.tmp",
+    "sqlite-migration.json.tmp",
     "static",
     "system-agents",
     "system-skills",
 ];
+
+const STORAGE_OWNED_TOP_LEVEL_PATHS: &[&str] = &[
+    "backups",
+    "lingclaw.db",
+    "lingclaw.db-journal",
+    "lingclaw.db-shm",
+    "lingclaw.db-wal",
+    "sqlite-migration.json",
+    "sqlite-migration.json.lingclaw-save-backup",
+    "sqlite-migration.json.recovery-backup",
+    "sqlite-migration.json.recovery.tmp",
+    "sqlite-migration.json.tmp",
+];
+
+pub(crate) fn is_storage_owned_session_id(id: &str) -> bool {
+    STORAGE_OWNED_TOP_LEVEL_PATHS
+        .iter()
+        .any(|name| id.eq_ignore_ascii_case(name))
+}
 
 const WINDOWS_RESERVED_DEVICE_NAMES: &[&str] = &[
     "aux", "con", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9", "lpt1",
@@ -243,6 +290,33 @@ pub(crate) fn validate_session_id(id: &str) -> Result<&str, String> {
         return Err("Invalid session id. This name is reserved on Windows.".to_string());
     }
     Ok(trimmed)
+}
+
+pub(crate) fn session_workspace_root_for_delete(session_id: &str) -> Result<PathBuf, String> {
+    let session_id = validate_session_id(session_id)?;
+    let home = crate::config_dir_path().unwrap_or_else(|| PathBuf::from(".lingclaw"));
+    let workspace_root = crate::session_workspace_path(session_id)
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "Session workspace has no parent directory.".to_string())?;
+    if workspace_root.parent() != Some(home.as_path()) {
+        return Err("Refusing to delete a session workspace outside LingClaw home.".to_string());
+    }
+
+    let is_storage_owned = STORAGE_OWNED_TOP_LEVEL_PATHS.iter().any(|name| {
+        let protected = home.join(name);
+        if cfg!(windows) {
+            protected
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&workspace_root.to_string_lossy())
+        } else {
+            protected == workspace_root
+        }
+    });
+    if is_storage_owned {
+        return Err("Refusing to delete a LingClaw storage-owned path.".to_string());
+    }
+    Ok(workspace_root)
 }
 
 pub(crate) fn subagent_snapshot_storage_key(tool_call_id: &str, occurrence: usize) -> String {
@@ -392,6 +466,7 @@ pub(crate) fn sessions_dir() -> PathBuf {
     let dir = config_dir_path()
         .unwrap_or_else(|| PathBuf::from(".lingclaw"))
         .join("sessions");
+    #[cfg(test)]
     std::fs::create_dir_all(&dir).ok();
     dir
 }
@@ -428,43 +503,58 @@ pub(crate) fn replace_session_file_from_temp(path: &Path, tmp_path: &Path) -> Re
 }
 
 async fn save_session_to_disk_inner(session: &Session) -> Result<(), String> {
-    let path = sessions_dir().join(format!("{}.json", session.id));
-    let tmp_path = sessions_dir().join(format!("{}.json.tmp", session.id));
-    let data = build_session_persist_payload(session)?;
-    let payload_hash = session_payload_hash(&data);
-    let payload_len = data.len();
-    if should_skip_session_write(
-        &session.id,
-        payload_hash,
-        payload_len,
-        session_file_signature(&path).await,
-    ) {
-        SESSION_SAVE_SKIPS.fetch_add(1, Ordering::Relaxed);
-        return Ok(());
+    #[cfg(not(test))]
+    {
+        crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .save_session(session)
+            .await
+            .map_err(|error| error.to_string())?;
+        SESSION_SAVE_WRITES.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
-    tokio::fs::write(&tmp_path, data)
-        .await
-        .map_err(|e| e.to_string())?;
+    #[cfg(test)]
+    {
+        let path = sessions_dir().join(format!("{}.json", session.id));
+        let tmp_path = sessions_dir().join(format!("{}.json.tmp", session.id));
+        let data = build_session_persist_payload(session)?;
+        let payload_hash = session_payload_hash(&data);
+        let payload_len = data.len();
+        if should_skip_session_write(
+            &session.id,
+            payload_hash,
+            payload_len,
+            session_file_signature(&path).await,
+        ) {
+            SESSION_SAVE_SKIPS.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        }
 
-    if let Err(e) = replace_session_file_from_temp(&path, &tmp_path) {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e);
+        tokio::fs::write(&tmp_path, data)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        if let Err(e) = replace_session_file_from_temp(&path, &tmp_path) {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e);
+        }
+        SESSION_SAVE_WRITES.fetch_add(1, Ordering::Relaxed);
+        update_session_persist_cache(
+            &session.id,
+            payload_hash,
+            payload_len,
+            session_file_signature(&path).await,
+        );
+        Ok(())
     }
-    SESSION_SAVE_WRITES.fetch_add(1, Ordering::Relaxed);
-    update_session_persist_cache(
-        &session.id,
-        payload_hash,
-        payload_len,
-        session_file_signature(&path).await,
-    );
-    Ok(())
 }
 
 pub(crate) async fn save_session_to_disk_locked(session: &Session) -> Result<(), String> {
     save_session_to_disk_inner(session).await
 }
 
+#[cfg(test)]
 pub(crate) async fn save_session_to_disk(session: &Session) -> Result<(), String> {
     let persist_gate = session_persist_gate(&session.id);
     let _persist_guard = persist_gate.lock().await;
@@ -483,6 +573,39 @@ pub(crate) async fn save_current_session_to_disk(
     };
     let session = snapshot.ok_or_else(|| "Session not found".to_string())?;
     save_session_to_disk_inner(&session).await
+}
+
+pub(crate) async fn delete_session_from_storage(
+    session_id: &str,
+) -> Result<crate::storage::SessionDeleteOutcome, String> {
+    let session_id = validate_session_id(session_id)?.to_string();
+    #[cfg(not(test))]
+    {
+        crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .delete_session(&session_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    {
+        let mut deleted = false;
+        for path in [
+            sessions_dir().join(format!("{session_id}.json")),
+            sessions_dir().join(format!("{session_id}.json.tmp")),
+        ] {
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => deleted = true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        Ok(crate::storage::SessionDeleteOutcome {
+            deleted,
+            affected_group_ids: Vec::new(),
+        })
+    }
 }
 
 pub(crate) fn sanitize_session_messages(messages: &mut Vec<ChatMessage>) {
@@ -619,6 +742,15 @@ fn build_session_persist_payload(session: &Session) -> Result<String, String> {
     .map_err(|e| e.to_string())
 }
 
+pub(crate) fn session_for_storage(session: &Session) -> Result<Session, String> {
+    let payload = build_session_persist_payload(session)?;
+    let mut stored: Session = serde_json::from_str(&payload).map_err(|error| error.to_string())?;
+    normalize_session(&mut stored);
+    stored.workspace = crate::session_workspace_path(&stored.id);
+    Ok(stored)
+}
+
+#[cfg(test)]
 pub(crate) fn load_session_snapshot_from_path(path: &Path) -> Option<Session> {
     let data = std::fs::read_to_string(path).ok()?;
     let mut session: Session = serde_json::from_str(&data).ok()?;
@@ -626,70 +758,122 @@ pub(crate) fn load_session_snapshot_from_path(path: &Path) -> Option<Session> {
     Some(session)
 }
 
-pub(crate) fn canonical_saved_session_id(id: &str) -> Option<String> {
-    let id = validate_session_id(id).ok()?;
-    let dir = sessions_dir();
-    let mut fallback = None;
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                continue;
-            };
-            if stem == id {
-                return Some(stem.to_string());
-            }
-            if cfg!(windows) && stem.eq_ignore_ascii_case(id) {
-                fallback = Some(stem.to_string());
+pub(crate) fn canonical_saved_session_id_result(id: &str) -> Result<Option<String>, String> {
+    #[cfg(not(test))]
+    {
+        let id = validate_session_id(id)?;
+        crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .canonical_session_id_blocking(id)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    {
+        let id = match validate_session_id(id) {
+            Ok(id) => id,
+            Err(_) => return Ok(None),
+        };
+        let dir = sessions_dir();
+        let mut fallback = None;
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                if stem == id {
+                    return Ok(Some(stem.to_string()));
+                }
+                if cfg!(windows) && stem.eq_ignore_ascii_case(id) {
+                    fallback = Some(stem.to_string());
+                }
             }
         }
+        Ok(fallback)
     }
-    fallback
 }
 
-pub(crate) fn load_session_from_disk(id: &str) -> Option<Session> {
-    let id = canonical_saved_session_id(id)
-        .or_else(|| validate_session_id(id).ok().map(str::to_string))?;
-    let path = sessions_dir().join(format!("{id}.json"));
-    let tmp_path = sessions_dir().join(format!("{id}.json.tmp"));
-    // Load from primary, fall back to .tmp, or pick the newer of the two.
-    // Crash scenarios: (a) primary missing, tmp exists → use tmp;
-    // (b) both exist, tmp is newer → use tmp (crash after tmp write, before rename);
-    // (c) both exist, primary is newer → use primary (normal case).
-    let primary = load_session_snapshot_from_path(&path);
-    let tmp_available = tmp_path.exists();
-    let mut session = match (primary, tmp_available) {
-        (Some(p), false) => p,
-        (None, true) => {
-            eprintln!(
-                "Warning: recovering session '{id}' from .tmp file (primary missing after crash)"
-            );
-            load_session_snapshot_from_path(&tmp_path)?
-        }
-        (Some(p), true) => {
-            // Both exist — pick the one with the later mtime.
-            let primary_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-            let tmp_mtime = std::fs::metadata(&tmp_path).and_then(|m| m.modified()).ok();
-            if tmp_mtime >= primary_mtime {
+#[cfg(test)]
+pub(crate) fn canonical_saved_session_id(id: &str) -> Option<String> {
+    canonical_saved_session_id_result(id).ok().flatten()
+}
+
+pub(crate) fn load_session_from_storage_result(id: &str) -> Result<Option<Session>, String> {
+    #[cfg(not(test))]
+    {
+        let Some(id) = canonical_saved_session_id_result(id)? else {
+            return Ok(None);
+        };
+        let session = crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .load_session_blocking(&id)
+            .map_err(|error| error.to_string())?;
+        let Some(mut session) = session else {
+            return Ok(None);
+        };
+        session.workspace = super::session_workspace_path(&session.id);
+        std::fs::create_dir_all(&session.workspace).ok();
+        prompts::ensure_session_workspace(&session.workspace);
+        Ok(Some(session))
+    }
+
+    #[cfg(test)]
+    {
+        let Some(id) = canonical_saved_session_id(id)
+            .or_else(|| validate_session_id(id).ok().map(str::to_string))
+        else {
+            return Ok(None);
+        };
+        let path = sessions_dir().join(format!("{id}.json"));
+        let tmp_path = sessions_dir().join(format!("{id}.json.tmp"));
+        // Load from primary, fall back to .tmp, or pick the newer of the two.
+        // Crash scenarios: (a) primary missing, tmp exists → use tmp;
+        // (b) both exist, tmp is newer → use tmp (crash after tmp write, before rename);
+        // (c) both exist, primary is newer → use primary (normal case).
+        let primary = load_session_snapshot_from_path(&path);
+        let tmp_available = tmp_path.exists();
+        let mut session = match (primary, tmp_available) {
+            (Some(p), false) => p,
+            (None, true) => {
                 eprintln!(
-                    "Warning: recovering session '{id}' from newer .tmp file (crash during save)"
+                    "Warning: recovering session '{id}' from .tmp file (primary missing after crash)"
                 );
-                load_session_snapshot_from_path(&tmp_path).unwrap_or(p)
-            } else {
-                // tmp is stale leftover — clean it up.
-                let _ = std::fs::remove_file(&tmp_path);
-                p
+                let Some(session) = load_session_snapshot_from_path(&tmp_path) else {
+                    return Ok(None);
+                };
+                session
             }
-        }
-        (None, false) => return None,
-    };
-    session.workspace = super::session_workspace_path(&session.id);
-    std::fs::create_dir_all(&session.workspace).ok();
-    prompts::ensure_session_workspace(&session.workspace);
-    Some(session)
+            (Some(p), true) => {
+                // Both exist — pick the one with the later mtime.
+                let primary_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+                let tmp_mtime = std::fs::metadata(&tmp_path).and_then(|m| m.modified()).ok();
+                if tmp_mtime >= primary_mtime {
+                    eprintln!(
+                        "Warning: recovering session '{id}' from newer .tmp file (crash during save)"
+                    );
+                    load_session_snapshot_from_path(&tmp_path).unwrap_or(p)
+                } else {
+                    // tmp is stale leftover — clean it up.
+                    let _ = std::fs::remove_file(&tmp_path);
+                    p
+                }
+            }
+            (None, false) => return Ok(None),
+        };
+        session.workspace = super::session_workspace_path(&session.id);
+        std::fs::create_dir_all(&session.workspace).ok();
+        prompts::ensure_session_workspace(&session.workspace);
+        Ok(Some(session))
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn load_session_from_disk(id: &str) -> Option<Session> {
+    load_session_from_storage_result(id).ok().flatten()
 }
 
 pub(crate) fn refresh_session_system_prompt(state: &AppState, session: &mut Session) {
@@ -718,31 +902,50 @@ pub(crate) fn sanitized_non_system_message_count(session: &Session) -> usize {
         .count()
 }
 
-pub(crate) fn list_saved_session_summaries_in_dir(dir: &Path) -> Vec<SessionSummary> {
-    let mut out = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                if let Some(session) = load_session_snapshot_from_path(&path) {
-                    out.push(SessionSummary::from_session(&session));
-                } else if let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) {
-                    out.push(SessionSummary {
-                        id: id.to_string(),
-                        name: "[Corrupt Session]".to_string(),
-                        model_override: None,
-                        messages: 0,
-                        tool_calls: 0,
-                        created_at: 0,
-                        updated_at: 0,
-                        corrupt: true,
-                    });
+pub(crate) fn list_saved_session_summaries_result(
+    dir: &Path,
+) -> Result<Vec<SessionSummary>, String> {
+    #[cfg(not(test))]
+    {
+        let _ = dir;
+        crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .list_session_summaries_blocking()
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    {
+        let mut out = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    if let Some(session) = load_session_snapshot_from_path(&path) {
+                        out.push(SessionSummary::from_session(&session));
+                    } else if let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) {
+                        out.push(SessionSummary {
+                            id: id.to_string(),
+                            name: "[Corrupt Session]".to_string(),
+                            model_override: None,
+                            messages: 0,
+                            tool_calls: 0,
+                            created_at: 0,
+                            updated_at: 0,
+                            corrupt: true,
+                        });
+                    }
                 }
             }
         }
+        sort_session_summaries(&mut out);
+        Ok(out)
     }
-    sort_session_summaries(&mut out);
-    out
+}
+
+#[cfg(test)]
+pub(crate) fn list_saved_session_summaries_in_dir(dir: &Path) -> Vec<SessionSummary> {
+    list_saved_session_summaries_result(dir).unwrap_or_default()
 }
 
 pub(crate) fn sort_session_summaries(summaries: &mut [SessionSummary]) {
@@ -767,20 +970,37 @@ pub(crate) fn recoverable_session_ids_from_summaries(summaries: &[SessionSummary
         .collect()
 }
 
-pub(crate) fn list_saved_session_ids_in_dir(dir: &Path) -> HashSet<String> {
-    let mut ids = HashSet::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                ids.insert(stem.to_string());
+pub(crate) fn list_saved_session_ids_result(dir: &Path) -> Result<HashSet<String>, String> {
+    #[cfg(not(test))]
+    {
+        let _ = dir;
+        crate::storage::Database::global()
+            .map_err(|error| error.to_string())?
+            .list_session_ids_blocking()
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    {
+        let mut ids = HashSet::new();
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    ids.insert(stem.to_string());
+                }
             }
         }
+        Ok(ids)
     }
-    ids
+}
+
+#[cfg(test)]
+pub(crate) fn list_saved_session_ids_in_dir(dir: &Path) -> HashSet<String> {
+    list_saved_session_ids_result(dir).unwrap_or_default()
 }
 
 #[allow(dead_code)]
@@ -1132,11 +1352,19 @@ total_usage_est: # 当前会话累计 token 使用估算\n\ttotal_tokens: {}\n\t
     )
 }
 
+#[cfg(test)]
 pub(crate) fn build_global_today_usage<'a>(
     sessions: impl IntoIterator<Item = &'a Session>,
 ) -> String {
     let (global_today_input_tokens, global_today_output_tokens) =
         super::accumulate_daily_token_usage(sessions);
+    build_global_today_usage_totals(global_today_input_tokens, global_today_output_tokens)
+}
+
+pub(crate) fn build_global_today_usage_totals(
+    global_today_input_tokens: u64,
+    global_today_output_tokens: u64,
+) -> String {
     format_usage_block(
         "global_today_usage_est",
         "所有会话今日 token 使用估算",
@@ -1145,6 +1373,7 @@ pub(crate) fn build_global_today_usage<'a>(
     )
 }
 
+#[cfg(test)]
 pub(crate) fn load_saved_sessions_not_in(loaded_ids: &HashSet<String>) -> Vec<Session> {
     let mut sessions = Vec::new();
     if let Ok(entries) = std::fs::read_dir(sessions_dir()) {

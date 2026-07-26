@@ -44,6 +44,7 @@ mod session_group;
 mod session_store;
 mod socket_sync;
 mod socket_tasks;
+mod storage;
 mod subagents;
 mod todos;
 mod tools;
@@ -66,9 +67,10 @@ use runtime_loop::{
     IdleSocketInputAction, ensure_session_ready, handle_idle_socket_input,
     resolve_or_create_socket_session, run_agent_session,
 };
+#[cfg(test)]
+use session_store::load_session_from_disk;
 use session_store::{
-    SessionSummary, list_saved_session_summaries_in_dir, load_session_from_disk,
-    refresh_session_system_prompt, save_session_to_disk, save_session_to_disk_locked,
+    SessionSummary, refresh_session_system_prompt, save_session_to_disk_locked,
     session_persist_gate, sessions_dir,
 };
 use socket_sync::{
@@ -91,6 +93,10 @@ use hooks::{
 };
 #[cfg(test)]
 use session_admin::gather_global_today_usage;
+#[cfg(test)]
+use session_store::list_saved_session_summaries_in_dir;
+#[cfg(test)]
+use session_store::save_session_to_disk;
 #[cfg(test)]
 use session_store::{
     build_active_session_lines, build_global_today_usage, build_history_payload,
@@ -558,6 +564,8 @@ async fn session_has_explicit_model(state: &AppState, session_id: &str) -> bool 
 }
 
 struct AppState {
+    #[cfg(not(test))]
+    storage: storage::Database,
     config: std::sync::Mutex<Arc<Config>>,
     http: Client,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
@@ -581,6 +589,28 @@ struct AppState {
 }
 
 impl AppState {
+    fn storage_status(&self) -> storage::StorageStatus {
+        #[cfg(not(test))]
+        {
+            self.storage.status()
+        }
+        #[cfg(test)]
+        {
+            storage::StorageStatus::default()
+        }
+    }
+
+    fn storage_is_writable(&self) -> bool {
+        #[cfg(not(test))]
+        {
+            self.storage.is_writable()
+        }
+        #[cfg(test)]
+        {
+            true
+        }
+    }
+
     fn next_config_revision(&self) -> u64 {
         let revision = CONFIG_REVISION.fetch_add(1, Ordering::AcqRel) + 1;
         #[cfg(test)]
@@ -1266,6 +1296,68 @@ pub(crate) struct LiveOutputReplayCtx {
 
 pub(crate) async fn ws_send(tx: &WsTx, data: &serde_json::Value) -> bool {
     tx.send(data.to_string()).await.is_ok()
+}
+
+async fn send_storage_status(tx: &WsTx, state: &AppState) {
+    let _ = ws_send(
+        tx,
+        &json!({
+            "type": "storage_status",
+            "storage": storage_status_payload(state),
+        }),
+    )
+    .await;
+}
+
+#[cfg(not(test))]
+async fn broadcast_storage_status(state: &AppState) {
+    let mut clients = state
+        .session_clients
+        .lock()
+        .await
+        .values()
+        .map(|binding| binding.tx.clone())
+        .collect::<Vec<_>>();
+    clients.extend(
+        state
+            .group_clients
+            .lock()
+            .await
+            .values()
+            .map(|binding| binding.tx.clone()),
+    );
+    let payload = json!({
+        "type": "storage_status",
+        "storage": storage_status_payload(state),
+    });
+    for client in clients {
+        let _ = ws_send(&client, &payload).await;
+    }
+}
+
+#[cfg(not(test))]
+async fn monitor_storage_status(
+    state: Arc<AppState>,
+    mut status_rx: tokio::sync::watch::Receiver<storage::StorageStatus>,
+) {
+    while status_rx.changed().await.is_ok() {
+        if status_rx.borrow().mode != storage::StorageMode::Protected {
+            continue;
+        }
+        let runs = state
+            .active_runs
+            .lock()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        for run in runs {
+            run.cancel.cancel();
+        }
+        session_control::cancel_all_active_runs_for_storage();
+        broadcast_storage_status(&state).await;
+        break;
+    }
 }
 
 pub(crate) async fn live_send(tx: &LiveTx, data: serde_json::Value) -> bool {
@@ -2752,6 +2844,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, requested_id: Op
         &connection_cancel,
     )
     .await;
+    send_storage_status(&tx, &state).await;
 
     let cancel = state.shutdown.clone();
     let current_session_ref = Arc::new(Mutex::new(current_session_id.clone()));
@@ -2952,8 +3045,17 @@ async fn handle_group_socket(
     };
     let group = {
         let gate = session_group::group_persist_gate(&group_id);
-        let _guard = gate.lock().await;
-        let group = session_group::load_group_from_disk(&group_id);
+        let guard = gate.lock().await;
+        let group = match session_group::load_group_from_storage_result(&group_id) {
+            Ok(group) => group,
+            Err(_) => {
+                drop(guard);
+                send_storage_status(&tx, &state).await;
+                drop(tx);
+                let _ = writer.await;
+                return;
+            }
+        };
         if group.is_some() {
             let mut clients = state.group_clients.lock().await;
             // Cancel any prior connection bound to this group before replacing it, so a
@@ -2997,9 +3099,13 @@ async fn handle_group_socket(
     {
         replay_group_member_live_round(&tx, &state, &group_id, run).await;
     }
-    ws_send(&tx, &build_group_list_payload()).await;
-    let session_list = socket_sync::build_session_list_payload(&state);
-    ws_send(&tx, &session_list).await;
+    if let Ok(group_list) = build_group_list_payload() {
+        ws_send(&tx, &group_list).await;
+    }
+    if let Ok(session_list) = socket_sync::build_session_list_payload(&state) {
+        ws_send(&tx, &session_list).await;
+    }
+    send_storage_status(&tx, &state).await;
 
     loop {
         let result = tokio::select! {
@@ -3014,6 +3120,10 @@ async fn handle_group_socket(
         };
         let trimmed = text.trim();
         if trimmed.is_empty() {
+            continue;
+        }
+        if !state.storage_is_writable() {
+            send_storage_status(&tx, &state).await;
             continue;
         }
         let payload = if trimmed.starts_with('{') {
@@ -3067,11 +3177,16 @@ async fn handle_group_socket(
                     .await;
                 }
                 Err(error) => {
-                    ws_send(
-                        &tx,
-                        &json!({"type":"error","content":error,"dismissible":true}),
-                    )
-                    .await;
+                    if state.storage_is_writable() {
+                        ws_send(
+                            &tx,
+                            &json!({"type":"error","content":error,"dismissible":true}),
+                        )
+                        .await;
+                    } else {
+                        eprintln!("ERROR: group stop entered storage protection: {error}");
+                        send_storage_status(&tx, &state).await;
+                    }
                 }
             }
             continue;
@@ -3101,11 +3216,16 @@ async fn handle_group_socket(
         )
         .await
         {
-            ws_send(
-                &tx,
-                &json!({"type":"error","content":error,"dismissible":true}),
-            )
-            .await;
+            if state.storage_is_writable() {
+                ws_send(
+                    &tx,
+                    &json!({"type":"error","content":error,"dismissible":true}),
+                )
+                .await;
+            } else {
+                eprintln!("ERROR: group message entered storage protection: {error}");
+                send_storage_status(&tx, &state).await;
+            }
         }
     }
 
@@ -3166,6 +3286,91 @@ async fn switch_socket_session(
 
 // ── HTTP API ──────────────────────────────────────────────────────────────────
 
+fn storage_status_payload(state: &AppState) -> serde_json::Value {
+    let status = state.storage_status();
+    match status.mode {
+        storage::StorageMode::Healthy => json!({ "mode": "healthy" }),
+        storage::StorageMode::Protected => json!({
+            "mode": "protected",
+            "code": "storage_protected",
+        }),
+    }
+}
+
+fn should_continue_after_default_session_error(status: &storage::StorageStatus) -> bool {
+    status.mode == storage::StorageMode::Protected
+}
+
+pub(crate) fn storage_protected_api_error() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": "Local storage is in protected mode. Repair it and restart LingClaw.",
+            "code": "storage_protected",
+        })),
+    )
+}
+
+fn is_storage_mutation(method: &Method, path: &str) -> bool {
+    matches!(
+        (method, path),
+        (
+            &Method::POST | &Method::PUT | &Method::DELETE,
+            "/api/session"
+        ) | (
+            &Method::POST | &Method::PUT | &Method::DELETE,
+            "/api/session-group"
+        ) | (&Method::PUT | &Method::DELETE, "/api/session-group/member")
+            | (&Method::PUT, "/api/session-skills")
+            | (&Method::PUT, "/api/mcp/session-policy")
+            | (&Method::PUT, "/api/todos")
+            | (&Method::POST, "/api/upload-images")
+    )
+}
+
+#[derive(Clone)]
+struct UploadedImageCleanup {
+    s3_cfg: config::S3Config,
+    object_keys: Vec<String>,
+}
+
+async fn enforce_storage_writable(
+    State(state): State<Arc<AppState>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let storage_mutation = is_storage_mutation(request.method(), request.uri().path());
+    let external_upload =
+        request.method() == Method::POST && request.uri().path() == "/api/upload-images";
+    if storage_mutation && !state.storage_is_writable() {
+        return storage_protected_api_error().into_response();
+    }
+    let response = next.run(request).await;
+    if should_replace_with_storage_protected(
+        storage_mutation,
+        external_upload,
+        response.status(),
+        state.storage_is_writable(),
+    ) {
+        if external_upload
+            && let Some(cleanup) = response.extensions().get::<UploadedImageCleanup>()
+        {
+            schedule_uploaded_image_cleanup(&state, &cleanup.s3_cfg, cleanup.object_keys.clone());
+        }
+        return storage_protected_api_error().into_response();
+    }
+    response
+}
+
+fn should_replace_with_storage_protected(
+    storage_mutation: bool,
+    external_upload: bool,
+    response_status: StatusCode,
+    storage_writable: bool,
+) -> bool {
+    storage_mutation && !storage_writable && (external_upload || !response_status.is_success())
+}
+
 async fn api_shutdown(headers: HeaderMap, State(state): State<Arc<AppState>>) -> impl IntoResponse {
     // Verify shutdown token — only the local CLI should be able to trigger this
     let provided = headers
@@ -3194,37 +3399,49 @@ async fn api_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "version": VERSION,
         "model": config.model,
         "sessions": sessions.len(),
+        "storage": storage_status_payload(&state),
     }))
 }
 
-async fn api_sessions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let persisted_summaries = list_saved_session_summaries_in_dir(&sessions_dir());
+async fn api_sessions(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let persisted_summaries =
+        crate::session_store::list_saved_session_summaries_result(&sessions_dir())
+            .map_err(|_| storage_protected_api_error())?;
     let config = state.config();
     let mut list: Vec<serde_json::Value> = Vec::new();
     let mut seen_ids = HashSet::new();
 
+    let mut summaries = persisted_summaries;
     {
         let sessions = state.sessions.lock().await;
         for session in sessions.values() {
-            seen_ids.insert(session.id.clone());
-            list.push(SessionSummary::from_session(session).to_json(&config, Some(session)));
+            if let Some(summary) = summaries
+                .iter_mut()
+                .find(|summary| session_ids_match(&summary.id, &session.id))
+            {
+                *summary = SessionSummary::from_session(session);
+            } else {
+                summaries.push(SessionSummary::from_session(session));
+            }
         }
     }
 
-    for summary in persisted_summaries {
-        if seen_ids.contains(&summary.id) {
+    for summary in summaries {
+        let dedupe_id = if cfg!(windows) {
+            summary.id.to_ascii_lowercase()
+        } else {
+            summary.id.clone()
+        };
+        if !seen_ids.insert(dedupe_id) {
             continue;
         }
-        let session = if summary.corrupt {
-            None
-        } else {
-            load_session_from_disk(&summary.id)
-        };
-        list.push(summary.to_json(&config, session.as_ref()));
+        list.push(summary.to_json(&config, None));
     }
 
     sort_session_json_values(&mut list);
-    Json(json!({"sessions": list}))
+    Ok(Json(json!({"sessions": list})))
 }
 
 fn sort_session_json_values(list: &mut [serde_json::Value]) {
@@ -3276,7 +3493,10 @@ async fn generate_available_session_id(
                 continue;
             }
         }
-        if crate::session_store::canonical_saved_session_id(&id).is_some() {
+        if crate::session_store::canonical_saved_session_id_result(&id)
+            .map_err(|_| storage_protected_api_error())?
+            .is_some()
+        {
             continue;
         }
         return Ok(id);
@@ -3306,7 +3526,10 @@ async fn api_post_session(
             ));
         }
     }
-    if crate::session_store::canonical_saved_session_id(&session_id).is_some() {
+    if crate::session_store::canonical_saved_session_id_result(&session_id)
+        .map_err(|_| storage_protected_api_error())?
+        .is_some()
+    {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({ "error": "Generated session id already exists" })),
@@ -3315,6 +3538,10 @@ async fn api_post_session(
 
     let config = state.config();
     let session_name = format!("Session {session_id}");
+    if !state.storage_is_writable() {
+        return Err(storage_protected_api_error());
+    }
+    let cleanup_fresh_workspace = !session_workspace_path(&session_id).exists();
     let mut session = Session::new_with_id(&session_id, &session_name);
     let model = session.effective_model(&config.model).to_string();
     let sys = prompts::build_system_prompt(
@@ -3326,6 +3553,9 @@ async fn api_post_session(
     session.messages.push(sys);
 
     if let Err(error) = save_session_to_disk_locked(&session).await {
+        if cleanup_fresh_workspace {
+            session_control::cleanup_failed_created_session(&session_id, &session.workspace);
+        }
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": format!("Failed to save new session: {error}") })),
@@ -3415,16 +3645,23 @@ async fn api_put_session(
     Ok(Json(payload))
 }
 
-fn build_group_list_payload() -> serde_json::Value {
-    let groups = session_group::list_saved_group_summaries()
+fn build_group_list_payload() -> Result<serde_json::Value, String> {
+    let groups = session_group::list_saved_group_summaries_result()?
         .into_iter()
         .map(|summary| summary.to_json())
         .collect::<Vec<_>>();
-    json!({"type":"session_group_list","groups": groups})
+    Ok(json!({"type":"session_group_list","groups": groups}))
 }
 
 pub(crate) async fn broadcast_group_list_payload(state: &AppState) {
-    let payload = build_group_list_payload();
+    let payload = match build_group_list_payload() {
+        Ok(payload) => payload,
+        Err(_) => {
+            #[cfg(not(test))]
+            broadcast_storage_status(state).await;
+            return;
+        }
+    };
     let session_ids = {
         let clients = state.session_clients.lock().await;
         clients.keys().cloned().collect::<Vec<_>>()
@@ -3468,7 +3705,10 @@ async fn ensure_session_loaded_for_api(
         }
     }
 
-    if let Some(session) = load_session_from_disk(&requested_session_id) {
+    if let Some(session) =
+        crate::session_store::load_session_from_storage_result(&requested_session_id)
+            .map_err(|_| storage_protected_api_error())?
+    {
         let session_id = session.id.clone();
         let mut sessions = state.sessions.lock().await;
         let effective_id = find_loaded_session_id(&sessions, &session_id).unwrap_or(session_id);
@@ -4204,21 +4444,8 @@ async fn api_todos(
 ) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)> {
     validate_local_request_headers(&headers)?;
 
-    let session_id = match query.session.as_deref() {
-        Some(requested) => crate::session_store::validate_session_id(requested)
-            .map_err(|error| (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))))?
-            .to_string(),
-        None => MAIN_SESSION_ID.to_string(),
-    };
-
-    {
-        let mut sessions = state.sessions.lock().await;
-        if !sessions.contains_key(session_id.as_str())
-            && let Some(session) = load_session_from_disk(&session_id)
-        {
-            sessions.insert(session_id.clone(), session);
-        }
-    }
+    let requested_session_id = query.session.as_deref().unwrap_or(MAIN_SESSION_ID);
+    let session_id = ensure_session_loaded_for_api(&state, requested_session_id).await?;
 
     match crate::todos::replace_session_todos(
         state.as_ref(),
@@ -4270,8 +4497,11 @@ async fn api_upload_images(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     mut multipart: Multipart,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     validate_local_request_headers(&headers)?;
+    if !state.storage_is_writable() {
+        return Err(storage_protected_api_error());
+    }
     let upload_token = headers
         .get(UPLOAD_TOKEN_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -4298,11 +4528,13 @@ async fn api_upload_images(
     let s3_config_id = image_uploads::s3_config_id(s3_cfg);
 
     let mut uploaded_images: Vec<serde_json::Value> = Vec::new();
+    let mut uploaded_object_keys: Vec<String> = Vec::new();
     let mut urls: Vec<String> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     let max_files = image_uploads::MAX_IMAGE_UPLOAD_FILES;
 
     loop {
+        ensure_upload_storage_writable(&state, s3_cfg, &uploaded_object_keys)?;
         let field = match multipart.next_field().await {
             Ok(Some(field)) => field,
             Ok(None) => break,
@@ -4356,6 +4588,7 @@ async fn api_upload_images(
         };
 
         let object_key = image_uploads::generate_s3_object_key(s3_cfg, content_type, &data);
+        ensure_upload_storage_writable(&state, s3_cfg, &uploaded_object_keys)?;
 
         let upload_timeout = std::time::Duration::from_secs(60);
         let upload_result = tokio::time::timeout(
@@ -4374,6 +4607,8 @@ async fn api_upload_images(
                 continue;
             }
         }
+        uploaded_object_keys.push(object_key.clone());
+        ensure_upload_storage_writable(&state, s3_cfg, &uploaded_object_keys)?;
 
         match image_uploads::s3_presigned_get_url(s3_cfg, &object_key) {
             Ok(url) => {
@@ -4387,13 +4622,66 @@ async fn api_upload_images(
                 }));
                 urls.push(url);
             }
-            Err(e) => errors.push(e),
+            Err(e) => {
+                schedule_uploaded_image_cleanup(&state, s3_cfg, vec![object_key.clone()]);
+                uploaded_object_keys.retain(|key| key != &object_key);
+                errors.push(e);
+            }
         }
     }
+    ensure_upload_storage_writable(&state, s3_cfg, &uploaded_object_keys)?;
 
-    Ok(Json(
+    let mut response = Json(
         json!({ "images": uploaded_images, "urls": urls, "errors": errors, "s3_config_id": s3_config_id }),
-    ))
+    )
+    .into_response();
+    response.extensions_mut().insert(UploadedImageCleanup {
+        s3_cfg: s3_cfg.clone(),
+        object_keys: uploaded_object_keys,
+    });
+    Ok(response)
+}
+
+fn ensure_upload_storage_writable(
+    state: &AppState,
+    s3_cfg: &config::S3Config,
+    uploaded_object_keys: &[String],
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if state.storage_is_writable() {
+        return Ok(());
+    }
+    schedule_uploaded_image_cleanup(state, s3_cfg, uploaded_object_keys.to_vec());
+    Err(storage_protected_api_error())
+}
+
+fn schedule_uploaded_image_cleanup(
+    state: &AppState,
+    s3_cfg: &config::S3Config,
+    object_keys: Vec<String>,
+) {
+    if object_keys.is_empty() {
+        return;
+    }
+    let http = state.http.clone();
+    let s3_cfg = s3_cfg.clone();
+    tokio::spawn(async move {
+        for object_key in object_keys {
+            let cleanup = tokio::time::timeout(
+                Duration::from_secs(10),
+                image_uploads::s3_delete_object(&http, &s3_cfg, &object_key),
+            )
+            .await;
+            match cleanup {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    eprintln!("WARNING: failed to clean up an uncommitted image upload: {error}");
+                }
+                Err(_) => {
+                    eprintln!("WARNING: timed out cleaning up an uncommitted image upload");
+                }
+            }
+        }
+    });
 }
 
 // ── Config & Usage API ───────────────────────────────────────────────────────
@@ -4982,6 +5270,61 @@ async fn api_test_mcp(
     }
 }
 
+fn usage_snapshot_from_session(session: &mut Session) -> storage::SessionUsageSnapshot {
+    context::rollover_daily_usage_if_needed(session);
+    storage::SessionUsageSnapshot {
+        daily_input: session.daily_input_tokens,
+        daily_output: session.daily_output_tokens,
+        total_input: session.input_tokens,
+        total_output: session.output_tokens,
+        input_source: session.input_token_source.clone(),
+        output_source: session.output_token_source.clone(),
+        usage_history: session.usage_history.clone(),
+        daily_labels: session.daily_provider_usage.clone(),
+        total_labels: session.total_label_usage.clone(),
+    }
+}
+
+fn usage_api_payload(snapshot: Option<storage::SessionUsageSnapshot>) -> serde_json::Value {
+    let snapshot = snapshot.unwrap_or_else(|| storage::SessionUsageSnapshot {
+        input_source: default_token_usage_source(),
+        output_source: default_token_usage_source(),
+        ..Default::default()
+    });
+    let (daily_providers, daily_roles) = split_usage_labels(&snapshot.daily_labels);
+    let (total_providers, total_roles) = split_usage_labels(&snapshot.total_labels);
+    let usage_history = snapshot
+        .usage_history
+        .iter()
+        .map(|day| {
+            let (providers, roles) = split_usage_labels(&day.providers);
+            json!({
+                "date": day.date,
+                "input": day.input,
+                "output": day.output,
+                "providers": providers,
+                "roles": roles,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "daily_input": snapshot.daily_input,
+        "daily_output": snapshot.daily_output,
+        "total_input": snapshot.total_input,
+        "total_output": snapshot.total_output,
+        "total": snapshot.total_input.saturating_add(snapshot.total_output),
+        "input_source": snapshot.input_source,
+        "output_source": snapshot.output_source,
+        "source_scope": "latest_update",
+        "usage_history": usage_history,
+        "daily_providers": daily_providers,
+        "daily_roles": daily_roles,
+        "total_providers": total_providers,
+        "total_roles": total_roles,
+    })
+}
+
 /// GET /api/usage — token usage statistics.
 async fn api_usage(
     Query(query): Query<SessionQuery>,
@@ -4997,87 +5340,57 @@ async fn api_usage(
         None => MAIN_SESSION_ID.to_string(),
     };
 
-    let mut sessions = state.sessions.lock().await;
-    if !sessions.contains_key(session_id.as_str())
-        && let Some(session) = load_session_from_disk(&session_id)
-    {
-        sessions.insert(session_id.clone(), session);
-    }
-    let session = sessions.get_mut(session_id.as_str());
-    let (
-        daily_input,
-        daily_output,
-        total_input,
-        total_output,
-        input_source,
-        output_source,
-        usage_history,
-        daily_providers,
-        daily_roles,
-        total_providers,
-        total_roles,
-    ) = if let Some(session) = session {
-        context::rollover_daily_usage_if_needed(session);
-        let (daily_providers, daily_roles) = split_usage_labels(&session.daily_provider_usage);
-        let (total_providers, total_roles) = split_usage_labels(&session.total_label_usage);
-        let usage_history = session
-            .usage_history
-            .iter()
-            .map(|snapshot| {
-                let (providers, roles) = split_usage_labels(&snapshot.providers);
-                json!({
-                    "date": snapshot.date,
-                    "input": snapshot.input,
-                    "output": snapshot.output,
-                    "providers": providers,
-                    "roles": roles,
-                })
-            })
-            .collect::<Vec<_>>();
-        (
-            session.daily_input_tokens,
-            session.daily_output_tokens,
-            session.input_tokens,
-            session.output_tokens,
-            session.input_token_source.clone(),
-            session.output_token_source.clone(),
-            serde_json::to_value(usage_history).unwrap_or_else(|_| json!([])),
-            serde_json::to_value(daily_providers).unwrap_or_else(|_| json!({})),
-            serde_json::to_value(daily_roles).unwrap_or_else(|_| json!({})),
-            serde_json::to_value(total_providers).unwrap_or_else(|_| json!({})),
-            serde_json::to_value(total_roles).unwrap_or_else(|_| json!({})),
-        )
-    } else {
-        (
-            0,
-            0,
-            0,
-            0,
-            default_token_usage_source(),
-            default_token_usage_source(),
-            json!([]),
-            json!({}),
-            json!({}),
-            json!({}),
-            json!({}),
-        )
+    #[cfg(test)]
+    let snapshot = {
+        let mut sessions = state.sessions.lock().await;
+        if !sessions.contains_key(session_id.as_str())
+            && let Some(session) = load_session_from_disk(&session_id)
+        {
+            sessions.insert(session_id.clone(), session);
+        }
+        sessions
+            .get_mut(session_id.as_str())
+            .map(usage_snapshot_from_session)
     };
 
-    Ok(Json(json!({
-        "daily_input": daily_input,
-        "daily_output": daily_output,
-        "total_input": total_input,
-        "total_output": total_output,
-        "total": total_input.saturating_add(total_output),
-        "input_source": input_source,
-        "output_source": output_source,
-        "source_scope": "latest_update",
-        "usage_history": usage_history,
-        "daily_providers": daily_providers,
-        "daily_roles": daily_roles,
-        "total_providers": total_providers,
-        "total_roles": total_roles,
-    })))
+    #[cfg(not(test))]
+    let snapshot = {
+        let loaded = {
+            let mut sessions = state.sessions.lock().await;
+            let loaded_id = sessions
+                .keys()
+                .find(|loaded_id| crate::session_ids_match(loaded_id, &session_id))
+                .cloned();
+            loaded_id
+                .and_then(|loaded_id| sessions.get_mut(&loaded_id))
+                .map(usage_snapshot_from_session)
+        };
+        match loaded {
+            Some(snapshot) => Some(snapshot),
+            None => state
+                .storage
+                .load_usage_snapshot(
+                    &session_id,
+                    &crate::prompts::current_local_snapshot().today(),
+                )
+                .await
+                .map_err(|error| {
+                    eprintln!(
+                        "ERROR: failed to load usage for Session '{}': {error}",
+                        session_id
+                    );
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "error": "Failed to load usage data.",
+                            "code": "storage_read_failed",
+                        })),
+                    )
+                })?,
+        }
+    };
+
+    Ok(Json(usage_api_payload(snapshot)))
 }
 
 fn read_config_file_snapshot_unlocked(path: &Path) -> std::io::Result<String> {
@@ -5191,6 +5504,11 @@ async fn main() {
         return;
     }
 
+    if args.get(1).map(String::as_str) == Some("db") {
+        storage::handle_db_cli(&args[2..]);
+        return;
+    }
+
     // CLI subcommands: lingclaw start|stop|restart|health|status|update
     if args.len() > 1
         && !args[1].starts_with('-')
@@ -5260,6 +5578,44 @@ async fn main() {
         config.context_limit_for_model(&config.model)
     );
 
+    let database_path = match storage::Database::default_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("ERROR: Failed to resolve SQLite storage path: {error}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(error) = storage::preflight_legacy_storage_path_conflicts(&database_path) {
+        eprintln!("ERROR: Legacy storage preflight failed: {error}");
+        std::process::exit(1);
+    }
+    let database = match storage::Database::open(database_path).await {
+        Ok(database) => database,
+        Err(error) => {
+            eprintln!("ERROR: Failed to initialize SQLite storage: {error}");
+            std::process::exit(1);
+        }
+    };
+    match storage::migrate_legacy_json_if_needed(&database).await {
+        Ok(Some(backup)) => {
+            eprintln!(
+                "  Storage:       migrated legacy JSON to SQLite (backup: {})",
+                backup.display()
+            );
+        }
+        Ok(None) => eprintln!("  Storage:       {}", database.path().display()),
+        Err(error) => {
+            eprintln!("ERROR: Legacy storage migration failed: {error}");
+            std::process::exit(1);
+        }
+    }
+    if let Err(error) = database.install_global() {
+        eprintln!("ERROR: Failed to activate SQLite storage: {error}");
+        std::process::exit(1);
+    }
+    #[cfg(not(test))]
+    let storage_status_rx = database.subscribe_status();
+
     let shutdown = CancellationToken::new();
 
     // Generate a one-time shutdown token and write it to disk for CLI use
@@ -5298,6 +5654,8 @@ async fn main() {
     }
 
     let state = Arc::new(AppState {
+        #[cfg(not(test))]
+        storage: database,
         config: std::sync::Mutex::new(Arc::new(config)),
         http,
         sessions,
@@ -5315,12 +5673,17 @@ async fn main() {
         hooks,
         memory_queue: std::sync::Mutex::new(memory_queue),
     });
+    #[cfg(not(test))]
+    tokio::spawn(monitor_storage_status(state.clone(), storage_status_rx));
 
     match ensure_session_ready(&state, None).await {
         Ok((session_id, _)) => eprintln!("  Default session: {session_id} ready"),
         Err(error) => {
             eprintln!("Failed to initialize default session: {error}");
-            return;
+            if !should_continue_after_default_session_error(&state.storage_status()) {
+                return;
+            }
+            eprintln!("  Storage:       protected; continuing with read-only recovery access");
         }
     }
 
@@ -5376,6 +5739,10 @@ async fn main() {
         )
         .route("/api/shutdown", post(api_shutdown))
         .fallback_service(ServeDir::new(static_dir).append_index_html_on_directories(true))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_storage_writable,
+        ))
         .layer(middleware::from_fn(enforce_local_request))
         .with_state(state.clone());
 
@@ -5428,6 +5795,10 @@ async fn main() {
     };
     for session_id in &session_ids {
         let _ = session_store::save_current_session_to_disk(&state, session_id).await;
+    }
+    #[cfg(not(test))]
+    if let Err(error) = state.storage.checkpoint().await {
+        eprintln!("WARNING: Failed to checkpoint SQLite storage: {error}");
     }
     // Clean up shutdown token file
     if let Some(dir) = config_dir_path() {

@@ -164,7 +164,7 @@ async fn collect_and_target_group_context_redact_secrets() {
     session_group::save_group_to_disk_locked(&group)
         .await
         .expect("group should save");
-    let context = target_group_context(&group_id, 4_000);
+    let context = target_group_context(&group_id, 4_000).expect("saved group context should load");
     assert!(context.contains("[redacted]"));
     assert!(!context.contains("secret-value"));
     assert!(!context.contains("super-secret"));
@@ -1396,7 +1396,9 @@ async fn session_list_output_uses_persisted_model_override_for_unloaded_sessions
         .expect("session should save");
     drop(session);
 
-    let output = session_list_output(&state).await;
+    let output = session_list_output(&state)
+        .await
+        .expect("session list should load");
 
     assert!(output.contains(&format!(
         "- {session_id} (Model Override Session) model=claude-sonnet-4-6"
@@ -1769,6 +1771,31 @@ async fn session_control_rejects_oversized_group_members() {
 
     assert!(outcome.is_error);
     assert!(outcome.output.contains("members exceeds"));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn group_member_resolution_canonicalizes_windows_aliases_before_save() {
+    let canonical_id = format!(
+        "CaseWorker{}",
+        NEXT_CONTROL_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    cleanup_created_session_for_test(&canonical_id);
+    let workspace = crate::session_workspace_path(&canonical_id);
+    std::fs::create_dir_all(&workspace).expect("workspace should be created");
+    let session = test_session_with_workspace(&canonical_id, "Case Worker", workspace);
+    session_store::save_session_to_disk(&session)
+        .await
+        .expect("session should save");
+
+    let resolved = canonicalize_existing_group_members(vec![
+        canonical_id.to_ascii_lowercase(),
+        canonical_id.to_ascii_uppercase(),
+    ])
+    .expect("Windows aliases should resolve");
+
+    assert_eq!(resolved, vec![canonical_id.clone()]);
+    cleanup_created_session_for_test(&canonical_id);
 }
 
 #[tokio::test]

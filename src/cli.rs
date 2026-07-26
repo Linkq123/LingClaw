@@ -2235,6 +2235,8 @@ fn handle_help_command() -> bool {
     println!("  mcp-check          Check MCP servers with runtime timeouts");
     println!("  health             Health check (exit 0 = ok)");
     println!("  status             Show detailed service status");
+    println!("  db status          Inspect SQLite storage without creating it");
+    println!("  db backup [PATH]   Create and verify an online SQLite backup");
     println!("  update             Check for updates, rebuild if newer");
     println!("  doctor             Check install readiness (Rust, versions)");
     println!(

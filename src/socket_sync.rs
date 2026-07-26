@@ -74,7 +74,12 @@ pub(crate) async fn send_existing_session_payloads(tx: &WsTx, state: &AppState, 
     ws_send(tx, &view_state).await;
     ws_send(tx, &todos_state).await;
     ws_send(tx, &history).await;
-    ws_send(tx, &crate::build_group_list_payload()).await;
+    match crate::build_group_list_payload() {
+        Ok(payload) => {
+            ws_send(tx, &payload).await;
+        }
+        Err(_) => crate::send_storage_status(tx, state).await,
+    }
 }
 
 /// Build the session info payload including model capabilities.
@@ -215,17 +220,20 @@ pub(crate) fn build_session_usage_payload(session: &crate::Session) -> serde_jso
     })
 }
 
-pub(crate) fn build_session_list_payload(state: &AppState) -> serde_json::Value {
+pub(crate) fn build_session_list_payload(state: &AppState) -> Result<serde_json::Value, String> {
     let config = state.config();
-    let mut summaries = list_saved_session_summaries_in_dir(&sessions_dir());
+    let mut summaries = list_saved_session_summaries_result(&sessions_dir())?;
 
     if let Ok(sessions) = state.sessions.try_lock() {
         for session in sessions.values() {
-            let already_listed = summaries.iter().any(|summary| summary.id == session.id);
-            if already_listed {
-                continue;
+            if let Some(summary) = summaries
+                .iter_mut()
+                .find(|summary| crate::session_ids_match(&summary.id, &session.id))
+            {
+                *summary = SessionSummary::from_session(session);
+            } else {
+                summaries.push(SessionSummary::from_session(session));
             }
-            summaries.push(SessionSummary::from_session(session));
         }
     }
 
@@ -234,22 +242,29 @@ pub(crate) fn build_session_list_payload(state: &AppState) -> serde_json::Value 
     let mut seen_ids = std::collections::HashSet::new();
     let mut list = Vec::new();
     for summary in summaries {
-        if !seen_ids.insert(summary.id.clone()) {
+        let dedupe_id = if cfg!(windows) {
+            summary.id.to_ascii_lowercase()
+        } else {
+            summary.id.clone()
+        };
+        if !seen_ids.insert(dedupe_id) {
             continue;
         }
-        let session = if summary.corrupt {
-            None
-        } else {
-            load_session_from_disk(&summary.id)
-        };
-        list.push(summary.to_json(&config, session.as_ref()));
+        list.push(summary.to_json(&config, None));
     }
 
-    json!({"type":"session_list","sessions": list})
+    Ok(json!({"type":"session_list","sessions": list}))
 }
 
 pub(crate) async fn broadcast_session_list_payload(state: &AppState) {
-    let payload = build_session_list_payload(state);
+    let payload = match build_session_list_payload(state) {
+        Ok(payload) => payload,
+        Err(_) => {
+            #[cfg(not(test))]
+            crate::broadcast_storage_status(state).await;
+            return;
+        }
+    };
     let session_ids = {
         let clients = state.session_clients.lock().await;
         clients.keys().cloned().collect::<Vec<_>>()

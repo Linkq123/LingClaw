@@ -35,6 +35,7 @@ describe('input slash command menu', () => {
     state.sessionSwitchInFlight = false;
     state.sessionIdentityMutationInFlight = false;
     state.imageUploadInFlight = false;
+    state.storageMode = 'healthy';
   });
 
   it('renders suggestions for slash-prefixed input and inserts the highlighted command with Tab', async () => {
@@ -479,6 +480,33 @@ describe('input slash command menu', () => {
 
     expect(sendMock).toHaveBeenCalledWith('/help');
     expect(stateModule.dom.input?.value).toBe('');
+  });
+
+  it('dispatches only read-only slash commands while storage is protected', async () => {
+    const stateModule = await import('../src/state.js');
+    stateModule.initDomRefs();
+    const sendMock = vi.fn();
+    stateModule.state.ws = { readyState: 1, send: sendMock } as unknown as WebSocket;
+    stateModule.state.storageMode = 'protected';
+    stateModule.state.composerModelAvailability = 'agent-model-unconfigured';
+    stateModule.state.composerEffectiveModelConfigured = false;
+    stateModule.state.pendingImages = [];
+
+    const { send } = await import('../src/input.js');
+    stateModule.dom.input!.value = '/status';
+    send();
+
+    expect(sendMock).toHaveBeenCalledWith('/status');
+    expect(stateModule.dom.input?.value).toBe('');
+
+    stateModule.state.busy = false;
+    stateModule.dom.input!.value = '/clear';
+    send();
+    stateModule.dom.input!.value = 'write must stay blocked';
+    send();
+
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(stateModule.dom.input?.value).toBe('write must stay blocked');
   });
 
   it('does not dispatch /new while the Agent model is unconfigured', async () => {

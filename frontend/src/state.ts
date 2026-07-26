@@ -77,6 +77,7 @@ export interface AppState {
   ws: WebSocket | null;
   currentMsg: HTMLElement | null;
   busy: boolean;
+  storageMode: 'healthy' | 'protected';
   composerModelAvailability: ComposerModelAvailability;
   composerExplicitPrimaryModelConfigured: boolean;
   composerSessionModelOverridePresent: boolean;
@@ -193,6 +194,7 @@ export const state: AppState = {
   ws: null,
   currentMsg: null,
   busy: false,
+  storageMode: 'healthy',
   composerModelAvailability: 'checking',
   composerExplicitPrimaryModelConfigured: false,
   composerSessionModelOverridePresent: false,

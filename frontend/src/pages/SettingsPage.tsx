@@ -36,6 +36,7 @@ import {
 import { UsageView } from './UsagePage.js';
 import { ModelsConsole } from './ModelsConsole.js';
 import { resumeChatScrollTracking, suspendChatScrollTracking } from '../scroll.js';
+import { currentStorageMode, subscribeStorageStatus, type StorageMode } from '../storageStatus.js';
 
 // ── Module-level bridge (imperative open/close from main.ts) ──────────────────
 
@@ -159,6 +160,17 @@ export type ConsoleSection = SettingsSection | 'tab-usage';
 type TabId = ConsoleSection;
 type StatusType = 'idle' | 'loading' | 'success' | 'error';
 type TabSaveMode = 'config' | 'skills' | 'none';
+
+function useStorageMode(): StorageMode {
+  const [mode, setMode] = useState<StorageMode>(() => currentStorageMode());
+
+  useEffect(() => {
+    setMode(currentStorageMode());
+    return subscribeStorageStatus(setMode);
+  }, []);
+
+  return mode;
+}
 
 interface TabMeta {
   id: TabId;
@@ -1043,6 +1055,7 @@ const McpServerCard = React.memo(McpServerCardInner);
 function McpTab({
   config,
   sessionId,
+  storageProtected,
   onChange,
   onStatus,
   onPolicyDirtyChange,
@@ -1050,6 +1063,7 @@ function McpTab({
 }: {
   config: AppConfig;
   sessionId: string;
+  storageProtected: boolean;
   onChange: (c: AppConfig) => void;
   onStatus: (msg: string, type?: string) => void;
   onPolicyDirtyChange?: (dirty: boolean) => void;
@@ -1421,6 +1435,10 @@ function McpTab({
   };
 
   const saveMcpPolicy = async () => {
+    if (storageProtected) {
+      onStatus(tr('storage.protectedDescription'), 'error');
+      return;
+    }
     const saveRevision = policyRevisionRef.current;
     setPolicySaving(true);
     try {
@@ -1607,7 +1625,7 @@ function McpTab({
           <button
             className="btn-primary"
             type="button"
-            disabled={!policyDirty || policySaving}
+            disabled={storageProtected || !policyDirty || policySaving}
             onClick={() => void saveMcpPolicy()}
           >
             {policySaving ? tr('settings.saving') : tr('settings.saveMcpPermissions')}
@@ -1622,6 +1640,7 @@ function McpTab({
           <input
             type="checkbox"
             checked={confirmMutatingTools}
+            disabled={storageProtected}
             onChange={(e) => {
               setConfirmMutatingTools(e.target.checked);
               markPolicyDirty();
@@ -1641,6 +1660,7 @@ function McpTab({
           <input
             type="checkbox"
             checked={Boolean(clientCapabilities.roots)}
+            disabled={storageProtected}
             onChange={(e) => {
               setClientCapabilities((prev) => ({ ...prev, roots: e.target.checked }));
               markPolicyDirty();
@@ -1680,7 +1700,7 @@ function McpTab({
                   <input
                     type="checkbox"
                     checked={enabledServers.has(server.id)}
-                    disabled={!server.configuredEnabled}
+                    disabled={storageProtected || !server.configuredEnabled}
                     onChange={(e) => toggleServerPolicy(server, e.target.checked)}
                   />
                   {tr('settings.enabledForSession')}
@@ -1712,6 +1732,7 @@ function McpTab({
                   <input
                     type="checkbox"
                     checked={enabledTools.has(tool.id)}
+                    disabled={storageProtected}
                     onChange={(e) => toggleToolPolicy(tool, e.target.checked)}
                   />
                   <span>
@@ -1842,9 +1863,11 @@ function sameStringList(a: string[], b: string[]): boolean {
 
 function SkillsTab({
   sessionId,
+  storageProtected,
   onDirtyChange,
 }: {
   sessionId: string;
+  storageProtected: boolean;
   onDirtyChange?: (dirty: boolean) => void;
 }) {
   const targetSessionId = sessionId || 'main';
@@ -1941,6 +1964,10 @@ function SkillsTab({
   }, [savedEnabledIds]);
 
   const saveSkills = useCallback(async () => {
+    if (storageProtected) {
+      setStatus({ message: tr('storage.protectedDescription'), type: 'error' });
+      return;
+    }
     setSaving(true);
     setStatus({ message: tr('settings.skillsSaving'), type: 'loading' });
     try {
@@ -1974,7 +2001,7 @@ function SkillsTab({
     } finally {
       setSaving(false);
     }
-  }, [currentEnabledIds, knownSkillIds, sessionLabel, skills, targetSessionId]);
+  }, [currentEnabledIds, knownSkillIds, sessionLabel, skills, storageProtected, targetSessionId]);
 
   const statusClass =
     status.type === 'success'
@@ -2003,25 +2030,29 @@ function SkillsTab({
         <button
           className="btn-secondary"
           onClick={() => setAllEnabled(true)}
-          disabled={loading || saving}
+          disabled={storageProtected || loading || saving}
         >
           {tr('settings.enableAll')}
         </button>
         <button
           className="btn-secondary"
           onClick={() => setAllEnabled(false)}
-          disabled={loading || saving}
+          disabled={storageProtected || loading || saving}
         >
           {tr('settings.disableAll')}
         </button>
         <button
           className="btn-secondary"
           onClick={revertSkills}
-          disabled={!dirty || loading || saving}
+          disabled={storageProtected || !dirty || loading || saving}
         >
           {tr('settings.revert')}
         </button>
-        <button className="btn-primary" onClick={saveSkills} disabled={!dirty || loading || saving}>
+        <button
+          className="btn-primary"
+          onClick={saveSkills}
+          disabled={storageProtected || !dirty || loading || saving}
+        >
           {tr('settings.saveSkills')}
         </button>
       </div>
@@ -2039,7 +2070,7 @@ function SkillsTab({
               <input
                 type="checkbox"
                 checked={skill.enabled}
-                disabled={loading || saving}
+                disabled={storageProtected || loading || saving}
                 onChange={(event) => setSkillEnabled(skill.id, event.target.checked)}
               />
               <span className="skill-row-body">
@@ -2276,6 +2307,7 @@ function SettingsShell({
   configConflict,
   skillsDirty,
   mcpDirty,
+  storageProtected,
   corrupt,
   showDiscardConfirm,
   onTabChange,
@@ -2294,6 +2326,7 @@ function SettingsShell({
   configConflict: boolean;
   skillsDirty: boolean;
   mcpDirty: boolean;
+  storageProtected: boolean;
   corrupt: boolean;
   showDiscardConfirm: boolean;
   onTabChange: (tab: TabId) => void;
@@ -2500,6 +2533,15 @@ function SettingsShell({
             </div>
           </div>
 
+          {storageProtected && (
+            <div className="console-storage-warning" role="status" aria-live="polite">
+              <svg className="icon" aria-hidden="true">
+                <use href={iconHref('alert-triangle')} />
+              </svg>
+              <span>{tr('storage.protectedDescription')}</span>
+            </div>
+          )}
+
           {showDiscardConfirm && (
             <div className="settings-discard-dialog" role="alertdialog" aria-live="assertive">
               <div>
@@ -2568,6 +2610,8 @@ function SettingsShell({
 
 export function SettingsPage() {
   useLanguageVersion();
+  const storageMode = useStorageMode();
+  const storageProtected = storageMode === 'protected';
   const [visible, setVisible] = useState(false);
   const [consoleRendered, setConsoleRendered] = useState(false);
   const [config, setConfig] = useState<AppConfig>({});
@@ -3051,6 +3095,7 @@ export function SettingsPage() {
       configConflict={configConflict}
       skillsDirty={skillsDirty}
       mcpDirty={mcpDirty}
+      storageProtected={storageProtected}
       corrupt={!!corruptData}
       showDiscardConfirm={showDiscardConfirm}
       onTabChange={selectTab}
@@ -3118,7 +3163,11 @@ export function SettingsPage() {
               aria-labelledby="tab-skills-button"
               hidden={activeTab !== 'tab-skills'}
             >
-              <SkillsTab sessionId={settingsSessionId} onDirtyChange={setSkillsDirty} />
+              <SkillsTab
+                sessionId={settingsSessionId}
+                storageProtected={storageProtected}
+                onDirtyChange={setSkillsDirty}
+              />
             </section>
           )}
           {visitedTabs.has('tab-agents') && (
@@ -3157,6 +3206,7 @@ export function SettingsPage() {
               <McpTab
                 config={config}
                 sessionId={settingsSessionId}
+                storageProtected={storageProtected}
                 onChange={setConfig}
                 onStatus={handleStatus}
                 onPolicyDirtyChange={setMcpDirty}

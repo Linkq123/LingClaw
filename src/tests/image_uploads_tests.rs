@@ -15,16 +15,16 @@ fn find_http_headers_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n")
 }
 
-fn read_http_put(stream: &mut std::net::TcpStream) {
+fn read_http_put(stream: &mut std::net::TcpStream) -> String {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("read timeout");
     let mut request = Vec::new();
     let mut chunk = [0_u8; 1024];
-    loop {
+    let headers_end = loop {
         let read = stream.read(&mut chunk).expect("request bytes");
         if read == 0 {
-            break;
+            break request.len();
         }
         request.extend_from_slice(&chunk[..read]);
         let Some(headers_end) = find_http_headers_end(&request) else {
@@ -42,9 +42,10 @@ fn read_http_put(stream: &mut std::net::TcpStream) {
             })
             .unwrap_or(0);
         if request.len() >= headers_end + 4 + content_length {
-            break;
+            break headers_end;
         }
-    }
+    };
+    String::from_utf8_lossy(&request[..headers_end]).into_owned()
 }
 
 fn spawn_s3_put_server(statuses: Vec<&'static str>) -> (String, thread::JoinHandle<()>) {
@@ -53,7 +54,7 @@ fn spawn_s3_put_server(statuses: Vec<&'static str>) -> (String, thread::JoinHand
     let handle = thread::spawn(move || {
         for status in statuses {
             let (mut stream, _) = listener.accept().expect("upload connection");
-            read_http_put(&mut stream);
+            let _ = read_http_put(&mut stream);
             let response =
                 format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
             stream.write_all(response.as_bytes()).expect("response");
@@ -91,7 +92,7 @@ fn spawn_blocking_s3_put_server(
                     accepted_for_server.fetch_add(1, Ordering::SeqCst);
                     let release = Arc::clone(&release_for_server);
                     workers.push(thread::spawn(move || {
-                        read_http_put(&mut stream);
+                        let _ = read_http_put(&mut stream);
                         let (released, wake) = &*release;
                         let mut released = released.lock().expect("release lock");
                         while !*released {
@@ -118,6 +119,29 @@ fn spawn_blocking_s3_put_server(
         }
     });
     (format!("http://{address}"), accepted, handle)
+}
+
+fn spawn_s3_recording_server(
+    status: &'static str,
+) -> (
+    String,
+    std::sync::mpsc::Receiver<String>,
+    thread::JoinHandle<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+    let address = listener.local_addr().expect("address");
+    let (request_tx, request_rx) = std::sync::mpsc::channel();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("S3 connection");
+        request_tx
+            .send(read_http_put(&mut stream))
+            .expect("request should be recorded");
+        let response =
+            format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        stream.write_all(response.as_bytes()).expect("response");
+        stream.flush().expect("flush");
+    });
+    (format!("http://{address}"), request_rx, handle)
 }
 
 fn tool_image(name: &str, data: Vec<u8>) -> ToolImageOutput {
@@ -223,6 +247,34 @@ async fn upload_tool_images_preserves_order_and_keeps_base64_out_of_serializatio
     let persisted = serde_json::to_string(&result.attachments).expect("serialize attachments");
     assert!(!persisted.contains("iVBOR"));
     assert!(!persisted.contains("\"data\""));
+}
+
+#[tokio::test]
+async fn delete_object_uses_signed_s3_delete_request() {
+    let (endpoint, request_rx, server) = spawn_s3_recording_server("204 No Content");
+    let cfg = test_s3(endpoint);
+
+    s3_delete_object(
+        &reqwest::Client::new(),
+        &cfg,
+        "tool-images/2026-07-25/cleanup.png",
+    )
+    .await
+    .expect("cleanup request should succeed");
+
+    server.join().expect("server");
+    let request = request_rx.recv().expect("request");
+    assert!(request.starts_with("DELETE /bucket/tool-images/2026-07-25/cleanup.png HTTP/1.1"));
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: aws4-hmac-sha256")
+    );
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("x-amz-content-sha256:")
+    );
 }
 
 #[tokio::test]

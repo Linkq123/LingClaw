@@ -16,12 +16,173 @@ import {
 } from '../src/composerAvailability.js';
 import { setLanguage } from '../src/i18n.js';
 import { state } from '../src/state.js';
+import { publishStorageStatus } from '../src/storageStatus.js';
 
 beforeEach(() => {
   setLanguage('en');
+  document.documentElement.dataset.storageMode = 'healthy';
   state.composerConfigRevision = null;
   state.composerSessionModelRevision = null;
   state.composerGroupModelRevision = null;
+});
+
+describe('SettingsPage storage protection', () => {
+  let root: Root | null = null;
+
+  beforeEach(() => {
+    (
+      globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }
+    ).IS_REACT_ACT_ENVIRONMENT = true;
+  });
+
+  afterEach(async () => {
+    if (root) {
+      await act(async () => {
+        root?.unmount();
+        await flushMicrotasks();
+      });
+      root = null;
+    }
+    document.body.innerHTML = '';
+    document.documentElement.dataset.storageMode = 'healthy';
+    delete (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean })
+      .IS_REACT_ACT_ENVIRONMENT;
+    vi.unstubAllGlobals();
+  });
+
+  it('disables session-backed controls while keeping config saves available', async () => {
+    let configSaveCalls = 0;
+    let sessionWriteCalls = 0;
+    const fetchMock = vi.fn<typeof fetch>((input, init) => {
+      const url = typeof input === 'string' ? input : input.url;
+      if (url === '/api/config' && init?.method === 'PUT') {
+        configSaveCalls += 1;
+        const body = JSON.parse(String(init.body || '{}')) as {
+          config?: Record<string, unknown>;
+        };
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: body.config || {},
+            configRevision: configSaveCalls,
+          }),
+        );
+      }
+      if (url === '/api/config') {
+        return Promise.resolve(
+          jsonResponse({
+            path: '/tmp/config.json',
+            config: {
+              settings: { port: 18989 },
+              mcpServers: {
+                remote: {
+                  transport: 'streamable-http',
+                  url: 'https://mcp.example/mcp',
+                  enabled: true,
+                },
+              },
+            },
+          }),
+        );
+      }
+      if (url === '/api/session-skills?session=main') {
+        if (init?.method === 'PUT') sessionWriteCalls += 1;
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            skills: [
+              {
+                id: 'system/pdf',
+                name: 'pdf',
+                path: 'system://skills/pdf/SKILL.md',
+                enabled: true,
+              },
+            ],
+            disabledSystemSkills: [],
+          }),
+        );
+      }
+      if (url === '/api/mcp/catalog?session=main') {
+        return Promise.resolve(
+          jsonResponse({
+            session: { id: 'main', name: 'Main' },
+            policy: { enabledServers: [], enabledTools: [] },
+            servers: [
+              {
+                id: 'remote',
+                name: 'remote',
+                transport: 'streamable-http',
+                configuredEnabled: true,
+                enabled: false,
+                authenticated: false,
+                toolCount: 0,
+                resourceCount: 0,
+                promptCount: 0,
+              },
+            ],
+            tools: [],
+            resources: [],
+            prompts: [],
+          }),
+        );
+      }
+      if (url === '/api/mcp/session-policy?session=main' && init?.method === 'PUT') {
+        sessionWriteCalls += 1;
+        return Promise.resolve(jsonResponse({ ok: true, policy: {} }));
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    ({ root } = await renderSettingsPage());
+    await openAndLoad();
+
+    await act(async () => {
+      publishStorageStatus('protected');
+      await flushMicrotasks();
+    });
+
+    const warning = document.querySelector('.console-storage-warning');
+    expect(warning?.textContent).toContain('Local storage is in protected mode.');
+
+    const portInput = document.querySelector<HTMLInputElement>('input[placeholder="18989"]');
+    expect(portInput).not.toBeNull();
+    await act(async () => {
+      setInputValue(portInput!, '19000');
+      await flushMicrotasks();
+    });
+    const configSave = document.getElementById('settings-save-btn') as HTMLButtonElement;
+    expect(configSave.disabled).toBe(false);
+    await act(async () => {
+      configSave.click();
+      await flushMicrotasks();
+    });
+    expect(configSaveCalls).toBe(1);
+
+    await act(async () => {
+      findButtonByText('Skills').click();
+      await flushMicrotasks();
+    });
+    expect(findSkillCheckbox('system/pdf').disabled).toBe(true);
+    expect(findButtonByText('Enable all').disabled).toBe(true);
+    expect(findButtonByText('Save Skills').disabled).toBe(true);
+
+    await act(async () => {
+      findButtonByText('MCP').click();
+      await flushMicrotasks();
+    });
+    const sessionPolicyCheckbox = findCheckboxByLabel('Enabled for session');
+    expect(sessionPolicyCheckbox.disabled).toBe(true);
+    expect(findButtonByText('Save MCP Permissions').disabled).toBe(true);
+    expect(sessionWriteCalls).toBe(0);
+
+    await act(async () => {
+      publishStorageStatus('healthy');
+      await flushMicrotasks();
+    });
+    expect(document.querySelector('.console-storage-warning')).toBeNull();
+    expect(sessionPolicyCheckbox.disabled).toBe(false);
+  });
 });
 
 function jsonResponse(payload: unknown, status = 200): Response {

@@ -14,7 +14,8 @@ flowchart TB
     Loop --> Prompt["Prompt, Skills, Memory, Context"]
     Loop --> Providers["OpenAI / Anthropic / Gemini / Ollama"]
     Loop --> Tools["Built-ins / MCP / Sub-agents"]
-    Sessions <--> Disk["Atomic local persistence"]
+    Sessions <--> SQLite["SQLite core storage"]
+    Sessions <--> Disk["Session workspace files"]
     Tools --> Images["Optional S3 image pipeline"]
 ```
 
@@ -64,8 +65,9 @@ flowchart TB
 | `context.rs` | Token 估算、请求预算、裁剪 |
 | `hooks.rs` | LLM/Tool/Command 生命周期与自动上下文压缩 |
 | `prompts.rs` | Workspace 提示、Bootstrap、Skills 发现与注入 |
-| `session_store.rs` | Session schema、迁移和原子磁盘 I/O |
-| `session_group.rs` | Group store、成员、管理员、投票和 replay payload |
+| `storage/` | SQLite schema、Session/Group repository、旧 JSON 迁移、状态检查和在线备份 |
+| `session_store.rs` | Session 运行时适配、规范化和 Workspace 兼容逻辑 |
+| `session_group.rs` | Group 模型、成员、管理员、投票和 replay payload |
 | `session_control.rs` | Main-only 跨 Session/Group 控制平面和派发 |
 | `todos.rs` | Todo 校验、revision 冲突和广播 |
 | `memory.rs` | Structured Memory、Daily Reflection 和队列 |
@@ -134,8 +136,8 @@ Orchestrator 验证 DAG，按拓扑层并行运行，传播依赖结果并发送
 ~/.lingclaw/
 ├── .lingclaw.json
 ├── mcp-auth.json
-├── sessions/<session-id>.json
-├── groups/<group-id>.json
+├── lingclaw.db
+├── backups/
 ├── system-skills/
 ├── system-agents/
 ├── skills/
@@ -153,9 +155,13 @@ Orchestrator 验证 DAG，按拓扑层并行运行，传播依赖结果并发送
     └── agents/
 ```
 
-Session 存档包含消息、模型覆盖、think/view state、Todos、Skills policy、pending plan 和 usage。当前 `SESSION_VERSION = 7`；加载旧存档时填充默认字段并修剪不完整 tool transaction。
+`lingclaw.db` 是 Session、消息、Todos、Usage、Sub-agent 快照和 Group 数据的唯一持久化来源。复杂 Provider 字段使用 JSON 列，身份、顺序、时间、Tool ID 等常用查询字段独立存储。消息保存通过指纹比较公共前缀，只替换发生变化的尾部；Session/Group 多表更新在一个事务中提交。数据库使用 WAL、`foreign_keys=ON`、`synchronous=NORMAL` 和 5 秒 busy timeout，并通过 `application_id`、`schema_migrations` 与 `user_version` 管理归属和版本。
 
-磁盘写入先创建 `.tmp` 再 rename，并针对 Windows 目标替换语义处理失败恢复。内存中已更新但落盘失败的 Session 不会立即丢弃，后续保存可以重试。
+首次发现旧 `sessions/` 或 `groups/` 时，Runtime 在监听端口前完成严格迁移：读取 primary/`.tmp`、校验 ID/引用和哈希，把目录原子移动到 `backups/sqlite-migration-<timestamp>/`，再在一个 SQLite 事务中导入、校验并记录完成标记。两阶段 journal 支持崩溃续跑；成功后不再读取或写入旧 JSON，备份不会自动删除。Schema 升级前先创建一致性数据库备份。
+
+运行期 SQLite I/O、损坏或约束错误会把进程置为粘性的 `protected` 状态。Runtime 取消活动 Agent/Group run 并拒绝核心数据库写入，读取和独立 `.lingclaw.json` 保存仍可用。HTTP 返回稳定的 `503 storage_protected`，WebSocket 广播 `storage_status`；修复外部问题后需要重启进程。
+
+Workspace 提示、Markdown Memory、Structured Memory、Skills 和 Agents 继续使用文件系统。Session 删除先提交数据库事务（包括 Group 成员和投票清理），再删除 Workspace；文件清理失败最多留下孤立目录，不会恢复已删除的数据库实体。
 
 ### Bootstrap prompt
 
@@ -199,7 +205,7 @@ sequenceDiagram
     R->>P: Fresh signed URL or local inline data
 ```
 
-Runtime 不从任意文本、stdout、路径或 URL 猜测图片。原始 Base64 不进入日志、WebSocket、模型文本或 Session JSON。一个工具批次最多保留 10 张图片，上传并发最多 3，结果顺序与 tool calls 一致。
+Runtime 不从任意文本、stdout、路径或 URL 猜测图片。原始 Base64 不进入日志、WebSocket、模型文本或 SQLite。一个工具批次最多保留 10 张图片，上传并发最多 3，结果顺序与 tool calls 一致。
 
 签名依赖 S3 配置身份；身份变化时旧 key 被跳过而不是用新配置重新签名。图片失败只追加“不可以使用”的文字说明，不改变原工具成功/失败状态。
 

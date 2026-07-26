@@ -41,6 +41,7 @@ describe('composer model availability', () => {
     `;
     initDomRefs();
     state.busy = false;
+    state.storageMode = 'healthy';
     state.composerModelAvailability = 'checking';
     state.composerExplicitPrimaryModelConfigured = false;
     state.composerSessionModelOverridePresent = false;
@@ -62,6 +63,53 @@ describe('composer model availability', () => {
     state.groupTargetMode = 'all';
     state.groupSelectedTargets = [];
     setLanguage('en');
+  });
+
+  it('disables all composer writes while local storage is protected', () => {
+    state.storageMode = 'protected';
+    state.composerModelAvailability = 'ready';
+    state.composerEffectiveModelConfigured = true;
+
+    syncComposerAvailability();
+
+    expect(dom.sendBtn?.disabled).toBe(true);
+    expect(dom.input?.placeholder).toBe(
+      'Local storage is in protected mode. Repair the database and restart LingClaw.',
+    );
+    expect(document.getElementById('composer-availability-message')?.textContent).toBe(
+      'Storage protected',
+    );
+    expect(dom.composerAvailabilityStatus?.hidden).toBe(false);
+  });
+
+  it('does not offer model recovery actions while storage protection overrides the reason', () => {
+    state.storageMode = 'protected';
+    state.composerModelAvailability = 'agent-model-unconfigured';
+    state.composerEffectiveModelConfigured = false;
+
+    syncComposerAvailability();
+
+    expect(dom.composerAvailabilityAction?.hidden).toBe(true);
+    expect(dom.composerAvailabilityStatus?.dataset.hasAction).toBe('false');
+    expect(dom.input?.placeholder).toBe(
+      'Local storage is in protected mode. Repair the database and restart LingClaw.',
+    );
+  });
+
+  it('enables protected-mode read-only commands even when the Agent model is unavailable', () => {
+    state.storageMode = 'protected';
+    state.composerModelAvailability = 'agent-model-unconfigured';
+    state.composerEffectiveModelConfigured = false;
+    dom.input!.value = '/status';
+
+    syncComposerAvailability();
+
+    expect(dom.sendBtn?.disabled).toBe(false);
+    expect(dom.input?.dataset.availability).toBe('ready');
+
+    dom.input!.value = '/clear';
+    syncComposerAvailability();
+    expect(dom.sendBtn?.disabled).toBe(true);
   });
 
   it('distinguishes missing models from a missing primary Agent model', () => {

@@ -17,7 +17,7 @@ use crate::{
     session_admin::gather_global_today_usage,
     session_store::{
         SessionSummary, build_session_status, build_usage_report,
-        list_saved_session_summaries_in_dir, replace_session_messages, save_session_to_disk_locked,
+        list_saved_session_summaries_result, replace_session_messages, save_session_to_disk_locked,
         session_persist_gate, sessions_dir,
     },
     tools, truncate, ws_send,
@@ -1745,7 +1745,16 @@ async fn handle_sessions_command(current_session_id: &str, state: &AppState) -> 
         .keys()
         .cloned()
         .collect();
-    let mut summaries = list_saved_session_summaries_in_dir(&sessions_dir());
+    let mut summaries = match list_saved_session_summaries_result(&sessions_dir()) {
+        Ok(summaries) => summaries,
+        Err(_) => {
+            return command_result(
+                "Local storage is in protected mode. Repair it and restart LingClaw.",
+                "error",
+                false,
+            );
+        }
+    };
     let sessions = state.sessions.lock().await;
     for session in sessions.values() {
         let already_listed = summaries.iter().any(|summary| summary.id == session.id);

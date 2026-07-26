@@ -1,5 +1,6 @@
 import { tr } from './i18n.js';
 import { mentionedGroupTargets } from './groupMentions.js';
+import { normalizeSlashCommandText } from './slashCommands.js';
 import { dom, state } from './state.js';
 import type { AppConfig, ConfigApiResponse } from './types/config.js';
 
@@ -151,6 +152,7 @@ export function resolveComposerModelAvailability(
 }
 
 function placeholderKey(): string {
+  if (state.storageMode === 'protected') return 'storage.protectedDescription';
   switch (state.composerModelAvailability) {
     case 'checking':
       return 'composer.checkingModel';
@@ -244,7 +246,16 @@ export function areGroupMessageTargetsModelReady(value: string): boolean {
   );
 }
 
+const STORAGE_PROTECTED_READ_ONLY_COMMANDS = new Set(['/help', '/status', '/usage', '/sessions']);
+
+export function canSendWhileStorageProtected(value: string): boolean {
+  if (state.activeGroupId || state.pendingImages.length > 0) return false;
+  const command = normalizeSlashCommandText(value.trim()).split(/\s+/, 1)[0].toLowerCase();
+  return STORAGE_PROTECTED_READ_ONLY_COMMANDS.has(command);
+}
+
 export function canBypassComposerModelGate(value: string): boolean {
+  if (state.storageMode === 'protected') return canSendWhileStorageProtected(value);
   if (state.pendingImages.length > 0) return false;
   const trimmed = value.trim();
   if (!trimmed.startsWith('/')) return false;
@@ -265,6 +276,7 @@ export function canBypassComposerModelGate(value: string): boolean {
 }
 
 export function syncComposerAvailability(): void {
+  const storageProtected = state.storageMode === 'protected';
   const ready = isComposerModelReady();
   const inputValue = dom.input?.value || '';
   const groupTargetsMissing = Boolean(
@@ -283,25 +295,27 @@ export function syncComposerAvailability(): void {
     targetedSwitchCommand(inputValue) &&
     (state.composerSessionIdentityPending || state.imageUploadInFlight || identityChangeBlocked),
   );
-  const key = groupSlashUnsupported
-    ? 'group.slashUnsupported'
-    : uploadBlocksSubmission
-      ? 'composer.uploadInProgress'
-      : identityChangeBlocked
-        ? 'composer.sessionChangeInProgress'
-        : state.composerModelAvailability === 'config-unavailable'
-          ? placeholderKey()
-          : groupTargetsMissing
-            ? state.groupTargetMode === 'mentions'
-              ? 'group.mentionRequired'
-              : 'group.selectMember'
-            : state.activeGroupId && groupReady
-              ? state.busy
-                ? 'composer.placeholderBusy'
-                : 'composer.placeholder'
-              : missingGroupTargets.length > 0
-                ? 'composer.groupTargetsUnconfigured'
-                : placeholderKey();
+  const key = storageProtected
+    ? 'storage.protectedDescription'
+    : groupSlashUnsupported
+      ? 'group.slashUnsupported'
+      : uploadBlocksSubmission
+        ? 'composer.uploadInProgress'
+        : identityChangeBlocked
+          ? 'composer.sessionChangeInProgress'
+          : state.composerModelAvailability === 'config-unavailable'
+            ? placeholderKey()
+            : groupTargetsMissing
+              ? state.groupTargetMode === 'mentions'
+                ? 'group.mentionRequired'
+                : 'group.selectMember'
+              : state.activeGroupId && groupReady
+                ? state.busy
+                  ? 'composer.placeholderBusy'
+                  : 'composer.placeholder'
+                : missingGroupTargets.length > 0
+                  ? 'composer.groupTargetsUnconfigured'
+                  : placeholderKey();
   const vars =
     missingGroupTargets.length > 0
       ? {
@@ -315,6 +329,7 @@ export function syncComposerAvailability(): void {
         }
       : undefined;
   const canSubmit =
+    (!storageProtected || modelFreeSlashCommand) &&
     !groupSlashUnsupported &&
     !uploadBlocksSubmission &&
     !identityChangeBlocked &&
@@ -329,17 +344,22 @@ export function syncComposerAvailability(): void {
     dom.sendBtn.disabled = !canSubmit;
     dom.sendBtn.title = canSubmit ? '' : tr(key, vars);
   }
-  const resolution = key === placeholderKey() ? composerAvailabilityResolution() : null;
+  const resolution =
+    !storageProtected && key === placeholderKey() ? composerAvailabilityResolution() : null;
   const retryVisible =
     !canSubmit &&
     key === 'composer.configUnavailable' &&
     state.composerModelAvailability === 'config-unavailable';
   const visibleStatus =
-    !canSubmit && ((!state.activeGroupId && resolution !== null) || retryVisible);
+    !canSubmit &&
+    (storageProtected || (!state.activeGroupId && resolution !== null) || retryVisible);
   const fullReason = canSubmit ? '' : tr(key, vars);
-  const compactKey = compactStatusKey(state.composerModelAvailability);
+  const compactKey = storageProtected
+    ? 'storage.protectedLabel'
+    : compactStatusKey(state.composerModelAvailability);
   const compactLabel = compactKey ? tr(compactKey) : '';
-  const useUnavailableComposerLayout = !canSubmit && key.startsWith('composer.');
+  const useUnavailableComposerLayout =
+    !canSubmit && (key.startsWith('composer.') || storageProtected);
   const activeElement = document.activeElement;
   const returnFocusFromRecovery = Boolean(
     (activeElement === dom.composerAvailabilityAction && (!visibleStatus || resolution === null)) ||
@@ -353,7 +373,9 @@ export function syncComposerAvailability(): void {
   }
   if (dom.composerAvailabilityStatus) {
     dom.composerAvailabilityStatus.hidden = !visibleStatus;
-    dom.composerAvailabilityStatus.dataset.kind = state.composerModelAvailability;
+    dom.composerAvailabilityStatus.dataset.kind = storageProtected
+      ? 'storage-protected'
+      : state.composerModelAvailability;
     const message = document.getElementById('composer-availability-message');
     if (message) message.textContent = visibleStatus ? compactLabel : '';
   }
@@ -375,6 +397,7 @@ export function syncComposerAvailability(): void {
     );
   }
   const attachmentChangesBlocked = Boolean(
+    storageProtected ||
     state.sessionSwitchInFlight ||
     state.sessionIdentityMutationInFlight ||
     state.composerSessionTransitionPending ||
@@ -402,6 +425,7 @@ export function syncComposerAvailability(): void {
   document.querySelectorAll<HTMLButtonElement>('.plan-execute-btn').forEach((button) => {
     const executing = state.pendingPlanExecutionId === button.dataset.planId;
     const canExecute =
+      !storageProtected &&
       ready &&
       !state.imageUploadInFlight &&
       !state.sessionSwitchInFlight &&
